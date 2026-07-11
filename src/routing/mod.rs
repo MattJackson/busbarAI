@@ -216,8 +216,9 @@ pub(crate) enum RoutingDecision {
     Abstain,
     /// REJECT the request: no upstream is dispatched and the caller receives a dialect-native error.
     /// The verb that makes content-seeing hooks (`policy.send_prompt`) useful — a PII screen or
-    /// guardrail can stop a request before it leaves the network. `status` is already clamped to
-    /// 4xx and `message` sanitized by `wire::normalize` (the only producer): a hook can never mint a
+    /// guardrail can stop a request before it leaves the network. The shipped transports produce
+    /// this only via `wire::normalize` (status clamped to 4xx, message sanitized), and the forward
+    /// seam RE-CLAMPS the status regardless — so no policy impl, shipped or future, can mint a
     /// 5xx, a success, or a header-injecting message through this path.
     Reject { status: u16, message: String },
 }

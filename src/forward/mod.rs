@@ -2031,8 +2031,9 @@ enum PolicyOutcome {
     },
 }
 
-/// Chars of the request's system prompt: a bare string, or the sum of `{type:"text"}` block texts
-/// when the system value is a block array (Anthropic allows both). The SAME shapes
+/// Chars of the request's system prompt: a bare string, or — when the system value is a block
+/// array (Anthropic allows both) — the sum of every block's `text` string (keyed on the `text`
+/// field's presence, not on `type`). The SAME shapes
 /// `build_prompt_projection` flattens, so the SIZE signal and the opt-in content projection never
 /// diverge on a block-array system prompt. Cheap v1 SIZE signal (NOT a token count).
 fn system_text_chars(v: &Value) -> usize {
@@ -2104,7 +2105,8 @@ fn body_end_user(v: &Value) -> Option<String> {
 
 /// Flatten the ingress body's prompt content into the opt-in hook projection
 /// (`policy.send_prompt`). The same content shapes as the SIZE signals (`total_text_chars` /
-/// `system_text_chars`) — bare-string content and `{type:"text", text}` blocks — but collecting
+/// `system_text_chars`) — bare-string content and blocks carrying a `text` string (keyed on the
+/// `text` field's presence, not on `type`) — but collecting
 /// the text instead of counting the chars. (The flattened text joins blocks with a newline, so
 /// its length can exceed the `total_chars` SIZE signal by one char per block boundary — the
 /// signal counts text, not separators.) Non-text blocks (images, documents, tool results)
@@ -2205,8 +2207,8 @@ async fn decide_policy_order(
 
     // ONE governance key lookup serves both consumers: the per-key rate headroom (always, same
     // value across candidates today — rate limits are per-key; see `Candidate.rate_headroom`) and,
-    // behind `policy.send_user`, the caller identity projection. The key RECORD is looked up; the
-    // secret itself never flows past this line.
+    // behind `policy.send_user`, the caller identity projection. The secret is CONSUMED here by
+    // `lookup`; only the returned key RECORD flows forward — nothing downstream sees the token.
     let gov = app.governance.as_ref();
     let gov_key = match (gov, caller_token) {
         (Some(g), Some(tok)) => g.lookup(tok),
@@ -2365,10 +2367,16 @@ async fn decide_policy_order(
         // Abstain is the clean "no opinion" — today's exact SWRR (NOT coerced via on_error).
         RoutingDecision::Abstain => PolicyOutcome::Weighted,
         // The hook's reject verb: a deliberate first-class decision (a guardrail said no), NOT an
-        // error — `on_error` does not apply. `status`/`message` were clamped/sanitized at parse
-        // time by `wire::normalize`.
+        // error — `on_error` does not apply. The shipped transports produce Reject only through
+        // `wire::normalize` (clamped + sanitized), but the trait lets ANY policy impl construct
+        // the variant directly — so the seam re-clamps the status to 400..=499 (else 403) as
+        // defense in depth: no policy, present or future, can mint a success/redirect/5xx here.
         RoutingDecision::Reject { status, message } => PolicyOutcome::RejectRequest {
-            status,
+            status: if (400..=499).contains(&status) {
+                status
+            } else {
+                403
+            },
             message,
             name: policy.name(),
         },
@@ -10606,6 +10614,40 @@ mod hook_seam_tests {
         // The secret NEVER rides the projection, under any configuration.
         assert_ne!(key_id.as_deref(), Some(secret.as_str()));
         assert_ne!(key_name.as_deref(), Some(secret.as_str()));
+    }
+
+    /// DEFENSE IN DEPTH at the seam: the shipped transports clamp in `wire::normalize`, but a
+    /// policy impl can construct `RoutingDecision::Reject` directly — the mapping arm re-clamps,
+    /// so no policy can mint a 5xx/success through the reject path.
+    #[tokio::test]
+    async fn reject_status_reclamped_at_the_seam() {
+        let (out, _) = run(false, false, Some((500, "boom".to_string())), body()).await;
+        match out {
+            PolicyOutcome::RejectRequest { status, .. } => assert_eq!(status, 403),
+            other => panic!(
+                "expected RejectRequest, got a different outcome: {}",
+                outcome_kind(&other)
+            ),
+        }
+    }
+
+    /// A hook 408 reject rides the Anthropic writer as the `timeout` typed error — the remaining
+    /// mapped kind not covered by the 451/429 envelope tests.
+    #[tokio::test]
+    async fn reject_408_maps_to_anthropic_timeout_envelope() {
+        use http_body_util::BodyExt as _;
+        let resp = ingress_error(
+            "anthropic",
+            StatusCode::from_u16(408).unwrap(),
+            reject_kind_for_status(408),
+            "guardrail: request deadline",
+        );
+        assert_eq!(resp.status().as_u16(), 408);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        // The Anthropic writer's typed literal for KIND_TIMEOUT.
+        assert_eq!(v["error"]["type"], "timeout_error");
+        assert_eq!(v["error"]["message"], "guardrail: request deadline");
     }
 
     /// The reject status → dialect error KIND mapping: an SDK caller must catch the right typed
