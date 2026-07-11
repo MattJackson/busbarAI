@@ -108,43 +108,35 @@ Each signal is normalized against the pool, so "how cheap" means cheapest-in-thi
     </marker>
   </defs>
   <rect x="0" y="0" width="940" height="250" fill="#ffffff"/>
-  <!-- the hook boundary: everything inside is YOUR binary, one decision, ~8 us -->
   <rect x="188" y="52" width="546" height="160" rx="14" fill="none" stroke="#a3e635" stroke-width="2" stroke-dasharray="7 6"/>
   <text x="461" y="80" text-anchor="middle" fill="#4d7c0f" font-size="12.5" font-weight="700" letter-spacing="0.04em">YOUR HOOK · ONE DECISION · ABOUT 8 µS</text>
-  <!-- arrows -->
   <g stroke="#94a3b8" stroke-width="2" marker-end="url(#sr-arw)">
     <line x1="158" y1="140" x2="200" y2="140"/>
     <line x1="352" y1="140" x2="380" y2="140"/>
     <line x1="524" y1="140" x2="552" y2="140"/>
     <line x1="722" y1="140" x2="764" y2="140"/>
   </g>
-  <!-- stages -->
   <g>
     <rect x="18" y="106" width="140" height="68" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
     <text x="88" y="136" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Request</text>
-    <text x="88" y="154" text-anchor="middle" fill="#64748b" font-size="10.5">"model": "my-smart-model"</text>
-
+    <text x="88" y="154" text-anchor="middle" fill="#64748b" font-size="10">"model": "my-smart-model"</text>
     <rect x="204" y="106" width="148" height="68" rx="10" fill="#f7fee7" stroke="#a3e635" stroke-width="2"/>
     <text x="278" y="130" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Classify</text>
     <text x="278" y="147" text-anchor="middle" fill="#4d7c0f" font-size="10.5">shape only, no content</text>
     <text x="278" y="161" text-anchor="middle" fill="#4d7c0f" font-size="10.5">tools? size? streaming?</text>
-
     <rect x="384" y="106" width="136" height="68" rx="10" fill="#f7fee7" stroke="#a3e635" stroke-width="2"/>
     <text x="452" y="130" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Favorite</text>
     <text x="452" y="147" text-anchor="middle" fill="#4d7c0f" font-size="10.5">the plan: agent work</text>
     <text x="452" y="161" text-anchor="middle" fill="#4d7c0f" font-size="10.5">wants "fable"</text>
-
     <rect x="556" y="106" width="162" height="68" rx="10" fill="#f7fee7" stroke="#a3e635" stroke-width="2"/>
     <text x="637" y="130" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Reality check</text>
     <text x="637" y="147" text-anchor="middle" fill="#4d7c0f" font-size="10.5">score EVERY lane live:</text>
     <text x="637" y="161" text-anchor="middle" fill="#4d7c0f" font-size="10.5">price · speed · free slots</text>
-
     <rect x="768" y="106" width="154" height="68" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
     <text x="845" y="130" text-anchor="middle" fill="#0f172a" font-size="14" font-weight="700">Dispatch</text>
     <text x="845" y="147" text-anchor="middle" fill="#64748b" font-size="10.5">busbar walks the order,</text>
     <text x="845" y="161" text-anchor="middle" fill="#64748b" font-size="10.5">failover + breaker intact</text>
   </g>
-  <!-- the fail-safe note under the hook boundary -->
   <text x="461" y="236" text-anchor="middle" fill="#64748b" font-size="11">hook slow, wrong, or dead? Busbar falls back to its default after 1 ms and the request proceeds anyway</text>
 </svg>
 
