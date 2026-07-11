@@ -12,8 +12,10 @@
 //! - [`OperationHandler`] — ONE per (protocol × operation). A pure codec: wire ↔ IR, both
 //!   directions, plus the operation-capability surface the engine reads. It never routes, fails
 //!   over, checks auth, bills, or knows another protocol exists.
-//! - [`OpDispatch`] — the thin `(operation, OperationHandler)` handle the streaming engine threads; no behavior
-//!   of its own. [`request_handler`] is the registry the catch-all dispatch resolves through.
+//! - [`OpDispatch`] — the thin `(operation, OperationHandler)` handle the streaming engine threads.
+//!   It mostly delegates to the `RequestHandler` vtable; its one bit of logic is honoring a per-lane
+//!   `path` override in `upstream_path` before falling back to the protocol default.
+//!   [`request_handler`] is the registry the catch-all dispatch resolves through.
 //!
 //! Adding a protocol: a Router ID line, a `RequestHandler` impl here, its OperationHandlers. Adding an
 //! operation: an OperationHandler + a line in each `RequestHandler` that speaks it. Nothing else moves.

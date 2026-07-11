@@ -321,6 +321,15 @@ impl OperationHandler for GeminiSpeech {
                     channels: 1,
                     bit_depth: 16,
                 });
+                // Validate the backend's base64 at this trust boundary: a corrupt payload must fail
+                // loud here (CodecError) rather than reach the egress writer, where a decode failure
+                // would silently become an empty 200 audio body. This is the response-side twin of
+                // the ingress inline_data validation.
+                if crate::media::base64_decode(data).is_none() {
+                    return Err(CodecError::Malformed(
+                        "gemini speech inlineData.data is not valid base64".into(),
+                    ));
+                }
                 return Ok(IrResp::Speech(SpeechResp {
                     audio: Some(MediaBlob {
                         payload: MediaPayload::B64(data.to_string()),
@@ -400,9 +409,18 @@ impl OperationHandler for GeminiImage {
         let IrReq::Image(r) = ir else {
             return Bytes::new();
         };
+        let mut params = json!({ "sampleCount": r.n.unwrap_or(1) });
+        // Carry the Imagen generation controls the reader captures; dropping them fell back to
+        // Imagen's defaults (1:1 aspect, default person-generation policy) instead of the request.
+        if let Some(a) = &r.aspect_ratio {
+            params["aspectRatio"] = json!(a);
+        }
+        if let Some(p) = &r.person_generation {
+            params["personGeneration"] = json!(p);
+        }
         let body = json!({
             "instances": [{ "prompt": r.prompt.clone().unwrap_or_default() }],
-            "parameters": { "sampleCount": r.n.unwrap_or(1) },
+            "parameters": params,
         });
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
@@ -519,7 +537,19 @@ impl OperationHandler for GeminiEmbeddings {
             }
             _ => String::new(),
         };
-        let body = json!({ "content": { "parts": [{ "text": text }] } });
+        // Carry the retrieval/shape controls the reader captures — Gemini `:embedContent` supports
+        // them natively. Dropping `outputDimensionality` returned full-width vectors instead of the
+        // requested size (a wrong-length response); `taskType`/`title` steer retrieval quality.
+        let mut body = json!({ "content": { "parts": [{ "text": text }] } });
+        if let Some(d) = r.dimensions {
+            body["outputDimensionality"] = json!(d);
+        }
+        if let Some(t) = &r.task_type {
+            body["taskType"] = json!(t);
+        }
+        if let Some(t) = &r.title {
+            body["title"] = json!(t);
+        }
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
     fn read_response(&self, wire: &[u8]) -> Result<IrResp, CodecError> {
@@ -744,5 +774,113 @@ mod tests {
         };
         assert_eq!(r.prompt.as_deref(), Some("roundtrip fox"));
         assert_eq!(r.n, Some(2));
+    }
+
+    #[test]
+    fn embeddings_write_request_carries_dimensions_task_type_and_title() {
+        // Gemini `:embedContent` supports these natively; dropping `outputDimensionality` returned
+        // full-width vectors, and taskType/title steer retrieval quality.
+        let ir = IrReq::Embeddings(crate::ir::embeddings::EmbeddingsReq {
+            input: EmbInput::Text(vec!["hi".into()]),
+            dimensions: Some(256),
+            task_type: Some("RETRIEVAL_DOCUMENT".into()),
+            title: Some("doc".into()),
+            ..Default::default()
+        });
+        let out = EMB.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["outputDimensionality"], 256);
+        assert_eq!(v["taskType"], "RETRIEVAL_DOCUMENT");
+        assert_eq!(v["title"], "doc");
+    }
+
+    #[test]
+    fn image_write_request_carries_aspect_ratio_and_person_generation() {
+        // Imagen generation controls must ride under `parameters`; dropping them fell back to
+        // Imagen's defaults (1:1 aspect, default person-generation policy).
+        let ir = IrReq::Image(crate::ir::image::ImageReq {
+            prompt: Some("a fox".into()),
+            aspect_ratio: Some("16:9".into()),
+            person_generation: Some("allow_adult".into()),
+            ..Default::default()
+        });
+        let out = IMG.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["parameters"]["aspectRatio"], "16:9");
+        assert_eq!(v["parameters"]["personGeneration"], "allow_adult");
+    }
+
+    #[test]
+    fn speech_read_response_invalid_base64_is_malformed() {
+        // A corrupt inline base64 audio payload must fail LOUD (CodecError) at this trust boundary
+        // rather than reach the egress writer, where a decode failure would silently become an
+        // empty 200 audio body.
+        let body = br#"{"candidates":[{"content":{"parts":[{"inlineData":{"data":"!!!not-base64!!!","mimeType":"audio/L16;codec=pcm;rate=24000"}}]}}]}"#;
+        let res = SPEECH.read_response(body);
+        assert!(matches!(res, Err(CodecError::Malformed(_))));
+    }
+
+    #[test]
+    fn speech_read_response_valid_base64_returns_audio_blob() {
+        // The valid-base64 case returns Ok with the audio blob carried as a B64 payload.
+        let data = base64_encode(b"pretend-pcm-audio");
+        let body = serde_json::to_vec(&json!({
+            "candidates": [{ "content": { "parts": [{ "inlineData": {
+                "data": data, "mimeType": "audio/L16;codec=pcm;rate=24000",
+            } }] } }],
+        }))
+        .unwrap();
+        let ir = SPEECH
+            .read_response(&body)
+            .expect("valid base64 must decode");
+        let IrResp::Speech(r) = ir else {
+            panic!("expected speech IR");
+        };
+        let blob = r.audio.expect("audio blob present");
+        match blob.payload {
+            MediaPayload::B64(s) => assert_eq!(s, base64_encode(b"pretend-pcm-audio")),
+            _ => panic!("expected B64 payload"),
+        }
+    }
+
+    #[test]
+    fn speech_read_request_captures_prompt_text() {
+        // A generateContent TTS body → IR Speech carrying the joined parts[].text as `input`.
+        let body = serde_json::to_vec(&json!({
+            "contents": [{ "parts": [{ "text": "hello" }] }],
+            "generationConfig": { "responseModalities": ["AUDIO"] },
+        }))
+        .unwrap();
+        let ir = SPEECH
+            .read_request(&body, "application/json")
+            .expect("valid speech body");
+        let IrReq::Speech(r) = ir else {
+            panic!("expected speech IR");
+        };
+        assert_eq!(r.input, "hello");
+    }
+
+    #[test]
+    fn speech_write_request_prefixes_instructions_to_prompt_not_language_code() {
+        // OpenAI-style free-text `instructions` steer Gemini TTS through the PROMPT, not the BCP-47
+        // `speechConfig.languageCode` (the old, request-corrupting behavior). Assert the prefix lands
+        // in parts[0].text as "<instr>: <input>" and no languageCode key is emitted.
+        let ir = IrReq::Speech(crate::ir::audio::SpeechReq {
+            input: "hello".into(),
+            voice: "Kore".into(),
+            instructions: Some("speak cheerfully".into()),
+            ..Default::default()
+        });
+        let out = SPEECH.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let text = v
+            .pointer("/contents/0/parts/0/text")
+            .and_then(Value::as_str)
+            .expect("prompt text present");
+        assert_eq!(text, "speak cheerfully: hello");
+        assert!(
+            !serde_json::to_string(&v).unwrap().contains("languageCode"),
+            "instructions must not corrupt speechConfig.languageCode: {v}"
+        );
     }
 }

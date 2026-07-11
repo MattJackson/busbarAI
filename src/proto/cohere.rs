@@ -217,10 +217,11 @@ fn read_cohere_stop_reason(token: &str) -> crate::ir::IrStopReason {
     }
 }
 
-/// Map a canonical IR stop reason to a valid Cohere v2 `finish_reason`. The Cohere reader
-/// lowercases the native tokens it does not fold into the canonical set (`ERROR`→`error`,
-/// `ERROR_LIMIT`→`error_limit`, `USER_CANCEL`→`user_cancel`), so re-upper-casing round-trips a
-/// Cohere→Cohere stop cleanly. A foreign token from another protocol (e.g. `refusal` from the
+/// Map a canonical IR stop reason to a valid Cohere v2 `finish_reason`. `ERROR` IS folded into the
+/// canonical set (reader `ERROR`→`S::Error`, writer `S::Error`→`ERROR`), so it round-trips as a
+/// first-class mapping. The reader lowercases only the native tokens it does NOT model
+/// (`ERROR_LIMIT`→`error_limit`, `USER_CANCEL`→`user_cancel`); those reach the writer as `S::Other`
+/// and degrade to `COMPLETE` below (a strict client rejects an unmodeled token). A foreign token from another protocol (e.g. `refusal` from the
 /// Responses reader) upper-cases to `REFUSAL`, which is NOT a member of Cohere's `finish_reason`
 /// enum and a strict client rejects; such reasons degrade to the SDK-safe terminal `COMPLETE`.
 /// EXHAUSTIVE: a reason with no Cohere analog (`refusal`, `pause_turn`, `other`) also falls back to

@@ -4269,10 +4269,43 @@ async fn forward_once(
                 // whose ingress protocol fails `protocol_for`) falls through to the ingress-native
                 // 500 below with NO completion delivered, so charging before translation is proven
                 // would bill the key for a body the client never receives.
-                if let Ok(rv) = crate::json::parse::<Value>(&bytes) {
-                    let egress_op = crate::handlers::request_handler(app.lanes[i].protocol.name())
-                        .and_then(|rh| rh.operation_handler(op.operation));
-                    let decoded = egress_op.map(|h| h.read_response_value(&rv));
+                let egress_op = crate::handlers::request_handler(app.lanes[i].protocol.name())
+                    .and_then(|rh| rh.operation_handler(op.operation));
+                // Parse the body ONCE, then branch on JSON vs opaque (binary) — mirrors the main
+                // forward path. Without the binary arm, a cross-protocol speech/transcription response
+                // (raw audio bytes) failed the JSON parse and fell straight through to the generic 500
+                // below, so every binary-body cross-protocol op on a fallback/least-bad lane 500'd
+                // even though the main path serves it correctly.
+                let body_json = crate::json::parse::<Value>(&bytes);
+                if body_json.is_err() {
+                    let decoded = egress_op.map(|h| h.read_response(&bytes));
+                    if let Some(Err(ref e)) = decoded {
+                        tracing::warn!(
+                            ingress = %ingress_protocol,
+                            egress = %egress_name,
+                            error = ?e,
+                            "cross-protocol binary response failed the egress codec (read_response, degraded path); returning ingress-native 500",
+                        );
+                    }
+                    if let Some(Ok(mut ir)) = decoded {
+                        record_resp_usage(&ir, &usage_sink);
+                        ir.prepare_for_ingress(ingress_protocol, now());
+                        if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
+                            .and_then(|rh| rh.operation_handler(op.operation))
+                            .map(|h| h.write_response(&ir))
+                        {
+                            let rb = Response::builder()
+                                .status(status)
+                                .header(CONTENT_TYPE, wire.content_type);
+                            let rb = maybe_attach_response_request_id(rb, ingress_protocol, None);
+                            return Ok(rb
+                                .body(Body::from(wire.bytes))
+                                .unwrap_or_else(|_| status.into_response()));
+                        }
+                    }
+                }
+                if let Ok(rv) = &body_json {
+                    let decoded = egress_op.map(|h| h.read_response_value(rv));
                     if let Some(Err(ref e)) = decoded {
                         // Degraded/fallback path: same swallowed-CodecError gap as the main forward
                         // path — log the codec error before the generic 500 so repeated failures on a

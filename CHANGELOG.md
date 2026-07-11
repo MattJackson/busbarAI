@@ -62,6 +62,25 @@ ships with the test that catches it.
 - **Cross-protocol codec errors are now logged.** A response body the egress codec could not decode
   fell through to a generic 500 with no diagnostic; the underlying error is now logged. The buffered
   cross-protocol path also no longer parses the response body twice.
+- **Cross-protocol egress dropped request fields.** Several egress writers emitted fewer fields than
+  their readers captured, silently changing behavior on a cross-protocol hop: embeddings
+  `dimensions`/`task_type`/`title` (Gemini), image `quality`/`style`/`response_format`/`user`/`size:
+  auto` (OpenAI), speech `instructions`/`speed` (OpenAI), image `aspect_ratio`/`person_generation`
+  (Gemini). All are now carried, matching the round-3 transcription fix.
+- **Binary responses on the degraded path.** A cross-protocol speech or transcription response
+  (raw audio bytes) on a fallback or least-bad lane returned a spurious 500 because the degraded
+  forwarding path handled only JSON bodies; it now has the same binary-response arm as the main path.
+- **Silent-empty audio at egress.** The two OpenAI audio egress writers decoded base64 with a fallback
+  that turned a corrupt payload into empty audio. Every reader that stores base64 audio now validates
+  it at its trust boundary (a corrupt Gemini speech response fails loud), and the egress decode logs
+  loudly on the now-unreachable failure instead of silently emptying.
+- **Anthropic forced tool_choice + thinking.** A request that both forced/targeted a tool and
+  requested reasoning emitted `tool_choice:{type:any|tool}` alongside `thinking`, which Anthropic
+  rejects with a 400. The tool_choice is now downgraded to `auto` (with a warning) when thinking is
+  emitted, matching the existing temperature/top_p/top_k handling.
+- **Multipart heap amplification.** A short (one-character) multipart boundary against a crafted body
+  could allocate a large offset table. The parser now walks segments in a single pass with no
+  per-offset allocation, bounding memory by the parsed fields regardless of boundary length.
 
 ### Changed
 

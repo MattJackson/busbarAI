@@ -125,6 +125,20 @@ fn sanitize_mime_type(raw: &str) -> String {
     }
 }
 
+/// Decode a `MediaPayload::B64` audio blob for egress. Every reader that stores a `B64` payload now
+/// validates the base64 at its trust boundary (gemini inline_data ingress + gemini speech response),
+/// so an invalid string here is an IR-invariant violation, not normal input. Decode defensively:
+/// on the should-be-unreachable failure, log loudly rather than silently substitute empty audio.
+fn decode_ir_b64(s: &str) -> Bytes {
+    base64_decode(s).unwrap_or_else(|| {
+        tracing::error!(
+            "B64 audio payload in the IR failed to decode at egress — a reader's base64 \
+             validation invariant was violated; emitting empty audio"
+        );
+        Bytes::new()
+    })
+}
+
 /// Minimal byte-level `multipart/form-data` parser: enough for the OpenAI audio form (a `model` text
 /// part + a binary `file` part). Boundary comes from the content-type; file bytes are preserved raw
 /// (never lossily UTF-8'd) so audio survives the ingress→IR hop.
@@ -137,54 +151,60 @@ fn parse_multipart<'a>(body: &'a [u8], content_type: &str) -> Vec<MultipartField
     // delimiter and silently drops every part). Cut at the first `;`, then trim and unquote.
     let boundary = boundary.split(';').next().unwrap_or(boundary);
     let boundary = boundary.trim().trim_matches('"');
-    // An empty (or absent) boundary yields delim `--`, whose 2-byte scan can push ~body/2 offsets
-    // into `positions` (heap amplification from a crafted Content-Type). A real boundary is >=1 char;
-    // reject anything shorter than that rather than scan.
+    // A real boundary is >=1 char; an empty (or absent) one is malformed. Reject it up front rather
+    // than scan for the degenerate `--` delimiter. (Amplification is separately bounded by the
+    // single-pass segment walk below, which stores no per-offset Vec.)
     if boundary.is_empty() {
         return Vec::new();
     }
     let delim = format!("--{boundary}");
     let delim_b = delim.as_bytes();
-    // Collect every delimiter offset, then walk the segments between consecutive delimiters.
-    let mut positions = Vec::new();
+    // Single pass, tracking ONLY the previous delimiter offset — a short boundary against a body of
+    // pure delimiter bytes used to push ~body/dl offsets into a `positions` Vec (heap amplification,
+    // e.g. ~90 MB from a 32 MiB body with a 1-char boundary). Processing each segment as its closing
+    // delimiter is found keeps memory bounded by the parsed fields, whatever the boundary length.
+    let mut fields = Vec::new();
     let (n, dl) = (body.len(), delim_b.len());
     let mut i = 0;
+    let mut prev: Option<usize> = None;
     while i + dl <= n {
         if &body[i..i + dl] == delim_b {
-            positions.push(i);
+            if let Some(p) = prev {
+                if let Some(field) = parse_multipart_segment(&body[p + dl..i]) {
+                    fields.push(field);
+                }
+            }
+            prev = Some(i);
             i += dl;
         } else {
             i += 1;
         }
     }
-    let mut fields = Vec::new();
-    for w in positions.windows(2) {
-        let seg = &body[w[0] + dl..w[1]];
-        let seg = seg.strip_prefix(b"\r\n").unwrap_or(seg);
-        let Some(hpos) = find_sub(seg, b"\r\n\r\n") else {
-            continue;
-        };
-        let headers = String::from_utf8_lossy(&seg[..hpos]);
-        let mut value = &seg[hpos + 4..];
-        if value.ends_with(b"\r\n") {
-            value = &value[..value.len() - 2];
-        }
-        let Some(name) = header_attr(&headers, "name") else {
-            continue;
-        };
-        let content_type = headers.lines().find_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("Content-Type:")
-                .or_else(|| l.strip_prefix("content-type:"))
-                .map(|v| v.trim().to_string())
-        });
-        fields.push(MultipartField {
-            name,
-            content_type,
-            value,
-        });
-    }
     fields
+}
+
+/// Parse ONE multipart segment (the bytes between two delimiters) into a field, or `None` if it has
+/// no `\r\n\r\n` header terminator or no `name` attribute. `value` borrows from `seg` (the body).
+fn parse_multipart_segment(seg: &[u8]) -> Option<MultipartField<'_>> {
+    let seg = seg.strip_prefix(b"\r\n").unwrap_or(seg);
+    let hpos = find_sub(seg, b"\r\n\r\n")?;
+    let headers = String::from_utf8_lossy(&seg[..hpos]);
+    let mut value = &seg[hpos + 4..];
+    if value.ends_with(b"\r\n") {
+        value = &value[..value.len() - 2];
+    }
+    let name = header_attr(&headers, "name")?;
+    let content_type = headers.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("Content-Type:")
+            .or_else(|| l.strip_prefix("content-type:"))
+            .map(|v| v.trim().to_string())
+    });
+    Some(MultipartField {
+        name,
+        content_type,
+        value,
+    })
 }
 
 /// Transcription (STT): multipart audio IN → `{text}` OUT.
@@ -262,7 +282,7 @@ impl OperationHandler for OpenAiTranscription {
         if let Some(blob) = &r.audio {
             let bytes = match &blob.payload {
                 MediaPayload::Bytes(b) => b.clone(),
-                MediaPayload::B64(s) => base64_decode(s).unwrap_or_default(),
+                MediaPayload::B64(s) => decode_ir_b64(s),
                 MediaPayload::Uri(_) => Bytes::new(),
             };
             // Sanitize at the EGRESS boundary too: mime_type can enter the IR from ANY ingress
@@ -360,6 +380,7 @@ impl OperationHandler for OpenAiSpeech {
                 .get("instructions")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            speed: wire.get("speed").and_then(Value::as_f64).map(|s| s as f32),
             ..Default::default()
         }))
     }
@@ -370,6 +391,14 @@ impl OperationHandler for OpenAiSpeech {
         let mut body = json!({ "model": r.model, "input": r.input, "voice": r.voice });
         if let Some(f) = &r.response_format {
             body["response_format"] = json!(f);
+        }
+        // Carry the caller's style + playback controls (gpt-4o-mini-tts `instructions`, `speed`);
+        // dropping them made the synthesized audio ignore the request on a cross-protocol hop.
+        if let Some(instr) = &r.instructions {
+            body["instructions"] = json!(instr);
+        }
+        if let Some(speed) = r.speed {
+            body["speed"] = json!(speed);
         }
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
@@ -630,8 +659,26 @@ impl OperationHandler for OpenAiImage {
         if let Some(n) = r.n {
             body["n"] = json!(n);
         }
-        if let Some(ImageSize::Wh { width, height }) = r.size {
-            body["size"] = json!(format!("{width}x{height}"));
+        match r.size {
+            Some(ImageSize::Wh { width, height }) => {
+                body["size"] = json!(format!("{width}x{height}"));
+            }
+            Some(ImageSize::Auto) => body["size"] = json!("auto"),
+            None => {}
+        }
+        // Carry the generation controls the reader captures; dropping them silently downgraded the
+        // request (e.g. a `b64_json` ask fell back to the default URL response, `hd` to standard).
+        if let Some(q) = &r.quality {
+            body["quality"] = json!(q);
+        }
+        if let Some(s) = &r.style {
+            body["style"] = json!(s);
+        }
+        if let Some(f) = &r.response_format {
+            body["response_format"] = json!(f);
+        }
+        if let Some(u) = &r.user {
+            body["user"] = json!(u);
         }
         Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
     }
@@ -1138,5 +1185,79 @@ mod tests {
         assert!(OpenAiEmbeddings
             .read_request(br#"{"model":"m","input":["a","b"]}"#, "application/json")
             .is_ok());
+    }
+
+    #[test]
+    fn speech_write_request_carries_instructions_and_speed() {
+        // gpt-4o-mini-tts style `instructions` and playback `speed` must survive to OpenAI egress;
+        // dropping them made the synthesized audio ignore the request on a cross-protocol hop.
+        let ir = IrReq::Speech(crate::ir::audio::SpeechReq {
+            input: "hello world".into(),
+            model: "gpt-4o-mini-tts".into(),
+            voice: "alloy".into(),
+            instructions: Some("speak cheerfully".into()),
+            speed: Some(1.25),
+            ..Default::default()
+        });
+        let out = OpenAiSpeech.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["instructions"], "speak cheerfully");
+        assert_eq!(v["speed"], 1.25);
+    }
+
+    #[test]
+    fn speech_read_write_roundtrip_preserves_speed() {
+        // A wire body carrying `speed` must read into the IR and re-emit on egress (not be dropped).
+        let body = br#"{"model":"tts-1","input":"hi","voice":"alloy","speed":0.75}"#;
+        let ir = OpenAiSpeech
+            .read_request(body, "application/json")
+            .expect("valid speech body");
+        let IrReq::Speech(ref r) = ir else {
+            panic!("expected speech IR");
+        };
+        assert_eq!(r.speed, Some(0.75));
+        let out = OpenAiSpeech.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["speed"], 0.75);
+    }
+
+    #[test]
+    fn image_write_request_carries_quality_style_response_format_user_and_auto_size() {
+        // The generation controls the reader captures must survive to egress; dropping them silently
+        // downgraded the request (e.g. a `b64_json` ask fell back to URL, `hd` to standard).
+        let ir = IrReq::Image(crate::ir::image::ImageReq {
+            op: ImageOp::Generate,
+            model: "gpt-image-1".into(),
+            prompt: Some("a fox".into()),
+            response_format: Some("b64_json".into()),
+            quality: Some("hd".into()),
+            style: Some("vivid".into()),
+            size: Some(ImageSize::Auto),
+            user: Some("user-42".into()),
+            ..Default::default()
+        });
+        let out = OpenAiImage.write_request(&ir);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["quality"], "hd");
+        assert_eq!(v["style"], "vivid");
+        assert_eq!(v["response_format"], "b64_json");
+        assert_eq!(v["user"], "user-42");
+        assert_eq!(v["size"], "auto");
+    }
+
+    #[test]
+    fn multipart_single_char_boundary_parses_correctly() {
+        // The single-pass parse_multipart rewrite must still handle a 1-character boundary
+        // (`boundary=a`): both the `model` and `file` parts must be extracted, proving the rewrite
+        // didn't break short boundaries (the case that previously drove the heap-amplification Vec).
+        let body = multipart_body("a");
+        let ir = OpenAiTranscription
+            .read_request(&body, "multipart/form-data; boundary=a")
+            .expect("well-formed body with 1-char boundary must parse");
+        let IrReq::Transcription(r) = ir else {
+            panic!("expected transcription IR")
+        };
+        assert_eq!(r.model, "whisper-1");
+        assert!(r.audio.is_some());
     }
 }

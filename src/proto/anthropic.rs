@@ -2071,6 +2071,25 @@ impl ProtocolWriter for AnthropicWriter {
                 );
             }
         }
+        if thinking_emitted {
+            // Anthropic rejects a FORCED/TARGETED tool_choice (`{type:"any"}` / `{type:"tool"}`)
+            // alongside extended thinking with a 400 — only `auto`/`none` are allowed. tool_choice
+            // was already written above (before the thinking decision), so downgrade a now-illegal
+            // `any`/`tool` to `auto` here, preserving any `disable_parallel_tool_use`, with a warn —
+            // same "think-ask wins, observably" rule applied to temperature/top_p/top_k below.
+            if let Some(tc) = out.get_mut("tool_choice").and_then(|v| v.as_object_mut()) {
+                let ty = tc.get("type").and_then(|t| t.as_str());
+                if ty == Some("any") || ty == Some("tool") {
+                    tracing::warn!(
+                        tool_choice = ?ty,
+                        "downgrading forced/targeted tool_choice to 'auto' on Anthropic egress: \
+                         not compatible with thinking"
+                    );
+                    tc.insert("type".to_string(), serde_json::json!("auto"));
+                    tc.remove("name"); // `name` is only valid on `{type:"tool"}`
+                }
+            }
+        }
         if thinking_emitted && req.temperature.is_some_and(|t| t != 1.0) {
             // Anthropic 400s on temperature != 1 with thinking enabled; the think-ask wins and the
             // sampling knob is omitted, observably.
@@ -5425,6 +5444,96 @@ mod anthropic_hardening_tests {
         // Sanity: the modeled fields it DOES support are still present, so the omission is targeted.
         assert_eq!(obj.get("max_tokens"), Some(&serde_json::json!(16)));
         assert!(obj.contains_key("messages"));
+    }
+
+    /// Anthropic 400s on a FORCED/TARGETED `tool_choice` (`{type:"any"}`/`{type:"tool"}`) alongside
+    /// extended `thinking` — only `auto`/`none` are legal. The writer must downgrade a now-illegal
+    /// forced directive to `{type:"auto"}` (dropping any `name`) WHEN thinking is emitted, and
+    /// PRESERVE it verbatim when thinking is NOT emitted.
+    #[test]
+    fn write_request_downgrades_forced_tool_choice_to_auto_when_thinking_emitted() {
+        let mk = |reasoning: Option<crate::ir::IrReasoningAsk>,
+                  tc: crate::ir::IrToolChoice|
+         -> crate::ir::IrRequest {
+            crate::ir::IrRequest {
+                messages: vec![crate::ir::IrMessage {
+                    role: crate::ir::IrRole::User,
+                    content: vec![crate::ir::IrBlock::Text {
+                        text: "hi".to_string(),
+                        cache_control: None,
+                        citations: Vec::new(),
+                    }],
+                }],
+                tools: vec![crate::ir::IrTool {
+                    name: "get_weather".to_string(),
+                    description: Some("look up weather".to_string()),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    cache_control: None,
+                }],
+                tool_choice: Some(tc),
+                reasoning,
+                // Large enough that the clamped thinking budget clears the 1024 minimum under
+                // max_tokens, so `thinking` is actually emitted.
+                max_tokens: Some(8192),
+                ..Default::default()
+            }
+        };
+
+        // WITH a thinking ask: the forced `any` (IrToolChoice::Required) downgrades to `auto`, and
+        // `thinking` is present on the egress.
+        let req = mk(
+            Some(crate::ir::IrReasoningAsk::Effort(
+                crate::ir::IrReasoningEffort::Low,
+            )),
+            crate::ir::IrToolChoice::Required,
+        );
+        let out = AnthropicWriter.write_request(&req);
+        assert!(
+            out.get("thinking").is_some(),
+            "thinking must be emitted: {out}"
+        );
+        assert_eq!(
+            out.pointer("/tool_choice/type").and_then(|v| v.as_str()),
+            Some("auto"),
+            "forced tool_choice must downgrade to auto with thinking: {out}"
+        );
+
+        // A TARGETED `tool` choice likewise downgrades, dropping the now-invalid `name`.
+        let req_tool = mk(
+            Some(crate::ir::IrReasoningAsk::Effort(
+                crate::ir::IrReasoningEffort::Low,
+            )),
+            crate::ir::IrToolChoice::Tool {
+                name: "get_weather".to_string(),
+            },
+        );
+        let out_tool = AnthropicWriter.write_request(&req_tool);
+        assert_eq!(
+            out_tool
+                .pointer("/tool_choice/type")
+                .and_then(|v| v.as_str()),
+            Some("auto"),
+            "targeted tool_choice must downgrade to auto with thinking: {out_tool}"
+        );
+        assert!(
+            out_tool.pointer("/tool_choice/name").is_none(),
+            "downgraded tool_choice must drop `name`: {out_tool}"
+        );
+
+        // WITHOUT a thinking ask: the forced `any` is preserved verbatim (no spurious downgrade).
+        let req_no_think = mk(None, crate::ir::IrToolChoice::Required);
+        let out_no_think = AnthropicWriter.write_request(&req_no_think);
+        assert!(
+            out_no_think.get("thinking").is_none(),
+            "no thinking must be emitted without a reasoning ask: {out_no_think}"
+        );
+        assert_eq!(
+            out_no_think
+                .pointer("/tool_choice/type")
+                .and_then(|v| v.as_str()),
+            Some("any"),
+            "forced tool_choice must be preserved without thinking: {out_no_think}"
+        );
     }
 
     /// response_format (M1): a cross-protocol IR carrying `response_format` reaching the Anthropic
