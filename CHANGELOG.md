@@ -9,6 +9,45 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
+## [Unreleased]
+
+A hardening and bug-fix release. No new features; a 10-phase multi-model audit of the 1.2.0
+change set plus deeper acceptance-harness coverage surfaced and fixed the issues below. Every fix
+ships with the test that catches it.
+
+### Fixed
+
+- **Token-count overflow on the new operations.** The embeddings/transcription egress writers
+  summed `input + output` token counts with an unchecked `+` on upstream-controlled values (a
+  panic in debug, a wrap to 0 in release). Now saturating, matching the billing invariant.
+- **Multipart MIME-type header injection.** A transcription client's file-part `Content-Type`
+  was written verbatim into Busbar's outgoing multipart header on a cross-protocol hop, so a
+  CR/LF in it could inject upstream request headers. The value is now sanitized at ingress.
+- **Anthropic thinking + `top_p`.** A cross-protocol reasoning request that also carried `top_p`
+  emitted it alongside `thinking`, which Anthropic rejects with a 400. `top_p` is now omitted
+  (with a warning) when thinking is emitted, matching the existing temperature/top_k handling.
+- **Gemini streaming block-index collision.** A Gemini stream carrying both thinking and
+  logprobs/citations could open a text block at the index the thinking block already owned,
+  corrupting cross-protocol block mapping. Both stream arms now offset past the thinking slot.
+- **Gemini reasoning returned nothing.** A cross-protocol reasoning ask requested a thinking
+  budget but not the thoughts, so a real Gemini backend returned no thinking content. Busbar now
+  sets `includeThoughts` on the cross-protocol path (a native Gemini request is preserved exactly).
+- **`reasoning_effort: "minimal"` on OpenAI egress.** `"minimal"` is not accepted by the o-series
+  reasoning models; a small cross-protocol budget now maps to the universally-valid `"low"`.
+- **Out-of-range request counts.** Client-supplied counts (`top_n`, image `n`, `numberOfImages`,
+  `dimensions`, ...) used unchecked `u64`->`u32` narrowing; an out-of-range value is now omitted
+  rather than silently wrapping.
+- **Embeddings `encoding_format` was dropped** on OpenAI egress, so a base64 request came back as
+  float. It is now honored.
+
+### Changed
+
+- The acceptance harness gained boot-refusal and TLS/mTLS pre-flights (the real binary must reject
+  bad configs and enforce mutual TLS), streaming logprobs/thinking coverage, a passthrough-auth
+  instance, the full admin key lifecycle with exact-billing assertions, and reliability sentinels
+  for mid-stream death, context-length failover, honored Retry-After, and hop-budget exhaustion.
+  Every row now documents what it proves.
+
 ## [1.2.0], 2026-07-10
 
 Busbar now speaks more than chat. Five new operations land on top of chat:
