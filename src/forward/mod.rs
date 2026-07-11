@@ -10668,6 +10668,81 @@ mod hook_seam_tests {
         assert_eq!(v["error"]["message"], "guardrail: request deadline");
     }
 
+    /// The FULL forward path: a request into a pool whose policy REJECTS comes back as the
+    /// dialect-native 4xx — hook status preserved, mapped error kind, sanitized message — with no
+    /// upstream dispatched (the lane's base_url is unroutable; reaching it would not yield a 451).
+    /// Closes the seam→response gap: everything from `forward_with_pool` through the
+    /// `RejectRequest` arm and `ingress_error` runs for real.
+    #[tokio::test]
+    async fn reject_rides_the_full_forward_path() {
+        use http_body_util::BodyExt as _;
+        let seen = Arc::new(StdMutex::new(None));
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://unused.invalid",
+            ))
+            .pool("pa", &[(0, 1)])
+            .pool_runtime(
+                "pa",
+                crate::state::PoolRuntime {
+                    members: Default::default(),
+                    failover: None,
+                    affinity: None,
+                    breaker: None,
+                    policy: Some(ResolvedPolicy::Policy {
+                        policy: Arc::new(CapturingPolicy {
+                            seen: seen.clone(),
+                            reject: Some((451, "PII detected".to_string())),
+                        }),
+                        on_error: crate::config::PolicyOnError::default(),
+                        timeout: std::time::Duration::from_millis(500),
+                        send_prompt: false,
+                        send_user: false,
+                    }),
+                },
+            )
+            .build();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "pa",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5
+        }))
+        .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![crate::state::WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            body.into(),
+            None,
+            "pa",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "the hook's status must reach the caller"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error"); // reject_kind_for_status(451)
+        assert_eq!(v["error"]["message"], "PII detected");
+        assert!(
+            seen.lock().unwrap().is_some(),
+            "the policy must actually have decided"
+        );
+    }
+
     /// The reject status → dialect error KIND mapping: an SDK caller must catch the right typed
     /// exception class for the status the hook chose.
     #[test]
