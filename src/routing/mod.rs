@@ -735,6 +735,78 @@ mod tests {
         }
     }
 
+    /// `route: native` FORCES the payload opt-ins off at resolve (no native policy reads them);
+    /// unlike the script twin this test runs on the DEFAULT build, so the force-off invariant is
+    /// always covered.
+    #[test]
+    fn native_resolve_forces_opt_in_flags_off() {
+        use crate::config::{PolicyCfg, RouteKind};
+        let client = reqwest::Client::new();
+        let cfg = pool_cfg(
+            RouteKind::Native,
+            Some(PolicyCfg {
+                name: Some(native::POLICY_NAME_CHEAPEST.to_string()),
+                timeout_ms: 5,
+                send_prompt: true,
+                send_user: true,
+                ..Default::default()
+            }),
+        );
+        match resolve_policy(&cfg, &client) {
+            Some(ResolvedPolicy::Policy {
+                send_prompt,
+                send_user,
+                ..
+            }) => {
+                assert!(!send_prompt, "native must force send_prompt off");
+                assert!(!send_user, "native must force send_user off");
+            }
+            None => panic!("native pool must resolve to a policy"),
+        }
+    }
+
+    /// The hook transports PASS the opt-in flags THROUGH to the resolved policy — the mirror
+    /// image of the script/native force-off: an accidental hardcoded `false` in the webhook or
+    /// socket arm would silently strip content from every opted-in hook.
+    #[test]
+    fn hook_transports_pass_opt_in_flags_through() {
+        use crate::config::{PolicyCfg, RouteKind};
+        let client = reqwest::Client::new();
+        let webhook = pool_cfg(
+            RouteKind::Webhook,
+            Some(PolicyCfg {
+                url: Some("http://127.0.0.1:8787/".to_string()),
+                timeout_ms: 5,
+                send_prompt: true,
+                send_user: true,
+                ..Default::default()
+            }),
+        );
+        let socket = pool_cfg(
+            RouteKind::Socket,
+            Some(PolicyCfg {
+                socket: Some("/run/busbar/hook.sock".to_string()),
+                timeout_ms: 5,
+                send_prompt: true,
+                send_user: true,
+                ..Default::default()
+            }),
+        );
+        for (label, cfg) in [("webhook", webhook), ("socket", socket)] {
+            match resolve_policy(&cfg, &client) {
+                Some(ResolvedPolicy::Policy {
+                    send_prompt,
+                    send_user,
+                    ..
+                }) => {
+                    assert!(send_prompt, "{label} must pass send_prompt through");
+                    assert!(send_user, "{label} must pass send_user through");
+                }
+                None => panic!("{label} pool must resolve to a policy"),
+            }
+        }
+    }
+
     /// LOCKS the invariant behind `forward`'s `unreachable!("from_ranked never rejects")` arm:
     /// `from_ranked` is a pure order-normalizer and must only ever produce Prefer/Abstain. If a
     /// future change makes it emit Reject, that unreachable arm panics on a live request — this

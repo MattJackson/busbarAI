@@ -527,7 +527,8 @@ pub(crate) struct PolicyCfg {
     /// says "this hook is trusted with request content" (PII screening, guardrails, audit).
     /// Cost note: the hook payload then scales with the request body (bounded by the ingress body
     /// cap; the serialized line is transiently held per decision) — budget hook memory accordingly.
-    /// Webhook/socket only; the deprecated script transport ignores it (with a startup warning).
+    /// Webhook/socket only; the script (deprecated) and native transports have no reader for it
+    /// and force it off at resolve, each with a startup warning.
     #[serde(default)]
     pub(crate) send_prompt: bool,
     /// Opt-in: include caller identity in the hook payload — the governance virtual-key `id`/`name`

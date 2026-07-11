@@ -34,7 +34,9 @@ pub(crate) struct HookReqProjection<'a> {
     pub(crate) total_chars: usize,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
-    /// `policy.send_prompt` opt-in: the flattened system prompt text. Absent when off.
+    /// `policy.send_prompt` opt-in: the flattened system prompt text. Absent when off — AND when
+    /// on but the request carries no (or an empty) system prompt, so a hook must key the opt-in
+    /// off `messages` (always present, possibly `[]`, when on), never off `system`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) system: Option<&'a str>,
     /// `policy.send_prompt` opt-in: every message as `{role, text}`. Absent when off.
@@ -195,16 +197,29 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
                 Some(s) if (400..=499).contains(&s) => s as u16,
                 _ => REJECT_STATUS_DEFAULT,
             };
-            // Sanitize: strip control chars AND the Unicode line/paragraph separators (U+2028/
-            // U+2029 — not category Cc, but several log/OTLP pipelines treat them as newlines, so
-            // they are a log-record-splitting vector just like CRLF), cap the length, fall back to
-            // the default when nothing printable survives.
+            // Sanitize: strip control chars, the Unicode line/paragraph separators (U+2028/29 —
+            // several log/OTLP pipelines treat them as newlines: a record-splitting vector like
+            // CRLF), and the invisible direction/zero-width formatting chars (bidi overrides
+            // U+202A..=U+202E and isolates U+2066..=U+2069 can visually spoof a log line in a
+            // terminal; zero-widths U+200B..=U+200F and U+FEFF hide content). Cap the length and
+            // fall back to the default when nothing printable survives.
             let message: String = reject
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .chars()
-                .filter(|c| !c.is_control() && *c != '\u{2028}' && *c != '\u{2029}')
+                .filter(|c| {
+                    !c.is_control()
+                        && !matches!(
+                            *c,
+                            '\u{2028}'
+                                | '\u{2029}'
+                                | '\u{200B}'..='\u{200F}'
+                                | '\u{202A}'..='\u{202E}'
+                                | '\u{2066}'..='\u{2069}'
+                                | '\u{FEFF}'
+                        )
+                })
                 .take(REJECT_MESSAGE_MAX_CHARS)
                 .collect();
             let message = if message.trim().is_empty() {
@@ -456,13 +471,18 @@ mod tests {
         ));
     }
 
-    /// U+2028/U+2029 (Unicode line/paragraph separators) are stripped from the reject message —
-    /// they are not `char::is_control` (category Zl/Zp) but several log/OTLP pipelines treat them
-    /// as newlines, so they are a log-record-splitting vector just like CRLF.
+    /// U+2028/U+2029 (line/paragraph separators — log-record splitters in several pipelines) AND
+    /// the invisible formatting chars (bidi overrides/isolates: terminal log-line spoofing;
+    /// zero-widths/BOM: hidden content) are stripped from the reject message.
     #[test]
     fn reject_message_strips_unicode_line_separators() {
         match norm("{\"reject\":{\"message\":\"a\\u2028b\\u2029c\"}}") {
             RoutingDecision::Reject { message, .. } => assert_eq!(message, "abc"),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        // Bidi override + isolate + zero-width + BOM all stripped; visible text intact.
+        match norm("{\"reject\":{\"message\":\"ok\\u202Espoof\\u2066x\\u200By\\uFEFFz\"}}") {
+            RoutingDecision::Reject { message, .. } => assert_eq!(message, "okspoofxyz"),
             other => panic!("expected Reject, got {other:?}"),
         }
     }
