@@ -18,15 +18,21 @@ pools:
     route: socket
     policy:
       socket: /run/busbar/router.sock
-      timeout_ms: 150        # hard deadline; on expiry -> on_error
+      timeout_ms: 1          # the default hard deadline; raise for slow hooks
       on_error: weighted     # a broken hook is indistinguishable from no hook
     members:
+      - target: claude-fable
+        tier: fable          # best and most expensive ...
+        cost_per_mtok: 25.0
+      - target: claude-opus
+        tier: opus
+        cost_per_mtok: 15.0
       - target: claude-sonnet
-        tier: large          # your quality judgment, as data
+        tier: sonnet
         cost_per_mtok: 3.0
-      - target: gpt-4o-mini
-        tier: small
-        cost_per_mtok: 0.15
+      - target: claude-haiku
+        tier: haiku          # ... down to cheap and fast
+        cost_per_mtok: 0.8
 ```
 
 Run the hook (you own its lifecycle — busbar never spawns it; connection is lazy,
@@ -50,15 +56,21 @@ pools:
     route: webhook
     policy:
       url: "http://127.0.0.1:8787/"
-      timeout_ms: 150
+      timeout_ms: 1
       on_error: weighted
     members:
+      - target: claude-fable
+        tier: fable          # best and most expensive ...
+        cost_per_mtok: 25.0
+      - target: claude-opus
+        tier: opus
+        cost_per_mtok: 15.0
       - target: claude-sonnet
-        tier: large
+        tier: sonnet
         cost_per_mtok: 3.0
-      - target: gpt-4o-mini
-        tier: small
-        cost_per_mtok: 0.15
+      - target: claude-haiku
+        tier: haiku          # ... down to cheap and fast
+        cost_per_mtok: 0.8
 ```
 
 ```
@@ -83,7 +95,7 @@ content by default, so the policy classifies on shape, not words.
 ## Fail-safe (both transports)
 
 The decision can never take your traffic down. It is bounded by
-`policy.timeout_ms` (default 150 ms), and on any timeout, crash, malformed reply,
+`policy.timeout_ms` (default 1 ms; raise it when your hook does I/O or crosses the network), and on any timeout, crash, malformed reply,
 or dead hook busbar coerces the decision to the pool's `on_error` (default
 `weighted`). The ranking then feeds the same failover + circuit-breaker loop
 everything else uses; a dropped candidate is demoted, not excluded, so a buggy

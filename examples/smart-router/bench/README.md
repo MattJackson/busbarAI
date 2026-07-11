@@ -27,12 +27,13 @@ BUSBAR_SOCKET_PROBE_PATH=/tmp/bb-probe.sock \
   cargo test --release --bin busbar socket_decide_timing -- --nocapture --ignored
 ```
 
-## Webhook (`route: webhook`): sub-millisecond co-located
+## Webhook (`route: webhook`): ~34 microseconds co-located
 
-The HTTP transport adds framing and a TCP round trip the socket does not. A
-co-located sidecar answers in a fraction of a millisecond; a sidecar across the
-network costs whatever that hop costs. Either way it is far under the default
-`policy.timeout_ms` of 150 ms, after which busbar falls back to the pool's
+Measured the same way (busbar's `WebhookPolicy::decide()` against a real external
+HTTP sidecar over loopback, 20,000 samples): **~34 us median, p99 ~47 us**. The
+HTTP framing and TCP round trip cost about 4x the socket transport. A sidecar
+across the network costs whatever that hop costs. Either way it is far under the default
+`policy.timeout_ms` of 1 ms, after which busbar falls back to the pool's
 `on_error` and the request proceeds regardless.
 
 ## Why the socket hook replaced the script engine

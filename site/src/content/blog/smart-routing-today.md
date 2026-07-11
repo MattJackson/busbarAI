@@ -4,11 +4,12 @@ description: "Everyone asks for automatic model selection by task, latency, qual
 date: 2026-07-11
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
+discussion: "https://github.com/MattJackson/busbarAI/discussions/14"
 ---
 
 A user told me this week: "The best model should be selected automatically based on the task, latency, quality, and cost."
 
-I agree. And I want to show why that sentence does not describe a new product. It describes a hook, and it should stay a hook: the policy is your judgment, and your judgment does not belong compiled into someone else's core. Busbar, Your AI Control Plane, runs that hook two ways, and in this post I show both, measured honestly: a compiled Rust binary on a local Unix socket that decides in about **8 microseconds**, and a webhook in any language for everywhere else. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. (Everything here is built on the 1.2.1 release.)
+I agree. And I want to show why that sentence does not describe a new product. It describes a hook, and it should stay a hook: the policy is your judgment, and your judgment does not belong compiled into someone else's core. Busbar, Your AI Control Plane, runs that hook two ways, and in this post I show both, measured honestly: a compiled Rust binary on a local Unix socket that decides in about **8 microseconds**, and a webhook in any language for everywhere else. Both plug into the same failover, circuit-breaker, and fail-safe machinery, so neither can take your traffic down. Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. (Everything here is built on the 1.2.1 release.)
 
 ## The shape of the problem
 
@@ -40,38 +41,109 @@ pools:
     route: socket
     policy:
       socket: /run/busbar/router.sock
-      timeout_ms: 150        # the hard deadline
+      timeout_ms: 1          # the hard deadline (the default: hooks are fast)
       on_error: weighted     # the fail-safe
     members:
+      - target: claude-fable
+        tier: fable          # the ladder every dev knows:
+        cost_per_mtok: 25.0  # best and most expensive ...
+      - target: claude-opus
+        tier: opus
+        cost_per_mtok: 15.0
       - target: claude-sonnet
-        tier: large
+        tier: sonnet
         cost_per_mtok: 3.0
-      - target: gpt-4o-mini
-        tier: small
-        cost_per_mtok: 0.15
+      - target: claude-haiku
+        tier: haiku          # ... down to cheap and fast
+        cost_per_mtok: 0.8
 ```
 
-Measured end to end through Busbar's real transport, against the real example binary running as a separate process: about **7.9 microseconds** median per decision, p99 around 12. Your policy is a separate process, so a crash in it is contained; Busbar never spawns or supervises it, connects lazily, and reconnects across restarts of your binary. Kill your router mid-traffic and requests keep flowing.
+Measured end to end through Busbar's real transport, against the real example binary running as a separate process: about **7.9 microseconds** median per decision, p99 around 12. Your policy is a separate process, so a crash in it is contained; Busbar never spawns or supervises it, connects lazily, and reconnects across restarts of your binary.
 
-The hook itself is about a hundred lines of Rust, standard library plus serde, and the whole policy is the classify-and-score above:
+The hook itself is about a hundred lines of Rust, standard library plus serde. The heart of it is the classify step picking each bucket's dials:
 
 ```rust
-fn weights(r: &Req) -> (f64, f64, f64, &'static [&'static str]) {
+// Step 1: what KIND of request is this? Each bucket sets its own dials: how much
+// this request cares about cheap, fast, and unloaded, and which tier to lean toward.
+fn weights(r: &Req) -> Dials {
+    // Four kinds of request, four lanes, one natural home each. The tier names are
+    // whatever YOU declare on your members; here, the ladder every dev knows.
     if r.has_tools {
-        (0.20, 0.40, 0.40, &["large", "primary"]) // code: capability + latency
+        // Agent / code traffic: the work is hard. Send it to the frontier model.
+        Dials { cost: 0.20, latency: 0.40, free_capacity: 0.40, prefer_tiers: &["fable"] }
     } else if r.max_tokens.unwrap_or(0) >= 4096 || r.total_chars > 24_000 {
-        (0.40, 0.20, 0.40, &["large", "primary"]) // long-form
+        // Long-form work: deep and big, but it takes a while anyway. Opus territory.
+        Dials { cost: 0.40, latency: 0.20, free_capacity: 0.40, prefer_tiers: &["opus"] }
     } else if !r.stream && r.message_count <= 1 {
-        (0.60, 0.10, 0.30, &["small", "overflow"]) // bulk: optimize cost
+        // Single-shot batch work with nobody watching: the cheapest lane wins.
+        Dials { cost: 0.60, latency: 0.10, free_capacity: 0.30, prefer_tiers: &["haiku"] }
     } else {
-        (0.30, 0.50, 0.20, &["small", "overflow"]) // interactive: optimize latency
+        // A human waiting on an interactive answer: the everyday driver.
+        Dials { cost: 0.30, latency: 0.50, free_capacity: 0.20, prefer_tiers: &["sonnet"] }
     }
 }
+
+// Step 2: score EVERY lane through those dials. Cheaper, faster, and more free
+// capacity score higher; the preferred tier gets a +0.5 tilt; a lane near its
+// rate cap gets scaled down. Sort descending: that is the order.
+let score = |c: &Cand| -> f64 {
+    let mut s = dials.cost          * (1.0 - c.cost / max_cost)
+              + dials.latency       * (1.0 - c.latency / max_latency)
+              + dials.free_capacity * (c.free_slots as f64 / max_free as f64);
+    if dials.prefer_tiers.contains(&c.tier) { s += 0.5 }     // your quality judgment
+    if let Some(h) = c.rate_headroom { s *= 0.5 + 0.5 * h }  // back off near 429s
+    s
+};
 ```
+
+Here is the decision it actually makes. One pool, the four lanes above, with live signals at this moment: `claude-fable` ($25/Mtok, 400 ms, 16 free slots), `claude-opus` ($15, 320 ms, 12 free), `claude-sonnet` ($3, 150 ms, 10 free), `claude-haiku` ($0.80, 95 ms, 6 free). The expensive lanes sit idle; the cheap ones are busy. Two requests walk in:
+
+```text
+request A: has_tools=true         -> agent/code bucket, prefer tier "fable"
+  claude-fable:   signals 0.40  + boost 0.50 = 0.90   <- first
+  claude-sonnet:  signals 0.68               = 0.68
+  claude-haiku:   signals 0.65               = 0.65
+  claude-opus:    signals 0.46               = 0.46
+  reply: {"order":[0,2,3,1]}  -> the frontier model gets the agent work
+
+request B: single-shot, no stream -> bulk bucket, prefer tier "haiku"
+  claude-haiku:   signals 0.77  + boost 0.50 = 1.27   <- first
+  claude-sonnet:  signals 0.78               = 0.78
+  claude-opus:    signals 0.49               = 0.49
+  claude-fable:   signals 0.30               = 0.30
+  reply: {"order":[3,2,1,0]}  -> the cheap model gets the batch job
+```
+
+Same pool, same four lanes, and `claude-fable` goes from first to last depending on what walked in. That is the whole idea: based on the request's shape, choose the lane. And the boost is a tilt, not a mandate: a preferred lane that is saturated and slow scores near zero on its live signals and a healthy lane outranks it. The failover loop then walks whatever order comes back, breaker rules intact.
 
 ## Answer two: a webhook, in any language, on any OS
 
-The socket hook is Unix-only and compiled. When you want the policy in whatever your team already ships, or you are on Windows, you write a webhook. Set `route: webhook`, point it at a sidecar you run, and Busbar POSTs the same projection over HTTP and reads back the same ranked `{"order":[...]}`. The example is about a hundred lines of Go, standard library only, and its `classify` is the same shape as the Rust one:
+The socket hook is Unix-only and compiled. When you want the policy in whatever your team already ships, or you are on Windows, you write a webhook. Set `route: webhook`, point it at a sidecar you run, and Busbar POSTs the same projection over HTTP and reads back the same ranked `{"order":[...]}`:
+
+```yaml
+pools:
+  chat:
+    route: webhook
+    policy:
+      url: "http://127.0.0.1:8787/"
+      timeout_ms: 1          # the same hard deadline
+      on_error: weighted     # the same fail-safe
+    members:
+      - target: claude-fable
+        tier: fable          # the ladder every dev knows:
+        cost_per_mtok: 25.0  # best and most expensive ...
+      - target: claude-opus
+        tier: opus
+        cost_per_mtok: 15.0
+      - target: claude-sonnet
+        tier: sonnet
+        cost_per_mtok: 3.0
+      - target: claude-haiku
+        tier: haiku          # ... down to cheap and fast
+        cost_per_mtok: 0.8
+```
+
+The example sidecar is about a hundred lines of Go, standard library only, and its `classify` is the same shape as the Rust one:
 
 ```go
 func classify(r request) weights {
@@ -88,32 +160,32 @@ func classify(r request) weights {
 }
 ```
 
-Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not, but it stays under a millisecond co-located and it runs anywhere.
+Same classify, same weights, same sort, and critically the same wire contract: both transports carry byte-identical JSON, so a hook graduates from a webhook prototype to a compiled socket binary without changing its logic. Both examples are in the repo under [`examples/smart-router/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router). The webhook adds the HTTP round trip the socket does not: about 34 microseconds co-located, measured the same way, and it runs anywhere.
 
 ## What the hook sees, and what it does not
 
 Both paths see the same projection. For the request: pool name, ingress protocol, message count, whether tools are declared, total prompt size in characters, requested `max_tokens`, whether it streams. For each candidate: model name, operator-declared `tier` and `cost_per_mtok`, a rolling latency EWMA, live free concurrency, remaining budget, and rate-limit headroom from Governance.
 
-Notice what is missing: the prompt. Routing is a shape decision, so by default Busbar sends no message content with it, and the policy classifies on sizes, counts, and flags, not on words. Your prompts do not leave the process just to pick a model. That is a Security default, not an accident, but it is not a wall: content is a separate, explicit, per-hook switch, off unless you turn it on. Default deny, opt in on purpose. That switch is exactly what makes the next hooks possible, which is where this goes.
-
-Any client speaking any of Busbar's six protocols hits the pool as if it were a model, and Translate carries the request to whichever backend wins. Every response tells you what happened: `x-busbar-route-policy` and `x-busbar-route-target`. That is Observability on every single decision.
+Notice what is missing: the prompt. Routing is a shape decision, so by default Busbar sends no message content with it, and the policy classifies on sizes, counts, and flags, not on words. Your prompts do not leave the process just to pick a model. That is a Security default, not an accident, but it is not a wall: content is a separate, explicit, per-hook switch, off unless you turn it on. Default deny, opt in on purpose. That switch is what makes the next hooks, like PII redaction and guardrails, possible at all.
 
 ## The part that makes it safe to run
 
 Here is the reason this belongs in a control plane and not in your app code. The hook is advisory. It can never become load-bearing.
 
-The decision has a hard deadline, `policy.timeout_ms`, which defaults to 150 ms. If the sidecar is slow, the decision is cut off and Busbar applies `on_error`, which defaults to plain weighted round-robin. Same for a crash, a non-2xx, or malformed JSON. A broken sidecar is indistinguishable from having no policy at all. Kill the router mid-traffic and requests keep flowing.
+The decision has a hard deadline, `policy.timeout_ms`, which defaults to 1 millisecond. That default is a statement: hooks are fast, and a deadline should say so. A co-located socket hook decides in about 8 microseconds and a co-located webhook in about 34, so 1 ms is 20x headroom or more. If your hook is legitimately slower, it calls a database, crosses the network, or asks a model, you raise the deadline; the default does not pay for it. If the hook is slow, the decision is cut off and Busbar applies `on_error`, which defaults to plain weighted round-robin. Same for a crash, a non-2xx, or malformed JSON. A broken sidecar is indistinguishable from having no policy at all. Kill the router mid-traffic and requests keep flowing.
 
 And the ranking feeds the same Failover loop everything else uses. If the policy's first choice is tripped or at capacity, Busbar walks to the second with the normal circuit-breaker machinery. If the policy drops a candidate from its list, that lane is demoted, not excluded, so a buggy ranking can never strand a healthy model. The policy proposes. The control plane disposes.
+
+Every response tells you what happened: `x-busbar-route-policy` and `x-busbar-route-target` are on every reply. That is Observability on every single decision, not sampled, not opt-in.
 
 ## What it costs, measured
 
 You can reproduce both numbers yourself; the benchmark and the commands are in [`examples/smart-router/bench/`](https://github.com/MattJackson/busbarAI/tree/main/examples/smart-router/bench), all on an Apple M5 Pro, all through Busbar's real transport code against real separate processes.
 
 - **Socket hook: about 7.9 microseconds** median per decision (p99 about 12, 50,000 samples). A compiled Rust binary over a kept-alive local socket. The whole Busbar layer adds tens of microseconds to a request, so the decision is close to free.
-- **Webhook: sub-millisecond** on a co-located sidecar, plus whatever the network hop costs if it is not co-located. You trade some latency for any-language, any-OS reach.
+- **Webhook: about 34 microseconds** median per decision (p99 about 47, 20,000 samples) co-located over loopback, plus whatever the network hop costs if it is not. You trade roughly 4x the socket's latency for any-language, any-OS reach; both are noise next to an LLM call.
 
-Either way it is far under the 150 ms deadline, after which Busbar coerces the decision to the pool's `on_error` fallback and the request proceeds anyway. (For the record: Busbar previously offered an embedded script engine for this, and the interpreter alone cost about 108 microseconds per decision, twenty times the entire compiled hook round trip. It is deprecated as of 1.2.1. When the same logic runs 20x faster in a separate process that cannot crash the control plane, an embedded interpreter is the wrong tool.)
+Either way it is far under even the 1 ms default deadline, after which Busbar coerces the decision to the pool's `on_error` fallback and the request proceeds anyway. (For the record: Busbar previously offered an embedded script engine for this, and the interpreter alone cost about 108 microseconds per decision, twenty times the entire compiled hook round trip. It is deprecated as of 1.2.1. When the same logic runs 20x faster in a separate process that cannot crash the control plane, an embedded interpreter is the wrong tool.)
 
 ## Honest words about "quality"
 

@@ -199,7 +199,7 @@ External policies let you run routing logic outside Busbar; in any language, wit
 
 Busbar POSTs a JSON payload to your operator-supplied sidecar URL before each request's failover loop. The sidecar returns a ranked list of candidate indices. The URL is operator-config-only; never derived from a request header or body.
 
-**Timeout and fallback.** The request is bounded by `policy.timeout_ms` (default 150 ms). On timeout, non-200 response, or malformed JSON, Busbar applies `on_error` (default: `weighted`; fall back to SWRR). A broken sidecar is indistinguishable from no policy. Concurrency is bounded by `policy.timeout_ms` and the HTTP client's connection pool; there is no separate in-flight cap on routing webhook calls.
+**Timeout and fallback.** The request is bounded by `policy.timeout_ms` (default 1 ms — the default says hooks are fast; raise it when your hook does I/O or crosses the network). On timeout, non-200 response, or malformed JSON, Busbar applies `on_error` (default: `weighted`; fall back to SWRR). A broken sidecar is indistinguishable from no policy. Concurrency is bounded by `policy.timeout_ms` and the HTTP client's connection pool; there is no separate in-flight cap on routing webhook calls.
 
 **URL security.** The sidecar URL allows loopback (`127.0.0.1`, `localhost`); routing sidecars are commonly co-located processes. RFC-1918, link-local, CGNAT, and cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`, etc.) are blocked regardless.
 
@@ -295,7 +295,7 @@ pools:
     route: socket
     policy:
       socket: /run/busbar/router.sock   # the hook binary's Unix socket (absolute path)
-      timeout_ms: 150
+      timeout_ms: 1
       on_error: weighted
     members:
       - target: claude-opus
@@ -389,7 +389,7 @@ Scripts are operator-config only; never client-supplied.
 | `name` | string | none | `native` | Native policy name: `weighted`, `cheapest`, `fastest`, `least_busy`, or `usage`. Needed for `route: native`; if absent or unknown, routing degrades to weighted SWRR. |
 | `url` | string | none | `webhook` | Operator sidecar URL. Loopback allowed; RFC-1918/CGNAT/metadata blocked. Required when `route: webhook`. |
 | `socket` | string | none | `socket` | Absolute filesystem path of the hook binary's Unix domain socket. Required when `route: socket`. The binary is operator-run; the connection is lazy, so the hook may start after Busbar. |
-| `timeout_ms` | integer | `150` | `native`, `webhook`, `socket`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout, `on_error` applies. (Native policies are synchronous and effectively never hit it.) |
+| `timeout_ms` | integer | `1` | `native`, `webhook`, `socket`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. On timeout, `on_error` applies. (Native policies are synchronous and effectively never hit it.) |
 | `on_error` | string | `weighted` | `native`, `webhook`, `socket`, `script` | Fallback when the policy times out or errors: `weighted` (SWRR), `reject` (503), or `first` (first member in config order). An explicit abstain bypasses this and always falls through to SWRR. |
 | `script` | string | none | `script` | Inline Rhai source. If both `script` and `script_file` are set, inline `script` takes precedence. |
 | `script_file` | string | none | `script` | Path to a Rhai script file. Alternative to inline `script`. If neither is set (or the `script-policy` feature is off), routing degrades to weighted SWRR. |
@@ -482,7 +482,7 @@ pools:
     route: webhook
     policy:
       url: "http://127.0.0.1:8731/route"
-      timeout_ms: 150
+      timeout_ms: 1               # the default; raise for hooks that do I/O
       on_error: weighted          # broken sidecar falls back to SWRR, never fails
     failover:
       timeout_secs: 60

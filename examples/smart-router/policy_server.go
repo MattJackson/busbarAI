@@ -9,7 +9,7 @@
 //
 // Fail-safe: if this process is slow, down, or wrong, busbar coerces the decision
 // to the pool's on_error (default: weighted) after policy.timeout_ms (default
-// 150ms). A broken sidecar never blocks a request.
+// 1ms by default; raise it for hooks that do I/O). A broken sidecar never blocks a request.
 //
 // Build/run:  go run policy_server.go [addr]   (default 127.0.0.1:8787)
 // Stdlib only, no dependencies.
@@ -65,14 +65,14 @@ const tierBoost = 0.5
 
 func classify(r request) weights {
 	switch {
-	case r.HasTools: // tool / agent traffic wants the capable tier
-		return weights{0.10, 0.20, 0.20, []string{"large", "primary"}}
-	case (r.MaxTokens != nil && *r.MaxTokens >= 4096) || r.TotalChars > 24000: // long-form
-		return weights{0.20, 0.10, 0.20, []string{"large", "primary"}}
-	case !r.Stream && r.MessageCount <= 1: // single-shot, non-interactive: optimize cost
-		return weights{0.60, 0.10, 0.30, []string{"small", "overflow"}}
-	default: // interactive default: optimize latency
-		return weights{0.30, 0.50, 0.20, []string{"small", "overflow"}}
+	case r.HasTools: // agent / code traffic: send it to the frontier model
+		return weights{0.20, 0.40, 0.40, []string{"fable"}}
+	case (r.MaxTokens != nil && *r.MaxTokens >= 4096) || r.TotalChars > 24000: // long-form: opus territory
+		return weights{0.40, 0.20, 0.40, []string{"opus"}}
+	case !r.Stream && r.MessageCount <= 1: // single-shot batch: cheapest wins
+		return weights{0.60, 0.10, 0.30, []string{"haiku"}}
+	default: // a human waiting on an interactive answer: the everyday driver
+		return weights{0.30, 0.50, 0.20, []string{"sonnet"}}
 	}
 }
 

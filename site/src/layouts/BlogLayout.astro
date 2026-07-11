@@ -10,8 +10,10 @@ interface Props {
   description: string;
   datePublished?: string;
   author?: string;
+  /** GitHub Discussion URL for this post's comment thread (rendered as the Comments CTA). */
+  discussion?: string;
 }
-const { title, description, datePublished, author } = Astro.props;
+const { title, description, datePublished, author, discussion } = Astro.props;
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const YEAR = new Date().getFullYear();
@@ -53,22 +55,13 @@ const ARTICLE = datePublished
       {datePublished && (
         <section class="post-comments">
           <h2>Comments</h2>
-          <p class="post-comments-note">Sign in with GitHub to comment. Threads live in <a href={`${GITHUB}/discussions`}>GitHub Discussions</a>.</p>
-          <script src="https://giscus.app/client.js"
-            data-repo="MattJackson/busbarAI"
-            data-repo-id="R_kgDOSq5yIA"
-            data-category="Announcements"
-            data-category-id="DIC_kwDOSq5yIM4DA8cA"
-            data-mapping="pathname"
-            data-strict="1"
-            data-reactions-enabled="1"
-            data-emit-metadata="0"
-            data-input-position="top"
-            data-theme="light"
-            data-lang="en"
-            data-loading="lazy"
-            crossorigin="anonymous"
-            async></script>
+          <p class="post-comments-note">Comments live in GitHub Discussions, so the conversation stays next to the code.</p>
+          <a class="post-comments-cta" href={discussion || `${GITHUB}/discussions`}>Join the discussion on GitHub</a>
+          {/* giscus (embedded Discussions comments) goes here once the giscus GitHub App is
+              installed on the repo (github.com/apps/giscus). Config for re-enable:
+              data-repo="MattJackson/busbarAI" data-repo-id="R_kgDOSq5yIA"
+              data-category="Announcements" data-category-id="DIC_kwDOSq5yIM4DA8cA"
+              data-mapping="pathname" data-strict="1" */}
         </section>
       )}
     </main>
@@ -175,6 +168,8 @@ const ARTICLE = datePublished
       .post-comments h2 { font-size: 22px; font-weight: 800; color: var(--slate); margin: 0 0 6px; }
       .post-comments-note { font-size: 14px; color: var(--muted); margin: 0 0 20px; }
       .post-comments-note a { color: #4d7c0f; text-decoration: underline; text-underline-offset: 3px; }
+      .post-comments-cta { display: inline-block; padding: 10px 18px; border: 1px solid var(--line); border-radius: 10px; font-size: 14.5px; font-weight: 600; color: var(--slate); transition: border-color 0.15s; }
+      .post-comments-cta:hover { border-color: var(--lime); }
 
       /* LIST */
       .post-list { max-width: 760px; margin: 0 auto; }

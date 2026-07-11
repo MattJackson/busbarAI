@@ -14,6 +14,8 @@ export const collections = {
       date: z.coerce.date(),
       author: z.string().default('Matthew Jackson'),
       authorTitle: z.string().default('Founder, Busbar'),
+      // GitHub Discussion URL for the post's comment thread (rendered as the Comments CTA).
+      discussion: z.string().url().optional(),
     }),
   }),
 };

@@ -55,7 +55,7 @@ You can also return an **abstain**, which means "no opinion, use the default wei
 ### What you cannot do
 
 - You cannot mutate the request. Policies rank; they do not rewrite. (Request/response mutation hooks — the shape guardrails, PII steering, and audit need — are the planned next tenant of this same fail-safe machinery. See the [roadmap](https://getbusbar.com/docs/roadmap/).)
-- You cannot make Busbar wait. The decision is bounded by `policy.timeout_ms` (default 150 ms), hard.
+- You cannot make Busbar wait. The decision is bounded by `policy.timeout_ms` (default 1 ms; raise it when your hook calls a database or crosses the network), hard.
 - You cannot see the message text. The projection carries sizes, counts, and flags, not content — your prompts do not leave the process just to make a routing decision.
 
 ### What Busbar guarantees when your hook misbehaves
