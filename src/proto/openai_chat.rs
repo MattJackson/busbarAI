@@ -242,7 +242,9 @@ const BASE62: &[u8; 62] = crate::proto::BASE62_ALPHABET;
 /// OpenAI's `logprobs` object (`{content: [{token, logprob, bytes, top_logprobs[]}]}`) → the
 /// neutral IR entries. `bytes` is preserved verbatim when present (a token can be a partial UTF-8
 /// fragment, so the byte array is the only faithful carrier).
-fn read_openai_logprobs(v: Option<&serde_json::Value>) -> Vec<crate::ir::IrTokenLogprob> {
+pub(crate) fn read_openai_logprobs(
+    v: Option<&serde_json::Value>,
+) -> Vec<crate::ir::IrTokenLogprob> {
     let entries = match v
         .and_then(|lp| lp.get("content"))
         .and_then(|c| c.as_array())
@@ -287,7 +289,7 @@ fn read_openai_logprobs(v: Option<&serde_json::Value>) -> Vec<crate::ir::IrToken
 /// Neutral IR logprobs → OpenAI's `logprobs` object. `bytes` is synthesized from the token's UTF-8
 /// encoding when the source protocol (Gemini) carries none — the same value OpenAI itself returns
 /// for a whole-token UTF-8 string.
-fn write_openai_logprobs(lps: &[crate::ir::IrTokenLogprob]) -> serde_json::Value {
+pub(crate) fn write_openai_logprobs(lps: &[crate::ir::IrTokenLogprob]) -> serde_json::Value {
     let content: Vec<serde_json::Value> = lps
         .iter()
         .map(|lp| {

@@ -8885,6 +8885,37 @@ mod logprobs_carry_tests {
     /// Gemini backend -> OpenAI caller (buffered): `logprobsResult` becomes
     /// `choices[0].logprobs.content[]`, chosen+top zipped, bytes synthesized from UTF-8.
     #[test]
+    fn openai_logprobs_codec_round_trips_bytes_and_top() {
+        // Direct read/write of the OpenAI logprobs codec: bytes and top_logprobs survive, and a
+        // missing `bytes` is synthesized from the token's UTF-8 on write.
+        use crate::proto::openai_chat::{read_openai_logprobs, write_openai_logprobs};
+        let src = serde_json::json!({"content": [
+            {"token": "Hi", "logprob": -0.1, "bytes": [72, 105],
+             "top_logprobs": [{"token": "Hi", "logprob": -0.1, "bytes": [72, 105]},
+                              {"token": "Yo", "logprob": -2.0, "bytes": [89, 111]}]}
+        ]});
+        let ir = read_openai_logprobs(Some(&src));
+        assert_eq!(ir.len(), 1);
+        assert_eq!(ir[0].token, "Hi");
+        assert_eq!(ir[0].bytes.as_deref(), Some(&[72u8, 105][..]));
+        assert_eq!(ir[0].top.len(), 2);
+        let back = write_openai_logprobs(&ir);
+        assert_eq!(back["content"][0]["token"], "Hi");
+        assert_eq!(back["content"][0]["bytes"], serde_json::json!([72, 105]));
+        assert_eq!(back["content"][0]["top_logprobs"][1]["token"], "Yo");
+
+        // bytes synthesized from UTF-8 when the source (e.g. Gemini) carried none.
+        let no_bytes = vec![crate::ir::IrTokenLogprob {
+            token: "Hi".into(),
+            logprob: -0.1,
+            bytes: None,
+            top: vec![],
+        }];
+        let out = write_openai_logprobs(&no_bytes);
+        assert_eq!(out["content"][0]["bytes"], serde_json::json!([72, 105]));
+    }
+
+    #[test]
     fn gemini_logprobs_reach_openai_caller() {
         let ir = Protocol::gemini()
             .reader()
