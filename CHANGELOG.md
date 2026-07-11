@@ -59,8 +59,8 @@ and verbs that make screening hooks possible.
 
 ### Fixed
 
-- **Hardened throughout.** Multiple rounds of extensive multi-model adversarial testing over the
-  full 1.2.0 change set and the new hook layer surfaced and fixed a broad batch of defects —
+- **Hardened throughout.** Multiple rounds of extensive adversarial testing and code review over
+  the full 1.2.0 change set and the new hook layer surfaced and fixed a broad batch of defects —
   protocol-translation edge cases, input validation and sanitization, error handling, and
   observability gaps. Every fix shipped with the regression test that catches it; the suite grew
   by several hundred tests this release.
