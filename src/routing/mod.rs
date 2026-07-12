@@ -261,6 +261,11 @@ pub(crate) enum ResolvedPolicy {
         send_prompt: bool,
         /// `policy.send_user` — build + send the caller identity projection (default false).
         send_user: bool,
+        /// Gate `on_empty` — behavior when a `restrict` reply leaves an EMPTY candidate intersection.
+        /// Default `Reject` (fail-closed; the spec default for a compliance restrict); `Weighted`
+        /// is the advisory escape (fall back to SWRR over the FULL pool). Inert for non-restricting
+        /// policies (native/order-only), which never produce an empty intersection.
+        on_empty: crate::config::PolicyOnError,
     },
 }
 
@@ -300,6 +305,8 @@ pub(crate) fn resolve_policy(
         // Native policies rank on live signals and have no reader for prompt/identity.
         send_prompt: false,
         send_user: false,
+        // A native ordering policy never restricts, so on_empty is inert; keep the fail-closed default.
+        on_empty: crate::config::PolicyOnError::Reject,
     })
 }
 
@@ -321,6 +328,7 @@ fn resolve_gate_transport(
             timeout: policy_timeout(hook.timeout_ms),
             send_prompt,
             send_user,
+            on_empty: gate_on_empty(hook),
         });
     }
     // Socket transport (Unix-only). The connection is LAZY — only the path's presence is checked.
@@ -344,7 +352,16 @@ fn resolve_gate_socket(
         timeout: policy_timeout(hook.timeout_ms),
         send_prompt,
         send_user,
+        on_empty: gate_on_empty(hook),
     })
+}
+
+/// A gate's `on_empty` behavior (empty restrict intersection): the configured value, or the
+/// FAIL-CLOSED default `Reject` — the spec default for a compliance restrict, never allow-all.
+fn gate_on_empty(hook: &crate::config::HookCfg) -> crate::config::PolicyOnError {
+    hook.on_empty
+        .clone()
+        .unwrap_or(crate::config::PolicyOnError::Reject)
 }
 
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default

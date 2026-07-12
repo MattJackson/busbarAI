@@ -2038,6 +2038,10 @@ enum PolicyOutcome {
     Restrict {
         tags_any: Vec<String>,
         name: &'static str,
+        /// Behavior when the intersection is empty: `Reject` (default, fail-closed 503) or `Weighted`
+        /// (advisory escape — SWRR over the FULL pool). `First` is treated as `Reject` (a restrict
+        /// with no eligible member has no "first" to fall to).
+        on_empty: crate::config::PolicyOnError,
     },
 }
 
@@ -2195,14 +2199,22 @@ async fn decide_policy_order(
 
     // A weighted/default pool resolves to `None` at config load (no policy object is constructed), so
     // the only `ResolvedPolicy` that can reach this seam is a constructed `Policy`.
-    let (policy, on_error, timeout, send_prompt, send_user) = match resolved {
+    let (policy, on_error, timeout, send_prompt, send_user, on_empty) = match resolved {
         ResolvedPolicy::Policy {
             policy,
             on_error,
             timeout,
             send_prompt,
             send_user,
-        } => (policy, on_error, *timeout, *send_prompt, *send_user),
+            on_empty,
+        } => (
+            policy,
+            on_error,
+            *timeout,
+            *send_prompt,
+            *send_user,
+            on_empty,
+        ),
     };
 
     // The candidate set the policy ranks over = this pool's members MINUS the already-excluded ones
@@ -2402,6 +2414,7 @@ async fn decide_policy_order(
         RoutingDecision::Restrict { tags_any } => PolicyOutcome::Restrict {
             tags_any,
             name: policy.name(),
+            on_empty: on_empty.clone(),
         },
     }
 }
@@ -2721,43 +2734,69 @@ pub(crate) async fn forward_with_pool_parsed(
                 // selects from this set) — the compliance guarantee ("only these lanes, ever"). An
                 // EMPTY intersection is fail-closed (`on_empty` default reject), never allow-all;
                 // an empty `tags_any` (fail-closed-normalized malformed restrict) forces it.
-                PolicyOutcome::Restrict { tags_any, name } => {
+                PolicyOutcome::Restrict {
+                    tags_any,
+                    name,
+                    on_empty,
+                } => {
                     let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
-                    cands.retain(|wl| {
-                        members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
-                            meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                    // Filter into a temp so the ORIGINAL `cands` survives for a weighted on_empty
+                    // escape; only commit the restriction when the intersection is non-empty.
+                    let restricted: Vec<WeightedLane> = cands
+                        .iter()
+                        .filter(|wl| {
+                            members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                                meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                            })
                         })
-                    });
-                    if cands.is_empty() {
+                        .cloned()
+                        .collect();
+                    if restricted.is_empty() {
+                        // Empty intersection → the gate's `on_empty`. `Weighted` is the advisory escape
+                        // (leave `cands` as the full pool → SWRR); default (and `First`, which has no
+                        // eligible "first") is fail-closed reject.
+                        if matches!(on_empty, crate::config::PolicyOnError::Weighted) {
+                            tracing::info!(
+                                policy = name,
+                                pool = pool_name,
+                                "routing policy restrict left no eligible lane; on_empty: weighted \
+                                 escape to full-pool SWRR"
+                            );
+                            None
+                        } else {
+                            metrics::counter!(
+                                crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                                "policy" => name,
+                                "pool" => pool_name.to_string(),
+                                "status" => "503".to_string(),
+                            )
+                            .increment(1);
+                            tracing::info!(
+                                policy = name,
+                                pool = pool_name,
+                                "routing policy restrict left no eligible lane (on_empty: reject)"
+                            );
+                            return ingress_error(
+                                ingress_protocol,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                KIND_OVERLOADED,
+                                "No upstream satisfies the routing policy's restriction. Please \
+                                 retry shortly.",
+                            );
+                        }
+                    } else {
+                        // Commit the restriction: shrink `cands` to the survivors so it PERSISTS
+                        // across every failover hop, then let SWRR pick among them.
+                        cands = restricted;
+                        chosen_policy_name = Some(name);
                         metrics::counter!(
-                            crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                            crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
                             "policy" => name,
                             "pool" => pool_name.to_string(),
-                            "status" => "503".to_string(),
                         )
                         .increment(1);
-                        tracing::info!(
-                            policy = name,
-                            pool = pool_name,
-                            "routing policy restrict left no eligible lane (on_empty: reject)"
-                        );
-                        return ingress_error(
-                            ingress_protocol,
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            KIND_OVERLOADED,
-                            "No upstream satisfies the routing policy's restriction. Please retry \
-                             shortly.",
-                        );
+                        None
                     }
-                    chosen_policy_name = Some(name);
-                    metrics::counter!(
-                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
-                        "policy" => name,
-                        "pool" => pool_name.to_string(),
-                    )
-                    .increment(1);
-                    // SWRR among the restricted survivors (no ranked order imposed by restrict).
-                    None
                 }
             }
         }
@@ -10499,6 +10538,7 @@ mod hook_seam_tests {
             timeout: std::time::Duration::from_millis(500),
             send_prompt,
             send_user,
+            on_empty: crate::config::PolicyOnError::Reject,
         };
         let cands = vec![WeightedLane {
             reasoning: None,
@@ -10655,6 +10695,7 @@ mod hook_seam_tests {
             timeout: std::time::Duration::from_millis(500),
             send_prompt: false,
             send_user: true,
+            on_empty: crate::config::PolicyOnError::Reject,
         };
         let cands = vec![WeightedLane {
             reasoning: None,
@@ -10764,6 +10805,7 @@ mod hook_seam_tests {
                         timeout: std::time::Duration::from_millis(500),
                         send_prompt: false,
                         send_user: false,
+                        on_empty: crate::config::PolicyOnError::Reject,
                     }),
                 },
             )
