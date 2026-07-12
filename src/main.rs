@@ -700,7 +700,30 @@ async fn main() {
     let rewrite_hooks =
         routing::resolve_rewrite_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
     // Resolve the global request-stage tap hooks the same way. Empty unless configured.
-    let tap_hooks = routing::resolve_tap_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+    let tap_hooks = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Request,
+    );
+    let tap_hooks_route = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Route,
+    );
+    let tap_hooks_attempt = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Attempt,
+    );
+    let tap_hooks_completion = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Completion,
+    );
     // Resolve the global DECISION gates (non-rewrite gates in global_hooks) — fired for a verdict on
     // every request. Empty unless configured.
     let global_gates = routing::resolve_gate_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
@@ -714,6 +737,9 @@ async fn main() {
         auth: auth_mw.clone(),
         rewrite_hooks,
         tap_hooks,
+        tap_hooks_route,
+        tap_hooks_attempt,
+        tap_hooks_completion,
         global_gates,
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),

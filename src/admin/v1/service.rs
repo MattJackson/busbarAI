@@ -147,8 +147,30 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
         &next.global_hooks,
         &next.client,
     );
-    next.tap_hooks =
-        crate::routing::resolve_tap_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.tap_hooks = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Request,
+    );
+    next.tap_hooks_route = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Route,
+    );
+    next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Attempt,
+    );
+    next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Completion,
+    );
     next.global_gates =
         crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
     Ok(next)
@@ -173,8 +195,30 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
         &next.global_hooks,
         &next.client,
     );
-    next.tap_hooks =
-        crate::routing::resolve_tap_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.tap_hooks = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Request,
+    );
+    next.tap_hooks_route = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Route,
+    );
+    next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Attempt,
+    );
+    next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Completion,
+    );
     next.global_gates =
         crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
     Ok(next)

@@ -546,16 +546,16 @@ pub(crate) fn resolve_rewrite_hooks(
     ranked.into_iter().map(|(_, t, p)| (t, p)).collect()
 }
 
-/// Resolve the GLOBAL request-stage TAP hooks — the `global_hooks` names whose registry entry is a
-/// `kind: tap` observing at the `request` stage (`at: request`, or unset which defaults to request),
-/// into their transports. Returns `(per-hook deadline, transport)` pairs. Taps are fire-and-forget so
-/// order is irrelevant, but a stable priority sort keeps startup deterministic. A non-request-stage
-/// tap (route/attempt/completion) is skipped here — those stages are a follow-up. Unresolvable
-/// transports are skipped (config_validate surfaces them at boot).
+/// Resolve the GLOBAL TAP hooks observing at ONE stage — the `global_hooks` names whose registry
+/// entry is a `kind: tap` with `at: <stage>` (an unset `at:` defaults to `request`) — into their
+/// transports. Returns `(per-hook deadline, prompt-grant, transport)` triples. Taps are
+/// fire-and-forget so order is irrelevant, but a stable priority sort keeps startup deterministic.
+/// Unresolvable transports are skipped (config_validate surfaces them at boot).
 pub(crate) fn resolve_tap_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
     client: &reqwest::Client,
+    stage: crate::config::HookStage,
 ) -> Vec<(std::time::Duration, bool, Arc<dyn RoutingPolicy>)> {
     let mut ranked: Vec<(u16, std::time::Duration, bool, Arc<dyn RoutingPolicy>)> = Vec::new();
     for name in global_hooks {
@@ -565,8 +565,8 @@ pub(crate) fn resolve_tap_hooks(
         if hook.kind != crate::config::HookKind::Tap {
             continue;
         }
-        // Request stage only for now (unset `at:` defaults to request).
-        if !matches!(hook.at, None | Some(crate::config::HookStage::Request)) {
+        // An unset `at:` defaults to the request stage.
+        if hook.at.unwrap_or(crate::config::HookStage::Request) != stage {
             continue;
         }
         // `send_prompt` carries the tap's `prompt: ro` grant through to the firing site, so a granted
@@ -1045,11 +1045,10 @@ mod tests {
         );
     }
 
-    /// `resolve_tap_hooks` admits ONLY `kind: tap` hooks observing at the `request` stage (unset
-    /// `at:` defaults to request). A gate is excluded (it fires on the gate seam, not the tap fan-out),
-    /// and a tap at a non-request stage is skipped (those stages are a follow-up). The two request-stage
-    /// taps below (one explicit `at: request`, one unset) both resolve; the gate and the completion-stage
-    /// tap do not.
+    /// `resolve_tap_hooks` admits ONLY `kind: tap` hooks observing at the REQUESTED stage (unset
+    /// `at:` defaults to request). A gate is excluded (it fires on the gate seam, not the tap
+    /// fan-out). The two request-stage taps below (one explicit `at: request`, one unset) resolve
+    /// for the request stage; the completion tap resolves for the completion stage only.
     #[test]
     fn resolve_tap_hooks_admits_only_request_stage_taps() {
         let client = reqwest::Client::new();
@@ -1084,11 +1083,26 @@ mod tests {
             "tap-completion".to_string(),
             "a-gate".to_string(),
         ];
-        let resolved = resolve_tap_hooks(&hooks, &global, &client);
+        let resolved =
+            resolve_tap_hooks(&hooks, &global, &client, crate::config::HookStage::Request);
         assert_eq!(
             resolved.len(),
             2,
             "only the two REQUEST-stage taps resolve; the gate and the completion-stage tap are excluded"
+        );
+        // The same registry resolved for the COMPLETION stage admits exactly the completion tap.
+        let completion = resolve_tap_hooks(
+            &hooks,
+            &global,
+            &client,
+            crate::config::HookStage::Completion,
+        );
+        assert_eq!(completion.len(), 1, "one completion-stage tap");
+        // And a stage nothing observes resolves empty (the zero-cost skip).
+        assert!(
+            resolve_tap_hooks(&hooks, &global, &client, crate::config::HookStage::Attempt)
+                .is_empty(),
+            "no attempt-stage tap is configured"
         );
         // Every resolved tap here is `prompt: no`, so `send_prompt` (the middle tuple element) is false.
         assert!(
@@ -1124,11 +1138,22 @@ mod tests {
             &hooks,
             &["ro-tap".to_string(), "no-tap".to_string()],
             &client,
+            crate::config::HookStage::Request,
         );
         assert_eq!(resolved.len(), 2);
         // Both taps share priority 0; identify each by re-resolving individually to assert the flag.
-        let ro = resolve_tap_hooks(&hooks, &["ro-tap".to_string()], &client);
-        let no = resolve_tap_hooks(&hooks, &["no-tap".to_string()], &client);
+        let ro = resolve_tap_hooks(
+            &hooks,
+            &["ro-tap".to_string()],
+            &client,
+            crate::config::HookStage::Request,
+        );
+        let no = resolve_tap_hooks(
+            &hooks,
+            &["no-tap".to_string()],
+            &client,
+            crate::config::HookStage::Request,
+        );
         assert!(ro[0].1, "prompt:ro tap carries send_prompt = true");
         assert!(!no[0].1, "prompt:no tap carries send_prompt = false");
     }

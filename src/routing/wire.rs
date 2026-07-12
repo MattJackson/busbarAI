@@ -19,6 +19,34 @@ pub(crate) struct HookRequest<'a> {
     pub(crate) request: HookReqProjection<'a>,
     pub(crate) candidates: Vec<HookCandidate<'a>>,
     pub(crate) context: HookContext<'a>,
+    /// TAP observation-stage payload — present ONLY on stage taps (`at: route|attempt|completion`);
+    /// absent on request-stage taps and every gate, so the pre-stages wire is byte-identical
+    /// (append-only schema).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stage: Option<HookStageProjection<'a>>,
+}
+
+/// The tap OBSERVATION-STAGE payload. Which fields are present depends on `at`:
+/// `route` carries the surviving candidate count after the decision reconcile;
+/// `attempt` carries the full failover story (attempt number, dispatched target, remaining
+/// candidates, and — from attempt 2 — why the previous attempt failed);
+/// `completion` carries the outcome (`ok` | `failed` | `rejected_by_gate` — the SYNTHETIC
+/// completion that lets an audit tap see denials) and the response status.
+#[derive(Serialize)]
+pub(crate) struct HookStageProjection<'a> {
+    pub(crate) at: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remaining_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_failure: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<u16>,
 }
 
 /// The request projection sent to a hook. THE CONTRACT: a **default bucket** of shape/metadata
@@ -305,6 +333,7 @@ pub(crate) fn build<'a>(
                 tags: c.tags,
             })
             .collect(),
+        stage: None,
         context: HookContext {
             pool: ctx.pool,
             budget_remaining: ctx.budget_remaining,

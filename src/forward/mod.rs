@@ -2650,6 +2650,119 @@ fn coerce_on_error(
     }
 }
 
+/// Shape scalars captured ONCE per request for the STAGE tap payloads (route/attempt/completion).
+/// All owned/`'static`-free scalars except the pool/protocol names (which outlive the request), so
+/// the capture survives `v` being consumed by the first dispatch hop. Stage taps are SHAPE-ONLY in
+/// this increment: the default signal bucket plus the stage object — never prompt content or caller
+/// identity, regardless of grant (never over-shares; a granted tap still gets content at the
+/// `request` stage).
+struct StageShape<'a> {
+    pool: &'a str,
+    ingress_protocol: &'a str,
+    message_count: usize,
+    has_tools: bool,
+    total_chars: usize,
+    max_tokens: Option<u32>,
+    stream: bool,
+}
+
+/// Capture the stage-tap shape from the parsed body (`None` = an opaque/binary body: zeroed shape).
+fn capture_stage_shape<'a>(
+    v: Option<&Value>,
+    pool: &'a str,
+    ingress_protocol: &'a str,
+    stream: bool,
+) -> StageShape<'a> {
+    let (message_count, has_tools, total_chars, max_tokens) = match v {
+        Some(v) => {
+            let system_chars = system_text_chars(v);
+            (
+                v.get("messages")
+                    .and_then(|m| m.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+                v.get("tools")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|a| !a.is_empty()),
+                total_text_chars(v, system_chars),
+                v.get("max_tokens")
+                    .and_then(|m| m.as_u64())
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+            )
+        }
+        None => (0, false, 0, None),
+    };
+    StageShape {
+        pool,
+        ingress_protocol,
+        message_count,
+        has_tools,
+        total_chars,
+        max_tokens,
+        stream,
+    }
+}
+
+/// Fire one STAGE's taps (route/attempt/completion) fire-and-forget: serialize the shape-only
+/// projection + stage object ONCE, then spawn one detached task per tap. A tap can never delay,
+/// reorder, or fail the request; a serialization failure silently skips the fire (observation is
+/// best-effort). ZERO COST when the stage has no taps (first-line empty check).
+fn fire_stage_taps(
+    taps: &[(
+        std::time::Duration,
+        bool,
+        Arc<dyn crate::routing::RoutingPolicy>,
+    )],
+    shape: &StageShape<'_>,
+    stage: crate::routing::wire::HookStageProjection<'_>,
+) {
+    if taps.is_empty() {
+        return;
+    }
+    let hook_req = crate::routing::wire::HookRequest {
+        request: crate::routing::wire::HookReqProjection {
+            pool: shape.pool,
+            ingress_protocol: shape.ingress_protocol,
+            message_count: shape.message_count,
+            has_tools: shape.has_tools,
+            total_chars: shape.total_chars,
+            max_tokens: shape.max_tokens,
+            stream: shape.stream,
+            system: None,
+            messages: None,
+            user: None,
+        },
+        candidates: Vec::new(),
+        context: crate::routing::wire::HookContext {
+            pool: shape.pool,
+            budget_remaining: None,
+        },
+        stage: Some(stage),
+    };
+    let Ok(bytes) = serde_json::to_vec(&hook_req) else {
+        return;
+    };
+    let bytes = std::sync::Arc::new(bytes);
+    for (timeout, _send_prompt, hook) in taps {
+        let policy = hook.clone();
+        let budget = *timeout;
+        let proj = bytes.clone();
+        tokio::spawn(async move { policy.notify(&proj, budget).await });
+    }
+}
+
+/// Response-extension marker set by every GATE-produced rejection return, so the completion-stage
+/// taps can report the SYNTHETIC `rejected_by_gate` outcome (audit taps see denials) instead of a
+/// generic `failed`.
+#[derive(Clone)]
+struct GateRejected;
+
+/// Tag a gate-produced rejection response with the [`GateRejected`] marker.
+fn gate_rejected(mut resp: Response) -> Response {
+    resp.extensions_mut().insert(GateRejected);
+    resp
+}
+
 /// Forward with pool name context for on_exhausted config lookup.
 /// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
 /// delegate. The ingress hot path (`route::forward_resolved`) instead calls
@@ -2709,6 +2822,82 @@ pub(crate) async fn forward_with_pool(
     fields(pool = %pool_name, ingress = %ingress_protocol, op = op.name())
 )]
 pub(crate) async fn forward_with_pool_parsed(
+    app: Arc<App>,
+    cands: Vec<WeightedLane>,
+    body: Bytes,
+    v: Option<Value>,
+    req_content_type: &str,
+    caller_token: Option<&str>,
+    pool_name: &str,
+    affinity_key: Option<&str>,
+    ingress_protocol: &str,
+    op: crate::handlers::Op,
+    usage_sink: Option<UsageSink>,
+) -> Response {
+    // ── STAGE TAPS: completion ── capture the shape BEFORE `v` moves into the dispatch core, fire
+    // AFTER the response head is known. `outcome`: a gate-produced rejection (marker extension) is
+    // the SYNTHETIC `rejected_by_gate`; else 2xx = `ok`, anything else = `failed`. For a STREAMING
+    // response this fires at response-HEAD time (status known, body still flowing) — stream-tail
+    // outcomes are a later increment. ZERO COST when no completion tap is configured.
+    let completion_shape = if app.tap_hooks_completion.is_empty() {
+        None
+    } else {
+        Some(capture_stage_shape(
+            v.as_ref(),
+            pool_name,
+            ingress_protocol,
+            v.as_ref()
+                .and_then(|b| b.get("stream"))
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false),
+        ))
+    };
+    let completion_app = app.clone();
+    let resp = forward_with_pool_parsed_inner(
+        app,
+        cands,
+        body,
+        v,
+        req_content_type,
+        caller_token,
+        pool_name,
+        affinity_key,
+        ingress_protocol,
+        op,
+        usage_sink,
+    )
+    .await;
+    if let Some(shape) = completion_shape {
+        let outcome = if resp.extensions().get::<GateRejected>().is_some() {
+            "rejected_by_gate"
+        } else if resp.status().is_success() {
+            "ok"
+        } else {
+            "failed"
+        };
+        fire_stage_taps(
+            &completion_app.tap_hooks_completion,
+            &shape,
+            crate::routing::wire::HookStageProjection {
+                at: "completion",
+                target: None,
+                attempt_number: None,
+                remaining_candidates: None,
+                previous_failure: None,
+                outcome: Some(outcome),
+                status: Some(resp.status().as_u16()),
+            },
+        );
+    }
+    resp
+}
+
+/// The dispatch core behind [`forward_with_pool_parsed`] (the thin wrapper exists only to fire the
+/// completion-stage taps around the whole request).
+//
+// Plumbing function: same parameter set as the public wrapper.
+#[allow(clippy::too_many_arguments)]
+async fn forward_with_pool_parsed_inner(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     body: Bytes,
@@ -3000,20 +3189,20 @@ pub(crate) async fn forward_with_pool_parsed(
                         message = %message,
                         "decision gate rejected the request"
                     );
-                    return ingress_error(
+                    return gate_rejected(ingress_error(
                         ingress_protocol,
                         StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN),
                         reject_kind_for_status(*status),
                         message,
-                    );
+                    ));
                 }
                 PolicyOutcome::Reject => {
-                    return ingress_error(
+                    return gate_rejected(ingress_error(
                         ingress_protocol,
                         StatusCode::SERVICE_UNAVAILABLE,
                         KIND_OVERLOADED,
                         "A required gate could not complete. Please retry shortly.",
-                    );
+                    ));
                 }
                 _ => {}
             }
@@ -3062,13 +3251,13 @@ pub(crate) async fn forward_with_pool_parsed(
                             pool = pool_name,
                             "decision gate restrict left no eligible lane (on_empty: reject)"
                         );
-                        return ingress_error(
+                        return gate_rejected(ingress_error(
                             ingress_protocol,
                             StatusCode::SERVICE_UNAVAILABLE,
                             KIND_OVERLOADED,
                             "No upstream satisfies a required gate's restriction. Please retry \
                              shortly.",
-                        );
+                        ));
                     }
                 } else {
                     cands = restricted;
@@ -3155,12 +3344,13 @@ pub(crate) async fn forward_with_pool_parsed(
                     // on_error == reject (and the policy errored/timed out / saturated): fail closed with a
                     // 503 rather than silently degrading. Never strands as a hang — a clean rejection.
                     PolicyOutcome::Reject => {
-                        return ingress_error(
-                        ingress_protocol,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        KIND_OVERLOADED,
-                        "The routing policy could not select an upstream. Please retry shortly.",
-                    );
+                        return gate_rejected(ingress_error(
+                            ingress_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            KIND_OVERLOADED,
+                            "The routing policy could not select an upstream. Please retry \
+                             shortly.",
+                        ));
                     }
                     // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
                     // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
@@ -3192,12 +3382,12 @@ pub(crate) async fn forward_with_pool_parsed(
                             message = %message,
                             "routing policy rejected the request"
                         );
-                        return ingress_error(
+                        return gate_rejected(ingress_error(
                             ingress_protocol,
                             StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
                             reject_kind_for_status(status),
                             &message,
-                        );
+                        ));
                     }
                     // The hook's RESTRICT verb: intersect the failover candidate set with members
                     // carrying one of `tags_any`, then let SWRR pick among the survivors. Shrinking
@@ -3247,13 +3437,13 @@ pub(crate) async fn forward_with_pool_parsed(
                                 pool = pool_name,
                                 "routing policy restrict left no eligible lane (on_empty: reject)"
                             );
-                                return ingress_error(
-                                ingress_protocol,
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                KIND_OVERLOADED,
-                                "No upstream satisfies the routing policy's restriction. Please \
-                                 retry shortly.",
-                            );
+                                return gate_rejected(ingress_error(
+                                    ingress_protocol,
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    KIND_OVERLOADED,
+                                    "No upstream satisfies the routing policy's restriction. \
+                                     Please retry shortly.",
+                                ));
                             }
                         } else {
                             // Commit the restriction: shrink `cands` to the survivors so it PERSISTS
@@ -3279,8 +3469,39 @@ pub(crate) async fn forward_with_pool_parsed(
     // the retained `body` bytes — never from a previous hop's egress-shaped Value — preserving the
     // mixed-protocol-pool correctness the per-hop re-parse was introduced for.
     let body_is_json = v.is_some();
+    // ── STAGE TAPS: route + attempt shape ── captured ONCE (scalars only, so it survives `v`
+    // moving into the first hop). Fire the `route` taps now: the decision reconcile + base ordering
+    // above produced the FINAL candidate set for dispatch. ZERO COST when no stage tap is configured.
+    let stage_shape = if app.tap_hooks_route.is_empty() && app.tap_hooks_attempt.is_empty() {
+        None
+    } else {
+        Some(capture_stage_shape(
+            v.as_ref(),
+            pool_name,
+            ingress_protocol,
+            wants_stream,
+        ))
+    };
+    if let Some(shape) = &stage_shape {
+        fire_stage_taps(
+            &app.tap_hooks_route,
+            shape,
+            crate::routing::wire::HookStageProjection {
+                at: "route",
+                target: None,
+                attempt_number: None,
+                remaining_candidates: Some(cands.len()),
+                previous_failure: None,
+                outcome: None,
+                status: None,
+            },
+        );
+    }
+    // Why the PREVIOUS attempt failed — feeds the attempt-stage tap payload (the failover story).
+    let mut last_failure: Option<&'static str> = None;
+
     let mut first_hop_v = v;
-    for _attempt in 0..=max_cap {
+    for attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
         if request_ctx.expired(now()) {
             return ingress_error(
@@ -3334,6 +3555,31 @@ pub(crate) async fn forward_with_pool_parsed(
 
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
+
+        // ── STAGE TAPS: attempt ── the full failover story, per dispatch attempt: which lane,
+        // which attempt number, how many candidates remain untried, and why the previous attempt
+        // failed (None on the first).
+        if let Some(shape) = &stage_shape {
+            let remaining = cands
+                .iter()
+                .filter(|wl| !request_ctx.excluded.contains(&wl.idx))
+                .count();
+            fire_stage_taps(
+                &app.tap_hooks_attempt,
+                shape,
+                crate::routing::wire::HookStageProjection {
+                    at: "attempt",
+                    target: Some(&app.lanes[i].model),
+                    attempt_number: Some(
+                        u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX),
+                    ),
+                    remaining_candidates: Some(remaining),
+                    previous_failure: last_failure,
+                    outcome: None,
+                    status: None,
+                },
+            );
+        }
 
         // The bounded `pool` LABEL for THIS hop's upstream/failover/breaker metrics (LOW #25).
         // Resolves to the routed lane's model name on the default (`""`) cell so these series
@@ -3559,6 +3805,7 @@ pub(crate) async fn forward_with_pool_parsed(
                             attempt_timeout_ms = ms,
                             "no response headers within the attempt cap; failing over"
                         );
+                        last_failure = Some("attempt_timeout");
                         drop(permit);
                         continue;
                     }
@@ -3599,6 +3846,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     "reason" => err_type.to_string()
                 )
                 .increment(1);
+                last_failure = Some(err_type);
                 drop(permit);
                 continue;
             }
@@ -3831,6 +4079,7 @@ pub(crate) async fn forward_with_pool_parsed(
                                 "reason" => DISPOSITION_TRANSIENT
                             )
                             .increment(1);
+                            last_failure = Some(DISPOSITION_TRANSIENT);
                             drop(permit);
                             continue;
                         }
@@ -3935,6 +4184,7 @@ pub(crate) async fn forward_with_pool_parsed(
                                 "reason" => DISPOSITION_HARD_DOWN
                             )
                             .increment(1);
+                            last_failure = Some(DISPOSITION_HARD_DOWN);
                             continue;
                         }
                         Disposition::ContextLength => {
@@ -3979,6 +4229,7 @@ pub(crate) async fn forward_with_pool_parsed(
                             // HalfOpen until the slow out-of-band prober rescues it. Release it so the
                             // lane is immediately probe-eligible again for normal-size requests.
                             app.store.release_probe_in(pool_name, i);
+                            last_failure = Some(DISPOSITION_CONTEXT_LENGTH);
                             drop(permit);
                             continue;
                         }
@@ -11407,6 +11658,156 @@ mod hook_seam_tests {
             .and_then(|m| m.as_str())
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// Build a webhook TAP transport pointed at a mock server, as the App stage-tap triple.
+    async fn webhook_tap() -> (
+        crate::test_support::MockServer,
+        Arc<crate::test_support::MockServerState>,
+        (
+            std::time::Duration,
+            bool,
+            Arc<dyn crate::routing::RoutingPolicy>,
+        ),
+    ) {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        for _ in 0..4 {
+            state.push(crate::test_support::MockResponse::Ok {
+                status: StatusCode::OK,
+                body: serde_json::json!({}),
+            });
+        }
+        let server = crate::test_support::MockServer::new(state.clone()).await;
+        let url = crate::observability::validate_routing_webhook_url(Some(&format!(
+            "{}/tap",
+            server.base_url()
+        )))
+        .expect("loopback tap url");
+        let policy: Arc<dyn crate::routing::RoutingPolicy> = Arc::new(
+            crate::routing::webhook::WebhookPolicy::new(url, reqwest::Client::new()),
+        );
+        (
+            server,
+            state,
+            (std::time::Duration::from_millis(500), false, policy),
+        )
+    }
+
+    /// Poll the mock tap server until it records a request body (taps are detached tasks).
+    async fn wait_for_tap_body(state: &crate::test_support::MockServerState) -> serde_json::Value {
+        for _ in 0..200 {
+            if let Some(body) = state.get_last_request_body() {
+                return serde_json::from_slice(&body).expect("tap payload is JSON");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("tap was never delivered");
+    }
+
+    /// STAGE TAPS: a completion tap fires with the SYNTHETIC `rejected_by_gate` outcome when a
+    /// decision gate rejects — audit taps see denials, not just served requests.
+    #[tokio::test]
+    async fn completion_tap_fires_synthetic_rejected_by_gate() {
+        let (server, state, tap) = webhook_tap().await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.tap_hooks_completion = vec![tap];
+            inner.global_gates = vec![(0u16, canned_gate(Canned::Reject(451, "denied"), "denier"))];
+        }
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 451);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "completion");
+        assert_eq!(payload["stage"]["outcome"], "rejected_by_gate");
+        assert_eq!(payload["stage"]["status"], 451);
+        server.shutdown().await;
+    }
+
+    /// STAGE TAPS: a completion tap reports `ok` + the status for a served request.
+    #[tokio::test]
+    async fn completion_tap_reports_ok_outcome() {
+        let (server, state, tap) = webhook_tap().await;
+        let lane = mock_lane("served").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &lane.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_completion = vec![tap];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "completion");
+        assert_eq!(payload["stage"]["outcome"], "ok");
+        assert_eq!(payload["stage"]["status"], 200);
+        server.shutdown().await;
+        lane.shutdown().await;
+    }
+
+    /// STAGE TAPS: an attempt tap carries the failover story — attempt number + dispatched target.
+    #[tokio::test]
+    async fn attempt_tap_carries_attempt_story() {
+        let (server, state, tap) = webhook_tap().await;
+        let lane = mock_lane("served").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &lane.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_attempt = vec![tap];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "attempt");
+        assert_eq!(payload["stage"]["attempt_number"], 1);
+        assert_eq!(payload["stage"]["target"], "m0");
+        assert!(
+            payload["stage"].get("previous_failure").is_none(),
+            "no failure precedes the first attempt"
+        );
+        server.shutdown().await;
+        lane.shutdown().await;
+    }
+
+    /// STAGE TAPS: a route tap observes the post-reconcile candidate-set size.
+    #[tokio::test]
+    async fn route_tap_reports_surviving_candidates() {
+        let (server, state, tap) = webhook_tap().await;
+        let lane = mock_lane("served").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &lane.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").tap_hooks_route = vec![tap];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "route");
+        assert_eq!(payload["stage"]["remaining_candidates"], 1);
+        server.shutdown().await;
+        lane.shutdown().await;
     }
 
     /// A test policy whose decide always errors — the on_error-chain tests' failing primary.

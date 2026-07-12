@@ -146,6 +146,28 @@ pub(crate) struct App {
         bool,
         Arc<dyn crate::routing::RoutingPolicy>,
     )>,
+    /// GLOBAL taps observing at the ROUTE stage (`at: route`) — fired once per request when the
+    /// decision reconcile has produced the final candidate set. Same triple shape as `tap_hooks`.
+    pub(crate) tap_hooks_route: Vec<(
+        std::time::Duration,
+        bool,
+        Arc<dyn crate::routing::RoutingPolicy>,
+    )>,
+    /// GLOBAL taps observing at the ATTEMPT stage (`at: attempt`) — fired per failover attempt with
+    /// the attempt number / dispatched target / remaining candidates / previous failure.
+    pub(crate) tap_hooks_attempt: Vec<(
+        std::time::Duration,
+        bool,
+        Arc<dyn crate::routing::RoutingPolicy>,
+    )>,
+    /// GLOBAL taps observing at the COMPLETION stage (`at: completion`) — fired once per request
+    /// with the outcome (`ok`/`failed`/`rejected_by_gate` — the SYNTHETIC completion, so audit taps
+    /// see gate denials too) and response status.
+    pub(crate) tap_hooks_completion: Vec<(
+        std::time::Duration,
+        bool,
+        Arc<dyn crate::routing::RoutingPolicy>,
+    )>,
     /// GLOBAL DECISION gates — the non-rewrite `kind: gate` hooks in `global_hooks`, resolved to
     /// their full `ResolvedPolicy` (transport + on_error/on_empty/grants), each with its `priority`.
     /// Fired CONCURRENTLY on every request in the phase-2 decision reconcile, merged with the pool's
