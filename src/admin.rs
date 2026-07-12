@@ -684,17 +684,21 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION")),
             "info must report the build version"
         );
-        // The default build compiles both removable plugins in; `weighted_floor` is always true.
+        // The `weighted_floor` is ALWAYS true (non-removable). `tokens`/`ranking` are present iff their
+        // feature is compiled in — so the compliance-by-compilation proof holds under
+        // `--no-default-features` too (the lists are empty there).
         assert_eq!(body["build"]["weighted_floor"], serde_json::json!(true));
         let auth_modules = body["build"]["auth_modules"].as_array().unwrap();
-        assert!(
+        assert_eq!(
             auth_modules.iter().any(|m| m == "tokens"),
-            "default build has the tokens auth module compiled in: {auth_modules:?}"
+            cfg!(feature = "auth-tokens"),
+            "auth_modules must contain `tokens` iff the auth-tokens feature is compiled in: {auth_modules:?}"
         );
         let hook_plugins = body["build"]["hook_plugins"].as_array().unwrap();
-        assert!(
+        assert_eq!(
             hook_plugins.iter().any(|m| m == "ranking"),
-            "default build has the ranking hook plugin compiled in: {hook_plugins:?}"
+            cfg!(feature = "hooks-ranking"),
+            "hook_plugins must contain `ranking` iff the hooks-ranking feature is compiled in: {hook_plugins:?}"
         );
         // Topology keys are present and numeric (exact counts depend on the TestApp fixture).
         assert!(body["topology"]["pools"].is_number());
@@ -908,22 +912,32 @@ mod tests {
             }
         };
 
-        // auth: the compiled-in tokens module (default build).
+        // auth: the compiled-in tokens module — present iff the auth-tokens feature is compiled in.
         let auth: serde_json::Value = get("auth").await.json().await.unwrap();
         let a_items = auth["items"].as_array().unwrap();
-        let tokens = a_items
-            .iter()
-            .find(|p| p["name"] == "tokens")
-            .expect("tokens compiled in");
-        assert_eq!(tokens["loader"], "compiled-in");
-        assert_eq!(tokens["type"], "auth");
+        let tokens = a_items.iter().find(|p| p["name"] == "tokens");
+        assert_eq!(
+            tokens.is_some(),
+            cfg!(feature = "auth-tokens"),
+            "tokens listed iff compiled in"
+        );
+        if let Some(tokens) = tokens {
+            assert_eq!(tokens["loader"], "compiled-in");
+            assert_eq!(tokens["type"], "auth");
+        }
 
-        // hooks: weighted floor (compiled-in) + ranking (compiled-in) + the external myhook.
+        // hooks: the weighted floor is ALWAYS compiled-in; ranking iff the feature is on; plus the
+        // external myhook.
         let hooks: serde_json::Value = get("hooks").await.json().await.unwrap();
         let h_items = hooks["items"].as_array().unwrap();
         assert!(h_items
             .iter()
             .any(|p| p["name"] == "weighted" && p["loader"] == "compiled-in"));
+        assert_eq!(
+            h_items.iter().any(|p| p["name"] == "ranking"),
+            cfg!(feature = "hooks-ranking"),
+            "ranking listed iff compiled in"
+        );
         let ext = h_items
             .iter()
             .find(|p| p["name"] == "myhook")
