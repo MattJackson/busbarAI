@@ -122,6 +122,12 @@ pub(crate) struct App {
     /// `ro`/`no` hook can never rewrite (the bidirectional grant holds by construction). Each entry is
     /// `(per-hook transform deadline, transport)`.
     pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
+    /// GLOBAL request-stage TAP hooks — the `kind: tap` hooks in `global_hooks` observing at the
+    /// `request` stage, resolved to their transports. Fired FIRE-AND-FORGET (spawned off the request
+    /// path) before dispatch — a tap can never delay or fail the request. Empty (the default) = no
+    /// taps, zero cost. Each entry is `(per-hook deadline, transport)`. Other stages
+    /// (route/attempt/completion + synthetic rejected-completion) are follow-ups.
+    pub(crate) tap_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
     /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).

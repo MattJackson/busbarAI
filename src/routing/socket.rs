@@ -201,18 +201,11 @@ impl RoutingPolicy for SocketPolicy {
         super::wire::parse_rewrite(&parsed.rewrite?)
     }
 
-    /// TAP: write-only fire-and-forget send of the request projection. No reply is read. Bounded by
-    /// `budget`; any error is swallowed — a tap never affects the served request.
-    #[allow(dead_code)] // wired into the forward tap seam next (slice-6 step)
-    async fn notify(&self, req: &RoutingRequest<'_>, budget: Duration) {
-        let empty: [Candidate<'_>; 0] = [];
-        let ctx = RoutingContext {
-            pool: req.pool,
-            budget_remaining: None,
-        };
-        let Ok(mut line) = serde_json::to_vec(&super::wire::build(req, &empty, &ctx)) else {
-            return;
-        };
+    /// TAP: write-only fire-and-forget send of the pre-serialized projection. No reply is read.
+    /// Bounded by `budget`; any error is swallowed — a tap never affects the served request.
+    async fn notify(&self, projection: &[u8], budget: Duration) {
+        let mut line = Vec::with_capacity(projection.len() + 1);
+        line.extend_from_slice(projection);
         line.push(b'\n');
         let _ = tokio::time::timeout(budget, self.write_only(&line)).await;
     }
@@ -380,7 +373,9 @@ mod tests {
             let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
         });
         let policy = SocketPolicy::new(path.to_string_lossy().into_owned());
-        policy.notify(&req(), Duration::from_secs(2)).await;
+        let projection =
+            serde_json::to_vec(&super::super::wire::build(&req(), &[], &ctx())).unwrap();
+        policy.notify(&projection, Duration::from_secs(2)).await;
         let received = tokio::time::timeout(Duration::from_secs(2), rx)
             .await
             .expect("tap should receive the projection")

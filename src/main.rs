@@ -664,6 +664,8 @@ async fn main() {
     // transports ONCE. Empty unless the operator configured a rewrite hook — zero cost by default.
     let rewrite_hooks =
         routing::resolve_rewrite_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+    // Resolve the global request-stage tap hooks the same way. Empty unless configured.
+    let tap_hooks = routing::resolve_tap_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
 
     let app = Arc::new(App {
         lanes,
@@ -673,6 +675,7 @@ async fn main() {
         client: upstream_client.clone(),
         auth: auth_mw.clone(),
         rewrite_hooks,
+        tap_hooks,
         failover_cfg,
         pool_runtime,
         fallback_pools,

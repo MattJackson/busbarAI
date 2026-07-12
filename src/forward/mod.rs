@@ -2090,6 +2090,7 @@ fn build_rewrite_request<'a>(
     pool_name: &'a str,
     ingress_protocol: &'a str,
     wants_stream: bool,
+    with_prompt: bool,
 ) -> crate::routing::RoutingRequest<'a> {
     let system_chars = system_text_chars(v);
     crate::routing::RoutingRequest {
@@ -2117,7 +2118,10 @@ fn build_rewrite_request<'a>(
             .and_then(|m| m.as_u64())
             .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
         stream: wants_stream,
-        prompt: Some(build_prompt_projection(v)),
+        // A `prompt: rw` rewrite gate needs the prompt content (`with_prompt`). A TAP gets the
+        // shape-only default bucket (`with_prompt == false`) — a per-grant prompt projection for
+        // `prompt: ro` taps is a follow-up; shape-only never OVER-shares, so the grant holds.
+        prompt: with_prompt.then(|| build_prompt_projection(v)),
         identity: None,
     }
 }
@@ -2140,7 +2144,7 @@ async fn apply_global_rewrites(
 ) {
     for (timeout, hook) in rewrite_hooks {
         // Rebuild the projection from the current body so a later hook sees the earlier rewrite.
-        let req = build_rewrite_request(v, pool_name, ingress_protocol, wants_stream);
+        let req = build_rewrite_request(v, pool_name, ingress_protocol, wants_stream, true);
         let rewritten = hook.transform(&req, *timeout).await;
         drop(req); // end the immutable borrow of `v` before mutating it
         if let Some(rw) = rewritten {
@@ -2672,6 +2676,35 @@ pub(crate) async fn forward_with_pool_parsed(
                 wants_stream,
             )
             .await;
+        }
+    }
+
+    // ── GLOBAL TAP (observe) FIRE ────────────────────────────────────────────────────────────────
+    // Fire the global request-stage `kind: tap` hooks FIRE-AND-FORGET: serialize the shape-only
+    // projection ONCE to owned bytes, then spawn one detached task per tap. A tap gets a write-only
+    // send with its own deadline; its reply (if any) is ignored, its errors swallowed — a tap can
+    // NEVER delay, reorder, or fail the request. Runs AFTER the rewrite pass so a tap observes the
+    // effective (post-compression) body. ZERO COST when no tap is configured (empty-list branch).
+    if !app.tap_hooks.is_empty() {
+        if let Some(body) = v.as_ref() {
+            let tap_req =
+                build_rewrite_request(body, pool_name, ingress_protocol, wants_stream, false);
+            if let Ok(bytes) = serde_json::to_vec(&crate::routing::wire::build(
+                &tap_req,
+                &[],
+                &crate::routing::RoutingContext {
+                    pool: pool_name,
+                    budget_remaining: None,
+                },
+            )) {
+                let projection = std::sync::Arc::new(bytes);
+                for (timeout, hook) in &app.tap_hooks {
+                    let policy = hook.clone();
+                    let proj = projection.clone();
+                    let budget = *timeout;
+                    tokio::spawn(async move { policy.notify(&proj, budget).await });
+                }
+            }
         }
     }
 

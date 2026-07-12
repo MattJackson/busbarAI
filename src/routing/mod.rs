@@ -256,13 +256,13 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
         None
     }
 
-    /// TAP (fire-and-forget): WRITE the request projection to the hook and return — a tap is
-    /// write-only in steady state, so NO reply is read. Best-effort and bounded by `budget`; ANY
-    /// error is swallowed by the transport, because a tap can NEVER delay or fail the served request
-    /// (the caller also spawns this off the request path). DEFAULT no-op: in-process policies are not
-    /// taps; only the out-of-process socket/webhook transports override it.
-    #[allow(dead_code)] // dispatched by the forward tap seam next (slice-6 step)
-    async fn notify(&self, _req: &RoutingRequest<'_>, _budget: std::time::Duration) {}
+    /// TAP (fire-and-forget): WRITE the pre-serialized request projection (JSON bytes, no trailing
+    /// newline — the transport frames it) to the hook and return. A tap is write-only in steady
+    /// state, so NO reply is read. Best-effort and bounded by `budget`; ANY error is swallowed,
+    /// because a tap can NEVER delay or fail the served request (the caller SPAWNS this off the
+    /// request path, which is why it takes owned bytes, not a borrowed projection). DEFAULT no-op:
+    /// in-process policies are not taps; only the out-of-process socket/webhook transports override it.
+    async fn notify(&self, _projection: &[u8], _budget: std::time::Duration) {}
 }
 
 /// The per-pool routing policy resolved ONCE at config load. `None` is the zero-cost default
@@ -418,6 +418,40 @@ pub(crate) fn resolve_rewrite_hooks(
         };
         // ONLY a gate with prompt: rw is a rewrite hook — the grant enforcement point.
         if hook.kind != crate::config::HookKind::Gate || !hook.prompt.can_rewrite() {
+            continue;
+        }
+        if let Some(ResolvedPolicy::Policy {
+            policy, timeout, ..
+        }) = resolve_gate_transport(hook, client)
+        {
+            ranked.push((hook.priority, timeout, policy));
+        }
+    }
+    ranked.sort_by_key(|(p, _, _)| *p);
+    ranked.into_iter().map(|(_, t, p)| (t, p)).collect()
+}
+
+/// Resolve the GLOBAL request-stage TAP hooks — the `global_hooks` names whose registry entry is a
+/// `kind: tap` observing at the `request` stage (`at: request`, or unset which defaults to request),
+/// into their transports. Returns `(per-hook deadline, transport)` pairs. Taps are fire-and-forget so
+/// order is irrelevant, but a stable priority sort keeps startup deterministic. A non-request-stage
+/// tap (route/attempt/completion) is skipped here — those stages are a follow-up. Unresolvable
+/// transports are skipped (config_validate surfaces them at boot).
+pub(crate) fn resolve_tap_hooks(
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+    global_hooks: &[String],
+    client: &reqwest::Client,
+) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
+    let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
+    for name in global_hooks {
+        let Some(hook) = hooks.get(name) else {
+            continue;
+        };
+        if hook.kind != crate::config::HookKind::Tap {
+            continue;
+        }
+        // Request stage only for now (unset `at:` defaults to request).
+        if !matches!(hook.at, None | Some(crate::config::HookStage::Request)) {
             continue;
         }
         if let Some(ResolvedPolicy::Policy {
@@ -671,6 +705,52 @@ mod tests {
             resolved.len(),
             1,
             "only the prompt:rw GATE is a rewrite hook; ro/no gates + the tap are excluded"
+        );
+    }
+
+    /// `resolve_tap_hooks` admits ONLY `kind: tap` hooks observing at the `request` stage (unset
+    /// `at:` defaults to request). A gate is excluded (it fires on the gate seam, not the tap fan-out),
+    /// and a tap at a non-request stage is skipped (those stages are a follow-up). The two request-stage
+    /// taps below (one explicit `at: request`, one unset) both resolve; the gate and the completion-stage
+    /// tap do not.
+    #[test]
+    fn resolve_tap_hooks_admits_only_request_stage_taps() {
+        let client = reqwest::Client::new();
+        let mk = |kind: HookKind, at: Option<crate::config::HookStage>| HookCfg {
+            kind,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9932/".to_string()),
+            timeout_ms: 5,
+            on_error: PolicyOnError::default(),
+            prompt: PromptAccess::No,
+            user: UserAccess::No,
+            priority: 0,
+            at,
+            on_empty: None,
+            global: true,
+        };
+        let mut hooks = HashMap::new();
+        hooks.insert(
+            "tap-req".to_string(),
+            mk(HookKind::Tap, Some(crate::config::HookStage::Request)),
+        );
+        hooks.insert("tap-unset".to_string(), mk(HookKind::Tap, None));
+        hooks.insert(
+            "tap-completion".to_string(),
+            mk(HookKind::Tap, Some(crate::config::HookStage::Completion)),
+        );
+        hooks.insert("a-gate".to_string(), mk(HookKind::Gate, None));
+        let global = vec![
+            "tap-req".to_string(),
+            "tap-unset".to_string(),
+            "tap-completion".to_string(),
+            "a-gate".to_string(),
+        ];
+        let resolved = resolve_tap_hooks(&hooks, &global, &client);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "only the two REQUEST-stage taps resolve; the gate and the completion-stage tap are excluded"
         );
     }
 

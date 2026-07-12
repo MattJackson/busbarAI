@@ -728,6 +728,7 @@ impl TestApp {
             client: reqwest::Client::builder().build().unwrap(),
             auth,
             rewrite_hooks: Vec::new(),
+            tap_hooks: Vec::new(),
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,
