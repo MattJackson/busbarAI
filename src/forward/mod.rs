@@ -10995,6 +10995,114 @@ mod hook_seam_tests {
         assert!(matches!(out, PolicyOutcome::Weighted), "abstain ⇒ weighted");
     }
 
+    /// FIRING: a GLOBAL decision gate that rejects short-circuits the whole request — no upstream is
+    /// dispatched (the lane URL is a dead localhost that would fail if reached) and the caller gets the
+    /// gate's clamped 4xx. Proves `App.global_gates` is actually fired in `forward_with_pool_parsed`
+    /// before pool routing, not just resolved.
+    #[tokio::test]
+    async fn global_gate_reject_short_circuits_the_request() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead — a dispatch would fail; the reject must prevent it
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: Arc::new(StdMutex::new(None)),
+                reject: Some((451, "blocked by global policy".to_string())),
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        // Inject the global gate (Arc refcount is 1 right after build()).
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![gate];
+
+        let body =
+            serde_json::to_vec(&serde_json::json!({"model": "p", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}))
+                .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            body.into(),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "a global reject gate must short-circuit with its clamped status, before any dispatch"
+        );
+    }
+
+    /// A GLOBAL gate that ABSTAINS does not interfere — the request proceeds past the global-gate loop
+    /// to normal routing (and here fails to connect to the dead lane, i.e. NOT a 451). Proves the
+    /// global-gate loop is a no-op on abstain.
+    #[tokio::test]
+    async fn global_gate_abstain_does_not_reject() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: Arc::new(StdMutex::new(None)),
+                reject: None, // abstain
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![gate];
+
+        let body =
+            serde_json::to_vec(&serde_json::json!({"model": "p", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}))
+                .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            body.into(),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+        assert_ne!(
+            resp.status().as_u16(),
+            451,
+            "an abstaining global gate must not reject the request"
+        );
+    }
+
     /// `send_prompt: true` alone: the policy sees the flattened content; identity stays absent.
     #[tokio::test]
     async fn send_prompt_projects_content_only() {
