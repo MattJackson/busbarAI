@@ -661,6 +661,11 @@ async fn main() {
         _ => None,
     };
 
+    // Resolve the global rewrite hooks (prompt: rw gates in global_hooks) into priority-ordered
+    // transports ONCE. Empty unless the operator configured a rewrite hook — zero cost by default.
+    let rewrite_hooks =
+        routing::resolve_rewrite_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+
     let app = Arc::new(App {
         lanes,
         store,
@@ -668,6 +673,7 @@ async fn main() {
         pools,
         client: upstream_client.clone(),
         auth: auth_mw.clone(),
+        rewrite_hooks,
         failover_cfg,
         pool_runtime,
         fallback_pools,

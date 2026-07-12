@@ -1248,6 +1248,7 @@ mod tests {
             auth: Arc::new(crate::auth::AuthMiddleware::new(
                 &crate::config::AuthCfg::default_none(),
             )),
+            rewrite_hooks: Vec::new(),
             failover_cfg: None,
             pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),

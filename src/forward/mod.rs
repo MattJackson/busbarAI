@@ -2055,7 +2055,6 @@ enum PolicyOutcome {
 /// `false` and leaves `v` UNTOUCHED — the request proceeds with the ORIGINAL body, never a corrupted
 /// one. (Full canonical re-render across ALL six dialects via the IR — `IrReq` — is the follow-up;
 /// see docs/1.3-everything-is-a-hook.md "Rewrite forward-integration crux".)
-#[allow(dead_code)] // dispatched by the forward global-hooks transform seam next (slice-4 step)
 fn apply_rewrite_to_body(v: &mut Value, rewrite: &crate::routing::wire::RewriteReply) -> bool {
     if rewrite.messages.is_empty() {
         return false;
@@ -2081,6 +2080,73 @@ fn apply_rewrite_to_body(v: &mut Value, rewrite: &crate::routing::wire::RewriteR
         }
     }
     true
+}
+
+/// Build the request projection a rewrite (`prompt: rw`) gate receives. The prompt is ALWAYS sent (a
+/// rewrite hook is a content hook); identity is omitted (rewrite operates on content, not caller
+/// identity — the `user` grant projection for rewrite hooks is a follow-up). Borrows from `v`.
+fn build_rewrite_request<'a>(
+    v: &'a Value,
+    pool_name: &'a str,
+    ingress_protocol: &'a str,
+    wants_stream: bool,
+) -> crate::routing::RoutingRequest<'a> {
+    let system_chars = system_text_chars(v);
+    crate::routing::RoutingRequest {
+        pool: pool_name,
+        ingress_protocol,
+        requested_model: v.get("model").and_then(|m| m.as_str()),
+        message_count: v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        tool_count: v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        has_tools: v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|a| !a.is_empty()),
+        total_chars: total_text_chars(v, system_chars),
+        system_chars,
+        max_tokens: v
+            .get("max_tokens")
+            .and_then(|m| m.as_u64())
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        stream: wants_stream,
+        prompt: Some(build_prompt_projection(v)),
+        identity: None,
+    }
+}
+
+/// The GLOBAL REWRITE (transform) pass: fire each `prompt: rw` gate in PRIORITY order, each seeing the
+/// prior gate's output (the projection is rebuilt from the CURRENT body every iteration — a true
+/// transform chain), and apply its rewrite to the body in place. FAIL-SAFE end to end: a hook that
+/// errors/times out/abstains yields `None` (`transform`) and is skipped; `apply_rewrite_to_body` only
+/// touches a chat-shaped body. Zero cost when no rewrite hook is configured (the caller guards on the
+/// empty list before calling).
+async fn apply_global_rewrites(
+    rewrite_hooks: &[(
+        std::time::Duration,
+        std::sync::Arc<dyn crate::routing::RoutingPolicy>,
+    )],
+    v: &mut Value,
+    pool_name: &str,
+    ingress_protocol: &str,
+    wants_stream: bool,
+) {
+    for (timeout, hook) in rewrite_hooks {
+        // Rebuild the projection from the current body so a later hook sees the earlier rewrite.
+        let req = build_rewrite_request(v, pool_name, ingress_protocol, wants_stream);
+        let rewritten = hook.transform(&req, *timeout).await;
+        drop(req); // end the immutable borrow of `v` before mutating it
+        if let Some(rw) = rewritten {
+            apply_rewrite_to_body(v, &rw);
+        }
+    }
 }
 
 /// Chars of the request's system prompt: a bare string, or — when the system value is a block
@@ -2540,8 +2606,9 @@ pub(crate) async fn forward_with_pool_parsed(
     body: Bytes,
     // The request body parsed ONCE by the caller for JSON-body operations; `None` for an OPAQUE
     // ingress body (multipart transcription, binary) — those relay/translate at the BYTE level via
-    // the operation codecs and skip every JSON-only read below.
-    v: Option<Value>,
+    // the operation codecs and skip every JSON-only read below. `mut` so the global rewrite pass can
+    // mutate it before dispatch.
+    mut v: Option<Value>,
     // The ingress request Content-Type — the byte-level codec's parse hint (multipart boundary).
     req_content_type: &str,
     caller_token: Option<&str>,
@@ -2589,6 +2656,24 @@ pub(crate) async fn forward_with_pool_parsed(
     // Delegated to the operation: chat reads the OpenAI-family `stream` boolean (byte-identical to
     // the previous inline read); a non-streaming op always returns false.
     let wants_stream = v.as_ref().map(|v| op.wants_stream(v)).unwrap_or(false);
+
+    // ── GLOBAL REWRITE (transform) PASS ─────────────────────────────────────────────────────────
+    // Fire the global `prompt: rw` gates (compression/redaction) BEFORE dispatch AND before the
+    // routing decision, so the decision + upstream both see the rewritten body. Priority-ordered
+    // transform chain; fail-safe throughout (a broken hook is skipped, a non-chat body is untouched).
+    // ZERO COST when no rewrite hook is configured — the common case is a single always-false branch.
+    if !app.rewrite_hooks.is_empty() {
+        if let Some(body) = v.as_mut() {
+            apply_global_rewrites(
+                &app.rewrite_hooks,
+                body,
+                pool_name,
+                ingress_protocol,
+                wants_stream,
+            )
+            .await;
+        }
+    }
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
     // body, not SSE. The route layer signals this via a router shim key (read here; stripped from the
@@ -5103,6 +5188,60 @@ mod usage_tap_tests {
         };
         assert!(!super::apply_rewrite_to_body(&mut v2, &empty));
         assert_eq!(v2, before2);
+    }
+
+    /// `apply_global_rewrites` fires the hooks in order and each sees the prior's output (a true
+    /// transform chain): a two-hook chain where hook A rewrites "orig"→"A" and hook B rewrites
+    /// whatever it sees →"B" ends at "B", proving B ran on A's output.
+    #[tokio::test]
+    async fn apply_global_rewrites_chains_in_order() {
+        use crate::routing::wire::RewriteReply;
+        use crate::routing::{
+            Candidate, PolicyResult, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
+        };
+
+        // A mock rewrite hook that replaces the (single) message content with a fixed marker.
+        struct RewriteMock(&'static str);
+        #[async_trait::async_trait]
+        impl RoutingPolicy for RewriteMock {
+            async fn decide(
+                &self,
+                _r: &RoutingRequest<'_>,
+                _c: &[Candidate<'_>],
+                _x: &RoutingContext<'_>,
+                _b: std::time::Duration,
+            ) -> PolicyResult {
+                Ok(RoutingDecision::Abstain)
+            }
+            fn name(&self) -> &'static str {
+                "mock-rewrite"
+            }
+            async fn transform(
+                &self,
+                _req: &RoutingRequest<'_>,
+                _budget: std::time::Duration,
+            ) -> Option<RewriteReply> {
+                Some(RewriteReply {
+                    messages: vec![serde_json::json!({"role": "user", "content": self.0})],
+                    tools: vec![],
+                })
+            }
+        }
+
+        let hooks: Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> = vec![
+            (
+                std::time::Duration::from_millis(50),
+                Arc::new(RewriteMock("A")),
+            ),
+            (
+                std::time::Duration::from_millis(50),
+                Arc::new(RewriteMock("B")),
+            ),
+        ];
+        let mut v = serde_json::json!({"messages": [{"role": "user", "content": "orig"}]});
+        super::apply_global_rewrites(&hooks, &mut v, "pool", "anthropic", false).await;
+        // Last hook in the chain wins; B ran on A's rewritten body.
+        assert_eq!(v["messages"][0]["content"], "B");
     }
 
     // Regression for #29: the token fee charged at response completion must be attributed to the

@@ -377,6 +377,38 @@ fn gate_on_empty(hook: &crate::config::HookCfg) -> crate::config::PolicyOnError 
         .unwrap_or(crate::config::PolicyOnError::Reject)
 }
 
+/// Resolve the GLOBAL rewrite hooks — the `global_hooks` names whose registry entry is a `kind: gate`
+/// with a `prompt: rw` grant — into their transports, sorted by ASCENDING `priority` (the transform
+/// chain order; `weighted`-tie-break by config order is preserved by the stable sort). Returns
+/// `(per-hook transform deadline, transport)` pairs. The `rw` GRANT IS ENFORCED HERE: a `ro`/`no`
+/// gate (or a tap, or a non-rewrite gate) is skipped, so it can never rewrite — the bidirectional
+/// grant holds by construction, independent of what a hook tries to return. Unresolvable transports
+/// (bad socket/webhook) are skipped; config_validate surfaces those loudly at boot.
+pub(crate) fn resolve_rewrite_hooks(
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+    global_hooks: &[String],
+    client: &reqwest::Client,
+) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
+    let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
+    for name in global_hooks {
+        let Some(hook) = hooks.get(name) else {
+            continue;
+        };
+        // ONLY a gate with prompt: rw is a rewrite hook — the grant enforcement point.
+        if hook.kind != crate::config::HookKind::Gate || !hook.prompt.can_rewrite() {
+            continue;
+        }
+        if let Some(ResolvedPolicy::Policy {
+            policy, timeout, ..
+        }) = resolve_gate_transport(hook, client)
+        {
+            ranked.push((hook.priority, timeout, policy));
+        }
+    }
+    ranked.sort_by_key(|(p, _, _)| *p);
+    ranked.into_iter().map(|(_, t, p)| (t, p)).collect()
+}
+
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
 /// SWRR with a loud pointer at the webhook transport. The request is never stranded.
 #[cfg(not(unix))]

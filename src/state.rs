@@ -115,6 +115,13 @@ pub(crate) struct App {
     pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
     pub(crate) client: Client,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
+    /// GLOBAL rewrite hooks — the `prompt: rw` gates named in `global_hooks`, resolved to their
+    /// transports and sorted by ascending `priority` (the transform-chain order). Fired before
+    /// dispatch to mutate the request body (compression/redaction). Empty (the default) = no rewrite
+    /// pass, zero cost. Only `rw` gates land here — the grant is enforced at RESOLUTION, so a
+    /// `ro`/`no` hook can never rewrite (the bidirectional grant holds by construction). Each entry is
+    /// `(per-hook transform deadline, transport)`.
+    pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
     /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).
