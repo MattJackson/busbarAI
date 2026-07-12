@@ -2031,6 +2031,14 @@ enum PolicyOutcome {
         message: String,
         name: &'static str,
     },
+    /// The hook's RESTRICT verb: the failover candidate set must be intersected with members carrying
+    /// one of `tags_any` BEFORE selection, and that restriction persists across hops. An EMPTY
+    /// intersection is fail-closed (`on_empty` default reject) — never allow-all. `tags_any` may be
+    /// empty (a fail-closed-normalized malformed restrict), which forces the empty intersection.
+    Restrict {
+        tags_any: Vec<String>,
+        name: &'static str,
+    },
 }
 
 /// Chars of the request's system prompt: a bare string, or — when the system value is a block
@@ -2362,8 +2370,11 @@ async fn decide_policy_order(
                 },
                 RoutingDecision::Abstain => PolicyOutcome::Weighted,
                 // `from_ranked` only ever produces Prefer/Abstain — it normalizes an order, it
-                // cannot invent a rejection.
+                // cannot invent a rejection or a restriction.
                 RoutingDecision::Reject { .. } => unreachable!("from_ranked never rejects"),
+                RoutingDecision::Restrict { .. } => {
+                    unreachable!("from_ranked never restricts")
+                }
             }
         }
         // Abstain is the clean "no opinion" — today's exact SWRR (NOT coerced via on_error).
@@ -2382,6 +2393,14 @@ async fn decide_policy_order(
                 403
             },
             message: crate::routing::wire::sanitize_reject_message(&message),
+            name: policy.name(),
+        },
+        // The hook's RESTRICT verb: keep only candidates carrying one of `tags_any` (a compliance
+        // gate). The intersection + on_empty are applied at the failover-set seam in `forward_with_
+        // pool`; here we just carry the tag set through. An empty `tags_any` (malformed restrict,
+        // normalized fail-closed) forces the empty intersection → on_empty, never allow-all.
+        RoutingDecision::Restrict { tags_any } => PolicyOutcome::Restrict {
+            tags_any,
             name: policy.name(),
         },
     }
@@ -2490,7 +2509,7 @@ pub(crate) async fn forward_with_pool_parsed(
     // not a valid egress for the operation — a clean no-handler 404 in the CALLER's dialect, never a
     // silent dispatch. Dormant while all six protocols serve chat; load-bearing the moment one is
     // removed (the deletion test).
-    let cands: Vec<WeightedLane> = {
+    let mut cands: Vec<WeightedLane> = {
         let (kept, dropped): (Vec<WeightedLane>, Vec<WeightedLane>) =
             cands.into_iter().partition(|wl| {
                 crate::handlers::request_handler(app.lanes[wl.idx].protocol.name())
@@ -2695,6 +2714,50 @@ pub(crate) async fn forward_with_pool_parsed(
                         reject_kind_for_status(status),
                         &message,
                     );
+                }
+                // The hook's RESTRICT verb: intersect the failover candidate set with members
+                // carrying one of `tags_any`, then let SWRR pick among the survivors. Shrinking
+                // `cands` here makes the restriction PERSIST across every failover hop (each hop
+                // selects from this set) — the compliance guarantee ("only these lanes, ever"). An
+                // EMPTY intersection is fail-closed (`on_empty` default reject), never allow-all;
+                // an empty `tags_any` (fail-closed-normalized malformed restrict) forces it.
+                PolicyOutcome::Restrict { tags_any, name } => {
+                    let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
+                    cands.retain(|wl| {
+                        members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                            meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                        })
+                    });
+                    if cands.is_empty() {
+                        metrics::counter!(
+                            crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                            "policy" => name,
+                            "pool" => pool_name.to_string(),
+                            "status" => "503".to_string(),
+                        )
+                        .increment(1);
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            "routing policy restrict left no eligible lane (on_empty: reject)"
+                        );
+                        return ingress_error(
+                            ingress_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            KIND_OVERLOADED,
+                            "No upstream satisfies the routing policy's restriction. Please retry \
+                             shortly.",
+                        );
+                    }
+                    chosen_policy_name = Some(name);
+                    metrics::counter!(
+                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                        "policy" => name,
+                        "pool" => pool_name.to_string(),
+                    )
+                    .increment(1);
+                    // SWRR among the restricted survivors (no ranked order imposed by restrict).
+                    None
                 }
             }
         }
@@ -10533,6 +10596,7 @@ mod hook_seam_tests {
             PolicyOutcome::Weighted => "Weighted",
             PolicyOutcome::Reject => "Reject",
             PolicyOutcome::RejectRequest { .. } => "RejectRequest",
+            PolicyOutcome::Restrict { .. } => "Restrict",
         }
     }
 

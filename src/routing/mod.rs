@@ -215,6 +215,13 @@ pub(crate) enum RoutingDecision {
     /// seam RE-CLAMPS the status regardless — so no policy impl, shipped or future, can mint a
     /// 5xx, a success, or a header-injecting message through this path.
     Reject { status: u16, message: String },
+    /// RESTRICT the candidate set to members carrying ANY of these `tags` — a compliance gate ("only
+    /// BAA-covered lanes"). Unlike `Prefer` (deprioritize-not-exclude), restrict EXCLUDES every
+    /// non-matching member from the failover set entirely and persists across hops. An empty
+    /// intersection is the gate's `on_empty` (default fail-closed reject), never allow-all. Produced
+    /// only via `wire::normalize` (fail-closed: a malformed restrict yields empty `tags_any` → the
+    /// on_empty path, never a silent allow-all).
+    Restrict { tags_any: Vec<String> },
 }
 
 /// THE transport-agnostic contract. webhook / socket / script / native all implement this.

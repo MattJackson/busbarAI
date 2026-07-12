@@ -123,8 +123,6 @@ pub(crate) struct HookResponse {
     /// never silently allow-all. Parsed by `parse_restrict`. Wired into the two-phase decision seam in
     /// a later slice-4 step; the reply contract + parser land here first (tested in isolation).
     #[serde(default)]
-    #[allow(dead_code)]
-    // consumed when the two-phase decision seam is wired (later slice-4 step)
     pub(crate) restrict: Option<serde_json::Value>,
     /// REWRITE the request body (`{"rewrite": {"messages": [...], "tools": [...]}}`) — the
     /// compression/redaction arm (Headroom). Untyped + FAIL-CLOSED: a malformed/oversize rewrite must
@@ -149,7 +147,6 @@ pub(crate) struct RestrictReply {
 /// strings]}`; anything else (not an object, missing/empty/non-array `tags_any`, no usable string
 /// entries) yields `None` — the caller treats that as the gate's `on_error`, never allow-all. Tag
 /// strings are trimmed; empty/whitespace-only entries are dropped.
-#[allow(dead_code)] // wired into the two-phase decision seam in a later slice-4 step
 pub(crate) fn parse_restrict(value: &serde_json::Value) -> Option<RestrictReply> {
     let tags_any: Vec<String> = value
         .get("tags_any")?
@@ -309,6 +306,17 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
                 reject.get("message").and_then(|m| m.as_str()).unwrap_or(""),
             );
             return RoutingDecision::Reject { status, message };
+        }
+    }
+    // RESTRICT comes after reject (reject wins) and before order. FAIL-CLOSED like reject: any
+    // `restrict` value except an explicit `false` restricts; a malformed one (parse_restrict → None)
+    // yields an EMPTY tag set, which downstream resolves via the gate's `on_empty` — never allow-all.
+    if let Some(restrict) = parsed.restrict {
+        if restrict != serde_json::Value::Bool(false) {
+            let tags_any = parse_restrict(&restrict)
+                .map(|r| r.tags_any)
+                .unwrap_or_default();
+            return RoutingDecision::Restrict { tags_any };
         }
     }
     if parsed.abstain {
@@ -622,6 +630,38 @@ mod tests {
             RoutingDecision::Abstain
         ));
         assert!(matches!(norm(r#"{}"#), RoutingDecision::Abstain));
+    }
+
+    /// `normalize` maps `restrict` to `RoutingDecision::Restrict` with reject > restrict > order
+    /// precedence; a malformed restrict is fail-closed to an EMPTY tag set (→ on_empty downstream),
+    /// and `restrict: false` is the explicit opt-out.
+    #[test]
+    fn normalize_restrict_precedence_and_fail_closed() {
+        // Well-formed restrict → the tags.
+        match norm(r#"{"restrict":{"tags_any":["baa"]}}"#) {
+            RoutingDecision::Restrict { tags_any } => assert_eq!(tags_any, vec!["baa".to_string()]),
+            other => panic!("expected Restrict, got {other:?}"),
+        }
+        // reject WINS over a co-present restrict.
+        assert!(matches!(
+            norm(r#"{"reject":{"status":403},"restrict":{"tags_any":["baa"]}}"#),
+            RoutingDecision::Reject { .. }
+        ));
+        // restrict WINS over a co-present order.
+        assert!(matches!(
+            norm(r#"{"restrict":{"tags_any":["x"]},"order":[0,1]}"#),
+            RoutingDecision::Restrict { .. }
+        ));
+        // Malformed restrict → fail-closed empty tag set (→ on_empty), never allow-all/order.
+        match norm(r#"{"restrict":{"tags_any":[]}}"#) {
+            RoutingDecision::Restrict { tags_any } => assert!(tags_any.is_empty()),
+            other => panic!("malformed restrict must stay Restrict (fail-closed), got {other:?}"),
+        }
+        // Explicit opt-out: `restrict: false` is NOT a restriction.
+        assert!(matches!(
+            norm(r#"{"restrict":false,"order":[1,0]}"#),
+            RoutingDecision::Prefer(_)
+        ));
     }
 
     /// `parse_restrict` is FAIL-CLOSED: a well-formed restrict yields the trimmed non-empty tags; any
