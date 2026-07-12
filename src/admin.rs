@@ -1925,6 +1925,7 @@ mod tests {
         let text = resp.text().await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         // Composed sections present.
+        assert_eq!(body["version"], 0, "fresh config is version 0");
         assert!(body["auth"]["chain"].is_array());
         assert!(body["pools"]
             .as_array()

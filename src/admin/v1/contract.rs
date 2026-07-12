@@ -334,6 +334,9 @@ impl<T> Page<T> {
 /// overlay) lands with the config overlay substrate.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveConfigView {
+    /// The monotonic config version at the time of this read (see `InfoView.config_version`) — so a
+    /// drift-detection read gets the config AND its version in one call.
+    pub(crate) version: u64,
     pub(crate) auth: AuthView,
     pub(crate) pools: Vec<PoolView>,
     pub(crate) models: Vec<ModelView>,

@@ -409,6 +409,7 @@ impl AdminService {
     /// lands with the overlay substrate.
     pub(crate) async fn get_config(&self) -> Result<EffectiveConfigView, AdminError> {
         Ok(EffectiveConfigView {
+            version: self.app.config_version,
             auth: self.get_auth().await?,
             pools: self.list_pools().await?.items,
             models: self.list_models().await?.items,
