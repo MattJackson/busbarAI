@@ -138,6 +138,29 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     Ok(next)
 }
 
+/// Build the next `App` snapshot with `name` REMOVED from the hook registry — the pure core of
+/// `DELETE /admin/v1/hooks/{name}`. `not_found` if the name is unregistered. Clones the current
+/// snapshot (sharing live state), drops the hook from the registry + global wiring, and re-resolves
+/// the rewrite/tap transports. Lanes/store untouched (breaker state preserved). Same GLOBAL scope as
+/// `build_with_hook`: pool-`hook:` references are resolved into `pool_runtime` at startup and are NOT
+/// re-resolved here — that (plus the dangling-ref 409) lands with the broader config/apply.
+pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, AdminError> {
+    if !current.hook_registry.contains_key(name) {
+        return Err(AdminError::NotFound(format!("hook `{name}`")));
+    }
+    let mut next = current.clone();
+    next.hook_registry.remove(name);
+    next.global_hooks.retain(|n| n != name);
+    next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+    );
+    next.tap_hooks =
+        crate::routing::resolve_tap_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    Ok(next)
+}
+
 /// The admin application core. Cheap to construct and clone-free to share (`Arc<App>` inside); a
 /// transport builds ONE and hands `Arc<AdminService>` to its routes.
 pub(crate) struct AdminService {

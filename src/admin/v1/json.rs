@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::contract::AdminError;
-use super::service::{build_with_hook, AdminService};
+use super::service::{build_with_hook, build_without_hook, AdminService};
 use crate::admin::transport::AdminTransport;
 use crate::state::AppHandle;
 
@@ -45,7 +45,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/models", get(list_models))
             .route("/admin/v1/providers", get(list_providers))
             .route("/admin/v1/hooks", get(list_hooks).post(register_hook))
-            .route("/admin/v1/hooks/{name}", get(get_hook))
+            .route("/admin/v1/hooks/{name}", get(get_hook).delete(delete_hook))
             .route("/admin/v1/hooks/{name}/health", get(hook_health))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
@@ -196,6 +196,20 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
                 StatusCode::CREATED,
                 service(&handle).get_hook(&req.name).await,
             )
+        }
+        Err(e) => err_json(&e),
+    }
+}
+
+/// `DELETE /admin/v1/hooks/{name}` — remove a hook at RUNTIME (live). Builds the next snapshot without
+/// the hook (dropped from the registry + global wiring, transports re-resolved) and swaps it in.
+/// `404 not_found` if the hook is unregistered. `204 No Content` on success.
+async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+    let current = handle.load();
+    match build_without_hook(&current, &name) {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => err_json(&e),
     }

@@ -1143,6 +1143,71 @@ mod tests {
         handle.abort();
     }
 
+    /// `DELETE /admin/v1/hooks/{name}` removes a hook at runtime (live): register → delete (204) →
+    /// GET /hooks/{name} 404. Deleting an unregistered hook is 404.
+    #[tokio::test]
+    async fn test_admin_v1_delete_hook_takes_effect_live() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let tok = ("x-admin-token", "admintok");
+
+        // Register a global tap.
+        let created = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header(tok.0, tok.1)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "logger",
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9978/", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+
+        // Delete an absent hook → 404.
+        let absent = client
+            .delete(format!("http://{addr}/admin/v1/hooks/nope"))
+            .header(tok.0, tok.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(absent.status().as_u16(), 404);
+
+        // Delete the registered hook → 204, and it's gone live.
+        let deleted = client
+            .delete(format!("http://{addr}/admin/v1/hooks/logger"))
+            .header(tok.0, tok.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status().as_u16(), 204);
+
+        let after = client
+            .get(format!("http://{addr}/admin/v1/hooks/logger"))
+            .header(tok.0, tok.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.status().as_u16(),
+            404,
+            "the hook is gone from the live config"
+        );
+
+        handle.abort();
+    }
+
     /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
     /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
     /// secret. Built on a fixture with one global gate.
