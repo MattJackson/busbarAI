@@ -6,16 +6,28 @@ Everything Busbar knows about itself — its topology, its hooks, its auth postu
 
 ---
 
-## Authentication
+## Authentication & scopes
 
-Every `/admin` request is guarded by the admin token (the same one that has always guarded `/admin/keys`). Present it as either header:
+Every `/admin` request is authenticated by the **`admin_auth:` chain** (default `[admin-tokens]` — the single operator admin token). Present the token as either header:
 
 ```
 x-admin-token: <token>
 Authorization: Bearer <token>
 ```
 
-A missing or wrong token is `401` on every endpoint — no admin read leaks without the credential. The admin token is configured under `governance.admin_token` (see [Configuration](https://getbusbar.com/docs/configuration/)).
+A missing or wrong credential is `401` on every endpoint — no admin read leaks without it. The admin token is configured under `governance.admin_token` (see [Configuration](https://getbusbar.com/docs/configuration/)). `admin_auth: []` is the explicit open dev posture; external admin modules (SSO/AD) slot into the same chain at compile time.
+
+**Authorization is a scope ladder** on the authenticated principal — `read-only` ⊂ `hooks-register` ⊂ `full` — checked per endpoint, never derived from the request body:
+
+| Scope | May |
+|---|---|
+| `read-only` | every `GET` |
+| `hooks-register` | reads + hook-definition mutations (`POST`/`PUT`/`DELETE` under `/admin/v1/hooks`) |
+| `full` | everything: keys, config rollback, cache — every other mutation |
+
+The operator admin token holds `full`. Group-carrying principals (external modules) get the most permissive `admin_scope` their groups map to in `group_map:`; unmapped groups grant nothing. Insufficient scope is `403 forbidden` naming the scope that would have sufficed.
+
+**Mutation rate limits.** Mutations are budgeted per principal in one-minute windows: config-plane mutations (rollback) at 10/min, everything else at 60/min. Failed attempts count (anti-enumeration). Over-budget is `429 rate_limited`, and the event is audited. Reads are unmetered.
 
 ## The error envelope
 
@@ -30,7 +42,8 @@ Every `/admin/v1` error is the same shape. Branch on `code` (stable), never on `
 | `not_found` | 404 | The named resource does not exist |
 | `invalid_request` | 400 | The request is malformed or a parameter is invalid |
 | `forbidden` | 403 | The credential lacks the scope for this endpoint |
-| `conflict` | 409 | Optimistic-concurrency mismatch (a stale write) |
+| `conflict` | 409 | Optimistic-concurrency mismatch (a stale write), or an immutable property change |
+| `rate_limited` | 429 | The principal's per-minute mutation budget is spent |
 | `internal` | 500 | An internal failure (details are logged server-side, never returned) |
 
 ## Discovery
@@ -83,7 +96,10 @@ Module names and modes only — never a token.
 |---|---|
 | `GET /admin/v1/usage` | Fleet usage aggregation: spend/tokens/requests totals plus a per-key breakdown |
 | `GET /admin/v1/config` | The effective running config as one snapshot (`version`, auth, pools, models, providers, hooks, global hooks) — for drift detection. Composed from the redacted reads above, so it carries no secret |
-| `GET /admin/v1/audit` | The admin audit log — every config mutation with its outcome (`applied`/`rejected`), newest first: who changed what, when. No secrets |
+| `GET /admin/v1/audit` | The admin audit log — every config mutation with its outcome (`applied`/`rejected`), newest first, hash-chained for tamper evidence and **attributed to the acting principal**. No secrets |
+| `GET /admin/v1/config/versions` | Config version history, newest first: `version`, timestamp, acting principal, and a one-line summary of the mutation that produced it |
+| `GET /admin/v1/config/versions/{v}` | One retained version with its full hook-surface snapshot |
+| `GET /admin/v1/config/diff?from=&to=` | A structured diff between two versions: hook names added/removed/changed + the global-wiring delta |
 | `POST /admin/v1/config/validate` | **Dry-run** a proposed config (`config.yaml` deploy block + `providers.yaml` defs) through the same resolve + validate Busbar runs at boot, without applying anything. Returns `{ "ok": true }` or `{ "ok": false, "errors": [...] }`. A malformed request body is `invalid_request`; a valid request describing an invalid config is `200` with `ok: false` |
 
 `config/validate` lets CI or your tooling preview a config change safely before rollout.
@@ -94,12 +110,13 @@ The virtual-key management surface (mint, inspect, adjust, revoke) is served und
 
 | Endpoint | Does |
 |---|---|
-| `GET /admin/v1/keys` | List keys (metadata only — never the secret or hash) |
+| `GET /admin/v1/keys` | List keys (metadata only — never the secret or hash). Paginate with `?limit=&offset=` over the id-sorted set; `total` counts the filtered set |
 | `GET /admin/v1/keys/{id}` | One key's metadata |
 | `POST /admin/v1/keys` | Mint a key (the secret is returned exactly once, here) |
 | `PATCH /admin/v1/keys/{id}` | Adjust budgets, rate limits, allowed pools, enabled |
 | `DELETE /admin/v1/keys/{id}` | Revoke |
 | `GET /admin/v1/keys/{id}/usage` | Current-window spend/tokens/requests |
+| `POST /admin/v1/keys/{id}/rotate` | Mint a **fresh secret in place**: same id (budgets, rate windows, usage history, and audit attribution carry over), the old secret stops resolving immediately, the new secret is returned exactly once |
 
 > The unversioned `/admin/keys*` routes remain as a deprecated alias for back-compatibility. New tooling should use `/admin/v1/`.
 
@@ -116,7 +133,11 @@ Busbar's config plane is live: an authenticated write takes effect immediately, 
 | Endpoint | Does |
 |---|---|
 | `POST /admin/v1/hooks` | Register (or replace) a hook at runtime. Body: `{ "name": "...", "config": { "kind": "gate\|tap", "webhook"\|"socket": "...", ... } }`. A `global: true` hook is live for the next request. Returns `201` with the hook definition. Invalid definitions (missing/both transports, `prompt: rw` on a `tap`) return `400 invalid_request` and change nothing |
+| `PUT /admin/v1/hooks/{name}` | Replace an existing **overlay** hook definition, live. `404` for an unknown name (PUT replaces; POST creates); `409 conflict` for a base-config-defined hook (edit the file — the API never silently shadows it) or a grant change (`kind`/`prompt`/`user` are immutable; delete and re-register to change them) |
 | `DELETE /admin/v1/hooks/{name}` | Remove a hook at runtime. `204` on success, `404 not_found` if unregistered |
+| `POST /admin/v1/config/rollback` | Restore a retained version's hook surface. Body: `{ "version": N, "expected_version": M? }`. The target is **re-validated against current reality** before the swap; the result is a NEW version (history is append-only). `404` for a pruned/unknown target; `409` on a stale `expected_version` |
+
+`POST`/`PUT` hook mutations also accept `expected_version` (the current `config_version` you read) for optimistic concurrency — a stale write is `409 conflict`, never a lost update.
 
 ```bash
 # Register a global compression gate — live immediately
