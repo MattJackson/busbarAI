@@ -1,90 +1,10 @@
 ---
 // The Hook Store — a marketing gallery of prebuilt hooks (NOT documentation).
-// Recaps what a hook is, then lists shippable hooks, each linking out to its
-// GitHub repo, with a CTA to submit your own. Uses PageLayout chrome/typography;
-// the card grid + CTA styles are scoped below.
+// Recaps what a hook is, then lists hooks as cards. Each card links to the hook's
+// own detail page (/hooks/{slug}); the "Yours" CTA card links to email instead.
+// Hook data is shared with the detail pages via src/data/hooks.ts.
 import PageLayout from '../layouts/PageLayout.astro';
-
-const GITHUB = 'https://github.com/MattJackson/busbarAI';
-
-// One entry per hook. `kind` is tap | gate (the two hook types); `status` drives
-// the badge: 'Available' (shippable, green + repo link), 'Example' (a template to
-// fork, amber + repo link), 'Idea' (not built — a prompt for what's possible), and
-// the final 'Yours' card (`cta: true`) which carries the submit-your-own message.
-// Keep copy tight and confident, matching the site voice.
-const hooks = [
-  {
-    name: 'Headroom',
-    kind: 'gate',
-    tagline: 'Context compression, on the path.',
-    body: 'A rewrite gate that trims and compacts a request’s context before it ships — so a long conversation stays under the window without your app rebuilding the prompt. Written once, it works against every protocol and provider Busbar speaks.',
-    repo: 'https://github.com/GetBusbar',
-    status: 'Available',
-    note: 'Powered by the open-source <a href="https://headroomlabs-ai.github.io/headroom/" target="_blank" rel="noopener">Headroom</a> project.',
-  },
-  {
-    name: 'Smart Router',
-    kind: 'gate',
-    tagline: 'Route by cost, latency, and live load.',
-    body: 'A worked example, not a finished product: a routing gate that picks the backend per request from real signals — each member’s cost, latency, live concurrency, and rate headroom. It’s a template to read, fork, and shape into the router you actually want.',
-    repo: `${GITHUB}/tree/main/examples/smart-router`,
-    linkLabel: 'View the example →',
-    status: 'Example',
-    note: 'Read the write-up: <a href="/blog/smart-routing-today/">the smart router you want is a hook</a>.',
-  },
-  {
-    name: 'Your hook',
-    kind: 'gate',
-    tagline: 'Built something worth sharing?',
-    body: 'A guardrail, a router, a cost meter, an audit sink — anything that runs on the path. Tell us what it does and where it lives, and we’ll list it here and link straight to your repo.',
-    note: 'Email us, or open a PR against <a href="https://github.com/MattJackson/busbarAI" target="_blank" rel="noopener">the repo</a>.',
-    repo: null,
-    status: 'Yours',
-    cta: true,
-  },
-  {
-    name: 'PII Guard',
-    kind: 'gate',
-    tagline: 'Redact sensitive data before it leaves.',
-    body: 'A gate that inspects and rewrites the request body, stripping or masking sensitive data — credit-card numbers, SSNs and other socials, patient records — before it reaches any provider. One guard covers every model behind Busbar, so the redaction rule lives in one place, not in every app.',
-    repo: null,
-    status: 'Idea',
-  },
-  {
-    name: 'Secret Shield',
-    kind: 'gate',
-    tagline: 'Keep your .env out of the prompt.',
-    body: 'AI coding agents load your <code>.env</code> into memory and can slip those secrets into a prompt — where they get logged, committed, or exfiltrated. A gate that scrubs the outbound body against your registered secrets catches them before the request ever leaves, for every provider at once.',
-    repo: null,
-    status: 'Idea',
-  },
-  {
-    name: 'SIEM Audit',
-    kind: 'tap',
-    tagline: 'Every call, in your security stack.',
-    body: 'A fire-and-forget tap that streams the full request and response to your SIEM or compliance archive without touching the hop. A complete, provider-agnostic audit trail for every AI call your org makes.',
-    repo: null,
-    status: 'Idea',
-  },
-  {
-    name: 'Prompt Firewall',
-    kind: 'gate',
-    tagline: 'Block jailbreaks and injection at the door.',
-    body: 'A gate that scores each request against injection and jailbreak patterns and rejects the dangerous ones before they reach a model — enforced once, in front of every provider, instead of bolted onto each app.',
-    repo: null,
-    status: 'Idea',
-  },
-  {
-    name: 'Semantic Cache',
-    kind: 'gate',
-    tagline: 'Skip the call when you already know the answer.',
-    body: 'A gate that recognises a request it has answered before and short-circuits it — returning the cached response instead of paying for the round-trip. Provider-agnostic, so the cache spans every model behind Busbar.',
-    repo: null,
-    status: 'Idea',
-  },
-];
-
-const kindLabel = { tap: 'Tap', gate: 'Gate' };
+import { hooks, kindLabel } from '../data/hooks';
 ---
 
 <PageLayout
@@ -105,7 +25,15 @@ const kindLabel = { tap: 'Tap', gate: 'Gate' };
   <h2>In the store</h2>
   <div class="hook-store">
     {hooks.map((h) => (
-      <article class:list={['store-card', { 'is-idea': !h.repo && !h.cta, 'is-cta': h.cta }]}>
+      <article class:list={['store-card', { 'is-idea': h.status === 'Idea', 'is-cta': h.cta, 'is-link': !!h.href }]}>
+        {h.href && (
+          <a
+            class="store-cover"
+            href={h.href}
+            aria-label={h.name}
+            {...(h.external ? { target: '_blank', rel: 'noopener' } : {})}
+          />
+        )}
         <div class="store-head">
           {h.cta
             ? <span class="store-kind kind-any">Tap or gate</span>
@@ -114,7 +42,7 @@ const kindLabel = { tap: 'Tap', gate: 'Gate' };
         </div>
         <h3>{h.name}</h3>
         <p class="store-tag">{h.tagline}</p>
-        <p class="store-body">{h.body}</p>
+        <p class="store-body" set:html={h.body}></p>
         {h.note && <p class="store-note" set:html={h.note} />}
         {(h.repo || h.cta) && (
           <div class="store-foot">
@@ -141,6 +69,7 @@ const kindLabel = { tap: 'Tap', gate: 'Gate' };
       margin: 0 0 12px;
     }
     .store-card {
+      position: relative;
       display: flex;
       flex-direction: column;
       background: #fff;
@@ -149,11 +78,27 @@ const kindLabel = { tap: 'Tap', gate: 'Gate' };
       padding: 22px 22px 20px;
       transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
     }
-    .store-card:hover {
+    /* Only cards that link somewhere (is-link) or carry the CTA lift on hover —
+       Idea cards are static prompts, so they stay put and show no pointer. */
+    .store-card.is-link:hover,
+    .store-card.is-cta:hover {
       border-color: #cbd5e1;
       box-shadow: 0 12px 30px -14px rgba(15, 23, 42, 0.16);
       transform: translateY(-2px);
     }
+    /* The stretched cover link makes the whole card clickable; footer/note links
+       sit above it (position + z-index) so they stay independently clickable. */
+    .store-cover {
+      position: absolute;
+      inset: 0;
+      z-index: 0;
+      border-radius: inherit;
+    }
+    .store-card.is-link { cursor: pointer; }
+    .store-card.is-link h3 { transition: color 0.15s; }
+    .store-card.is-link:hover h3 { color: #4d7c0f; }
+    .store-note a,
+    .store-foot { position: relative; z-index: 1; }
     /* Ideas: unbuilt prompts — a softer card so they read as suggestions, not products. */
     .store-card.is-idea { background: var(--bg-soft); }
     /* The "Yours" card: lime-tinted with a green edge, so the invitation stands out. */
@@ -183,9 +128,11 @@ const kindLabel = { tap: 'Tap', gate: 'Gate' };
       text-transform: uppercase;
       color: #4d7c0f;
     }
-    /* Badge states: Available (shippable, green), Example (a template to fork,
-       amber), Idea (unbuilt prompt, muted), Yours (the invitation, green). */
+    /* Badge states: Available (shippable, green), Coming soon (built, not yet
+       linkable, amber), Example (a template to fork, amber), Idea (unbuilt
+       prompt, muted), Yours (the invitation, green). */
     .store-status.status-available { color: #4d7c0f; }
+    .store-status.status-coming-soon { color: #b45309; }
     .store-status.status-example { color: #b45309; }
     .store-status.status-idea { color: var(--muted); }
     .store-status.status-yours { color: #4d7c0f; }
