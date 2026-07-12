@@ -52,6 +52,9 @@ impl AdminTransport for JsonRest {
         // each handler pulls `Arc<AdminService>` and maps the typed result onto the JSON wire.
         Router::new()
             .route("/admin/v1/info", get(info))
+            .route("/admin/v1/pools", get(list_pools))
+            .route("/admin/v1/models", get(list_models))
+            .route("/admin/v1/providers", get(list_providers))
             .layer(axum::Extension(service))
     }
 }
@@ -93,6 +96,21 @@ fn respond<T: Serialize>(status: StatusCode, result: Result<T, AdminError>) -> R
 /// `GET /admin/v1/info` — thin adapter: call the service, project the typed result onto JSON.
 async fn info(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.info().await)
+}
+
+/// `GET /admin/v1/pools` — pool topology for the fleet dashboard.
+async fn list_pools(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.list_pools().await)
+}
+
+/// `GET /admin/v1/models` — model lanes + providers.
+async fn list_models(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.list_models().await)
+}
+
+/// `GET /admin/v1/providers` — distinct providers + lane counts.
+async fn list_providers(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.list_providers().await)
 }
 
 /// Mount the admin v1 surface onto `router` using the given transport over the shared `App`. Called

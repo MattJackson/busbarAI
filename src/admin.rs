@@ -704,6 +704,87 @@ mod tests {
         handle.abort();
     }
 
+    /// The topology read surface (`/admin/v1/pools`, `/models`, `/providers`) flows through the
+    /// service and projects the pool/model/provider views. Built on a two-lane, two-provider fixture
+    /// so the provider aggregation + pool membership are observable.
+    #[tokio::test]
+    async fn test_admin_v1_topology_reads_pools_models_providers() {
+        use crate::test_support::LaneSpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "model-a",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("prov-x"),
+            )
+            .lane(
+                LaneSpec::new(
+                    "model-b",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("prov-y"),
+            )
+            .pool("mypool", &[(0, 3), (1, 1)])
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let get = |path: String| {
+            let url = format!("http://{addr}{path}");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let pools = get("/admin/v1/pools".into()).await;
+        let items = pools["items"].as_array().unwrap();
+        let mypool = items
+            .iter()
+            .find(|p| p["name"] == "mypool")
+            .expect("mypool present");
+        let members = mypool["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2, "pool has two members");
+        let weight_a = members.iter().find(|m| m["model"] == "model-a").unwrap()["weight"].as_u64();
+        assert_eq!(weight_a, Some(3), "model-a weight projected");
+
+        let models = get("/admin/v1/models".into()).await;
+        let m_items = models["items"].as_array().unwrap();
+        assert!(m_items
+            .iter()
+            .any(|m| m["model"] == "model-a" && m["provider"] == "prov-x"));
+        assert!(m_items
+            .iter()
+            .any(|m| m["model"] == "model-b" && m["provider"] == "prov-y"));
+
+        let providers = get("/admin/v1/providers".into()).await;
+        let p_items = providers["items"].as_array().unwrap();
+        let px = p_items.iter().find(|p| p["provider"] == "prov-x").unwrap();
+        assert_eq!(px["model_count"].as_u64(), Some(1));
+        assert!(p_items.iter().any(|p| p["provider"] == "prov-y"));
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

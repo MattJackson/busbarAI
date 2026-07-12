@@ -13,7 +13,10 @@ use std::sync::Arc;
 
 use crate::state::App;
 
-use super::contract::{AdminError, BuildInfo, InfoView, TopologyInfo};
+use super::contract::{
+    AdminError, BuildInfo, InfoView, ModelView, Page, PoolMemberView, PoolView, ProviderView,
+    TopologyInfo,
+};
 
 /// Process start instant, for the `info` uptime read. Stamped ONCE at startup by `mark_start()`.
 /// A missing value (never stamped — e.g. a unit test that skips `main`) yields a `None` uptime
@@ -74,5 +77,62 @@ impl AdminService {
                 providers: providers.len(),
             },
         })
+    }
+
+    /// `GET /admin/v1/pools` — the pool topology (name + member models/weights) for the fleet
+    /// dashboard. Read scope. Sorted by name for a stable, diff-friendly listing. Live per-member
+    /// status is an additive follow-up (§6.9).
+    pub(crate) async fn list_pools(&self) -> Result<Page<PoolView>, AdminError> {
+        let mut pools: Vec<PoolView> = self
+            .app
+            .pools
+            .iter()
+            .map(|(name, members)| PoolView {
+                name: name.clone(),
+                members: members
+                    .iter()
+                    .map(|m| PoolMemberView {
+                        // `idx` is the stable lane handle; project the lane's model name.
+                        model: self.app.lanes[m.idx].model.clone(),
+                        weight: m.weight,
+                    })
+                    .collect(),
+            })
+            .collect();
+        pools.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Page::single(pools))
+    }
+
+    /// `GET /admin/v1/models` — every model lane + its upstream provider. Read scope. Sorted by
+    /// model name. No credentials.
+    pub(crate) async fn list_models(&self) -> Result<Page<ModelView>, AdminError> {
+        let mut models: Vec<ModelView> = self
+            .app
+            .lanes
+            .iter()
+            .map(|l| ModelView {
+                model: l.model.clone(),
+                provider: l.provider.clone(),
+            })
+            .collect();
+        models.sort_by(|a, b| a.model.cmp(&b.model));
+        Ok(Page::single(models))
+    }
+
+    /// `GET /admin/v1/providers` — distinct upstream providers + the count of model lanes routing
+    /// through each. Read scope. Sorted by provider name.
+    pub(crate) async fn list_providers(&self) -> Result<Page<ProviderView>, AdminError> {
+        let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for lane in &self.app.lanes {
+            *counts.entry(lane.provider.as_str()).or_insert(0) += 1;
+        }
+        let providers = counts
+            .into_iter()
+            .map(|(provider, model_count)| ProviderView {
+                provider: provider.to_string(),
+                model_count,
+            })
+            .collect();
+        Ok(Page::single(providers))
     }
 }

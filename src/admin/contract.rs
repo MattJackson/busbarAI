@@ -146,3 +146,55 @@ pub(crate) struct TopologyInfo {
     pub(crate) models: usize,
     pub(crate) providers: usize,
 }
+
+/// A pool in the topology read (`GET /admin/v1/pools`). Summary shape today: name + the member
+/// models and their weights. LIVE per-member status (breaker state, available concurrency, latency
+/// EWMA, budget/rate headroom — design-admin-api-v1 §6.9) is an additive follow-up; the field set
+/// only grows.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolView {
+    pub(crate) name: String,
+    pub(crate) members: Vec<PoolMemberView>,
+}
+
+/// One member of a pool: the model it targets and its SWRR weight.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolMemberView {
+    pub(crate) model: String,
+    pub(crate) weight: u32,
+}
+
+/// A model lane in the topology read (`GET /admin/v1/models`): the config key + its upstream
+/// provider. No credentials, ever.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModelView {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+}
+
+/// A provider in the topology read (`GET /admin/v1/providers`): the provider name + how many model
+/// lanes route through it.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderView {
+    pub(crate) provider: String,
+    pub(crate) model_count: usize,
+}
+
+/// A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
+/// (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Page<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+impl<T> Page<T> {
+    /// A single-page result (no further pages). The topology reads are small and unpaginated today;
+    /// keys/audit/versions get real cursoring as they land.
+    pub(crate) fn single(items: Vec<T>) -> Self {
+        Self {
+            items,
+            next_cursor: None,
+        }
+    }
+}
