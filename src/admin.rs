@@ -339,6 +339,11 @@ pub(crate) async fn create_key(
         let res = tokio::task::spawn_blocking(move || gov.create_key_with_aws(spec, now)).await;
         match res {
             Ok(Ok((key, secret, access_key_id, secret_access_key))) => {
+                audit::AUDIT.record(
+                    "key.create",
+                    &format!("key:{}", key.id),
+                    audit::OUTCOME_APPLIED,
+                );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // bearer secret, shown exactly once
                                                 // The AccessKeyId is NOT secret (it travels in plaintext in the SigV4 header), but it
@@ -355,6 +360,11 @@ pub(crate) async fn create_key(
         let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
         match res {
             Ok(Ok((key, secret))) => {
+                audit::AUDIT.record(
+                    "key.create",
+                    &format!("key:{}", key.id),
+                    audit::OUTCOME_APPLIED,
+                );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // shown exactly once
                 json_response(StatusCode::CREATED, body)
@@ -468,14 +478,21 @@ pub(crate) async fn update_key(
     // handler. If the client drops the request, the already-scheduled closure still runs to completion
     // holding the gate — so a dropped outer future can never release the gate while the lookup→write
     // is still in flight (which would re-open the resurrection / double-revoke races).
+    let resource = format!("key:{id}");
     let res = tokio::task::spawn_blocking(move || {
         let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
         gov.update_key(&id, enabled, rpm, tpm, budget)
     })
     .await;
     match res {
-        Ok(Ok(Some(key))) => json_response(StatusCode::OK, key_meta(&key)),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
+        Ok(Ok(Some(key))) => {
+            audit::AUDIT.record("key.patch", &resource, audit::OUTCOME_APPLIED);
+            json_response(StatusCode::OK, key_meta(&key))
+        }
+        Ok(Ok(None)) => {
+            audit::AUDIT.record("key.patch", &resource, audit::OUTCOME_REJECTED);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
         Ok(Err(e)) => internal_error("update_key", &e),
         Err(e) => join_error("update_key", &e),
     }
@@ -601,9 +618,16 @@ pub(crate) async fn delete_key(
         }
     })
     .await;
+    let resource = format!("key:{id}");
     match res {
-        Ok(Ok(Some(()))) => json_response(StatusCode::OK, json!({"deleted": id})),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
+        Ok(Ok(Some(()))) => {
+            audit::AUDIT.record("key.delete", &resource, audit::OUTCOME_APPLIED);
+            json_response(StatusCode::OK, json!({"deleted": id}))
+        }
+        Ok(Ok(None)) => {
+            audit::AUDIT.record("key.delete", &resource, audit::OUTCOME_REJECTED);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
         Ok(Err(e)) => internal_error("delete_key", &e),
         Err(e) => join_error("delete_key", &e),
     }
@@ -1219,6 +1243,55 @@ mod tests {
         assert_eq!(mine["action"], "hook.register");
         assert_eq!(mine["outcome"], "applied");
         assert!(mine["seq"].is_number() && mine["ts"].is_number());
+
+        handle.abort();
+    }
+
+    /// Key mutations are audited too (§6.7 — EVERY admin mutation): minting a key records
+    /// `key.create` / `applied` with the new key's id.
+    #[tokio::test]
+    async fn test_admin_v1_audit_records_key_mutations() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Mint a uniquely-named key.
+        let minted: serde_json::Value = client
+            .post(format!("http://{addr}/admin/v1/keys"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"name": "audit_key_probe_z3"}).to_string())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = minted["id"].as_str().unwrap().to_string();
+
+        let audit: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/audit"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mine = audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["resource"] == format!("key:{id}"))
+            .expect("the key creation is recorded in the audit log");
+        assert_eq!(mine["action"], "key.create");
+        assert_eq!(mine["outcome"], "applied");
 
         handle.abort();
     }
