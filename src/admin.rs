@@ -1034,6 +1034,95 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/config` composes the effective-config snapshot (auth + pools/models/providers +
+    /// hooks + global_hooks) from the redacted reads. Asserts the shape and that no secret-bearing
+    /// field (client tokens, provider keys) appears anywhere in the serialized body.
+    #[tokio::test]
+    async fn test_admin_v1_config_effective_snapshot_no_secrets() {
+        use crate::test_support::LaneSpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let gate = crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9970/".to_string()),
+            timeout_ms: 5,
+            on_error: crate::config::PolicyOnError::default(),
+            prompt: crate::config::PromptAccess::No,
+            user: crate::config::UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: false,
+        };
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "m",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("prov"),
+            )
+            .pool("p", &[(0, 1)])
+            .hook("g", gate)
+            .global_hook("g")
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{addr}/admin/v1/config"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let text = resp.text().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // Composed sections present.
+        assert!(body["auth"]["chain"].is_array());
+        assert!(body["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "p"));
+        assert!(body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["model"] == "m"));
+        assert!(body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["provider"] == "prov"));
+        assert!(body["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["name"] == "g"));
+        assert!(body["global_hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "g"));
+        // No secret-bearing key names anywhere in the snapshot.
+        for needle in ["admintok", "client_tokens", "api_key", "secret"] {
+            assert!(
+                !text.contains(needle),
+                "effective config must not leak `{needle}`: {text}"
+            );
+        }
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

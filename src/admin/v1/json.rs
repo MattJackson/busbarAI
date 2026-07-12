@@ -45,6 +45,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/hooks/{name}", get(get_hook))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
+            .route("/admin/v1/config", get(get_config))
             .route("/admin/v1/config/validate", post(validate_config))
             .layer(Extension(service))
     }
@@ -134,6 +135,11 @@ async fn list_plugins(
 /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode (no secrets).
 async fn get_auth(Extension(service): Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.get_auth().await)
+}
+
+/// `GET /admin/v1/config` — the effective running config snapshot (redacted; no secrets).
+async fn get_config(Extension(service): Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.get_config().await)
 }
 
 /// The `POST /admin/v1/config/validate` request body: a full proposed config — the `config.yaml`

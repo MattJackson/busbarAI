@@ -269,6 +269,23 @@ impl<T> Page<T> {
     }
 }
 
+/// The EFFECTIVE config snapshot (`GET /admin/v1/config`) — the running configuration as busbar
+/// resolved it, for drift detection (compare against your desired config) and one-shot inspection.
+/// Composed from the same REDACTED reads as the individual endpoints (auth chain names, pool/model/
+/// provider topology, hook definitions, global-hook wiring) — so it carries NO secret: no client
+/// tokens, no provider keys, no hook payloads. Additive-only; the source-layer annotation (base vs
+/// overlay) lands with the config overlay substrate.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EffectiveConfigView {
+    pub(crate) auth: AuthView,
+    pub(crate) pools: Vec<PoolView>,
+    pub(crate) models: Vec<ModelView>,
+    pub(crate) providers: Vec<ProviderView>,
+    pub(crate) hooks: Vec<HookView>,
+    /// Names fired on every request (`global_hooks:` + any inline `global: true`).
+    pub(crate) global_hooks: Vec<String>,
+}
+
 /// The result of `POST /admin/v1/config/validate` — a DRY-RUN: does a proposed config resolve +
 /// validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
 /// failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid

@@ -14,8 +14,9 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, AuthView, BuildInfo, ConfigValidateView, HookTransportView, HookView, InfoView,
-    ModelView, Page, PluginView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
+    AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView, HookTransportView,
+    HookView, InfoView, ModelView, Page, PluginView, PoolMemberView, PoolView, ProviderView,
+    TopologyInfo,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
@@ -241,6 +242,21 @@ impl AdminService {
             }
         }
         Ok(Page::single(plugins))
+    }
+
+    /// `GET /admin/v1/config` — the EFFECTIVE running config, composed from the same redacted reads as
+    /// the individual endpoints (auth/pools/models/providers/hooks/global-hooks). Read scope. Carries
+    /// no secret. For drift detection + one-shot inspection; the base-vs-overlay source annotation
+    /// lands with the overlay substrate.
+    pub(crate) async fn get_config(&self) -> Result<EffectiveConfigView, AdminError> {
+        Ok(EffectiveConfigView {
+            auth: self.get_auth().await?,
+            pools: self.list_pools().await?.items,
+            models: self.list_models().await?.items,
+            providers: self.list_providers().await?.items,
+            hooks: self.list_hooks().await?.items,
+            global_hooks: self.app.global_hooks.clone(),
+        })
     }
 
     /// `POST /admin/v1/config/validate` — DRY-RUN a proposed config: resolve (`config.yaml` deploy +
