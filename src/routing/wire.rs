@@ -21,10 +21,18 @@ pub(crate) struct HookRequest<'a> {
     pub(crate) context: HookContext<'a>,
 }
 
-/// The request projection (a cheap, read-only slice of the ingress request). Shape signals only BY
-/// DEFAULT — no prompt text or caller identity rides this projection unless the pool opted in
-/// (`policy.send_prompt` / `policy.send_user`). The opt-in fields are omitted from the JSON
-/// entirely when off, so the default payload is byte-identical to the pre-opt-in contract.
+/// The request projection sent to a hook. THE CONTRACT: a **default bucket** of shape/metadata
+/// signals is ALWAYS present (pool, protocol, counts, sizes, stream, max_tokens; plus every
+/// candidate's metadata + live signals in `HookCandidate`) — nothing sensitive. On top of that, at
+/// most **two access-gated SECURITY fields** ride the projection, each opted in per hook by an
+/// explicit grant:
+///   - `prompt` grant (`no|ro|rw`): `system` + `messages` (flattened text) — present when the grant
+///     is `ro` OR `rw`. The REQUEST wire is IDENTICAL for `ro` and `rw` (a hook must SEE the prompt to
+///     screen it or to rewrite it); the extra power of `rw` is on the REPLY only — a `rw` hook's
+///     `rewrite` arm is applied, a `ro` hook's is dropped (enforced at the rewrite seam by the grant).
+///   - `user` grant (`no|ro`): caller identity — present when `ro`.
+/// A grant of `no` OMITS the field from the JSON entirely, so the default payload carries no
+/// sensitive content. These are the ONLY two fields that ever carry caller content/identity.
 #[derive(Serialize)]
 pub(crate) struct HookReqProjection<'a> {
     pub(crate) pool: &'a str,
@@ -34,16 +42,16 @@ pub(crate) struct HookReqProjection<'a> {
     pub(crate) total_chars: usize,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
-    /// `policy.send_prompt` opt-in: the flattened system prompt text. Absent when off — AND when
-    /// on but the request carries no (or an empty) system prompt, so a hook must key the opt-in
-    /// off `messages` (always present, possibly `[]`, when on), never off `system`.
+    /// SECURITY (`prompt: ro|rw` grant): the flattened system prompt text. Absent when the grant is
+    /// `no` — AND when granted but the request carries no (or an empty) system prompt, so a hook must
+    /// key the grant off `messages` (always present, possibly `[]`, when granted), never off `system`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) system: Option<&'a str>,
-    /// `policy.send_prompt` opt-in: every message as `{role, text}`. Absent when off.
+    /// SECURITY (`prompt: ro|rw` grant): every message as `{role, text}`. Absent when the grant is `no`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) messages: Option<Vec<HookMessage<'a>>>,
-    /// `policy.send_user` opt-in: caller identity (key id/name + end-user field, NEVER the secret).
-    /// Absent when off.
+    /// SECURITY (`user: ro` grant): caller identity (key id/name + end-user field, NEVER the secret).
+    /// Absent when the grant is `no`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) user: Option<HookUser<'a>>,
 }
