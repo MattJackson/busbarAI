@@ -789,6 +789,71 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/pools/{name}` projects each member's LIVE status (usable/cooldown/concurrency/
+    /// inflight/tallies) from the store; 404s an unknown pool.
+    #[tokio::test]
+    async fn test_admin_v1_pool_detail_live_status() {
+        use crate::test_support::LaneSpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "m1",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("p"),
+            )
+            .pool("mypool", &[(0, 5)])
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let ok: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/pools/mypool"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ok["name"], "mypool");
+        let members = ok["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        let m = &members[0];
+        assert_eq!(m["model"], "m1");
+        assert_eq!(m["weight"], 5);
+        // Live-status fields present + typed. A fresh lane is usable with no cooldown.
+        assert_eq!(m["usable"], true);
+        assert_eq!(m["cooldown_remaining_s"], 0);
+        assert!(m["available_concurrency"].is_number());
+        assert!(m["inflight"].is_number());
+        assert!(m["ok"].is_number());
+        assert!(m["dead"].is_boolean());
+
+        // Unknown pool → 404 not_found.
+        let missing = client
+            .get(format!("http://{addr}/admin/v1/pools/nope"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        assert_eq!(
+            missing.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "not_found"
+        );
+
+        handle.abort();
+    }
+
     /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
     /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
     /// secret. Built on a fixture with one global gate.

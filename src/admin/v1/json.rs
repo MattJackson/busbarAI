@@ -39,6 +39,7 @@ impl AdminTransport for JsonV1 {
         Router::new()
             .route("/admin/v1/info", get(info))
             .route("/admin/v1/pools", get(list_pools))
+            .route("/admin/v1/pools/{name}", get(get_pool))
             .route("/admin/v1/models", get(list_models))
             .route("/admin/v1/providers", get(list_providers))
             .route("/admin/v1/hooks", get(list_hooks))
@@ -99,6 +100,14 @@ async fn info(Extension(service): Extension<Arc<AdminService>>) -> Response {
 /// `GET /admin/v1/pools` — pool topology read.
 async fn list_pools(Extension(service): Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.list_pools().await)
+}
+
+/// `GET /admin/v1/pools/{name}` — live per-member status of one pool (404 if unknown).
+async fn get_pool(
+    Extension(service): Extension<Arc<AdminService>>,
+    Path(name): Path<String>,
+) -> Response {
+    respond(StatusCode::OK, service.get_pool(&name).await)
 }
 
 /// `GET /admin/v1/models` — model lanes + providers.
@@ -214,6 +223,23 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "OK"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/pools/{name}".to_string(),
+        json!({
+            "get": {
+                "summary": "Live per-member status of one pool (breaker/concurrency/latency)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Unknown pool (error code `not_found`)"}
                 }
             }
         }),

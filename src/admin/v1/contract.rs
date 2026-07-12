@@ -165,6 +165,41 @@ pub(crate) struct PoolMemberView {
     pub(crate) weight: u32,
 }
 
+/// The LIVE per-pool detail read (`GET /admin/v1/pools/{name}`) — the reliability/capacity dashboard
+/// data (design-admin-api-v1 §6.9): each member's breaker state, concurrency headroom, in-flight
+/// count, latency EWMA, and success/error tallies, read from the SAME store signals the routing seam
+/// ranks on. No LLM content, no credentials.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolDetailView {
+    pub(crate) name: String,
+    pub(crate) members: Vec<PoolMemberStatusView>,
+}
+
+/// One member's live status within a pool. The breaker signal is the release-exposed
+/// `usable`/`cooldown_remaining_s` pair (a lane in breaker cooldown reports `usable: false` with the
+/// seconds remaining) — the same summary `/stats` surfaces.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolMemberStatusView {
+    pub(crate) model: String,
+    pub(crate) weight: u32,
+    /// Whether the lane can currently take dispatch (breaker closed / recovered). `false` while a
+    /// tripped breaker cools down or the lane is dead.
+    pub(crate) usable: bool,
+    /// Seconds until a tripped breaker's cooldown elapses; `0` when not cooling down.
+    pub(crate) cooldown_remaining_s: u64,
+    /// Free concurrency slots on this lane right now (lane-global; permits are shared across pools).
+    pub(crate) available_concurrency: usize,
+    /// In-flight requests on this lane right now.
+    pub(crate) inflight: i64,
+    /// Latency EWMA in milliseconds, or `None` if no sample yet.
+    pub(crate) latency_ms: Option<f64>,
+    /// Successful and errored request tallies for this lane.
+    pub(crate) ok: u64,
+    pub(crate) err: u64,
+    /// Whether the lane is hard-down/dead (distinct from a transiently-tripped breaker).
+    pub(crate) dead: bool,
+}
+
 /// A model lane in the topology read (`GET /admin/v1/models`): the config key + its upstream
 /// provider. No credentials, ever.
 #[derive(Debug, Clone, Serialize)]

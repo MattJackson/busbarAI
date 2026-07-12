@@ -15,8 +15,8 @@ use crate::state::App;
 
 use super::contract::{
     AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView, HookHealthView,
-    HookTransportView, HookView, InfoView, ModelView, Page, PluginView, PoolMemberView, PoolView,
-    ProviderView, TopologyInfo,
+    HookTransportView, HookView, InfoView, ModelView, Page, PluginView, PoolDetailView,
+    PoolMemberStatusView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
@@ -156,6 +156,42 @@ impl AdminService {
             .collect();
         pools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(Page::single(pools))
+    }
+
+    /// `GET /admin/v1/pools/{name}` — the LIVE per-member status of one pool (breaker/concurrency/
+    /// latency/tallies), from the same store signals the routing seam ranks on. Read scope.
+    /// `not_found` if the pool is unknown.
+    pub(crate) async fn get_pool(&self, name: &str) -> Result<PoolDetailView, AdminError> {
+        let members = self
+            .app
+            .pools
+            .get(name)
+            .ok_or_else(|| AdminError::NotFound(format!("pool `{name}`")))?;
+        let now = crate::store::now();
+        let members = members
+            .iter()
+            .map(|m| {
+                // `snapshot` is the same release-exposed live summary `/stats` reads (usable / cooldown
+                // / inflight / tallies / dead); `available_permits` + `lane_latency_ms` round it out.
+                let snap = self.app.store.snapshot(m.idx, now);
+                PoolMemberStatusView {
+                    model: self.app.lanes[m.idx].model.clone(),
+                    weight: m.weight,
+                    usable: snap.usable,
+                    cooldown_remaining_s: snap.cooldown_remaining_s,
+                    available_concurrency: self.app.store.available_permits(m.idx),
+                    inflight: snap.inflight,
+                    latency_ms: self.app.store.lane_latency_ms(m.idx),
+                    ok: snap.ok,
+                    err: snap.err,
+                    dead: snap.dead,
+                }
+            })
+            .collect();
+        Ok(PoolDetailView {
+            name: name.to_string(),
+            members,
+        })
     }
 
     /// `GET /admin/v1/models` — every model lane + its upstream provider. Read scope. Sorted by
