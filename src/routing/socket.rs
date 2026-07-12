@@ -88,6 +88,38 @@ impl SocketPolicy {
         }
         Ok(reply)
     }
+
+    /// Send one newline-terminated line and read the reply, bounded by `budget`, reusing the
+    /// kept-alive connection and reconnecting ONCE on a stale one. Shared by `decide` and
+    /// `transform` so both get identical timeout + connection-reuse + poison-on-timeout semantics.
+    async fn exchange(&self, line: &[u8], budget: Duration) -> Result<Vec<u8>, super::PolicyError> {
+        let exchange = async {
+            let mut guard = self.conn.lock().await;
+            if let Some(mut conn) = guard.take() {
+                match Self::round_trip(&mut conn, line).await {
+                    Ok(reply) => {
+                        *guard = Some(conn);
+                        return Ok::<Vec<u8>, std::io::Error>(reply);
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "socket hook: cached connection failed; reconnecting");
+                    }
+                }
+            }
+            let stream = UnixStream::connect(&self.path).await?;
+            let (r, w) = stream.into_split();
+            let mut conn: Conn = (BufReader::new(r), w);
+            let reply = Self::round_trip(&mut conn, line).await?;
+            *guard = Some(conn);
+            Ok(reply)
+        };
+        tokio::time::timeout(budget, exchange)
+            .await
+            .map_err(|_| -> super::PolicyError {
+                format!("socket hook deadline ({budget:?}) exceeded").into()
+            })?
+            .map_err(|e| -> super::PolicyError { e.into() })
+    }
 }
 
 #[async_trait::async_trait]
@@ -105,42 +137,10 @@ impl RoutingPolicy for SocketPolicy {
         line.reserve_exact(1); // to_vec returns an exact-fit Vec; avoid a guaranteed realloc
         line.push(b'\n');
 
-        // Hard wall-clock deadline over the WHOLE exchange (connect + write + read): the caller also
-        // wraps `decide` in its own timeout, but holding the budget here keeps the mutex hold time
-        // bounded too. On timeout the half-exchanged connection is dropped (poisoned mid-protocol —
-        // never reuse it), and the caller coerces the `Err` to the pool's `on_error`.
-        let exchange = async {
-            let mut guard = self.conn.lock().await;
-            // Reuse the kept-alive connection; on ANY error retry ONCE on a fresh connection, so a
-            // hook-binary restart costs zero failed requests (the cached half-dead connection is the
-            // common failure after a restart, not an actual outage).
-            if let Some(mut conn) = guard.take() {
-                match Self::round_trip(&mut conn, &line).await {
-                    Ok(reply) => {
-                        *guard = Some(conn);
-                        return Ok::<Vec<u8>, std::io::Error>(reply);
-                    }
-                    Err(e) => {
-                        // Stale after a hook restart — fall through to a fresh connect. Debug (not
-                        // warn): a single reconnect is normal across a hook restart, but a hook that
-                        // crash-loops shows up as a steady stream of these.
-                        tracing::debug!(error = %e, "socket hook: cached connection failed; reconnecting");
-                    }
-                }
-            }
-            let stream = UnixStream::connect(&self.path).await?;
-            let (r, w) = stream.into_split();
-            let mut conn: Conn = (BufReader::new(r), w);
-            let reply = Self::round_trip(&mut conn, &line).await?;
-            *guard = Some(conn);
-            Ok(reply)
-        };
-        let reply =
-            tokio::time::timeout(budget, exchange)
-                .await
-                .map_err(|_| -> super::PolicyError {
-                    format!("socket hook deadline ({budget:?}) exceeded").into()
-                })??;
+        // Hard wall-clock deadline over the WHOLE exchange (connect + write + read), with connection
+        // reuse + reconnect-once, in the shared `exchange` helper. On timeout the half-exchanged
+        // connection is dropped (poisoned); the caller coerces the `Err` to the pool's `on_error`.
+        let reply = self.exchange(&line, budget).await?;
 
         // Depth-guarded parse (MAX_JSON_DEPTH) + the shared normalizer — identical hostile-peer
         // posture and identical liberal-in-what-you-accept rules as the webhook transport. The
@@ -155,6 +155,29 @@ impl RoutingPolicy for SocketPolicy {
 
     fn name(&self) -> &'static str {
         "socket"
+    }
+
+    /// REWRITE transform: send the request projection, return the hook's `rewrite` reply. FAIL-CLOSED
+    /// — ANY error (timeout, I/O, malformed reply, no/empty rewrite) yields `None`, so the caller
+    /// proceeds with the ORIGINAL body. A rewrite hook reads the `request` projection (its `prompt`),
+    /// not the candidate set, so an empty candidate list is sent.
+    #[allow(dead_code)] // wired into the forward global-hooks transform seam next (slice-4 step)
+    async fn transform(
+        &self,
+        req: &RoutingRequest<'_>,
+        budget: Duration,
+    ) -> Option<super::wire::RewriteReply> {
+        let empty: [Candidate<'_>; 0] = [];
+        let ctx = RoutingContext {
+            pool: req.pool,
+            budget_remaining: None,
+        };
+        let mut line = serde_json::to_vec(&super::wire::build(req, &empty, &ctx)).ok()?;
+        line.push(b'\n');
+        // Fail-closed: any transport/parse error → None (proceed with the original body).
+        let reply = self.exchange(&line, budget).await.ok()?;
+        let parsed: super::wire::HookResponse = crate::json::parse(&reply).ok()?;
+        super::wire::parse_rewrite(&parsed.rewrite?)
     }
 }
 
@@ -317,6 +340,35 @@ mod tests {
                 .expect("ok decision");
             assert_eq!(d, RoutingDecision::Prefer(vec![2, 0, 1]));
         }
+    }
+
+    /// The `transform` (rewrite) call parses a well-formed `rewrite` reply into a `RewriteReply`, and
+    /// is FAIL-CLOSED — a reply with no `rewrite` (e.g. a bare `order`) yields `None` so the caller
+    /// keeps the original body.
+    #[tokio::test]
+    async fn transform_parses_rewrite_and_is_fail_closed() {
+        let dir = tempdir();
+        let path = mock_hook(
+            dir.path(),
+            r#"{"rewrite":{"messages":[{"role":"user","content":"compressed"}],"tools":[{"name":"headroom_retrieve"}]}}"#,
+        )
+        .await;
+        let policy = SocketPolicy::new(path);
+        let rw = policy
+            .transform(&req(), Duration::from_secs(2))
+            .await
+            .expect("well-formed rewrite parses");
+        assert_eq!(rw.messages.len(), 1);
+        assert_eq!(rw.tools.len(), 1);
+
+        // A reply with no rewrite → None (fail-closed).
+        let dir2 = tempdir();
+        let path2 = mock_hook(dir2.path(), r#"{"order":[0]}"#).await;
+        let policy2 = SocketPolicy::new(path2);
+        assert!(policy2
+            .transform(&req(), Duration::from_secs(2))
+            .await
+            .is_none());
     }
 
     /// Explicit abstain and empty-object replies are the clean Abstain path, not errors.

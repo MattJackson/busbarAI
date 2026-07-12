@@ -240,6 +240,21 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
     /// Stable transport/policy name for metrics + the `x-busbar-route` header
     /// (e.g. `"webhook"`, `"socket"`, `"weighted"`, `"cheapest"`).
     fn name(&self) -> &'static str;
+
+    /// REWRITE phase (`prompt: rw` gate): send the request projection and return the hook's `rewrite`
+    /// reply — the replacement message body (+ optional injected tools), FAIL-CLOSED (`None` = proceed
+    /// with the ORIGINAL body). Distinct from `decide` (which ranks): this is the transform-pass call.
+    /// DEFAULT `None`: in-process ranking hooks never rewrite; only the out-of-process socket/webhook
+    /// transports override it. The caller enforces the `rw` grant (only a `rw` hook reaches here) and
+    /// applies the returned body; a malformed/oversize/timed-out rewrite yields `None`.
+    #[allow(dead_code)] // dispatched by the forward global-hooks transform seam next (slice-4 step)
+    async fn transform(
+        &self,
+        _req: &RoutingRequest<'_>,
+        _budget: std::time::Duration,
+    ) -> Option<wire::RewriteReply> {
+        None
+    }
 }
 
 /// The per-pool routing policy resolved ONCE at config load. `None` is the zero-cost default
