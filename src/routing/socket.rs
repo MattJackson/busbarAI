@@ -120,6 +120,27 @@ impl SocketPolicy {
             })?
             .map_err(|e| -> super::PolicyError { e.into() })
     }
+
+    /// WRITE one newline-terminated line WITHOUT reading a reply — the tap (fire-and-forget) path. A
+    /// tap is write-only in steady state, so we never read. Reuses the kept-alive connection,
+    /// reconnecting ONCE on a stale one.
+    async fn write_only(&self, line: &[u8]) -> Result<(), std::io::Error> {
+        let mut guard = self.conn.lock().await;
+        if let Some(mut conn) = guard.take() {
+            if conn.1.write_all(line).await.is_ok() && conn.1.flush().await.is_ok() {
+                *guard = Some(conn);
+                return Ok(());
+            }
+            // Stale after a tap-binary restart — fall through to a fresh connect.
+        }
+        let stream = UnixStream::connect(&self.path).await?;
+        let (r, w) = stream.into_split();
+        let mut conn: Conn = (BufReader::new(r), w);
+        conn.1.write_all(line).await?;
+        conn.1.flush().await?;
+        *guard = Some(conn);
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -178,6 +199,22 @@ impl RoutingPolicy for SocketPolicy {
         let reply = self.exchange(&line, budget).await.ok()?;
         let parsed: super::wire::HookResponse = crate::json::parse(&reply).ok()?;
         super::wire::parse_rewrite(&parsed.rewrite?)
+    }
+
+    /// TAP: write-only fire-and-forget send of the request projection. No reply is read. Bounded by
+    /// `budget`; any error is swallowed — a tap never affects the served request.
+    #[allow(dead_code)] // wired into the forward tap seam next (slice-6 step)
+    async fn notify(&self, req: &RoutingRequest<'_>, budget: Duration) {
+        let empty: [Candidate<'_>; 0] = [];
+        let ctx = RoutingContext {
+            pool: req.pool,
+            budget_remaining: None,
+        };
+        let Ok(mut line) = serde_json::to_vec(&super::wire::build(req, &empty, &ctx)) else {
+            return;
+        };
+        line.push(b'\n');
+        let _ = tokio::time::timeout(budget, self.write_only(&line)).await;
     }
 }
 
@@ -323,6 +360,34 @@ mod tests {
             pc(0.95),
             pc(0.99),
             xs[0]
+        );
+    }
+
+    /// TAP `notify`: writes the request projection fire-and-forget (no reply read). The tap receives
+    /// the projection line; notify returns without waiting on a reply.
+    #[tokio::test]
+    async fn notify_writes_projection_fire_and_forget() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempdir();
+        let path = dir.path().join("hook.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        let policy = SocketPolicy::new(path.to_string_lossy().into_owned());
+        policy.notify(&req(), Duration::from_secs(2)).await;
+        let received = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("tap should receive the projection")
+            .unwrap();
+        assert!(
+            received.contains("\"pool\"") && received.ends_with('\n'),
+            "tap must receive the newline-delimited projection: {received}"
         );
     }
 

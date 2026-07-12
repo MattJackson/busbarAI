@@ -255,6 +255,14 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
     ) -> Option<wire::RewriteReply> {
         None
     }
+
+    /// TAP (fire-and-forget): WRITE the request projection to the hook and return — a tap is
+    /// write-only in steady state, so NO reply is read. Best-effort and bounded by `budget`; ANY
+    /// error is swallowed by the transport, because a tap can NEVER delay or fail the served request
+    /// (the caller also spawns this off the request path). DEFAULT no-op: in-process policies are not
+    /// taps; only the out-of-process socket/webhook transports override it.
+    #[allow(dead_code)] // dispatched by the forward tap seam next (slice-6 step)
+    async fn notify(&self, _req: &RoutingRequest<'_>, _budget: std::time::Duration) {}
 }
 
 /// The per-pool routing policy resolved ONCE at config load. `None` is the zero-cost default

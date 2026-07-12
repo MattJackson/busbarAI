@@ -128,6 +128,31 @@ impl RoutingPolicy for WebhookPolicy {
         let parsed = self.send(req, &empty, &ctx, budget).await.ok()?;
         super::wire::parse_rewrite(&parsed.rewrite?)
     }
+
+    /// TAP: fire-and-forget POST of the request projection. The response is NOT read (a tap is
+    /// write-only). Bounded by `budget`; any error is swallowed — a tap never affects the request.
+    #[allow(dead_code)] // wired into the forward tap seam next (slice-6 step)
+    async fn notify(&self, req: &RoutingRequest<'_>, budget: Duration) {
+        let empty: [Candidate<'_>; 0] = [];
+        let ctx = RoutingContext {
+            pool: req.pool,
+            budget_remaining: None,
+        };
+        let Ok(payload) = serde_json::to_vec(&super::wire::build(req, &empty, &ctx)) else {
+            return;
+        };
+        let _ = self
+            .client
+            .post(&self.url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                crate::forward::APPLICATION_JSON,
+            )
+            .body(payload)
+            .timeout(budget)
+            .send()
+            .await; // response intentionally dropped — a tap does not read a reply
+    }
 }
 
 #[cfg(test)]
