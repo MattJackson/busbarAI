@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
 //! B1 cross-protocol drop contract primitives (design-operations-oop.md §1/§5b, risk 6).
 //!
 //! "Lossless, no compromise" is trivial SAME-protocol (the same cell re-emits everything). The hard,

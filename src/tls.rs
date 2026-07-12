@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
 //! Native inbound TLS termination (+ optional mutual-TLS) for the client↔Busbar hop.
 //!
 //! This module is a thin transport wrapper around the *ingress* listener. It does NOT touch routing,

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
 //! The `Operation` axis — busbar's semantic operation vocabulary (design-operations-oop.md §1b/§6).
 //!
 //! A coarse TAG only: a metrics label and the `paths:` config key. It carries NO capability booleans
