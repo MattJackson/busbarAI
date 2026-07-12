@@ -779,6 +779,32 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
 
+    // Stamp EVERY path+method with its required admin scope (`x-busbar-required-scope`) from the
+    // SAME `required_scope` matrix the middleware enforces — the machine-readable authorization
+    // matrix (§6.3), drift-proof by construction because both readers share one function. The
+    // matrix keys on the literal path shape; templated segments (`{name}`) sit inside the same
+    // prefix the matcher tests, so the annotation is exact for every route documented here.
+    for (path, methods) in paths.iter_mut() {
+        if let Some(obj) = methods.as_object_mut() {
+            for (method, op) in obj.iter_mut() {
+                let m = match method.as_str() {
+                    "get" => axum::http::Method::GET,
+                    "post" => axum::http::Method::POST,
+                    "put" => axum::http::Method::PUT,
+                    "patch" => axum::http::Method::PATCH,
+                    "delete" => axum::http::Method::DELETE,
+                    _ => continue,
+                };
+                if let Some(op) = op.as_object_mut() {
+                    op.insert(
+                        "x-busbar-required-scope".to_string(),
+                        json!(crate::admin::v1::contract::required_scope(&m, path).as_str()),
+                    );
+                }
+            }
+        }
+    }
+
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -864,6 +890,33 @@ mod tests {
     fn err_json_uses_stable_envelope() {
         let resp = err_json(&AdminError::NotFound("hook".into()));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// CONTRACT LOCK: every openapi path+method is annotated with `x-busbar-required-scope`, and
+    /// the annotation matches the enforced `required_scope` matrix exactly (one source of truth —
+    /// this test guards against a future hand-written path entry forgetting or contradicting it).
+    #[test]
+    fn openapi_paths_annotate_required_scope() {
+        let doc = openapi_doc();
+        let paths = doc["paths"].as_object().expect("paths object");
+        assert!(!paths.is_empty());
+        for (path, methods) in paths {
+            for (method, op) in methods.as_object().expect("methods") {
+                let m = match method.as_str() {
+                    "get" => axum::http::Method::GET,
+                    "post" => axum::http::Method::POST,
+                    "put" => axum::http::Method::PUT,
+                    "patch" => axum::http::Method::PATCH,
+                    "delete" => axum::http::Method::DELETE,
+                    other => panic!("unexpected method {other} on {path}"),
+                };
+                let annotated = op["x-busbar-required-scope"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} missing scope annotation"));
+                let enforced = crate::admin::v1::contract::required_scope(&m, path).as_str();
+                assert_eq!(annotated, enforced, "{method} {path} annotation drifted");
+            }
+        }
     }
 
     /// CONTRACT LOCK: the openapi Error-schema `code` enum must EXACTLY match the frozen `AdminError`
