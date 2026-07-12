@@ -125,9 +125,15 @@ pub(crate) struct App {
     /// GLOBAL request-stage TAP hooks — the `kind: tap` hooks in `global_hooks` observing at the
     /// `request` stage, resolved to their transports. Fired FIRE-AND-FORGET (spawned off the request
     /// path) before dispatch — a tap can never delay or fail the request. Empty (the default) = no
-    /// taps, zero cost. Each entry is `(per-hook deadline, transport)`. Other stages
-    /// (route/attempt/completion + synthetic rejected-completion) are follow-ups.
-    pub(crate) tap_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
+    /// taps, zero cost. Each entry is `(per-hook deadline, send_prompt, transport)`: `send_prompt`
+    /// carries the tap's `prompt: ro` grant so a granted tap receives the prompt-content projection and
+    /// a `prompt: no` tap receives shape-only. Other stages (route/attempt/completion + synthetic
+    /// rejected-completion) are follow-ups.
+    pub(crate) tap_hooks: Vec<(
+        std::time::Duration,
+        bool,
+        Arc<dyn crate::routing::RoutingPolicy>,
+    )>,
     /// The raw `hooks:` registry (name → definition) as configured, for the Admin API v1 hooks READ
     /// surface (`GET /admin/v1/hooks`). This is the DEFINITION set, distinct
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty

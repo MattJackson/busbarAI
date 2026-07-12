@@ -2680,27 +2680,51 @@ pub(crate) async fn forward_with_pool_parsed(
     }
 
     // ── GLOBAL TAP (observe) FIRE ────────────────────────────────────────────────────────────────
-    // Fire the global request-stage `kind: tap` hooks FIRE-AND-FORGET: serialize the shape-only
-    // projection ONCE to owned bytes, then spawn one detached task per tap. A tap gets a write-only
-    // send with its own deadline; its reply (if any) is ignored, its errors swallowed — a tap can
-    // NEVER delay, reorder, or fail the request. Runs AFTER the rewrite pass so a tap observes the
-    // effective (post-compression) body. ZERO COST when no tap is configured (empty-list branch).
+    // Fire the global request-stage `kind: tap` hooks FIRE-AND-FORGET: serialize the projection(s) to
+    // owned bytes ONCE, then spawn one detached task per tap. A tap gets a write-only send with its
+    // own deadline; its reply (if any) is ignored, its errors swallowed — a tap can NEVER delay,
+    // reorder, or fail the request. Runs AFTER the rewrite pass so a tap observes the effective
+    // (post-compression) body. Each tap receives the projection its GRANT allows: a `prompt: ro` tap
+    // gets the prompt-content projection, a `prompt: no` (default) tap gets shape-only — so a tap
+    // never over-shares. At most TWO projections are built (shape-only + with-prompt), regardless of
+    // tap count. ZERO COST when no tap is configured (empty-list branch).
     if !app.tap_hooks.is_empty() {
         if let Some(body) = v.as_ref() {
-            let tap_req =
-                build_rewrite_request(body, pool_name, ingress_protocol, wants_stream, false);
-            if let Ok(bytes) = serde_json::to_vec(&crate::routing::wire::build(
-                &tap_req,
-                &[],
-                &crate::routing::RoutingContext {
-                    pool: pool_name,
-                    budget_remaining: None,
-                },
-            )) {
-                let projection = std::sync::Arc::new(bytes);
-                for (timeout, hook) in &app.tap_hooks {
+            let ctx = crate::routing::RoutingContext {
+                pool: pool_name,
+                budget_remaining: None,
+            };
+            let build_proj = |with_prompt: bool| {
+                let req = build_rewrite_request(
+                    body,
+                    pool_name,
+                    ingress_protocol,
+                    wants_stream,
+                    with_prompt,
+                );
+                serde_json::to_vec(&crate::routing::wire::build(&req, &[], &ctx))
+                    .ok()
+                    .map(std::sync::Arc::new)
+            };
+            // Shape-only is needed whenever any tap lacks the prompt grant; the prompt projection only
+            // when at least one tap holds `prompt: ro`. Build each at most once.
+            let any_prompt = app.tap_hooks.iter().any(|(_, send_prompt, _)| *send_prompt);
+            let any_shape = app
+                .tap_hooks
+                .iter()
+                .any(|(_, send_prompt, _)| !*send_prompt);
+            let shape_proj = if any_shape { build_proj(false) } else { None };
+            let prompt_proj = if any_prompt { build_proj(true) } else { None };
+            for (timeout, send_prompt, hook) in &app.tap_hooks {
+                // A granted tap prefers the prompt projection; fall back to shape-only if it failed to
+                // serialize (never over-share, always safe).
+                let proj = if *send_prompt {
+                    prompt_proj.clone().or_else(|| shape_proj.clone())
+                } else {
+                    shape_proj.clone()
+                };
+                if let Some(proj) = proj {
                     let policy = hook.clone();
-                    let proj = projection.clone();
                     let budget = *timeout;
                     tokio::spawn(async move { policy.notify(&proj, budget).await });
                 }

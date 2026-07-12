@@ -441,8 +441,8 @@ pub(crate) fn resolve_tap_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
     client: &reqwest::Client,
-) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
-    let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
+) -> Vec<(std::time::Duration, bool, Arc<dyn RoutingPolicy>)> {
+    let mut ranked: Vec<(u16, std::time::Duration, bool, Arc<dyn RoutingPolicy>)> = Vec::new();
     for name in global_hooks {
         let Some(hook) = hooks.get(name) else {
             continue;
@@ -454,15 +454,20 @@ pub(crate) fn resolve_tap_hooks(
         if !matches!(hook.at, None | Some(crate::config::HookStage::Request)) {
             continue;
         }
+        // `send_prompt` carries the tap's `prompt: ro` grant through to the firing site, so a granted
+        // tap gets the prompt content projection and a `prompt: no` (default) tap gets shape-only.
         if let Some(ResolvedPolicy::Policy {
-            policy, timeout, ..
+            policy,
+            timeout,
+            send_prompt,
+            ..
         }) = resolve_gate_transport(hook, client)
         {
-            ranked.push((hook.priority, timeout, policy));
+            ranked.push((hook.priority, timeout, send_prompt, policy));
         }
     }
-    ranked.sort_by_key(|(p, _, _)| *p);
-    ranked.into_iter().map(|(_, t, p)| (t, p)).collect()
+    ranked.sort_by_key(|(p, _, _, _)| *p);
+    ranked.into_iter().map(|(_, t, sp, p)| (t, sp, p)).collect()
 }
 
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
@@ -752,6 +757,46 @@ mod tests {
             2,
             "only the two REQUEST-stage taps resolve; the gate and the completion-stage tap are excluded"
         );
+        // Every resolved tap here is `prompt: no`, so `send_prompt` (the middle tuple element) is false.
+        assert!(
+            resolved.iter().all(|(_, send_prompt, _)| !*send_prompt),
+            "a prompt:no tap must not carry the prompt-content grant"
+        );
+    }
+
+    /// A tap's `prompt: ro` grant flows through `resolve_tap_hooks` as `send_prompt = true`, so the
+    /// firing site can hand it the prompt-content projection; a `prompt: no` tap stays `false`
+    /// (shape-only). This is the per-grant projection contract for taps.
+    #[test]
+    fn resolve_tap_hooks_carries_prompt_grant() {
+        let client = reqwest::Client::new();
+        let mk = |prompt: PromptAccess| HookCfg {
+            kind: HookKind::Tap,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9933/".to_string()),
+            timeout_ms: 5,
+            on_error: PolicyOnError::default(),
+            prompt,
+            user: UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: true,
+        };
+        let mut hooks = HashMap::new();
+        hooks.insert("ro-tap".to_string(), mk(PromptAccess::Ro));
+        hooks.insert("no-tap".to_string(), mk(PromptAccess::No));
+        let resolved = resolve_tap_hooks(
+            &hooks,
+            &["ro-tap".to_string(), "no-tap".to_string()],
+            &client,
+        );
+        assert_eq!(resolved.len(), 2);
+        // Both taps share priority 0; identify each by re-resolving individually to assert the flag.
+        let ro = resolve_tap_hooks(&hooks, &["ro-tap".to_string()], &client);
+        let no = resolve_tap_hooks(&hooks, &["no-tap".to_string()], &client);
+        assert!(ro[0].1, "prompt:ro tap carries send_prompt = true");
+        assert!(!no[0].1, "prompt:no tap carries send_prompt = false");
     }
 
     /// The `timeout_ms == 0` → default guard in `policy_timeout` (belt-and-suspenders for any
