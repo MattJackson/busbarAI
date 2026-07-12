@@ -517,19 +517,69 @@ pub(crate) async fn list_keys(
     let gov = gov.clone();
     let enabled = q.get("enabled").and_then(|s| s.parse::<bool>().ok());
     let prefix = q.get("prefix").cloned();
+    // PAGINATION (design-admin-api-v1 §2.1): `?limit=&offset=` over the filtered, id-sorted set.
+    // Absent params = the full list (unchanged legacy shape); `total` counts the filtered set so a
+    // pager can compute pages without a second call.
+    let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok());
+    let offset = q
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     let res = tokio::task::spawn_blocking(move || gov.all_keys()).await;
     match res {
         Ok(Ok(keys)) => {
-            let filtered: Vec<_> = keys
+            let mut filtered: Vec<_> = keys
                 .iter()
                 .filter(|k| enabled.is_none_or(|e| k.enabled == e))
                 .filter(|k| prefix.as_deref().is_none_or(|p| k.id.starts_with(p)))
+                .collect();
+            // Deterministic page boundaries: sort by id (the store's iteration order is not a
+            // pagination contract).
+            filtered.sort_by(|a, b| a.id.cmp(&b.id));
+            let total = filtered.len();
+            let page: Vec<_> = filtered
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
                 .map(key_meta)
                 .collect();
-            json_response(StatusCode::OK, json!({ "keys": filtered }))
+            json_response(StatusCode::OK, json!({ "keys": page, "total": total }))
         }
         Ok(Err(e)) => internal_error("list_keys", &e),
         Err(e) => join_error("list_keys", &e),
+    }
+}
+
+/// POST /admin/v1/keys/{id}/rotate — mint a FRESH bearer secret for an existing key, in place: the
+/// id (and with it budgets, rate windows, usage, audit attribution) is unchanged; the old secret
+/// stops resolving immediately; the new secret is returned exactly once, exactly like mint. 404
+/// for an unknown id. An attached AWS SigV4 credential is not touched (separate lifecycle).
+pub(crate) async fn rotate_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(id): Path<String>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let Some(gov) = &app.governance else {
+        return disabled();
+    };
+    let gov = gov.clone();
+    let gid = id.clone();
+    let res = tokio::task::spawn_blocking(move || gov.rotate_key(&gid)).await;
+    let resource = format!("key:{id}");
+    match res {
+        Ok(Ok(Some((key, secret)))) => {
+            audit::AUDIT.record_by("key.rotate", &resource, audit::OUTCOME_APPLIED, &actor);
+            let mut body = key_meta(&key);
+            body["secret"] = json!(secret); // shown exactly once, exactly like mint
+            json_response(StatusCode::OK, body)
+        }
+        Ok(Ok(None)) => {
+            audit::AUDIT.record_by("key.rotate", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
+        Ok(Err(e)) => internal_error("rotate_key", &e),
+        Err(e) => join_error("rotate_key", &e),
     }
 }
 
@@ -1094,6 +1144,103 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// Key ROTATION: the new secret works, the old stops resolving, the id + settings are
+    /// unchanged; unknown ids 404. And keys pagination: limit/offset over the id-sorted set with a
+    /// stable total.
+    #[tokio::test]
+    async fn test_admin_v1_key_rotate_and_pagination() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov.clone()).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // Mint three keys.
+        let mut ids = Vec::new();
+        for n in ["ka", "kb", "kc"] {
+            let created: serde_json::Value =
+                admin(client.post(format!("http://{addr}/admin/v1/keys")))
+                    .body(serde_json::json!({"name": n}).to_string())
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            ids.push((
+                created["id"].as_str().unwrap().to_string(),
+                created["secret"].as_str().unwrap().to_string(),
+            ));
+        }
+
+        // Pagination: limit 2 offset 0 then offset 2 covers all three exactly once, total stable.
+        let p1: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2&offset=0")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let p2: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2&offset=2")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(p1["total"], 3);
+        assert_eq!(p1["keys"].as_array().unwrap().len(), 2);
+        assert_eq!(p2["keys"].as_array().unwrap().len(), 1);
+        let mut seen: Vec<String> = p1["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(p2["keys"].as_array().unwrap())
+            .map(|k| k["id"].as_str().unwrap().to_string())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "pages cover every key exactly once");
+
+        // Rotate the first key: same id, new secret; old secret dead, new secret resolves.
+        let (id, old_secret) = ids[0].clone();
+        let rotated: serde_json::Value =
+            admin(client.post(format!("http://{addr}/admin/v1/keys/{id}/rotate")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(rotated["id"], id.as_str(), "id is stable across rotation");
+        let new_secret = rotated["secret"].as_str().unwrap().to_string();
+        assert_ne!(new_secret, old_secret);
+        assert!(gov.lookup(&new_secret).is_some(), "new secret resolves");
+        assert!(
+            gov.lookup(&old_secret).is_none(),
+            "old secret stops resolving immediately"
+        );
+
+        // Unknown id → 404.
+        let missing = admin(client.post(format!("http://{addr}/admin/v1/keys/vk_nope/rotate")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+
+        handle.abort();
+    }
+
     /// `PUT /admin/v1/hooks/{name}`: replaces an overlay hook live; 404 for an unknown name;
     /// 409 for a grant change (immutability) and for a stale expected_version.
     #[tokio::test]

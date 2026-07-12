@@ -490,6 +490,25 @@ impl GovState {
     /// The old single-`Option` shape conflated absent and present-null, so a cap could never be
     /// cleared back to unlimited once set — only widened/narrowed. `enabled` stays a plain `Option`
     /// (a bool has no "unlimited"/clear state; absent vs present is its only distinction).
+    /// ROTATE a key's bearer secret in place: a fresh secret is minted, its hash replaces the
+    /// stored `key_hash`, and the OLD secret stops resolving immediately (cache refresh). The key
+    /// `id` stays STABLE — budgets, rate windows, usage history, and audit attribution carry over.
+    /// The id-from-hash-prefix coupling is a MINT-time collision guard only (lookups resolve by the
+    /// full `key_hash`), so a rotated row's id no longer matching its new hash prefix is harmless
+    /// by design. An attached AWS SigV4 credential (if any) is NOT rotated here — it is a separate
+    /// credential with its own lifecycle. Returns `None` for an unknown id; the new secret is shown
+    /// exactly once.
+    pub(crate) fn rotate_key(&self, id: &str) -> StoreResult<Option<(VirtualKey, String)>> {
+        let Some(mut key) = self.store.get_key(id)? else {
+            return Ok(None);
+        };
+        let secret = generate_secret()?;
+        key.key_hash = crate::sigv4::sha256_hex(secret.as_bytes());
+        self.store.put_key(&key)?;
+        self.refresh()?;
+        Ok(Some((key, secret)))
+    }
+
     pub(crate) fn update_key(
         &self,
         id: &str,

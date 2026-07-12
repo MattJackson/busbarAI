@@ -1118,6 +1118,7 @@ fn build_router_with_limits(
                 .patch(admin::update_key),
         )
         .route("/admin/v1/keys/{id}/usage", get(admin::key_usage))
+        .route("/admin/v1/keys/{id}/rotate", post(admin::rotate_key))
         // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery, admin,
         // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
