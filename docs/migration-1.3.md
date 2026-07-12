@@ -114,6 +114,30 @@ under `hooks:` (kind: gate, socket:) and reference it with `hook:``.
 
 ---
 
+## 5. Auth: `auth.mode` → `auth.chain` + `upstream_credentials`
+
+Authentication is now a **chain of modules** (a PAM-style list), not a single `mode`. The old
+`mode:` conflated two separate things — *who authenticates the caller* and *whose key hits the
+provider* — which are now separate keys.
+
+```yaml
+# 1.2.x
+auth:
+  mode: token            # token | passthrough | none
+  client_tokens: [ "${BUSBAR_CLIENT_TOKEN}" ]
+
+# 1.3
+auth:
+  chain: [tokens]                 # ordered auth modules; [] = open front door (was mode: none)
+  upstream_credentials: own       # own (default) | passthrough (was mode: passthrough)
+  client_tokens: [ "${BUSBAR_CLIENT_TOKEN}" ]   # the `tokens` module's allowlist
+```
+
+Mapping: `mode: token` → `chain: [tokens]`; `mode: none` → `chain: []`; `mode: passthrough` →
+`chain: []` + `upstream_credentials: passthrough`. `tokens` is the built-in auth module (removable /
+swappable — external SSO/AD/OIDC modules are added at compile time and named in the chain the same
+way). A stale `mode:` key is a loud boot error (`unknown field mode`).
+
 ## Quick checklist
 
 - [ ] `route: <weighted|cheapest|fastest|least_busy|usage>` → `policy: <same>`
@@ -121,6 +145,8 @@ under `hooks:` (kind: gate, socket:) and reference it with `hook:``.
 - [ ] `policy.send_prompt: true` → hook `prompt: ro` (or `rw` to allow rewrite)
 - [ ] `policy.send_user: true` → hook `user: ro`
 - [ ] `route: script` → a socket hook binary + `hooks:` entry
+- [ ] `auth.mode: token` → `auth.chain: [tokens]`; `mode: passthrough` → `chain: []` +
+      `upstream_credentials: passthrough`; `mode: none` → `chain: []`
 
 If Busbar starts, you're done — there are no silent fallbacks, so a clean boot means a fully migrated
 config.
