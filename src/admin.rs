@@ -1193,6 +1193,51 @@ mod tests {
         handle.abort();
     }
 
+    /// SECURITY CONTRACT: every documented `/admin/v1` GET endpoint rejects a MISSING token and a
+    /// WRONG token with 401 — the whole surface is admin-guarded, no read leaks without the credential.
+    /// Iterates the same V1_GET_PATHS the openapi doc + drift guard use, so a newly-added endpoint is
+    /// automatically covered.
+    #[tokio::test]
+    async fn test_admin_v1_all_reads_require_admin_token() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
+            // No token → 401.
+            let none = client
+                .get(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                none.status().as_u16(),
+                401,
+                "{path} must reject a request with NO admin token"
+            );
+            // Wrong token → 401.
+            let wrong = client
+                .get(format!("http://{addr}{path}"))
+                .header("x-admin-token", "not-the-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                wrong.status().as_u16(),
+                401,
+                "{path} must reject a request with the WRONG admin token"
+            );
+        }
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key
