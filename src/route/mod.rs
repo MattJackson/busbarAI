@@ -1250,6 +1250,7 @@ mod tests {
             )),
             rewrite_hooks: Vec::new(),
             tap_hooks: Vec::new(),
+            global_gates: Vec::new(),
             hook_registry: std::collections::HashMap::new(),
             global_hooks: Vec::new(),
             overlay_path: None,

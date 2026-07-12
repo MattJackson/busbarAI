@@ -751,6 +751,7 @@ impl TestApp {
             auth,
             rewrite_hooks: Vec::new(),
             tap_hooks: Vec::new(),
+            global_gates: Vec::new(),
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
             overlay_path: self.overlay_path,

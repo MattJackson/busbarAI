@@ -504,6 +504,37 @@ pub(crate) fn resolve_tap_hooks(
     ranked.into_iter().map(|(_, t, sp, p)| (t, sp, p)).collect()
 }
 
+/// Resolve the GLOBAL DECISION gates — the `global_hooks` names whose registry entry is a `kind: gate`
+/// that is NOT a rewrite gate (`prompt: rw` gates fire in the phase-1 transform pass via
+/// `resolve_rewrite_hooks`; taps observe, they don't decide). These fire on EVERY request to reach a
+/// verdict (reject / restrict / order) alongside a pool's own `hook:` gate. Returns the full
+/// `ResolvedPolicy` for each (carrying `on_error`/`on_empty`/grants) so the firing site can run it
+/// through the same `decide_policy_order` machinery as a pool gate. Sorted by ascending `priority`
+/// (tie-break order, e.g. which reject message surfaces first). Unresolvable transports are skipped
+/// (config_validate surfaces them at boot).
+pub(crate) fn resolve_gate_hooks(
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+    global_hooks: &[String],
+    client: &reqwest::Client,
+) -> Vec<ResolvedPolicy> {
+    let mut ranked: Vec<(u16, ResolvedPolicy)> = Vec::new();
+    for name in global_hooks {
+        let Some(hook) = hooks.get(name) else {
+            continue;
+        };
+        // Decision gates only: a gate that does not rewrite. `rw` gates are phase-1 rewrites; taps
+        // never decide. (A gate may still return nothing/reject/restrict/order.)
+        if hook.kind != crate::config::HookKind::Gate || hook.prompt.can_rewrite() {
+            continue;
+        }
+        if let Some(rp) = resolve_gate_transport(hook, client) {
+            ranked.push((hook.priority, rp));
+        }
+    }
+    ranked.sort_by_key(|(p, _)| *p);
+    ranked.into_iter().map(|(_, rp)| rp).collect()
+}
+
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
 /// SWRR with a loud pointer at the webhook transport. The request is never stranded.
 #[cfg(not(unix))]
@@ -801,6 +832,46 @@ mod tests {
             resolved.len(),
             1,
             "only the prompt:rw GATE is a rewrite hook; ro/no gates + the tap are excluded"
+        );
+    }
+
+    /// `resolve_gate_hooks` admits the GLOBAL DECISION gates: `kind: gate` that is NOT a rewrite
+    /// (`prompt: rw`) gate. A rewrite gate fires in the phase-1 transform pass (excluded here); a tap
+    /// never decides (excluded). So from {rw-gate, ro-gate, no-gate, rw-tap} exactly the ro + no gates
+    /// resolve as decision gates.
+    #[test]
+    fn resolve_gate_hooks_admits_only_decision_gates() {
+        let client = reqwest::Client::new();
+        let mk = |kind: HookKind, prompt: PromptAccess| HookCfg {
+            kind,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9933/".to_string()),
+            timeout_ms: 5,
+            on_error: PolicyOnError::default(),
+            prompt,
+            user: UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: true,
+            default: false,
+        };
+        let mut hooks = HashMap::new();
+        hooks.insert("rw-gate".to_string(), mk(HookKind::Gate, PromptAccess::Rw));
+        hooks.insert("ro-gate".to_string(), mk(HookKind::Gate, PromptAccess::Ro));
+        hooks.insert("no-gate".to_string(), mk(HookKind::Gate, PromptAccess::No));
+        hooks.insert("a-tap".to_string(), mk(HookKind::Tap, PromptAccess::Ro));
+        let global = vec![
+            "rw-gate".to_string(),
+            "ro-gate".to_string(),
+            "no-gate".to_string(),
+            "a-tap".to_string(),
+        ];
+        let resolved = resolve_gate_hooks(&hooks, &global, &client);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "decision gates = the ro + no gates; the rw (rewrite) gate and the tap are excluded"
         );
     }
 

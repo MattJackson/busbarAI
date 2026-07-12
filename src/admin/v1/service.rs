@@ -149,6 +149,8 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     );
     next.tap_hooks =
         crate::routing::resolve_tap_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.global_gates =
+        crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
     Ok(next)
 }
 
@@ -173,6 +175,8 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
     );
     next.tap_hooks =
         crate::routing::resolve_tap_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.global_gates =
+        crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
     Ok(next)
 }
 

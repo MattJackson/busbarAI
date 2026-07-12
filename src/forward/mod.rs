@@ -2822,6 +2822,73 @@ pub(crate) async fn forward_with_pool_parsed(
     // `x-busbar-route-policy` transparency header). It stays `None` on the default path AND when a
     // configured policy Abstains / errors-to-weighted (both fall through to SWRR, which is not a
     // "policy choice" worth advertising).
+    // ── GLOBAL DECISION GATES ────────────────────────────────────────────────────────────────────
+    // Fire the global (non-rewrite) `kind: gate` hooks for a verdict on this request, BEFORE pool
+    // routing. Today the REJECT arm is honored: a global guard/PII gate that says no short-circuits
+    // with a dialect-native 4xx and nothing dispatched — so a `global_hooks: [pii-guard]` reject gate
+    // now actually enforces (it was previously inert; only a pool's own `hook:` fired). Priority order
+    // makes the surfacing reject deterministic. restrict/order from a GLOBAL gate are a follow-up (this
+    // increment does not let a global gate reshape the candidate set — that reconcile lands next).
+    // ZERO COST when no global gate is configured (empty-loop).
+    for gate in &app.global_gates {
+        match decide_policy_order(
+            &app,
+            gate,
+            &cands,
+            &request_ctx,
+            v.as_ref().unwrap_or(&Value::Null),
+            pool_name,
+            ingress_protocol,
+            wants_stream,
+            caller_token,
+        )
+        .await
+        {
+            // The gate's deliberate REJECT verd — status clamped 400..=499 + message sanitized at the
+            // producing seam, so this arm can trust both. Dialect-native 4xx, nothing dispatched.
+            PolicyOutcome::RejectRequest {
+                status,
+                message,
+                name,
+            } => {
+                metrics::counter!(
+                    crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                    "policy" => name,
+                    "pool" => pool_name.to_string(),
+                    "status" => status.to_string(),
+                )
+                .increment(1);
+                tracing::info!(
+                    policy = name,
+                    pool = pool_name,
+                    status,
+                    message = %message,
+                    "global gate rejected the request"
+                );
+                return ingress_error(
+                    ingress_protocol,
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                    reject_kind_for_status(status),
+                    &message,
+                );
+            }
+            // A fail-closed global gate (`on_error: reject`) that errored/timed out: 503, never a
+            // silent proceed — the gate was declared load-bearing.
+            PolicyOutcome::Reject => {
+                return ingress_error(
+                    ingress_protocol,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    KIND_OVERLOADED,
+                    "A required gate could not complete. Please retry shortly.",
+                );
+            }
+            // order / restrict / abstain / weighted from a GLOBAL gate: not honored this increment
+            // (globals only reject for now); a global gate that orders or restricts is a no-op until
+            // the multi-gate reconcile lands.
+            _ => {}
+        }
+    }
+
     let mut chosen_policy_name: Option<&'static str> = None;
     let policy_order: Option<Vec<usize>> = match app
         .pool_runtime

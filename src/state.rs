@@ -140,6 +140,13 @@ pub(crate) struct App {
         bool,
         Arc<dyn crate::routing::RoutingPolicy>,
     )>,
+    /// GLOBAL DECISION gates — the non-rewrite `kind: gate` hooks in `global_hooks`, resolved to their
+    /// full `ResolvedPolicy` (transport + on_error/on_empty/grants). Fired on EVERY request to reach a
+    /// verdict, alongside a pool's own `hook:` gate. Today the REJECT arm is honored (a global guard/PII
+    /// gate that says no short-circuits before pool routing); restrict/order from globals are a
+    /// follow-up increment. Empty (the default) = no global gates, zero cost. Priority-ordered so the
+    /// surfacing reject is deterministic.
+    pub(crate) global_gates: Vec<crate::routing::ResolvedPolicy>,
     /// The raw `hooks:` registry (name → definition) as configured, for the Admin API v1 hooks READ
     /// surface (`GET /admin/v1/hooks`). This is the DEFINITION set, distinct
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty
