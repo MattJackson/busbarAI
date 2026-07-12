@@ -126,7 +126,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 
 [features]
-default = []
+# The built-in `tokens` auth plugin is a DEFAULT-ON, REMOVABLE feature — compliance by compilation.
+# A `--no-default-features` build contains NO client-token auth code at all (the module, its
+# constant-time fold, and the allowlist are absent from the binary, provable by attestation +
+# symbols). `auth.chain: [tokens]` then BOOT-ERRORS instead of silently opening. A regulated
+# deployment ships tokens OUT and wires its own auth module (SAML/AD/OIDC) in the private repo.
+default = ["auth-tokens"]
+auth-tokens = []
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.

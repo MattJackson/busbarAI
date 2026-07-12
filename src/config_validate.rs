@@ -738,14 +738,26 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     // stale `mode:`/`token:` key fails AT PARSE with serde's "unknown field" — a loud clean-break
     // boot error, no validate-time check needed (and no silent credential drop).
     if let Some(auth) = &cfg.auth {
-        // Every module name in the chain must resolve to a compiled-in auth module (only `tokens`
-        // today). An unknown name is a hard boot error, never a silently-dropped module.
+        // Every module name in the chain must resolve to a COMPILED-IN auth module (only `tokens`
+        // today, and only when the `auth-tokens` feature is on). An unknown OR uncompiled name is a
+        // hard boot error — never a silently-dropped module (which would silently open the relay).
         for name in &auth.chain {
-            if name != "tokens" {
-                errors.push(format!(
-                    "auth.chain names unknown module '{name}': the only built-in auth module is \
-                     'tokens' (external modules are added at compile time)"
-                ));
+            let available = name == "tokens" && cfg!(feature = "auth-tokens");
+            if !available {
+                if name == "tokens" {
+                    // `--no-default-features` (compliance build): tokens auth is absent.
+                    errors.push(
+                        "auth.chain names 'tokens' but this binary was built WITHOUT the \
+                         `auth-tokens` feature — the token auth module is absent from the binary. \
+                         Rebuild with default features, or configure a different auth module."
+                            .to_string(),
+                    );
+                } else {
+                    errors.push(format!(
+                        "auth.chain names unknown module '{name}': the only built-in auth module is \
+                         'tokens' (external modules are added at compile time)"
+                    ));
+                }
             }
         }
         let chain_has_tokens = auth.chain.iter().any(|n| n == "tokens");

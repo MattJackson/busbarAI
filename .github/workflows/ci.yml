@@ -36,6 +36,24 @@ jobs:
       - name: Test
         run: cargo test --locked --verbose
 
+  # Compliance-by-compilation gate: busbar must build + lint clean with the built-in `tokens` auth
+  # plugin COMPILED OUT (`--no-default-features`), so a regulated deployment can ship a binary that
+  # provably contains no client-token auth code. (Tests run on the default build; here we only prove
+  # the featureless build stays green — `auth.chain: [tokens]` is a boot error in this binary.)
+  no-default-features:
+    name: no-default-features build · clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (no-default-features)
+        run: cargo clippy --no-default-features --locked -- -D warnings
+      - name: Build (no-default-features)
+        run: cargo build --no-default-features --locked --verbose
+
   # Portability gate: busbar must build + pass tests on Windows too (no OS-specific code).
   windows:
     name: windows build · test

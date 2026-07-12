@@ -84,6 +84,10 @@ impl fmt::Debug for CallerToken {
 /// `Pass` = "not mine" — no usable credential for this module, defer to the next module / the mode
 /// default. Slice 2 uses only the verdict; the principal payload lands in slice 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The contract enum persists even when NO built-in auth module is compiled (a `--no-default-features`
+// / external-only build): an external `AuthModule` constructs these verdicts. Without a compiled-in
+// module the variants are unconstructed, hence allow(dead_code).
+#[allow(dead_code)]
 pub(crate) enum AuthOutcome {
     Identify,
     Reject,
@@ -107,7 +111,9 @@ pub(crate) trait AuthModule: Send + Sync {
 
 // The built-in `tokens` auth module IMPLEMENTATION lives in the `tokens` auth plugin
 // (`crate::plugins::auth::tokens`), NOT in the engine core — the engine holds only the `AuthModule`
-// contract above. `grep token` in the engine is clean; the plugin is default-included and removable.
+// contract above. `grep token` in the engine is clean; the plugin is default-included and REMOVABLE
+// (the `auth-tokens` feature; a `--no-default-features` build contains no token auth code at all).
+#[cfg(feature = "auth-tokens")]
 use crate::plugins::auth::tokens::TokensModule;
 
 /// AuthMiddleware holds the resolved auth chain, the upstream-credential mode, and the token allowlist.
@@ -159,12 +165,17 @@ impl AuthMiddleware {
             .iter()
             .filter_map(|name| -> Option<Box<dyn AuthModule>> {
                 match name.as_str() {
+                    // The built-in tokens module — present only in an `auth-tokens` build. When
+                    // compiled OUT, `chain: [tokens]` is a config_validate BOOT ERROR (never a
+                    // silently-dropped module -> never a silent open relay), so this arm's absence is
+                    // safe.
+                    #[cfg(feature = "auth-tokens")]
                     "tokens" => Some(Box::new(TokensModule::new(&tokens))),
                     other => {
                         tracing::error!(
                             module = other,
-                            "auth.chain names an unknown module; skipping (config_validate rejects \
-                             this at boot)"
+                            "auth.chain names an unknown/uncompiled module; skipping \
+                             (config_validate rejects this at boot)"
                         );
                         None
                     }
