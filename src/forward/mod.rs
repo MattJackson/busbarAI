@@ -2045,6 +2045,44 @@ enum PolicyOutcome {
     },
 }
 
+/// Apply a rewrite gate's reply to the ingress request body IN PLACE (the transform pass). MVP:
+/// replace the `messages` array (the openai/anthropic-family chat shape) with the rewritten messages,
+/// and inject any returned `tools` (append to an existing `tools` array, else set it). Returns whether
+/// a rewrite was applied.
+///
+/// FAIL-SAFE by construction: if the body is not an object, or has no `messages` ARRAY (a dialect the
+/// MVP does not cover — e.g. gemini `contents`), or the rewrite carries no messages, it returns
+/// `false` and leaves `v` UNTOUCHED — the request proceeds with the ORIGINAL body, never a corrupted
+/// one. (Full canonical re-render across ALL six dialects via the IR — `IrReq` — is the follow-up;
+/// see docs/1.3-everything-is-a-hook.md "Rewrite forward-integration crux".)
+#[allow(dead_code)] // dispatched by the forward global-hooks transform seam next (slice-4 step)
+fn apply_rewrite_to_body(v: &mut Value, rewrite: &crate::routing::wire::RewriteReply) -> bool {
+    if rewrite.messages.is_empty() {
+        return false;
+    }
+    let Some(obj) = v.as_object_mut() else {
+        return false;
+    };
+    // Only rewrite a body that already carries a `messages` ARRAY (openai/anthropic family). Any other
+    // shape is left untouched — fail-safe, never a corrupted body.
+    if !obj.get("messages").is_some_and(Value::is_array) {
+        return false;
+    }
+    obj.insert(
+        "messages".to_string(),
+        Value::Array(rewrite.messages.clone()),
+    );
+    if !rewrite.tools.is_empty() {
+        match obj.get_mut("tools").and_then(Value::as_array_mut) {
+            Some(existing) => existing.extend(rewrite.tools.iter().cloned()),
+            None => {
+                obj.insert("tools".to_string(), Value::Array(rewrite.tools.clone()));
+            }
+        }
+    }
+    true
+}
+
 /// Chars of the request's system prompt: a bare string, or — when the system value is a block
 /// array (Anthropic allows both) — the sum of every block's `text` string (keyed on the `text`
 /// field's presence, not on `type`). The SAME shapes
@@ -5020,6 +5058,52 @@ mod usage_tap_tests {
     use super::{record_ir_usage, stable_hash, UsageSink};
     use crate::ir::IrUsage;
     use std::sync::Arc;
+
+    /// `apply_rewrite_to_body` replaces the `messages` array + injects tools on a chat-shaped body,
+    /// and is FAIL-SAFE — a body with no `messages` array (or an empty rewrite) is left UNTOUCHED and
+    /// returns false, so the request proceeds with the original body.
+    #[test]
+    fn apply_rewrite_to_body_swaps_messages_and_is_fail_safe() {
+        use crate::routing::wire::RewriteReply;
+
+        // Chat-shaped body → messages replaced, tool injected (appended to existing tools).
+        let mut v = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "a very long original prompt"}],
+            "tools": [{"name": "existing"}]
+        });
+        let rw = RewriteReply {
+            messages: vec![serde_json::json!({"role": "user", "content": "compressed"})],
+            tools: vec![serde_json::json!({"name": "headroom_retrieve"})],
+        };
+        assert!(super::apply_rewrite_to_body(&mut v, &rw));
+        assert_eq!(
+            v["messages"],
+            serde_json::json!([{"role":"user","content":"compressed"}])
+        );
+        assert_eq!(
+            v["tools"].as_array().unwrap().len(),
+            2,
+            "tool injected, existing kept"
+        );
+        assert_eq!(v["model"], "m", "unrelated fields untouched");
+
+        // No `messages` array (e.g. gemini `contents`) → untouched, returns false.
+        let mut g = serde_json::json!({"contents": [{"parts": []}]});
+        let before = g.clone();
+        assert!(!super::apply_rewrite_to_body(&mut g, &rw));
+        assert_eq!(g, before, "non-chat body left untouched (fail-safe)");
+
+        // Empty rewrite → untouched, false.
+        let mut v2 = serde_json::json!({"messages": [{"role":"user","content":"x"}]});
+        let before2 = v2.clone();
+        let empty = RewriteReply {
+            messages: vec![],
+            tools: vec![],
+        };
+        assert!(!super::apply_rewrite_to_body(&mut v2, &empty));
+        assert_eq!(v2, before2);
+    }
 
     // Regression for #29: the token fee charged at response completion must be attributed to the
     // SAME budget window the request was admitted in (`UsageSink::charged_at`, the header-arrival
