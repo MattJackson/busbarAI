@@ -3973,8 +3973,6 @@ models:
             on_error: config::PolicyOnError::default(),
             send_prompt: false,
             send_user: false,
-            script: None,
-            script_file: None,
             name: None,
         });
         let mut pools = HashMap::new();
@@ -4057,8 +4055,6 @@ models:
             on_error: config::PolicyOnError::default(),
             send_prompt: false,
             send_user: false,
-            script: None,
-            script_file: None,
             name: None,
         });
         let mut pools = HashMap::new();

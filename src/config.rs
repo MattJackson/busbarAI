@@ -351,7 +351,7 @@ pub(crate) struct PoolCfg {
     /// `policy.name: cheapest`) and the short form are byte-identical after load. `route: weighted`
     /// (long or short) stays plain `RouteKind::Weighted` (the zero-cost default), NOT a native object.
     pub(crate) route: RouteKind,
-    /// Per-transport policy configuration (URL/script/native-name/timeout/on_error). Inert when
+    /// Per-transport policy configuration (URL/native-name/timeout/on_error). Inert when
     /// `route: weighted`. For a native shorthand the resolved `name` is synthesized here so the
     /// native registry lookup in `routing::resolve_policy` sees a single canonical shape.
     pub(crate) policy: Option<PolicyCfg>,
@@ -362,7 +362,7 @@ pub(crate) struct PoolCfg {
 /// `usage`) desugars to `RouteKind::Native` with `policy.name` set to that shorthand, so the rest of
 /// the codebase only ever sees the canonical `(route: native, policy.name: <native>)` shape — the
 /// long form keeps working unchanged. `route: weighted` (long or short) stays `RouteKind::Weighted`
-/// (the zero-cost default); `webhook` / `script` / `native` keep their existing meaning. An explicit
+/// (the zero-cost default); `webhook` / `socket` / `native` keep their existing meaning. An explicit
 /// `policy.name` is never overwritten by the shorthand (a long-form config wins).
 impl<'de> Deserialize<'de> for PoolCfg {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -399,7 +399,17 @@ impl<'de> Deserialize<'de> for PoolCfg {
             }
             Some("webhook") => (RouteKind::Webhook, None),
             Some("socket") => (RouteKind::Socket, None),
-            Some("script") => (RouteKind::Script, None),
+            // `route: script` (the embedded Rhai transport) was REMOVED in 1.3 — a clean break, not
+            // a silent fallback. Scriptable routing is now an out-of-process socket hook. Name the
+            // fix in the boot error so the migration is a one-liner, never a mystery.
+            Some("script") => {
+                return Err(serde::de::Error::custom(
+                    "route: script (the embedded Rhai transport) was removed in 1.3. Migrate to \
+                     route: socket (a compiled hook on a Unix domain socket — same ranked-order \
+                     wire contract, ~100x faster) or route: webhook. See the 1.2.x -> 1.3 \
+                     migration guide.",
+                ));
+            }
             Some("native") => (RouteKind::Native, None),
             // Native shorthands: a bare policy name in `route:` ⇒ Native + that name in policy.name.
             Some(crate::routing::native::POLICY_NAME_CHEAPEST) => (
@@ -420,8 +430,8 @@ impl<'de> Deserialize<'de> for PoolCfg {
             ),
             Some(other) => {
                 return Err(serde::de::Error::custom(format!(
-                    "unknown route '{other}': expected one of weighted, webhook, socket, script, \
-                     native, or a native shorthand (cheapest, fastest, least_busy, usage)"
+                    "unknown route '{other}': expected one of weighted, webhook, socket, native, \
+                     or a native shorthand (cheapest, fastest, least_busy, usage)"
                 )));
             }
         };
@@ -470,9 +480,6 @@ pub(crate) enum RouteKind {
     /// An operator-run BINARY hook on a local Unix domain socket (`policy.socket`) — the same wire
     /// contract as the webhook without the HTTP stack, for microsecond decisions. Unix-only.
     Socket,
-    /// An embedded Rhai script (behind the `script-policy` cargo feature) returning a ranked order.
-    /// DEPRECATED: prefer `socket` (compiled hook, ~100x faster) or `webhook`.
-    Script,
     /// A Busbar-native policy selected by `policy.name` (e.g. `cheapest`/`fastest`/`least_busy`/
     /// `usage`/`weighted`).
     Native,
@@ -492,8 +499,8 @@ pub(crate) enum PolicyOnError {
 }
 
 /// Per-pool policy configuration. All transports share `timeout_ms`/`on_error`; the transport-specific
-/// fields (`url`, `script`/`script_file`, `name`) are validated against `route` at startup.
-// The transport-specific fields (`url`, `script`/`script_file`, `name`) are consumed by
+/// fields (`url`, `socket`, `name`) are validated against `route` at startup.
+// The transport-specific fields (`url`, `socket`, `name`) are consumed by
 // `routing::resolve_policy` at config load to construct the matching transport, and validated against
 // `route` at startup.
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -527,28 +534,17 @@ pub(crate) struct PolicyCfg {
     /// says "this hook is trusted with request content" (PII screening, guardrails, audit).
     /// Cost note: the hook payload then scales with the request body (bounded by the ingress body
     /// cap; the serialized line is transiently held per decision) — budget hook memory accordingly.
-    /// Webhook/socket only; the script (deprecated) and native transports have no reader for it
-    /// and force it off at resolve, each with a startup warning.
+    /// Webhook/socket only; the native transport has no reader for it and forces it off at resolve
+    /// with a startup warning.
     #[serde(default)]
     pub(crate) send_prompt: bool,
     /// Opt-in: include caller identity in the hook payload — the governance virtual-key `id`/`name`
     /// (NEVER the secret) and the request body's end-user field (`user` / `metadata.user_id`).
     /// DEFAULT OFF. Turning it on enables route-by-who policies (team lanes, per-user denies).
-    /// Webhook/socket only; the script (deprecated) and native transports have no reader for it
-    /// and force it off at resolve, each with a startup warning.
+    /// Webhook/socket only; the native transport has no reader for it and forces it off at resolve
+    /// with a startup warning.
     #[serde(default)]
     pub(crate) send_user: bool,
-    // ── script transport ─────────────────────────────────────────────────────────────────────────
-    /// Inline Rhai source. Exactly one of `script`/`script_file` is required when `route: script`.
-    /// Read by `routing::resolve_policy`'s script arm, which is gated on the `script-policy` feature;
-    /// the default build parses the field (configs round-trip) but compiles out the only reader.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
-    pub(crate) script: Option<String>,
-    /// Path to a Rhai script file. Alternative to inline `script`. Same `script-policy`-gated reader.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
-    pub(crate) script_file: Option<String>,
     // ── native transport ─────────────────────────────────────────────────────────────────────────
     /// Native policy name (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`). Required when
     /// `route: native`.
@@ -575,7 +571,7 @@ pub(crate) struct PoolMember {
     #[serde(default)]
     pub(crate) context_max: Option<usize>,
     /// Operator-declared routing tier (e.g. `"large"`/`"small"`/`"primary"`/`"overflow"`). Projected
-    /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/script policies.
+    /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/socket policies.
     #[serde(default)]
     pub(crate) tier: Option<String>,
     /// Per-ATTEMPT time-to-response-headers cap (ms) for THIS member in THIS pool — overrides the
@@ -589,11 +585,11 @@ pub(crate) struct PoolMember {
     #[serde(default)]
     pub(crate) reasoning: Option<bool>,
     /// Operator-declared cost in currency-units per million tokens. Drives the native `cheapest`
-    /// policy and is exposed to webhook/script policies. Inert when unset.
+    /// policy and is exposed to webhook/socket policies. Inert when unset.
     #[serde(default)]
     pub(crate) cost_per_mtok: Option<f64>,
     /// Free-form operator tags (e.g. `["opus"]`) a policy can match on. Projected into the routing
-    /// `Candidate` and read by webhook/script policies.
+    /// `Candidate` and read by webhook/socket policies.
     #[serde(default)]
     pub(crate) tags: Vec<String>,
 }
@@ -1887,11 +1883,25 @@ models:
         assert_eq!(long.route, RouteKind::Native);
         assert_eq!(long.policy.unwrap().name.as_deref(), Some("fastest"));
 
-        // webhook / script keep their kind.
+        // webhook keeps its kind.
         let wh: PoolCfg =
             serde_yaml::from_str("route: webhook\nmembers: []\npolicy:\n  url: http://x\n")
                 .expect("webhook parses");
         assert_eq!(wh.route, RouteKind::Webhook);
+    }
+
+    /// `route: script` (the removed Rhai transport) is a CLEAN-BREAK boot error in 1.3 — not a
+    /// silent fallback to weighted — and the error names the migration (socket/webhook).
+    #[test]
+    fn test_route_script_is_removed_boot_error() {
+        let err = serde_yaml::from_str::<PoolCfg>("route: script\nmembers: []\n")
+            .expect_err("route: script must be a hard error");
+        let msg = err.to_string();
+        assert!(msg.contains("removed in 1.3"), "names the removal: {msg}");
+        assert!(
+            msg.contains("route: socket") && msg.contains("route: webhook"),
+            "names the migration path: {msg}"
+        );
     }
 
     /// The hook payload opt-ins (`policy.send_prompt` / `policy.send_user`) are SIMPLE booleans

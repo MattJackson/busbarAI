@@ -93,15 +93,11 @@ getrandom = "0.4"
 # correct, fast CRC32. `crc32fast` is small, dependency-light, and the de-facto standard.
 crc32fast = "1"
 # The pluggable routing-policy contract (`RoutingPolicy`) is an async trait so the webhook transport
-# can do I/O; native/script policies return immediately. `async-trait` is the standard, zero-runtime
+# can do I/O; native/socket policies return immediately. `async-trait` is the standard, zero-runtime
 # (compile-time desugar to boxed futures) way to express object-safe async traits on stable Rust. It
 # is only ever entered for NON-default pools — a `route: weighted` (default) pool never constructs a
 # `RoutingPolicy` and never touches this boxing, preserving the zero-cost default.
 async-trait = "0.1"
-# Optional embedded scripting transport (`route: script`). Pure-Rust, no unsafe, sandboxable (op-count
-# cap, size caps, no I/O host fns). Feature-gated so operators who don't want the dependency build
-# without it; webhook + native transports work with the feature off.
-rhai = { version = "1", optional = true, default-features = false, features = ["sync"] }
 # Native inbound TLS termination (+ optional mTLS). `tokio-rustls` wraps the accepted TcpStream in a
 # rustls server handshake; it pins the `ring` crypto provider (already the only provider in the graph
 # via reqwest/hyper-rustls), so the process holds exactly one CryptoProvider — no aws-lc-rs.
@@ -131,8 +127,6 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 
 [features]
 default = []
-# Enables the Rhai `route: script` transport.
-script-policy = ["dep:rhai"]
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.

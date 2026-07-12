@@ -7,7 +7,7 @@
 //! ordered **preference** of members — not a single pick. The ordered list feeds the failover loop
 //! Busbar already has (`forward::pick_among`): if the policy's #1 is tripped / excluded / at
 //! capacity, Busbar walks to #2 using the existing breaker machinery. One transport-agnostic trait
-//! (`RoutingPolicy`); webhook / socket / script / native are implementations.
+//! (`RoutingPolicy`); webhook / socket / native are implementations.
 //!
 //! ZERO-COST DEFAULT: a `route: weighted` (default / absent) pool resolves to `ResolvedPolicy::None`
 //! at config load and NEVER constructs any of the projection types or enters this module's async
@@ -16,7 +16,7 @@
 //! This surface is PRODUCTION-WIRED: `forward::decide_policy_order` builds the `RoutingRequest` +
 //! `Candidate` projections from the live store signals and invokes the resolved policy on every
 //! non-default request; `forward::pick_among` walks the ranked order through the existing failover
-//! loop. `resolve_policy` (below) constructs the native / webhook / socket / script transports once
+//! loop. `resolve_policy` (below) constructs the native / webhook / socket transports once
 //! at config load.
 
 use std::sync::Arc;
@@ -35,8 +35,6 @@ fn policy_timeout(timeout_ms: u64) -> std::time::Duration {
 }
 
 pub(crate) mod native;
-#[cfg(feature = "script-policy")]
-pub(crate) mod script;
 pub(crate) mod socket;
 pub(crate) mod webhook;
 pub(crate) mod wire;
@@ -49,23 +47,20 @@ pub(crate) mod wire;
 pub(crate) struct RoutingRequest<'a> {
     pub(crate) pool: &'a str,
     pub(crate) ingress_protocol: &'a str,
-    /// The model the caller asked for (may be a pool name or a member model), if any. Projected to
-    /// the SCRIPT policy only — the shared webhook/socket wire (`wire::HookReqProjection`)
-    /// deliberately omits it. The script projection is the only reader in the default build, so it
-    /// is gated on `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// The model the caller asked for (may be a pool name or a member model), if any. RESERVED for
+    /// the gate/rewrite hook projections (1.3 hooks seam) — the shared webhook/socket wire
+    /// (`wire::HookReqProjection`) omits it today, so it has no reader yet.
+    #[allow(dead_code)]
     pub(crate) requested_model: Option<&'a str>,
     pub(crate) message_count: usize,
-    /// Number of tool definitions on the request. Projected to the script policy (the only reader),
-    /// so it is gated on `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// Number of tool definitions on the request. RESERVED for the hook seam (no reader yet).
+    #[allow(dead_code)]
     pub(crate) tool_count: usize,
     pub(crate) has_tools: bool,
     /// Sum of all text-block chars across system + messages. A v1 SIZE signal (NOT a token count).
     pub(crate) total_chars: usize,
-    /// System-prompt text chars only. Projected to the script policy (the only reader), so it is
-    /// gated on `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// System-prompt text chars only. RESERVED for the hook seam (no reader yet).
+    #[allow(dead_code)]
     pub(crate) system_chars: usize,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
@@ -144,23 +139,22 @@ pub(crate) struct Candidate<'a> {
     /// Index into `app.lanes` — the failover loop's lingua franca.
     pub(crate) idx: usize,
     pub(crate) model: &'a str,
-    /// Upstream provider name. Projected to the script policy (its only reader), so it is gated on
-    /// `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// Upstream provider name. RESERVED for the gate/rewrite hook projections (1.3 hooks seam);
+    /// no reader yet.
+    #[allow(dead_code)]
     pub(crate) provider: &'a str,
-    /// The existing SWRR weight (so a policy can fall back to it). Projected to the script policy (its
-    /// only reader), so it is gated on `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// The existing SWRR weight (so a policy can fall back to it). RESERVED for the hook seam; no
+    /// reader yet.
+    #[allow(dead_code)]
     pub(crate) weight: u32,
-    /// Member context-window ceiling. Projected to the script policy (its only reader), so it is
-    /// gated on `script-policy`.
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
+    /// Member context-window ceiling. RESERVED for the hook seam; no reader yet.
+    #[allow(dead_code)]
     pub(crate) context_max: Option<usize>,
     // ── operator-declared member metadata (config) ───────────────────────────────────────────────
     pub(crate) tier: Option<&'a str>,
     pub(crate) cost_per_mtok: Option<f64>,
     /// Free-form operator tags. Projected to the hook wire (`wire::HookCandidate.tags`, omitted
-    /// when empty) and to the script policy.
+    /// when empty).
     pub(crate) tags: &'a [String],
     // ── live signals (read per-request from the store at the seam) ───────────────────────────────
     /// Rolling EWMA of recent end-to-end latency for this lane, in milliseconds. `None` until the
@@ -194,8 +188,8 @@ pub(crate) struct RoutingContext<'a> {
 }
 
 /// A boxed, thread-safe policy error. Kept dependency-free (no `anyhow`/`thiserror`) so the routing
-/// contract adds no new crate. A transport surfaces transient failures (a webhook 500, a script
-/// panic, a marshaling error) as this; the caller coerces any `Err` to the pool's `on_error` fallback,
+/// contract adds no new crate. A transport surfaces transient failures (a webhook 500, a socket
+/// disconnect, a marshaling error) as this; the caller coerces any `Err` to the pool's `on_error` fallback,
 /// so an error NEVER propagates to the client — it degrades to weighted/reject/first.
 pub(crate) type PolicyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -239,7 +233,7 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
     ) -> PolicyResult;
 
     /// Stable transport/policy name for metrics + the `x-busbar-route` header
-    /// (e.g. `"webhook"`, `"script"`, `"weighted"`, `"cheapest"`).
+    /// (e.g. `"webhook"`, `"socket"`, `"weighted"`, `"cheapest"`).
     fn name(&self) -> &'static str;
 }
 
@@ -248,7 +242,7 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
 /// on `App` keyed by pool name; the hot path is `if let Some(p) = app.pool_policies.get(pool) { … }`.
 #[derive(Clone)]
 pub(crate) enum ResolvedPolicy {
-    /// A constructed policy object (webhook / script / native non-weighted) plus its fallback config.
+    /// A constructed policy object (webhook / socket / native non-weighted) plus its fallback config.
     /// The default SWRR / weighted path is represented as `None` by `resolve_policy` (it constructs no
     /// policy object), so there is no `Weighted` variant — a weighted pool simply has no resolved
     /// policy and takes the inline SWRR branch.
@@ -270,7 +264,7 @@ pub(crate) enum ResolvedPolicy {
 /// no projections, and takes the unchanged `select_weighted_in` branch.
 ///
 /// Every non-default transport is resolved here: a non-weighted native is looked up in the registry,
-/// a webhook is constructed over its validated URL + the shared client, and a script is compiled once.
+/// a webhook is constructed over its validated URL + the shared client, and a socket wraps its path.
 /// A missing / invalid / unknown transport degrades to `None` (the default SWRR) so routing never
 /// strands a request — startup validation is what surfaces the misconfiguration. The resolved policy
 /// is stored on `PoolRuntime::policy` and consumed per-request by `forward::decide_policy_order`.
@@ -298,8 +292,8 @@ pub(crate) fn resolve_policy(
             }
             let policy = native::native_policy(name)?;
             // The payload opt-ins are webhook/socket-only: native policies rank on live signals
-            // and have no reader for prompt/identity, so the flags are FORCED OFF (mirroring the
-            // script arm) — honoring them would burn per-request flattening/lookup building data
+            // and have no reader for prompt/identity, so the flags are FORCED OFF — honoring them
+            // would burn per-request flattening/lookup building data
             // nothing reads. Warn so the operator learns the flags are inert here.
             if policy_cfg.send_prompt || policy_cfg.send_user {
                 tracing::warn!(
@@ -333,13 +327,6 @@ pub(crate) fn resolve_policy(
                 send_user: policy_cfg.send_user,
             })
         }
-        // SCRIPT (Rhai) transport. Behind the `script-policy` feature so the default build pulls no
-        // Rhai. The script is compiled ONCE here at config load; a compile error degrades to the
-        // default SWRR (`None`) with a loud warning — never strands a request. When the feature is
-        // absent, `route: script` likewise degrades to default with a clear "feature not enabled"
-        // warning, so a misconfigured pool is loud, not silent. DEPRECATED in favor of the socket
-        // hook (`resolve_script` warns).
-        RouteKind::Script => resolve_script(cfg),
         // The Unix-socket BINARY hook: an operator-run compiled hook on a local Unix domain socket,
         // same wire contract as the webhook, microseconds instead of a network hop. Unix-only; the
         // non-unix arm degrades loudly to the default (use `route: webhook` there). A missing socket
@@ -374,90 +361,6 @@ fn resolve_socket(_cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
     tracing::warn!(
         "route: socket (the Unix-socket hook) is not available on this platform; falling back to \
          weighted. Use `route: webhook` for an out-of-process routing hook here."
-    );
-    None
-}
-
-/// Resolve a `route: script` pool. Feature-gated body: with `script-policy` it compiles the operator
-/// script once and wraps it as a `Policy`; without the feature it warns and falls to the default.
-#[cfg(feature = "script-policy")]
-fn resolve_script(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
-    tracing::warn!(
-        "route: script (Rhai) is DEPRECATED and will be removed in a future release: the \
-         interpreter adds ~100us per decision where the socket hook (`route: socket`, a compiled \
-         binary on a Unix socket, same wire contract) answers in single-digit microseconds. \
-         Migrate to `route: socket` or `route: webhook`."
-    );
-    let policy_cfg = cfg.policy.as_ref();
-    // The payload opt-ins are webhook/socket-only: the frozen Rhai env has no bindings for them,
-    // so `resolve` forces them off (building the projections would be pure waste). Warn so the
-    // operator learns the flags are inert here rather than wondering why the script sees nothing.
-    if policy_cfg.is_some_and(|p| p.send_prompt || p.send_user) {
-        tracing::warn!(
-            "route: script does not support policy.send_prompt / policy.send_user; the flags are \
-             ignored. Migrate to `route: socket` or `route: webhook` for the payload opt-ins."
-        );
-    }
-    let source = match policy_cfg.map_or(Ok(None), script_source) {
-        Ok(Some(src)) => src,
-        Ok(None) => {
-            tracing::warn!(
-                "route: script pool has no `script`/`script_file`; falling back to weighted"
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!("route: script source error: {e}; falling back to weighted");
-            return None;
-        }
-    };
-    match script::ScriptPolicy::compile(&source) {
-        Ok(policy) => Some(ResolvedPolicy::Policy {
-            policy: std::sync::Arc::new(policy),
-            on_error: policy_cfg.map(|p| p.on_error.clone()).unwrap_or_default(),
-            timeout: policy_timeout(
-                policy_cfg
-                    .map(|p| p.timeout_ms)
-                    .unwrap_or(crate::limits::default_policy_timeout_ms()),
-            ),
-            // The deprecated script transport never receives the opt-in projections (its frozen
-            // Rhai env has no bindings for them), so the flags are FORCED OFF here: honoring them
-            // would burn the per-request flattening/lookup cost to build data the script cannot
-            // read. Setting them on a script pool warns (at the top of this fn) instead of
-            // silently wasting work.
-            send_prompt: false,
-            send_user: false,
-        }),
-        Err(e) => {
-            tracing::warn!("route: script failed to compile: {e}; falling back to weighted");
-            None
-        }
-    }
-}
-
-/// Read the inline `script` or `script_file` source for a `route: script` pool. Exactly one is
-/// expected; `script_file` is read from disk at config load. `Ok(None)` = neither was set.
-#[cfg(feature = "script-policy")]
-fn script_source(p: &crate::config::PolicyCfg) -> Result<Option<String>, PolicyError> {
-    if let Some(src) = &p.script {
-        return Ok(Some(src.clone()));
-    }
-    if let Some(path) = &p.script_file {
-        let src = std::fs::read_to_string(path)
-            .map_err(|e| -> PolicyError { format!("reading script_file {path}: {e}").into() })?;
-        return Ok(Some(src));
-    }
-    Ok(None)
-}
-
-/// Feature-OFF fallback: a `route: script` pool without the `script-policy` feature can't construct a
-/// Rhai policy, so it degrades to the default SWRR with a clear "feature not enabled" warning. The
-/// request is never stranded; the operator sees that the build lacks the feature they configured.
-#[cfg(not(feature = "script-policy"))]
-fn resolve_script(_cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
-    tracing::warn!(
-        "route: script configured but this binary was built WITHOUT the `script-policy` feature; \
-         falling back to weighted. Rebuild with `--features script-policy` to enable Rhai routing."
     );
     None
 }
@@ -705,40 +608,7 @@ mod tests {
         );
     }
 
-    /// The deprecated script transport FORCES the payload opt-ins off at resolve time: its frozen
-    /// Rhai env has no bindings for them, so honoring the flags would burn per-request flattening
-    /// cost building data the script can never read.
-    #[cfg(feature = "script-policy")]
-    #[test]
-    fn script_resolve_forces_opt_in_flags_off() {
-        use crate::config::{PolicyCfg, RouteKind};
-        let client = reqwest::Client::new();
-        let cfg = pool_cfg(
-            RouteKind::Script,
-            Some(PolicyCfg {
-                script: Some("candidates.map(|c| c.idx)".to_string()),
-                timeout_ms: 5,
-                send_prompt: true,
-                send_user: true,
-                ..Default::default()
-            }),
-        );
-        match resolve_policy(&cfg, &client) {
-            Some(ResolvedPolicy::Policy {
-                send_prompt,
-                send_user,
-                ..
-            }) => {
-                assert!(!send_prompt, "script must force send_prompt off");
-                assert!(!send_user, "script must force send_user off");
-            }
-            None => panic!("script pool must resolve to a policy"),
-        }
-    }
-
-    /// `route: native` FORCES the payload opt-ins off at resolve (no native policy reads them);
-    /// unlike the script twin this test runs on the DEFAULT build, so the force-off invariant is
-    /// always covered.
+    /// `route: native` FORCES the payload opt-ins off at resolve (no native policy reads them).
     #[test]
     fn native_resolve_forces_opt_in_flags_off() {
         use crate::config::{PolicyCfg, RouteKind};
@@ -767,7 +637,7 @@ mod tests {
     }
 
     /// The hook transports PASS the opt-in flags THROUGH to the resolved policy — the mirror
-    /// image of the script/native force-off: an accidental hardcoded `false` in the webhook or
+    /// image of the native force-off: an accidental hardcoded `false` in the webhook or
     /// socket arm would silently strip content from every opted-in hook. The socket half runs on
     /// unix only: on other platforms `route: socket` deliberately resolves to `None` (degrades to
     /// weighted with a warning), so there is no policy to assert flags on.
