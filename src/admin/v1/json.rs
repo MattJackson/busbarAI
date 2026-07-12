@@ -800,7 +800,7 @@ fn openapi_doc() -> serde_json::Value {
                             "properties": {
                                 "code": {"type": "string",
                                     "enum": ["not_found", "forbidden", "invalid_request",
-                                             "conflict", "internal"]},
+                                             "conflict", "rate_limited", "internal"]},
                                 "message": {"type": "string"}
                             },
                             "required": ["code", "message"]
@@ -888,6 +888,7 @@ mod tests {
             },
             AdminError::Validation(String::new()),
             AdminError::Conflict(String::new()),
+            AdminError::RateLimited,
             AdminError::Internal,
         ]
         .iter()

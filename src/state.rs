@@ -194,6 +194,9 @@ pub(crate) struct App {
     /// base hook is a 409 (edit the file, don't shadow it); API-registered (overlay) hooks replace
     /// freely. Immutable after boot.
     pub(crate) base_hook_names: std::collections::HashSet<String>,
+    /// Per-principal ADMIN MUTATION rate limiter (§6.6). Arc-shared across apply snapshots so the
+    /// windows survive every swap.
+    pub(crate) mutation_limiter: Arc<crate::admin::rate::MutationLimiter>,
     /// Config VERSION HISTORY — every successful config-plane mutation records its snapshot here.
     /// Arc-shared across apply snapshots (survives every swap); bounded ring (see
     /// `admin::versions`).

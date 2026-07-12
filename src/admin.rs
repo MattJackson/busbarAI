@@ -155,6 +155,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 // breaks. The legacy `/admin/keys` handlers below stay as a deprecated alias with their `{type}`
 // envelope while keys migrate into the versioned service.
 pub(crate) mod audit;
+pub(crate) mod rate;
 pub(crate) mod transport;
 pub(crate) mod v1;
 pub(crate) mod versions;
@@ -1144,6 +1145,54 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// Per-principal mutation rate limits: the config class (apply/rollback) caps at 10/min per
+    /// principal — the 11th attempt in the window is a 429 in the frozen envelope, and FAILED
+    /// attempts count (these are all 404s — anti-enumeration).
+    #[tokio::test]
+    async fn test_admin_v1_mutation_rate_limit_config_class() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // 10 rollback attempts to a bogus version (all 404 — still spend budget), then the 11th
+        // is limited. Tolerate landing exactly on a minute boundary (window refill mid-loop) by
+        // accepting the 429 anywhere from attempt 11 to 22, but REQUIRE it eventually.
+        let mut limited_at = None;
+        for i in 1..=22 {
+            let resp = client
+                .post(format!("http://{addr}/admin/v1/config/rollback"))
+                .header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+                .body(serde_json::json!({"version": 424242}).to_string())
+                .send()
+                .await
+                .unwrap();
+            match resp.status().as_u16() {
+                404 => continue,
+                429 => {
+                    assert!(i >= 11, "the budget is 10/min; limited too early at {i}");
+                    let body: serde_json::Value = resp.json().await.unwrap();
+                    assert_eq!(body["error"]["code"], "rate_limited");
+                    limited_at = Some(i);
+                    break;
+                }
+                other => panic!("unexpected status {other} at attempt {i}"),
+            }
+        }
+        assert!(
+            limited_at.is_some(),
+            "the limiter never fired in 22 attempts"
+        );
+
+        handle.abort();
+    }
+
     /// Key ROTATION: the new secret works, the old stops resolving, the id + settings are
     /// unchanged; unknown ids 404. And keys pagination: limit/offset over the id-sorted set with a
     /// stable total.

@@ -600,6 +600,20 @@ fn forbidden_response(needed: crate::admin::v1::contract::Scope) -> Response {
         .expect("static forbidden response")
 }
 
+/// A 429 in the frozen admin error envelope — the per-principal mutation budget is spent.
+fn rate_limited_response() -> Response {
+    let e = crate::admin::v1::contract::AdminError::RateLimited;
+    let body = serde_json::json!({
+        "error": { "code": e.code(), "message": e.message() }
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static rate-limited response")
+}
+
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
@@ -675,6 +689,37 @@ pub(crate) async fn auth_middleware(
         match scope {
             Some(s) if s.allows(required) => {}
             _ => return Err(forbidden_response(required)),
+        }
+        // MUTATION RATE LIMITS (§6.6): per-principal fixed windows, spent BEFORE the handler so
+        // FAILED attempts count too (anti-enumeration). Config-plane mutations (apply/rollback)
+        // are the tight class; every other mutation is the CRUD class. Reads are unmetered.
+        let method = req.method();
+        let is_mutation = method == axum::http::Method::POST
+            || method == axum::http::Method::PUT
+            || method == axum::http::Method::PATCH
+            || method == axum::http::Method::DELETE;
+        if is_mutation {
+            let class = if path.starts_with("/admin/v1/config/") {
+                crate::admin::rate::MutationClass::Config
+            } else {
+                crate::admin::rate::MutationClass::Crud
+            };
+            let actor = principal
+                .as_ref()
+                .map(|p| p.id.as_str())
+                .unwrap_or("anonymous");
+            if !app
+                .mutation_limiter
+                .check(actor, class, crate::store::now())
+            {
+                crate::admin::audit::AUDIT.record_by(
+                    "admin.rate_limited",
+                    &format!("{}:{path}", class.label()),
+                    crate::admin::audit::OUTCOME_REJECTED,
+                    actor,
+                );
+                return Err(rate_limited_response());
+            }
         }
         req.extensions_mut().insert(AuthPrincipal(principal));
         // INTENTIONAL governance bypass for the operator admin token. A successful admin auth attaches

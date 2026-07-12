@@ -754,6 +754,7 @@ async fn main() {
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
         versions: Arc::new(admin::versions::VersionLog::new()),
+        mutation_limiter: Arc::new(admin::rate::MutationLimiter::new()),
         base_hook_names,
         admin_chain: cfg.admin_auth.clone(),
         group_map: cfg.group_map.clone(),

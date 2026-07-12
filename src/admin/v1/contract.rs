@@ -113,6 +113,8 @@ pub(crate) enum AdminError {
     /// Optimistic-concurrency mismatch: the caller's `expected_version`/`If-Match` is stale. `code =
     /// conflict`.
     Conflict(String),
+    /// The principal exhausted its per-minute mutation budget (§6.6). `code = rate_limited`.
+    RateLimited,
     /// An internal failure (store/plugin). `code = internal`. The human `message` is generic; details
     /// are logged server-side, never returned.
     Internal,
@@ -126,6 +128,7 @@ impl AdminError {
             AdminError::Forbidden { .. } => "forbidden",
             AdminError::Validation(_) => "invalid_request",
             AdminError::Conflict(_) => "conflict",
+            AdminError::RateLimited => "rate_limited",
             AdminError::Internal => "internal",
         }
     }
@@ -137,6 +140,7 @@ impl AdminError {
             AdminError::Forbidden { .. } => 403,
             AdminError::Validation(_) => 400,
             AdminError::Conflict(_) => 409,
+            AdminError::RateLimited => 429,
             AdminError::Internal => 500,
         }
     }
@@ -153,6 +157,9 @@ impl AdminError {
             }
             AdminError::Validation(msg) => msg.clone(),
             AdminError::Conflict(msg) => msg.clone(),
+            AdminError::RateLimited => {
+                "admin mutation rate limit exceeded; retry next minute".to_string()
+            }
             AdminError::Internal => "internal error".to_string(),
         }
     }
@@ -521,6 +528,7 @@ mod tests {
             ),
             (AdminError::Validation("bad".into()), "invalid_request", 400),
             (AdminError::Conflict("stale".into()), "conflict", 409),
+            (AdminError::RateLimited, "rate_limited", 429),
             (AdminError::Internal, "internal", 500),
         ];
         for (e, code, status) in cases {
