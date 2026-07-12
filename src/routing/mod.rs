@@ -613,6 +613,47 @@ mod tests {
         assert!(resolve_policy(&pool_policy(PoolPolicy::Weighted), &hooks, &client).is_none());
     }
 
+    /// SECURITY INVARIANT: `resolve_rewrite_hooks` admits ONLY `prompt: rw` GATES as rewrite hooks.
+    /// A `ro`/`no` gate and a tap (even one that claims `prompt: rw`) are excluded — the rw grant is
+    /// enforced at RESOLUTION, so a hook without the grant can NEVER reach the rewrite/transform path,
+    /// independent of what it tries to return (the bidirectional grant holds by construction).
+    #[test]
+    fn resolve_rewrite_hooks_admits_only_prompt_rw_gates() {
+        let client = reqwest::Client::new();
+        // Loopback webhook so the transport resolves on every platform (unlike unix-only sockets).
+        let mk = |kind: HookKind, prompt: PromptAccess| HookCfg {
+            kind,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9931/".to_string()),
+            timeout_ms: 5,
+            on_error: PolicyOnError::default(),
+            prompt,
+            user: UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: true,
+        };
+        let mut hooks = HashMap::new();
+        hooks.insert("rw-gate".to_string(), mk(HookKind::Gate, PromptAccess::Rw));
+        hooks.insert("ro-gate".to_string(), mk(HookKind::Gate, PromptAccess::Ro));
+        hooks.insert("no-gate".to_string(), mk(HookKind::Gate, PromptAccess::No));
+        // A tap that (nonsensically) claims prompt: rw — still NEVER a rewrite hook (a tap can't reply).
+        hooks.insert("rw-tap".to_string(), mk(HookKind::Tap, PromptAccess::Rw));
+        let global = vec![
+            "rw-gate".to_string(),
+            "ro-gate".to_string(),
+            "no-gate".to_string(),
+            "rw-tap".to_string(),
+        ];
+        let resolved = resolve_rewrite_hooks(&hooks, &global, &client);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "only the prompt:rw GATE is a rewrite hook; ro/no gates + the tap are excluded"
+        );
+    }
+
     /// The `timeout_ms == 0` → default guard in `policy_timeout` (belt-and-suspenders for any
     /// code-built `PolicyCfg` that slips a 0 through).
     #[test]
