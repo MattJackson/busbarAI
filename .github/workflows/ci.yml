@@ -38,10 +38,12 @@ jobs:
 
   # Compliance-by-compilation gate: busbar must build + lint clean with the built-in `tokens` auth
   # plugin COMPILED OUT (`--no-default-features`), so a regulated deployment can ship a binary that
-  # provably contains no client-token auth code. (Tests run on the default build; here we only prove
-  # the featureless build stays green — `auth.chain: [tokens]` is a boot error in this binary.)
+  # provably contains no client-token auth code. Build, clippy, AND the test suite all stay green on
+  # the featureless binary — the feature-dependent behavior tests (token auth, native ranking policies)
+  # are `#[cfg(feature = ...)]`-gated, so what remains proves the featureless binary works. This is the
+  # compliance-by-compilation guarantee: `auth.chain: [tokens]` is a boot error in this binary.
   no-default-features:
-    name: no-default-features build · clippy
+    name: no-default-features build · clippy · test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -53,6 +55,8 @@ jobs:
         run: cargo clippy --no-default-features --locked -- -D warnings
       - name: Build (no-default-features)
         run: cargo build --no-default-features --locked --verbose
+      - name: Test (no-default-features)
+        run: cargo test --no-default-features --locked --verbose
 
   # Portability gate: busbar must build + pass tests on Windows too (no OS-specific code).
   windows:
