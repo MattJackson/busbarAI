@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! OpenAI `RequestHandler` and its OperationHandlers (design §6/§7). Per the design these live under
 //! `handlers/request/openai/operations/`; the flat `cells/openai.rs` layout is a deferred cosmetic

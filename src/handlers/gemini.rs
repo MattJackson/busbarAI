@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Gemini `RequestHandler` + cells (design §6/§7). Embeddings via `models/{id}:embedContent`.
 #![allow(dead_code)]

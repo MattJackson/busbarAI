@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Unix-socket** routing hook (`route: socket`) — an operator-run BINARY that ranks pool
 //! members over a local Unix domain socket. The fast rung of the hook ladder: same wire contract as

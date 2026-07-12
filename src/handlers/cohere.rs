@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Cohere `RequestHandler` + cells (design §6/§7). Embeddings via `/v2/embed`.
 #![allow(dead_code)]

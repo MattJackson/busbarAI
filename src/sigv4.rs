@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! AWS Signature Version 4 request signing — hand-rolled with RustCrypto (sha2 + hmac), no
 //! AWS SDK. Used by the Bedrock protocol writer to sign Converse requests. The core algorithm is

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Hook plugins — BUILT-IN hooks compiled into the binary, implementing the hook contract on the IR
 //! (tap/gate). Distinct from auth plugins: a different contract at a different pipeline stage.

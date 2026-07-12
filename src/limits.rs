@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Process-wide operational limits ("NEVER CODED CAPS"), installed ONCE at startup from the
 //! resolved config (`config::LimitsResolved`) and read by the use sites that live too deep in a

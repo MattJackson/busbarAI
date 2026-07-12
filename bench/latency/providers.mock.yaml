@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Matthew Jackson
+# Copyright (C) 2026 Busbar Inc and contributors
 #
 # Minimal provider catalog for the latency benchmark. Defines ONE provider, `mock`, whose base_url
 # points at the local fixed-latency mock upstream (mock_upstream.py). Busbar's OpenAI writer appends

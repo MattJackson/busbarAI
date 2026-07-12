@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Matthew Jackson
+# Copyright (C) 2026 Busbar Inc and contributors
 #
 # Busbar deployment config for the latency benchmark. One provider (the local mock), one model, one
 # single-member pool. Token auth with a fixed bench token so the load generator can authenticate.

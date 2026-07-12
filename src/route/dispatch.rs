@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The protocol catch-all dispatch (design: web server listens for anything → Router IDs the
 //! protocol → that protocol's `RequestHandler` decides the operation → its OperationHandler). Holds

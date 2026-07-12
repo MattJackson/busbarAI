@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The per-operation IR enums (design §12.4): `IrReq` / `IrResp`, one variant per operation. The
 //! design's single `enum Ir` reconciles to TWO enums because the engine already splits request from

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Virtual-key management API. Admin CRUD over `/admin/keys`, guarded by the
 //! configured admin token (enforced in `auth_middleware`, not here). Mutations refresh the

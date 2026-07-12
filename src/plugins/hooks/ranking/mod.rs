@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The built-in RANKING hooks — `cheapest` / `fastest` / `least_busy` / `usage` (see `ranking.rs`).
 //!

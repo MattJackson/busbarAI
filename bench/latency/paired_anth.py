@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Matthew Jackson
+# Copyright (C) 2026 Busbar Inc and contributors
 #
 # PAIRED real-Anthropic wall-clock: direct vs through-Busbar, INTERLEAVED on alternating requests
 # (direct, busbar, direct, busbar, …) in one time window. Because the two paths are fired back-to-back,

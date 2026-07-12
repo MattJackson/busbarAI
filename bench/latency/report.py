@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Matthew Jackson
+# Copyright (C) 2026 Busbar Inc and contributors
 #
 # Reads the per-run JSON lines produced by loadgen.py (labels "direct/<mode>/<delay>ms" and
 # "busbar/<mode>/<delay>ms") and prints, per (mode, delay):

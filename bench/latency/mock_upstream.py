@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Matthew Jackson
+# Copyright (C) 2026 Busbar Inc and contributors
 #
 # Fixed-latency mock upstream for the Busbar latency benchmark.
 #

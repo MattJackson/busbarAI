@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 //
 // busbar — a native-protocol LLM gateway. It fronts many LLM providers and routes each request to
 // a model or to a weighted pool of models, translating losslessly between wire protocols and

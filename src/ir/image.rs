@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Image-generation IR (design-operations-oop.md §5b). Cross-protocol across OpenAI, Gemini, Bedrock.
 //! ONE operation with an `op` discriminant (Generate/Edit/Variation) — edit/variation are not separate

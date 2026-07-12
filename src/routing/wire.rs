@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The ONE hook wire contract — shared by every out-of-process routing transport (HTTP webhook,
 //! Unix-socket binary). A policy hook receives this exact JSON projection and returns this exact

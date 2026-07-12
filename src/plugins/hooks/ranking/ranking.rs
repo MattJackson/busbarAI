@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Busbar-native routing policies — small, sync sorts over the live signals projected into
 //! `Candidate`. Each native is the proof-of-completeness for its input signal (the scope-lock
