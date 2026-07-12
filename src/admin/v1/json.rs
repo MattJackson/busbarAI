@@ -21,6 +21,7 @@ use serde_json::json;
 
 use super::contract::AdminError;
 use super::service::{build_with_hook, build_without_hook, AdminService};
+use crate::admin::audit;
 use crate::admin::transport::AdminTransport;
 use crate::state::AppHandle;
 
@@ -52,6 +53,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/admin-auth", get(get_admin_auth))
             .route("/admin/v1/usage", get(get_usage))
             .route("/admin/v1/config", get(get_config))
+            .route("/admin/v1/audit", get(get_audit))
             .route("/admin/v1/config/validate", post(validate_config))
             .route("/admin/v1/openapi.json", get(openapi))
     }
@@ -188,16 +190,21 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
     };
     let current = handle.load();
+    let resource = format!("hook:{}", req.name);
     match build_with_hook(&current, &req.name, req.config) {
         Ok(next) => {
             handle.swap(Arc::new(next));
+            audit::AUDIT.record("hook.register", &resource, audit::OUTCOME_APPLIED);
             // Project the registered hook from the NEW (post-swap) snapshot for the 201 body.
             respond(
                 StatusCode::CREATED,
                 service(&handle).get_hook(&req.name).await,
             )
         }
-        Err(e) => err_json(&e),
+        Err(e) => {
+            audit::AUDIT.record("hook.register", &resource, audit::OUTCOME_REJECTED);
+            err_json(&e)
+        }
     }
 }
 
@@ -206,13 +213,24 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
 /// `404 not_found` if the hook is unregistered. `204 No Content` on success.
 async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
     let current = handle.load();
+    let resource = format!("hook:{name}");
     match build_without_hook(&current, &name) {
         Ok(next) => {
             handle.swap(Arc::new(next));
+            audit::AUDIT.record("hook.delete", &resource, audit::OUTCOME_APPLIED);
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(e) => err_json(&e),
+        Err(e) => {
+            audit::AUDIT.record("hook.delete", &resource, audit::OUTCOME_REJECTED);
+            err_json(&e)
+        }
     }
+}
+
+/// `GET /admin/v1/audit` — the admin audit log (most-recent-first), every mutation with its outcome.
+async fn get_audit() -> Response {
+    let entries = audit::AUDIT.list(200);
+    ok_json(StatusCode::OK, &json!({ "entries": entries }))
 }
 
 /// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
@@ -246,6 +264,10 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
         "/admin/v1/config",
         "Effective running config snapshot (redacted)",
+    ),
+    (
+        "/admin/v1/audit",
+        "Admin audit log — every mutation with its outcome (newest first)",
     ),
     ("/admin/v1/openapi.json", "This OpenAPI 3.1 document"),
 ];

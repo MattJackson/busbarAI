@@ -154,6 +154,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 // across versions and transports. Releasing v2 is a LAYER copy of `v1/`, not a rewrite; v1 never
 // breaks. The legacy `/admin/keys` handlers below stay as a deprecated alias with their `{type}`
 // envelope while keys migrate into the versioned service.
+pub(crate) mod audit;
 pub(crate) mod transport;
 pub(crate) mod v1;
 
@@ -1165,6 +1166,59 @@ mod tests {
             escalate.json::<serde_json::Value>().await.unwrap()["error"]["code"],
             "conflict"
         );
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/audit` records admin mutations: registering a hook appears in the audit log as
+    /// `hook.register` / `applied`, with the resource named. (The audit ring is process-global, so
+    /// other concurrent tests may add entries — assert the specific action appears, not an exact count.)
+    #[tokio::test]
+    async fn test_admin_v1_audit_records_mutations() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // A uniquely-named hook so the audit assertion can't collide with a concurrent test.
+        let name = "audit_probe_hook_x7";
+        client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": name,
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let audit: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/audit"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let entries = audit["entries"].as_array().unwrap();
+        let mine = entries
+            .iter()
+            .find(|e| e["resource"] == format!("hook:{name}"))
+            .expect("the registration is recorded in the audit log");
+        assert_eq!(mine["action"], "hook.register");
+        assert_eq!(mine["outcome"], "applied");
+        assert!(mine["seq"].is_number() && mine["ts"].is_number());
 
         handle.abort();
     }
