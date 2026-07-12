@@ -109,6 +109,8 @@ The virtual-key management surface (mint, inspect, adjust, revoke) is served und
 
 Busbar's config plane is live: an authenticated write takes effect immediately, with no restart and without disturbing in-flight requests. Under the hood an apply atomically swaps the running config snapshot — new requests see the new config; requests already in flight finish on the old one; and live reliability state (circuit breakers, latency) is preserved.
 
+**Persistence (optional).** By default, API-applied changes are live but not written to disk — they are lost on restart. Set `BUSBAR_CONFIG_OVERLAY=/path/to/overlay.json` to persist them: Busbar writes API changes to that busbar-owned overlay file and re-applies it at the next boot on top of your hand-written `config.yaml` (which it never touches). Effective config = base `config.yaml` + overlay. A missing or corrupt overlay is ignored at boot (Busbar starts on the base config alone), so a bad overlay can never brick startup.
+
 ### Hooks
 
 | Endpoint | Does |
