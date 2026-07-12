@@ -157,6 +157,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 pub(crate) mod audit;
 pub(crate) mod transport;
 pub(crate) mod v1;
+pub(crate) mod versions;
 
 pub(crate) use v1::json::JsonV1;
 pub(crate) use v1::service::mark_start;
@@ -1093,6 +1094,109 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// The config version-history cycle: mutations record attributed versions; diff explains a
+    /// change; rollback restores a prior hook surface LIVE as a NEW version; unknown targets 404
+    /// and a stale expected_version conflicts.
+    #[tokio::test]
+    async fn test_admin_v1_config_versions_rollback_and_diff() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| req.header("x-admin-token", "admintok");
+
+        // v1: register a hook. v2: delete it. (Boot floor is v0.)
+        let body = serde_json::json!({
+            "name": "rbk",
+            "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/"}
+        });
+        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let deleted = admin(client.delete(format!("http://{addr}/admin/v1/hooks/rbk")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status().as_u16(), 204);
+
+        // The history lists boot + register + delete, newest first, attributed.
+        let versions: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/config/versions")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let list = versions["versions"].as_array().unwrap();
+        assert_eq!(list.len(), 3, "boot + register + delete: {versions}");
+        assert_eq!(list[0]["version"], 2);
+        assert!(list[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("hook.delete hook:rbk"));
+        assert_eq!(list[0]["principal"], "admin");
+
+        // Diff v1 -> v2: the hook was removed.
+        let diff: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/config/diff?from=1&to=2")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(diff["hooks"]["removed"][0], "rbk", "{diff}");
+
+        // Rollback to v1 restores the hook, LIVE, as a NEW version (append-only history).
+        let rb = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"version": 1}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rb.status().as_u16(), 200);
+        let rb_body: serde_json::Value = rb.json().await.unwrap();
+        assert_eq!(rb_body["restored_version"], 1);
+        assert_eq!(rb_body["new_version"], 3);
+        let restored = admin(client.get(format!("http://{addr}/admin/v1/hooks/rbk")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.status().as_u16(),
+            200,
+            "the rolled-back hook is live again"
+        );
+
+        // Guard rails: unknown target = 404; stale expected_version = 409.
+        let missing = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"version": 999}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        let stale = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"version": 1, "expected_version": 0}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status().as_u16(), 409);
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_admin_v1_register_hook_takes_effect_live() {
         crate::metrics::init();

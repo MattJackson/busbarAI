@@ -190,6 +190,10 @@ pub(crate) struct App {
     /// true`). Carried for the hooks read surface so a definition can report whether it is globally
     /// wired. Read-only after construction.
     pub(crate) global_hooks: Vec<String>,
+    /// Config VERSION HISTORY — every successful config-plane mutation records its snapshot here.
+    /// Arc-shared across apply snapshots (survives every swap); bounded ring (see
+    /// `admin::versions`).
+    pub(crate) versions: Arc<crate::admin::versions::VersionLog>,
     /// The ADMIN auth chain (`admin_auth:` module names, default `[admin-tokens]`) — executed by
     /// the auth middleware for `/admin` paths. Empty = the explicit OPEN admin posture (dev).
     pub(crate) admin_chain: Vec<String>,

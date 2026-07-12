@@ -224,6 +224,86 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
     Ok(next)
 }
 
+/// Build the next `App` snapshot with the whole HOOK SURFACE replaced by a version snapshot — the
+/// pure core of `POST /admin/v1/config/rollback`. RE-VALIDATES the snapshot against CURRENT reality
+/// before any mutation (a snapshot that was valid when recorded may violate an invariant now):
+/// per-hook transport XOR + rw-on-tap, at-most-one-default, and no dangling global refs. Clones the
+/// current snapshot (sharing live state — lanes/store untouched, breaker state preserved) and
+/// re-resolves every global transport. Same restrict-scope as the other builders: pool-resolved
+/// hook references are startup-resolved and not re-resolved here.
+pub(crate) fn build_with_registry(
+    current: &App,
+    registry: std::collections::HashMap<String, HookCfg>,
+    global_hooks: Vec<String>,
+) -> Result<App, AdminError> {
+    for (name, cfg) in &registry {
+        if cfg.socket.is_none() == cfg.webhook.is_none() {
+            return Err(AdminError::Validation(format!(
+                "hook `{name}` must set exactly one transport: `socket` or `webhook`"
+            )));
+        }
+        if cfg.kind == HookKind::Tap && cfg.prompt == PromptAccess::Rw {
+            return Err(AdminError::Validation(format!(
+                "hook `{name}` sets `prompt: rw` on a `kind: tap` (a tap cannot rewrite)"
+            )));
+        }
+    }
+    let defaults: Vec<&str> = registry
+        .iter()
+        .filter(|(_, h)| h.default)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if defaults.len() > 1 {
+        return Err(AdminError::Validation(format!(
+            "snapshot has more than one `default: true` hook: {}",
+            defaults.join(", ")
+        )));
+    }
+    for g in &global_hooks {
+        if !registry.contains_key(g) {
+            return Err(AdminError::Validation(format!(
+                "snapshot wires unknown global hook `{g}`"
+            )));
+        }
+    }
+    let mut next = current.clone();
+    next.config_version = current.config_version.wrapping_add(1);
+    next.hook_registry = registry;
+    next.global_hooks = global_hooks;
+    next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+    );
+    next.tap_hooks = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Request,
+    );
+    next.tap_hooks_route = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Route,
+    );
+    next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Attempt,
+    );
+    next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        crate::config::HookStage::Completion,
+    );
+    next.global_gates =
+        crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    Ok(next)
+}
+
 /// The admin application core. Cheap to construct and clone-free to share (`Arc<App>` inside); a
 /// transport builds ONE and hands `Arc<AdminService>` to its routes.
 pub(crate) struct AdminService {

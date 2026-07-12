@@ -742,7 +742,7 @@ impl TestApp {
                 &crate::config::AuthCfg::default_none(),
             ))
         });
-        std::sync::Arc::new(crate::state::App {
+        let app = std::sync::Arc::new(crate::state::App {
             lanes,
             store: std::sync::Arc::new(crate::store::InMemoryStore::new(lane_data)),
             by_model,
@@ -757,6 +757,7 @@ impl TestApp {
             global_gates: Vec::new(),
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
+            versions: std::sync::Arc::new(crate::admin::versions::VersionLog::new()),
             admin_chain: vec!["admin-tokens".to_string()],
             group_map: std::collections::HashMap::new(),
             overlay_path: self.overlay_path,
@@ -768,7 +769,11 @@ impl TestApp {
             governance: self.governance,
             default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
             reasoning_effort_budgets: [1024, 4096, 8192, 16384],
-        })
+        });
+        // Mirror main's boot-version floor so rollback tests have a v0 to restore.
+        app.versions
+            .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
+        app
     }
 }
 

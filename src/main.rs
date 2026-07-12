@@ -748,6 +748,7 @@ async fn main() {
         global_gates,
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
+        versions: Arc::new(admin::versions::VersionLog::new()),
         admin_chain: cfg.admin_auth.clone(),
         group_map: cfg.group_map.clone(),
         overlay_path,
@@ -763,6 +764,11 @@ async fn main() {
             [b.minimal, b.low, b.medium, b.high]
         },
     });
+
+    // Record the BOOT snapshot as version 0 so the version history always has a rollback floor
+    // (the pre-any-mutation state).
+    app.versions
+        .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
 
     // configure the request-log webhook (reusing the pooled client). No-op if unset.
     observability::configure_webhook(

@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::contract::AdminError;
-use super::service::{build_with_hook, build_without_hook, AdminService};
+use super::service::{build_with_hook, build_with_registry, build_without_hook, AdminService};
 use crate::admin::audit;
 use crate::admin::transport::AdminTransport;
 use crate::state::AppHandle;
@@ -55,6 +55,10 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/config", get(get_config))
             .route("/admin/v1/audit", get(get_audit))
             .route("/admin/v1/config/validate", post(validate_config))
+            .route("/admin/v1/config/versions", get(list_config_versions))
+            .route("/admin/v1/config/versions/{v}", get(get_config_version))
+            .route("/admin/v1/config/diff", get(config_diff))
+            .route("/admin/v1/config/rollback", post(rollback_config))
             .route("/admin/v1/openapi.json", get(openapi))
     }
 }
@@ -203,6 +207,13 @@ async fn register_hook(
             // Persist the new hook state to the overlay (best-effort; no-op when persistence disabled).
             // Clear any tombstone for this name — a re-register un-deletes it.
             let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                &format!("hook.register {resource}"),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
                 &cur.hook_registry,
@@ -240,6 +251,13 @@ async fn delete_hook(
             audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_APPLIED, &actor);
             // Tombstone this name so the deletion survives a restart even if the hook was base-defined.
             let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                &format!("hook.delete {resource}"),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
                 &cur.hook_registry,
@@ -268,6 +286,197 @@ async fn get_audit(Query(q): Query<std::collections::HashMap<String, String>>) -
     let resource = q.get("resource").map(String::as_str);
     let entries = audit::AUDIT.list_filtered(limit, action, resource);
     ok_json(StatusCode::OK, &json!({ "entries": entries }))
+}
+
+/// `GET /admin/v1/config/versions` — version history metadata, newest first (`?limit=N`, cap 1000).
+async fn list_config_versions(
+    State(handle): State<Arc<AppHandle>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(1000);
+    ok_json(
+        StatusCode::OK,
+        &json!({ "versions": handle.load().versions.list(limit) }),
+    )
+}
+
+/// `GET /admin/v1/config/versions/{v}` — one retained version WITH its hook-surface snapshot.
+async fn get_config_version(State(handle): State<Arc<AppHandle>>, Path(v): Path<u64>) -> Response {
+    match handle.load().versions.get(v) {
+        Some(cv) => ok_json(
+            StatusCode::OK,
+            &json!({
+                "version": cv.version,
+                "ts": cv.ts,
+                "principal": cv.principal,
+                "summary": cv.summary,
+                "hooks": cv.hook_registry,
+                "global_hooks": cv.global_hooks,
+            }),
+        ),
+        None => err_json(&AdminError::NotFound(format!(
+            "config version {v} (pruned or never recorded)"
+        ))),
+    }
+}
+
+/// `GET /admin/v1/config/diff?from=&to=` — structured hook-surface diff between two retained
+/// versions: hook names added / removed / changed (definition differs), plus the global wiring of
+/// each side when it changed.
+async fn config_diff(
+    State(handle): State<Arc<AppHandle>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let (Some(from), Some(to)) = (
+        q.get("from").and_then(|s| s.parse::<u64>().ok()),
+        q.get("to").and_then(|s| s.parse::<u64>().ok()),
+    ) else {
+        return err_json(&AdminError::Validation(
+            "`from` and `to` query params (version numbers) are required".into(),
+        ));
+    };
+    let app = handle.load();
+    let (Some(a), Some(b)) = (app.versions.get(from), app.versions.get(to)) else {
+        return err_json(&AdminError::NotFound(format!(
+            "config version {from} and/or {to} (pruned or never recorded)"
+        )));
+    };
+    let mut added: Vec<&String> = b
+        .hook_registry
+        .keys()
+        .filter(|k| !a.hook_registry.contains_key(*k))
+        .collect();
+    let mut removed: Vec<&String> = a
+        .hook_registry
+        .keys()
+        .filter(|k| !b.hook_registry.contains_key(*k))
+        .collect();
+    // "Changed" = present in both with a differing definition. HookCfg has no PartialEq (transport
+    // objects don't); compare the serialized form — the definition IS its config shape.
+    let mut changed: Vec<&String> = a
+        .hook_registry
+        .iter()
+        .filter(|(k, va)| {
+            b.hook_registry
+                .get(*k)
+                .is_some_and(|vb| serde_json::to_value(va).ok() != serde_json::to_value(vb).ok())
+        })
+        .map(|(k, _)| k)
+        .collect();
+    added.sort();
+    removed.sort();
+    changed.sort();
+    let mut body = json!({
+        "from": from,
+        "to": to,
+        "hooks": { "added": added, "removed": removed, "changed": changed },
+    });
+    if a.global_hooks != b.global_hooks {
+        body["global_hooks"] = json!({ "from": a.global_hooks, "to": b.global_hooks });
+    }
+    ok_json(StatusCode::OK, &body)
+}
+
+/// The `POST /admin/v1/config/rollback` request body.
+#[derive(serde::Deserialize)]
+struct RollbackReq {
+    /// The retained version to restore.
+    version: u64,
+    /// Optimistic-concurrency guard: reject with `conflict` if the CURRENT config version differs
+    /// (someone mutated between your read and this rollback). Optional in v1 (mandatory with the
+    /// broader ETag sweep).
+    #[serde(default)]
+    expected_version: Option<u64>,
+}
+
+/// `POST /admin/v1/config/rollback` — restore a retained version's hook surface. The target is
+/// RE-VALIDATED against current reality before the swap (a rollback that no longer resolves is
+/// rejected, never blindly applied); the result is a NEW version (history is append-only — rolling
+/// back never rewrites it), audited and overlay-persisted.
+async fn rollback_config(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let req: RollbackReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed rollback body: {e}"
+            )))
+        }
+    };
+    let current = handle.load();
+    let resource = format!("config:v{}", req.version);
+    if let Some(expected) = req.expected_version {
+        if expected != current.config_version {
+            audit::AUDIT.record_by(
+                "config.rollback",
+                &resource,
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            return err_json(&AdminError::Conflict(format!(
+                "expected_version {expected} is stale (current is {})",
+                current.config_version
+            )));
+        }
+    }
+    let Some(target) = current.versions.get(req.version) else {
+        audit::AUDIT.record_by(
+            "config.rollback",
+            &resource,
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&AdminError::NotFound(format!(
+            "config version {} (pruned or never recorded)",
+            req.version
+        )));
+    };
+    match build_with_registry(&current, target.hook_registry, target.global_hooks) {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            audit::AUDIT.record_by("config.rollback", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                &format!("config.rollback to v{}", req.version),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
+            // Best-effort overlay persistence of the restored surface (no-op when disabled).
+            crate::config::overlay::persist(
+                cur.overlay_path.as_deref(),
+                &cur.hook_registry,
+                &cur.global_hooks,
+                None,
+                None,
+            );
+            ok_json(
+                StatusCode::OK,
+                &json!({
+                    "restored_version": req.version,
+                    "new_version": cur.config_version,
+                }),
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "config.rollback",
+                &resource,
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            err_json(&e)
+        }
+    }
 }
 
 /// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
@@ -305,6 +514,14 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
         "/admin/v1/audit",
         "Admin audit log — every mutation with its outcome (newest first)",
+    ),
+    (
+        "/admin/v1/config/versions",
+        "Config version history (newest first; id/ts/principal/summary)",
+    ),
+    (
+        "/admin/v1/config/diff",
+        "Structured hook-surface diff between two versions (?from=&to=)",
     ),
     ("/admin/v1/openapi.json", "This OpenAPI 3.1 document"),
 ];
@@ -408,6 +625,38 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "OK (`reachable` may be null for webhook/non-unix)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/config/versions/{v}".to_string(),
+        json!({
+            "get": {
+                "summary": "One retained config version, with its hook-surface snapshot",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "v", "in": "path", "required": true,
+                    "schema": {"type": "integer"}
+                }],
+                "responses": {
+                    "200": {"description": "The version (metadata + hooks + global_hooks)"},
+                    "404": {"description": "Pruned or never recorded (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/config/rollback".to_string(),
+        json!({
+            "post": {
+                "summary": "Restore a retained version's hook surface (re-validated; a NEW version)",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{restored_version, new_version}`"},
+                    "404": {"description": "Target version not retained (error code `not_found`)"},
+                    "409": {"description": "`expected_version` stale (error code `conflict`)"},
+                    "400": {"description": "Snapshot fails re-validation (error code `invalid_request`)"}
                 }
             }
         }),
