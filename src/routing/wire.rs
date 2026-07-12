@@ -117,6 +117,80 @@ pub(crate) struct HookResponse {
     /// rejects.
     #[serde(default)]
     pub(crate) reject: Option<serde_json::Value>,
+    /// RESTRICT the surviving candidate set to members carrying ANY of these tags
+    /// (`{"restrict": {"tags_any": [...]}}`). A compliance gate ("only BAA-covered lanes"). Untyped +
+    /// FAIL-CLOSED like `reject`: a malformed restrict must fall to the gate's `on_error`/`on_empty`,
+    /// never silently allow-all. Parsed by `parse_restrict`. Wired into the two-phase decision seam in
+    /// a later slice-4 step; the reply contract + parser land here first (tested in isolation).
+    #[serde(default)]
+    #[allow(dead_code)]
+    // consumed when the two-phase decision seam is wired (later slice-4 step)
+    pub(crate) restrict: Option<serde_json::Value>,
+    /// REWRITE the request body (`{"rewrite": {"messages": [...], "tools": [...]}}`) — the
+    /// compression/redaction arm (Headroom). Untyped + FAIL-CLOSED: a malformed/oversize rewrite must
+    /// proceed with the UNMODIFIED body, never a corrupted one. Requires the hook's `prompt: rw` grant.
+    /// Parsed by `parse_rewrite`. Applied by the priority-ordered transform pass wired in a later
+    /// slice-4 step; the reply contract + parser land here first (tested in isolation).
+    #[serde(default)]
+    #[allow(dead_code)]
+    // consumed when the priority-ordered transform pass is wired (later slice-4 step)
+    pub(crate) rewrite: Option<serde_json::Value>,
+}
+
+/// A parsed, validated `restrict` reply: the set of tags a surviving candidate must carry at least
+/// one of. FAIL-CLOSED — `parse_restrict` returns `None` for a malformed/empty restrict so the caller
+/// routes it to `on_error`, never to an accidental allow-all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestrictReply {
+    pub(crate) tags_any: Vec<String>,
+}
+
+/// Parse the untyped `restrict` value fail-closed. A well-formed restrict is `{"tags_any": [non-empty
+/// strings]}`; anything else (not an object, missing/empty/non-array `tags_any`, no usable string
+/// entries) yields `None` — the caller treats that as the gate's `on_error`, never allow-all. Tag
+/// strings are trimmed; empty/whitespace-only entries are dropped.
+#[allow(dead_code)] // wired into the two-phase decision seam in a later slice-4 step
+pub(crate) fn parse_restrict(value: &serde_json::Value) -> Option<RestrictReply> {
+    let tags_any: Vec<String> = value
+        .get("tags_any")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tags_any.is_empty() {
+        return None;
+    }
+    Some(RestrictReply { tags_any })
+}
+
+/// A parsed, validated `rewrite` reply: the replacement message body and any injected tools. Both are
+/// opaque dialect-agnostic JSON arrays busbar re-renders per target protocol. FAIL-CLOSED —
+/// `parse_rewrite` returns `None` for a malformed rewrite so the caller proceeds with the ORIGINAL
+/// body, never a corrupted one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteReply {
+    pub(crate) messages: Vec<serde_json::Value>,
+    pub(crate) tools: Vec<serde_json::Value>,
+}
+
+/// Parse the untyped `rewrite` value fail-closed. A well-formed rewrite is `{"messages": [...],
+/// "tools"?: [...]}` with a NON-EMPTY messages array; anything else yields `None` (proceed with the
+/// original body). `tools` is optional (defaults empty).
+#[allow(dead_code)] // applied by the priority-ordered transform pass in a later slice-4 step
+pub(crate) fn parse_rewrite(value: &serde_json::Value) -> Option<RewriteReply> {
+    let messages: Vec<serde_json::Value> = value.get("messages")?.as_array()?.clone();
+    if messages.is_empty() {
+        return None;
+    }
+    let tools = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Some(RewriteReply { messages, tools })
 }
 
 /// Reject-status clamp range + fallback: any status outside 400..=499 becomes 403.
@@ -548,5 +622,45 @@ mod tests {
             RoutingDecision::Abstain
         ));
         assert!(matches!(norm(r#"{}"#), RoutingDecision::Abstain));
+    }
+
+    /// `parse_restrict` is FAIL-CLOSED: a well-formed restrict yields the trimmed non-empty tags; any
+    /// malformed shape yields `None` (the caller routes to on_error, never allow-all).
+    #[test]
+    fn parse_restrict_is_fail_closed() {
+        let ok = parse_restrict(&serde_json::json!({"tags_any": ["baa", " gpu ", ""]}))
+            .expect("well-formed restrict parses");
+        assert_eq!(ok.tags_any, vec!["baa".to_string(), "gpu".to_string()]);
+
+        // Malformed → None (fail-closed): no tags_any, empty list, whitespace-only, non-array, non-object.
+        assert!(parse_restrict(&serde_json::json!({})).is_none());
+        assert!(parse_restrict(&serde_json::json!({"tags_any": []})).is_none());
+        assert!(parse_restrict(&serde_json::json!({"tags_any": ["", "  "]})).is_none());
+        assert!(parse_restrict(&serde_json::json!({"tags_any": "baa"})).is_none());
+        assert!(parse_restrict(&serde_json::json!("baa")).is_none());
+    }
+
+    /// `parse_rewrite` is FAIL-CLOSED: a well-formed rewrite yields the messages (+ optional tools);
+    /// any malformed shape yields `None` (the caller keeps the ORIGINAL body).
+    #[test]
+    fn parse_rewrite_is_fail_closed() {
+        let ok = parse_rewrite(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "headroom_retrieve"}]
+        }))
+        .expect("well-formed rewrite parses");
+        assert_eq!(ok.messages.len(), 1);
+        assert_eq!(ok.tools.len(), 1);
+
+        // tools optional → defaults empty.
+        let no_tools = parse_rewrite(&serde_json::json!({"messages": [{"role": "user"}]}))
+            .expect("rewrite without tools parses");
+        assert!(no_tools.tools.is_empty());
+
+        // Malformed → None (fail-closed): no messages, empty messages, non-array, non-object.
+        assert!(parse_rewrite(&serde_json::json!({})).is_none());
+        assert!(parse_rewrite(&serde_json::json!({"messages": []})).is_none());
+        assert!(parse_rewrite(&serde_json::json!({"messages": "hi"})).is_none());
+        assert!(parse_rewrite(&serde_json::json!("hi")).is_none());
     }
 }
