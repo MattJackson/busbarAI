@@ -785,6 +785,88 @@ mod tests {
         handle.abort();
     }
 
+    /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
+    /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
+    /// secret. Built on a fixture with one global gate.
+    #[tokio::test]
+    async fn test_admin_v1_hooks_read_surface() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+
+        let gate = crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9990/".to_string()),
+            timeout_ms: 25,
+            on_error: crate::config::PolicyOnError::Reject,
+            prompt: crate::config::PromptAccess::Rw,
+            user: crate::config::UserAccess::Ro,
+            priority: 7,
+            at: None,
+            on_empty: None,
+            global: false,
+        };
+        let app = TestApp::new()
+            .governance(gov)
+            .hook("compress", gate)
+            .global_hook("compress")
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // List: the one hook, projected.
+        let list = client
+            .get(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let h = &items[0];
+        assert_eq!(h["name"], "compress");
+        assert_eq!(h["kind"], "gate");
+        assert_eq!(h["prompt"], "rw");
+        assert_eq!(h["user"], "ro");
+        assert_eq!(h["priority"], 7);
+        assert_eq!(h["on_error"], "reject");
+        assert_eq!(h["transport"]["kind"], "webhook");
+        assert_eq!(h["transport"]["target"], "http://127.0.0.1:9990/");
+        assert_eq!(
+            h["global"], true,
+            "named in global_hooks → reported as globally wired"
+        );
+
+        // Get one by name.
+        let one = client
+            .get(format!("http://{addr}/admin/v1/hooks/compress"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(one.status().as_u16(), 200);
+
+        // Unknown name → 404 with the stable v1 `not_found` code.
+        let missing = client
+            .get(format!("http://{addr}/admin/v1/hooks/nope"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        let body: serde_json::Value = missing.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "not_found");
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

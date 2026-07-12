@@ -1250,6 +1250,8 @@ mod tests {
             )),
             rewrite_hooks: Vec::new(),
             tap_hooks: Vec::new(),
+            hook_registry: std::collections::HashMap::new(),
+            global_hooks: Vec::new(),
             failover_cfg: None,
             pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),

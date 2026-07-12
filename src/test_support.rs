@@ -643,6 +643,8 @@ pub(crate) struct TestApp {
     pool_runtime: std::collections::HashMap<String, crate::state::PoolRuntime>,
     fallback_pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
     on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
+    hook_registry: std::collections::HashMap<String, crate::config::HookCfg>,
+    global_hooks: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -657,7 +659,19 @@ impl TestApp {
             pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),
             on_exhausted_cfgs: std::collections::HashMap::new(),
+            hook_registry: std::collections::HashMap::new(),
+            global_hooks: Vec::new(),
         }
+    }
+    /// Register a hook definition in the `hooks:` registry (for the Admin API v1 hooks read surface).
+    pub(crate) fn hook(mut self, name: &str, cfg: crate::config::HookCfg) -> Self {
+        self.hook_registry.insert(name.into(), cfg);
+        self
+    }
+    /// Add a name to the `global_hooks:` list (globally-wired hooks).
+    pub(crate) fn global_hook(mut self, name: &str) -> Self {
+        self.global_hooks.push(name.into());
+        self
     }
     pub(crate) fn lane(mut self, spec: LaneSpec) -> Self {
         self.lanes.push(spec);
@@ -729,6 +743,8 @@ impl TestApp {
             auth,
             rewrite_hooks: Vec::new(),
             tap_hooks: Vec::new(),
+            hook_registry: self.hook_registry,
+            global_hooks: self.global_hooks,
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,

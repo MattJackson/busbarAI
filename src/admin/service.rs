@@ -14,9 +14,10 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, BuildInfo, InfoView, ModelView, Page, PoolMemberView, PoolView, ProviderView,
-    TopologyInfo,
+    AdminError, BuildInfo, HookTransportView, HookView, InfoView, ModelView, Page, PoolMemberView,
+    PoolView, ProviderView, TopologyInfo,
 };
+use crate::config::{HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, UserAccess};
 
 /// Process start instant, for the `info` uptime read. Stamped ONCE at startup by `mark_start()`.
 /// A missing value (never stamped — e.g. a unit test that skips `main`) yields a `None` uptime
@@ -134,5 +135,71 @@ impl AdminService {
             })
             .collect();
         Ok(Page::single(providers))
+    }
+
+    /// `GET /admin/v1/hooks` — the hook registry (the CP plugin-store view). Read scope. Each entry
+    /// is the DEFINITION (kind/transport/grants/ordering/stage), never a secret. Sorted by name.
+    pub(crate) async fn list_hooks(&self) -> Result<Page<HookView>, AdminError> {
+        let mut hooks: Vec<HookView> = self
+            .app
+            .hook_registry
+            .iter()
+            .map(|(name, cfg)| self.hook_view(name, cfg))
+            .collect();
+        hooks.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Page::single(hooks))
+    }
+
+    /// `GET /admin/v1/hooks/{name}` — one hook definition, or `not_found` if the name is unregistered.
+    pub(crate) async fn get_hook(&self, name: &str) -> Result<HookView, AdminError> {
+        self.app
+            .hook_registry
+            .get(name)
+            .map(|cfg| self.hook_view(name, cfg))
+            .ok_or_else(|| AdminError::NotFound(format!("hook `{name}`")))
+    }
+
+    /// Project a registry `HookCfg` into the wire `HookView`. `global` is true when the hook is named
+    /// in `global_hooks:` OR declares inline `global: true` — the two ways a hook is globally wired.
+    fn hook_view(&self, name: &str, cfg: &HookCfg) -> HookView {
+        let (transport_kind, target) = match (&cfg.socket, &cfg.webhook) {
+            (Some(path), _) => ("socket", Some(path.clone())),
+            (None, Some(url)) => ("webhook", Some(url.clone())),
+            (None, None) => ("none", None),
+        };
+        HookView {
+            name: name.to_string(),
+            kind: match cfg.kind {
+                HookKind::Tap => "tap",
+                HookKind::Gate => "gate",
+            },
+            transport: HookTransportView {
+                kind: transport_kind,
+                target,
+            },
+            prompt: match cfg.prompt {
+                PromptAccess::No => "no",
+                PromptAccess::Ro => "ro",
+                PromptAccess::Rw => "rw",
+            },
+            user: match cfg.user {
+                UserAccess::No => "no",
+                UserAccess::Ro => "ro",
+            },
+            priority: cfg.priority,
+            at: cfg.at.map(|s| match s {
+                HookStage::Request => "request",
+                HookStage::Route => "route",
+                HookStage::Attempt => "attempt",
+                HookStage::Completion => "completion",
+            }),
+            on_error: match cfg.on_error {
+                PolicyOnError::Weighted => "weighted",
+                PolicyOnError::Reject => "reject",
+                PolicyOnError::First => "first",
+            },
+            timeout_ms: cfg.timeout_ms,
+            global: cfg.global || self.app.global_hooks.iter().any(|n| n == name),
+        }
     }
 }

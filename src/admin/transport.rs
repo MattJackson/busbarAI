@@ -55,6 +55,8 @@ impl AdminTransport for JsonRest {
             .route("/admin/v1/pools", get(list_pools))
             .route("/admin/v1/models", get(list_models))
             .route("/admin/v1/providers", get(list_providers))
+            .route("/admin/v1/hooks", get(list_hooks))
+            .route("/admin/v1/hooks/{name}", get(get_hook))
             .layer(axum::Extension(service))
     }
 }
@@ -111,6 +113,19 @@ async fn list_models(axum::Extension(service): axum::Extension<Arc<AdminService>
 /// `GET /admin/v1/providers` — distinct providers + lane counts.
 async fn list_providers(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.list_providers().await)
+}
+
+/// `GET /admin/v1/hooks` — the hook registry (CP plugin-store view).
+async fn list_hooks(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.list_hooks().await)
+}
+
+/// `GET /admin/v1/hooks/{name}` — one hook definition (404 if unregistered).
+async fn get_hook(
+    axum::Extension(service): axum::Extension<Arc<AdminService>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    respond(StatusCode::OK, service.get_hook(&name).await)
 }
 
 /// Mount the admin v1 surface onto `router` using the given transport over the shared `App`. Called

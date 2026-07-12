@@ -678,6 +678,8 @@ async fn main() {
         auth: auth_mw.clone(),
         rewrite_hooks,
         tap_hooks,
+        hook_registry: cfg.hooks.clone(),
+        global_hooks: cfg.global_hooks.clone(),
         failover_cfg,
         pool_runtime,
         fallback_pools,

@@ -180,6 +180,42 @@ pub(crate) struct ProviderView {
     pub(crate) model_count: usize,
 }
 
+/// A hook definition in the registry read (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) — the
+/// CP plugin-store view. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a
+/// secret. `global` reports whether the hook fires on every request (named in `global_hooks:` or
+/// declared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HookView {
+    pub(crate) name: String,
+    /// `"tap"` (fire-and-forget) or `"gate"` (fire-and-wait).
+    pub(crate) kind: &'static str,
+    pub(crate) transport: HookTransportView,
+    /// Prompt access grant: `"no"` | `"ro"` | `"rw"`.
+    pub(crate) prompt: &'static str,
+    /// Caller-identity access grant: `"no"` | `"ro"`.
+    pub(crate) user: &'static str,
+    /// Rewrite/reject ordering key (transform-chain order + reject tie-break).
+    pub(crate) priority: u16,
+    /// TAP observation stage (`"request"`/`"route"`/`"attempt"`/`"completion"`), or `None` for a gate.
+    pub(crate) at: Option<&'static str>,
+    /// Gate fallback on timeout/error/abstain: `"weighted"` | `"reject"` | `"first"`.
+    pub(crate) on_error: &'static str,
+    /// Gate decision deadline in milliseconds.
+    pub(crate) timeout_ms: u64,
+    /// Whether this hook fires on every request (globally wired).
+    pub(crate) global: bool,
+}
+
+/// The transport half of a `HookView`: which wire the hook speaks and its target (socket path or
+/// webhook URL — operator config, not a secret). Exactly one of `socket`/`webhook` is set.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HookTransportView {
+    /// `"socket"` or `"webhook"` (or `"none"` for a misconfigured entry with neither).
+    pub(crate) kind: &'static str,
+    /// The socket path or webhook URL. `None` only if the definition set neither transport.
+    pub(crate) target: Option<String>,
+}
+
 /// A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
 /// (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
 #[derive(Debug, Clone, Serialize)]
