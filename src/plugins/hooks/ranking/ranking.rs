@@ -12,7 +12,7 @@
 //! The native bodies + `native_policy` registry are live: `resolve_policy` looks a non-weighted name
 //! up here at config load, and `forward::decide_policy_order` invokes the resolved policy per request.
 
-use super::{
+use crate::routing::{
     Candidate, PolicyResult, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
 };
 use std::time::Duration;

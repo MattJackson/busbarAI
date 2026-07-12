@@ -31,8 +31,11 @@ pub(crate) struct HookRequest<'a> {
 ///     screen it or to rewrite it); the extra power of `rw` is on the REPLY only — a `rw` hook's
 ///     `rewrite` arm is applied, a `ro` hook's is dropped (enforced at the rewrite seam by the grant).
 ///   - `user` grant (`no|ro`): caller identity — present when `ro`.
-/// A grant of `no` OMITS the field from the JSON entirely, so the default payload carries no
-/// sensitive content. These are the ONLY two fields that ever carry caller content/identity.
+///
+/// A grant of `no` OMITS the field from the JSON entirely AND is fail-closed the other direction too
+/// (a returned value for a field the hook wasn't granted is ignored): `ro`'s rewrite is dropped,
+/// `no` sends nothing and accepts nothing back. These are the ONLY two fields that ever carry caller
+/// content/identity.
 #[derive(Serialize)]
 pub(crate) struct HookReqProjection<'a> {
     pub(crate) pool: &'a str,

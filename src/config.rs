@@ -486,10 +486,10 @@ impl PoolPolicy {
     pub(crate) fn native_name(&self) -> Option<&'static str> {
         match self {
             PoolPolicy::Weighted => None,
-            PoolPolicy::Cheapest => Some(crate::routing::native::POLICY_NAME_CHEAPEST),
-            PoolPolicy::Fastest => Some(crate::routing::native::POLICY_NAME_FASTEST),
-            PoolPolicy::LeastBusy => Some(crate::routing::native::POLICY_NAME_LEAST_BUSY),
-            PoolPolicy::Usage => Some(crate::routing::native::POLICY_NAME_USAGE),
+            PoolPolicy::Cheapest => Some(crate::plugins::hooks::ranking::POLICY_NAME_CHEAPEST),
+            PoolPolicy::Fastest => Some(crate::plugins::hooks::ranking::POLICY_NAME_FASTEST),
+            PoolPolicy::LeastBusy => Some(crate::plugins::hooks::ranking::POLICY_NAME_LEAST_BUSY),
+            PoolPolicy::Usage => Some(crate::plugins::hooks::ranking::POLICY_NAME_USAGE),
         }
     }
 }

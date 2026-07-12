@@ -8,3 +8,7 @@
 //! at runtime (`hooks:` config), so they live outside the engine. This module is the reserved home
 //! for any hook we choose to compile in by default (e.g. a future in-tree redaction hook); each
 //! would live in `plugins/hooks/<name>/` behind its own cargo feature.
+
+/// The built-in RANKING hooks (cheapest/fastest/least_busy/usage) — order-gates over the
+/// `RoutingPolicy` contract, relocated out of the engine core.
+pub(crate) mod ranking;

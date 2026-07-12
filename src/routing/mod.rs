@@ -34,7 +34,6 @@ fn policy_timeout(timeout_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
-pub(crate) mod native;
 pub(crate) mod socket;
 pub(crate) mod webhook;
 pub(crate) mod wire;
@@ -295,7 +294,7 @@ pub(crate) fn resolve_policy(
     // No gate: resolve the native `policy:` ordering. `weighted` ⇒ the zero-cost default path (no
     // policy object, inline SWRR) — byte-identical to 1.2.1's `route: weighted`.
     let name = cfg.policy.native_name()?;
-    let policy = native::native_policy(name)?;
+    let policy = crate::plugins::hooks::ranking::native_policy(name)?;
     Some(ResolvedPolicy::Policy {
         policy,
         on_error: crate::config::PolicyOnError::default(),
