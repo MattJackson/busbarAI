@@ -95,6 +95,30 @@ impl<'de> serde::Deserialize<'de> for AuthMode {
     }
 }
 
+/// The UPSTREAM-credential mode — whose credential reaches the provider. This is DISTINCT from
+/// authentication (which auth plugin, if any, ran at the front door): `Own` signs the upstream call
+/// with busbar's configured lane key; `Passthrough` forwards the CALLER's credential upstream. A
+/// proto writer uses THIS (not the front-door auth mode) to resolve an otherwise-ambiguous credential
+/// scheme to the single native header the caller's real client produces. Splitting this out of
+/// `AuthMode` is step one of dissolving `AuthMode` into a pure `auth:` plugin chain (slice 2d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamCreds {
+    Own,
+    Passthrough,
+}
+
+impl AuthMode {
+    /// The upstream-credential mode implied by this front-door auth mode — the TRANSITIONAL bridge
+    /// while `AuthMode` is being dissolved (2d-2 makes `upstream_credentials` its own config key).
+    /// `Passthrough` forwards the caller's credential; `Token`/`None` use busbar's configured key.
+    pub(crate) fn upstream_creds(self) -> UpstreamCreds {
+        match self {
+            AuthMode::Passthrough => UpstreamCreds::Passthrough,
+            AuthMode::Token | AuthMode::None => UpstreamCreds::Own,
+        }
+    }
+}
+
 /// The caller's bearer token, threaded into request extensions by `auth_middleware` so handlers can
 /// forward it upstream in passthrough mode. `None` when no usable bearer token was presented.
 #[derive(Clone, Default)]

@@ -1772,7 +1772,7 @@ impl AnthropicWriter {
 /// load.
 fn anthropic_auth_headers(
     key: &str,
-    mode: Option<crate::auth::AuthMode>,
+    creds: Option<crate::auth::UpstreamCreds>,
 ) -> Vec<(HeaderName, HeaderValue)> {
     // Build a credential header pair, OMITTING it (returning None) when the value carries bytes
     // invalid for an HTTP header value. Never logs the key bytes — only the header name and the fact
@@ -1826,11 +1826,9 @@ fn anthropic_auth_headers(
         AnthropicCredScheme::OAuth => assemble(vec![authorization()]),
         // Unrecognized shape: the mode resolves it to a single native header on the wire path;
         // the mode-blind primitive falls back to both so neither path silently drops.
-        AnthropicCredScheme::Ambiguous => match mode {
-            Some(crate::auth::AuthMode::Passthrough) => assemble(vec![authorization()]),
-            Some(crate::auth::AuthMode::Token) | Some(crate::auth::AuthMode::None) => {
-                assemble(vec![x_api_key()])
-            }
+        AnthropicCredScheme::Ambiguous => match creds {
+            Some(crate::auth::UpstreamCreds::Passthrough) => assemble(vec![authorization()]),
+            Some(crate::auth::UpstreamCreds::Own) => assemble(vec![x_api_key()]),
             None => assemble(vec![x_api_key(), authorization()]),
         },
     }
@@ -1861,11 +1859,11 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn sign_request(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
-        // Wire path: the front-door auth mode (set by forward.rs into the SigningContext) resolves an
-        // Ambiguous Anthropic credential to the SINGLE native header that mode implies — Passthrough
-        // forwards the caller's token as `authorization: Bearer`; Token/None present the configured
-        // key as `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
-        anthropic_auth_headers(key, Some(ctx.auth_mode))
+        // Wire path: the upstream-credential mode (set by forward.rs into the SigningContext) resolves
+        // an Ambiguous Anthropic credential to the SINGLE native header it implies — Passthrough
+        // forwards the caller's token as `authorization: Bearer`; Own presents the configured key as
+        // `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
+        anthropic_auth_headers(key, Some(ctx.upstream_creds))
     }
 
     fn requires_max_tokens(&self) -> bool {
@@ -2648,7 +2646,7 @@ mod anthropic_hardening_tests {
             canonical_uri: PATH_UPSTREAM.to_string(),
             body: b"{}",
             timestamp_epoch: 0,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         for headers in [
             AnthropicWriter.auth_headers(raw),
@@ -2695,7 +2693,7 @@ mod anthropic_hardening_tests {
             canonical_uri: PATH_UPSTREAM.to_string(),
             body: b"{}",
             timestamp_epoch: 0,
-            auth_mode: crate::auth::AuthMode::Passthrough,
+            upstream_creds: crate::auth::UpstreamCreds::Passthrough,
         };
         let pt = AnthropicWriter.sign_request(amb, &ctx);
         assert_eq!(
@@ -2734,17 +2732,17 @@ mod anthropic_hardening_tests {
     #[test]
     fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
         let body = b"{}";
-        let ctx = |mode| crate::proto::SigningContext {
+        let ctx = |creds| crate::proto::SigningContext {
             host: "api.anthropic.com".to_string(),
             canonical_uri: PATH_UPSTREAM.to_string(),
             body,
             timestamp_epoch: 0,
-            auth_mode: mode,
+            upstream_creds: creds,
         };
         let amb = "caller-specific-token-abc123";
 
         // Passthrough: forward the caller's token as Bearer ONLY (no x-api-key tell).
-        let pt = AnthropicWriter.sign_request(amb, &ctx(crate::auth::AuthMode::Passthrough));
+        let pt = AnthropicWriter.sign_request(amb, &ctx(crate::auth::UpstreamCreds::Passthrough));
         assert_eq!(
             header_value(&pt, "authorization").as_deref(),
             Some("Bearer caller-specific-token-abc123")
@@ -2754,21 +2752,20 @@ mod anthropic_hardening_tests {
             "passthrough wire path must NOT also emit x-api-key (dual-header tell)"
         );
 
-        // Token mode (configured lane key): present the API-key shape ONLY (no Bearer tell).
-        for mode in [crate::auth::AuthMode::Token, crate::auth::AuthMode::None] {
-            let h = AnthropicWriter.sign_request(amb, &ctx(mode));
-            assert_eq!(
-                header_value(&h, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
-                Some("caller-specific-token-abc123")
-            );
-            assert!(
-                header_value(&h, "authorization").is_none(),
-                "token/none wire path must NOT also emit authorization (dual-header tell)"
-            );
-        }
+        // Own (configured lane key): present the API-key shape ONLY (no Bearer tell).
+        let h = AnthropicWriter.sign_request(amb, &ctx(crate::auth::UpstreamCreds::Own));
+        assert_eq!(
+            header_value(&h, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
+            Some("caller-specific-token-abc123")
+        );
+        assert!(
+            header_value(&h, "authorization").is_none(),
+            "own-key wire path must NOT also emit authorization (dual-header tell)"
+        );
 
         // Clear API-key / OAuth credentials stay single-header on the wire path regardless of mode.
-        let api = AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::AuthMode::None));
+        let api =
+            AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::UpstreamCreds::Own));
         assert!(
             header_value(&api, "x-api-key").is_some() // golden wire-contract literal (kept bare on purpose)
                 && header_value(&api, "authorization").is_none()

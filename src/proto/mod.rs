@@ -305,12 +305,13 @@ pub(crate) struct SigningContext<'a> {
     pub(crate) body: &'a [u8],
     /// Unix epoch seconds at signing time.
     pub(crate) timestamp_epoch: u64,
-    /// The front-door auth mode for this request. Lets a writer resolve a credential whose scheme is
-    /// otherwise ambiguous (e.g. Anthropic's API-key-vs-Bearer choice) to the single native header
-    /// the mode implies — Passthrough forwards the caller's Bearer token; Token/None present the
+    /// The UPSTREAM-credential mode for this request. Lets a writer resolve a credential whose scheme
+    /// is otherwise ambiguous (e.g. Anthropic's API-key-vs-Bearer choice) to the single native header
+    /// the mode implies — `Passthrough` forwards the caller's Bearer token; `Own` presents the
     /// configured-key shape. Without it, an ambiguous credential must emit BOTH headers, which is an
-    /// upstream-distinguishability tell no native client produces.
-    pub(crate) auth_mode: crate::auth::AuthMode,
+    /// upstream-distinguishability tell no native client produces. (The upstream-credential concern,
+    /// split out of the front-door auth mode in slice 2d.)
+    pub(crate) upstream_creds: crate::auth::UpstreamCreds,
 }
 
 /// ProtocolWriter rewrites intents for the upstream wire format.

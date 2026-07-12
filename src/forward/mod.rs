@@ -2886,7 +2886,7 @@ pub(crate) async fn forward_with_pool_parsed(
             canonical_uri,
             body: &payload,
             timestamp_epoch: now(),
-            auth_mode: app.auth_mode(),
+            upstream_creds: app.auth_mode().upstream_creds(),
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
@@ -4174,7 +4174,7 @@ async fn forward_once(
         canonical_uri,
         body: &payload,
         timestamp_epoch: now(),
-        auth_mode: app.auth_mode(),
+        upstream_creds: app.auth_mode().upstream_creds(),
     };
     let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
@@ -5544,7 +5544,7 @@ mod auth_style_tests {
             canonical_uri: "/openai/deployments/gpt-4o/chat/completions".to_string(),
             body,
             timestamp_epoch: 0,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         }
     }
 
