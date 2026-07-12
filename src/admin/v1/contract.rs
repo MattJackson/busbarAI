@@ -217,6 +217,21 @@ pub(crate) struct HookTransportView {
     pub(crate) target: Option<String>,
 }
 
+/// The live health of one hook's transport (`GET /admin/v1/hooks/{name}/health`). BEST-EFFORT: for a
+/// socket transport `reachable` is `Some(true/false)` from a short-timeout connect probe; for a webhook
+/// (or on a non-unix host) it is `None` (probed on demand, not here) with a `detail` note. Never fires
+/// the hook — just checks whether the endpoint accepts a connection. Additive-only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HookHealthView {
+    pub(crate) name: String,
+    pub(crate) transport: HookTransportView,
+    /// `Some(true)` = the transport accepted a connection; `Some(false)` = it did not; `None` = not
+    /// probed here (webhook / non-unix).
+    pub(crate) reachable: Option<bool>,
+    /// A short human note on the probe (why `None`, or the connect error class). Never a secret.
+    pub(crate) detail: Option<String>,
+}
+
 /// One plugin in the plugin catalog (`GET /admin/v1/plugins?type=`). A plugin is either
 /// COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)
 /// or EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where

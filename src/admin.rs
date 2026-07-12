@@ -871,6 +871,77 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/hooks/{name}/health` best-effort probes a hook's transport: 404 for an unknown
+    /// name; a webhook hook reports `reachable: null` (probed on demand); a socket hook pointing at a
+    /// nonexistent path reports `reachable: false`. Never fires the hook.
+    #[tokio::test]
+    async fn test_admin_v1_hook_health_best_effort() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mk = |socket: Option<&str>, webhook: Option<&str>| crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: socket.map(str::to_string),
+            webhook: webhook.map(str::to_string),
+            timeout_ms: 5,
+            on_error: crate::config::PolicyOnError::default(),
+            prompt: crate::config::PromptAccess::No,
+            user: crate::config::UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: false,
+        };
+        let app = TestApp::new()
+            .governance(gov)
+            .hook("web", mk(None, Some("http://127.0.0.1:9980/")))
+            .hook("sock", mk(Some("/nonexistent/busbar-hook.sock"), None))
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let get = |name: &str| {
+            let url = format!("http://{addr}/admin/v1/hooks/{name}/health");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Unknown → 404 not_found.
+        let missing = get("nope").await;
+        assert_eq!(missing.status().as_u16(), 404);
+        assert_eq!(
+            missing.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "not_found"
+        );
+
+        // Webhook → reachable null (not probed here).
+        let web: serde_json::Value = get("web").await.json().await.unwrap();
+        assert_eq!(web["name"], "web");
+        assert_eq!(web["transport"]["kind"], "webhook");
+        assert!(web["reachable"].is_null(), "webhook is not probed here");
+
+        // Socket to a nonexistent path → reachable false (best-effort connect failed).
+        let sock: serde_json::Value = get("sock").await.json().await.unwrap();
+        assert_eq!(sock["transport"]["kind"], "socket");
+        // On unix the connect fails → Some(false); on non-unix sockets aren't probed → null. Accept both.
+        assert!(
+            sock["reachable"] == serde_json::json!(false) || sock["reachable"].is_null(),
+            "socket to a dead path is unreachable (unix) or unprobed (non-unix): {}",
+            sock["reachable"]
+        );
+
+        handle.abort();
+    }
+
     /// The plugin catalog (`GET /admin/v1/plugins?type=`) lists compiled-in plugins per type (the
     /// same feature-gated source as `info`) plus external hooks from the registry, and rejects an
     /// unknown/absent type with the stable `invalid_request` code.

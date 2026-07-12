@@ -43,6 +43,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/providers", get(list_providers))
             .route("/admin/v1/hooks", get(list_hooks))
             .route("/admin/v1/hooks/{name}", get(get_hook))
+            .route("/admin/v1/hooks/{name}/health", get(hook_health))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
             .route("/admin/v1/config", get(get_config))
@@ -121,6 +122,14 @@ async fn get_hook(
     Path(name): Path<String>,
 ) -> Response {
     respond(StatusCode::OK, service.get_hook(&name).await)
+}
+
+/// `GET /admin/v1/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
+async fn hook_health(
+    Extension(service): Extension<Arc<AdminService>>,
+    Path(name): Path<String>,
+) -> Response {
+    respond(StatusCode::OK, service.hook_health(&name).await)
 }
 
 /// `GET /admin/v1/plugins?type=auth|hooks` — the plugin catalog for one type. A missing/unknown
@@ -204,6 +213,23 @@ fn openapi_doc() -> serde_json::Value {
                 }],
                 "responses": {
                     "200": {"description": "OK"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/hooks/{name}/health".to_string(),
+        json!({
+            "get": {
+                "summary": "Best-effort hook transport reachability",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "OK (`reachable` may be null for webhook/non-unix)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
                 }
             }

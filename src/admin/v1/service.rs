@@ -14,9 +14,9 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView, HookTransportView,
-    HookView, InfoView, ModelView, Page, PluginView, PoolMemberView, PoolView, ProviderView,
-    TopologyInfo,
+    AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView, HookHealthView,
+    HookTransportView, HookView, InfoView, ModelView, Page, PluginView, PoolMemberView, PoolView,
+    ProviderView, TopologyInfo,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
@@ -53,6 +53,45 @@ fn hook_plugins_compiled_in() -> Vec<&'static str> {
         "ranking",
     ]
     .to_vec()
+}
+
+/// Best-effort reachability probe for a hook's transport, for the health read. NEVER sends a hook
+/// request — it only checks whether the endpoint accepts a connection. A socket gets a short-timeout
+/// `connect` (unix only); a webhook is not probed here (returns `None` with a note — webhooks lazy-
+/// connect per request, and a blind GET/HEAD could have side effects). Returns `(reachable, detail)`.
+async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
+    // Cap the probe so an unresponsive socket can never stall the admin read.
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+    match (&cfg.socket, &cfg.webhook) {
+        (Some(path), _) => {
+            #[cfg(unix)]
+            {
+                match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(path))
+                    .await
+                {
+                    Ok(Ok(_stream)) => (Some(true), None),
+                    Ok(Err(e)) => (Some(false), Some(format!("connect failed: {}", e.kind()))),
+                    Err(_) => (Some(false), Some("connect timed out".to_string())),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                (
+                    None,
+                    Some("socket transport is unix-only; not probed on this host".to_string()),
+                )
+            }
+        }
+        (None, Some(_url)) => (
+            None,
+            Some("webhook is probed on demand at request time, not here".to_string()),
+        ),
+        (None, None) => (
+            Some(false),
+            Some("hook defines no transport (socket or webhook)".to_string()),
+        ),
+    }
 }
 
 /// The admin application core. Cheap to construct and clone-free to share (`Arc<App>` inside); a
@@ -294,6 +333,26 @@ impl AdminService {
                 crate::auth::UpstreamCreds::Passthrough => "passthrough",
             },
             open: self.app.auth.is_open(),
+        })
+    }
+
+    /// `GET /admin/v1/hooks/{name}/health` — best-effort transport reachability for one hook. Read
+    /// scope. `not_found` if the name is unregistered. NEVER fires the hook: for a socket it does a
+    /// short-timeout connect probe (`reachable = Some(_)`); for a webhook (or on non-unix) it reports
+    /// `reachable = None` with a note (webhooks are probed on demand at request time, not here).
+    pub(crate) async fn hook_health(&self, name: &str) -> Result<HookHealthView, AdminError> {
+        let cfg = self
+            .app
+            .hook_registry
+            .get(name)
+            .ok_or_else(|| AdminError::NotFound(format!("hook `{name}`")))?;
+        let view = self.hook_view(name, cfg);
+        let (reachable, detail) = probe_transport(cfg).await;
+        Ok(HookHealthView {
+            name: name.to_string(),
+            transport: view.transport,
+            reachable,
+            detail,
         })
     }
 
