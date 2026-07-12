@@ -613,6 +613,7 @@ mod tests {
             at: None,
             on_empty: None,
             global,
+            default: false,
         }
     }
 

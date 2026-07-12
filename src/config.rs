@@ -639,6 +639,17 @@ pub(crate) struct HookCfg {
     /// Fire on EVERY request — inline sugar for adding this name to `global_hooks:`. Default false.
     #[serde(default)]
     pub(crate) global: bool,
+    /// Mark this hook as THE default — the base a pool inherits when it names no hook of its own.
+    /// REPLACEMENT semantics (unlike `global:`, which is an overlay ON TOP of the base): a `default`
+    /// hook becomes the base, so the compiled-in backstop (`weighted`) is not used. Exactly like
+    /// `auth: [sso]` means the built-in `tokens` is not loaded. AT MOST ONE hook may set `default:
+    /// true` (boot AND every admin apply → error naming both); 0 ⇒ the compiled-in backstop. Only an
+    /// ordering hook (one that returns `order`) is a meaningful default. Default false. RESERVED:
+    /// the resolution reader lands with the ranking relocation (validated now so the invariant holds
+    /// from the moment the field exists).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) default: bool,
 }
 
 /// The default hard wall-clock deadline for a gate decision, in milliseconds. Used by serde's

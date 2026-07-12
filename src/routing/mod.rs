@@ -565,6 +565,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: false,
+            default: false,
         }
     }
 
@@ -695,6 +696,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: true,
+            default: false,
         };
         let mut hooks = HashMap::new();
         hooks.insert("rw-gate".to_string(), mk(HookKind::Gate, PromptAccess::Rw));
@@ -736,6 +738,7 @@ mod tests {
             at,
             on_empty: None,
             global: true,
+            default: false,
         };
         let mut hooks = HashMap::new();
         hooks.insert(
@@ -785,6 +788,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: true,
+            default: false,
         };
         let mut hooks = HashMap::new();
         hooks.insert("ro-tap".to_string(), mk(PromptAccess::Ro));

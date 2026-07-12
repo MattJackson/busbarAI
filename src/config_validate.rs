@@ -734,6 +734,29 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (hooks/at-most-one-default): AT MOST ONE hook may claim `default: true` — it becomes the
+    // base ordering a pool inherits when it names none, REPLACING the compiled-in backstop. Two
+    // defaults are ambiguous (which base?), so >1 is a boot error naming every offender. This runs on
+    // the resolved config, so it fires at boot AND on every admin apply (the apply path re-resolves +
+    // re-validates), closing "add a second default live." 0 defaults ⇒ the compiled-in backstop; the
+    // single-default check needs no lower bound.
+    {
+        let mut defaults: Vec<&str> = cfg
+            .hooks
+            .iter()
+            .filter(|(_, h)| h.default)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if defaults.len() > 1 {
+            defaults.sort_unstable();
+            errors.push(format!(
+                "more than one hook sets `default: true` ({}); at most one hook may be the default \
+                 base ordering",
+                defaults.join(", ")
+            ));
+        }
+    }
+
     // Rule (hooks/pool-ref): a pool's `hook:` must name a registry entry that is a GATE (a tap can't
     // influence routing). Dangling or wrong-kind references are startup errors that name the hook.
     for (pool_name, pool_cfg) in &cfg.pools {
@@ -4086,6 +4109,7 @@ models:
             at: None,
             on_empty: None,
             global: false,
+            default: false,
         }
     }
 
@@ -4124,6 +4148,44 @@ models:
                 errs.iter()
                     .any(|e| e.contains(&format!("hook '{reserved}'")) && e.contains("reserved")),
                 "reserved hook name '{reserved}' must be rejected by name; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_at_most_one_default() {
+        // Two hooks claiming `default: true` is a boot error naming both; one (or zero) is fine.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        let mut two = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        two.default = true;
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert("rank_a".to_string(), two.clone());
+        cfg.hooks.insert("rank_b".to_string(), two);
+        let errs = validate(&cfg).expect_err("two defaults must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("default: true")
+                && e.contains("rank_a")
+                && e.contains("rank_b")),
+            "the error must name both offending defaults; got: {errs:?}"
+        );
+
+        // Exactly one default is accepted (no default-rule error).
+        cfg.hooks.remove("rank_b");
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("more than one hook sets")),
+                "a single default must not trip the at-most-one rule; got: {errs:?}"
             );
         }
     }

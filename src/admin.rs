@@ -1678,6 +1678,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: false,
+            default: false,
         };
         let app = TestApp::new()
             .governance(gov)
@@ -1759,6 +1760,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: false,
+            default: false,
         };
         let app = TestApp::new()
             .governance(gov)
@@ -1830,6 +1832,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: false,
+            default: false,
         };
         let app = TestApp::new().governance(gov).hook("myhook", gate).build();
         let router = crate::build_router(app);
@@ -2008,6 +2011,7 @@ mod tests {
             at: None,
             on_empty: None,
             global: false,
+            default: false,
         };
         let app = TestApp::new()
             .governance(gov)
