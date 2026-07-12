@@ -117,17 +117,92 @@ impl fmt::Debug for CallerToken {
     }
 }
 
+/// The verdict of one auth module. The PAM-style trichotomy the 1.3 auth-plugin layer is built on
+/// (design-hooks-v2 §2): `Identify` = this module authenticated the caller (slice 3 attaches the
+/// `Principal`); `Reject` = a credential was presented but is invalid (fail-closed, stop the chain);
+/// `Pass` = "not mine" — no usable credential for this module, defer to the next module / the mode
+/// default. Slice 2 uses only the verdict; the principal payload lands in slice 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthOutcome {
+    Identify,
+    Reject,
+    Pass,
+}
+
+/// One authentication module — a swappable implementation of the fixed `auth` engine stage. The
+/// built-in `tokens` module implements it today; SAML/AD/OIDC modules implement the same trait in
+/// the private repo. Extraction of the credential carriers (Bearer / x-api-key / x-goog-api-key)
+/// stays in the middleware, so a module never re-parses headers — it receives the already-extracted
+/// candidate and returns a verdict. (Slice 3 extends this with a configure/describe handshake and a
+/// `Principal` on `Identify`.)
+pub(crate) trait AuthModule: Send + Sync {
+    /// Stable module name for config references, metrics, and audit (e.g. `"tokens"`). RESERVED:
+    /// consumed by the slice-3 `auth:` chain + audit; no caller in slice 2.
+    #[allow(dead_code)]
+    fn name(&self) -> &'static str;
+    /// Judge the presented candidate credential. Constant-time and side-effect-free.
+    fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome;
+}
+
+/// The built-in `tokens` auth module: a static allowlist of client tokens, matched in constant time
+/// against the presented candidate. Owns the SHA-256 digests (64-hex-char) of each configured token,
+/// pre-computed once at construction so `authenticate` folds over FIXED-LENGTH digests instead of
+/// re-hashing the allowlist per call. The security property is unchanged from the pre-trait fold:
+/// the candidate is hashed exactly once, ALL N comparisons run unconditionally (bitwise-OR, no
+/// short-circuit), and every compare is over equal-length (64-hex-char) strings.
+pub(crate) struct TokensModule {
+    hashed_tokens: Vec<String>,
+}
+
+impl TokensModule {
+    /// Pre-hash the allowlist once. `sha256_hex` is the same digest facility used for virtual keys.
+    fn new(tokens: &[String]) -> Self {
+        Self {
+            hashed_tokens: tokens
+                .iter()
+                .map(|t| crate::sigv4::sha256_hex(t.as_bytes()))
+                .collect(),
+        }
+    }
+}
+
+impl AuthModule for TokensModule {
+    fn name(&self) -> &'static str {
+        "tokens"
+    }
+
+    fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome {
+        // No usable credential presented -> Pass (defer). An empty candidate is treated as absent.
+        let Some(token) = candidate.filter(|t| !t.is_empty()) else {
+            return AuthOutcome::Pass;
+        };
+        // Hash the candidate once, then constant-time-fold against EVERY allowed digest with
+        // bitwise-OR (NOT `.any()`, which would short-circuit and leak the matched token's position
+        // as a list-level timing oracle). `black_box` keeps the optimizer from reintroducing an
+        // early exit. Byte-for-byte the pre-trait fold from `validate_token`.
+        let candidate_hash = crate::sigv4::sha256_hex(token.as_bytes());
+        let found = self.hashed_tokens.iter().fold(0u8, |acc, allowed_hash| {
+            acc | u8::from(AuthMiddleware::constant_time_eq(
+                &candidate_hash,
+                allowed_hash,
+            ))
+        });
+        if std::hint::black_box(found) != 0 {
+            AuthOutcome::Identify
+        } else {
+            AuthOutcome::Reject
+        }
+    }
+}
+
 /// AuthMiddleware holds the resolved auth mode and token allowlist.
 pub(crate) struct AuthMiddleware {
     pub(crate) mode: AuthMode,
     pub(crate) client_tokens: Vec<String>,
-    /// SHA-256 digests (64-hex-char) of each `client_tokens` entry, pre-computed once at
-    /// construction so `validate_token` can fold over FIXED-LENGTH digests on every request
-    /// instead of re-hashing the allowlist N times per call. The security property is identical:
-    /// the candidate is still hashed exactly once per request, and the fold still runs ALL N
-    /// comparisons unconditionally with bitwise-OR (no short-circuit). Length-uniformity
-    /// (64-hex-char) is preserved — `constant_time_eq` still always compares equal-length strings.
-    hashed_client_tokens: Vec<String>,
+    /// The built-in `tokens` auth module (owns the pre-hashed allowlist). `validate_token`'s
+    /// `Token` arm delegates its verdict to this module. Slice 3 generalizes this single module
+    /// into the configured `auth:` chain.
+    token_module: TokensModule,
 }
 
 // MANUAL Debug that REDACTS the allowlist. A derived `Debug` would print every entry of
@@ -180,15 +255,12 @@ impl AuthMiddleware {
             }
         }
 
-        let hashed_client_tokens: Vec<String> = tokens
-            .iter()
-            .map(|t| crate::sigv4::sha256_hex(t.as_bytes()))
-            .collect();
+        let token_module = TokensModule::new(&tokens);
 
         Self {
             mode,
             client_tokens: tokens,
-            hashed_client_tokens,
+            token_module,
         }
     }
 
@@ -272,40 +344,12 @@ impl AuthMiddleware {
     /// constant-time regardless of which header carried it.
     pub(crate) fn validate_token(&self, token: Option<&str>) -> bool {
         match self.mode {
+            // Delegate the Token-mode verdict to the built-in `tokens` auth module. The module owns
+            // the constant-time hash-fold (moved verbatim from here); only an `Identify` verdict
+            // admits. `Reject` (wrong/absent token) and `Pass` (no credential) both deny — identical
+            // to the pre-trait behavior where a missing/empty/non-matching token returned `false`.
             AuthMode::Token => {
-                let Some(token) = token else {
-                    return false;
-                };
-                if token.is_empty() {
-                    return false;
-                }
-
-                // Length-independent compare: `constant_time_eq` early-returns on a length
-                // mismatch, which would leak each configured client token's LENGTH via timing (a
-                // candidate of the right length runs the full byte loop; a wrong-length one returns
-                // immediately). Remove that oracle by hashing BOTH the presented candidate and each
-                // configured token with SHA-256 (the same `sha256_hex` facility used for virtual
-                // keys and the admin token above) and constant-time-comparing the fixed-length
-                // (64-hex-char) digests — every candidate now does identical work regardless of its
-                // length, and a wrong-length token still fails the digest compare (so correctness is
-                // preserved: a valid token authenticates, an invalid/wrong-length one is rejected).
-                //
-                // Constant-time compare against EVERY allowed token. `.any()` would short-circuit
-                // on the first match, making the number of `constant_time_eq` calls depend on the
-                // matched token's position in the allowlist (a match at index 0 returns after one
-                // comparison; a miss scans all N) — a list-level timing oracle that lets an
-                // adversary distinguish "matched early" from "matched late" / "not found". Fold
-                // with bitwise-OR (`|`, NOT `||`) so all N comparisons always run regardless of
-                // where (or whether) a match occurs; `black_box` keeps the optimizer from
-                // reintroducing an early exit.
-                let candidate_hash = crate::sigv4::sha256_hex(token.as_bytes());
-                let found = self
-                    .hashed_client_tokens
-                    .iter()
-                    .fold(0u8, |acc, allowed_hash| {
-                        acc | u8::from(Self::constant_time_eq(&candidate_hash, allowed_hash))
-                    });
-                std::hint::black_box(found) != 0
+                matches!(self.token_module.authenticate(token), AuthOutcome::Identify)
             }
             AuthMode::Passthrough | AuthMode::None => true,
         }
