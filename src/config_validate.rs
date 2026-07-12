@@ -705,6 +705,35 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (hooks/reserved-names): a hook in ANY layer (base config, and — once the admin API can
+    // register hooks — the overlay) may NOT reuse a name that a compiled-in built-in already answers
+    // to. This is REGISTRY NAME UNIQUENESS, not a privileged-word list: `weighted`/`cheapest`/… are
+    // the native ranking strategies (becoming named registry hooks), and `tokens`/`admin-tokens` are
+    // the built-in auth modules. Two things can't answer to one name — which one would `on_error:
+    // weighted` or an `auth:`/`default hook` reference resolve to? A collision is a boot error naming
+    // the offender. Closing this before scope enforcement / `on_error`-as-string makes the shadowing
+    // path reachable. (`weighted` reserved even though it constructs no object today: it is still the
+    // name the default routing floor answers to.)
+    const RESERVED_HOOK_NAMES: &[&str] = &[
+        // native ranking strategies (PoolPolicy::native_name + the always-present `weighted` floor)
+        "weighted",
+        "cheapest",
+        "fastest",
+        "least_busy",
+        "usage",
+        // built-in auth modules (AuthModule::name)
+        "tokens",
+        "admin-tokens",
+    ];
+    for hook_name in cfg.hooks.keys() {
+        if RESERVED_HOOK_NAMES.contains(&hook_name.as_str()) {
+            errors.push(format!(
+                "hook '{hook_name}' uses a name reserved by a built-in (ranking strategy or auth \
+                 module); rename the hook — a runtime hook cannot shadow a compiled-in plugin's name"
+            ));
+        }
+    }
+
     // Rule (hooks/pool-ref): a pool's `hook:` must name a registry entry that is a GATE (a tap can't
     // influence routing). Dangling or wrong-kind references are startup errors that name the hook.
     for (pool_name, pool_cfg) in &cfg.pools {
@@ -4057,6 +4086,73 @@ models:
             at: None,
             on_empty: None,
             global: false,
+        }
+    }
+
+    #[test]
+    fn test_hook_reserved_name_rejected() {
+        // A hook cannot reuse a built-in's name (ranking strategy or auth module) — registry name
+        // uniqueness. Each reserved name, defined as a valid gate hook, must be rejected by name.
+        for reserved in [
+            "weighted",
+            "cheapest",
+            "fastest",
+            "least_busy",
+            "usage",
+            "tokens",
+            "admin-tokens",
+        ] {
+            let mut providers = HashMap::new();
+            providers.insert(
+                "prov".to_string(),
+                make_provider("anthropic", "https://api.example.com", "API_KEY"),
+            );
+            let mut models = HashMap::new();
+            models.insert("m1".to_string(), make_model("prov", 4));
+            let pools = {
+                let mut p = HashMap::new();
+                p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+                p
+            };
+            let mut cfg = make_root_cfg(providers, models, pools);
+            cfg.hooks.insert(
+                reserved.to_string(),
+                gate_hook(Some("/run/busbar/h.sock"), None, 150),
+            );
+            let errs = validate(&cfg).expect_err("a reserved hook name must be rejected");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(&format!("hook '{reserved}'")) && e.contains("reserved")),
+                "reserved hook name '{reserved}' must be rejected by name; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_nonreserved_name_ok() {
+        // A normal hook name is NOT flagged by the reserved-name rule.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert(
+            "headroom".to_string(),
+            gate_hook(Some("/run/busbar/h.sock"), None, 150),
+        );
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("reserved")),
+                "a non-reserved hook name must not trip the reserved-name rule; got: {errs:?}"
+            );
         }
     }
 
