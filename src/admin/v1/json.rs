@@ -47,6 +47,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/hooks/{name}/health", get(hook_health))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
+            .route("/admin/v1/admin-auth", get(get_admin_auth))
             .route("/admin/v1/usage", get(get_usage))
             .route("/admin/v1/config", get(get_config))
             .route("/admin/v1/config/validate", post(validate_config))
@@ -157,6 +158,11 @@ async fn get_auth(Extension(service): Extension<Arc<AdminService>>) -> Response 
     respond(StatusCode::OK, service.get_auth().await)
 }
 
+/// `GET /admin/v1/admin-auth` — the admin-plane auth config (the admin surface guard).
+async fn get_admin_auth(Extension(service): Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.get_admin_auth().await)
+}
+
 /// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests, per-key).
 async fn get_usage(Extension(service): Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.get_usage().await)
@@ -186,6 +192,10 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
         "/admin/v1/auth",
         "Ingress auth chain + upstream-credential mode",
+    ),
+    (
+        "/admin/v1/admin-auth",
+        "Admin-plane auth config (the admin surface guard)",
     ),
     (
         "/admin/v1/usage",

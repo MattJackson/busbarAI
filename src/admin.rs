@@ -882,6 +882,39 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/admin-auth` reports the admin-plane guard: with governance + an admin token it
+    /// is `configured: true` with the `admin-token` module. Never a secret.
+    #[tokio::test]
+    async fn test_admin_v1_admin_auth_read() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/admin-auth"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["configured"], true);
+        assert!(body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "admin-token"));
+
+        handle.abort();
+    }
+
     /// `GET /admin/v1/keys/{id}` returns one key's metadata (never the secret/hash); 404 for an
     /// unknown id. Fills the single-key read gap on the legacy key surface.
     #[tokio::test]

@@ -14,10 +14,10 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView, HookHealthView,
-    HookTransportView, HookView, InfoView, KeyUsageView, ModelView, Page, PluginView,
-    PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
-    UsageTotals, UsageView,
+    AdminAuthView, AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView,
+    HookHealthView, HookTransportView, HookView, InfoView, KeyUsageView, ModelView, Page,
+    PluginView, PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView,
+    TopologyInfo, UsageTotals, UsageView,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
@@ -357,6 +357,28 @@ impl AdminService {
                 Err(errors) => Ok(ConfigValidateView { ok: false, errors }),
             },
         }
+    }
+
+    /// `GET /admin/v1/admin-auth` — the ADMIN-plane auth config (distinct from the ingress chain).
+    /// Read scope. Today reports the built-in admin-token gate; when the pluggable `admin_auth` chain
+    /// lands it reports that chain. Never a secret.
+    pub(crate) async fn get_admin_auth(&self) -> Result<AdminAuthView, AdminError> {
+        // The admin plane is guarded by the governance admin token today.
+        let configured = self
+            .app
+            .governance
+            .as_ref()
+            .map(|g| g.admin_token_hash().is_some())
+            .unwrap_or(false);
+        let modules = if configured {
+            vec!["admin-token"]
+        } else {
+            Vec::new()
+        };
+        Ok(AdminAuthView {
+            configured,
+            modules,
+        })
     }
 
     /// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests totals + per-key

@@ -363,6 +363,19 @@ pub(crate) struct KeyUsageView {
     pub(crate) requests: u64,
 }
 
+/// The admin-plane auth read (`GET /admin/v1/admin-auth`) — which modules guard the ADMIN surface
+/// (distinct from the ingress `auth` chain). Today the admin plane is guarded by the built-in
+/// admin-token gate; `configured` is whether a token is set and `modules` names the active guard(s).
+/// When the pluggable `admin_auth` chain lands, `modules` reports that chain. Never a secret.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AdminAuthView {
+    /// Whether an admin credential is configured (an unconfigured admin plane is a boot error, so in
+    /// practice this is `true` on a running server with governance).
+    pub(crate) configured: bool,
+    /// The active admin-plane guard module names (today `["admin-token"]` when configured).
+    pub(crate) modules: Vec<&'static str>,
+}
+
 /// The result of `POST /admin/v1/config/validate` — a DRY-RUN: does a proposed config resolve +
 /// validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
 /// failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid
