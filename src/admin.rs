@@ -498,18 +498,29 @@ pub(crate) async fn update_key(
     }
 }
 
-/// GET /admin/keys — list key metadata (no secrets/hashes).
-pub(crate) async fn list_keys(crate::state::CurrentApp(app): crate::state::CurrentApp) -> Response {
+/// GET /admin/keys — list key metadata (no secrets/hashes). Optional filters (design-admin-api-v1
+/// §2.1): `?enabled=true|false` (by enabled state), `?prefix=vk_ab` (by key-id prefix).
+pub(crate) async fn list_keys(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
     let gov = gov.clone();
+    let enabled = q.get("enabled").and_then(|s| s.parse::<bool>().ok());
+    let prefix = q.get("prefix").cloned();
     let res = tokio::task::spawn_blocking(move || gov.all_keys()).await;
     match res {
-        Ok(Ok(keys)) => json_response(
-            StatusCode::OK,
-            json!({ "keys": keys.iter().map(key_meta).collect::<Vec<_>>() }),
-        ),
+        Ok(Ok(keys)) => {
+            let filtered: Vec<_> = keys
+                .iter()
+                .filter(|k| enabled.is_none_or(|e| k.enabled == e))
+                .filter(|k| prefix.as_deref().is_none_or(|p| k.id.starts_with(p)))
+                .map(key_meta)
+                .collect();
+            json_response(StatusCode::OK, json!({ "keys": filtered }))
+        }
         Ok(Err(e)) => internal_error("list_keys", &e),
         Err(e) => join_error("list_keys", &e),
     }
@@ -1274,6 +1285,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none["entries"].as_array().unwrap().len(), 0);
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/keys` supports `?prefix=` and `?enabled=` filters (§2.1): a full-id prefix
+    /// returns just that key; a non-matching prefix returns none; `?enabled=true` includes a fresh key.
+    #[tokio::test]
+    async fn test_admin_v1_list_keys_filters() {
+        use crate::governance::NewKeySpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (minted, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "filter-probe".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let get = |query: String| {
+            let url = format!("http://{addr}/admin/v1/keys{query}");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Prefix = the full id → exactly this key.
+        let by_prefix = get(format!("?prefix={}", minted.id)).await;
+        let keys = by_prefix["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["id"], minted.id);
+
+        // Non-matching prefix → none.
+        let none = get("?prefix=vk_does_not_exist".into()).await;
+        assert_eq!(none["keys"].as_array().unwrap().len(), 0);
+
+        // enabled=true includes the fresh (enabled) key.
+        let enabled = get("?enabled=true".into()).await;
+        assert!(enabled["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["id"] == minted.id));
 
         handle.abort();
     }
