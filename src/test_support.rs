@@ -758,6 +758,7 @@ impl TestApp {
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
             versions: std::sync::Arc::new(crate::admin::versions::VersionLog::new()),
+            base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
             group_map: std::collections::HashMap::new(),
             overlay_path: self.overlay_path,

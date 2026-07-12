@@ -190,6 +190,10 @@ pub(crate) struct App {
     /// true`). Carried for the hooks read surface so a definition can report whether it is globally
     /// wired. Read-only after construction.
     pub(crate) global_hooks: Vec<String>,
+    /// Hook names defined in the BASE config file (pre-overlay). `PUT /admin/v1/hooks/{name}` on a
+    /// base hook is a 409 (edit the file, don't shadow it); API-registered (overlay) hooks replace
+    /// freely. Immutable after boot.
+    pub(crate) base_hook_names: std::collections::HashSet<String>,
     /// Config VERSION HISTORY — every successful config-plane mutation records its snapshot here.
     /// Arc-shared across apply snapshots (survives every swap); bounded ring (see
     /// `admin::versions`).

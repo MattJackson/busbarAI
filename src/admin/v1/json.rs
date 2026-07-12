@@ -46,7 +46,10 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/models", get(list_models))
             .route("/admin/v1/providers", get(list_providers))
             .route("/admin/v1/hooks", get(list_hooks).post(register_hook))
-            .route("/admin/v1/hooks/{name}", get(get_hook).delete(delete_hook))
+            .route(
+                "/admin/v1/hooks/{name}",
+                get(get_hook).put(put_hook).delete(delete_hook),
+            )
             .route("/admin/v1/hooks/{name}/health", get(hook_health))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
@@ -181,6 +184,19 @@ async fn get_config(State(handle): State<Arc<AppHandle>>) -> Response {
 struct RegisterHookReq {
     name: String,
     config: crate::config::HookCfg,
+    /// Optimistic-concurrency guard: reject with `conflict` when the CURRENT config version
+    /// differs (a concurrent mutation landed between your read and this write). Optional in the
+    /// transition; the release contract makes it mandatory.
+    #[serde(default)]
+    expected_version: Option<u64>,
+}
+
+/// The `PUT /admin/v1/hooks/{name}` body: the replacement definition (the name rides the path).
+#[derive(serde::Deserialize)]
+struct PutHookReq {
+    config: crate::config::HookCfg,
+    #[serde(default)]
+    expected_version: Option<u64>,
 }
 
 /// `POST /admin/v1/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
@@ -200,6 +216,15 @@ async fn register_hook(
     };
     let current = handle.load();
     let resource = format!("hook:{}", req.name);
+    if let Some(expected) = req.expected_version {
+        if expected != current.config_version {
+            audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
+            return err_json(&AdminError::Conflict(format!(
+                "expected_version {expected} is stale (current is {})",
+                current.config_version
+            )));
+        }
+    }
     match build_with_hook(&current, &req.name, req.config) {
         Ok(next) => {
             handle.swap(Arc::new(next));
@@ -229,6 +254,71 @@ async fn register_hook(
         }
         Err(e) => {
             audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
+/// `PUT /admin/v1/hooks/{name}` — REPLACE an existing hook definition at runtime (live, atomic
+/// swap). `404 not_found` for an unregistered name (PUT replaces; POST creates). `409 conflict`
+/// for a BASE-defined hook (operator file config is edited in the file, never silently shadowed
+/// via the API) and for a grant change (`kind`/`prompt`/`user` are immutable — §6.4, enforced in
+/// `build_with_hook`). Audited + versioned + overlay-persisted like every mutation.
+async fn put_hook(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let req: PutHookReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
+    };
+    let current = handle.load();
+    let resource = format!("hook:{name}");
+    if !current.hook_registry.contains_key(&name) {
+        return err_json(&AdminError::NotFound(format!("hook `{name}`")));
+    }
+    if current.base_hook_names.contains(&name) {
+        audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "hook `{name}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)"
+        )));
+    }
+    if let Some(expected) = req.expected_version {
+        if expected != current.config_version {
+            audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+            return err_json(&AdminError::Conflict(format!(
+                "expected_version {expected} is stale (current is {})",
+                current.config_version
+            )));
+        }
+    }
+    match build_with_hook(&current, &name, req.config) {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                &format!("hook.replace {resource}"),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
+            crate::config::overlay::persist(
+                cur.overlay_path.as_deref(),
+                &cur.hook_registry,
+                &cur.global_hooks,
+                None,
+                Some(&name),
+            );
+            respond(StatusCode::OK, service(&handle).get_hook(&name).await)
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
             err_json(&e)
         }
     }
@@ -579,6 +669,20 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "OK"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            },
+            "put": {
+                "summary": "Replace an overlay hook definition — live immediately (grants immutable)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "The replaced hook"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"},
+                    "409": {"description": "Base-defined hook, grant change, or stale expected_version (error code `conflict`)"},
+                    "400": {"description": "Invalid definition (error code `invalid_request`)"}
                 }
             },
             "delete": {

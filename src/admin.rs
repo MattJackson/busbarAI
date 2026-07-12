@@ -1094,6 +1094,98 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// `PUT /admin/v1/hooks/{name}`: replaces an overlay hook live; 404 for an unknown name;
+    /// 409 for a grant change (immutability) and for a stale expected_version.
+    #[tokio::test]
+    async fn test_admin_v1_put_hook_replaces_live_with_guards() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // PUT on an unknown name is 404 (PUT replaces; POST creates).
+        let missing = admin(client.put(format!("http://{addr}/admin/v1/hooks/nope")))
+            .body(
+                serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:1/"}})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+
+        // Create, then replace with a new transport target (same grants) — 200, live.
+        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+            .body(
+                serde_json::json!({
+                    "name": "rep",
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9971/"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let replaced = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .body(
+                serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9972/"}})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replaced.status().as_u16(), 200);
+        let got: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/hooks/rep")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            got["transport"].to_string().contains("9972"),
+            "the replacement is live: {got}"
+        );
+
+        // Grant change via PUT is a 409 (immutability holds on the replace path too).
+        let escalate = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .body(serde_json::json!({"config": {"kind": "gate", "webhook": "http://127.0.0.1:9972/", "prompt": "rw"}}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(escalate.status().as_u16(), 409, "grants are immutable");
+
+        // Stale expected_version is a 409 conflict.
+        let stale = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .body(
+                serde_json::json!({
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9973/"},
+                    "expected_version": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            stale.status().as_u16(),
+            409,
+            "stale expected_version conflicts"
+        );
+
+        handle.abort();
+    }
+
     /// The config version-history cycle: mutations record attributed versions; diff explains a
     /// change; rollback restores a prior hook surface LIVE as a NEW version; unknown targets 404
     /// and a stale expected_version conflicts.

@@ -306,6 +306,11 @@ async fn main() {
         .ok()
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
+    // The BASE-defined hook names, captured BEFORE the overlay merges in API-registered hooks:
+    // the admin API refuses to PUT-replace a base hook (409 — operator file config is edited in
+    // the file, not silently shadowed via the API; deletion works live but base re-appears on
+    // restart, the documented overlay edge).
+    let base_hook_names: std::collections::HashSet<String> = deploy.hooks.keys().cloned().collect();
     if let Some(ref p) = overlay_path {
         if let Some(doc) = config::overlay::read(p) {
             tracing::info!(
@@ -749,6 +754,7 @@ async fn main() {
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
         versions: Arc::new(admin::versions::VersionLog::new()),
+        base_hook_names,
         admin_chain: cfg.admin_auth.clone(),
         group_map: cfg.group_map.clone(),
         overlay_path,

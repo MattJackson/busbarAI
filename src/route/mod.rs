@@ -1257,6 +1257,7 @@ mod tests {
             hook_registry: std::collections::HashMap::new(),
             global_hooks: Vec::new(),
             versions: Arc::new(crate::admin::versions::VersionLog::new()),
+            base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
             group_map: std::collections::HashMap::new(),
             overlay_path: None,
