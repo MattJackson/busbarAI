@@ -83,6 +83,7 @@ Module names and modes only — never a token.
 |---|---|
 | `GET /admin/v1/usage` | Fleet usage aggregation: spend/tokens/requests totals plus a per-key breakdown |
 | `GET /admin/v1/config` | The effective running config as one snapshot (auth, pools, models, providers, hooks, global hooks) — for drift detection. Composed from the redacted reads above, so it carries no secret |
+| `GET /admin/v1/audit` | The admin audit log — every config mutation with its outcome (`applied`/`rejected`), newest first: who changed what, when. No secrets |
 | `POST /admin/v1/config/validate` | **Dry-run** a proposed config (`config.yaml` deploy block + `providers.yaml` defs) through the same resolve + validate Busbar runs at boot, without applying anything. Returns `{ "ok": true }` or `{ "ok": false, "errors": [...] }`. A malformed request body is `invalid_request`; a valid request describing an invalid config is `200` with `ok: false` |
 
 `config/validate` lets CI or your tooling preview a config change safely before rollout.
