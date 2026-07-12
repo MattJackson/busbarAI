@@ -119,6 +119,19 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
             "`prompt: rw` is invalid on a `kind: tap` hook (a tap cannot rewrite)".into(),
         ));
     }
+    // GRANT IMMUTABILITY (§6.4): `kind`/`prompt`/`user` are definition-only and FROZEN after first
+    // registration. Re-registering a name with different grants is a `conflict` — delete and
+    // re-register to change them. This closes the "register `prompt: no`, wire it in, then escalate to
+    // `rw`" exfiltration path: a grant can never widen in place. Re-registering with the SAME grants is
+    // allowed (an idempotent re-register / settings refresh).
+    if let Some(existing) = current.hook_registry.get(name) {
+        if existing.kind != cfg.kind || existing.prompt != cfg.prompt || existing.user != cfg.user {
+            return Err(AdminError::Conflict(format!(
+                "hook `{name}` already exists with different kind/prompt/user grants; grants are \
+                 immutable — delete and re-register to change them"
+            )));
+        }
+    }
 
     // ── build the next snapshot (clone shares live state; only config-derived fields change) ──
     let mut next = current.clone();
@@ -648,5 +661,32 @@ mod tests {
             build_with_hook(&app, "  ", empty_name),
             Err(AdminError::Validation(_))
         ));
+    }
+
+    /// GRANT IMMUTABILITY (§6.4): re-registering an existing hook with DIFFERENT kind/prompt/user is a
+    /// `conflict`; re-registering with the SAME grants is allowed (idempotent). Closes the escalation
+    /// path (register `prompt: no`, then widen to `rw`).
+    #[test]
+    fn build_with_hook_enforces_grant_immutability() {
+        let app = TestApp::new().build();
+        // First registration: a gate with prompt: no.
+        let after_first = build_with_hook(&app, "g", hook(HookKind::Gate, false)).unwrap();
+
+        // Re-register the SAME name with a WIDENED grant (prompt: rw) → conflict.
+        let mut escalated = hook(HookKind::Gate, false);
+        escalated.prompt = PromptAccess::Rw;
+        assert!(
+            matches!(
+                build_with_hook(&after_first, "g", escalated),
+                Err(AdminError::Conflict(_))
+            ),
+            "widening a grant in place must be a conflict"
+        );
+
+        // Re-register with the SAME grants → allowed (idempotent).
+        assert!(
+            build_with_hook(&after_first, "g", hook(HookKind::Gate, false)).is_ok(),
+            "re-registering with identical grants is allowed"
+        );
     }
 }
