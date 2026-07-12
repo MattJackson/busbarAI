@@ -1244,6 +1244,37 @@ mod tests {
         assert_eq!(mine["outcome"], "applied");
         assert!(mine["seq"].is_number() && mine["ts"].is_number());
 
+        // Filter by resource (§2.5): only this hook's entries come back.
+        let filtered: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/audit?resource=hook:{name}"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let f = filtered["entries"].as_array().unwrap();
+        assert!(!f.is_empty());
+        assert!(
+            f.iter().all(|e| e["resource"] == format!("hook:{name}")),
+            "the resource filter returns only matching entries"
+        );
+
+        // Filter by a non-matching action → empty.
+        let none: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/admin/v1/audit?resource=hook:{name}&action=key.create"
+            ))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(none["entries"].as_array().unwrap().len(), 0);
+
         handle.abort();
     }
 

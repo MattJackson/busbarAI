@@ -115,10 +115,28 @@ impl AuditLog {
         true
     }
 
-    /// The most-recent `limit` entries, newest first.
-    pub(crate) fn list(&self, limit: usize) -> Vec<AuditEntry> {
+    /// The most-recent `limit` entries, newest first, optionally filtered by exact `action` and/or
+    /// `resource` (design-admin-api-v1 §2.5). `None` filters match everything.
+    pub(crate) fn list_filtered(
+        &self,
+        limit: usize,
+        action: Option<&str>,
+        resource: Option<&str>,
+    ) -> Vec<AuditEntry> {
         let q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        q.iter().rev().take(limit).cloned().collect()
+        q.iter()
+            .rev()
+            .filter(|e| action.is_none_or(|a| e.action == a))
+            .filter(|e| resource.is_none_or(|r| e.resource == r))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// The most-recent `limit` entries, newest first (unfiltered).
+    #[cfg(test)]
+    pub(crate) fn list(&self, limit: usize) -> Vec<AuditEntry> {
+        self.list_filtered(limit, None, None)
     }
 }
 

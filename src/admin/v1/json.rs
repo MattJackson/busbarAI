@@ -228,8 +228,16 @@ async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
 }
 
 /// `GET /admin/v1/audit` — the admin audit log (most-recent-first), every mutation with its outcome.
-async fn get_audit() -> Response {
-    let entries = audit::AUDIT.list(200);
+/// Optional filters: `?action=hook.register`, `?resource=hook:x`, `?limit=N` (capped at 1000).
+async fn get_audit(Query(q): Query<std::collections::HashMap<String, String>>) -> Response {
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(200)
+        .min(1000);
+    let action = q.get("action").map(String::as_str);
+    let resource = q.get("resource").map(String::as_str);
+    let entries = audit::AUDIT.list_filtered(limit, action, resource);
     ok_json(StatusCode::OK, &json!({ "entries": entries }))
 }
 
