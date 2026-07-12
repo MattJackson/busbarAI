@@ -3630,7 +3630,7 @@ mod tests {
                     .provider("zai"),
             )
             .pool("foo", &[(0, 1)])
-            .auth_mode(crate::auth::AuthMode::Passthrough)
+            .upstream_creds(crate::auth::UpstreamCreds::Passthrough)
             .build();
         let (addr, handle) = serve(app).await;
 

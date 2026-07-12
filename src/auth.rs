@@ -42,81 +42,18 @@ const ADMIN_PATH_PREFIX: &str = "/admin/";
 /// `crate::auth::DUMMY_SECRET` rather than maintaining a separate copy.
 pub(crate) const DUMMY_SECRET: &str = "AWS4-DUMMY-SECRET-FOR-CONSTANT-TIME-REJECT-PATH";
 
-/// Runtime authentication mode — exhaustive enum over the three supported behaviors.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum AuthMode {
-    /// Require a client token matching the allowlist in Authorization: Bearer <token>.
-    Token,
-    /// Forward caller's key to upstream (passthrough); 401/403 attributed to caller.
-    Passthrough,
-    /// Open relay; no auth required.
-    None,
-}
-
-impl AuthMode {
-    /// The wire/config spellings of each mode — the single source of truth for the `auth.mode`
-    /// strings (used by parsing, validation, and the config default), so no comparison site
-    /// hardcodes them.
-    pub(crate) const TOKEN: &'static str = "token";
-    pub(crate) const PASSTHROUGH: &'static str = "passthrough";
-    pub(crate) const NONE: &'static str = "none";
-
-    /// Parse the config `auth.mode` value (case-insensitive, trimmed). `None` if unrecognized.
-    pub(crate) fn from_config_str(s: &str) -> Option<AuthMode> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            Self::TOKEN => Some(AuthMode::Token),
-            Self::PASSTHROUGH => Some(AuthMode::Passthrough),
-            Self::NONE => Some(AuthMode::None),
-            _ => None,
-        }
-    }
-}
-
-// Deserialize `auth.mode` through `from_config_str` so the accepted wire strings are UNCHANGED from
-// the pre-enum (String) field: case-insensitive and whitespace-trimmed (`"  PassThrough "`, `"NONE"`
-// all parse), with a friendly error naming the valid values for an unknown spelling. A derived
-// `#[serde(rename_all = "snake_case")]` impl would be a strict, case-sensitive subset and would
-// reject configs that loaded before 1.0, so the mapping is done by hand here.
-impl<'de> serde::Deserialize<'de> for AuthMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        AuthMode::from_config_str(&s).ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "auth.mode '{}' is invalid: must be '{}', '{}', or '{}'",
-                s,
-                AuthMode::TOKEN,
-                AuthMode::PASSTHROUGH,
-                AuthMode::NONE
-            ))
-        })
-    }
-}
-
-/// The UPSTREAM-credential mode — whose credential reaches the provider. This is DISTINCT from
-/// authentication (which auth plugin, if any, ran at the front door): `Own` signs the upstream call
-/// with busbar's configured lane key; `Passthrough` forwards the CALLER's credential upstream. A
-/// proto writer uses THIS (not the front-door auth mode) to resolve an otherwise-ambiguous credential
-/// scheme to the single native header the caller's real client produces. Splitting this out of
-/// `AuthMode` is step one of dissolving `AuthMode` into a pure `auth:` plugin chain (slice 2d).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The UPSTREAM-credential mode (`upstream_credentials:`) — whose credential reaches the provider.
+/// DISTINCT from authentication (which auth module, if any, ran at the front door — that's the
+/// `auth.chain`): `Own` (default) signs the upstream call with busbar's configured lane key;
+/// `Passthrough` forwards the CALLER's credential upstream. A proto writer uses THIS to resolve an
+/// otherwise-ambiguous credential scheme to the single native header the caller's real client
+/// produces. (Split out of the old `AuthMode`, now its own config key — `AuthMode` is gone.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum UpstreamCreds {
+    #[default]
     Own,
     Passthrough,
-}
-
-impl AuthMode {
-    /// The upstream-credential mode implied by this front-door auth mode — the TRANSITIONAL bridge
-    /// while `AuthMode` is being dissolved (2d-2 makes `upstream_credentials` its own config key).
-    /// `Passthrough` forwards the caller's credential; `Token`/`None` use busbar's configured key.
-    pub(crate) fn upstream_creds(self) -> UpstreamCreds {
-        match self {
-            AuthMode::Passthrough => UpstreamCreds::Passthrough,
-            AuthMode::Token | AuthMode::None => UpstreamCreds::Own,
-        }
-    }
 }
 
 /// The caller's bearer token, threaded into request extensions by `auth_middleware` so handlers can
@@ -173,17 +110,17 @@ pub(crate) trait AuthModule: Send + Sync {
 // contract above. `grep token` in the engine is clean; the plugin is default-included and removable.
 use crate::plugins::auth::tokens::TokensModule;
 
-/// AuthMiddleware holds the resolved auth mode and token allowlist.
+/// AuthMiddleware holds the resolved auth chain, the upstream-credential mode, and the token allowlist.
 pub(crate) struct AuthMiddleware {
-    pub(crate) mode: AuthMode,
+    /// The upstream-credential mode (`upstream_credentials:`) — whether the egress path signs with
+    /// busbar's key (`Own`) or forwards the caller's (`Passthrough`). Read by the egress signing path.
+    pub(crate) upstream_creds: UpstreamCreds,
     pub(crate) client_tokens: Vec<String>,
-    /// The AUTH CHAIN — an ordered list of auth modules. `validate_token` runs it: the first module
+    /// The AUTH CHAIN — the ordered `auth.chain` modules. `validate_token` runs it: the first module
     /// to `Identify` admits, a `Reject` denies, and if every module `Pass`es (no usable credential
-    /// matched) a NON-EMPTY chain denies (fail-closed). An EMPTY chain admits unconditionally — that
-    /// is the `none`/`passthrough` open-front-door shape. Today the chain is `[tokens]` for
-    /// `mode: token` and `[]` otherwise (built from `AuthMode` in `new`), so behavior is byte-identical
-    /// while the token-specific branch is gone from `validate_token`. Slice-3-config turns this into
-    /// the configured `auth: [...]` chain and deletes `AuthMode`.
+    /// matched) a NON-EMPTY chain denies (fail-closed). An EMPTY chain admits unconditionally — the
+    /// open front door (`chain: []`, the old none/passthrough). No `AuthMode` — the front-door policy
+    /// is the chain shape, the egress policy is `upstream_creds`.
     chain: Vec<Box<dyn AuthModule>>,
 }
 
@@ -194,7 +131,8 @@ pub(crate) struct AuthMiddleware {
 impl fmt::Debug for AuthMiddleware {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthMiddleware")
-            .field("mode", &self.mode)
+            .field("upstream_creds", &self.upstream_creds)
+            .field("chain_len", &self.chain.len())
             .field(
                 "client_tokens",
                 &format_args!("<redacted; {} configured>", self.client_tokens.len()),
@@ -205,10 +143,6 @@ impl fmt::Debug for AuthMiddleware {
 
 impl AuthMiddleware {
     pub(crate) fn new(cfg: &AuthCfg) -> Self {
-        // `cfg.mode` is already a parsed `AuthMode` (the config field deserializes through
-        // `from_config_str`, so an invalid spelling fails at load, not here).
-        let mode = cfg.mode;
-
         // client_tokens are already env-interpolated: `interpolate_env` runs over the WHOLE
         // config.yaml text once at load (main.rs), before deserialization. A second per-token pass
         // here would double-interpolate — a token that legitimately contains the literal `${...}`
@@ -216,41 +150,57 @@ impl AuthMiddleware {
         // exactly once; just clone the resolved values.
         let tokens: Vec<String> = cfg.client_tokens.clone();
 
-        if mode == AuthMode::None {
+        // Build the auth chain by RESOLVING the configured module names. `tokens` -> the built-in
+        // tokens module (owns the pre-hashed allowlist). An unknown name is skipped here with a loud
+        // log; config_validate rejects it at boot, so a running server never has a silently-dropped
+        // module. An EMPTY chain is the open front door (the old none/passthrough).
+        let chain: Vec<Box<dyn AuthModule>> = cfg
+            .chain
+            .iter()
+            .filter_map(|name| -> Option<Box<dyn AuthModule>> {
+                match name.as_str() {
+                    "tokens" => Some(Box::new(TokensModule::new(&tokens))),
+                    other => {
+                        tracing::error!(
+                            module = other,
+                            "auth.chain names an unknown module; skipping (config_validate rejects \
+                             this at boot)"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        if chain.is_empty() {
             if tokens.is_empty() {
                 tracing::warn!(
-                    "auth.mode=none (open relay) — only acceptable for dev; reject in production"
+                    "auth.chain is empty (open relay) — only acceptable for dev; reject in production"
                 );
             } else {
-                // `validate_token` admits unconditionally in None mode (see below), so a configured
-                // `client_tokens` allowlist has ZERO enforcement effect here. An operator who set
-                // BOTH `mode: none` and a `client_tokens` list in the belief the list constrains
-                // access is running an unrestricted open relay while their config reads as secured.
-                // Warn loudly that the listed tokens are inert (mirrored at boot in
-                // `config_validate::validate`, which can see the config before this runs).
+                // An empty chain admits every request, so a configured `client_tokens` allowlist has
+                // ZERO enforcement effect. Warn loudly that the listed tokens are inert (mirrored at
+                // boot in `config_validate::validate`).
                 tracing::warn!(
-                    "auth.mode=none ignores the configured client_tokens ({} listed): None mode is \
-                     an open relay and admits every request regardless of token. The allowlist has \
-                     no effect — set auth.mode=token to enforce it.",
+                    "auth.chain is empty but client_tokens ({} listed) are configured: an empty \
+                     chain is an open relay and admits every request regardless of token. The \
+                     allowlist has no effect — add `tokens` to auth.chain to enforce it.",
                     tokens.len()
                 );
             }
         }
 
-        // Build the auth chain from the mode (the transitional bridge until the config becomes a
-        // real `auth: [...]` list): `token` -> [tokens module]; `none`/`passthrough` -> [] (empty
-        // chain = open front door, admit unconditionally). Byte-identical to the pre-chain behavior.
-        let chain: Vec<Box<dyn AuthModule>> = if mode == AuthMode::Token {
-            vec![Box::new(TokensModule::new(&tokens))]
-        } else {
-            Vec::new()
-        };
-
         Self {
-            mode,
+            upstream_creds: cfg.upstream_credentials,
             client_tokens: tokens,
             chain,
         }
+    }
+
+    /// Whether the front door is OPEN — an empty auth chain admits every request unconditionally
+    /// (the old `none`/`passthrough`). Governance, when enabled, supersedes this.
+    pub(crate) fn is_open(&self) -> bool {
+        self.chain.is_empty()
     }
 
     /// Run the auth chain over the presented candidate credential. Empty chain -> admit (the
@@ -603,9 +553,9 @@ pub(crate) async fn auth_middleware(
 
     // when governance is enabled, the caller's token MUST resolve to an enabled virtual key; the
     // resolved key is attached for downstream allowed-pools enforcement. This supersedes the static
-    // AuthMode token check. The token may arrive via any supported carrier (Bearer / x-api-key /
+    // Auth-chain token check. The token may arrive via any supported carrier (Bearer / x-api-key /
     // x-goog-api-key) — `client_token` already encodes that precedence. When governance is
-    // disabled, the existing AuthMode (None/Token/Passthrough) applies unchanged.
+    // disabled, the configured auth chain (empty = open, [tokens] = validated) applies unchanged.
     if let Some(gov) = &app.governance {
         // governance enabled + `auth.mode: passthrough` is a self-contradictory deployment: the
         // governance branch below requires every request to present a valid enabled busbar virtual
@@ -614,15 +564,15 @@ pub(crate) async fn auth_middleware(
         // that lacks a virtual key. There is no place in `validate(&RootCfg)` to catch this —
         // governance is read separately from the resolved config — so warn once here, at the first
         // request that exercises the combination, rather than letting it pass unremarked.
-        if app.auth_mode() == AuthMode::Passthrough {
+        if app.upstream_creds() == UpstreamCreds::Passthrough {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
-                    "auth.mode=passthrough with governance enabled: governance supersedes \
-                     passthrough — every request must present a valid enabled virtual key, and \
-                     passthrough's accept-and-forward-caller-credential semantics are NOT honoured. \
-                     This combination is unsupported; configure auth.mode=token (or omit auth) \
-                     alongside governance."
+                    "upstream_credentials: passthrough with governance enabled: governance \
+                     supersedes passthrough — every request must present a valid enabled virtual \
+                     key, and passthrough's accept-and-forward-caller-credential semantics are NOT \
+                     honoured. This combination is unsupported; use upstream_credentials: own (or \
+                     omit it) alongside governance."
                 );
             });
         }
@@ -633,13 +583,13 @@ pub(crate) async fn auth_middleware(
         // is a supported combination — governance simply wins), so there is no boot-time error;
         // mirror the passthrough advisory with a parallel one-shot warning at the first request that
         // exercises it, rather than leaving the override undiagnosed.
-        if app.auth_mode() == AuthMode::None {
+        if app.auth.is_open() && app.upstream_creds() == UpstreamCreds::Own {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
-                    "auth.mode=none with governance enabled: governance supersedes the open-relay \
-                     mode — every request must present a valid enabled virtual key; none mode's \
-                     accept-every-request semantics are NOT honoured."
+                    "auth.chain is empty (open relay) with governance enabled: governance supersedes \
+                     the open-relay mode — every request must present a valid enabled virtual key; \
+                     the open front door's accept-every-request semantics are NOT honoured."
                 );
             });
         }
@@ -653,11 +603,11 @@ pub(crate) async fn auth_middleware(
         // simply wins), so there is no boot-time error; mirror the passthrough/none advisories with a
         // parallel one-shot warning at the first request that exercises it, rather than leaving the
         // inert allowlist undiagnosed.
-        if app.auth_mode() == AuthMode::Token && !app.auth.client_tokens.is_empty() {
+        if !app.auth.is_open() && !app.auth.client_tokens.is_empty() {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 tracing::warn!(
-                    "auth.mode=token with governance enabled: governance supersedes the static \
+                    "auth.chain with governance enabled: governance supersedes the static \
                      client_tokens allowlist — every request is resolved against the virtual-key \
                      store and the configured client_tokens entries have NO enforcement effect. \
                      Remove them, or disable governance, to avoid a misleading config."
@@ -1036,20 +986,10 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_mode_from_config_str() {
-        assert_eq!(AuthMode::from_config_str("token"), Some(AuthMode::Token));
-        assert_eq!(
-            AuthMode::from_config_str("  PassThrough "),
-            Some(AuthMode::Passthrough)
-        );
-        assert_eq!(AuthMode::from_config_str("NONE"), Some(AuthMode::None));
-        assert_eq!(AuthMode::from_config_str("bogus"), None);
-    }
-
-    #[test]
     fn test_auth_mode_token_valid() {
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["tok1".to_string(), "tok2".to_string()],
         };
         let mw = AuthMiddleware::new(&cfg);
@@ -1067,7 +1007,8 @@ mod tests {
         // configured token (bitwise-OR fold, no `.any()` short-circuit). Behaviorally this means a
         // match is found regardless of the token's ordinal position — first, middle, or last.
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![
                 "first-token".to_string(),
                 "middle-token".to_string(),
@@ -1088,7 +1029,8 @@ mod tests {
         // SHA-256-hashed to a fixed 64-hex-char digest before the constant-time compare, so a
         // wrong-length candidate runs the same work as a right-length one AND still fails.
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
         };
         let mw = AuthMiddleware::new(&cfg);
@@ -1127,7 +1069,8 @@ mod tests {
     #[test]
     fn test_auth_mode_passthrough() {
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
         };
         let mw = AuthMiddleware::new(&cfg);
@@ -1140,7 +1083,8 @@ mod tests {
     #[test]
     fn test_auth_mode_none() {
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::None,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![],
         };
         let mw = AuthMiddleware::new(&cfg);
@@ -1158,7 +1102,8 @@ mod tests {
         // request (including a token NOT in the list, and no token at all), proving the allowlist is
         // inert. (A startup warning is emitted but is not asserted here — behaviour is the contract.)
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::None,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["listed-but-ignored".to_string()],
         };
         let mw = AuthMiddleware::new(&cfg);
@@ -1170,22 +1115,19 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_mode_invalid_is_rejected_at_deserialize() {
-        // `auth.mode` is now an `AuthMode` enum that deserializes through `from_config_str`, so an
-        // invalid spelling is rejected at config LOAD (where the boundary moved to) rather than
-        // panicking later in `AuthMiddleware::new`. The accepted spellings are unchanged.
+    fn test_upstream_credentials_deserialize() {
+        // `upstream_credentials` deserializes snake_case; an unknown value is rejected at config LOAD.
         assert!(
-            serde_yaml::from_str::<AuthMode>("invalid").is_err(),
-            "an unrecognized auth mode must fail to deserialize"
-        );
-        // The pre-enum case-insensitive/trimmed acceptance is preserved.
-        assert_eq!(
-            serde_yaml::from_str::<AuthMode>("  PassThrough ").unwrap(),
-            AuthMode::Passthrough
+            serde_yaml::from_str::<crate::auth::UpstreamCreds>("invalid").is_err(),
+            "an unrecognized upstream_credentials value must fail to deserialize"
         );
         assert_eq!(
-            serde_yaml::from_str::<AuthMode>("NONE").unwrap(),
-            AuthMode::None
+            serde_yaml::from_str::<crate::auth::UpstreamCreds>("passthrough").unwrap(),
+            crate::auth::UpstreamCreds::Passthrough
+        );
+        assert_eq!(
+            serde_yaml::from_str::<crate::auth::UpstreamCreds>("own").unwrap(),
+            crate::auth::UpstreamCreds::Own
         );
     }
 
@@ -1197,7 +1139,8 @@ mod tests {
         // on an unset var). Regression for the dropped second interpolation pass.
         let raw = "sk-${NOT_A_REAL_ENV_VAR}-suffix";
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![raw.to_string()],
         };
         // Must not panic even though NOT_A_REAL_ENV_VAR is unset.
@@ -1699,7 +1642,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![token.to_string()],
         };
         let app = TestApp::new()
@@ -1830,7 +1774,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
         };
         let app = TestApp::new()
@@ -1933,7 +1878,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
         };
         let app = TestApp::new()
@@ -2019,7 +1965,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
         };
         let app = TestApp::new()
@@ -2100,7 +2047,8 @@ mod tests {
         let server = MockServer::new(state).await;
 
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
         };
         let app = TestApp::new()
@@ -2328,7 +2276,7 @@ mod tests {
                 .provider("zai"),
             )
             .pool("pa", &[(0, 1)])
-            .auth_mode(AuthMode::None)
+            .upstream_creds(crate::auth::UpstreamCreds::Own)
             .governance(gov)
             .build();
 
@@ -2432,7 +2380,7 @@ mod tests {
                 .provider("zai"),
             )
             .pool("pa", &[(0, 1)])
-            .auth_mode(AuthMode::Passthrough)
+            .upstream_creds(crate::auth::UpstreamCreds::Passthrough)
             .governance(gov)
             .build();
 
@@ -2597,7 +2545,7 @@ mod tests {
                 // auth.mode=token WITH a non-empty static allowlist — the inert combination. The
                 // listed static token is NOT the governance virtual key.
                 let auth_cfg = crate::config::AuthCfg {
-                    mode: AuthMode::Token,
+                    chain: vec!["tokens".to_string()], upstream_credentials: crate::auth::UpstreamCreds::Own,
                     client_tokens: vec!["static-allowlisted-but-inert".to_string()],
                 };
 
@@ -2649,7 +2597,7 @@ mod tests {
         assert!(
             msgs.iter().any(|m| {
                 let lc = m.to_ascii_lowercase();
-                lc.contains("auth.mode=token")
+                lc.contains("auth.chain")
                     && lc.contains("governance")
                     && lc.contains("client_tokens")
             }),
@@ -3134,7 +3082,8 @@ mod tests {
         let secret_a = "sk-super-secret-token-AAAA";
         let secret_b = "sk-super-secret-token-BBBB";
         let cfg = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![secret_a.to_string(), secret_b.to_string()],
         };
         let mw = AuthMiddleware::new(&cfg);
@@ -3148,14 +3097,14 @@ mod tests {
             !dbg.contains("sk-super-secret"),
             "AuthMiddleware Debug leaked a token prefix: {dbg}"
         );
-        // The count (and the mode) are non-secret and SHOULD be reported.
+        // The count (and the chain length / upstream mode) are non-secret and SHOULD be reported.
         assert!(
             dbg.contains('2'),
             "AuthMiddleware Debug should report the token count: {dbg}"
         );
         assert!(
-            dbg.contains("Token"),
-            "AuthMiddleware Debug should report the mode: {dbg}"
+            dbg.contains("chain_len") && dbg.contains("Own"),
+            "AuthMiddleware Debug should report the chain length + upstream mode: {dbg}"
         );
     }
 

@@ -733,71 +733,64 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule 5: Validate auth-block semantics. `auth.mode` is now a parsed `AuthMode` enum (an invalid
-    // spelling fails at deserialize, so there is no longer an unknown-mode arm here). The legacy
-    // single-token `token:` field was removed in 1.0.0; `AuthCfg` is now `deny_unknown_fields`, so a
-    // stale `token:` key fails AT PARSE with serde's "unknown field `token`" — no validate-time check
-    // needed (and no silent credential drop).
+    // Rule 5: Validate auth-block semantics. `auth.chain` is a list of module names + `upstream_
+    // credentials` a snake_case enum, both validated below. `AuthCfg` is `deny_unknown_fields`, so a
+    // stale `mode:`/`token:` key fails AT PARSE with serde's "unknown field" — a loud clean-break
+    // boot error, no validate-time check needed (and no silent credential drop).
     if let Some(auth) = &cfg.auth {
-        match auth.mode {
-            crate::auth::AuthMode::Token => {
-                // Token mode with no client tokens rejects 100% of requests with no startup signal —
-                // the locked-out mirror of the loudly-warned open-relay (mode: none) case.
-                if effective_client_tokens_empty(auth) {
-                    errors.push(
-                        "auth.mode is 'token' but no client_tokens are configured; token mode requires at least one client token (otherwise every request is rejected)".to_string(),
-                    );
-                }
+        // Every module name in the chain must resolve to a compiled-in auth module (only `tokens`
+        // today). An unknown name is a hard boot error, never a silently-dropped module.
+        for name in &auth.chain {
+            if name != "tokens" {
+                errors.push(format!(
+                    "auth.chain names unknown module '{name}': the only built-in auth module is \
+                     'tokens' (external modules are added at compile time)"
+                ));
             }
-            // Passthrough carries no token-allowlist requirement, but a configured upstream key on a
-            // passthrough provider is a MISCONFIGURATION worth flagging. forward.rs selects the upstream
-            // key as `caller_token.unwrap_or("")`: an UNAUTHENTICATED caller in passthrough mode
-            // forwards an EMPTY credential (the provider returns 401/403 attributed to the caller), NOT
-            // busbar's configured lane key. A passthrough deployment is meant to forward the CALLER's
-            // credential, never a configured one — so a provider whose `api_key_env` resolves to a
-            // NON-EMPTY value is a config smell (a key busbar will never use on this provider).
-            //
-            // We WARN (not hard-reject): a legit Bedrock-ingress passthrough provider authenticates
-            // per-request with SigV4 from the AWS credential chain, so its `api_key_env` normally
-            // resolves EMPTY and never trips this — but an operator may also have a deliberate
-            // static-key fallback provider, and rejecting would break that. Mirror main.rs's
-            // single env read (`std::env::var(api_key_env)`) so the guard sees the SAME value the
-            // lane will, and surface a prominent boot warning naming each offending provider. The
-            // resolved `_legacy_api_key` is always None (config::resolve discards+warns on it), so
-            // `api_key_env` is the only key source to check.
-            crate::auth::AuthMode::Passthrough => {
-                for (provider_name, provider_cfg) in &cfg.providers {
-                    let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
-                    if !resolved_key.trim().is_empty() {
-                        tracing::warn!(
-                            provider = %provider_name,
-                            api_key_env = %provider_cfg.api_key_env,
-                            "auth.mode=passthrough with a NON-EMPTY configured api_key for this \
-                             provider is a credential-leak risk: in passthrough mode an \
-                             UNAUTHENTICATED caller (no token) has busbar's OWN configured lane key \
-                             substituted upstream (caller_token.unwrap_or(lane.api_key)), forwarding \
-                             your secret on the caller's behalf. A passthrough deployment should \
-                             forward the CALLER credential, never a configured one. Unset the \
-                             environment variable named by api_key_env (Bedrock-ingress passthrough \
-                             signs per-request via SigV4 and needs no static key), or switch to \
-                             auth.mode=token to gate callers."
-                        );
-                    }
-                }
-            }
-            crate::auth::AuthMode::None => {
-                // mode=none is an open relay: `validate_token` admits every request unconditionally,
-                // so a configured `client_tokens` allowlist has ZERO enforcement effect. An operator
-                // who set BOTH `mode: none` and a `client_tokens` list believes the list constrains
-                // access while the server is wide open. This is not a hard boot error (none mode is
-                // intentionally permissive and may be deliberate in dev), but it MUST be loud — warn
-                // here at boot (config-visible) in addition to the runtime warning AuthMiddleware::new
-                // emits. NB: this is a no-op when no tokens are listed (the common none-mode case).
-                if !effective_client_tokens_empty(auth) {
+        }
+        let chain_has_tokens = auth.chain.iter().any(|n| n == "tokens");
+
+        // `tokens` in the chain with no client_tokens rejects 100% of requests with no startup signal
+        // — the locked-out mirror of the loudly-warned open-relay (empty chain) case.
+        if chain_has_tokens && effective_client_tokens_empty(auth) {
+            errors.push(
+                "auth.chain includes 'tokens' but no client_tokens are configured; the tokens module requires at least one client token (otherwise every request is rejected)".to_string(),
+            );
+        }
+
+        // An empty chain is an open relay: it admits every request unconditionally, so a configured
+        // `client_tokens` allowlist has ZERO enforcement effect. Not a hard error (an empty chain may
+        // be a deliberate dev open-relay), but it MUST be loud. No-op when no tokens are listed.
+        if auth.chain.is_empty() && !effective_client_tokens_empty(auth) {
+            tracing::warn!(
+                "auth.chain is empty (open relay) but client_tokens are configured: an empty chain \
+                 admits every request regardless of token, so the allowlist has no enforcement \
+                 effect. Add 'tokens' to auth.chain to enforce it."
+            );
+        }
+
+        // `upstream_credentials: passthrough` with a NON-EMPTY configured api_key on a provider is a
+        // credential-leak risk: forward.rs selects the upstream key as `caller_token.unwrap_or("")`,
+        // so an UNAUTHENTICATED caller forwards an EMPTY credential (the provider 401/403s the
+        // caller), NOT busbar's configured lane key — but a non-empty configured key means busbar's
+        // OWN secret gets substituted upstream on the caller's behalf. WARN (not hard-reject): a
+        // legit Bedrock-ingress passthrough provider signs per-request via SigV4 and resolves EMPTY
+        // here, and a deliberate static-key fallback provider is valid too.
+        if auth.upstream_credentials == crate::auth::UpstreamCreds::Passthrough {
+            for (provider_name, provider_cfg) in &cfg.providers {
+                let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
+                if !resolved_key.trim().is_empty() {
                     tracing::warn!(
-                        "auth.mode=none ignores the configured client_tokens: None mode is an open \
-                         relay that admits every request regardless of token, so the allowlist has \
-                         no enforcement effect. Set auth.mode=token to enforce it."
+                        provider = %provider_name,
+                        api_key_env = %provider_cfg.api_key_env,
+                        "upstream_credentials: passthrough with a NON-EMPTY configured api_key for \
+                         this provider is a credential-leak risk: an UNAUTHENTICATED caller has \
+                         busbar's OWN configured lane key substituted upstream \
+                         (caller_token.unwrap_or(lane.api_key)), forwarding your secret on the \
+                         caller's behalf. Passthrough should forward the CALLER credential, never a \
+                         configured one. Unset the environment variable named by api_key_env \
+                         (Bedrock-ingress passthrough signs per-request via SigV4 and needs no static \
+                         key), or use upstream_credentials: own to gate callers with an auth chain."
                     );
                 }
             }
@@ -982,9 +975,11 @@ pub(crate) fn validate_governance(
              price_per_request_cents."
         );
     }
-    if governance.enabled && auth.is_some_and(|a| a.mode == crate::auth::AuthMode::Passthrough) {
+    if governance.enabled
+        && auth.is_some_and(|a| a.upstream_credentials == crate::auth::UpstreamCreds::Passthrough)
+    {
         errors.push(
-            "governance.enabled is true together with auth.mode=passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; set auth.mode=token (or omit the auth block) alongside governance.".to_string(),
+            "governance.enabled is true together with upstream_credentials: passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; use upstream_credentials: own (with an auth chain, or omit the auth block) alongside governance.".to_string(),
         );
     }
     // A 0 sweep interval would disable the rate-map's idle-entry eviction sweep entirely — it rides on
@@ -2058,9 +2053,17 @@ mod tests {
     }
 
     fn make_auth(mode: &str, client_tokens: Vec<&str>) -> config::AuthCfg {
+        // Map the legacy mode string onto the 1.3 chain/upstream shape: token -> chain [tokens];
+        // none -> empty chain; passthrough -> empty chain + upstream passthrough.
+        let (chain, upstream): (Vec<String>, crate::auth::UpstreamCreds) = match mode {
+            "token" => (vec!["tokens".to_string()], crate::auth::UpstreamCreds::Own),
+            "none" => (vec![], crate::auth::UpstreamCreds::Own),
+            "passthrough" => (vec![], crate::auth::UpstreamCreds::Passthrough),
+            other => panic!("invalid auth mode in test: {other}"),
+        };
         config::AuthCfg {
-            mode: crate::auth::AuthMode::from_config_str(mode)
-                .unwrap_or_else(|| panic!("invalid auth mode in test: {mode}")),
+            chain,
+            upstream_credentials: upstream,
             client_tokens: client_tokens.into_iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -2850,21 +2853,28 @@ mod tests {
     }
 
     fn auth_cfg(mode: &str) -> config::AuthCfg {
+        let (chain, upstream): (Vec<String>, crate::auth::UpstreamCreds) = match mode {
+            "token" => (vec!["tokens".to_string()], crate::auth::UpstreamCreds::Own),
+            "none" => (vec![], crate::auth::UpstreamCreds::Own),
+            "passthrough" => (vec![], crate::auth::UpstreamCreds::Passthrough),
+            other => panic!("invalid auth mode in test: {other}"),
+        };
         config::AuthCfg {
-            mode: crate::auth::AuthMode::from_config_str(mode)
-                .unwrap_or_else(|| panic!("invalid auth mode in test: {mode}")),
+            chain,
+            upstream_credentials: upstream,
             client_tokens: vec![],
         }
     }
 
     #[test]
     fn test_validate_governance_rejects_passthrough_combination() {
-        // Regression: governance.enabled + auth.mode=passthrough is a self-contradictory deployment.
+        // Regression: governance.enabled + upstream_credentials: passthrough is self-contradictory.
         // Governance supersedes passthrough (every request must resolve to an enabled virtual key),
         // so an operator who believes they are in passthrough silently rejects every caller lacking
         // a virtual key — a behaviour inversion that must fail loud at boot, not pass to a runtime
-        // warning. Case-insensitive / whitespace-tolerant, matching AuthMode::from_config_str.
-        for mode in ["passthrough", "  PassThrough "] {
+        // warning.
+        {
+            let mode = "passthrough";
             let gov = config::GovernanceCfg {
                 enabled: true,
                 db_path: "busbar-governance.db".to_string(),
@@ -2879,7 +2889,8 @@ mod tests {
                 .expect_err("governance + passthrough must be rejected at boot");
             assert!(
                 errs.iter()
-                    .any(|e| e.contains("auth.mode=passthrough") && e.contains("governance")),
+                    .any(|e| e.contains("upstream_credentials: passthrough")
+                        && e.contains("governance")),
                 "expected a governance+passthrough rejection for mode {mode:?}; got: {errs:?}"
             );
         }
@@ -2935,7 +2946,7 @@ mod tests {
         let errs = validate(&cfg).expect_err("token mode with no tokens must fail validation");
         assert!(
             errs.iter()
-                .any(|e| e.contains("token mode requires at least one client token")),
+                .any(|e| e.contains("the tokens module requires at least one client token")),
             "expected a token-mode lockout error; got: {errs:?}"
         );
     }

@@ -20,13 +20,14 @@
 listen: "0.0.0.0:8080"
 
 # ── Client authentication ────────────────────────────────────────────────────────────────────────
-# mode:
-#   token        — clients must send `Authorization: Bearer <token>` matching an allowlist below.
-#   passthrough  — the client's own key is forwarded to the upstream provider (busbar adds nothing).
-#   none         — open relay (no client auth; dev only).
+# auth.chain — an ordered list of auth modules that identify the caller. `tokens` is the built-in:
+#   clients must send `Authorization: Bearer <token>` matching the allowlist below. An EMPTY chain is
+#   an open relay (no client auth; dev only). upstream_credentials controls whose key hits the
+#   provider: `own` (default — busbar's configured key) or `passthrough` (forward the caller's key).
 # When governance is enabled (bottom of file), virtual keys supersede this for proxied requests.
 auth:
-  mode: token
+  chain: [tokens]
+  upstream_credentials: own
   client_tokens:
     - "${BUSBAR_CLIENT_TOKEN}"        # one or more allowed client tokens (env-expanded)
 

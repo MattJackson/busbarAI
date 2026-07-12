@@ -148,8 +148,16 @@ pub(crate) struct TlsCfg {
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthCfg {
-    #[serde(default = "default_auth_mode")]
-    pub(crate) mode: crate::auth::AuthMode,
+    /// The authentication CHAIN — ordered module names (e.g. `[tokens]`). Empty (the default) is the
+    /// open front door (the old `mode: none`). Replaces `mode:` — a stale `mode:` key is a loud boot
+    /// error (deny_unknown_fields). Each name must resolve to a compiled-in auth module.
+    #[serde(default)]
+    pub(crate) chain: Vec<String>,
+    /// Upstream-credential mode: `own` (default — busbar's configured lane key) or `passthrough`
+    /// (forward the caller's credential upstream; the old `mode: passthrough`).
+    #[serde(default)]
+    pub(crate) upstream_credentials: crate::auth::UpstreamCreds,
+    /// The `tokens` module's allowlist. Inert unless `tokens` is in `chain`.
     #[serde(default)]
     pub(crate) client_tokens: Vec<String>,
 }
@@ -162,7 +170,8 @@ pub(crate) struct AuthCfg {
 impl fmt::Debug for AuthCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthCfg")
-            .field("mode", &self.mode)
+            .field("chain", &self.chain)
+            .field("upstream_credentials", &self.upstream_credentials)
             .field(
                 "client_tokens",
                 &format_args!("<redacted; {} configured>", self.client_tokens.len()),
@@ -172,17 +181,14 @@ impl fmt::Debug for AuthCfg {
 }
 
 impl AuthCfg {
-    /// Create a default AuthCfg for initialization.
+    /// Create a default (open front door) AuthCfg for initialization.
     pub(crate) fn default_none() -> Self {
         Self {
-            mode: crate::auth::AuthMode::None,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![],
         }
     }
-}
-
-fn default_auth_mode() -> crate::auth::AuthMode {
-    crate::auth::AuthMode::None
 }
 
 #[derive(Deserialize)]
@@ -2704,7 +2710,8 @@ models: {}
         // AuthCfg: client_tokens (the 1.0.0 `token` field was removed — setting it is now a parse
         // error, so it can no longer reach `Debug`).
         let auth = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![
                 "SECRET-client-token-aaa".to_string(),
                 "SECRET-client-token-bbb".to_string(),
@@ -2799,7 +2806,8 @@ models: {}
             listen: "127.0.0.1:8080".to_string(),
             tls: None,
             auth: Some(AuthCfg {
-                mode: crate::auth::AuthMode::Token,
+                chain: vec!["tokens".to_string()],
+                upstream_credentials: crate::auth::UpstreamCreds::Own,
                 client_tokens: vec!["SECRET-embedded-client-token".to_string()],
             }),
             providers,

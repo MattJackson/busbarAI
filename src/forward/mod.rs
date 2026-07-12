@@ -7794,7 +7794,8 @@ mod ingress_indistinguishability_tests {
         // Passthrough mode + a MISCONFIGURED lane that DOES carry an operator key. Lane speaks OpenAI
         // (Bearer auth), ingress same-protocol openai.
         let passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             ..AuthCfg::default_none()
         };
         let app = TestApp::new()
@@ -8684,7 +8685,8 @@ data: {"type":"message_stop"}"#
 
         // Passthrough auth mode + anthropic lane, same-protocol anthropic ingress.
         let passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             ..AuthCfg::default_none()
         };
         let app = TestApp::new()

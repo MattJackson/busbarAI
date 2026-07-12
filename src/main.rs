@@ -202,19 +202,18 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// Return the open-relay banner to emit when auth resolves to `mode=none`, or `None` when auth is
-/// engaged. `auth_present` distinguishes an explicit `mode: none` (operator opted in) from a
-/// missing `auth:` block (serde-defaulted to none — the silent foot-gun the banner must call out).
-/// Returns `None` for every non-`None` mode (and for an unparseable mode, which validation already
-/// rejects upstream) so the caller emits nothing.
-fn open_relay_banner(mode: Option<auth::AuthMode>, auth_present: bool) -> Option<&'static str> {
-    if mode != Some(auth::AuthMode::None) {
+/// Return the open-relay banner to emit when the auth chain is EMPTY (open front door), or `None`
+/// when an auth module is engaged. `chain_empty` = the resolved `auth.chain` is empty. `auth_present`
+/// distinguishes an explicit empty chain (operator opted in) from a missing `auth:` block
+/// (serde-defaulted to open — the silent foot-gun the banner must call out).
+fn open_relay_banner(chain_empty: bool, auth_present: bool) -> Option<&'static str> {
+    if !chain_empty {
         return None;
     }
     Some(if auth_present {
-        "auth is DISABLED (auth.mode=none) — busbar is running as an OPEN RELAY; do not run this in production"
+        "auth is DISABLED (auth.chain is empty) — busbar is running as an OPEN RELAY; do not run this in production"
     } else {
-        "auth is DISABLED: no `auth:` block in config — busbar is running as an OPEN RELAY (anyone can use it). Add `auth:` with `mode: token` (and `client_tokens`) before exposing it; do not run this in production"
+        "auth is DISABLED: no `auth:` block in config — busbar is running as an OPEN RELAY (anyone can use it). Add `auth:` with `chain: [tokens]` (and `client_tokens`) before exposing it; do not run this in production"
     })
 }
 
@@ -529,7 +528,7 @@ async fn main() {
     // `auth:` silently becomes an open relay. Surface this at ERROR level (not warn — a warn is
     // suppressed under RUST_LOG=error, the very level an operator most likely runs in production)
     // AND unconditionally on stderr, so the open-relay state cannot be masked by log configuration.
-    if let Some(banner) = open_relay_banner(Some(auth_cfg.mode), cfg.auth.is_some()) {
+    if let Some(banner) = open_relay_banner(auth_cfg.chain.is_empty(), cfg.auth.is_some()) {
         eprintln!("[error] {banner}");
         tracing::error!("{banner}");
     }
@@ -1228,29 +1227,24 @@ mod tests {
 
     #[test]
     fn test_open_relay_banner_distinguishes_absent_vs_explicit_none() {
-        // Absent `auth:` block: banner must flag the silent open-relay foot-gun.
-        let absent = open_relay_banner(Some(auth::AuthMode::None), false)
-            .expect("mode=none must produce a banner");
+        // Absent `auth:` block (empty chain): banner must flag the silent open-relay foot-gun.
+        let absent = open_relay_banner(true, false).expect("empty chain must produce a banner");
         assert!(
             absent.contains("OPEN RELAY") && absent.contains("no `auth:` block"),
             "absent-auth banner must call out the missing block; got: {absent}"
         );
-        // Explicit mode: none: still an open relay, but the operator opted in.
-        let explicit = open_relay_banner(Some(auth::AuthMode::None), true)
-            .expect("explicit none must produce a banner");
+        // Explicit empty chain: still an open relay, but the operator opted in.
+        let explicit = open_relay_banner(true, true).expect("explicit empty chain must banner");
         assert!(
-            explicit.contains("OPEN RELAY") && explicit.contains("auth.mode=none"),
-            "explicit-none banner must reference auth.mode=none; got: {explicit}"
+            explicit.contains("OPEN RELAY") && explicit.contains("auth.chain is empty"),
+            "explicit-empty banner must reference auth.chain is empty; got: {explicit}"
         );
     }
 
     #[test]
     fn test_open_relay_banner_silent_when_auth_engaged() {
-        // Token / passthrough modes (and an unparseable mode, already rejected by validation) emit
-        // nothing — the banner is exclusively for the open-relay state.
-        assert!(open_relay_banner(Some(auth::AuthMode::Token), true).is_none());
-        assert!(open_relay_banner(Some(auth::AuthMode::Passthrough), true).is_none());
-        assert!(open_relay_banner(None, true).is_none());
+        // A non-empty chain emits nothing — the banner is exclusively for the open-relay state.
+        assert!(open_relay_banner(false, true).is_none());
     }
 
     /// The fallback handlers infer the ingress protocol from the

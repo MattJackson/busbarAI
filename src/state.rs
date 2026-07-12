@@ -144,19 +144,10 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// The configured auth mode — SINGLE SOURCE OF TRUTH. The `AuthMiddleware` owns it (set once at
-    /// construction from `auth.mode`, never mutated), and ingress token-gating reads it there; this
-    /// accessor lets the EGRESS credential-selection path read the same value without a denormalized
-    /// copy on `App` that could (in principle) drift. Cheap: `AuthMode` is `Copy`.
-    pub(crate) fn auth_mode(&self) -> crate::auth::AuthMode {
-        self.auth.mode
-    }
-
     /// The UPSTREAM-credential mode — whether the egress path signs with busbar's configured lane key
-    /// (`Own`) or forwards the caller's credential (`Passthrough`). The credential-selection concern,
-    /// read off the same single source of truth; slice 2d-2 splits it from `auth_mode` so nothing on
-    /// the egress path branches on the front-door auth mode. Cheap: `UpstreamCreds` is `Copy`.
+    /// (`Own`) or forwards the caller's credential (`Passthrough`). Read off the `AuthMiddleware`
+    /// (set once at construction from `upstream_credentials:`, never mutated). Cheap: `Copy`.
     pub(crate) fn upstream_creds(&self) -> crate::auth::UpstreamCreds {
-        self.auth.mode.upstream_creds()
+        self.auth.upstream_creds
     }
 }

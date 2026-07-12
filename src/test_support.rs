@@ -668,17 +668,15 @@ impl TestApp {
         self.pools.insert(name.into(), weighted(members));
         self
     }
-    /// Set the auth mode by installing an `AuthMiddleware` configured for that mode (empty
-    /// `client_tokens`). The middleware is now the SINGLE source of the mode (see `App::auth_mode`),
-    /// so this drives BOTH the ingress gate and egress credential selection — matching production,
-    /// where the two are always the same value. Tests that need a specific `client_tokens` allowlist
-    /// (token-mode ingress) should use `.auth(...)` with an explicit middleware instead; calling both
-    /// is last-wins.
-    pub(crate) fn auth_mode(mut self, m: crate::auth::AuthMode) -> Self {
-        // Struct-update from `default_none()` (mode none, empty client_tokens) so we only override
-        // `mode` and stay forward-compatible with any future `AuthCfg` field.
+    /// Install an `AuthMiddleware` with an EMPTY chain (open front door) and the given upstream-
+    /// credential mode — driving the egress credential-selection path. `Own` = the old `mode: none`;
+    /// `Passthrough` = the old `mode: passthrough`. Tests needing a `tokens`-chain ingress gate should
+    /// use `.auth(...)` with an explicit middleware; calling both is last-wins.
+    pub(crate) fn upstream_creds(mut self, uc: crate::auth::UpstreamCreds) -> Self {
+        // Struct-update from `default_none()` (empty chain, empty client_tokens) so we only override
+        // the upstream-credential mode and stay forward-compatible with future `AuthCfg` fields.
         let cfg = crate::config::AuthCfg {
-            mode: m,
+            upstream_credentials: uc,
             ..crate::config::AuthCfg::default_none()
         };
         self.auth = Some(std::sync::Arc::new(crate::auth::AuthMiddleware::new(&cfg)));
@@ -1465,7 +1463,8 @@ mod tests {
 
         let token = "sk-metrics-scrape";
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![token.to_string()],
         };
         let app = TestApp::new()
@@ -2662,7 +2661,8 @@ mod tests {
 
         // Scenario A: Passthrough mode — lane should NOT be tripped
         let auth_cfg_passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
         };
         let app_passthrough = TestApp::new()
@@ -2723,7 +2723,8 @@ mod tests {
         });
 
         let auth_cfg_token = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["caller-token-123".to_string()],
         };
         let app_token = TestApp::new()
@@ -2833,7 +2834,8 @@ mod tests {
         let server = MockServer::new(state.clone()).await;
 
         let auth_cfg_passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
         };
         let app = TestApp::new()
