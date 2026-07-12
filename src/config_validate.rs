@@ -2979,6 +2979,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "auth-tokens")]
     #[test]
     fn test_validate_token_mode_with_tokens_ok() {
         // The allowlist form satisfies the requirement (the legacy single-token form was removed in

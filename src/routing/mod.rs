@@ -576,7 +576,10 @@ mod tests {
     }
 
     /// Each native `policy:` strategy resolves to a constructed `Policy` whose name round-trips the
-    /// native registry name. (No gate; empty hook registry.)
+    /// native registry name. (No gate; empty hook registry.) Requires the removable `hooks-ranking`
+    /// plugin — under `--no-default-features` a non-weighted native policy is a boot error, not a
+    /// resolvable policy, so this behavior test only applies when the plugin is compiled in.
+    #[cfg(feature = "hooks-ranking")]
     #[test]
     fn native_policy_resolves_constructed_policy() {
         let client = reqwest::Client::new();
@@ -830,6 +833,8 @@ mod tests {
     }
 
     /// A native `policy:` FORCES the payload projections off at resolve (no native policy reads them).
+    /// Requires the `hooks-ranking` plugin (a native non-weighted policy exists only when compiled in).
+    #[cfg(feature = "hooks-ranking")]
     #[test]
     fn native_resolve_forces_opt_in_flags_off() {
         let client = reqwest::Client::new();

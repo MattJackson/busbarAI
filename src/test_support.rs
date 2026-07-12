@@ -1483,6 +1483,7 @@ mod tests {
     /// that re-added `/metrics` to the always-open allowlist alongside `/healthz` (auth.rs)
     /// would let this unauthenticated scrape through and fail here. The same request WITH the
     /// configured token is admitted (200), proving the gate is token-based, not a blanket block.
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_metrics_requires_auth_in_token_mode() {
         crate::metrics::init();

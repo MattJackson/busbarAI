@@ -1000,6 +1000,7 @@ mod tests {
         assert_eq!(AuthMiddleware::extract_bearer_token("Basic abc"), None);
     }
 
+    #[cfg(feature = "auth-tokens")]
     #[test]
     fn test_auth_mode_token_valid() {
         let cfg = AuthCfg {
@@ -1016,6 +1017,7 @@ mod tests {
         assert!(!mw.validate_token(Some(""))); // empty token never matches
     }
 
+    #[cfg(feature = "auth-tokens")]
     #[test]
     fn test_validate_token_matches_any_allowlist_position() {
         // Regression for the list-level timing oracle: validation must compare against EVERY
@@ -1037,6 +1039,7 @@ mod tests {
         assert!(!mw.validate_token(Some("absent-token")), "no match");
     }
 
+    #[cfg(feature = "auth-tokens")]
     #[test]
     fn test_validate_token_length_independent_compare() {
         // Regression for the client-token timing-LENGTH leak: the configured token's length must not
@@ -1628,6 +1631,7 @@ mod tests {
     /// token authenticates via `x-goog-api-key` (Gemini SDK), via `x-api-key` (Anthropic SDK), and
     /// via `Authorization: Bearer`. A missing/wrong token is rejected 401 with the native error
     /// envelope shaped for the inferred ingress protocol (`application/json`, not `text/plain`).
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_token_mode_accepts_all_carriers_and_native_401() {
         use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
@@ -1776,6 +1780,7 @@ mod tests {
     /// RESPECTIVE protocol's native error envelope — not an Anthropic/OpenAI-shaped body. The
     /// existing multi-carrier test only covers the Anthropic path, leaving these two protocol
     /// envelopes untested on the auth boundary (an indistinguishability failure if regressed).
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_cohere_and_responses_ingress_token_mode_native_401() {
         use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -1880,6 +1885,7 @@ mod tests {
     /// status + typing headers were exercised only by a direct `unauthorized_response` call that
     /// bypasses the middleware → router stack, so a regression dropping the 403/headers in the full
     /// pipeline would be uncaught.
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_bedrock_ingress_wrong_token_is_403_native_envelope() {
         use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -1968,6 +1974,7 @@ mod tests {
     /// "INVALID_ARGUMENT"` (a real Generative Language API bad key is 400 INVALID_ARGUMENT, NOT
     /// 401/UNAUTHENTICATED). The stable-v1 path was previously mis-shaped as an OpenAI 401 because
     /// `proto_for_path` had no `/v1/models/` arm — this exercises both prefixes through the full stack.
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_gemini_ingress_wrong_token_is_native_bad_key_envelope() {
         use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -2050,6 +2057,7 @@ mod tests {
     /// auth branch with the inferred-protocol native 401 envelope — never routed down the admin
     /// branch (which would early-return without the `CallerToken` extension and 500 in a non-admin
     /// handler). `/adminx/v1/messages` infers the anthropic protocol via the `/v1/messages` suffix.
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_admin_prefix_is_boundary_safe() {
         use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -2503,6 +2511,7 @@ mod tests {
     /// (no such warning); it passes once the diagnostic is emitted. The static `WARN_ONCE` is
     /// process-global, but this is the ONLY test that exercises the token+governance+non-empty pairing,
     /// so it observes the first (and only) firing.
+    #[cfg(feature = "auth-tokens")]
     #[test]
     fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
         use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
