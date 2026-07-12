@@ -486,9 +486,9 @@ impl<'de> Deserialize<'de> for PoolCfg {
                 ));
             }
             // Partition the list: ordering strategies set the base ranking; anything else is a gate ref
-            // (validated against the registry at startup). At most one strategy (a pool has one base
-            // ordering); gates keep their list order — it is the phase-2 chain order. Multi-gate is
-            // held at ≤1 here until the concurrent reconcile fires N gates (next increment).
+            // (validated against the registry at startup). At most one strategy (a pool has ONE base
+            // ordering); ANY number of gates, keeping list order — that is the phase-2 chain
+            // tie-break order (reject/restrict commute; order last-wins; `priority` sorts first).
             let mut policy: Option<PoolPolicy> = None;
             let mut gates: Vec<String> = Vec::new();
             for name in names {
@@ -501,12 +501,6 @@ impl<'de> Deserialize<'de> for PoolCfg {
                     }
                     policy = Some(parse_strategy(&name)?);
                 } else {
-                    if !gates.is_empty() {
-                        return Err(serde::de::Error::custom(
-                            "a pool `hooks:` list names more than one gate; multi-gate is not yet \
-                             supported (coming in a later 1.3 increment)",
-                        ));
-                    }
                     gates.push(name);
                 }
             }
@@ -2116,6 +2110,18 @@ models:
         assert_eq!(s.policy, PoolPolicy::Fastest);
         assert!(s.gates.is_empty());
         assert!(s.base_named);
+    }
+
+    /// A `hooks:` list may name SEVERAL gates — they fire concurrently in the phase-2 reconcile.
+    /// List order is preserved (the chain tie-break within equal `priority`).
+    #[test]
+    fn test_pool_hooks_list_accepts_multiple_gates() {
+        let pool: PoolCfg =
+            serde_yaml::from_str("hooks: [cheapest, pii-guard, compliance]\nmembers: []\n")
+                .expect("multi-gate list must parse");
+        assert_eq!(pool.policy, PoolPolicy::Cheapest);
+        assert_eq!(pool.gates, ["pii-guard", "compliance"]);
+        assert!(pool.base_named);
     }
 
     /// Mixing the unified `hooks:` list with the legacy `policy:`/`hook:` pair is an error (pick one).

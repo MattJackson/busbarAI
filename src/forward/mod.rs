@@ -11161,6 +11161,394 @@ mod hook_seam_tests {
         );
     }
 
+    /// A canned phase-2 decision for the reconcile tests below.
+    enum Canned {
+        Order(Vec<usize>),
+        Restrict(Vec<String>),
+        Reject(u16, &'static str),
+    }
+
+    /// A test gate returning a fixed decision — the reconcile tests' building block.
+    struct CannedGate {
+        canned: Canned,
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for CannedGate {
+        async fn decide(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            Ok(match &self.canned {
+                Canned::Order(order) => RoutingDecision::Prefer(order.clone()),
+                Canned::Restrict(tags) => RoutingDecision::Restrict {
+                    tags_any: tags.clone(),
+                },
+                Canned::Reject(status, message) => RoutingDecision::Reject {
+                    status: *status,
+                    message: (*message).to_string(),
+                },
+            })
+        }
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    /// Wrap a canned decision as a resolved gate transport (shape-only, fail-closed defaults).
+    fn canned_gate(canned: Canned, name: &'static str) -> ResolvedPolicy {
+        ResolvedPolicy::Policy {
+            policy: Arc::new(CannedGate { canned, name }),
+            on_error: crate::config::PolicyOnError::default(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        }
+    }
+
+    /// A `PoolRuntime` carrying per-lane tags (for restrict reconciles) and the pool's own gates.
+    fn pool_runtime_with(
+        tags_by_idx: &[(usize, &[&str])],
+        gates: Vec<(u16, ResolvedPolicy)>,
+    ) -> crate::state::PoolRuntime {
+        let mut members = std::collections::HashMap::new();
+        for (idx, tags) in tags_by_idx {
+            members.insert(
+                *idx,
+                crate::state::MemberMeta {
+                    tier: None,
+                    cost_per_mtok: None,
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                },
+            );
+        }
+        crate::state::PoolRuntime {
+            members,
+            failover: None,
+            affinity: None,
+            breaker: None,
+            policy: None,
+            gates,
+        }
+    }
+
+    fn chat_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": "p",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10
+        }))
+        .unwrap()
+    }
+
+    fn lanes(n: usize) -> Vec<WeightedLane> {
+        (0..n)
+            .map(|idx| WeightedLane {
+                reasoning: None,
+                idx,
+                weight: 1,
+                attempt_timeout_ms: None,
+            })
+            .collect()
+    }
+
+    async fn fire(app: Arc<App>, n_lanes: usize) -> Response {
+        forward_with_pool(
+            app,
+            lanes(n_lanes),
+            chat_body().into(),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await
+    }
+
+    /// An Anthropic-shaped 200 whose `model` names the serving lane — the observable that tells the
+    /// reconcile tests WHICH lane actually got dispatched.
+    async fn mock_lane(model: &'static str) -> crate::test_support::MockServer {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        for _ in 0..4 {
+            state.push(crate::test_support::MockResponse::Ok {
+                status: StatusCode::OK,
+                body: serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "model": model,
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            });
+        }
+        crate::test_support::MockServer::new(state).await
+    }
+
+    async fn body_model(resp: Response) -> String {
+        use http_body_util::BodyExt as _;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        v.get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// RECONCILE: a pool's OWN gate (from `PoolRuntime.gates`) fires in phase 2 — its reject
+    /// short-circuits before dispatch, proving the pool-gate half of the chain is wired.
+    #[tokio::test]
+    async fn pool_gate_reject_fires_from_pool_runtime_gates() {
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead — the reject must prevent dispatch
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(
+                    &[],
+                    vec![(
+                        0u16,
+                        canned_gate(Canned::Reject(451, "pool gate says no"), "pg"),
+                    )],
+                ),
+            )
+            .build();
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "a pool gate in PoolRuntime.gates must fire in the phase-2 reconcile"
+        );
+    }
+
+    /// RECONCILE: when several gates reject at once, the LOWEST-priority gate's status/message
+    /// surfaces (the chain sort is the tie-break) — regardless of injection order.
+    #[tokio::test]
+    async fn reject_priority_tie_break_surfaces_lowest_priority() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        // Deliberately injected out of order: the firing site's stable sort must put 1 before 5.
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (
+                5u16,
+                canned_gate(Canned::Reject(451, "high priority number"), "late"),
+            ),
+            (
+                1u16,
+                canned_gate(Canned::Reject(452, "low priority number"), "early"),
+            ),
+        ];
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            452,
+            "the lowest-priority rejecting gate must supply the surfacing status"
+        );
+    }
+
+    /// RECONCILE: two concurrent restricts INTERSECT. Disjoint tag sets empty the intersection and
+    /// fail closed (the fail-closed default on_empty ⇒ 503) — never allow-all.
+    #[tokio::test]
+    async fn multi_restrict_disjoint_intersection_fails_closed() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "eu-lane",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .lane(LaneSpec::new(
+                "baa-lane",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(&[(0, &["eu"]), (1, &["baa"])], Vec::new()),
+            )
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (
+                0u16,
+                canned_gate(Canned::Restrict(vec!["eu".to_string()]), "geo"),
+            ),
+            (
+                1u16,
+                canned_gate(Canned::Restrict(vec!["baa".to_string()]), "hipaa"),
+            ),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "disjoint concurrent restricts must intersect to empty and fail closed"
+        );
+    }
+
+    /// RECONCILE: two concurrent restricts INTERSECT to the one lane carrying BOTH tags — and the
+    /// request dispatches to exactly that lane (the restriction bounds dispatch, not just ranking).
+    #[tokio::test]
+    async fn multi_restrict_intersection_dispatches_only_the_survivor() {
+        let survivor = mock_lane("both").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "eu-only",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead: dispatching here would error, not 200
+            ))
+            .lane(LaneSpec::new(
+                "eu-baa",
+                crate::proto::Protocol::anthropic(),
+                &survivor.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(&[(0, &["eu"]), (1, &["eu", "baa"])], Vec::new()),
+            )
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (
+                0u16,
+                canned_gate(Canned::Restrict(vec!["eu".to_string()]), "geo"),
+            ),
+            (
+                1u16,
+                canned_gate(Canned::Restrict(vec!["baa".to_string()]), "hipaa"),
+            ),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "both",
+            "dispatch must stay inside the restrict intersection"
+        );
+        survivor.shutdown().await;
+    }
+
+    /// RECONCILE index-space: an ORDER captured at t0 naming only members a concurrent RESTRICT
+    /// excluded filters to empty ⇒ abstain — the request proceeds on the surviving set (never a
+    /// strand, never a resurrected excluded member).
+    #[tokio::test]
+    async fn stale_order_filtered_against_post_restrict_set() {
+        let survivor = mock_lane("kept").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "excluded",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead: the stale order names ONLY this lane
+            ))
+            .lane(LaneSpec::new(
+                "kept-lane",
+                crate::proto::Protocol::anthropic(),
+                &survivor.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(&[(0, &["a"]), (1, &["b"])], Vec::new()),
+            )
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (0u16, canned_gate(Canned::Order(vec![0]), "orderer")),
+            (
+                1u16,
+                canned_gate(Canned::Restrict(vec!["b".to_string()]), "restrictor"),
+            ),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "kept",
+            "a t0 order naming only restricted-out members must abstain to the surviving set"
+        );
+        survivor.shutdown().await;
+    }
+
+    /// RECONCILE: with two ordering gates, the LAST in the chain wins. Both lanes are healthy, so
+    /// whichever order wins is dispatched first with no failover — the serving lane is the proof.
+    #[tokio::test]
+    async fn order_last_in_chain_wins() {
+        let alpha = mock_lane("alpha").await;
+        let beta = mock_lane("beta").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "lane-a",
+                crate::proto::Protocol::anthropic(),
+                &alpha.base_url(),
+            ))
+            .lane(LaneSpec::new(
+                "lane-b",
+                crate::proto::Protocol::anthropic(),
+                &beta.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (0u16, canned_gate(Canned::Order(vec![0, 1]), "first")),
+            (1u16, canned_gate(Canned::Order(vec![1, 0]), "second")),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "beta",
+            "the LAST ordering gate in the chain must win the reconcile"
+        );
+        alpha.shutdown().await;
+        beta.shutdown().await;
+    }
+
+    /// RECONCILE: a global gate ORDER is now honored (the previously-deferred arm): a single global
+    /// ordering gate reorders dispatch away from config order.
+    #[tokio::test]
+    async fn global_gate_order_arm_is_honored() {
+        let alpha = mock_lane("alpha").await;
+        let beta = mock_lane("beta").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "lane-a",
+                crate::proto::Protocol::anthropic(),
+                &alpha.base_url(),
+            ))
+            .lane(LaneSpec::new(
+                "lane-b",
+                crate::proto::Protocol::anthropic(),
+                &beta.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates =
+            vec![(0u16, canned_gate(Canned::Order(vec![1]), "prefer-b"))];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "beta",
+            "a global ordering gate must steer dispatch (the ORDER arm is live)"
+        );
+        alpha.shutdown().await;
+        beta.shutdown().await;
+    }
+
     /// `send_prompt: true` alone: the policy sees the flattened content; identity stays absent.
     #[tokio::test]
     async fn send_prompt_projects_content_only() {
