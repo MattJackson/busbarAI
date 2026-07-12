@@ -597,6 +597,10 @@ async fn main() {
         .build()
         .expect("build upstream HTTP client");
 
+    // The `default:` hook (if any) — the base ordering that pools which named none inherit, replacing
+    // the compiled-in weighted backstop (everything-is-a-hook model). At most one (validated).
+    let default_hook = routing::default_hook_name(&cfg.hooks).map(str::to_string);
+
     // Per-pool runtime config (failover/exclusions), keyed by pool name.
     let mut pool_runtime = std::collections::HashMap::new();
     for (pool_name, pool_cfg) in &cfg.pools {
@@ -625,9 +629,15 @@ async fn main() {
                         })
                     })
                     .collect(),
-                // Resolve the routing policy ONCE here. `route: weighted` (default) ⇒ `None` ⇒ the
-                // zero-cost inline SWRR path; the webhook transport reuses the shared upstream client.
-                policy: routing::resolve_policy(pool_cfg, &cfg.hooks, &upstream_client),
+                // Resolve the routing policy ONCE here. `weighted` (default) ⇒ `None` ⇒ the zero-cost
+                // inline SWRR path; a `default:` hook replaces that base for pools that named none; the
+                // webhook transport reuses the shared upstream client.
+                policy: routing::resolve_pool_ordering(
+                    pool_cfg,
+                    &cfg.hooks,
+                    &upstream_client,
+                    default_hook.as_deref(),
+                ),
             },
         );
     }

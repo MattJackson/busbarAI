@@ -345,6 +345,40 @@ pub(crate) fn resolve_policy(
     }
 }
 
+/// The name of the registered `default: true` hook, if any — the base ordering that pools which named
+/// none inherit. At most one exists (config_validate enforces it), so `find` is unambiguous.
+pub(crate) fn default_hook_name(
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+) -> Option<&str> {
+    hooks
+        .iter()
+        .find(|(_, h)| h.default)
+        .map(|(name, _)| name.as_str())
+}
+
+/// Resolve a pool's base ordering, honoring the `default:` hook. A pool that named NO base ordering
+/// (`base_named == false`) and has no gate of its own INHERITS the `default:` hook as its base (the
+/// default gate orders it) — the REPLACEMENT of the compiled-in `weighted` backstop, per the
+/// everything-is-a-hook model. A pool with its own gate, or one that explicitly named a base, keeps its
+/// choice (the default does NOT override it). When no `default:` hook is registered, this is exactly
+/// `resolve_policy` (the compiled-in backstop). Called once per pool at startup.
+pub(crate) fn resolve_pool_ordering(
+    cfg: &crate::config::PoolCfg,
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+    client: &reqwest::Client,
+    default_hook: Option<&str>,
+) -> Option<ResolvedPolicy> {
+    if cfg.hook.is_none() && !cfg.base_named {
+        if let Some(name) = default_hook {
+            if let Some(hook) = hooks.get(name) {
+                // The default gate becomes this pool's base ordering.
+                return resolve_gate_transport(hook, client);
+            }
+        }
+    }
+    resolve_policy(cfg, hooks, client)
+}
+
 /// Resolve a GATE hook's transport (socket or webhook) into a [`ResolvedPolicy`]. The prompt/identity
 /// projections are gated by the hook's `prompt:`/`user:` grants (`ro`/`rw` send the prompt; `ro` sends
 /// identity). A missing/invalid transport degrades to `None` — config_validate surfaces it loudly.
@@ -608,6 +642,56 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// The `default:` hook becomes the base ordering for a pool that named NO base (base_named=false)
+    /// and has no gate of its own — but NOT for a pool that named a base or brought its own gate.
+    #[cfg(unix)]
+    #[test]
+    fn default_hook_resolves_as_base_for_unnamed_pools() {
+        let client = reqwest::Client::new();
+        let mut def = base_gate();
+        def.socket = Some("/run/busbar/def.sock".to_string());
+        def.default = true;
+        let mut hooks = registry("def", def);
+        // also register the own-gate hook "h"
+        let mut h = base_gate();
+        h.socket = Some("/run/busbar/h.sock".to_string());
+        hooks.insert("h".to_string(), h);
+
+        assert_eq!(default_hook_name(&hooks), Some("def"));
+
+        // base_named=false + no gate ⇒ inherits the default gate as its base ordering.
+        let mut unnamed = pool_with_hook("x");
+        unnamed.hook = None; // base_named is already false from pool_with_hook
+        assert!(
+            resolve_pool_ordering(&unnamed, &hooks, &client, Some("def")).is_some(),
+            "an unnamed-base pool inherits the default hook as its ordering"
+        );
+
+        // base_named=true (explicit weighted) ⇒ default does NOT override; weighted ⇒ None.
+        assert!(
+            resolve_pool_ordering(
+                &pool_policy(PoolPolicy::Weighted),
+                &hooks,
+                &client,
+                Some("def")
+            )
+            .is_none(),
+            "a pool that named its base keeps it; the default does not override"
+        );
+
+        // base_named=false but its OWN gate ⇒ uses its own gate, not the default.
+        assert!(
+            resolve_pool_ordering(&pool_with_hook("h"), &hooks, &client, Some("def")).is_some(),
+            "a pool with its own gate keeps it"
+        );
+
+        // No default registered ⇒ identical to resolve_policy (backstop): unnamed pool ⇒ None.
+        assert!(
+            resolve_pool_ordering(&unnamed, &HashMap::new(), &client, None).is_none(),
+            "no default hook ⇒ the compiled-in weighted backstop (None)"
+        );
     }
 
     /// `policy: weighted` (default / absent) collapses to the zero-cost default (`None`).
