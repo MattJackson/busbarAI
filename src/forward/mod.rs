@@ -2307,23 +2307,26 @@ async fn decide_policy_order(
 
     // A weighted/default pool resolves to `None` at config load (no policy object is constructed), so
     // the only `ResolvedPolicy` that can reach this seam is a constructed `Policy`.
-    let (policy, on_error, timeout, send_prompt, send_user, on_empty) = match resolved {
-        ResolvedPolicy::Policy {
-            policy,
-            on_error,
-            timeout,
-            send_prompt,
-            send_user,
-            on_empty,
-        } => (
-            policy,
-            on_error,
-            *timeout,
-            *send_prompt,
-            *send_user,
-            on_empty,
-        ),
-    };
+    let (policy, on_error, on_error_chain, timeout, send_prompt, send_user, on_empty) =
+        match resolved {
+            ResolvedPolicy::Policy {
+                policy,
+                on_error,
+                on_error_chain,
+                timeout,
+                send_prompt,
+                send_user,
+                on_empty,
+            } => (
+                policy,
+                on_error,
+                on_error_chain,
+                *timeout,
+                *send_prompt,
+                *send_user,
+                on_empty,
+            ),
+        };
 
     // The candidate set the policy ranks over = this pool's members MINUS the already-excluded ones
     // (configured exclusions). `idx` is the stable lane handle the ordered walk speaks.
@@ -2462,7 +2465,16 @@ async fn decide_policy_order(
                 error = %e,
                 "routing policy failed; applying on_error fallback"
             );
-            return coerce_on_error(on_error, &candidates, policy.name());
+            return run_on_error_chain(
+                on_error_chain,
+                on_error,
+                &req,
+                &candidates,
+                &ctx,
+                policy.name(),
+                pool_name,
+            )
+            .await;
         }
         // Timed out at the seam's own hard deadline: same fallback, same visibility. The policy/
         // transport stays cancel-safe — a dropped future on timeout is fine.
@@ -2473,9 +2485,101 @@ async fn decide_policy_order(
                 timeout_ms = timeout.as_millis() as u64,
                 "routing policy deadline exceeded; applying on_error fallback"
             );
-            return coerce_on_error(on_error, &candidates, policy.name());
+            return run_on_error_chain(
+                on_error_chain,
+                on_error,
+                &req,
+                &candidates,
+                &ctx,
+                policy.name(),
+                pool_name,
+            )
+            .await;
         }
     };
+
+    map_decision(decision, policy.name(), &candidates, on_empty)
+}
+
+/// Walk a failed gate's resolved `on_error` fallback CHAIN: fire each fallback in order (bounded by
+/// ITS deadline, projected per ITS grants — a fallback never sees prompt/identity its own grants
+/// don't allow), and let the FIRST one that answers decide, exactly as a primary decision would.
+/// Every link failing lands on the chain's reserved TERMINAL (weighted/reject/first). The common
+/// case — `on_error: weighted` etc. — has an EMPTY chain and goes straight to the terminal.
+async fn run_on_error_chain(
+    chain: &[crate::routing::FallbackHook],
+    terminal: &crate::config::PolicyOnError,
+    req: &crate::routing::RoutingRequest<'_>,
+    candidates: &[crate::routing::Candidate<'_>],
+    ctx: &crate::routing::RoutingContext<'_>,
+    failed_policy_name: &'static str,
+    pool_name: &str,
+) -> PolicyOutcome {
+    for fb in chain {
+        // Re-project per the FALLBACK's grants: it may see at most what the primary projection
+        // built AND its own grants allow (never over-shares; a fallback with a grant the primary
+        // lacked gets shape-only — the projection was never built).
+        let fb_req = crate::routing::RoutingRequest {
+            prompt: if fb.send_prompt {
+                req.prompt.clone()
+            } else {
+                None
+            },
+            identity: if fb.send_user {
+                req.identity.clone()
+            } else {
+                None
+            },
+            ..req.clone()
+        };
+        match tokio::time::timeout(
+            fb.timeout,
+            fb.policy.decide(&fb_req, candidates, ctx, fb.timeout),
+        )
+        .await
+        {
+            Ok(Ok(decision)) => {
+                tracing::info!(
+                    policy = failed_policy_name,
+                    fallback = fb.policy.name(),
+                    pool = pool_name,
+                    "on_error fallback hook answered for the failed gate"
+                );
+                return map_decision(decision, fb.policy.name(), candidates, &fb.on_empty);
+            }
+            // This link failed too — follow the chain to the next (its own on_error was flattened
+            // into this chain at resolution).
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    fallback = fb.policy.name(),
+                    pool = pool_name,
+                    error = %e,
+                    "on_error fallback hook failed; continuing down the chain"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    fallback = fb.policy.name(),
+                    pool = pool_name,
+                    timeout_ms = fb.timeout.as_millis() as u64,
+                    "on_error fallback hook deadline exceeded; continuing down the chain"
+                );
+            }
+        }
+    }
+    coerce_on_error(terminal, candidates, failed_policy_name)
+}
+
+/// Map a policy's `RoutingDecision` to the seam's `PolicyOutcome` — shared by the primary decision
+/// and every on_error fallback, so a fallback's reject/restrict/order carries the same clamping,
+/// sanitizing, and normalization guarantees as a primary's.
+fn map_decision(
+    decision: crate::routing::RoutingDecision,
+    policy_name: &'static str,
+    candidates: &[crate::routing::Candidate<'_>],
+    on_empty: &crate::config::PolicyOnError,
+) -> PolicyOutcome {
+    use crate::routing::RoutingDecision;
 
     match decision {
         RoutingDecision::Prefer(order) => {
@@ -2486,7 +2590,7 @@ async fn decide_policy_order(
             match RoutingDecision::from_ranked(order, &valid) {
                 RoutingDecision::Prefer(o) => PolicyOutcome::Order {
                     order: o,
-                    name: policy.name(),
+                    name: policy_name,
                 },
                 RoutingDecision::Abstain => PolicyOutcome::Weighted,
                 // `from_ranked` only ever produces Prefer/Abstain — it normalizes an order, it
@@ -2513,7 +2617,7 @@ async fn decide_policy_order(
                 403
             },
             message: crate::routing::wire::sanitize_reject_message(&message),
-            name: policy.name(),
+            name: policy_name,
         },
         // The hook's RESTRICT verb: keep only candidates carrying one of `tags_any` (a compliance
         // gate). The intersection + on_empty are applied at the failover-set seam in `forward_with_
@@ -2521,7 +2625,7 @@ async fn decide_policy_order(
         // normalized fail-closed) forces the empty intersection → on_empty, never allow-all.
         RoutingDecision::Restrict { tags_any } => PolicyOutcome::Restrict {
             tags_any,
-            name: policy.name(),
+            name: policy_name,
             on_empty: on_empty.clone(),
         },
     }
@@ -11005,6 +11109,7 @@ mod hook_seam_tests {
                 reject,
             }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt,
             send_user,
@@ -11073,6 +11178,7 @@ mod hook_seam_tests {
                 reject: Some((451, "blocked by global policy".to_string())),
             }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt: false,
             send_user: false,
@@ -11127,6 +11233,7 @@ mod hook_seam_tests {
                 reject: None, // abstain
             }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt: false,
             send_user: false,
@@ -11204,6 +11311,7 @@ mod hook_seam_tests {
         ResolvedPolicy::Policy {
             policy: Arc::new(CannedGate { canned, name }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt: false,
             send_user: false,
@@ -11299,6 +11407,100 @@ mod hook_seam_tests {
             .and_then(|m| m.as_str())
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// A test policy whose decide always errors — the on_error-chain tests' failing primary.
+    struct ErroringPolicy;
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for ErroringPolicy {
+        async fn decide(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            Err("deliberately broken".into())
+        }
+        fn name(&self) -> &'static str {
+            "erroring"
+        }
+    }
+
+    /// ON_ERROR CHAIN: a failing gate's named fallback hook FIRES and its decision is honored
+    /// exactly as a primary's would be (here: the fallback rejects with 451).
+    #[tokio::test]
+    async fn on_error_fallback_hook_fires_and_decides() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(ErroringPolicy),
+            on_error: crate::config::PolicyOnError::Weighted,
+            on_error_chain: vec![crate::routing::FallbackHook {
+                policy: Arc::new(CannedGate {
+                    canned: Canned::Reject(451, "fallback says no"),
+                    name: "backup",
+                }),
+                timeout: std::time::Duration::from_millis(500),
+                send_prompt: false,
+                send_user: false,
+                on_empty: crate::config::PolicyOnError::Reject,
+            }],
+            timeout: std::time::Duration::from_millis(50),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "the failed gate's fallback hook must fire and its reject must be honored"
+        );
+    }
+
+    /// ON_ERROR CHAIN: every link failing lands on the chain's reserved TERMINAL (here `reject`
+    /// ⇒ fail-closed 503) — never a silent proceed.
+    #[tokio::test]
+    async fn on_error_chain_exhausted_applies_terminal() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(ErroringPolicy),
+            on_error: crate::config::PolicyOnError::Reject,
+            on_error_chain: vec![crate::routing::FallbackHook {
+                policy: Arc::new(ErroringPolicy), // the fallback fails too
+                timeout: std::time::Duration::from_millis(50),
+                send_prompt: false,
+                send_user: false,
+                on_empty: crate::config::PolicyOnError::Reject,
+            }],
+            timeout: std::time::Duration::from_millis(50),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "an exhausted chain must land on the fail-closed reject terminal"
+        );
     }
 
     /// RECONCILE: a pool's OWN gate (from `PoolRuntime.gates`) fires in phase 2 — its reject
@@ -11658,6 +11860,7 @@ mod hook_seam_tests {
                 reject: None,
             }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt: false,
             send_user: true,
@@ -11768,6 +11971,7 @@ mod hook_seam_tests {
                             reject: Some((451, "PII detected".to_string())),
                         }),
                         on_error: crate::config::PolicyOnError::default(),
+                        on_error_chain: Vec::new(),
                         timeout: std::time::Duration::from_millis(500),
                         send_prompt: false,
                         send_user: false,

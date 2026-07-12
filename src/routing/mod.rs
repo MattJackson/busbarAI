@@ -276,7 +276,14 @@ pub(crate) enum ResolvedPolicy {
     /// policy and takes the inline SWRR branch.
     Policy {
         policy: Arc<dyn RoutingPolicy>,
+        /// The TERMINAL the on_error chain bottoms out on (weighted/reject/first) — applied when
+        /// the policy fails and every chain link (below) also fails.
         on_error: crate::config::PolicyOnError,
+        /// The resolved on_error FALLBACK CHAIN: hooks/strategies fired IN ORDER when the policy
+        /// errors or times out; the first that answers decides. Empty (the common case — a
+        /// terminal was named directly) costs nothing. Resolved once at config load; boot
+        /// validation proves termination (cycles/unknowns/taps never reach here).
+        on_error_chain: Vec<FallbackHook>,
         timeout: std::time::Duration,
         /// Derived from the hook's `prompt` grant (`ro`/`rw`) — build + send the prompt content
         /// projection (default false, i.e. `prompt: no`).
@@ -290,6 +297,18 @@ pub(crate) enum ResolvedPolicy {
         /// policies (native/order-only), which never produce an empty intersection.
         on_empty: crate::config::PolicyOnError,
     },
+}
+
+/// One link in a gate's resolved `on_error` fallback chain: the fallback hook's transport plus
+/// the per-hook config the firing site needs (its own deadline, ITS grants — a fallback never
+/// sees a projection its own grants don't allow — and its own `on_empty`).
+#[derive(Clone)]
+pub(crate) struct FallbackHook {
+    pub(crate) policy: Arc<dyn RoutingPolicy>,
+    pub(crate) timeout: std::time::Duration,
+    pub(crate) send_prompt: bool,
+    pub(crate) send_user: bool,
+    pub(crate) on_empty: crate::config::PolicyOnError,
 }
 
 /// Resolve a pool's routing config into a runtime policy ONCE at config load. Returns `None` for the
@@ -316,6 +335,7 @@ pub(crate) fn resolve_policy(cfg: &crate::config::PoolCfg) -> Option<ResolvedPol
         Some(ResolvedPolicy::Policy {
             policy,
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: policy_timeout(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
             // Native policies rank on live signals and have no reader for prompt/identity.
             send_prompt: false,
@@ -359,7 +379,7 @@ pub(crate) fn resolve_pool_ordering(
         if let Some(name) = default_hook {
             if let Some(hook) = hooks.get(name) {
                 // The default gate becomes this pool's base ordering.
-                return resolve_gate_transport(hook, client);
+                return resolve_gate_transport(hook, hooks, client);
             }
         }
     }
@@ -383,7 +403,7 @@ pub(crate) fn resolve_pool_gates(
             if hook.kind != crate::config::HookKind::Gate {
                 return None;
             }
-            resolve_gate_transport(hook, client).map(|rp| (hook.priority, rp))
+            resolve_gate_transport(hook, hooks, client).map(|rp| (hook.priority, rp))
         })
         .collect()
 }
@@ -393,45 +413,97 @@ pub(crate) fn resolve_pool_gates(
 /// identity). A missing/invalid transport degrades to `None` — config_validate surfaces it loudly.
 fn resolve_gate_transport(
     hook: &crate::config::HookCfg,
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
 ) -> Option<ResolvedPolicy> {
-    let send_prompt = hook.prompt.sends_prompt();
-    let send_user = hook.user.sends_user();
-    // Webhook transport: validate the URL at load (SSRF guard, OTLP loopback carve-out).
+    let policy = gate_transport_only(hook, client)?;
+    let (on_error_chain, on_error) = resolve_on_error_chain(hook, hooks, client);
+    Some(ResolvedPolicy::Policy {
+        policy,
+        on_error,
+        on_error_chain,
+        timeout: policy_timeout(hook.timeout_ms),
+        send_prompt: hook.prompt.sends_prompt(),
+        send_user: hook.user.sends_user(),
+        on_empty: gate_on_empty(hook),
+    })
+}
+
+/// The bare transport of a gate — webhook (SSRF-validated at load) or Unix socket (lazy connect) —
+/// without the surrounding policy config. Shared by the primary resolution and the on_error chain.
+fn gate_transport_only(
+    hook: &crate::config::HookCfg,
+    client: &reqwest::Client,
+) -> Option<Arc<dyn RoutingPolicy>> {
     if let Some(url) = hook.webhook.as_deref() {
         let url = crate::observability::validate_routing_webhook_url(Some(url)).ok()?;
-        return Some(ResolvedPolicy::Policy {
-            policy: Arc::new(webhook::WebhookPolicy::new(url, client.clone())),
-            on_error: crate::config::on_error_terminal(&hook.on_error).unwrap_or_default(),
-            timeout: policy_timeout(hook.timeout_ms),
-            send_prompt,
-            send_user,
-            on_empty: gate_on_empty(hook),
-        });
+        return Some(Arc::new(webhook::WebhookPolicy::new(url, client.clone())));
     }
-    // Socket transport (Unix-only). The connection is LAZY — only the path's presence is checked.
-    resolve_gate_socket(hook, send_prompt, send_user)
+    gate_socket_transport(hook)
 }
 
 /// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`].
 #[cfg(unix)]
-fn resolve_gate_socket(
-    hook: &crate::config::HookCfg,
-    send_prompt: bool,
-    send_user: bool,
-) -> Option<ResolvedPolicy> {
+fn gate_socket_transport(hook: &crate::config::HookCfg) -> Option<Arc<dyn RoutingPolicy>> {
     let path = hook.socket.as_deref()?;
     if path.is_empty() {
         return None;
     }
-    Some(ResolvedPolicy::Policy {
-        policy: Arc::new(socket::SocketPolicy::new(path.to_string())),
-        on_error: crate::config::on_error_terminal(&hook.on_error).unwrap_or_default(),
-        timeout: policy_timeout(hook.timeout_ms),
-        send_prompt,
-        send_user,
-        on_empty: gate_on_empty(hook),
-    })
+    Some(Arc::new(socket::SocketPolicy::new(path.to_string())))
+}
+
+/// Resolve a hook's `on_error` NAME into its runtime fallback chain + terminal, following the
+/// registry: a reserved terminal stops immediately (the common, zero-cost case); a built-in ranking
+/// strategy appends one infallible link and terminates (its abstain converges with weighted);
+/// another GATE appends its transport and the walk continues through ITS `on_error`. Boot
+/// validation is the loud gate for unknown names / taps / cycles — here they degrade safely to the
+/// weighted terminal (never a stranded request), with a visited guard so a cycle cannot loop.
+fn resolve_on_error_chain<'a>(
+    hook: &'a crate::config::HookCfg,
+    hooks: &'a std::collections::HashMap<String, crate::config::HookCfg>,
+    client: &reqwest::Client,
+) -> (Vec<FallbackHook>, crate::config::PolicyOnError) {
+    let mut chain: Vec<FallbackHook> = Vec::new();
+    let mut visited: Vec<&str> = Vec::new();
+    let mut current: &'a str = hook.on_error.as_str();
+    loop {
+        if let Some(terminal) = crate::config::on_error_terminal(current) {
+            return (chain, terminal);
+        }
+        // A built-in ranking strategy: sync, no I/O, cannot fail — one link, then done. Compiled
+        // out, the name falls through to the registry lookup below (and validation errored at boot).
+        #[cfg(feature = "hooks-ranking")]
+        if let Some(policy) = crate::plugins::hooks::ranking::native_policy(current) {
+            chain.push(FallbackHook {
+                policy,
+                timeout: policy_timeout(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+                send_prompt: false,
+                send_user: false,
+                on_empty: crate::config::PolicyOnError::Reject,
+            });
+            return (chain, crate::config::PolicyOnError::Weighted);
+        }
+        if visited.contains(&current) {
+            return (chain, crate::config::PolicyOnError::default());
+        }
+        let Some(h) = hooks.get(current) else {
+            return (chain, crate::config::PolicyOnError::default());
+        };
+        if h.kind != crate::config::HookKind::Gate {
+            return (chain, crate::config::PolicyOnError::default());
+        }
+        if let Some(policy) = gate_transport_only(h, client) {
+            chain.push(FallbackHook {
+                policy,
+                timeout: policy_timeout(h.timeout_ms),
+                send_prompt: h.prompt.sends_prompt(),
+                send_user: h.user.sends_user(),
+                on_empty: gate_on_empty(h),
+            });
+        }
+        visited.push(current);
+        current = h.on_error.as_str();
+    }
 }
 
 /// A gate's `on_empty` behavior (empty restrict intersection): the configured value, or the
@@ -465,7 +537,7 @@ pub(crate) fn resolve_rewrite_hooks(
         }
         if let Some(ResolvedPolicy::Policy {
             policy, timeout, ..
-        }) = resolve_gate_transport(hook, client)
+        }) = resolve_gate_transport(hook, hooks, client)
         {
             ranked.push((hook.priority, timeout, policy));
         }
@@ -504,7 +576,7 @@ pub(crate) fn resolve_tap_hooks(
             timeout,
             send_prompt,
             ..
-        }) = resolve_gate_transport(hook, client)
+        }) = resolve_gate_transport(hook, hooks, client)
         {
             ranked.push((hook.priority, timeout, send_prompt, policy));
         }
@@ -537,7 +609,7 @@ pub(crate) fn resolve_gate_hooks(
         if hook.kind != crate::config::HookKind::Gate || hook.prompt.can_rewrite() {
             continue;
         }
-        if let Some(rp) = resolve_gate_transport(hook, client) {
+        if let Some(rp) = resolve_gate_transport(hook, hooks, client) {
             ranked.push((hook.priority, rp));
         }
     }
@@ -548,11 +620,7 @@ pub(crate) fn resolve_gate_hooks(
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
 /// SWRR with a loud pointer at the webhook transport. The request is never stranded.
 #[cfg(not(unix))]
-fn resolve_gate_socket(
-    _hook: &crate::config::HookCfg,
-    _send_prompt: bool,
-    _send_user: bool,
-) -> Option<ResolvedPolicy> {
+fn gate_socket_transport(_hook: &crate::config::HookCfg) -> Option<Arc<dyn RoutingPolicy>> {
     tracing::warn!(
         "a socket gate (Unix-domain-socket hook) is not available on this platform; falling back to \
          weighted. Use a `webhook:` hook for an out-of-process gate here."
@@ -597,7 +665,7 @@ mod tests {
     }
 
     /// Build a minimal `PoolCfg` with the given `route`/`policy` for resolve_policy tests.
-    use crate::config::{HookCfg, HookKind, PoolPolicy, PromptAccess, UserAccess};
+    use crate::config::{HookCfg, HookKind, PolicyOnError, PoolPolicy, PromptAccess, UserAccess};
     use std::collections::HashMap;
 
     /// A pool with a native ranking strategy and no gate.
@@ -807,6 +875,92 @@ mod tests {
     #[test]
     fn weighted_default_resolves_none() {
         assert!(resolve_policy(&pool_policy(PoolPolicy::Weighted)).is_none());
+    }
+
+    /// `on_error` resolution: a reserved terminal yields an EMPTY chain + that terminal; a gate
+    /// name appends its transport and follows ITS on_error; a ranking strategy appends one
+    /// infallible link and terminates.
+    #[cfg(unix)]
+    #[test]
+    fn on_error_chain_resolves_gates_and_terminals() {
+        let client = reqwest::Client::new();
+        // a (socket, on_error: b) -> b (socket, on_error: reject)
+        let mut a = base_gate();
+        a.socket = Some("/run/busbar/a.sock".to_string());
+        a.on_error = "b".to_string();
+        let mut b = base_gate();
+        b.socket = Some("/run/busbar/b.sock".to_string());
+        b.on_error = "reject".to_string();
+        let mut hooks = registry("a", a);
+        hooks.insert("b".to_string(), b);
+
+        let resolved = resolve_pool_gates(&pool_with_hook("a"), &hooks, &client);
+        let Some((
+            _,
+            ResolvedPolicy::Policy {
+                on_error,
+                on_error_chain,
+                ..
+            },
+        )) = resolved.into_iter().next()
+        else {
+            panic!("gate a must resolve");
+        };
+        assert_eq!(on_error_chain.len(), 1, "one fallback link (gate b)");
+        assert_eq!(on_error_chain[0].policy.name(), "socket");
+        assert_eq!(
+            on_error,
+            PolicyOnError::Reject,
+            "the chain bottoms out on b's reject terminal"
+        );
+
+        // A direct terminal ⇒ empty chain.
+        let mut c = base_gate();
+        c.socket = Some("/run/busbar/c.sock".to_string());
+        c.on_error = "first".to_string();
+        let hooks = registry("c", c);
+        let Some((
+            _,
+            ResolvedPolicy::Policy {
+                on_error,
+                on_error_chain,
+                ..
+            },
+        )) = resolve_pool_gates(&pool_with_hook("c"), &hooks, &client)
+            .into_iter()
+            .next()
+        else {
+            panic!("gate c must resolve");
+        };
+        assert!(on_error_chain.is_empty(), "a terminal name has no chain");
+        assert_eq!(on_error, PolicyOnError::First);
+    }
+
+    /// `on_error: <ranking strategy>` appends one infallible link and terminates at weighted.
+    #[cfg(all(unix, feature = "hooks-ranking"))]
+    #[test]
+    fn on_error_chain_strategy_terminates() {
+        let client = reqwest::Client::new();
+        let mut g = base_gate();
+        g.socket = Some("/run/busbar/g.sock".to_string());
+        g.on_error = "cheapest".to_string();
+        let hooks = registry("g", g);
+        let Some((
+            _,
+            ResolvedPolicy::Policy {
+                on_error,
+                on_error_chain,
+                ..
+            },
+        )) = resolve_pool_gates(&pool_with_hook("g"), &hooks, &client)
+            .into_iter()
+            .next()
+        else {
+            panic!("gate g must resolve");
+        };
+        assert_eq!(on_error_chain.len(), 1);
+        assert_eq!(on_error_chain[0].policy.name(), "cheapest");
+        assert_eq!(on_error, PolicyOnError::Weighted);
     }
 
     /// SECURITY INVARIANT: `resolve_rewrite_hooks` admits ONLY `prompt: rw` GATES as rewrite hooks.
