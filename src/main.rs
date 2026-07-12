@@ -605,7 +605,7 @@ async fn main() {
                     .collect(),
                 // Resolve the routing policy ONCE here. `route: weighted` (default) ⇒ `None` ⇒ the
                 // zero-cost inline SWRR path; the webhook transport reuses the shared upstream client.
-                policy: routing::resolve_policy(pool_cfg, &upstream_client),
+                policy: routing::resolve_policy(pool_cfg, &cfg.hooks, &upstream_client),
             },
         );
     }
@@ -1153,8 +1153,8 @@ mod tests {
             failover: None,
             on_exhausted: None,
             affinity: None,
-            route: crate::config::RouteKind::default(),
-            policy: None,
+            policy: crate::config::PoolPolicy::default(),
+            hook: None,
         }
     }
 

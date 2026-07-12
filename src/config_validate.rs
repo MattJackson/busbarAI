@@ -658,50 +658,78 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule (routing/webhook): a `route: webhook` pool MUST carry a `policy.url`, and that URL MUST
-    // pass the routing-webhook SSRF guard (the OTLP loopback carve-out: loopback/localhost sidecars
-    // allowed, link-local/IMDS/RFC1918/CGNAT/cloud-metadata blocked; plaintext http:// only on
-    // loopback). Rejected at startup rather than silently degrading to SWRR at runtime, so an operator
-    // who asked for a webhook policy learns immediately that it is misconfigured.
-    for (pool_name, pool_cfg) in &cfg.pools {
-        if pool_cfg.route != crate::config::RouteKind::Webhook {
-            continue;
+    // Rule (hooks/registry): every entry in the top-level `hooks:` registry is validated once, here.
+    // A hook declares EXACTLY ONE transport (`socket` XOR `webhook`); a webhook URL must pass the
+    // routing SSRF guard (OTLP loopback carve-out: loopback/localhost sidecars allowed, link-local/
+    // IMDS/RFC1918/CGNAT/cloud-metadata blocked; plaintext http:// only on loopback); a socket path
+    // must be non-empty + ABSOLUTE (a relative path silently depends on busbar's CWD) and the platform
+    // must support Unix domain sockets. Rejected at startup, never a silent degrade.
+    for (hook_name, hook) in &cfg.hooks {
+        match (hook.socket.as_deref(), hook.webhook.as_deref()) {
+            (None, None) | (Some(""), None) | (None, Some("")) => errors.push(format!(
+                "hook '{hook_name}' declares no transport: set exactly one of `socket` (a Unix \
+                 domain socket path) or `webhook` (an https URL)"
+            )),
+            (Some(_), Some(_)) => errors.push(format!(
+                "hook '{hook_name}' declares BOTH `socket` and `webhook`: a hook has exactly one \
+                 transport"
+            )),
+            (Some(path), None) => {
+                if !cfg!(unix) {
+                    errors.push(format!(
+                        "hook '{hook_name}' uses a `socket` transport, unavailable on this platform \
+                         (Unix domain sockets); use a `webhook` hook here"
+                    ));
+                } else if !path.starts_with('/') {
+                    errors.push(format!(
+                        "hook '{hook_name}' `socket` must be an absolute path (got '{path}'); a \
+                         relative path depends on busbar's working directory"
+                    ));
+                }
+            }
+            (None, Some(url)) => {
+                if let Err(msg) = crate::observability::validate_routing_webhook_url(Some(url)) {
+                    errors.push(format!("hook '{hook_name}' `webhook` is invalid: {msg}"));
+                }
+            }
         }
-        let url = pool_cfg.policy.as_ref().and_then(|p| p.url.as_deref());
-        if let Err(msg) = crate::observability::validate_routing_webhook_url(url) {
+        // `prompt: rw` grants the REWRITE arm, which only a GATE can return — a tap is fire-and-forget
+        // and never replies, so `rw` on a tap is a config error (it would silently never rewrite).
+        if hook.prompt == crate::config::PromptAccess::Rw
+            && hook.kind == crate::config::HookKind::Tap
+        {
             errors.push(format!(
-                "pool '{pool_name}' route: webhook is invalid: {msg}"
+                "hook '{hook_name}' is a tap with `prompt: rw`, but only a gate can rewrite (a tap \
+                 never replies). Use `kind: gate`, or lower to `prompt: ro`."
             ));
         }
     }
 
-    // Rule (routing/socket): a `route: socket` pool MUST carry a non-empty, ABSOLUTE `policy.socket`
-    // path (a relative path silently depends on busbar's CWD — a classic deploy footgun). The socket
-    // FILE may not exist yet (the hook binary can start after busbar; connection is lazy), so only
-    // the path's shape is validated. Rejected at startup rather than silently degrading to SWRR, so
-    // an operator who asked for a socket hook learns immediately that it is misconfigured. On
-    // non-unix platforms the transport is unavailable — also a startup error, pointing at webhook.
+    // Rule (hooks/pool-ref): a pool's `hook:` must name a registry entry that is a GATE (a tap can't
+    // influence routing). Dangling or wrong-kind references are startup errors that name the hook.
     for (pool_name, pool_cfg) in &cfg.pools {
-        if pool_cfg.route != crate::config::RouteKind::Socket {
+        let Some(hook_name) = pool_cfg.hook.as_deref() else {
             continue;
-        }
-        if !cfg!(unix) {
-            errors.push(format!(
-                "pool '{pool_name}' route: socket is not available on this platform (Unix domain \
-                 sockets); use route: webhook for an out-of-process routing hook here"
-            ));
-            continue;
-        }
-        match pool_cfg.policy.as_ref().and_then(|p| p.socket.as_deref()) {
-            None | Some("") => errors.push(format!(
-                "pool '{pool_name}' route: socket requires policy.socket (the hook binary's Unix \
-                 domain socket path)"
+        };
+        match cfg.hooks.get(hook_name) {
+            None => errors.push(format!(
+                "pool '{pool_name}' references unknown hook '{hook_name}'; define it under \
+                 top-level `hooks:`"
             )),
-            Some(path) if !path.starts_with('/') => errors.push(format!(
-                "pool '{pool_name}' policy.socket must be an absolute path (got '{path}'); a \
-                 relative path depends on busbar's working directory"
+            Some(h) if h.kind != crate::config::HookKind::Gate => errors.push(format!(
+                "pool '{pool_name}' hook '{hook_name}' is a tap, but a pool `hook:` must be a gate \
+                 (fire-and-wait); a tap cannot influence routing"
             )),
             Some(_) => {}
+        }
+    }
+
+    // Rule (hooks/global-ref): every name in `global_hooks:` must reference a registry entry.
+    for name in &cfg.global_hooks {
+        if !cfg.hooks.contains_key(name) {
+            errors.push(format!(
+                "global_hooks references unknown hook '{name}'; define it under top-level `hooks:`"
+            ));
         }
     }
 
@@ -1508,6 +1536,8 @@ mod tests {
             providers,
             models,
             pools,
+            hooks: HashMap::new(),
+            global_hooks: Vec::new(),
             blocked_metadata_hosts: Vec::new(),
             allow_metadata_hosts: Vec::new(),
             allow_all_metadata: false,
@@ -1562,8 +1592,8 @@ mod tests {
             failover: None,
             on_exhausted: None,
             affinity: None,
-            route: config::RouteKind::default(),
-            policy: None,
+            policy: config::PoolPolicy::default(),
+            hook: None,
         }
     }
 
@@ -3965,19 +3995,29 @@ models:
         let mut models = HashMap::new();
         models.insert("m1".to_string(), make_model("prov", 4));
         let mut pool = make_pool(vec![make_member("m1")]);
-        pool.route = config::RouteKind::Webhook;
-        pool.policy = Some(config::PolicyCfg {
-            url: url.map(str::to_string),
-            socket: None,
-            timeout_ms: 150,
-            on_error: config::PolicyOnError::default(),
-            send_prompt: false,
-            send_user: false,
-            name: None,
-        });
+        pool.hook = Some("h".to_string());
         let mut pools = HashMap::new();
         pools.insert("p1".to_string(), pool);
-        make_root_cfg(providers, models, pools)
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert("h".to_string(), gate_hook(None, url, 150));
+        cfg
+    }
+
+    /// A gate `HookCfg` with the given socket/webhook transport (test builder).
+    fn gate_hook(socket: Option<&str>, webhook: Option<&str>, timeout_ms: u64) -> config::HookCfg {
+        config::HookCfg {
+            kind: config::HookKind::Gate,
+            socket: socket.map(str::to_string),
+            webhook: webhook.map(str::to_string),
+            timeout_ms,
+            on_error: config::PolicyOnError::default(),
+            prompt: config::PromptAccess::No,
+            user: config::UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: false,
+        }
     }
 
     #[test]
@@ -3994,7 +4034,9 @@ models:
             let res = validate(&cfg);
             if let Err(errs) = res {
                 assert!(
-                    !errs.iter().any(|e| e.contains("route: webhook")),
+                    !errs
+                        .iter()
+                        .any(|e| e.contains("hook 'h'") && e.contains("webhook")),
                     "loopback sidecar '{ok}' must pass the routing-webhook guard; got: {errs:?}"
                 );
             }
@@ -4016,7 +4058,7 @@ models:
                 .unwrap_err_or_default(format!("'{bad}' must fail routing-webhook validation"));
             assert!(
                 errs.iter()
-                    .any(|e| e.contains("p1") && e.contains("route: webhook")),
+                    .any(|e| e.contains("hook 'h'") && e.contains("webhook")),
                 "internal/plaintext target '{bad}' must be rejected; got: {errs:?}"
             );
         }
@@ -4027,11 +4069,11 @@ models:
         // A `route: webhook` pool with no `policy.url` is a misconfiguration caught at startup.
         let cfg = webhook_pool_cfg(None);
         let errs = validate(&cfg)
-            .unwrap_err_or_default("missing policy.url must fail validation".to_string());
+            .unwrap_err_or_default("missing webhook transport must fail validation".to_string());
         assert!(
             errs.iter()
-                .any(|e| e.contains("route: webhook") && e.contains("required")),
-            "missing url must be reported; got: {errs:?}"
+                .any(|e| e.contains("hook 'h'") && e.contains("no transport")),
+            "a hook with no transport must be reported; got: {errs:?}"
         );
     }
 
@@ -4047,19 +4089,13 @@ models:
         let mut models = HashMap::new();
         models.insert("m1".to_string(), make_model("prov", 4));
         let mut pool = make_pool(vec![make_member("m1")]);
-        pool.route = config::RouteKind::Socket;
-        pool.policy = Some(config::PolicyCfg {
-            url: None,
-            socket: socket.map(str::to_string),
-            timeout_ms: 150,
-            on_error: config::PolicyOnError::default(),
-            send_prompt: false,
-            send_user: false,
-            name: None,
-        });
+        pool.hook = Some("h".to_string());
         let mut pools = HashMap::new();
         pools.insert("p1".to_string(), pool);
-        make_root_cfg(providers, models, pools)
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks
+            .insert("h".to_string(), gate_hook(socket, None, 150));
+        cfg
     }
 
     /// `route: socket` with a valid absolute path passes the socket rule (the socket FILE need not
@@ -4072,7 +4108,7 @@ models:
             assert!(
                 !errs
                     .iter()
-                    .any(|e| e.contains("route: socket") || e.contains("policy.socket")),
+                    .any(|e| e.contains("hook 'h'") && e.contains("socket")),
                 "an absolute socket path must pass the socket rule; got: {errs:?}"
             );
         }
@@ -4085,10 +4121,10 @@ models:
         for missing in [None, Some("")] {
             let cfg = socket_pool_cfg(missing);
             let errs = validate(&cfg)
-                .unwrap_err_or_default("missing policy.socket must fail validation".to_string());
+                .unwrap_err_or_default("missing socket transport must fail validation".to_string());
             assert!(
                 errs.iter()
-                    .any(|e| e.contains("route: socket") && e.contains("requires policy.socket")),
+                    .any(|e| e.contains("hook 'h'") && e.contains("no transport")),
                 "missing/empty socket path must be reported; got: {errs:?}"
             );
         }
@@ -4100,10 +4136,10 @@ models:
     fn test_socket_route_rejects_relative_path() {
         let cfg = socket_pool_cfg(Some("run/hook.sock"));
         let errs = validate(&cfg)
-            .unwrap_err_or_default("relative policy.socket must fail validation".to_string());
+            .unwrap_err_or_default("relative socket path must fail validation".to_string());
         assert!(
             errs.iter()
-                .any(|e| e.contains("policy.socket") && e.contains("absolute")),
+                .any(|e| e.contains("hook 'h'") && e.contains("absolute")),
             "relative socket path must be reported; got: {errs:?}"
         );
     }

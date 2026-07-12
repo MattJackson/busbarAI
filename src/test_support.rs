@@ -3867,8 +3867,8 @@ mod tests {
                 failover: None,
                 on_exhausted: None,
                 affinity: None,
-                route: crate::config::RouteKind::default(),
-                policy: None,
+                policy: crate::config::PoolPolicy::default(),
+                hook: None,
             };
             let make = |error_map: std::collections::HashMap<String, String>| {
                 let mut providers = HashMap::new();
@@ -3897,6 +3897,8 @@ mod tests {
                     providers,
                     models,
                     pools,
+                    hooks: HashMap::new(),
+                    global_hooks: Vec::new(),
                     blocked_metadata_hosts: Vec::new(),
                     allow_metadata_hosts: Vec::new(),
                     allow_all_metadata: false,

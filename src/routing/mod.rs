@@ -270,97 +270,87 @@ pub(crate) enum ResolvedPolicy {
 /// is stored on `PoolRuntime::policy` and consumed per-request by `forward::decide_policy_order`.
 pub(crate) fn resolve_policy(
     cfg: &crate::config::PoolCfg,
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
 ) -> Option<ResolvedPolicy> {
-    use crate::config::RouteKind;
-    match cfg.route {
-        // Default / absent: today's inline SWRR. No policy object — the zero-cost fast path.
-        RouteKind::Weighted => None,
-        // The native form (`route: native` + `policy.name`, OR a native shorthand desugared to the
-        // same shape by `PoolCfg`'s deserializer). Look the name up in the native registry and wrap
-        // it as a `Policy`. The `weighted` native resolves to `None` (the zero-cost default): it would
-        // only ever `Abstain`, so constructing a policy object + projection for it is pure waste —
-        // collapsing it to `None` keeps `route: native, policy.name: weighted` byte-identical to the
-        // default SWRR hot path. A missing `policy`/`name`, or an unknown name, falls back to `None`
-        // (default SWRR) — startup validation surfaces the misconfiguration; routing never strands.
-        RouteKind::Native => {
-            let policy_cfg = cfg.policy.as_ref()?;
-            let name = policy_cfg.name.as_deref()?;
-            // `weighted` ⇒ the zero-cost default path (no policy object, inline SWRR).
-            if name == native::POLICY_NAME_WEIGHTED {
-                return None;
-            }
-            let policy = native::native_policy(name)?;
-            // The payload opt-ins are webhook/socket-only: native policies rank on live signals
-            // and have no reader for prompt/identity, so the flags are FORCED OFF — honoring them
-            // would burn per-request flattening/lookup building data
-            // nothing reads. Warn so the operator learns the flags are inert here.
-            if policy_cfg.send_prompt || policy_cfg.send_user {
-                tracing::warn!(
-                    "route: native does not support policy.send_prompt / policy.send_user; the \
-                     flags are ignored. Use `route: socket` or `route: webhook` for the payload \
-                     opt-ins."
-                );
-            }
-            Some(ResolvedPolicy::Policy {
-                policy,
-                on_error: policy_cfg.on_error.clone(),
-                timeout: policy_timeout(policy_cfg.timeout_ms),
-                send_prompt: false,
-                send_user: false,
-            })
-        }
-        // The operator-sidecar HTTP transport. The URL is validated at config load
-        // (`observability::validate_routing_webhook_url`, the OTLP loopback carve-out); here we
-        // construct the `WebhookPolicy` over that URL and a clone of the SHARED upstream client. A
-        // missing/invalid URL falls back to `None` (the default SWRR path) — startup validation is
-        // what surfaces the misconfiguration; routing must never strand a request.
-        RouteKind::Webhook => {
-            let policy_cfg = cfg.policy.as_ref()?;
-            let url = policy_cfg.url.as_deref()?;
-            let url = crate::observability::validate_routing_webhook_url(Some(url)).ok()?;
-            Some(ResolvedPolicy::Policy {
-                policy: Arc::new(webhook::WebhookPolicy::new(url, client.clone())),
-                on_error: policy_cfg.on_error.clone(),
-                timeout: policy_timeout(policy_cfg.timeout_ms),
-                send_prompt: policy_cfg.send_prompt,
-                send_user: policy_cfg.send_user,
-            })
-        }
-        // The Unix-socket BINARY hook: an operator-run compiled hook on a local Unix domain socket,
-        // same wire contract as the webhook, microseconds instead of a network hop. Unix-only; the
-        // non-unix arm degrades loudly to the default (use `route: webhook` there). A missing socket
-        // path falls back to `None` — startup validation surfaces the misconfiguration.
-        RouteKind::Socket => resolve_socket(cfg),
+    // A pool's `hook:` GATE takes the resolved-policy slot when present. Full composition — a gate's
+    // `order` reply falling back to the native `policy:` ordering — lands in the slice-4 seam; for now
+    // the gate resolves to one transport policy exactly as 1.2.1's `route: socket|webhook` did.
+    if let Some(hook_name) = cfg.hook.as_deref() {
+        // A missing entry / non-gate kind is caught loudly by config_validate; if somehow unresolved
+        // here, degrade to None (default SWRR) rather than strand a request.
+        let hook = hooks.get(hook_name)?;
+        return resolve_gate_transport(hook, client);
     }
+    // No gate: resolve the native `policy:` ordering. `weighted` ⇒ the zero-cost default path (no
+    // policy object, inline SWRR) — byte-identical to 1.2.1's `route: weighted`.
+    let name = cfg.policy.native_name()?;
+    let policy = native::native_policy(name)?;
+    Some(ResolvedPolicy::Policy {
+        policy,
+        on_error: crate::config::PolicyOnError::default(),
+        timeout: policy_timeout(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+        // Native policies rank on live signals and have no reader for prompt/identity.
+        send_prompt: false,
+        send_user: false,
+    })
 }
 
-/// Resolve a `route: socket` pool: wrap the configured socket path as a [`socket::SocketPolicy`].
-/// The connection is LAZY (the hook binary may start after busbar), so only the path's presence is
-/// checked here; `config_validate` enforces it loudly at startup.
+/// Resolve a GATE hook's transport (socket or webhook) into a [`ResolvedPolicy`]. The prompt/identity
+/// projections are gated by the hook's `prompt:`/`user:` grants (`ro`/`rw` send the prompt; `ro` sends
+/// identity). A missing/invalid transport degrades to `None` — config_validate surfaces it loudly.
+fn resolve_gate_transport(
+    hook: &crate::config::HookCfg,
+    client: &reqwest::Client,
+) -> Option<ResolvedPolicy> {
+    let send_prompt = hook.prompt.sends_prompt();
+    let send_user = hook.user.sends_user();
+    // Webhook transport: validate the URL at load (SSRF guard, OTLP loopback carve-out).
+    if let Some(url) = hook.webhook.as_deref() {
+        let url = crate::observability::validate_routing_webhook_url(Some(url)).ok()?;
+        return Some(ResolvedPolicy::Policy {
+            policy: Arc::new(webhook::WebhookPolicy::new(url, client.clone())),
+            on_error: hook.on_error.clone(),
+            timeout: policy_timeout(hook.timeout_ms),
+            send_prompt,
+            send_user,
+        });
+    }
+    // Socket transport (Unix-only). The connection is LAZY — only the path's presence is checked.
+    resolve_gate_socket(hook, send_prompt, send_user)
+}
+
+/// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`].
 #[cfg(unix)]
-fn resolve_socket(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
-    let policy_cfg = cfg.policy.as_ref()?;
-    let path = policy_cfg.socket.as_deref()?;
+fn resolve_gate_socket(
+    hook: &crate::config::HookCfg,
+    send_prompt: bool,
+    send_user: bool,
+) -> Option<ResolvedPolicy> {
+    let path = hook.socket.as_deref()?;
     if path.is_empty() {
         return None;
     }
     Some(ResolvedPolicy::Policy {
         policy: Arc::new(socket::SocketPolicy::new(path.to_string())),
-        on_error: policy_cfg.on_error.clone(),
-        timeout: policy_timeout(policy_cfg.timeout_ms),
-        send_prompt: policy_cfg.send_prompt,
-        send_user: policy_cfg.send_user,
+        on_error: hook.on_error.clone(),
+        timeout: policy_timeout(hook.timeout_ms),
+        send_prompt,
+        send_user,
     })
 }
 
-/// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so `route: socket` degrades to the
-/// default SWRR with a loud pointer at the webhook transport. The request is never stranded.
+/// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
+/// SWRR with a loud pointer at the webhook transport. The request is never stranded.
 #[cfg(not(unix))]
-fn resolve_socket(_cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
+fn resolve_gate_socket(
+    _hook: &crate::config::HookCfg,
+    _send_prompt: bool,
+    _send_user: bool,
+) -> Option<ResolvedPolicy> {
     tracing::warn!(
-        "route: socket (the Unix-socket hook) is not available on this platform; falling back to \
-         weighted. Use `route: webhook` for an out-of-process routing hook here."
+        "a socket gate (Unix-domain-socket hook) is not available on this platform; falling back to \
+         weighted. Use a `webhook:` hook for an out-of-process gate here."
     );
     None
 }
@@ -402,180 +392,154 @@ mod tests {
     }
 
     /// Build a minimal `PoolCfg` with the given `route`/`policy` for resolve_policy tests.
-    fn pool_cfg(
-        route: crate::config::RouteKind,
-        policy: Option<crate::config::PolicyCfg>,
-    ) -> crate::config::PoolCfg {
+    use crate::config::{HookCfg, HookKind, PolicyOnError, PoolPolicy, PromptAccess, UserAccess};
+    use std::collections::HashMap;
+
+    /// A pool with a native ranking strategy and no gate.
+    fn pool_policy(policy: PoolPolicy) -> crate::config::PoolCfg {
         crate::config::PoolCfg {
             members: vec![],
             breaker: None,
             failover: None,
             on_exhausted: None,
             affinity: None,
-            route,
             policy,
+            hook: None,
         }
     }
 
-    /// `route: native` + a non-weighted `policy.name` must resolve to a constructed `Policy`.
-    /// The resolved policy's name must round-trip the native registry name.
+    /// A pool referencing a gate hook by name (native strategy defaults to weighted).
+    fn pool_with_hook(name: &str) -> crate::config::PoolCfg {
+        crate::config::PoolCfg {
+            members: vec![],
+            breaker: None,
+            failover: None,
+            on_exhausted: None,
+            affinity: None,
+            policy: PoolPolicy::Weighted,
+            hook: Some(name.to_string()),
+        }
+    }
+
+    /// A minimal gate hook; transport/grants filled by the caller.
+    fn base_gate() -> HookCfg {
+        HookCfg {
+            kind: HookKind::Gate,
+            socket: None,
+            webhook: None,
+            timeout_ms: crate::config::DEFAULT_POLICY_TIMEOUT_MS,
+            on_error: PolicyOnError::default(),
+            prompt: PromptAccess::No,
+            user: UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: false,
+        }
+    }
+
+    /// A one-entry hooks registry.
+    fn registry(name: &str, hook: HookCfg) -> HashMap<String, HookCfg> {
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), hook);
+        m
+    }
+
+    /// Each native `policy:` strategy resolves to a constructed `Policy` whose name round-trips the
+    /// native registry name. (No gate; empty hook registry.)
     #[test]
-    fn native_arm_resolves_constructed_policy() {
-        use crate::config::{PolicyCfg, RouteKind};
+    fn native_policy_resolves_constructed_policy() {
         let client = reqwest::Client::new();
-        for name in ["cheapest", "fastest", "least_busy", "usage"] {
-            let cfg = pool_cfg(
-                RouteKind::Native,
-                Some(PolicyCfg {
-                    name: Some(name.to_string()),
-                    ..Default::default()
-                }),
-            );
-            match resolve_policy(&cfg, &client) {
+        let hooks = HashMap::new();
+        for (policy, name) in [
+            (PoolPolicy::Cheapest, "cheapest"),
+            (PoolPolicy::Fastest, "fastest"),
+            (PoolPolicy::LeastBusy, "least_busy"),
+            (PoolPolicy::Usage, "usage"),
+        ] {
+            let cfg = pool_policy(policy);
+            match resolve_policy(&cfg, &hooks, &client) {
                 Some(ResolvedPolicy::Policy { policy, .. }) => {
-                    assert_eq!(policy.name(), name, "resolved native policy name must round-trip");
-                }
-                other => panic!("route: native, policy.name: {name} must resolve to a Policy, got a non-Policy resolution: {}", other.is_none()),
-            }
-        }
-    }
-
-    /// `route: native, policy.name: weighted` collapses to the zero-cost default (`None`): the
-    /// weighted native only ever Abstains, so building a policy object for it is pure waste.
-    #[test]
-    fn native_weighted_resolves_none_zero_cost() {
-        use crate::config::{PolicyCfg, RouteKind};
-        let client = reqwest::Client::new();
-        let cfg = pool_cfg(
-            RouteKind::Native,
-            Some(PolicyCfg {
-                name: Some("weighted".to_string()),
-                ..Default::default()
-            }),
-        );
-        assert!(
-            resolve_policy(&cfg, &client).is_none(),
-            "the weighted native must collapse to the zero-cost default path"
-        );
-    }
-
-    /// A `route: native` with a missing `policy`/`name`, or an unknown name, falls back to `None`
-    /// (default SWRR) — routing must never strand a request; startup validation surfaces the misconfig.
-    #[test]
-    fn native_missing_or_unknown_name_falls_back_to_none() {
-        use crate::config::{PolicyCfg, RouteKind};
-        let client = reqwest::Client::new();
-        // No policy at all.
-        assert!(resolve_policy(&pool_cfg(RouteKind::Native, None), &client).is_none());
-        // Policy present but no name.
-        assert!(resolve_policy(
-            &pool_cfg(RouteKind::Native, Some(PolicyCfg::default())),
-            &client
-        )
-        .is_none());
-        // Unknown name.
-        assert!(resolve_policy(
-            &pool_cfg(
-                RouteKind::Native,
-                Some(PolicyCfg {
-                    name: Some("nonexistent".to_string()),
-                    ..Default::default()
-                }),
-            ),
-            &client
-        )
-        .is_none());
-    }
-
-    /// `route: socket` + a `policy.socket` path resolves to a constructed socket policy (unix);
-    /// a missing/empty path falls back to `None` (startup validation surfaces the misconfig).
-    #[cfg(unix)]
-    #[test]
-    fn socket_arm_resolves_constructed_policy() {
-        use crate::config::{PolicyCfg, RouteKind};
-        let client = reqwest::Client::new();
-        let cfg = pool_cfg(
-            RouteKind::Socket,
-            Some(PolicyCfg {
-                socket: Some("/run/busbar/hook.sock".to_string()),
-                ..Default::default()
-            }),
-        );
-        match resolve_policy(&cfg, &client) {
-            Some(ResolvedPolicy::Policy { policy, .. }) => assert_eq!(policy.name(), "socket"),
-            other => panic!(
-                "route: socket must resolve to a Policy, got none={}",
-                other.is_none()
-            ),
-        }
-        // Missing / empty socket path → None (default SWRR; validation is the loud gate).
-        assert!(resolve_policy(&pool_cfg(RouteKind::Socket, None), &client).is_none());
-        assert!(resolve_policy(
-            &pool_cfg(
-                RouteKind::Socket,
-                Some(PolicyCfg {
-                    socket: Some(String::new()),
-                    ..Default::default()
-                }),
-            ),
-            &client
-        )
-        .is_none());
-    }
-
-    /// The `route: socket` YAML shorthand desugars to `RouteKind::Socket` and resolves with the
-    /// documented default deadline (not 0ms) — same guarantee as the native shorthands.
-    #[cfg(unix)]
-    #[test]
-    fn socket_route_parses_and_gets_default_timeout() {
-        let client = reqwest::Client::new();
-        let yaml = "route: socket\nmembers: []\npolicy:\n  socket: /run/busbar/hook.sock\n";
-        let cfg: crate::config::PoolCfg = serde_yaml::from_str(yaml).expect("socket route parses");
-        assert_eq!(cfg.route, crate::config::RouteKind::Socket);
-        match resolve_policy(&cfg, &client) {
-            Some(ResolvedPolicy::Policy { timeout, .. }) => assert_eq!(
-                timeout,
-                std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
-            ),
-            other => panic!("must resolve, got none={}", other.is_none()),
-        }
-    }
-
-    /// The plain default (`route: weighted`) stays the zero-cost `None` path.
-    #[test]
-    fn weighted_route_resolves_none() {
-        let client = reqwest::Client::new();
-        assert!(
-            resolve_policy(&pool_cfg(crate::config::RouteKind::Weighted, None), &client).is_none()
-        );
-    }
-
-    /// A native shorthand (`route: cheapest`, etc.) must resolve to a `Policy` whose hard deadline
-    /// is the documented default — NOT the 0ms a `PolicyCfg::default()`-built struct would carry.
-    /// Drives the desugar through serde (as a real config would) and then `resolve_policy`.
-    #[test]
-    fn shorthand_route_resolves_default_timeout_not_zero() {
-        let client = reqwest::Client::new();
-        for name in ["cheapest", "fastest", "least_busy", "usage"] {
-            let yaml = format!("route: {name}\nmembers: []\n");
-            let cfg: crate::config::PoolCfg =
-                serde_yaml::from_str(&yaml).expect("shorthand must parse");
-            match resolve_policy(&cfg, &client) {
-                Some(ResolvedPolicy::Policy { timeout, .. }) => {
                     assert_eq!(
-                        timeout,
-                        std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
-                        "shorthand `route: {name}` must resolve to the documented \
-                         {default}ms deadline, not 0ms",
-                        default = crate::config::DEFAULT_POLICY_TIMEOUT_MS,
+                        policy.name(),
+                        name,
+                        "resolved native policy name must round-trip"
                     );
                 }
                 other => panic!(
-                    "shorthand `route: {name}` must resolve to a Policy, got none={}",
+                    "policy: {name} must resolve to a Policy, got none={}",
                     other.is_none()
                 ),
             }
         }
+    }
+
+    /// `policy: weighted` (default / absent) collapses to the zero-cost default (`None`).
+    #[test]
+    fn weighted_policy_resolves_none_zero_cost() {
+        let client = reqwest::Client::new();
+        let hooks = HashMap::new();
+        assert!(
+            resolve_policy(&pool_policy(PoolPolicy::Weighted), &hooks, &client).is_none(),
+            "the weighted native must collapse to the zero-cost default path"
+        );
+    }
+
+    /// A pool `hook:` referencing an UNKNOWN registry entry degrades to `None` (default SWRR) — routing
+    /// never strands a request; config_validate is the loud gate that rejects the dangling ref at boot.
+    #[test]
+    fn unknown_hook_ref_falls_back_to_none() {
+        let client = reqwest::Client::new();
+        let hooks = HashMap::new();
+        assert!(resolve_policy(&pool_with_hook("nonexistent"), &hooks, &client).is_none());
+    }
+
+    /// A pool `hook:` naming a socket gate resolves to a constructed socket policy (unix); an
+    /// empty socket path degrades to `None`.
+    #[cfg(unix)]
+    #[test]
+    fn socket_gate_resolves_constructed_policy() {
+        let client = reqwest::Client::new();
+        let hooks = registry(
+            "h",
+            HookCfg {
+                socket: Some("/run/busbar/hook.sock".to_string()),
+                ..base_gate()
+            },
+        );
+        match resolve_policy(&pool_with_hook("h"), &hooks, &client) {
+            Some(ResolvedPolicy::Policy {
+                policy, timeout, ..
+            }) => {
+                assert_eq!(policy.name(), "socket");
+                assert_eq!(
+                    timeout,
+                    std::time::Duration::from_millis(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+                    "a gate with the default timeout resolves to the documented deadline, not 0ms",
+                );
+            }
+            other => panic!(
+                "socket gate must resolve to a Policy, got none={}",
+                other.is_none()
+            ),
+        }
+        // Empty socket path → None (default SWRR; validation is the loud gate).
+        let empty = registry(
+            "h",
+            HookCfg {
+                socket: Some(String::new()),
+                ..base_gate()
+            },
+        );
+        assert!(resolve_policy(&pool_with_hook("h"), &empty, &client).is_none());
+    }
+
+    /// The plain default (`policy: weighted`, no hook) stays the zero-cost `None` path.
+    #[test]
+    fn weighted_default_resolves_none() {
+        let client = reqwest::Client::new();
+        let hooks = HashMap::new();
+        assert!(resolve_policy(&pool_policy(PoolPolicy::Weighted), &hooks, &client).is_none());
     }
 
     /// The `timeout_ms == 0` → default guard in `policy_timeout` (belt-and-suspenders for any
@@ -608,22 +572,12 @@ mod tests {
         );
     }
 
-    /// `route: native` FORCES the payload opt-ins off at resolve (no native policy reads them).
+    /// A native `policy:` FORCES the payload projections off at resolve (no native policy reads them).
     #[test]
     fn native_resolve_forces_opt_in_flags_off() {
-        use crate::config::{PolicyCfg, RouteKind};
         let client = reqwest::Client::new();
-        let cfg = pool_cfg(
-            RouteKind::Native,
-            Some(PolicyCfg {
-                name: Some(native::POLICY_NAME_CHEAPEST.to_string()),
-                timeout_ms: 5,
-                send_prompt: true,
-                send_user: true,
-                ..Default::default()
-            }),
-        );
-        match resolve_policy(&cfg, &client) {
+        let hooks = HashMap::new();
+        match resolve_policy(&pool_policy(PoolPolicy::Cheapest), &hooks, &client) {
             Some(ResolvedPolicy::Policy {
                 send_prompt,
                 send_user,
@@ -636,55 +590,54 @@ mod tests {
         }
     }
 
-    /// The hook transports PASS the opt-in flags THROUGH to the resolved policy — the mirror
-    /// image of the native force-off: an accidental hardcoded `false` in the webhook or
-    /// socket arm would silently strip content from every opted-in hook. The socket half runs on
-    /// unix only: on other platforms `route: socket` deliberately resolves to `None` (degrades to
-    /// weighted with a warning), so there is no policy to assert flags on.
+    /// A gate hook's `prompt: ro` / `user: ro` grants PASS THROUGH to the resolved policy as
+    /// send_prompt / send_user — the mirror image of the native force-off: an accidental hardcoded
+    /// `false` in the webhook or socket arm would silently strip content from every opted-in hook.
+    /// The socket half runs on unix only (elsewhere a socket gate resolves to `None`).
     #[test]
-    fn hook_transports_pass_opt_in_flags_through() {
-        use crate::config::{PolicyCfg, RouteKind};
+    fn gate_grants_pass_through_as_projection_flags() {
         let client = reqwest::Client::new();
         // On non-unix the socket push below is compiled out and `mut` would be unused.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases = vec![(
             "webhook",
-            pool_cfg(
-                RouteKind::Webhook,
-                Some(PolicyCfg {
-                    url: Some("http://127.0.0.1:8787/".to_string()),
-                    timeout_ms: 5,
-                    send_prompt: true,
-                    send_user: true,
-                    ..Default::default()
-                }),
+            registry(
+                "h",
+                HookCfg {
+                    webhook: Some("http://127.0.0.1:8787/".to_string()),
+                    prompt: PromptAccess::Ro,
+                    user: UserAccess::Ro,
+                    ..base_gate()
+                },
             ),
         )];
         #[cfg(unix)]
         cases.push((
             "socket",
-            pool_cfg(
-                RouteKind::Socket,
-                Some(PolicyCfg {
+            registry(
+                "h",
+                HookCfg {
                     socket: Some("/run/busbar/hook.sock".to_string()),
-                    timeout_ms: 5,
-                    send_prompt: true,
-                    send_user: true,
-                    ..Default::default()
-                }),
+                    prompt: PromptAccess::Ro,
+                    user: UserAccess::Ro,
+                    ..base_gate()
+                },
             ),
         ));
-        for (label, cfg) in cases {
-            match resolve_policy(&cfg, &client) {
+        for (label, hooks) in cases {
+            match resolve_policy(&pool_with_hook("h"), &hooks, &client) {
                 Some(ResolvedPolicy::Policy {
                     send_prompt,
                     send_user,
                     ..
                 }) => {
-                    assert!(send_prompt, "{label} must pass send_prompt through");
-                    assert!(send_user, "{label} must pass send_user through");
+                    assert!(
+                        send_prompt,
+                        "{label} must pass prompt:ro through as send_prompt"
+                    );
+                    assert!(send_user, "{label} must pass user:ro through as send_user");
                 }
-                None => panic!("{label} pool must resolve to a policy"),
+                None => panic!("{label} gate must resolve to a policy"),
             }
         }
     }
