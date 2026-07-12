@@ -336,6 +336,33 @@ pub(crate) struct EffectiveConfigView {
     pub(crate) global_hooks: Vec<String>,
 }
 
+/// Fleet usage aggregation (`GET /admin/v1/usage`) — spend/tokens/requests totals plus a per-key
+/// breakdown, read from governance's per-key counters. The data-plane half of metering. Empty (zero
+/// totals, no keys) when governance is disabled. No secrets — key ids/names only, never a token.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct UsageView {
+    pub(crate) total: UsageTotals,
+    pub(crate) keys: Vec<KeyUsageView>,
+}
+
+/// Aggregate spend/tokens/requests across all keys (the fleet totals).
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct UsageTotals {
+    pub(crate) spend_cents: i64,
+    pub(crate) tokens: u64,
+    pub(crate) requests: u64,
+}
+
+/// One key's usage in the fleet breakdown: the key id/name (never the secret) + its counters.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct KeyUsageView {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) spend_cents: i64,
+    pub(crate) tokens: u64,
+    pub(crate) requests: u64,
+}
+
 /// The result of `POST /admin/v1/config/validate` — a DRY-RUN: does a proposed config resolve +
 /// validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
 /// failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid

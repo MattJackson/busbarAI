@@ -15,8 +15,9 @@ use crate::state::App;
 
 use super::contract::{
     AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView, HookHealthView,
-    HookTransportView, HookView, InfoView, ModelView, Page, PluginView, PoolDetailView,
-    PoolMemberStatusView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
+    HookTransportView, HookView, InfoView, KeyUsageView, ModelView, Page, PluginView,
+    PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
+    UsageTotals, UsageView,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
@@ -355,6 +356,56 @@ impl AdminService {
                 }),
                 Err(errors) => Ok(ConfigValidateView { ok: false, errors }),
             },
+        }
+    }
+
+    /// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests totals + per-key
+    /// breakdown) from governance's counters. Read scope. Empty when governance is disabled. The
+    /// per-key store reads run on a blocking thread (the SQLite store is synchronous), so the async
+    /// runtime is never blocked. Never returns a secret — ids/names only.
+    pub(crate) async fn get_usage(&self) -> Result<UsageView, AdminError> {
+        let Some(gov) = self.app.governance.clone() else {
+            return Ok(UsageView {
+                total: UsageTotals::default(),
+                keys: Vec::new(),
+            });
+        };
+        let now = crate::store::now();
+        let joined = tokio::task::spawn_blocking(move || -> Result<UsageView, ()> {
+            let keys = gov.all_keys().map_err(|_| ())?;
+            let mut total = UsageTotals::default();
+            let mut per_key = Vec::with_capacity(keys.len());
+            for k in keys {
+                let u = gov.usage_for(&k.id, now).map_err(|_| ())?.unwrap_or(
+                    crate::governance::Usage {
+                        spend_cents: 0,
+                        tokens: 0,
+                        requests: 0,
+                    },
+                );
+                total.spend_cents = total.spend_cents.saturating_add(u.spend_cents);
+                total.tokens = total.tokens.saturating_add(u.tokens);
+                total.requests = total.requests.saturating_add(u.requests);
+                per_key.push(KeyUsageView {
+                    id: k.id,
+                    name: k.name,
+                    spend_cents: u.spend_cents,
+                    tokens: u.tokens,
+                    requests: u.requests,
+                });
+            }
+            per_key.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(UsageView {
+                total,
+                keys: per_key,
+            })
+        })
+        .await;
+        match joined {
+            Ok(Ok(view)) => Ok(view),
+            // A store failure or a blocking-join failure is an internal error (details logged upstream
+            // in the store layer); the caller never sees store internals.
+            Ok(Err(())) | Err(_) => Err(AdminError::Internal),
         }
     }
 

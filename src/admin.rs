@@ -854,6 +854,65 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/usage` aggregates governance's per-key counters into fleet totals + a per-key
+    /// breakdown. A freshly minted key appears with zero usage; totals reflect it. Never leaks the
+    /// secret (id/name only).
+    #[tokio::test]
+    async fn test_admin_v1_usage_aggregates_per_key() {
+        use crate::governance::NewKeySpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        // Mint a key directly so the fleet has something to aggregate.
+        let (minted, minted_secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "team-a".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/usage"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(body["total"]["spend_cents"].is_number());
+        assert!(body["total"]["tokens"].is_number());
+        assert!(body["total"]["requests"].is_number());
+        let keys = body["keys"].as_array().unwrap();
+        let entry = keys
+            .iter()
+            .find(|k| k["name"] == "team-a")
+            .expect("minted key appears in usage");
+        assert_eq!(entry["id"], minted.id);
+        assert_eq!(entry["spend_cents"], 0, "fresh key has no spend");
+        // The secret is never present in the usage body.
+        let text = body.to_string();
+        assert!(
+            !text.contains(&minted_secret),
+            "usage must not leak the key secret"
+        );
+
+        handle.abort();
+    }
+
     /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
     /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
     /// secret. Built on a fixture with one global gate.
