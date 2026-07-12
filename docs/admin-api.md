@@ -49,7 +49,7 @@ Returns the OpenAPI 3.1 schema of the whole surface — generate a client, or po
 
 | Endpoint | Returns |
 |---|---|
-| `GET /admin/v1/info` | Busbar version, uptime, the **compiled-in plugin proof** (`auth_modules`, `hook_plugins`, and the always-present `weighted_floor`), and a pool/model/provider count summary |
+| `GET /admin/v1/info` | Busbar version, uptime, the **compiled-in plugin proof** (`auth_modules`, `hook_plugins`, and the always-present `weighted_floor`), a pool/model/provider count summary, `config_persistence` (whether API changes survive restart), and `config_version` (bumps on each apply — for drift detection) |
 | `GET /admin/v1/pools` | Every pool with its member models and SWRR weights |
 | `GET /admin/v1/pools/{name}` | One pool's **live** per-member status: usable + breaker cooldown, available concurrency, in-flight count, latency EWMA, and success/error tallies |
 | `GET /admin/v1/models` | Every model lane and its upstream provider |
@@ -82,7 +82,7 @@ Module names and modes only — never a token.
 | Endpoint | Returns |
 |---|---|
 | `GET /admin/v1/usage` | Fleet usage aggregation: spend/tokens/requests totals plus a per-key breakdown |
-| `GET /admin/v1/config` | The effective running config as one snapshot (auth, pools, models, providers, hooks, global hooks) — for drift detection. Composed from the redacted reads above, so it carries no secret |
+| `GET /admin/v1/config` | The effective running config as one snapshot (`version`, auth, pools, models, providers, hooks, global hooks) — for drift detection. Composed from the redacted reads above, so it carries no secret |
 | `GET /admin/v1/audit` | The admin audit log — every config mutation with its outcome (`applied`/`rejected`), newest first: who changed what, when. No secrets |
 | `POST /admin/v1/config/validate` | **Dry-run** a proposed config (`config.yaml` deploy block + `providers.yaml` defs) through the same resolve + validate Busbar runs at boot, without applying anything. Returns `{ "ok": true }` or `{ "ok": false, "errors": [...] }`. A malformed request body is `invalid_request`; a valid request describing an invalid config is `200` with `ok: false` |
 
