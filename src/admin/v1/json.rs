@@ -283,7 +283,8 @@ fn openapi_doc() -> serde_json::Value {
                 "security": [{"adminToken": []}],
                 "responses": {
                     "201": {"description": "Registered (body is the hook definition)"},
-                    "400": {"description": "Malformed body or invalid definition (`invalid_request`)"}
+                    "400": {"description": "Malformed body or invalid definition (`invalid_request`)"},
+                    "409": {"description": "Grant change on an existing hook (`conflict`, §6.4 immutability)"}
                 }
             }),
         );

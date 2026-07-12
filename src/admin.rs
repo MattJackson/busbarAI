@@ -1140,6 +1140,32 @@ mod tests {
             "invalid_request"
         );
 
+        // Grant immutability over the wire (§6.4): re-registering "compress" (a prompt:rw gate) with a
+        // DIFFERENT grant (prompt:ro) → 409 conflict, no mutation. Same grants would be idempotent.
+        let escalate = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "compress",
+                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:9977/", "prompt": "ro"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            escalate.status().as_u16(),
+            409,
+            "grant change must conflict"
+        );
+        assert_eq!(
+            escalate.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "conflict"
+        );
+
         handle.abort();
     }
 
