@@ -1353,6 +1353,65 @@ mod tests {
         handle.abort();
     }
 
+    /// Config-overlay PERSISTENCE: with an overlay path set, registering a hook over the API writes it
+    /// to the overlay file, and merging that overlay onto a fresh base config (a "restart") restores
+    /// the hook — so a runtime-registered hook survives a restart.
+    #[tokio::test]
+    async fn test_admin_v1_hook_register_persists_to_overlay() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let overlay = std::env::temp_dir().join(format!(
+            "busbar-persist-test-{}-{}.json",
+            std::process::id(),
+            crate::store::now()
+        ));
+        let _ = std::fs::remove_file(&overlay);
+        let app = TestApp::new()
+            .governance(gov)
+            .overlay_path(overlay.clone())
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Register a global gate — the handler persists it to the overlay file.
+        let created = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "persisted_gate",
+                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:9981/", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+
+        // The overlay file now holds the hook.
+        let doc = crate::config::overlay::read(&overlay).expect("overlay written");
+        assert!(doc.hooks.contains_key("persisted_gate"));
+        assert!(doc.global_hooks.iter().any(|g| g == "persisted_gate"));
+
+        // "Restart": merge the overlay onto a fresh base config → the hook is restored.
+        let mut fresh: crate::config::DeployCfg =
+            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
+        crate::config::overlay::merge_into(&mut fresh, doc);
+        assert!(
+            fresh.hooks.contains_key("persisted_gate"),
+            "the runtime-registered hook survives a restart via the overlay"
+        );
+
+        let _ = std::fs::remove_file(&overlay);
+        handle.abort();
+    }
+
     /// Key mutations are audited too (§6.7 — EVERY admin mutation): minting a key records
     /// `key.create` / `applied` with the new key's id.
     #[tokio::test]

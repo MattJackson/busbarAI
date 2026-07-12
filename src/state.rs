@@ -150,6 +150,11 @@ pub(crate) struct App {
     /// true`). Carried for the hooks read surface so a definition can report whether it is globally
     /// wired. Read-only after construction.
     pub(crate) global_hooks: Vec<String>,
+    /// The config-overlay path (`BUSBAR_CONFIG_OVERLAY`), if persistence is enabled. `Some` = an
+    /// API-applied hook change is written here so it survives a restart (re-merged onto base config at
+    /// boot); `None` (the default) = runtime changes are live but not persisted. Carried on `App` (not
+    /// a global) so it is testable + survives config swaps (`App::clone` copies it).
+    pub(crate) overlay_path: Option<std::path::PathBuf>,
     /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).

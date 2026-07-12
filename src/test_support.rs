@@ -645,6 +645,7 @@ pub(crate) struct TestApp {
     on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     hook_registry: std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: Vec<String>,
+    overlay_path: Option<std::path::PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -661,7 +662,14 @@ impl TestApp {
             on_exhausted_cfgs: std::collections::HashMap::new(),
             hook_registry: std::collections::HashMap::new(),
             global_hooks: Vec::new(),
+            overlay_path: None,
         }
+    }
+
+    /// Enable config-overlay persistence at `path` (for testing runtime-change durability).
+    pub(crate) fn overlay_path(mut self, path: std::path::PathBuf) -> Self {
+        self.overlay_path = Some(path);
+        self
     }
     /// Register a hook definition in the `hooks:` registry (for the Admin API v1 hooks read surface).
     pub(crate) fn hook(mut self, name: &str, cfg: crate::config::HookCfg) -> Self {
@@ -745,6 +753,7 @@ impl TestApp {
             tap_hooks: Vec::new(),
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
+            overlay_path: self.overlay_path,
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,

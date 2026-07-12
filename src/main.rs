@@ -294,8 +294,28 @@ async fn main() {
     });
     let interpolated_config =
         config::interpolate_env(&raw_config).unwrap_or_else(|e| die(format!("config.yaml: {e}")));
-    let deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
+    let mut deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
         .unwrap_or_else(|e| die(format!("config.yaml: invalid YAML: {e}")));
+
+    // Config-overlay persistence (opt-in via `BUSBAR_CONFIG_OVERLAY`): install the path, then MERGE
+    // any previously-persisted overlay (API-applied hook changes) into the deploy config BEFORE
+    // resolve, so a runtime-registered hook survives a restart. Effective = base (this config.yaml,
+    // untouched) + overlay. Absent/corrupt overlay is fail-soft (boot proceeds on base alone). Disabled
+    // (env unset) leaves boot completely unchanged.
+    let overlay_path = std::env::var("BUSBAR_CONFIG_OVERLAY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    if let Some(ref p) = overlay_path {
+        if let Some(doc) = config::overlay::read(p) {
+            tracing::info!(
+                path = %p.display(),
+                hooks = doc.hooks.len(),
+                "merging persisted config overlay onto base config"
+            );
+            config::overlay::merge_into(&mut deploy, doc);
+        }
+    }
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
@@ -680,6 +700,7 @@ async fn main() {
         tap_hooks,
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
+        overlay_path,
         failover_cfg,
         pool_runtime,
         fallback_pools,

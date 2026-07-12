@@ -195,6 +195,13 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
         Ok(next) => {
             handle.swap(Arc::new(next));
             audit::AUDIT.record("hook.register", &resource, audit::OUTCOME_APPLIED);
+            // Persist the new hook state to the overlay (best-effort; no-op when persistence disabled).
+            let cur = handle.load();
+            crate::config::overlay::persist(
+                cur.overlay_path.as_deref(),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
             // Project the registered hook from the NEW (post-swap) snapshot for the 201 body.
             respond(
                 StatusCode::CREATED,
@@ -218,6 +225,12 @@ async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
         Ok(next) => {
             handle.swap(Arc::new(next));
             audit::AUDIT.record("hook.delete", &resource, audit::OUTCOME_APPLIED);
+            let cur = handle.load();
+            crate::config::overlay::persist(
+                cur.overlay_path.as_deref(),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {

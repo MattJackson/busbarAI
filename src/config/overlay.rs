@@ -12,14 +12,30 @@
 //! corrupt overlay yields `None` and boot proceeds on base config alone — a bad overlay never bricks
 //! startup).
 
-#![allow(dead_code)] // read/write/merge are wired by the boot-merge + apply-write increment (next).
-
 use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::{DeployCfg, HookCfg};
+
+/// Persist the current hook state to the overlay at `path`, IF persistence is enabled (`Some`). The
+/// path is opt-in via `BUSBAR_CONFIG_OVERLAY` and carried on `App`, so the default behavior + config
+/// schema are unchanged. Best-effort: the live config already swapped, so the overlay is durability
+/// (not correctness) — a write failure is logged, never fatal, never blocks the request. `None` is a
+/// no-op (persistence disabled, the default — runtime changes are live but do not survive a restart).
+pub(crate) fn persist(
+    path: Option<&Path>,
+    hooks: &HashMap<String, HookCfg>,
+    global_hooks: &[String],
+) {
+    if let Some(p) = path {
+        let doc = from_state(hooks, global_hooks);
+        if let Err(e) = write(p, &doc) {
+            tracing::warn!(error = %e, path = %p.display(), "failed to persist config overlay");
+        }
+    }
+}
 
 /// The persisted overlay document: the API-applied hook registry + global-hook wiring.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
