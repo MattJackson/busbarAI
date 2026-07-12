@@ -2840,7 +2840,7 @@ pub(crate) async fn forward_with_pool_parsed(
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
-        let key = match app.auth_mode() {
+        let key = match app.upstream_creds() {
             // Passthrough forwards the CALLER's credential upstream. When the caller presents NO
             // credential, fall back to an EMPTY credential — NOT the lane operator's `api_key`
             // (LOW #15 SECURITY): borrowing the operator key would let an unauthenticated caller
@@ -2849,8 +2849,8 @@ pub(crate) async fn forward_with_pool_parsed(
             // lane penalty), matching the documented passthrough contract. No-op in canonical
             // keyless passthrough (lane.api_key already empty); only changes the misconfigured
             // passthrough+configured-key case.
-            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
-            crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
+            crate::auth::UpstreamCreds::Passthrough => caller_token.unwrap_or(""),
+            crate::auth::UpstreamCreds::Own => &app.lanes[i].api_key,
         };
 
         // per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
@@ -2886,7 +2886,7 @@ pub(crate) async fn forward_with_pool_parsed(
             canonical_uri,
             body: &payload,
             timestamp_epoch: now(),
-            upstream_creds: app.auth_mode().upstream_creds(),
+            upstream_creds: app.upstream_creds(),
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
@@ -3035,8 +3035,8 @@ pub(crate) async fn forward_with_pool_parsed(
                 if !status.is_success() {
                     // caveat: passthrough 401/403 is caller's key failing, not busbar's
                     // Do NOT trip breaker / change member health; relay verbatim to caller
-                    let auth_mode = app.auth_mode();
-                    let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
+                    let is_passthrough_40x = app.upstream_creds()
+                        == crate::auth::UpstreamCreds::Passthrough
                         && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
 
                     // Clone headers before consuming r with bytes(). The upstream `Retry-After`
@@ -4135,7 +4135,7 @@ async fn forward_once(
     let base = &app.lanes[i].base_url;
 
     // Mode-aware key selection: passthrough uses caller token, others use lane's api_key.
-    let key = match app.auth_mode() {
+    let key = match app.upstream_creds() {
         // Passthrough forwards the CALLER's credential upstream. When the caller presents NO
         // credential, fall back to an EMPTY credential — NOT the lane operator's `api_key`
         // (LOW #15 SECURITY): borrowing the operator key would let an unauthenticated caller
@@ -4144,8 +4144,8 @@ async fn forward_once(
         // lane penalty), matching the documented passthrough contract. No-op in canonical
         // keyless passthrough (lane.api_key already empty); only changes the misconfigured
         // passthrough+configured-key case.
-        crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
-        crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
+        crate::auth::UpstreamCreds::Passthrough => caller_token.unwrap_or(""),
+        crate::auth::UpstreamCreds::Own => &app.lanes[i].api_key,
     };
 
     // per-request auth (SigV4 for Bedrock; static otherwise).
@@ -4174,7 +4174,7 @@ async fn forward_once(
         canonical_uri,
         body: &payload,
         timestamp_epoch: now(),
-        upstream_creds: app.auth_mode().upstream_creds(),
+        upstream_creds: app.upstream_creds(),
     };
     let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 

@@ -144,4 +144,12 @@ impl App {
     pub(crate) fn auth_mode(&self) -> crate::auth::AuthMode {
         self.auth.mode
     }
+
+    /// The UPSTREAM-credential mode — whether the egress path signs with busbar's configured lane key
+    /// (`Own`) or forwards the caller's credential (`Passthrough`). The credential-selection concern,
+    /// read off the same single source of truth; slice 2d-2 splits it from `auth_mode` so nothing on
+    /// the egress path branches on the front-door auth mode. Cheap: `UpstreamCreds` is `Copy`.
+    pub(crate) fn upstream_creds(&self) -> crate::auth::UpstreamCreds {
+        self.auth.mode.upstream_creds()
+    }
 }
