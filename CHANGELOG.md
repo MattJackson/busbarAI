@@ -32,9 +32,12 @@ clear startup error telling you exactly what to write instead.
   both human-readable, so "who set this" is always answerable.
 - **Admin audit log.** Every admin mutation is recorded: who changed what, when. Scoped admin
   tokens let you mint credentials that can, for example, only register hooks or only read.
-- **Named hooks.** Define a hook once under `hooks:`, reference it anywhere: `route:
-  my-router` on a pool, or `global_hooks:` to run on every request. The old `route: socket` +
-  `policy:` form still works and now just sugars into a named hook.
+- **Named hooks.** Define a hook once under `hooks:`, reference it anywhere: `hook: my-router`
+  on a pool, or `global_hooks:` to run on every request. A pool picks its native ranking with
+  `policy: cheapest` (weighted, cheapest, fastest, least_busy, usage) and layers a gate with
+  `hook:`. The old inline `policy:` block and transport-named `route:` values are removed — an
+  old-form key is a clear startup error naming its replacement (a clean cut, no silent
+  fallback). See the 1.2.x → 1.3 migration guide (`docs/migration-1.3.md`).
 - **Gates and taps.** A `gate` is a blocking hook that can reject a request or restrict which
   pool members may serve it; a `tap` is fire-and-forget observation (request, route,
   per-attempt, and completion stages) that can never delay or fail a request. Routes rank,
