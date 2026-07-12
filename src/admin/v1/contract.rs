@@ -127,6 +127,10 @@ pub(crate) struct InfoView {
     /// Seconds since process start, or `None` if the start instant was never stamped.
     pub(crate) uptime_seconds: Option<u64>,
     pub(crate) topology: TopologyInfo,
+    /// Whether config-overlay persistence is enabled (`BUSBAR_CONFIG_OVERLAY` set): `true` = API-applied
+    /// config changes are durable across restarts; `false` = live-only (lost on restart). Lets tooling
+    /// tell an operator whether their runtime changes will survive a restart.
+    pub(crate) config_persistence: bool,
 }
 
 /// The compiled-in feature proof (`InfoView.build`).

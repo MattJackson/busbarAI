@@ -211,6 +211,7 @@ impl AdminService {
                 models: self.app.by_model.len(),
                 providers: providers.len(),
             },
+            config_persistence: self.app.overlay_path.is_some(),
         })
     }
 

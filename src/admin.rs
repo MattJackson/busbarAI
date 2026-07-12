@@ -777,6 +777,8 @@ mod tests {
         assert!(body["topology"]["pools"].is_number());
         assert!(body["topology"]["models"].is_number());
         assert!(body["topology"]["providers"].is_number());
+        // No overlay configured in this fixture → persistence off.
+        assert_eq!(body["config_persistence"], false);
 
         handle.abort();
     }
