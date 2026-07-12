@@ -785,6 +785,61 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (hooks/on_error): a hook's `on_error` is a NAME — a reserved terminal (`weighted` |
+    // `reject` | `first`), a built-in ranking strategy, or another registry GATE (a fallback
+    // chain: when the hook fails, the named fallback fires; if THAT fails, its own on_error
+    // chains further). Boot proves every chain TERMINATES: an unknown name, a tap fallback, or a
+    // cycle (including self-reference) is a startup error — the safety guarantee that a failing
+    // gate always bottoms out on something that cannot fail.
+    for (hook_name, hook) in &cfg.hooks {
+        let mut visited: Vec<&str> = vec![hook_name.as_str()];
+        let mut current: &str = hook.on_error.as_str();
+        loop {
+            // A reserved terminal ends the chain (weighted/reject/first cannot fail).
+            if crate::config::on_error_terminal(current).is_some() {
+                break;
+            }
+            // A built-in ranking strategy is infallible (sync, no I/O) — it terminates the chain.
+            // Compiled out (`--no-default-features`), naming one is a boot error, never a silent
+            // degrade (the same compliance-by-compilation stance as the pool strategy rule).
+            if matches!(current, "cheapest" | "fastest" | "least_busy" | "usage") {
+                if cfg!(not(feature = "hooks-ranking")) {
+                    errors.push(format!(
+                        "hook '{hook_name}' on_error names the built-in ranking strategy \
+                         '{current}' but this binary was built WITHOUT the `hooks-ranking` \
+                         feature. Rebuild with default features or use weighted|reject|first."
+                    ));
+                }
+                break;
+            }
+            if visited.contains(&current) {
+                errors.push(format!(
+                    "hook on_error chain does not terminate: {} -> {current} is a cycle; every \
+                     chain must bottom out on weighted|reject|first or a ranking strategy",
+                    visited.join(" -> ")
+                ));
+                break;
+            }
+            let Some(next) = cfg.hooks.get(current) else {
+                errors.push(format!(
+                    "hook '{hook_name}' on_error names unknown fallback '{current}'; use a \
+                     reserved terminal (weighted|reject|first), a ranking strategy, or another \
+                     gate in the `hooks:` registry"
+                ));
+                break;
+            };
+            if next.kind != crate::config::HookKind::Gate {
+                errors.push(format!(
+                    "hook '{hook_name}' on_error fallback '{current}' is a tap; a fallback must \
+                     be a gate (fire-and-wait) — a tap cannot decide"
+                ));
+                break;
+            }
+            visited.push(current);
+            current = next.on_error.as_str();
+        }
+    }
+
     // Rule (hooks/global-ref): every name in `global_hooks:` must reference a registry entry.
     for name in &cfg.global_hooks {
         if !cfg.hooks.contains_key(name) {
@@ -4113,7 +4168,7 @@ models:
             socket: socket.map(str::to_string),
             webhook: webhook.map(str::to_string),
             timeout_ms,
-            on_error: config::PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt: config::PromptAccess::No,
             user: config::UserAccess::No,
             priority: 0,
@@ -4121,6 +4176,126 @@ models:
             on_empty: None,
             global: false,
             default: false,
+        }
+    }
+
+    /// A minimal valid RootCfg with an empty hooks registry (for on_error chain tests).
+    fn hooks_test_cfg() -> RootCfg {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        make_root_cfg(providers, models, pools)
+    }
+
+    /// `on_error` naming an unknown fallback is a boot error (chains resolve against the registry).
+    #[test]
+    fn test_hook_on_error_unknown_name_rejected() {
+        let mut cfg = hooks_test_cfg();
+        let mut h = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        h.on_error = "nonexistent".to_string();
+        cfg.hooks.insert("a".to_string(), h);
+        let errs = validate(&cfg).expect_err("an unknown on_error name must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("unknown fallback 'nonexistent'")),
+            "{errs:?}"
+        );
+    }
+
+    /// `on_error` naming a TAP is a boot error (a fallback must decide; a tap only observes).
+    #[test]
+    fn test_hook_on_error_tap_fallback_rejected() {
+        let mut cfg = hooks_test_cfg();
+        let mut gate = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        gate.on_error = "watcher".to_string();
+        let mut tap = gate_hook(Some("/run/busbar/t.sock"), None, 150);
+        tap.kind = config::HookKind::Tap;
+        cfg.hooks.insert("a".to_string(), gate);
+        cfg.hooks.insert("watcher".to_string(), tap);
+        let errs = validate(&cfg).expect_err("a tap fallback must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("fallback 'watcher' is a tap")),
+            "{errs:?}"
+        );
+    }
+
+    /// An on_error CYCLE (including a self-reference) is a boot error — every chain must terminate.
+    #[test]
+    fn test_hook_on_error_cycle_rejected() {
+        // a -> b -> a
+        let mut cfg = hooks_test_cfg();
+        let mut a = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        a.on_error = "b".to_string();
+        let mut b = gate_hook(Some("/run/busbar/b.sock"), None, 150);
+        b.on_error = "a".to_string();
+        cfg.hooks.insert("a".to_string(), a);
+        cfg.hooks.insert("b".to_string(), b);
+        let errs = validate(&cfg).expect_err("an on_error cycle must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("does not terminate")),
+            "{errs:?}"
+        );
+
+        // self-reference
+        let mut cfg = hooks_test_cfg();
+        let mut selfy = gate_hook(Some("/run/busbar/s.sock"), None, 150);
+        selfy.on_error = "s".to_string();
+        cfg.hooks.insert("s".to_string(), selfy);
+        let errs = validate(&cfg).expect_err("a self-referencing on_error must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("does not terminate")),
+            "{errs:?}"
+        );
+    }
+
+    /// A terminating gate chain (a -> b -> weighted) and a strategy fallback are both accepted.
+    #[test]
+    fn test_hook_on_error_terminating_chain_ok() {
+        let mut cfg = hooks_test_cfg();
+        let mut a = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        a.on_error = "b".to_string();
+        let b = gate_hook(Some("/run/busbar/b.sock"), None, 150); // on_error: weighted
+        cfg.hooks.insert("a".to_string(), a);
+        cfg.hooks.insert("b".to_string(), b);
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("on_error")),
+                "a terminating chain must not trip the on_error rule; got: {errs:?}"
+            );
+        }
+
+        // A ranking-strategy fallback terminates the chain when the plugin is compiled in; when it
+        // is compiled out, naming one is a boot error (compliance-by-compilation).
+        let mut cfg = hooks_test_cfg();
+        let mut c = gate_hook(Some("/run/busbar/c.sock"), None, 150);
+        c.on_error = "cheapest".to_string();
+        cfg.hooks.insert("c".to_string(), c);
+        let result = validate(&cfg);
+        #[cfg(feature = "hooks-ranking")]
+        if let Err(errs) = result {
+            assert!(
+                !errs.iter().any(|e| e.contains("on_error")),
+                "a strategy fallback must be accepted when compiled in; got: {errs:?}"
+            );
+        }
+        #[cfg(not(feature = "hooks-ranking"))]
+        {
+            let errs = result.expect_err("a strategy fallback without the plugin must be rejected");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("WITHOUT the `hooks-ranking` feature")),
+                "{errs:?}"
+            );
         }
     }
 

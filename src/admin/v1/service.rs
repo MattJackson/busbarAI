@@ -20,7 +20,7 @@ use super::contract::{
     TopologyInfo, UsageTotals, UsageView,
 };
 use crate::config::{
-    DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
+    DeployCfg, HookCfg, HookKind, HookStage, PromptAccess, ProviderDef, UserAccess,
 };
 
 /// Process start instant, for the `info` uptime read. Stamped ONCE at startup by `mark_start()`.
@@ -587,11 +587,7 @@ impl AdminService {
                 HookStage::Attempt => "attempt",
                 HookStage::Completion => "completion",
             }),
-            on_error: match cfg.on_error {
-                PolicyOnError::Weighted => "weighted",
-                PolicyOnError::Reject => "reject",
-                PolicyOnError::First => "first",
-            },
+            on_error: cfg.on_error.clone(),
             timeout_ms: cfg.timeout_ms,
             global: cfg.global || self.app.global_hooks.iter().any(|n| n == name),
         }
@@ -601,7 +597,7 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HookCfg, HookKind, PolicyOnError, PromptAccess, UserAccess};
+    use crate::config::{HookCfg, HookKind, PromptAccess, UserAccess};
     use crate::test_support::TestApp;
 
     fn hook(kind: HookKind, global: bool) -> HookCfg {
@@ -610,7 +606,7 @@ mod tests {
             socket: None,
             webhook: Some("http://127.0.0.1:9971/".to_string()),
             timeout_ms: 5,
-            on_error: PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt: PromptAccess::No,
             user: UserAccess::No,
             priority: 0,

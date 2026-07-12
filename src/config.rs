@@ -622,10 +622,12 @@ pub(crate) enum HookStage {
     Completion,
 }
 
-/// Behavior when a policy times out, errors, abstains, or saturates. `Weighted` (default) is the
-/// non-negotiable safety stance: a broken/slow policy is indistinguishable from no policy and NEVER
-/// blocks or fails a request. `Reject` is fail-closed (503). `First` uses the configured member
-/// order (a deterministic degraded pick).
+/// A resolved on_error/on_empty TERMINAL. `Weighted` (default) is the non-negotiable safety
+/// stance: a broken/slow policy is indistinguishable from no policy and NEVER blocks or fails a
+/// request. `Reject` is fail-closed (503). `First` uses the configured member order (a
+/// deterministic degraded pick). The `on_error` CONFIG field is a free string (a fallback chain of
+/// hook names bottoming out on one of these three reserved terminals); `on_empty` parses this enum
+/// directly.
 #[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PolicyOnError {
@@ -633,6 +635,27 @@ pub(crate) enum PolicyOnError {
     Weighted,
     Reject,
     First,
+}
+
+/// The serde default for a hook's `on_error` — the `weighted` reserved terminal.
+fn default_on_error() -> String {
+    ON_ERROR_WEIGHTED.to_string()
+}
+
+/// The three RESERVED on_error terminal names — every fallback chain must bottom out on one.
+pub(crate) const ON_ERROR_WEIGHTED: &str = "weighted";
+pub(crate) const ON_ERROR_REJECT: &str = "reject";
+pub(crate) const ON_ERROR_FIRST: &str = "first";
+
+/// Map an `on_error` NAME to its reserved terminal, if it is one. `None` = the name is a fallback
+/// hook reference (a ranking strategy or a registry gate), resolved by routing / validated at boot.
+pub(crate) fn on_error_terminal(name: &str) -> Option<PolicyOnError> {
+    match name {
+        ON_ERROR_WEIGHTED => Some(PolicyOnError::Weighted),
+        ON_ERROR_REJECT => Some(PolicyOnError::Reject),
+        ON_ERROR_FIRST => Some(PolicyOnError::First),
+        _ => None,
+    }
 }
 
 /// A named entry in the top-level `hooks:` registry — a single hook (tap or gate) and its transport.
@@ -659,10 +682,14 @@ pub(crate) struct HookCfg {
     /// On timeout the decision is coerced to `on_error` and the request proceeds.
     #[serde(default = "default_policy_timeout_ms")]
     pub(crate) timeout_ms: u64,
-    /// Fallback when a GATE times out/errors/abstains/saturates (default `weighted` = proceed as
-    /// busbar normally would). Security gates set `reject`.
-    #[serde(default)]
-    pub(crate) on_error: PolicyOnError,
+    /// Fallback when a GATE times out/errors/saturates — a NAME resolved against the same registry
+    /// as any hook (default `weighted` = proceed as busbar normally would). Reserved terminals:
+    /// `weighted` | `reject` (fail closed — security gates set this) | `first`. Any other name is a
+    /// fallback HOOK (a built-in ranking strategy or another gate) fired when this one fails; its
+    /// own `on_error` chains further, and boot validation proves every chain terminates (unknown
+    /// names, taps, and cycles are boot errors).
+    #[serde(default = "default_on_error")]
+    pub(crate) on_error: String,
     /// PROMPT access grant: `no` (default, shape-only) | `ro` (read prompt content) | `rw` (read +
     /// may `rewrite` the body). The single trust ladder for request content; `rw` is how a gate is
     /// granted rewrite. Immutable after registration. `rw` on a tap is a config error.

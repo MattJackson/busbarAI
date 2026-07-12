@@ -402,7 +402,7 @@ fn resolve_gate_transport(
         let url = crate::observability::validate_routing_webhook_url(Some(url)).ok()?;
         return Some(ResolvedPolicy::Policy {
             policy: Arc::new(webhook::WebhookPolicy::new(url, client.clone())),
-            on_error: hook.on_error.clone(),
+            on_error: crate::config::on_error_terminal(&hook.on_error).unwrap_or_default(),
             timeout: policy_timeout(hook.timeout_ms),
             send_prompt,
             send_user,
@@ -426,7 +426,7 @@ fn resolve_gate_socket(
     }
     Some(ResolvedPolicy::Policy {
         policy: Arc::new(socket::SocketPolicy::new(path.to_string())),
-        on_error: hook.on_error.clone(),
+        on_error: crate::config::on_error_terminal(&hook.on_error).unwrap_or_default(),
         timeout: policy_timeout(hook.timeout_ms),
         send_prompt,
         send_user,
@@ -597,7 +597,7 @@ mod tests {
     }
 
     /// Build a minimal `PoolCfg` with the given `route`/`policy` for resolve_policy tests.
-    use crate::config::{HookCfg, HookKind, PolicyOnError, PoolPolicy, PromptAccess, UserAccess};
+    use crate::config::{HookCfg, HookKind, PoolPolicy, PromptAccess, UserAccess};
     use std::collections::HashMap;
 
     /// A pool with a native ranking strategy and no gate.
@@ -635,7 +635,7 @@ mod tests {
             socket: None,
             webhook: None,
             timeout_ms: crate::config::DEFAULT_POLICY_TIMEOUT_MS,
-            on_error: PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt: PromptAccess::No,
             user: UserAccess::No,
             priority: 0,
@@ -822,7 +822,7 @@ mod tests {
             socket: None,
             webhook: Some("http://127.0.0.1:9931/".to_string()),
             timeout_ms: 5,
-            on_error: PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt,
             user: UserAccess::No,
             priority: 0,
@@ -863,7 +863,7 @@ mod tests {
             socket: None,
             webhook: Some("http://127.0.0.1:9933/".to_string()),
             timeout_ms: 5,
-            on_error: PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt,
             user: UserAccess::No,
             priority: 0,
@@ -904,7 +904,7 @@ mod tests {
             socket: None,
             webhook: Some("http://127.0.0.1:9932/".to_string()),
             timeout_ms: 5,
-            on_error: PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt: PromptAccess::No,
             user: UserAccess::No,
             priority: 0,
@@ -954,7 +954,7 @@ mod tests {
             socket: None,
             webhook: Some("http://127.0.0.1:9933/".to_string()),
             timeout_ms: 5,
-            on_error: PolicyOnError::default(),
+            on_error: "weighted".to_string(),
             prompt,
             user: UserAccess::No,
             priority: 0,

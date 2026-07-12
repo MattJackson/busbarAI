@@ -241,8 +241,9 @@ pub(crate) struct HookView {
     pub(crate) priority: u16,
     /// TAP observation stage (`"request"`/`"route"`/`"attempt"`/`"completion"`), or `None` for a gate.
     pub(crate) at: Option<&'static str>,
-    /// Gate fallback on timeout/error/abstain: `"weighted"` | `"reject"` | `"first"`.
-    pub(crate) on_error: &'static str,
+    /// Gate fallback on timeout/error — a reserved terminal (`"weighted"` | `"reject"` |
+    /// `"first"`) or the NAME of the fallback hook the chain continues through.
+    pub(crate) on_error: String,
     /// Gate decision deadline in milliseconds.
     pub(crate) timeout_ms: u64,
     /// Whether this hook fires on every request (globally wired).
