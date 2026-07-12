@@ -11,21 +11,23 @@
 
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{extract::Path, extract::Query, Extension, Router};
+use axum::{extract::Path, extract::Query, Router};
 use serde::Serialize;
 use serde_json::json;
 
 use super::contract::AdminError;
-use super::service::AdminService;
+use super::service::{build_with_hook, AdminService};
 use crate::admin::transport::AdminTransport;
 use crate::state::AppHandle;
 
 /// The JSON-REST adapter for v1: the `/admin/v1/*` resource API with the stable
-/// `{"error":{"code","message"}}` envelope (design-admin-api-v1 §0.3). Zero-sized — every request
-/// reads the shared service out of the router's extension layer.
+/// `{"error":{"code","message"}}` envelope (design-admin-api-v1 §0.3). Zero-sized — each request
+/// builds an `AdminService` over the CURRENT snapshot from the router's `Arc<AppHandle>` state (so a
+/// read after a config apply reflects the new config), and the mutation path swaps through the handle.
 pub(crate) struct JsonV1;
 
 impl AdminTransport for JsonV1 {
@@ -33,16 +35,16 @@ impl AdminTransport for JsonV1 {
         "json/v1"
     }
 
-    fn router(&self, service: Arc<AdminService>) -> Router<Arc<AppHandle>> {
-        // The service is shared across every route via an extension layer. Routes stay declarative;
-        // each handler pulls `Arc<AdminService>` and maps the typed result onto the JSON wire.
+    fn router(&self) -> Router<Arc<AppHandle>> {
+        // Routes stay declarative; each handler pulls the `Arc<AppHandle>` state, loads the current
+        // snapshot into a per-request `AdminService`, and maps the typed result onto the JSON wire.
         Router::new()
             .route("/admin/v1/info", get(info))
             .route("/admin/v1/pools", get(list_pools))
             .route("/admin/v1/pools/{name}", get(get_pool))
             .route("/admin/v1/models", get(list_models))
             .route("/admin/v1/providers", get(list_providers))
-            .route("/admin/v1/hooks", get(list_hooks))
+            .route("/admin/v1/hooks", get(list_hooks).post(register_hook))
             .route("/admin/v1/hooks/{name}", get(get_hook))
             .route("/admin/v1/hooks/{name}/health", get(hook_health))
             .route("/admin/v1/plugins", get(list_plugins))
@@ -52,8 +54,12 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/config", get(get_config))
             .route("/admin/v1/config/validate", post(validate_config))
             .route("/admin/v1/openapi.json", get(openapi))
-            .layer(Extension(service))
     }
+}
+
+/// Build a per-request `AdminService` over the CURRENT snapshot loaded from the handle.
+fn service(handle: &Arc<AppHandle>) -> AdminService {
+    AdminService::new(handle.load())
 }
 
 // ── JSON wire helpers (v1) ───────────────────────────────────────────────────────────────────────
@@ -95,82 +101,104 @@ fn respond<T: Serialize>(status: StatusCode, result: Result<T, AdminError>) -> R
 // ── route handlers (thin: call the service, project onto the wire) ───────────────────────────────
 
 /// `GET /admin/v1/info` — version, compiled-in plugin proof, uptime, topology.
-async fn info(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.info().await)
+async fn info(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).info().await)
 }
 
 /// `GET /admin/v1/pools` — pool topology read.
-async fn list_pools(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.list_pools().await)
+async fn list_pools(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).list_pools().await)
 }
 
 /// `GET /admin/v1/pools/{name}` — live per-member status of one pool (404 if unknown).
-async fn get_pool(
-    Extension(service): Extension<Arc<AdminService>>,
-    Path(name): Path<String>,
-) -> Response {
-    respond(StatusCode::OK, service.get_pool(&name).await)
+async fn get_pool(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+    respond(StatusCode::OK, service(&handle).get_pool(&name).await)
 }
 
 /// `GET /admin/v1/models` — model lanes + providers.
-async fn list_models(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.list_models().await)
+async fn list_models(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).list_models().await)
 }
 
 /// `GET /admin/v1/providers` — distinct providers + lane counts.
-async fn list_providers(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.list_providers().await)
+async fn list_providers(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).list_providers().await)
 }
 
 /// `GET /admin/v1/hooks` — the hook registry read.
-async fn list_hooks(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.list_hooks().await)
+async fn list_hooks(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).list_hooks().await)
 }
 
 /// `GET /admin/v1/hooks/{name}` — one hook definition (404 if unregistered).
-async fn get_hook(
-    Extension(service): Extension<Arc<AdminService>>,
-    Path(name): Path<String>,
-) -> Response {
-    respond(StatusCode::OK, service.get_hook(&name).await)
+async fn get_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+    respond(StatusCode::OK, service(&handle).get_hook(&name).await)
 }
 
 /// `GET /admin/v1/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
-async fn hook_health(
-    Extension(service): Extension<Arc<AdminService>>,
-    Path(name): Path<String>,
-) -> Response {
-    respond(StatusCode::OK, service.hook_health(&name).await)
+async fn hook_health(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+    respond(StatusCode::OK, service(&handle).hook_health(&name).await)
 }
 
 /// `GET /admin/v1/plugins?type=auth|hooks` — the plugin catalog for one type. A missing/unknown
 /// `type` is an `invalid_request` (the two types are distinct engine contracts).
 async fn list_plugins(
-    Extension(service): Extension<Arc<AdminService>>,
+    State(handle): State<Arc<AppHandle>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let ptype = q.get("type").map(String::as_str).unwrap_or("");
-    respond(StatusCode::OK, service.list_plugins(ptype).await)
+    respond(StatusCode::OK, service(&handle).list_plugins(ptype).await)
 }
 
 /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode (no secrets).
-async fn get_auth(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.get_auth().await)
+async fn get_auth(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).get_auth().await)
 }
 
 /// `GET /admin/v1/admin-auth` — the admin-plane auth config (the admin surface guard).
-async fn get_admin_auth(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.get_admin_auth().await)
+async fn get_admin_auth(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).get_admin_auth().await)
 }
 
 /// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests, per-key).
-async fn get_usage(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.get_usage().await)
+async fn get_usage(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).get_usage().await)
 }
 
 /// `GET /admin/v1/config` — the effective running config snapshot (redacted; no secrets).
-async fn get_config(Extension(service): Extension<Arc<AdminService>>) -> Response {
-    respond(StatusCode::OK, service.get_config().await)
+async fn get_config(State(handle): State<Arc<AppHandle>>) -> Response {
+    respond(StatusCode::OK, service(&handle).get_config().await)
+}
+
+/// The `POST /admin/v1/hooks` request body: the hook name + its definition.
+#[derive(serde::Deserialize)]
+struct RegisterHookReq {
+    name: String,
+    config: crate::config::HookCfg,
+}
+
+/// `POST /admin/v1/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
+/// the next `App` snapshot with the hook wired + transports re-resolved, atomically `swap`s it in, and
+/// returns `201` with the registered hook. A `global` hook is LIVE immediately (new requests see it);
+/// in-flight requests finish on the old snapshot. Lanes/store are untouched — live breaker state is
+/// preserved. This is the first API-driven config mutation.
+async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::Bytes) -> Response {
+    let req: RegisterHookReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
+    };
+    let current = handle.load();
+    match build_with_hook(&current, &req.name, req.config) {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            // Project the registered hook from the NEW (post-swap) snapshot for the 201 body.
+            respond(
+                StatusCode::CREATED,
+                service(&handle).get_hook(&req.name).await,
+            )
+        }
+        Err(e) => err_json(&e),
+    }
 }
 
 /// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
@@ -351,7 +379,7 @@ struct ValidateConfigReq {
 /// `POST /admin/v1/config/validate` — dry-run validate a proposed config. A malformed body is an
 /// `invalid_request`; a well-formed body always returns 200 with the `{ok, errors}` verdict.
 async fn validate_config(
-    Extension(service): Extension<Arc<AdminService>>,
+    State(handle): State<Arc<AppHandle>>,
     body: axum::body::Bytes,
 ) -> Response {
     let req: ValidateConfigReq = match serde_json::from_slice(&body) {
@@ -364,7 +392,9 @@ async fn validate_config(
     };
     respond(
         StatusCode::OK,
-        service.validate_config(req.config, req.providers).await,
+        service(&handle)
+            .validate_config(req.config, req.providers)
+            .await,
     )
 }
 

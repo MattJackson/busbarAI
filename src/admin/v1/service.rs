@@ -102,7 +102,6 @@ async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
 /// swap. Lanes/store/pools/auth are UNTOUCHED, so the store's per-lane breaker state is preserved (no
 /// re-index — the safe, store-constraint-free subset of config apply). The caller `AppHandle::swap`s
 /// the returned snapshot. Pure + `Result` → unit-testable without the transport.
-#[allow(dead_code)] // wired by the POST /admin/v1/hooks endpoint (next increment).
 pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result<App, AdminError> {
     // ── validate the definition (fail-closed, before any mutation) ──
     if name.trim().is_empty() {

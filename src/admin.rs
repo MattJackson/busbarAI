@@ -1041,6 +1041,108 @@ mod tests {
         handle.abort();
     }
 
+    /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
+    /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
+    /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    #[tokio::test]
+    async fn test_admin_v1_register_hook_takes_effect_live() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Before: no hooks.
+        let before: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(before["items"].as_array().unwrap().len(), 0);
+
+        // Register a global gate at runtime.
+        let body = serde_json::json!({
+            "name": "compress",
+            "config": {
+                "kind": "gate",
+                "webhook": "http://127.0.0.1:9977/",
+                "prompt": "rw",
+                "global": true
+            }
+        });
+        let created = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201, "hook registered");
+        let created_body: serde_json::Value = created.json().await.unwrap();
+        assert_eq!(created_body["name"], "compress");
+        assert_eq!(created_body["kind"], "gate");
+        assert_eq!(created_body["global"], true);
+
+        // After: the hook is LIVE — a fresh read sees it (swap took effect + reads-current).
+        let after: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = after["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the registered hook is now in the live config"
+        );
+        assert_eq!(items[0]["name"], "compress");
+
+        // GET one by name also sees it.
+        let one = client
+            .get(format!("http://{addr}/admin/v1/hooks/compress"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(one.status().as_u16(), 200);
+
+        // Invalid definition (prompt:rw on a tap) → 400 invalid_request, no mutation.
+        let bad = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "bad",
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9977/", "prompt": "rw"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400);
+        assert_eq!(
+            bad.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+
+        handle.abort();
+    }
+
     /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
     /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
     /// secret. Built on a fixture with one global gate.
