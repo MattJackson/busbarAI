@@ -2882,9 +2882,72 @@ pub(crate) async fn forward_with_pool_parsed(
                     "A required gate could not complete. Please retry shortly.",
                 );
             }
-            // order / restrict / abstain / weighted from a GLOBAL gate: not honored this increment
-            // (globals only reject for now); a global gate that orders or restricts is a no-op until
-            // the multi-gate reconcile lands.
+            // The gate's RESTRICT verb: a global compliance gate pins traffic to members carrying one
+            // of `tags_any`. Intersect the candidate set here, BEFORE pool routing, so the restriction
+            // PERSISTS across every failover hop (each hop selects from the shrunk `cands`) and the
+            // pool's own ordering never sees an excluded member. Successive global restricts intersect
+            // (each gate sees the prior's shrunk set). An empty intersection is fail-closed via the
+            // gate's `on_empty` (default reject; `weighted` is the advisory escape to the full pool).
+            PolicyOutcome::Restrict {
+                tags_any,
+                name,
+                on_empty,
+            } => {
+                let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
+                let restricted: Vec<WeightedLane> = cands
+                    .iter()
+                    .filter(|wl| {
+                        members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                            meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if restricted.is_empty() {
+                    if matches!(on_empty, crate::config::PolicyOnError::Weighted) {
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            "global gate restrict left no eligible lane; on_empty: weighted escape \
+                             to the full pool"
+                        );
+                        // leave `cands` unchanged (full pool) and continue to the next global gate.
+                    } else {
+                        metrics::counter!(
+                            crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                            "policy" => name,
+                            "pool" => pool_name.to_string(),
+                            "status" => "503".to_string(),
+                        )
+                        .increment(1);
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            "global gate restrict left no eligible lane (on_empty: reject)"
+                        );
+                        return ingress_error(
+                            ingress_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            KIND_OVERLOADED,
+                            "No upstream satisfies a required gate's restriction. Please retry \
+                             shortly.",
+                        );
+                    }
+                } else {
+                    // Commit: shrink `cands` to the survivors so the restriction persists across
+                    // failover and the pool decision below orders only within the eligible set.
+                    cands = restricted;
+                    metrics::counter!(
+                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                        "policy" => name,
+                        "pool" => pool_name.to_string(),
+                    )
+                    .increment(1);
+                }
+            }
+            // order / abstain / weighted from a GLOBAL gate: not honored this increment. A global gate
+            // that ORDERS is a no-op until the pool-vs-global order reconcile lands (in practice the
+            // pool's router-gate orders while globals reject/restrict).
             _ => {}
         }
     }
