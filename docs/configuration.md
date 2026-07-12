@@ -28,7 +28,7 @@ Both files support `${VAR}` environment interpolation before YAML is parsed. A m
   - [`models`](#models)
   - [`pools`](#pools)
     - [Members and weights](#members-and-weights)
-    - [`route` and `policy`](#route-and-policy)
+    - [Pool `hooks`: ordering and gates](#pool-hooks-ordering-and-gates)
     - [`breaker`](#breaker)
     - [`failover`](#failover)
     - [`on_exhausted`](#on_exhausted)
@@ -199,36 +199,38 @@ Front-door authentication for clients. When [governance](#governance) is enabled
 
 ```yaml
 auth:
-  mode: token
+  chain: [tokens]
+  upstream_credentials: own
   client_tokens:
     - "${BUSBAR_CLIENT_TOKEN}"
 ```
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `mode` | string | no | `none` | `token`, `passthrough`, or `none` (case-insensitive). An unknown value is a startup error. |
-| `client_tokens` | list<string> | no | `[]` | Allowed bearer tokens (env-interpolated). Required to be non-empty when `mode: token`. All comparisons are constant-time (no timing oracle). |
-| `token` | string | no | n/a | **Removed in 1.0.0.** The `auth` block now rejects unknown keys, so setting `token:` is a hard parse error (`unknown field \`token\``): the gateway refuses to boot. Move its value into the `client_tokens` allowlist instead. |
+| `chain` | list<string> | no | `[]` | The ordered authentication chain — each name is a compiled-in auth module (the built-in is `tokens`). `[]` (default) is the open front door: no client authentication, development only, loud startup warning. An unknown module name is a startup error. |
+| `upstream_credentials` | string | no | `own` | Whose key hits the provider: `own` (Busbar's configured lane credential) or `passthrough` (forward the caller's own token upstream — Busbar holds no keys). |
+| `client_tokens` | list<string> | no | `[]` | The `tokens` module's allowlist (env-interpolated). Required to be non-empty when `tokens` is in the chain. All comparisons are constant-time (no timing oracle). Inert when `tokens` is not in the chain. |
+| `mode` | string | no | n/a | **Removed in 1.3** (was `token`/`passthrough`/`none`). The `auth` block rejects unknown keys, so a stale `mode:` is a hard parse error. Mapping: `mode: token` → `chain: [tokens]`; `mode: none` → `chain: []`; `mode: passthrough` → `chain: []` + `upstream_credentials: passthrough`. |
 
-**Token extraction order (for `token` and `passthrough` modes):** `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key`. Blank values are treated as absent.
+**Token extraction order:** `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key`. Blank values are treated as absent.
 
-**Mode semantics:**
+**Semantics:**
 
-- **`token`**: the client must send `Authorization: Bearer <token>` matching an entry in `client_tokens`. Every route except `/healthz` requires a valid token (including `/stats` and `/metrics`, which are information-disclosure surfaces).
-- **`passthrough`**: the caller's own token is forwarded to the upstream provider. Busbar holds no keys in this mode. An upstream 401/403 response is attributed to the caller; the breaker's `auth`/`billing` disposition fires, which hard-downs the lane for 30 minutes: so callers with bad keys will suppress that lane for everyone for 30 minutes. Use with care.
-- **`none`**: open relay, no client authentication. `/metrics` and `/stats` are admitted unconditionally. Development only; Busbar logs a loud warning at startup.
+- **`chain: [tokens]`**: the client must send a token matching an entry in `client_tokens`. Every route except `/healthz` requires a valid token (including `/stats` and `/metrics`, which are information-disclosure surfaces).
+- **`upstream_credentials: passthrough`**: the caller's own token is forwarded to the upstream provider. An upstream 401/403 response is attributed to the caller; the breaker's `auth`/`billing` disposition fires, which hard-downs the lane for 30 minutes: so callers with bad keys will suppress that lane for everyone for 30 minutes. Use with care.
+- **`chain: []`**: open relay, no client authentication. `/metrics` and `/stats` are admitted unconditionally. Development only; Busbar logs a loud warning at startup.
 
 **Startup validation:**
-- `mode: token` + empty effective `client_tokens` → startup error (every request would be rejected).
-- `mode: none` + non-empty `client_tokens` → startup warning (the list has no effect).
-- `mode: passthrough` + a provider whose `api_key_env` resolves to a non-empty value → startup warning (credential-leak risk: an unauthenticated caller's request will carry Busbar's own key to the upstream).
+- `tokens` in the chain + empty effective `client_tokens` → startup error (every request would be rejected).
+- `chain: []` + non-empty `client_tokens` → startup warning (the list has no effect).
+- `upstream_credentials: passthrough` + a provider whose `api_key_env` resolves to a non-empty value → startup warning (credential-leak risk: an unauthenticated caller's request could carry Busbar's own key to the upstream).
 
 **Bedrock ingress.** Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization: AWS4-HMAC-SHA256 …`). There are two tracks:
 
-- **Without governance** (`mode: passthrough` or `none`): Busbar does not verify the inbound SigV4 signature. The header is forwarded upstream (passthrough) or ignored entirely (none). Use this for transparent Bedrock proxying without per-key controls.
-- **With governance** (`mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **Without governance** (`chain: []`, with or without `upstream_credentials: passthrough`): Busbar does not verify the inbound SigV4 signature. The header is forwarded upstream (passthrough) or ignored entirely. Use this for transparent Bedrock proxying without per-key controls.
+- **With governance** (`chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
-All other five ingress protocols use bearer-style auth and work in every mode.
+All other five ingress protocols use bearer-style auth and work with every chain configuration.
 
 ---
 
@@ -372,9 +374,9 @@ pools:
 | `context_max` | integer | no | none | This member's maximum context window (tokens). Used for [context-length failover](#context-length-failover). |
 | `attempt_timeout_ms` | integer | no | the model's value | Per-attempt time-to-response-headers cap for this member **in this pool**, overriding the model-level `attempt_timeout_ms`. Lets the same model carry different hang tolerances per pool (e.g. `10000` in a batch pool, `50` in a latency-critical one). Must be ≥ 1 when set (0 is a startup error). See [Per-attempt timeouts](#per-attempt-timeouts-attempt_timeout_ms). |
 | `reasoning` | bool | no | the model's value | Per-pool override of the model-level `reasoning` capability flag (member wins), so the same lane can allow thinking in a research pool and refuse it in a latency-critical one. See [Cross-protocol reasoning](#cross-protocol-reasoning-reasoning). |
-| `tier` | string | no | none | Operator-declared routing tier label (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Inert for `route: weighted` pools. Exposed to webhook and script policies as the `tier` field on each candidate. See [`route` and `policy`](#route-and-policy). |
-| `cost_per_mtok` | float | no | none | Operator-declared cost in currency units per million tokens. Drives the `cheapest` native policy (sort ascending) and is exposed to webhook/script policies. Inert when unset or when `route: weighted`. |
-| `tags` | list<string> | no | `[]` | Free-form string labels (e.g. `["opus", "large-context"]`). Inert for `route: weighted` pools. Exposed to webhook/script policies for tag-based candidate selection. |
+| `tier` | string | no | none | Operator-declared routing tier label (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Inert for plain weighted pools (no hooks). Exposed to gate hooks as the `tier` field on each candidate. See [Pool `hooks`](#pool-hooks-ordering-and-gates). |
+| `cost_per_mtok` | float | no | none | Operator-declared cost in currency units per million tokens. Drives the `cheapest` ordering strategy and is exposed to gate hooks. Inert when unset or for plain weighted pools. |
+| `tags` | list<string> | no | `[]` | Free-form string labels (e.g. `["opus", "large-context"]`). The `restrict` gate verb intersects the candidate set against these tags (compliance pinning). Exposed to gate hooks for tag-based candidate selection. Inert for plain weighted pools. |
 
 Selection uses Nginx-style smooth weighted round-robin (SWRR) across the healthy subset. A tripped, dead, or capacity-exhausted member is skipped and its share redistributes to the remaining members automatically. Selection state is isolated per-pool (separate SWRR shard), so unrelated pools that share a lane select independently.
 
@@ -452,16 +454,19 @@ Guard rails, applied automatically: the budget is clamped to leave at least 1024
 
 ---
 
-#### `route` and `policy`
+#### Pool `hooks`: ordering and gates
 
-A pool's routing policy decides the **order** in which healthy members are tried. The default: `weighted` (SWRR), is zero-cost and unchanged from the pre-routing-policy baseline. Any other `route` value wires a pluggable policy that runs once per request, before the failover loop. The full guide, including external policies and signals, lives in the [routing guide](https://getbusbar.com/docs/routing/).
+A pool names the hooks it wants — an **ordering strategy** and/or **gates** — in one `hooks: [...]` list. The ordering strategy decides the **order** in which healthy members are tried; gates can **reject**, **restrict**, or **order** the request before dispatch. The default (no list, or no strategy named) is `weighted` (SWRR) — zero-cost and byte-identical to the pre-hooks baseline. The full hook model — the registry, taps vs gates, grants, reply arms, and guarantees — lives in [Hooks](hooks.md).
 
 ```yaml
+hooks:                      # top-level registry: define each hook once
+  smart-router:
+    kind: gate
+    socket: /run/busbar/router.sock
+
 pools:
   smart:
-    route: native
-    policy:
-      name: cheapest
+    hooks: [cheapest, smart-router]    # base ordering strategy + a gate, one list
     members:
       - target: claude-sonnet-4-5
         weight: 2
@@ -482,40 +487,29 @@ pools:
         tags: ["cheap"]
 ```
 
-**Pool-level fields:**
+**The pool `hooks:` list:**
 
-| Field | Type | Default | Notes |
+- **At most one ordering strategy** — `weighted`, `cheapest`, `fastest`, `least_busy`, or `usage` — sets the pool's base ranking. Naming none leaves the base defaulted: the registry's `default: true` hook (if one exists) becomes the base, else the compiled-in `weighted`.
+- **Any other name is a gate reference** into the top-level `hooks:` registry (must exist and be `kind: gate` — a dangling name or a tap is a startup error).
+- **Several gates may share the list.** All decision gates — the pool's and any `global_hooks` — fire **concurrently** per request and reconcile deterministically: any `reject` wins (the lowest-`priority` gate's status/message surfaces), `restrict`s intersect (an empty intersection applies that gate's `on_empty` — fail-closed by default), and with multiple `order`s the last in the chain wins. A restriction persists across every failover hop.
+
+**Top-level `hooks:` registry fields** (per named hook; full reference in [Hooks](hooks.md)):
+
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `route` | string (enum) | `weighted` | Routing transport. One of `weighted`, `native`, `webhook`, `socket`, or `script` (deprecated). `weighted` (default/absent) is zero-cost SWRR: no policy object is constructed and behavior is byte-identical to the baseline. Any other value runs a pluggable policy once per request before the failover loop. |
-| `policy` | object | none | Transport configuration. `webhook` and `socket` are validated at boot (a missing or SSRF-blocked `policy.url`, or a missing/relative `policy.socket` path, is a startup error); a misconfigured `native` or `script` policy is not fatal, it degrades to weighted SWRR. Parsed but inert when `route: weighted`. |
+| `kind` | `tap` \| `gate` | required | `gate` = fire-and-wait (may rank/reject/restrict/rewrite); `tap` = fire-and-forget observation. |
+| `socket` | string | none | Absolute Unix-domain-socket path of the operator-run hook binary (lazy connect; Unix only). Exactly one of `socket`/`webhook`. |
+| `webhook` | string | none | Sidecar URL. SSRF-guarded (loopback allowed; RFC-1918/CGNAT/link-local/metadata blocked; remote must be `https://`). |
+| `timeout_ms` | integer | `1` | Hard wall-clock deadline for a gate decision. Co-located socket ≈ 8 µs, webhook ≈ 34 µs — raise it when the hook does I/O. On timeout the decision is coerced to `on_error`. |
+| `on_error` | string | `weighted` | Fallback when a gate times out / errors / saturates: `weighted` (proceed as Busbar normally would), `reject` (fail closed — security gates set this), or `first`. A gate's deliberate `reject` reply is a decision, not a failure — `on_error` never applies to it. |
+| `prompt` | `no` \| `ro` \| `rw` | `no` | Prompt-content grant: `ro` sends the prompt read-only; `rw` additionally allows a `rewrite` reply. `rw` on a tap is a startup error. Immutable after registration; enforced both directions. |
+| `user` | `no` \| `ro` | `no` | Caller-identity grant: governance key id/name (never the secret) + the body's end-user field. |
+| `priority` | integer | `0` | Chain ordering key: orders the rewrite transform chain and tie-breaks the phase-2 reconcile (which reject surfaces; which order is "last"). Ties keep globals first, then config order. |
+| `on_empty` | string | `reject` | A restrict gate's empty-intersection behavior: `reject` (fail closed, 503) or `weighted` (advisory escape — that gate's restriction is skipped). |
+| `global` | boolean | `false` | Fire on every request (overlay on top of each pool's own hooks) — inline sugar for listing the name in `global_hooks:`. |
+| `default` | boolean | `false` | Make this hook THE base ordering for pools that named no strategy (replacement, not overlay). At most one hook may set it — a second is a startup error. |
 
-**`route` enum values:**
-
-| Value | Description |
-|---|---|
-| `weighted` | **Default.** Smooth weighted round-robin (SWRR) over healthy members. Zero added overhead: the existing SWRR hot path, unchanged. |
-| `native` | A Busbar-built policy selected by `policy.name`. Sync, no I/O, no external deps. |
-| `webhook` | An operator HTTP sidecar. Busbar POSTs a request projection and waits for a ranked preference list (or a `reject`), bounded by `policy.timeout_ms`. Any language, any OS. |
-| `socket` | An operator-run compiled binary on a local Unix domain socket. Same wire contract and reply shapes as the webhook, no HTTP stack in between — about 8 microseconds per decision co-located. Unix-only; use `webhook` elsewhere. |
-| `script` | **Deprecated.** An embedded Rhai script (behind the `script-policy` cargo feature). Warns at startup; migrate to `socket` or `webhook`. |
-
-`route:` also accepts the bare native policy names `cheapest`, `fastest`, `least_busy`, and `usage` as shorthand for `route: native` + `policy.name: <name>`. See the [Routing guide](/docs/routing/) for what each policy does.
-
-**`policy` block fields:**
-
-| Field | Type | Default | Transport | Description |
-|---|---|---|---|---|
-| `name` | string | none | `native` | Native policy name. Required when `route: native`. Valid values: `weighted`, `cheapest`, `fastest`, `least_busy`, `usage`. An unknown value is a startup error. |
-| `url` | string | none | `webhook` | Operator sidecar URL. Required when `route: webhook`. Validated by the routing SSRF guard: loopback (`127.0.0.1`, `localhost`) is allowed; RFC-1918, link-local, CGNAT (100.64/10), and cloud metadata hosts are blocked. Plain `http://` is allowed for loopback; remote endpoints must use `https://`. |
-| `socket` | string | none | `socket` | Absolute filesystem path of the hook binary's Unix domain socket. Required when `route: socket`. The binary is operator-run (Busbar never spawns it); the connection is lazy, so the hook may start after Busbar. |
-| `timeout_ms` | integer | `1` | `webhook`, `socket`, `script` | Hard wall-clock deadline for the policy decision in milliseconds. The default says hooks are fast (a co-located socket hook decides in ~8 µs, a webhook in ~34 µs); raise it when your hook does I/O or crosses the network. On timeout the decision is coerced to `on_error`. |
-| `on_error` | string (enum) | `weighted` | `webhook`, `socket`, `script` | Fallback when the policy times out, errors, abstains, or its in-flight queue is saturated. `weighted` (SWRR), `reject` (503), or `first` (first member in config order). A hook's deliberate `reject` reply is a decision, not a failure — `on_error` does not apply to it. |
-| `send_prompt` | boolean | `false` | `webhook`, `socket` | Opt-in: add the request's prompt content (`request.system` + `request.messages` as `{role, text}`) to the hook payload. Off = the shape-only default payload. For hooks trusted with content: PII screening, guardrails, audit. |
-| `send_user` | boolean | `false` | `webhook`, `socket` | Opt-in: add caller identity (`request.user`: the governance virtual-key `id`/`name` plus the body's end-user field) to the hook payload. The caller's secret/token is never sent, under any configuration. |
-| `script` | string | none | `script` | Inline Rhai source string. Exactly one of `script` or `script_file` is required when `route: script`. Mutually exclusive with `script_file`. |
-| `script_file` | string | none | `script` | Path to a Rhai script file on disk. Alternative to inline `script`. |
-
-The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed these policies. See the [routing guide](https://getbusbar.com/docs/routing/) for the native policy catalog, the shared webhook/socket wire format (including the payload opt-ins and the `reject` reply), and the `x-busbar-route-policy` / `x-busbar-route-target` observability headers.
+The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed the ordering strategies and gate candidates. Gate observability: the `x-busbar-route-policy` / `x-busbar-route-target` response headers name the deciding hook and chosen lane.
 
 ---
 
@@ -935,11 +929,9 @@ pools:
       action: least_bad       # serve degraded rather than hard 503
 
   # Cost-optimized pool, cheapest available member first.
-  # cost_per_mtok on each member drives the native cheapest policy.
+  # cost_per_mtok on each member drives the cheapest ordering strategy.
   batch:
-    route: native
-    policy:
-      name: cheapest
+    hooks: [cheapest]
     members:
       - target: gpt-4o-mini
         weight: 1
@@ -1012,16 +1004,19 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | Fallback pool unknown | `on_exhausted: fallback_pool:<name>` where `name` is not a configured pool |
 | `on_exhausted` malformed | Unrecognized `action` string |
 | `affinity.mode` unknown | Any value other than `session` |
-| `route: native` + no `policy.name` | Native transport requires a policy name |
-| `route: native` + unknown `policy.name` | Name must be one of `weighted`, `cheapest`, `fastest`, `least_busy`, `usage` |
-| `route: webhook` + no `policy.url` | Webhook transport requires a sidecar URL |
-| `route: webhook` + SSRF-blocked `policy.url` | RFC-1918, CGNAT, link-local, and metadata hosts are blocked (loopback allowed) |
-| `route: script` + neither `policy.script` nor `policy.script_file` | Script transport requires a Rhai source |
-| `route: script` + both `policy.script` and `policy.script_file` | Mutually exclusive |
-| `route: script` without the `script-policy` feature | Script transport not compiled into the binary |
+| Pool `hooks:` names more than one ordering strategy | A pool has one base ordering |
+| Pool `hooks:` gate name not in the registry | Every non-strategy name must reference a top-level `hooks:` entry |
+| Pool `hooks:` names a tap | Only a gate (fire-and-wait) can influence routing |
+| Hook with neither/both of `socket` and `webhook` | Exactly one transport per hook |
+| Hook `webhook` SSRF-blocked | RFC-1918, CGNAT, link-local, and metadata hosts are blocked (loopback allowed) |
+| `prompt: rw` on a `kind: tap` hook | A tap observes; it can never rewrite |
+| More than one hook with `default: true` | At most one default base ordering (error names both hooks) |
+| Hook named after a built-in | Registry names must not shadow the compiled-in plugin names |
+| `route:` / `policy:` / `hook:` pool keys | Removed/retired keys; each parse error names the `hooks: [...]` fix |
 | Breaker `max_cooldown < base_cooldown` | Cooldown ceiling below the base |
-| `auth.mode: token` + empty `client_tokens` | Every request would be rejected |
-| `auth.mode` unknown | Value not in `{token, passthrough, none}` |
+| `tokens` in `auth.chain` + empty `client_tokens` | Every request would be rejected |
+| `auth.chain` names an unknown module | Every chain entry must be a compiled-in auth module |
+| `auth.mode` present | Removed in 1.3 — write `chain:` + `upstream_credentials:` |
 | `governance.enabled: true` + no `admin_token` | Admin API silently inaccessible |
 | `governance.enabled: true` + `auth.mode: passthrough` | Unsupported combination |
 | `${VAR}` unset in config | Unresolvable interpolation reference |

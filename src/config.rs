@@ -371,9 +371,7 @@ pub(crate) struct PoolCfg {
     /// `hooks: [...]`), vs leaving it defaulted. `false` (defaulted) is the pool that INHERITS the
     /// `default:` hook when one is registered (else the compiled-in `weighted` backstop); `true` means
     /// the operator picked a base, so the `default:` hook does NOT override it. `policy` alone can't
-    /// carry this — it defaults to `Weighted` indistinguishably from an explicit `weighted`. RESERVED:
-    /// the `default:`-resolution reader lands next; tracked now so the distinction survives parse.
-    #[allow(dead_code)]
+    /// carry this — it defaults to `Weighted` indistinguishably from an explicit `weighted`.
     pub(crate) base_named: bool,
 }
 
@@ -674,21 +672,20 @@ pub(crate) struct HookCfg {
     /// — + body end-user field). Enables route-by-who gates. Immutable after registration.
     #[serde(default)]
     pub(crate) user: UserAccess,
-    /// Hook ordering key (default 0). Orders the rewrite transform chain and tie-breaks which reject
-    /// message surfaces (see design-hooks-v2 §3.2). RESERVED: load-bearing in slice 4; parsed now to
-    /// avoid a second breaking parse change (no reader yet).
+    /// Hook ordering key (default 0). Orders the rewrite transform chain and the phase-2 decision
+    /// chain (which reject surfaces; which order is "last" — see design-hooks-v2 §3.2). Ascending;
+    /// ties keep globals before pool gates, then config order.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) priority: u16,
     /// TAP observation stage (`request`/`route`/`attempt`/`completion`). RESERVED: the tap-firing seam
     /// lands in a later slice (no reader yet).
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) at: Option<HookStage>,
-    /// GATE restrict empty-intersection behavior (default `reject`, fail-closed). RESERVED: the
-    /// restrict reconciliation seam lands in slice 4 (no reader yet).
+    /// GATE restrict empty-intersection behavior (default `reject`, fail-closed; `weighted` is the
+    /// advisory escape — the gate's restriction is skipped). Applied per gate in the phase-2
+    /// reconcile.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) on_empty: Option<PolicyOnError>,
     /// Fire on EVERY request — inline sugar for adding this name to `global_hooks:`. Default false.
     #[serde(default)]
@@ -698,11 +695,9 @@ pub(crate) struct HookCfg {
     /// hook becomes the base, so the compiled-in backstop (`weighted`) is not used. Exactly like
     /// `auth: [sso]` means the built-in `tokens` is not loaded. AT MOST ONE hook may set `default:
     /// true` (boot AND every admin apply → error naming both); 0 ⇒ the compiled-in backstop. Only an
-    /// ordering hook (one that returns `order`) is a meaningful default. Default false. RESERVED:
-    /// the resolution reader lands with the ranking relocation (validated now so the invariant holds
-    /// from the moment the field exists).
+    /// ordering hook (one that returns `order`) is a meaningful default. Default false. Resolution:
+    /// `routing::resolve_pool_ordering` gives this hook to every pool whose base is unnamed.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) default: bool,
 }
 

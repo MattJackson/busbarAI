@@ -5,16 +5,16 @@ not silently accepted — Busbar reports a clear startup error naming exactly wh
 you can migrate with confidence and never run a half-understood config. This guide covers every
 config change. Most deployments touch only one or two lines.
 
-The mental model: **the engine runs hooks.** A pool picks a native ranking with `policy:`, and
-optionally layers a gate (a hook) with `hook:`. Hooks are defined once under a top-level `hooks:`
+The mental model: **the engine runs hooks.** A pool names the hooks it wants — an ordering strategy
+and/or gates — in one `hooks: [...]` list. Hooks are defined once under a top-level `hooks:`
 registry and referenced by name — on a pool, or globally.
 
 ---
 
-## 1. Native routing strategy: `route:` → `policy:`
+## 1. Native routing strategy: `route:` → `hooks: [<strategy>]`
 
-The pool's built-in ranking strategy moved from `route:` to its own key, `policy:`. The values are
-unchanged (`weighted` — the default — `cheapest`, `fastest`, `least_busy`, `usage`).
+The pool's built-in ranking strategy moved from `route:` into the pool's `hooks:` list. The values
+are unchanged (`weighted` — the default — `cheapest`, `fastest`, `least_busy`, `usage`).
 
 ```yaml
 # 1.2.x
@@ -26,20 +26,22 @@ pools:
 # 1.3
 pools:
   my-pool:
-    policy: cheapest
+    hooks: [cheapest]
     members: [...]
 ```
 
-`route: weighted` (or an absent `route:`) needs no change beyond the rename — `policy: weighted` is
-still the zero-cost default. Boot error if you leave `route: cheapest`:
-`the `route:` pool key was removed in 1.3; the native strategy moved to `policy:` — write `policy: <name>``.
+`route: weighted` (or an absent `route:`) needs no change beyond deleting the key — weighted is
+still the zero-cost default when a pool names no strategy. Boot error if you leave `route: cheapest`:
+`the `route:` pool key was removed in 1.3; a pool names its ordering strategy in its `hooks:` list —
+write `hooks: [<name>]``.
 
 ---
 
-## 2. Routing hooks: `route: socket|webhook` + `policy:` block → `hooks:` registry + `hook:`
+## 2. Routing hooks: `route: socket|webhook` + `policy:` block → `hooks:` registry + pool list
 
 A hook (webhook sidecar or Unix-socket binary) is now **defined once** in a top-level `hooks:`
-registry and **referenced by name** from a pool. The inline `policy:` block is gone.
+registry and **referenced by name** from a pool's `hooks: [...]` list. The inline `policy:` block is
+gone.
 
 ```yaml
 # 1.2.x — transport named in route:, config inline
@@ -52,7 +54,7 @@ pools:
       on_error: weighted
     members: [...]
 
-# 1.3 — define the hook once, reference it
+# 1.3 — define the hook once, name it in the pool's list
 hooks:
   my-router:
     kind: gate
@@ -62,18 +64,29 @@ hooks:
 
 pools:
   my-pool:
-    hook: my-router
+    hooks: [my-router]
     members: [...]
 ```
 
 The webhook transport is the same, moved into the registry entry as `webhook: https://…` (exactly one
-of `socket` or `webhook` per hook). A pool's `hook:` must name a `kind: gate` entry. Boot errors name
-the fix: `the `route: socket|webhook` transport was removed in 1.3; define the hook once under
-top-level `hooks:` … and reference it with `hook: my-hook`` and, for the block,
-`the `policy:` block was removed in 1.3; `policy:` is now a scalar strategy …`.
+of `socket` or `webhook` per hook). A name in a pool's `hooks:` list that isn't an ordering strategy
+must reference a `kind: gate` registry entry. Boot errors name the fix.
+
+One list carries both jobs, and a pool may name **several gates** — they fire concurrently and
+reconcile (any reject wins; restricts intersect; the last order wins):
+
+```yaml
+pools:
+  my-pool:
+    hooks: [cheapest, pii-guard, compliance-gate]   # base ordering + two gates
+    members: [...]
+```
 
 Note `kind:` — a hook is a `gate` (fire-and-wait: it can rank, reject, restrict, or rewrite) or a
-`tap` (fire-and-forget observation). A pool's `hook:` references a gate.
+`tap` (fire-and-forget observation). Only a gate may appear in a pool's `hooks:` list.
+
+> **Transitional 1.3 pre-releases** briefly accepted `policy: <strategy>` and `hook: <name>` pool
+> keys. Both are retired; each fails at boot with a message naming the `hooks: [...]` fix.
 
 ---
 
@@ -110,7 +123,7 @@ The embedded Rhai scripting transport, deprecated in 1.2.1, is gone. Scriptable 
 out-of-process socket hook — the same ranked-order wire contract, ~100× faster (a compiled binary vs
 an interpreter). Move your logic into a small socket hook binary and register it as in §2. Boot
 error: `route: script (the embedded Rhai transport) was removed in 1.3. Define an out-of-process gate
-under `hooks:` (kind: gate, socket:) and reference it with `hook:``.
+under top-level `hooks:` (kind: gate, socket:) and name it in the pool's `hooks: [...]` list`.
 
 ---
 
@@ -140,8 +153,8 @@ way). A stale `mode:` key is a loud boot error (`unknown field mode`).
 
 ## Quick checklist
 
-- [ ] `route: <weighted|cheapest|fastest|least_busy|usage>` → `policy: <same>`
-- [ ] `route: socket|webhook` + `policy:` block → a `hooks:` registry entry + pool `hook: <name>`
+- [ ] `route: <weighted|cheapest|fastest|least_busy|usage>` → pool `hooks: [<same>]`
+- [ ] `route: socket|webhook` + `policy:` block → a `hooks:` registry entry + pool `hooks: [<name>]`
 - [ ] `policy.send_prompt: true` → hook `prompt: ro` (or `rw` to allow rewrite)
 - [ ] `policy.send_user: true` → hook `user: ro`
 - [ ] `route: script` → a socket hook binary + `hooks:` entry
