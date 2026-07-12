@@ -145,6 +145,51 @@ pub(crate) struct LaneSnapshot {
 
 /// StateStore trait - the seam for lane state access.
 /// Operations, NOT field access. `lane: usize` identifies a member.
+/// One lane's PORTABLE health state, keyed by its STABLE IDENTITY (model + provider) instead of
+/// its array position (D1). This is the carrier that lets learned reliability state survive the
+/// two events that invalidate positional indexing: a config APPLY that changes the lane set (the
+/// new store is built with the surviving lanes' snapshots restored), and — via serde, for the D3
+/// persistence follow-up — a RESTART. Ephemeral state is deliberately NOT carried: semaphores /
+/// in-flight counts (empty by definition in a fresh store), the single-flight probe flag (reset —
+/// an in-flight probe records into the OLD store snapshot it was dispatched under), SWRR fairness
+/// counters (positional by nature; reset is harmless), and the rolling outcome windows (strictly
+/// time-windowed — they refill within seconds and carrying them would import stale samples).
+// Bin-target consumer is the config-apply core (next slice); tests exercise it now.
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LaneHealthSnapshot {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    /// Remaining lifetime request budget (`-1` = unlimited).
+    pub(crate) budget: i64,
+    /// Default-cell breaker: FSM state, cooldown deadline (unix secs), consecutive-error streak.
+    pub(crate) breaker_state: u64,
+    pub(crate) cooldown_until: u64,
+    pub(crate) streak: u32,
+    /// Lane-global hard-down latch + reason.
+    pub(crate) dead: bool,
+    pub(crate) dead_reason: String,
+    /// Lifetime counters (feed /stats continuity).
+    pub(crate) ok: u64,
+    pub(crate) err: u64,
+    pub(crate) client_fault: u64,
+    /// Latency EWMA (raw f64 bits; 0 = no sample).
+    pub(crate) latency_ewma_bits: u64,
+    /// Per-(pool) breaker cells for this lane.
+    pub(crate) cells: Vec<PoolCellHealthSnapshot>,
+}
+
+/// One per-pool breaker cell's portable state (the FSM triple; windows/probe/SWRR stay ephemeral).
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PoolCellHealthSnapshot {
+    pub(crate) pool: String,
+    pub(crate) breaker_state: u64,
+    pub(crate) cooldown_until: u64,
+    pub(crate) streak: u32,
+    pub(crate) err: u64,
+}
+
 pub(crate) trait StateStore: Send + Sync + 'static {
     // ── Health queries ─────────────────────────────────────────────────────────────────────────
     // The bare `lane` methods operate on the lane-default cell (direct/ad-hoc routes, `/stats`);
@@ -398,6 +443,11 @@ pub(crate) trait StateStore: Send + Sync + 'static {
 
     // stats snapshot for /stats
     fn snapshot(&self, lane: usize, now: u64) -> LaneSnapshot;
+
+    /// Export every lane's PORTABLE health state, keyed by stable identity (D1) — the input to a
+    /// state-carrying store rebuild (config apply) and to the persistence snapshotter (D3).
+    #[allow(dead_code)] // bin-target consumer is the config-apply core (next slice)
+    fn export_health(&self) -> Vec<LaneHealthSnapshot>;
 }
 
 /// Bounded sliding window of recent request outcomes, each tagged success/error, used to compute
@@ -742,6 +792,64 @@ impl InMemoryStore {
                 .collect(),
             pool_shards: std::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// Construct with PRIOR HEALTH STATE restored by stable lane identity (D1): each lane whose
+    /// (model, provider) appears in `restored` starts with that snapshot's breaker/cooldown/streak/
+    /// hard-down/latency/counters instead of fresh state — the carry-over that makes a lane-set
+    /// config APPLY (and, via the persistence layer, a restart) preserve learned reliability.
+    /// Matching is by IDENTITY, never position, so added/removed/reordered lanes are immune to the
+    /// index-shift misattribution this design exists to prevent. Unmatched snapshots are dropped
+    /// (their lane no longer exists); unmatched lanes start fresh (they are new). `LaneData`
+    /// baseline fields (budget/cooldown/streak/dead/counters) are OVERRIDDEN by a matching
+    /// snapshot — the snapshot IS the live truth the previous store held; per-pool cells are
+    /// re-created eagerly so a restored Open cell blocks dispatch from the first request.
+    // Bin-target consumer is the config-apply core (next slice); the carry-over tests use it now.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_limits_restored(
+        lanes: Vec<LaneData>,
+        hard_down_cooldown_secs: u64,
+        max_honored_retry_after_secs: u64,
+        restored: &[LaneHealthSnapshot],
+    ) -> Self {
+        let store =
+            Self::new_with_limits(lanes, hard_down_cooldown_secs, max_honored_retry_after_secs);
+        for (idx, lane) in store.lanes.iter().enumerate() {
+            let Some(snap) = restored
+                .iter()
+                .find(|s| s.model == lane.model && s.provider == lane.provider)
+            else {
+                continue;
+            };
+            lane.budget.store(snap.budget, Ordering::Relaxed);
+            lane.breaker_state
+                .store(snap.breaker_state, Ordering::Relaxed);
+            lane.cooldown_until
+                .store(snap.cooldown_until, Ordering::Relaxed);
+            lane.streak.store(snap.streak, Ordering::Relaxed);
+            lane.dead.store(snap.dead, Ordering::Relaxed);
+            *lane.dead_reason.lock().unwrap_or_else(|e| e.into_inner()) = snap.dead_reason.clone();
+            lane.ok.store(snap.ok, Ordering::Relaxed);
+            lane.err.store(snap.err, Ordering::Relaxed);
+            lane.client_fault
+                .store(snap.client_fault, Ordering::Relaxed);
+            lane.latency_ewma_bits
+                .store(snap.latency_ewma_bits, Ordering::Relaxed);
+            // Recreate the per-pool breaker cells eagerly with their restored FSM state.
+            let mut map = store.pool_cells.write().unwrap_or_else(|e| e.into_inner());
+            let cells = map.entry(idx).or_default();
+            for cs in &snap.cells {
+                let cell = Arc::new(BreakerCell::new());
+                cell.breaker_state
+                    .store(cs.breaker_state, Ordering::Relaxed);
+                cell.cooldown_until
+                    .store(cs.cooldown_until, Ordering::Relaxed);
+                cell.streak.store(cs.streak, Ordering::Relaxed);
+                cell.err.store(cs.err, Ordering::Relaxed);
+                cells.push((cs.pool.clone().into_boxed_str(), cell));
+            }
+        }
+        store
     }
 
     fn get_lane(&self, lane: usize) -> &Arc<LaneState> {
@@ -2333,6 +2441,48 @@ impl StateStore for InMemoryStore {
         }
     }
 
+    fn export_health(&self) -> Vec<LaneHealthSnapshot> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .map(|(idx, ls)| LaneHealthSnapshot {
+                model: ls.model.clone(),
+                provider: ls.provider.clone(),
+                budget: if ls.limited {
+                    ls.budget.load(Ordering::Relaxed)
+                } else {
+                    -1
+                },
+                breaker_state: ls.breaker_state.load(Ordering::Relaxed),
+                cooldown_until: ls.cooldown_until.load(Ordering::Relaxed),
+                streak: ls.streak.load(Ordering::Relaxed),
+                dead: ls.dead.load(Ordering::Relaxed),
+                dead_reason: lock_recover(&ls.dead_reason).clone(),
+                ok: ls.ok.load(Ordering::Relaxed),
+                err: ls.err.load(Ordering::Relaxed),
+                client_fault: ls.client_fault.load(Ordering::Relaxed),
+                latency_ewma_bits: ls.latency_ewma_bits.load(Ordering::Relaxed),
+                cells: {
+                    let map = self.pool_cells.read().unwrap_or_else(|e| e.into_inner());
+                    map.get(&idx)
+                        .map(|cells| {
+                            cells
+                                .iter()
+                                .map(|(pool, cell)| PoolCellHealthSnapshot {
+                                    pool: pool.to_string(),
+                                    breaker_state: cell.breaker_state.load(Ordering::Relaxed),
+                                    cooldown_until: cell.cooldown_until.load(Ordering::Relaxed),
+                                    streak: cell.streak.load(Ordering::Relaxed),
+                                    err: cell.err.load(Ordering::Relaxed),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+            })
+            .collect()
+    }
+
     // SWRR selection over the healthy subset (ADR-0001 algorithm). Uses the lane-default cells.
     #[cfg(test)]
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize> {
@@ -2443,6 +2593,86 @@ mod tests {
             attempt_timeout_ms: None,
             reasoning: false,
         }
+    }
+
+    /// D1 CARRY-OVER: health state follows the lane's stable IDENTITY across a store rebuild —
+    /// not its array position. A tripped per-pool breaker, hard-down latch, latency EWMA, and
+    /// counters all survive a rebuild that REORDERS the lane set and inserts a new lane in front;
+    /// the new lane starts fresh; a removed lane's snapshot is dropped.
+    #[test]
+    fn test_health_state_follows_identity_across_rebuild() {
+        set_now_for_test(1000);
+        // Store A: lanes [model-0, model-1] at idx 0/1.
+        let a = InMemoryStore::new(vec![make_lane_data(0, 10), make_lane_data(1, 10)]);
+        let cfg = BreakerCfg::default();
+        // Trip model-1's breaker in pool "p" (error-rate: 5/5 >= 0.5) + teach it a latency.
+        for _ in 0..5 {
+            a.record_transient_in("p", 1, "5xx", &cfg, None);
+        }
+        assert!(!a.ready_in("p", 1, 1000), "model-1 tripped in pool p");
+        a.record_latency_in("p", 1, 123.0);
+        let snaps = a.export_health();
+        assert_eq!(snaps.len(), 2);
+        let s1 = snaps.iter().find(|s| s.model == "model-1").unwrap();
+        assert!(
+            !s1.cells.is_empty(),
+            "the tripped pool cell must be exported"
+        );
+
+        // Store B: model-9 (NEW) first, then model-1 — model-1 moved from idx 1 to idx 1→? and
+        // model-0 was REMOVED. Restore from A's snapshots.
+        let b = InMemoryStore::new_with_limits_restored(
+            vec![make_lane_data(9, 10), make_lane_data(1, 10)],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        // model-1 (now idx 1 in a DIFFERENT lane set) is still tripped in pool "p".
+        assert!(
+            !b.ready_in("p", 1, 1000),
+            "the tripped breaker must follow model-1's identity into the new store"
+        );
+        // Its latency EWMA survived too.
+        assert_eq!(
+            b.lane_latency_ms(1),
+            a.lane_latency_ms(1),
+            "latency EWMA carries by identity"
+        );
+        // The NEW lane (idx 0) starts completely fresh.
+        assert!(b.ready_in("p", 0, 1000), "a new lane starts fresh");
+        assert_eq!(b.lane_latency_ms(0), None, "no inherited latency");
+        // model-0's snapshot had no surviving lane — dropped without error.
+        let b_snaps = b.export_health();
+        assert!(b_snaps.iter().all(|s| s.model != "model-0"));
+
+        // And the carried state keeps EVOLVING normally: cooldown expiry recovers the lane.
+        set_now_for_test(1000 + 24 * 3600);
+        assert!(
+            b.usable_in("p", 1, 1000 + 24 * 3600),
+            "a restored cooldown still expires on schedule (usable_in performs the \
+             Open->HalfOpen probe transition)"
+        );
+    }
+
+    /// D1: a restored HARD-DOWN latch (dead + reason) survives the rebuild and keeps blocking.
+    #[test]
+    fn test_hard_down_follows_identity_across_rebuild() {
+        set_now_for_test(5000);
+        let a = InMemoryStore::new(vec![make_lane_data(3, 4)]);
+        a.record_hard_down(0, "auth rejected (HTTP 401)");
+        assert!(!a.usable(0, 5000), "hard-down blocks the default cell");
+        let snaps = a.export_health();
+        let b = InMemoryStore::new_with_limits_restored(
+            vec![make_lane_data(3, 4)],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        assert!(!b.usable(0, 5000), "hard-down must survive the rebuild");
+        let restored = &b.export_health()[0];
+        // Hard-down is recoverable-by-design (sticky Open + cooldown, NOT the dead latch); the
+        // reason string + the default-cell Open state are what carry.
+        assert_eq!(restored.dead_reason, "auth rejected (HTTP 401)");
     }
 
     #[test]
