@@ -12,7 +12,11 @@
 
 use serde::Serialize;
 
-/// One admin audit record. `outcome` is a stable token tooling can branch on.
+/// One admin audit record. `outcome` is a stable token tooling can branch on. The record is
+/// HASH-CHAINED for tamper-EVIDENCE (§6.7): `hash = sha256(prev_hash | seq | ts | action | resource |
+/// outcome)`, and `prev_hash` is the preceding entry's `hash`. Recomputing the chain detects any
+/// altered/reordered/deleted entry (detection, not prevention — a compromised host can still rewrite
+/// the whole chain; prevention is shipping the log off-box to a SIEM).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AuditEntry {
     /// Monotonic sequence number (1-based), unique within a process lifetime.
@@ -26,6 +30,22 @@ pub(crate) struct AuditEntry {
     /// Stable outcome token: `applied` (mutation committed) | `rejected` (validation/conflict, nothing
     /// changed).
     pub(crate) outcome: &'static str,
+    /// The preceding entry's `hash` (empty for the first entry of the process, or the oldest retained
+    /// entry whose predecessor was pruned).
+    pub(crate) prev_hash: String,
+    /// `sha256(prev_hash | seq | ts | action | resource | outcome)` — the tamper-evidence digest.
+    pub(crate) hash: String,
+}
+
+impl AuditEntry {
+    /// Recompute this entry's digest from its fields — the verification primitive.
+    fn compute_hash(&self) -> String {
+        let canonical = format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.prev_hash, self.seq, self.ts, self.action, self.resource, self.outcome
+        );
+        crate::sigv4::sha256_hex(canonical.as_bytes())
+    }
 }
 
 /// Outcome tokens (kept small + stable).
@@ -53,18 +73,46 @@ impl AuditLog {
     /// to a panic would be worse than proceeding). Bounded: prunes the oldest past the cap.
     pub(crate) fn record(&self, action: &str, resource: &str, outcome: &'static str) {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let entry = AuditEntry {
+        let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        // Chain to the most recent entry (the back), before any prune.
+        let prev_hash = q.back().map(|e| e.hash.clone()).unwrap_or_default();
+        let mut entry = AuditEntry {
             seq,
             ts: crate::store::now(),
             action: action.to_string(),
             resource: resource.to_string(),
             outcome,
+            prev_hash,
+            hash: String::new(),
         };
-        let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entry.hash = entry.compute_hash();
         while q.len() >= MAX_AUDIT_ENTRIES {
             q.pop_front();
         }
         q.push_back(entry);
+    }
+
+    /// Verify the tamper-evidence chain over the RETAINED entries: every entry's `hash` recomputes
+    /// from its fields, and each entry links to its predecessor (`prev_hash == predecessor.hash`). The
+    /// oldest retained entry's `prev_hash` may point to a pruned digest, so its link is not checked —
+    /// only its self-digest. Returns `true` if intact. Used by the tamper test; a live tamper-alert
+    /// endpoint is a follow-up.
+    #[cfg(test)]
+    pub(crate) fn verify(&self) -> bool {
+        let q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let mut prev: Option<&str> = None;
+        for e in q.iter() {
+            if e.hash != e.compute_hash() {
+                return false;
+            }
+            if let Some(p) = prev {
+                if e.prev_hash != p {
+                    return false;
+                }
+            }
+            prev = Some(&e.hash);
+        }
+        true
     }
 
     /// The most-recent `limit` entries, newest first.
@@ -90,5 +138,28 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].action, "hook.delete", "newest first");
         assert!(entries[0].seq > entries[1].seq, "monotonic seq");
+    }
+
+    #[test]
+    fn hash_chain_links_and_verifies() {
+        let log = AuditLog::new();
+        log.record("hook.register", "hook:a", OUTCOME_APPLIED);
+        log.record("hook.register", "hook:b", OUTCOME_REJECTED);
+        log.record("hook.delete", "hook:a", OUTCOME_APPLIED);
+        assert!(log.verify(), "an untouched chain verifies");
+
+        // Each entry (oldest→newest) links to its predecessor's hash.
+        let q = log.entries.lock().unwrap();
+        assert_eq!(q[0].prev_hash, "", "first entry has no predecessor");
+        assert_eq!(q[1].prev_hash, q[0].hash);
+        assert_eq!(q[2].prev_hash, q[1].hash);
+        drop(q);
+
+        // Tamper: mutate a recorded field in place → verification fails.
+        {
+            let mut q = log.entries.lock().unwrap();
+            q[1].resource = "hook:evil".to_string();
+        }
+        assert!(!log.verify(), "a tampered entry breaks the chain");
     }
 }
