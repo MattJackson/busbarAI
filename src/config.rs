@@ -487,15 +487,17 @@ pub(crate) enum PoolPolicy {
 }
 
 impl PoolPolicy {
-    /// The native-registry name for this strategy (`routing::native::native_policy`). `weighted`
-    /// returns `None` — it IS the zero-cost default and constructs no policy object.
+    /// The ranking-registry name for this strategy (`plugins::hooks::ranking::native_policy`).
+    /// `weighted` returns `None` — it IS the zero-cost inline-SWRR default and constructs no policy
+    /// object. String literals (not the ranking plugin's constants) so this stays engine-level and
+    /// compiles when the `hooks-ranking` plugin is removed; the plugin matches the same names.
     pub(crate) fn native_name(&self) -> Option<&'static str> {
         match self {
             PoolPolicy::Weighted => None,
-            PoolPolicy::Cheapest => Some(crate::plugins::hooks::ranking::POLICY_NAME_CHEAPEST),
-            PoolPolicy::Fastest => Some(crate::plugins::hooks::ranking::POLICY_NAME_FASTEST),
-            PoolPolicy::LeastBusy => Some(crate::plugins::hooks::ranking::POLICY_NAME_LEAST_BUSY),
-            PoolPolicy::Usage => Some(crate::plugins::hooks::ranking::POLICY_NAME_USAGE),
+            PoolPolicy::Cheapest => Some("cheapest"),
+            PoolPolicy::Fastest => Some("fastest"),
+            PoolPolicy::LeastBusy => Some("least_busy"),
+            PoolPolicy::Usage => Some("usage"),
         }
     }
 }

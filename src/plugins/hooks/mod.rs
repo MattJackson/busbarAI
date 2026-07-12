@@ -10,5 +10,6 @@
 //! would live in `plugins/hooks/<name>/` behind its own cargo feature.
 
 /// The built-in RANKING hooks (cheapest/fastest/least_busy/usage) — order-gates over the
-/// `RoutingPolicy` contract, relocated out of the engine core.
+/// `RoutingPolicy` contract, relocated out of the engine core. Removable (`hooks-ranking` feature).
+#[cfg(feature = "hooks-ranking")]
 pub(crate) mod ranking;

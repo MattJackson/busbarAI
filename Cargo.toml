@@ -131,8 +131,12 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 # constant-time fold, and the allowlist are absent from the binary, provable by attestation +
 # symbols). `auth.chain: [tokens]` then BOOT-ERRORS instead of silently opening. A regulated
 # deployment ships tokens OUT and wires its own auth module (SAML/AD/OIDC) in the private repo.
-default = ["auth-tokens"]
+default = ["auth-tokens", "hooks-ranking"]
 auth-tokens = []
+# The built-in RANKING hooks (cheapest/fastest/least_busy/usage) are also a default-on, removable
+# feature. `--no-default-features` drops them; `weighted` stays (it's the engine's inline SWRR floor,
+# not a plugin). A pool `policy: cheapest` (etc.) is then a boot error.
+hooks-ranking = []
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.

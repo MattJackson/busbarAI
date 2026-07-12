@@ -310,19 +310,31 @@ pub(crate) fn resolve_policy(
         return resolve_gate_transport(hook, client);
     }
     // No gate: resolve the native `policy:` ordering. `weighted` ⇒ the zero-cost default path (no
-    // policy object, inline SWRR) — byte-identical to 1.2.1's `route: weighted`.
+    // policy object, inline SWRR) — byte-identical to 1.2.1's `route: weighted` — so `native_name()`
+    // returns `None` here and we take the `?` short-circuit BELOW regardless of the ranking feature.
     let name = cfg.policy.native_name()?;
-    let policy = crate::plugins::hooks::ranking::native_policy(name)?;
-    Some(ResolvedPolicy::Policy {
-        policy,
-        on_error: crate::config::PolicyOnError::default(),
-        timeout: policy_timeout(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
-        // Native policies rank on live signals and have no reader for prompt/identity.
-        send_prompt: false,
-        send_user: false,
-        // A native ordering policy never restricts, so on_empty is inert; keep the fail-closed default.
-        on_empty: crate::config::PolicyOnError::Reject,
-    })
+    // The non-weighted ranking strategies are the `hooks-ranking` plugin. When it's compiled OUT, a
+    // `policy: cheapest` (etc.) is a config_validate BOOT ERROR, so this arm is unreachable in a
+    // running server; degrade to None (SWRR) as belt-and-suspenders.
+    #[cfg(feature = "hooks-ranking")]
+    {
+        let policy = crate::plugins::hooks::ranking::native_policy(name)?;
+        Some(ResolvedPolicy::Policy {
+            policy,
+            on_error: crate::config::PolicyOnError::default(),
+            timeout: policy_timeout(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
+            // Native policies rank on live signals and have no reader for prompt/identity.
+            send_prompt: false,
+            send_user: false,
+            // A native ordering policy never restricts, so on_empty is inert; keep the fail-closed default.
+            on_empty: crate::config::PolicyOnError::Reject,
+        })
+    }
+    #[cfg(not(feature = "hooks-ranking"))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 /// Resolve a GATE hook's transport (socket or webhook) into a [`ResolvedPolicy`]. The prompt/identity

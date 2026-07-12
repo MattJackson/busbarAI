@@ -11,7 +11,6 @@
 
 #[allow(clippy::module_inception)]
 mod ranking;
-pub(crate) use ranking::{
-    native_policy, POLICY_NAME_CHEAPEST, POLICY_NAME_FASTEST, POLICY_NAME_LEAST_BUSY,
-    POLICY_NAME_USAGE,
-};
+// Only the registry entry point is used outside the plugin; the POLICY_NAME_* constants are internal
+// to `ranking.rs` (the engine names strategies with literals — see `PoolPolicy::native_name`).
+pub(crate) use ranking::native_policy;

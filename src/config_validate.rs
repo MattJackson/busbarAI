@@ -733,6 +733,22 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (compliance-by-compilation): the non-weighted ranking strategies are the `hooks-ranking`
+    // plugin. When it's compiled OUT (`--no-default-features`), a pool `policy: <non-weighted>` is a
+    // BOOT ERROR — never a silent degrade to weighted. (Inert in the default build; `weighted` always
+    // works — it's the engine's inline SWRR floor, not a plugin.)
+    #[cfg(not(feature = "hooks-ranking"))]
+    for (pool_name, pool_cfg) in &cfg.pools {
+        if pool_cfg.policy != crate::config::PoolPolicy::Weighted {
+            errors.push(format!(
+                "pool '{pool_name}' uses policy: {:?} but this binary was built WITHOUT the \
+                 `hooks-ranking` feature — the built-in ranking strategies are absent. Rebuild with \
+                 default features, use `policy: weighted`, or reference an external ranking hook.",
+                pool_cfg.policy
+            ));
+        }
+    }
+
     // Rule 5: Validate auth-block semantics. `auth.chain` is a list of module names + `upstream_
     // credentials` a snake_case enum, both validated below. `AuthCfg` is `deny_unknown_fields`, so a
     // stale `mode:`/`token:` key fails AT PARSE with serde's "unknown field" — a loud clean-break
