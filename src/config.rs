@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // Re-export status_class_from_str for config validation
 pub(crate) use crate::breaker::status_class_from_str;
@@ -505,7 +505,7 @@ impl PoolPolicy {
 /// A hook's MODE — the `kind:` key. A hook is one thing; `tap`/`gate` just say whether busbar waits
 /// for a reply. `tap` = fire-and-forget (watch). `gate` = fire-and-wait (decide: nothing / reject /
 /// restrict / order / rewrite). Only a gate can influence dispatch; a pool's `hook:` must name a gate.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HookKind {
     Tap,
@@ -517,7 +517,7 @@ pub(crate) enum HookKind {
 /// prompt for READ-ONLY inspection (PII screening, guardrails, audit). `rw` additionally lets a GATE
 /// return a `rewrite` arm that mutates the body (compression, redaction) — rewrite REQUIRES read, so
 /// it is the top rung of the SAME ladder, not a separate flag. Immutable after registration.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PromptAccess {
     #[default]
@@ -541,7 +541,7 @@ impl PromptAccess {
 /// A hook's caller-IDENTITY access grant (`user:`). `no` (default) = no identity in the payload; `ro`
 /// = the governance key id/name (NEVER the secret) + the body end-user field. No `rw`: identity is
 /// established by the auth plugin and hooks never rewrite it. Immutable after registration.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UserAccess {
     #[default]
@@ -558,7 +558,7 @@ impl UserAccess {
 
 /// The pipeline stage a TAP observes (`at:`). Parsed now; the seam that fires taps at each stage
 /// lands in a later slice. Inert on a gate.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HookStage {
     Request,
@@ -571,7 +571,7 @@ pub(crate) enum HookStage {
 /// non-negotiable safety stance: a broken/slow policy is indistinguishable from no policy and NEVER
 /// blocks or fails a request. `Reject` is fail-closed (503). `First` uses the configured member
 /// order (a deterministic degraded pick).
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PolicyOnError {
     #[default]
@@ -584,7 +584,7 @@ pub(crate) enum PolicyOnError {
 /// One transport per hook: exactly one of `socket` (Unix domain socket, ~8us) or `webhook` (HTTPS
 /// sidecar). Shared runtime knobs carry over from the 1.2.1 policy block. A pool references a GATE by
 /// name via its `hook:` key; global taps/gates via `global_hooks:` (or inline `global: true`).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HookCfg {
     /// The hook's MODE: `tap` (fire-and-forget) or `gate` (fire-and-wait, returns a reply arm).
@@ -1672,6 +1672,35 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hook config types are round-trippable (Deserialize + Serialize) — the foundation for the
+    /// config-overlay persistence that will let a runtime-registered hook survive a restart. A
+    /// `HookCfg` deserialized from JSON re-serializes + re-parses to an identical shape, exercising the
+    /// snake_case enums (kind/prompt/user) + the transport + the ordering/stage fields.
+    #[test]
+    fn hook_cfg_round_trips_for_overlay_persistence() {
+        let src = serde_json::json!({
+            "kind": "gate",
+            "webhook": "http://127.0.0.1:8900/",
+            "prompt": "rw",
+            "user": "ro",
+            "priority": 7,
+            "on_error": "reject",
+            "global": true,
+            "timeout_ms": 25
+        });
+        let cfg: HookCfg = serde_json::from_value(src).expect("HookCfg deserializes");
+        // Serialize -> re-deserialize -> re-serialize: the two JSON forms must be identical (stable).
+        let once = serde_json::to_value(&cfg).expect("HookCfg serializes");
+        let cfg2: HookCfg = serde_json::from_value(once.clone()).expect("re-deserializes");
+        let twice = serde_json::to_value(&cfg2).expect("re-serializes");
+        assert_eq!(once, twice, "HookCfg round-trips stably");
+        // Spot-check the snake_case enum projection survives.
+        assert_eq!(once["kind"], "gate");
+        assert_eq!(once["prompt"], "rw");
+        assert_eq!(once["user"], "ro");
+        assert_eq!(once["on_error"], "reject");
+    }
 
     /// Serializes tests that touch the *shared* `BUSBAR_CLIENT_TOKEN` env var. Env vars are
     /// process-global, and `cargo test` runs tests in parallel by default, so two tests that
