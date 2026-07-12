@@ -491,10 +491,114 @@ fn extract_admin_header_token(req: &Request<Body>) -> Option<String> {
 /// consumers (audit attribution, the hook `send_user` projection, admin scopes) can extract it
 /// without an is-it-there dance. Never carries the credential.
 #[derive(Debug, Clone)]
-pub(crate) struct AuthPrincipal(
-    // Read by the admin scope-enforcement + audit-attribution consumers (next increments).
-    #[allow(dead_code)] pub(crate) Option<Principal>,
-);
+pub(crate) struct AuthPrincipal(pub(crate) Option<Principal>);
+
+impl AuthPrincipal {
+    /// The attribution handle for audit records: the principal id, or `anonymous` for the
+    /// explicit open-front-door postures.
+    pub(crate) fn actor_id(&self) -> &str {
+        self.0
+            .as_ref()
+            .map(|p| p.id.as_str())
+            .unwrap_or("anonymous")
+    }
+}
+
+/// Execute the ADMIN auth chain (`admin_auth:`) over the extracted admin credential carriers.
+/// Mirrors `AuthMiddleware::run_chain` (first Identify admits, Reject denies, all-Pass denies,
+/// empty chain = the explicit open posture) but takes BOTH carriers — an admin credential
+/// legitimately arrives as `Authorization: Bearer` or `X-Admin-Token`, and the constant-time
+/// both-carriers fold lives inside the module. Unknown / compiled-out names are skipped with a
+/// loud log (config_validate rejects them at boot).
+fn run_admin_chain(
+    app: &crate::state::App,
+    bearer: Option<&str>,
+    header: Option<&str>,
+) -> ChainVerdict {
+    if app.admin_chain.is_empty() {
+        return ChainVerdict::Open;
+    }
+    for name in &app.admin_chain {
+        let outcome = match name.as_str() {
+            #[cfg(feature = "auth-admin-tokens")]
+            "admin-tokens" => crate::plugins::auth::admin_tokens::authenticate_admin_tokens(
+                app.governance.as_ref().and_then(|g| g.admin_token_hash()),
+                bearer,
+                header,
+            ),
+            other => {
+                tracing::error!(
+                    module = other,
+                    "admin_auth names an unknown/uncompiled module; skipping (config_validate \
+                     rejects this at boot)"
+                );
+                AuthOutcome::Pass
+            }
+        };
+        match outcome {
+            AuthOutcome::Identify(principal) => return ChainVerdict::Identified(principal),
+            AuthOutcome::Reject => return ChainVerdict::Denied,
+            AuthOutcome::Pass => {}
+        }
+    }
+    ChainVerdict::Denied
+}
+
+/// Resolve a principal's ADMIN SCOPE — the authorization half, operator-owned by construction:
+/// the built-in operator token (the `admin-tokens` principal) is FULL by definition (it is the
+/// root credential); any other principal gets the most permissive `admin_scope` its groups map to
+/// in `group_map:` (unmapped groups grant nothing — fail closed). `None` principal = the explicit
+/// open admin posture (empty `admin_auth:`) — full, dev-only.
+fn admin_scope_for(
+    principal: Option<&Principal>,
+    group_map: &std::collections::HashMap<String, crate::config::GroupMapEntry>,
+) -> Option<crate::admin::v1::contract::Scope> {
+    use crate::admin::v1::contract::Scope;
+    let Some(p) = principal else {
+        return Some(Scope::Full);
+    };
+    // The operator credential. Scope is MODULE-intrinsic, keyed off the fixed principal id the
+    // admin-tokens module mints — an external module returning `id: "admin"` cannot reach here
+    // with it, because group-carrying principals resolve THROUGH group_map below only when they
+    // carry groups; a groupless external "admin" id would land Some(Full) — so the id is reserved:
+    // config_validate forbids `group_map` entries that could shadow it, and external modules are
+    // capped by `allowed_groups`/`max_admin_scope` when they land. Until external ADMIN modules
+    // exist (none are compiled today), the only producer of a groupless principal on this path is
+    // admin-tokens itself.
+    if p.groups.is_empty() {
+        #[cfg(feature = "auth-admin-tokens")]
+        if p.id == crate::plugins::auth::admin_tokens::ADMIN_TOKENS_PRINCIPAL_ID {
+            return Some(Scope::Full);
+        }
+        return None;
+    }
+    p.groups
+        .iter()
+        .filter_map(|g| group_map.get(g))
+        .filter_map(|e| e.admin_scope.as_deref())
+        .filter_map(Scope::parse)
+        .max()
+}
+
+/// A 403 in the frozen admin error envelope (`{"error":{"code":"forbidden","message":…}}`),
+/// naming the scope that WOULD have sufficed — never any other principal's data.
+fn forbidden_response(needed: crate::admin::v1::contract::Scope) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "code": "forbidden",
+            "message": format!(
+                "this endpoint requires the `{}` admin scope",
+                needed.as_str()
+            ),
+        }
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static forbidden response")
+}
 
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
@@ -541,77 +645,38 @@ pub(crate) async fn auth_middleware(
     req.extensions_mut()
         .insert(CallerToken(client_token.clone()));
 
-    // the /admin management API is guarded by the configured admin token (Bearer or
-    // X-Admin-Token) — NOT a virtual key, and NOT the vendor-SDK carriers (admin is a busbar
-    // operator surface, not a native SDK ingress). Disabled (401) when no admin token is
-    // configured. Extract the admin Bearer separately so the multi-scheme client-token carriers
-    // can't present an operator token via `x-api-key`/`x-goog-api-key`.
+    // the /admin management API is gated by the ADMIN AUTH CHAIN (`admin_auth:`, default
+    // `[admin-tokens]` — the single operator token, Bearer or X-Admin-Token) — NOT a virtual key,
+    // and NOT the vendor-SDK carriers (admin is a busbar operator surface, not a native SDK
+    // ingress). The chain authenticates (WHO); the principal's admin SCOPE then authorizes against
+    // the endpoint's required scope (WHAT) — the §1 matrix, checked here at the one chokepoint
+    // every /admin path crosses. Extract the admin Bearer separately so the multi-scheme
+    // client-token carriers can't present an operator token via `x-api-key`/`x-goog-api-key`.
     if is_admin {
         let admin_bearer = req
             .headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(AuthMiddleware::extract_bearer_token);
-        // The admin token's SHA-256 is pre-computed once at `GovState` construction
-        // (`GovState::admin_token_hash`) and is present exactly when an admin token is configured.
-        // Match on it directly: the configured-token compare needs no per-request SHA-256, and there
-        // is no parallel `Option` to unwrap on this auth path.
-        let authorized = match app.governance.as_ref().and_then(|g| g.admin_token_hash()) {
-            // Constant-time compare so the admin token can't be recovered byte-by-byte via a timing
-            // side channel. BOTH carrier comparisons run UNCONDITIONALLY and are combined with a
-            // bitwise-OR fold (`|`, NOT `||`): a `||` short-circuits, so a request presenting BOTH a
-            // Bearer and an x-admin-token would skip the header compare whenever the Bearer matched —
-            // a carrier-level timing observable distinguishing "Bearer matched" (one compare) from
-            // "Bearer missed, fell through to header" (two compares), leaking one bit of oracle about
-            // the Bearer value. Mirror the client-token allowlist fold: compute each compare into a
-            // `u8`, OR them, and `black_box` the result so the optimizer can't reintroduce an early
-            // exit. A missing carrier contributes 0 (no compare to a secret leaks via its absence).
-            Some(configured_hash) => {
-                // Length-independent compare: `constant_time_eq` early-returns on a length mismatch,
-                // which leaks the admin token's LENGTH via timing (a candidate of the right length runs
-                // the full byte loop; a wrong-length one returns immediately). Remove that oracle by
-                // hashing BOTH the presented candidate and the configured token with SHA-256 (the same
-                // `sha256_hex` facility used for virtual keys) and constant-time-comparing the
-                // fixed-length (64-hex-char) digests — every candidate now does identical work
-                // regardless of its length. A missing carrier contributes 0 (no compare against a
-                // secret-derived digest, so its absence leaks nothing). The compares run
-                // UNCONDITIONALLY and fold with bitwise-OR (see the no-short-circuit rationale above).
-                // `configured_hash` is bound from the match above — pre-computed once at `GovState`
-                // construction, so there is no per-request SHA-256 of the configured token and no
-                // unwrap/expect on this auth path.
-                let bearer_match = u8::from(
-                    admin_bearer
-                        .as_deref()
-                        .map(|b| {
-                            AuthMiddleware::constant_time_eq(
-                                &crate::sigv4::sha256_hex(b.as_bytes()),
-                                configured_hash,
-                            )
-                        })
-                        .unwrap_or(false),
-                );
-                let header_match = u8::from(
-                    admin_header_token
-                        .as_deref()
-                        .map(|h| {
-                            AuthMiddleware::constant_time_eq(
-                                &crate::sigv4::sha256_hex(h.as_bytes()),
-                                configured_hash,
-                            )
-                        })
-                        .unwrap_or(false),
-                );
-                std::hint::black_box(bearer_match | header_match) != 0
-            }
-            None => false,
-        };
-        if !authorized {
-            return Err(unauthorized_response(&path));
+        let principal =
+            match run_admin_chain(&app, admin_bearer.as_deref(), admin_header_token.as_deref()) {
+                ChainVerdict::Identified(p) => Some(p),
+                // The explicit `admin_auth: []` OPEN posture (dev): anonymous, full authority —
+                // symmetric with the data plane's empty chain. The default config never lands here.
+                ChainVerdict::Open => None,
+                ChainVerdict::Denied => return Err(unauthorized_response(&path)),
+            };
+        // AUTHORIZATION: resolve the principal's admin scope (module-intrinsic for the operator
+        // token; `group_map:` for group-carrying principals — most permissive wins, unmapped
+        // groups grant nothing) and check it against the endpoint's required scope. An identified
+        // principal with NO grant is 403, never 401 — authenticated but not authorized.
+        let scope = admin_scope_for(principal.as_ref(), &app.group_map);
+        let required = crate::admin::v1::contract::required_scope(req.method(), &path);
+        match scope {
+            Some(s) if s.allows(required) => {}
+            _ => return Err(forbidden_response(required)),
         }
-        // The legacy single admin token identifies as the fixed operator principal (the
-        // admin-tokens module + scopes refine this).
-        req.extensions_mut()
-            .insert(AuthPrincipal(Some(Principal::from_id("admin"))));
+        req.extensions_mut().insert(AuthPrincipal(principal));
         // INTENTIONAL governance bypass for the operator admin token. A successful admin auth attaches
         // an EMPTY `GovCtx::default()` (no resolved virtual key) and returns HERE — BEFORE the
         // virtual-key governance resolution below — so per-key controls (`allowed_pools`, budget, RPM/
@@ -986,6 +1051,55 @@ fn verify_bedrock_sigv4(
 
 #[cfg(test)]
 mod tests {
+    /// `admin_scope_for`: the operator principal is full; group-carrying principals resolve
+    /// through group_map (most permissive wins, unmapped grants nothing); a groupless non-operator
+    /// principal gets nothing; the open posture (no principal) is full.
+    #[test]
+    fn admin_scope_resolution() {
+        use crate::admin::v1::contract::Scope;
+        let mut gm = std::collections::HashMap::new();
+        gm.insert(
+            "viewers".to_string(),
+            crate::config::GroupMapEntry {
+                admin_scope: Some("read-only".to_string()),
+            },
+        );
+        gm.insert(
+            "admins".to_string(),
+            crate::config::GroupMapEntry {
+                admin_scope: Some("full".to_string()),
+            },
+        );
+        gm.insert(
+            "no-admin".to_string(),
+            crate::config::GroupMapEntry { admin_scope: None },
+        );
+
+        // Open posture: full.
+        assert_eq!(admin_scope_for(None, &gm), Some(Scope::Full));
+        // The operator principal (admin-tokens): full.
+        #[cfg(feature = "auth-admin-tokens")]
+        assert_eq!(
+            admin_scope_for(Some(&Principal::from_id("admin")), &gm),
+            Some(Scope::Full)
+        );
+        // Group-mapped: most permissive of the mapped groups wins.
+        let mut p = Principal::from_id("ad:alice");
+        p.groups = vec!["viewers".to_string(), "admins".to_string()];
+        assert_eq!(admin_scope_for(Some(&p), &gm), Some(Scope::Full));
+        p.groups = vec!["viewers".to_string()];
+        assert_eq!(admin_scope_for(Some(&p), &gm), Some(Scope::ReadOnly));
+        // Unmapped groups grant nothing (fail closed).
+        p.groups = vec!["strangers".to_string()];
+        assert_eq!(admin_scope_for(Some(&p), &gm), None);
+        // A group mapped WITHOUT admin_scope grants nothing.
+        p.groups = vec!["no-admin".to_string()];
+        assert_eq!(admin_scope_for(Some(&p), &gm), None);
+        // A groupless NON-operator principal gets nothing (an external module cannot mint the
+        // operator identity by returning a bare id).
+        let stranger = Principal::from_id("ad:bob");
+        assert_eq!(admin_scope_for(Some(&stranger), &gm), None);
+    }
     use super::*;
     use axum::http::header::CONTENT_TYPE;
 
@@ -2740,6 +2854,8 @@ mod tests {
     /// the admin surface. Driven end-to-end through the real router + `auth_middleware` so the
     /// extraction + constant-time compare are exercised together. A correct token via the same header
     /// authorizes, proving the 401 is the empty-filter and not a blanket reject.
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[tokio::test]
     async fn test_admin_blank_header_token_rejected() {
         use crate::governance::{GovState, SqliteStore};
@@ -2798,6 +2914,8 @@ mod tests {
     ///   - wrong Bearer  + correct x-admin-token  → authorized (Bearer miss didn't short-circuit away
     ///                                               the header compare)
     ///   - wrong + wrong                          → 401
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[tokio::test]
     async fn test_admin_token_both_carriers_or_fold_no_short_circuit() {
         use crate::governance::{GovState, SqliteStore};
@@ -2875,6 +2993,8 @@ mod tests {
     /// leaked/observed client header into operator-surface (key create/delete) access. This pins the
     /// boundary: the CORRECT admin secret presented via `x-api-key` or `x-goog-api-key` MUST 401,
     /// while the two sanctioned admin carriers MUST authorize.
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[tokio::test]
     async fn test_admin_token_not_acceptable_via_vendor_carriers() {
         use crate::governance::{GovState, SqliteStore};

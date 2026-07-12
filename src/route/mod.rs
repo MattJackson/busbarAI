@@ -1256,6 +1256,8 @@ mod tests {
             global_gates: Vec::new(),
             hook_registry: std::collections::HashMap::new(),
             global_hooks: Vec::new(),
+            admin_chain: vec!["admin-tokens".to_string()],
+            group_map: std::collections::HashMap::new(),
             overlay_path: None,
             config_version: 0,
             failover_cfg: None,
@@ -1322,6 +1324,7 @@ mod tests {
                 breaker: None,
                 policy: None,
                 gates: Vec::new(),
+                rewrite_hooks: Vec::new(),
             },
         );
         // App is behind Arc; rebuild with the populated map.
@@ -1348,6 +1351,7 @@ mod tests {
                 breaker: None,
                 policy: None,
                 gates: Vec::new(),
+                rewrite_hooks: Vec::new(),
             },
         );
         let inner = Arc::get_mut(&mut app).expect("sole owner");

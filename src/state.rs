@@ -111,6 +111,11 @@ pub(crate) struct PoolRuntime {
     /// globals-before-pool on ties, then config order). Empty (the default) = no pool gates — the
     /// phase-2 pass is skipped entirely when this and `global_gates` are both empty.
     pub(crate) gates: Vec<(u16, crate::routing::ResolvedPolicy)>,
+    /// This pool's REWRITE chain — the `prompt: rw` gates in its `hooks: [...]` list, resolved once
+    /// at config load, ascending-priority order. Fired in the phase-1 transform pass AFTER the
+    /// global rewrite chain, only for requests routed to this pool. Empty (the default) = no pool
+    /// rewrites, zero cost.
+    pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
 }
 
 /// `Clone` is the config-apply enabler: cloning an `App` shares the live-state `Arc`s (store, auth,
@@ -185,6 +190,12 @@ pub(crate) struct App {
     /// true`). Carried for the hooks read surface so a definition can report whether it is globally
     /// wired. Read-only after construction.
     pub(crate) global_hooks: Vec<String>,
+    /// The ADMIN auth chain (`admin_auth:` module names, default `[admin-tokens]`) — executed by
+    /// the auth middleware for `/admin` paths. Empty = the explicit OPEN admin posture (dev).
+    pub(crate) admin_chain: Vec<String>,
+    /// `group_map:` — principal groups → operator policy (admin scope today). Read by the admin
+    /// authorization resolution; unmapped groups grant nothing (fail closed).
+    pub(crate) group_map: HashMap<String, crate::config::GroupMapEntry>,
     /// The config-overlay path (`BUSBAR_CONFIG_OVERLAY`), if persistence is enabled. `Some` = an
     /// API-applied hook change is written here so it survives a restart (re-merged onto base config at
     /// boot); `None` (the default) = runtime changes are live but not persisted. Carried on `App` (not

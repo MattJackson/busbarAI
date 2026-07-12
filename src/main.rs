@@ -641,6 +641,11 @@ async fn main() {
                 // This pool's decision gates, resolved once here (priority carried for the phase-2
                 // chain merge). NOT re-resolved on config apply yet — same scope caveat as `policy`.
                 gates: routing::resolve_pool_gates(pool_cfg, &cfg.hooks, &upstream_client),
+                rewrite_hooks: routing::resolve_pool_rewrites(
+                    pool_cfg,
+                    &cfg.hooks,
+                    &upstream_client,
+                ),
             },
         );
     }
@@ -743,6 +748,8 @@ async fn main() {
         global_gates,
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
+        admin_chain: cfg.admin_auth.clone(),
+        group_map: cfg.group_map.clone(),
         overlay_path,
         config_version: 0,
         failover_cfg,

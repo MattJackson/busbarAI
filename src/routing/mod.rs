@@ -403,9 +403,44 @@ pub(crate) fn resolve_pool_gates(
             if hook.kind != crate::config::HookKind::Gate {
                 return None;
             }
+            // A `prompt: rw` gate is a phase-1 REWRITE (resolved by `resolve_pool_rewrites`), not
+            // a phase-2 decision gate — including it here would fire it for a decision it never
+            // returns (its rewrite reply normalizes to Abstain), paying its deadline for nothing.
+            if hook.prompt.can_rewrite() {
+                return None;
+            }
             resolve_gate_transport(hook, hooks, client).map(|rp| (hook.priority, rp))
         })
         .collect()
+}
+
+/// Resolve a pool's REWRITE gates — the `prompt: rw` gates in its `hooks: [...]` list — into the
+/// pool's phase-1 transform chain, sorted by ascending `priority` (stable: config order breaks
+/// ties). Fired AFTER the global rewrite chain for requests routed to this pool (each chain is
+/// internally priority-ordered; globals always precede pool rewrites). The rw GRANT is the
+/// admission ticket, enforced here at resolution exactly as in `resolve_rewrite_hooks`.
+pub(crate) fn resolve_pool_rewrites(
+    cfg: &crate::config::PoolCfg,
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+    client: &reqwest::Client,
+) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
+    let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
+    for name in &cfg.gates {
+        let Some(hook) = hooks.get(name) else {
+            continue;
+        };
+        if hook.kind != crate::config::HookKind::Gate || !hook.prompt.can_rewrite() {
+            continue;
+        }
+        if let Some(ResolvedPolicy::Policy {
+            policy, timeout, ..
+        }) = resolve_gate_transport(hook, hooks, client)
+        {
+            ranked.push((hook.priority, timeout, policy));
+        }
+    }
+    ranked.sort_by_key(|(p, _, _)| *p);
+    ranked.into_iter().map(|(_, t, p)| (t, p)).collect()
 }
 
 /// Resolve a GATE hook's transport (socket or webhook) into a [`ResolvedPolicy`]. The prompt/identity
@@ -914,6 +949,33 @@ mod tests {
             "the chain bottoms out on b's reject terminal"
         );
 
+        // `on_error: nothing` — the explicit do-not-participate terminal — resolves to the same
+        // no-op machinery as weighted (an empty chain + the Weighted terminal, which every
+        // reconcile pass skips): a failing gate with `nothing` can never displace another gate.
+        let mut n = base_gate();
+        n.socket = Some("/run/busbar/n.sock".to_string());
+        n.on_error = "nothing".to_string();
+        let hooks_n = registry("n", n);
+        let Some((
+            _,
+            ResolvedPolicy::Policy {
+                on_error,
+                on_error_chain,
+                ..
+            },
+        )) = resolve_pool_gates(&pool_with_hook("n"), &hooks_n, &client)
+            .into_iter()
+            .next()
+        else {
+            panic!("gate n must resolve");
+        };
+        assert!(on_error_chain.is_empty());
+        assert_eq!(
+            on_error,
+            PolicyOnError::Weighted,
+            "nothing = the non-participating terminal"
+        );
+
         // A direct terminal ⇒ empty chain.
         let mut c = base_gate();
         c.socket = Some("/run/busbar/c.sock".to_string());
@@ -961,6 +1023,36 @@ mod tests {
         assert_eq!(on_error_chain.len(), 1);
         assert_eq!(on_error_chain[0].policy.name(), "cheapest");
         assert_eq!(on_error, PolicyOnError::Weighted);
+    }
+
+    /// A pool's `prompt: rw` gate is a PHASE-1 rewrite, not a phase-2 decision gate: it is
+    /// EXCLUDED from `resolve_pool_gates` and resolved by `resolve_pool_rewrites` instead — so it
+    /// never pays a decision deadline for a reply arm it cannot return.
+    #[cfg(unix)]
+    #[test]
+    fn pool_rw_gate_resolves_as_rewrite_not_decision() {
+        let client = reqwest::Client::new();
+        let mut rw = base_gate();
+        rw.socket = Some("/run/busbar/rw.sock".to_string());
+        rw.prompt = PromptAccess::Rw;
+        let hooks = registry("rw", rw);
+        let pool = pool_with_hook("rw");
+        assert!(
+            resolve_pool_gates(&pool, &hooks, &client).is_empty(),
+            "an rw gate must not resolve as a decision gate"
+        );
+        assert_eq!(
+            resolve_pool_rewrites(&pool, &hooks, &client).len(),
+            1,
+            "an rw gate must resolve into the pool rewrite chain"
+        );
+        // And the inverse: a plain (non-rw) gate stays a decision gate, no rewrite entry.
+        let mut plain = base_gate();
+        plain.socket = Some("/run/busbar/plain.sock".to_string());
+        let hooks = registry("plain", plain);
+        let pool = pool_with_hook("plain");
+        assert_eq!(resolve_pool_gates(&pool, &hooks, &client).len(), 1);
+        assert!(resolve_pool_rewrites(&pool, &hooks, &client).is_empty());
     }
 
     /// SECURITY INVARIANT: `resolve_rewrite_hooks` admits ONLY `prompt: rw` GATES as rewrite hooks.

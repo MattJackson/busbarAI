@@ -757,6 +757,8 @@ impl TestApp {
             global_gates: Vec::new(),
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
+            admin_chain: vec!["admin-tokens".to_string()],
+            group_map: std::collections::HashMap::new(),
             overlay_path: self.overlay_path,
             config_version: 0,
             failover_cfg: self.failover_cfg,
@@ -1383,6 +1385,7 @@ mod tests {
                     breaker: None,
                     policy: None,
                     gates: Vec::new(),
+                    rewrite_hooks: Vec::new(),
                 },
             )
             .build();
@@ -2189,6 +2192,8 @@ mod tests {
 
     /// the /admin management API — create→list→usage→delete, admin-token gating, and a minted
     /// secret then authenticating as a working virtual key.
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[tokio::test]
     async fn test_governance_admin_api() {
         use crate::governance::{GovState, SqliteStore};
@@ -3931,6 +3936,8 @@ mod tests {
                     listen: "0.0.0.0:8080".into(),
                     tls: None,
                     auth: None,
+                    admin_auth: vec!["admin-tokens".to_string()],
+                    group_map: std::collections::HashMap::new(),
                     providers,
                     models,
                     pools,

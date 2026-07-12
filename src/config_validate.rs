@@ -807,7 +807,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     errors.push(format!(
                         "hook '{hook_name}' on_error names the built-in ranking strategy \
                          '{current}' but this binary was built WITHOUT the `hooks-ranking` \
-                         feature. Rebuild with default features or use weighted|reject|first."
+                         feature. Rebuild with default features or use nothing|weighted|reject|first."
                     ));
                 }
                 break;
@@ -815,7 +815,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             if visited.contains(&current) {
                 errors.push(format!(
                     "hook on_error chain does not terminate: {} -> {current} is a cycle; every \
-                     chain must bottom out on weighted|reject|first or a ranking strategy",
+                     chain must bottom out on nothing|weighted|reject|first or a ranking strategy",
                     visited.join(" -> ")
                 ));
                 break;
@@ -823,7 +823,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             let Some(next) = cfg.hooks.get(current) else {
                 errors.push(format!(
                     "hook '{hook_name}' on_error names unknown fallback '{current}'; use a \
-                     reserved terminal (weighted|reject|first), a ranking strategy, or another \
+                     reserved terminal (nothing|weighted|reject|first), a ranking strategy, or another \
                      gate in the `hooks:` registry"
                 ));
                 break;
@@ -837,6 +837,35 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             }
             visited.push(current);
             current = next.on_error.as_str();
+        }
+    }
+
+    // Rule (admin_auth/known-modules): every name in the `admin_auth:` chain must resolve to a
+    // compiled-in admin auth module. `admin-tokens` is the only built-in; when it is compiled OUT
+    // (`--no-default-features`) the DEFAULT chain still names it — that combination simply leaves
+    // the admin API disabled (all-Pass ⇒ denied), matching the no-token posture, so it is not an
+    // error here; a CONFIGURED admin token with the module absent is rejected by
+    // `validate_governance` (a silent admin lockout must be loud). An unknown name is always a
+    // boot error — a typo must never silently drop an auth module.
+    for name in &cfg.admin_auth {
+        if name != "admin-tokens" {
+            errors.push(format!(
+                "admin_auth names unknown module '{name}'; the built-in admin module is \
+                 `admin-tokens` (external admin modules are registered at compile time)"
+            ));
+        }
+    }
+
+    // Rule (group_map/admin-scope): every `group_map.<group>.admin_scope` must be a known scope
+    // token. A typo'd scope must fail at boot, never silently grant nothing at runtime.
+    for (group, entry) in &cfg.group_map {
+        if let Some(scope) = entry.admin_scope.as_deref() {
+            if crate::admin::v1::contract::Scope::parse(scope).is_none() {
+                errors.push(format!(
+                    "group_map '{group}' has unknown admin_scope '{scope}': expected read-only, \
+                     hooks-register, or full"
+                ));
+            }
         }
     }
 
@@ -1090,6 +1119,21 @@ pub(crate) fn validate_governance(
     auth: Option<&crate::config::AuthCfg>,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+    // A configured admin token with the `admin-tokens` module compiled OUT would silently disable
+    // the admin API (the chain all-Passes) — a silent lockout must be a loud boot error instead.
+    #[cfg(not(feature = "auth-admin-tokens"))]
+    if governance
+        .admin_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        errors.push(
+            "governance.admin_token is configured but this binary was built WITHOUT the \
+             `auth-admin-tokens` feature — the admin API would be silently disabled. Rebuild with \
+             default features or wire an external admin auth module."
+                .to_string(),
+        );
+    }
     if governance.enabled
         && governance
             .admin_token
@@ -1677,6 +1721,8 @@ mod tests {
             models,
             pools,
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             blocked_metadata_hosts: Vec::new(),
             allow_metadata_hosts: Vec::new(),
@@ -2892,6 +2938,8 @@ mod tests {
         }
     }
 
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_validate_governance_rejects_whitespace_only_admin_token() {
         // Regression (LOW #21): a WHITESPACE-ONLY admin_token (" ", "\t", "\n") passes a bare
@@ -2939,6 +2987,25 @@ mod tests {
         );
     }
 
+    /// FEATURELESS counterpart: a configured admin token in a binary WITHOUT the `admin-tokens`
+    /// module is a loud boot error (a silently-disabled admin API is a lockout, never acceptable).
+    #[cfg(not(feature = "auth-admin-tokens"))]
+    #[test]
+    fn test_validate_governance_rejects_admin_token_without_module() {
+        let gov = crate::config::GovernanceCfg {
+            enabled: true,
+            admin_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let errs = validate_governance(&gov, None).expect_err("must be a boot error");
+        assert!(
+            errs.iter().any(|e| e.contains("auth-admin-tokens")),
+            "{errs:?}"
+        );
+    }
+
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_validate_governance_ok_when_enabled_with_admin_token() {
         let gov = config::GovernanceCfg {
@@ -3042,6 +3109,8 @@ mod tests {
         }
     }
 
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_validate_governance_allows_token_and_none_modes() {
         // governance + auth.mode=token (or none) is the supported pairing and must NOT be rejected

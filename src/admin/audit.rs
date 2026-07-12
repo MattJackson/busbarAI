@@ -30,6 +30,10 @@ pub(crate) struct AuditEntry {
     /// Stable outcome token: `applied` (mutation committed) | `rejected` (validation/conflict, nothing
     /// changed).
     pub(crate) outcome: &'static str,
+    /// WHO — the authenticated principal id that attempted the mutation (`admin` for the operator
+    /// token; a virtual-key id or an external module's principal id otherwise; `anonymous` for the
+    /// explicit open admin posture). Attribution, never a credential.
+    pub(crate) principal: String,
     /// The preceding entry's `hash` (empty for the first entry of the process, or the oldest retained
     /// entry whose predecessor was pruned).
     pub(crate) prev_hash: String,
@@ -41,8 +45,14 @@ impl AuditEntry {
     /// Recompute this entry's digest from its fields — the verification primitive.
     fn compute_hash(&self) -> String {
         let canonical = format!(
-            "{}|{}|{}|{}|{}|{}",
-            self.prev_hash, self.seq, self.ts, self.action, self.resource, self.outcome
+            "{}|{}|{}|{}|{}|{}|{}",
+            self.prev_hash,
+            self.seq,
+            self.ts,
+            self.action,
+            self.resource,
+            self.outcome,
+            self.principal
         );
         crate::sigv4::sha256_hex(canonical.as_bytes())
     }
@@ -71,7 +81,15 @@ impl AuditLog {
 
     /// Record one mutation attempt. Never fails (a poisoned lock is recovered — losing the audit log
     /// to a panic would be worse than proceeding). Bounded: prunes the oldest past the cap.
-    pub(crate) fn record(&self, action: &str, resource: &str, outcome: &'static str) {
+    /// Record one mutation attempt WITH principal attribution (§6.7: every mutation, success AND
+    /// failure, attributed to WHO attempted it).
+    pub(crate) fn record_by(
+        &self,
+        action: &str,
+        resource: &str,
+        outcome: &'static str,
+        principal: &str,
+    ) {
         let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         // Chain to the most recent entry (the back), before any prune.
@@ -82,6 +100,7 @@ impl AuditLog {
             action: action.to_string(),
             resource: resource.to_string(),
             outcome,
+            principal: principal.to_string(),
             prev_hash,
             hash: String::new(),
         };
@@ -150,8 +169,8 @@ mod tests {
     #[test]
     fn record_and_list_newest_first() {
         let log = AuditLog::new();
-        log.record("hook.register", "hook:a", OUTCOME_APPLIED);
-        log.record("hook.delete", "hook:a", OUTCOME_APPLIED);
+        log.record_by("hook.register", "hook:a", OUTCOME_APPLIED, "admin");
+        log.record_by("hook.delete", "hook:a", OUTCOME_APPLIED, "admin");
         let entries = log.list(10);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].action, "hook.delete", "newest first");
@@ -161,9 +180,9 @@ mod tests {
     #[test]
     fn hash_chain_links_and_verifies() {
         let log = AuditLog::new();
-        log.record("hook.register", "hook:a", OUTCOME_APPLIED);
-        log.record("hook.register", "hook:b", OUTCOME_REJECTED);
-        log.record("hook.delete", "hook:a", OUTCOME_APPLIED);
+        log.record_by("hook.register", "hook:a", OUTCOME_APPLIED, "admin");
+        log.record_by("hook.register", "hook:b", OUTCOME_REJECTED, "admin");
+        log.record_by("hook.delete", "hook:a", OUTCOME_APPLIED, "admin");
         assert!(log.verify(), "an untouched chain verifies");
 
         // Each entry (oldest→newest) links to its predecessor's hash.

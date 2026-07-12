@@ -6,3 +6,6 @@
 
 #[cfg(feature = "auth-tokens")]
 pub(crate) mod tokens;
+
+#[cfg(feature = "auth-admin-tokens")]
+pub(crate) mod admin_tokens;

@@ -184,7 +184,12 @@ struct RegisterHookReq {
 /// returns `201` with the registered hook. A `global` hook is LIVE immediately (new requests see it);
 /// in-flight requests finish on the old snapshot. Lanes/store are untouched — live breaker state is
 /// preserved. This is the first API-driven config mutation.
-async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::Bytes) -> Response {
+async fn register_hook(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
     let req: RegisterHookReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
@@ -194,7 +199,7 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
     match build_with_hook(&current, &req.name, req.config) {
         Ok(next) => {
             handle.swap(Arc::new(next));
-            audit::AUDIT.record("hook.register", &resource, audit::OUTCOME_APPLIED);
+            audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_APPLIED, &actor);
             // Persist the new hook state to the overlay (best-effort; no-op when persistence disabled).
             // Clear any tombstone for this name — a re-register un-deletes it.
             let cur = handle.load();
@@ -212,7 +217,7 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
             )
         }
         Err(e) => {
-            audit::AUDIT.record("hook.register", &resource, audit::OUTCOME_REJECTED);
+            audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
             err_json(&e)
         }
     }
@@ -221,13 +226,18 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
 /// `DELETE /admin/v1/hooks/{name}` — remove a hook at RUNTIME (live). Builds the next snapshot without
 /// the hook (dropped from the registry + global wiring, transports re-resolved) and swaps it in.
 /// `404 not_found` if the hook is unregistered. `204 No Content` on success.
-async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+async fn delete_hook(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(name): Path<String>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
     let current = handle.load();
     let resource = format!("hook:{name}");
     match build_without_hook(&current, &name) {
         Ok(next) => {
             handle.swap(Arc::new(next));
-            audit::AUDIT.record("hook.delete", &resource, audit::OUTCOME_APPLIED);
+            audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_APPLIED, &actor);
             // Tombstone this name so the deletion survives a restart even if the hook was base-defined.
             let cur = handle.load();
             crate::config::overlay::persist(
@@ -240,7 +250,7 @@ async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
-            audit::AUDIT.record("hook.delete", &resource, audit::OUTCOME_REJECTED);
+            audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_REJECTED, &actor);
             err_json(&e)
         }
     }

@@ -46,6 +46,49 @@ impl Scope {
             Scope::Full => "full",
         }
     }
+
+    /// Parse a config-side scope token (`group_map.<g>.admin_scope`). `None` = unknown token —
+    /// config_validate rejects it at boot; runtime callers treat it as no grant (fail closed).
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token {
+            "read-only" => Some(Scope::ReadOnly),
+            "hooks-register" => Some(Scope::HooksRegister),
+            "full" => Some(Scope::Full),
+            _ => None,
+        }
+    }
+
+    /// Whether a principal holding `self` may call an endpoint requiring `needed`. The scopes are
+    /// a strict ladder (`read-only ⊂ hooks-register ⊂ full`), encoded in the derive(Ord) variant
+    /// order above.
+    pub(crate) fn allows(self, needed: Scope) -> bool {
+        self >= needed
+    }
+}
+
+/// The AUTHORIZATION MATRIX (design-admin-api-v1 §1, §6.3): the scope an admin endpoint requires,
+/// derived from METHOD + PATH — never from the body (a crafted request cannot escalate). The
+/// ladder: every read is `read-only`; the hook-DEFINITION lifecycle (`/admin/v1/hooks*` mutations)
+/// is `hooks-register` (deliberately narrow — automation can register itself but cannot mint keys
+/// or change auth); every other mutation — keys, config apply/rollback, auth chains, group_map,
+/// cache — is `full`. Unknown methods fail closed to `full`. Body-derived refinements (§6.3: a
+/// `hooks-register` principal must not register a hook wired into a security-critical path) are
+/// enforced at the service layer, where the body is parsed.
+pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
+    use axum::http::Method;
+    if method == Method::GET || method == Method::HEAD {
+        return Scope::ReadOnly;
+    }
+    // Only the enumerated mutation verbs earn the narrower hooks scope; anything else (OPTIONS,
+    // TRACE, extension methods) fails closed to `full`.
+    let is_mutation = method == Method::POST
+        || method == Method::PUT
+        || method == Method::PATCH
+        || method == Method::DELETE;
+    if is_mutation && (path == "/admin/v1/hooks" || path.starts_with("/admin/v1/hooks/")) {
+        return Scope::HooksRegister;
+    }
+    Scope::Full
 }
 
 /// The stable v1 error taxonomy. Each variant maps to a fixed `code` (the machine-stable branch key
@@ -402,6 +445,66 @@ pub(crate) struct ConfigValidateView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Method;
+
+    /// The §1 authorization matrix, test-locked: reads are read-only, hook-definition mutations
+    /// are hooks-register, everything else (keys, config, auth, cache) is full. Unknown methods
+    /// fail closed to full.
+    #[test]
+    fn required_scope_matrix() {
+        for path in [
+            "/admin/v1/info",
+            "/admin/v1/hooks",
+            "/admin/v1/keys",
+            "/admin/v1/config",
+            "/admin/v1/audit",
+        ] {
+            assert_eq!(
+                required_scope(&Method::GET, path),
+                Scope::ReadOnly,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            required_scope(&Method::POST, "/admin/v1/hooks"),
+            Scope::HooksRegister
+        );
+        assert_eq!(
+            required_scope(&Method::DELETE, "/admin/v1/hooks/my-hook"),
+            Scope::HooksRegister
+        );
+        assert_eq!(
+            required_scope(&Method::PATCH, "/admin/v1/hooks/my-hook/settings"),
+            Scope::HooksRegister
+        );
+        // A sibling path must not inherit the hooks scope (boundary-safe prefix).
+        assert_eq!(
+            required_scope(&Method::POST, "/admin/v1/hooksx"),
+            Scope::Full
+        );
+        assert_eq!(required_scope(&Method::POST, "/admin/v1/keys"), Scope::Full);
+        assert_eq!(
+            required_scope(&Method::POST, "/admin/v1/config/apply"),
+            Scope::Full
+        );
+        assert_eq!(
+            required_scope(&Method::OPTIONS, "/admin/v1/hooks"),
+            Scope::Full,
+            "unknown methods fail closed"
+        );
+    }
+
+    /// The scope ladder: read-only ⊂ hooks-register ⊂ full — and parse round-trips the tokens.
+    #[test]
+    fn scope_ladder_allows() {
+        assert!(Scope::Full.allows(Scope::ReadOnly));
+        assert!(Scope::Full.allows(Scope::HooksRegister));
+        assert!(Scope::HooksRegister.allows(Scope::ReadOnly));
+        assert!(!Scope::HooksRegister.allows(Scope::Full));
+        assert!(!Scope::ReadOnly.allows(Scope::HooksRegister));
+        assert!(Scope::parse("bogus").is_none());
+        assert_eq!(Scope::parse("hooks-register"), Some(Scope::HooksRegister));
+    }
 
     /// The stable error taxonomy is locked: each variant's `code` + HTTP status is the frozen wire
     /// contract tooling branches on. A change here is a breaking change to v1 and must fail this test.

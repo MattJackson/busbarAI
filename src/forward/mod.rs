@@ -2132,6 +2132,9 @@ fn build_rewrite_request<'a>(
 /// errors/times out/abstains yields `None` (`transform`) and is skipped; `apply_rewrite_to_body` only
 /// touches a chat-shaped body. Zero cost when no rewrite hook is configured (the caller guards on the
 /// empty list before calling).
+/// Returns whether ANY rewrite actually committed to the body — the caller must then invalidate
+/// every retained copy of the ORIGINAL bytes (the same-protocol pristine short-circuit and the
+/// failover re-parse both read them), or the rewrite silently vanishes on those paths.
 async fn apply_global_rewrites(
     rewrite_hooks: &[(
         std::time::Duration,
@@ -2141,16 +2144,18 @@ async fn apply_global_rewrites(
     pool_name: &str,
     ingress_protocol: &str,
     wants_stream: bool,
-) {
+) -> bool {
+    let mut applied = false;
     for (timeout, hook) in rewrite_hooks {
         // Rebuild the projection from the current body so a later hook sees the earlier rewrite.
         let req = build_rewrite_request(v, pool_name, ingress_protocol, wants_stream, true);
         let rewritten = hook.transform(&req, *timeout).await;
         drop(req); // end the immutable borrow of `v` before mutating it
         if let Some(rw) = rewritten {
-            apply_rewrite_to_body(v, &rw);
+            applied |= apply_rewrite_to_body(v, &rw);
         }
     }
+    applied
 }
 
 /// Chars of the request's system prompt: a bare string, or — when the system value is a block
@@ -2900,7 +2905,7 @@ pub(crate) async fn forward_with_pool_parsed(
 async fn forward_with_pool_parsed_inner(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
-    body: Bytes,
+    mut body: Bytes,
     // The request body parsed ONCE by the caller for JSON-body operations; `None` for an OPAQUE
     // ingress body (multipart transcription, binary) — those relay/translate at the BYTE level via
     // the operation codecs and skip every JSON-only read below. `mut` so the global rewrite pass can
@@ -2959,16 +2964,50 @@ async fn forward_with_pool_parsed_inner(
     // routing decision, so the decision + upstream both see the rewritten body. Priority-ordered
     // transform chain; fail-safe throughout (a broken hook is skipped, a non-chat body is untouched).
     // ZERO COST when no rewrite hook is configured — the common case is a single always-false branch.
-    if !app.rewrite_hooks.is_empty() {
-        if let Some(body) = v.as_mut() {
-            apply_global_rewrites(
+    // The pool's own rewrite chain (rw gates in its `hooks: [...]` list) fires AFTER the globals —
+    // each chain internally priority-ordered, globals always first.
+    let pool_rewrites: &[(
+        std::time::Duration,
+        std::sync::Arc<dyn crate::routing::RoutingPolicy>,
+    )] = app
+        .pool_runtime
+        .get(pool_name)
+        .map(|r| r.rewrite_hooks.as_slice())
+        .unwrap_or(&[]);
+    if !app.rewrite_hooks.is_empty() || !pool_rewrites.is_empty() {
+        if let Some(parsed) = v.as_mut() {
+            let mut applied = apply_global_rewrites(
                 &app.rewrite_hooks,
-                body,
+                parsed,
                 pool_name,
                 ingress_protocol,
                 wants_stream,
             )
             .await;
+            applied |= apply_global_rewrites(
+                pool_rewrites,
+                parsed,
+                pool_name,
+                ingress_protocol,
+                wants_stream,
+            )
+            .await;
+            // A committed rewrite makes the RETAINED bytes stale: the same-protocol pristine
+            // short-circuit re-emits them verbatim, and failover hops 2+ re-parse them — either
+            // path would silently discard the rewrite. Re-serialize the rewritten body as the new
+            // retained bytes so every downstream reader of `body` sees the effective request.
+            // Cost only on the rewrite path (a no-op request never reaches this serialize).
+            if applied {
+                match crate::json::to_vec(parsed) {
+                    Ok(bytes) => body = Bytes::from(bytes),
+                    // Serialization of a Value we just built cannot realistically fail; if it
+                    // somehow does, keep the original bytes (the pre-rewrite request is still a
+                    // valid request — fail-safe, never a corrupted body).
+                    Err(e) => {
+                        tracing::warn!(error = %e, "re-serializing rewritten body failed; keeping the original bytes");
+                    }
+                }
+            }
         }
     }
 
@@ -11593,6 +11632,7 @@ mod hook_seam_tests {
             breaker: None,
             policy: None,
             gates,
+            rewrite_hooks: Vec::new(),
         }
     }
 
@@ -11808,6 +11848,123 @@ mod hook_seam_tests {
         assert_eq!(payload["stage"]["remaining_candidates"], 1);
         server.shutdown().await;
         lane.shutdown().await;
+    }
+
+    /// A rewrite-arm test gate: abstains as a decision, rewrites the message content on transform.
+    struct RewritingGate(&'static str);
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for RewritingGate {
+        async fn decide(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            Ok(crate::routing::RoutingDecision::Abstain)
+        }
+        fn name(&self) -> &'static str {
+            "rewriter"
+        }
+        async fn transform(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _budget: std::time::Duration,
+        ) -> Option<crate::routing::wire::RewriteReply> {
+            Some(crate::routing::wire::RewriteReply {
+                messages: vec![serde_json::json!({"role": "user", "content": self.0})],
+                tools: vec![],
+            })
+        }
+    }
+
+    /// REGRESSION (Headroom e2e finding): a committed GLOBAL REWRITE must reach the upstream on a
+    /// SAME-PROTOCOL passthrough. The pristine-bytes short-circuit re-emits the retained request
+    /// bytes verbatim; before the fix those were the PRE-rewrite bytes, so a global compressor's
+    /// output was silently discarded exactly on the fast path.
+    #[tokio::test]
+    async fn same_protocol_passthrough_carries_global_rewrite() {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        state.push(crate::test_support::MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "m0",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        });
+        let server = crate::test_support::MockServer::new(state.clone()).await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(), // anthropic ingress → anthropic lane: same-protocol
+                &server.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").rewrite_hooks = vec![(
+            std::time::Duration::from_millis(500),
+            Arc::new(RewritingGate("COMPRESSED")),
+        )];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let upstream_body = state
+            .get_last_request_body()
+            .expect("upstream must have been dispatched");
+        let v: Value = serde_json::from_slice(&upstream_body).unwrap();
+        assert_eq!(
+            v["messages"][0]["content"], "COMPRESSED",
+            "the upstream must see the REWRITTEN body on the same-protocol fast path"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (Headroom e2e finding): a POOL-scoped `prompt: rw` gate joins the phase-1
+    /// transform pass — its rewrite reaches the upstream (before the fix it fired as a decision
+    /// gate, its rewrite reply normalized to Abstain, and the request paid its deadline for
+    /// nothing).
+    #[tokio::test]
+    async fn pool_scoped_rw_gate_rewrites_the_body() {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        state.push(crate::test_support::MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "m0",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        });
+        let server = crate::test_support::MockServer::new(state.clone()).await;
+        let mut rt = pool_runtime_with(&[], Vec::new());
+        rt.rewrite_hooks = vec![(
+            std::time::Duration::from_millis(500),
+            Arc::new(RewritingGate("POOL-COMPRESSED")),
+        )];
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime("p", rt)
+            .build();
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let upstream_body = state
+            .get_last_request_body()
+            .expect("upstream must have been dispatched");
+        let v: Value = serde_json::from_slice(&upstream_body).unwrap();
+        assert_eq!(
+            v["messages"][0]["content"], "POOL-COMPRESSED",
+            "a pool-scoped rw gate must rewrite the dispatched body"
+        );
+        server.shutdown().await;
     }
 
     /// A test policy whose decide always errors — the on_error-chain tests' failing primary.
@@ -12379,6 +12536,7 @@ mod hook_seam_tests {
                         on_empty: crate::config::PolicyOnError::Reject,
                     }),
                     gates: Vec::new(),
+                    rewrite_hooks: Vec::new(),
                 },
             )
             .build();

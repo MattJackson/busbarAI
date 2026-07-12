@@ -104,6 +104,16 @@ pub(crate) struct RootCfg {
     /// gate by name via `hook:`, and `global_hooks` names those firing on every request. Empty when
     /// no `hooks:` block is present.
     pub(crate) hooks: HashMap<String, HookCfg>,
+    /// The ADMIN auth chain (`admin_auth:`) — ordered module names gating `/admin/v1/*` (the
+    /// parallel of `auth.chain` for the operator surface). Default `[admin-tokens]` (the single
+    /// operator admin token, exactly 1.2.1 behavior). `[]` = OPEN admin (dev only; loud boot
+    /// warning). Each name must resolve to a compiled-in admin auth module.
+    pub(crate) admin_auth: Vec<String>,
+    /// `group_map:` — principal GROUPS (returned by external auth modules) → operator-owned
+    /// policy. Policy stays in config, never asserted by a plugin (design-hooks-v2 §2.3): a
+    /// module says WHO, this map says WHAT THEY MAY DO. Multiple groups union; the most
+    /// permissive `admin_scope` wins; unmapped groups grant NOTHING (fail closed).
+    pub(crate) group_map: HashMap<String, GroupMapEntry>,
     /// Names of hooks that fire on EVERY request (`global_hooks:` plus any hook with inline
     /// `global: true`, deduped). Validated to reference registry entries at boot.
     pub(crate) global_hooks: Vec<String>,
@@ -642,20 +652,46 @@ fn default_on_error() -> String {
     ON_ERROR_WEIGHTED.to_string()
 }
 
-/// The three RESERVED on_error terminal names — every fallback chain must bottom out on one.
+/// The RESERVED on_error terminal names — every fallback chain must bottom out on one.
 pub(crate) const ON_ERROR_WEIGHTED: &str = "weighted";
 pub(crate) const ON_ERROR_REJECT: &str = "reject";
 pub(crate) const ON_ERROR_FIRST: &str = "first";
+/// The explicit DO-NOT-PARTICIPATE terminal: the failing gate simply drops out of the decision —
+/// it cannot steer, and it cannot displace any OTHER gate's verdict (in the concurrent reconcile a
+/// non-participating outcome is skipped by every pass). The right posture for a gate whose job is
+/// orthogonal to routing (e.g. a compressor): its failure should never reshape traffic. Internally
+/// identical to the `weighted` terminal — "didn't participate" and "busbar's normal ordering" are
+/// the same behavior — but the NAME teaches the correct mental model.
+pub(crate) const ON_ERROR_NOTHING: &str = "nothing";
 
 /// Map an `on_error` NAME to its reserved terminal, if it is one. `None` = the name is a fallback
 /// hook reference (a ranking strategy or a registry gate), resolved by routing / validated at boot.
 pub(crate) fn on_error_terminal(name: &str) -> Option<PolicyOnError> {
     match name {
-        ON_ERROR_WEIGHTED => Some(PolicyOnError::Weighted),
+        ON_ERROR_WEIGHTED | ON_ERROR_NOTHING => Some(PolicyOnError::Weighted),
         ON_ERROR_REJECT => Some(PolicyOnError::Reject),
         ON_ERROR_FIRST => Some(PolicyOnError::First),
         _ => None,
     }
+}
+
+/// The serde default for `admin_auth:` — the built-in `admin-tokens` module (the single operator
+/// admin token; byte-identical to the pre-chain behavior).
+fn default_admin_auth() -> Vec<String> {
+    vec!["admin-tokens".to_string()]
+}
+
+/// One `group_map:` entry — the operator-owned policy granted to a principal GROUP. Additive
+/// surface: governance fields (allowed_pools, budgets, rate limits) land here next; today it
+/// carries the admin authorization scope.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupMapEntry {
+    /// The ADMIN scope this group grants: `read-only` | `hooks-register` | `full`. Absent = no
+    /// admin access from this group. Validated at boot; the most permissive of a principal's
+    /// mapped groups wins.
+    #[serde(default)]
+    pub(crate) admin_scope: Option<String>,
 }
 
 /// A named entry in the top-level `hooks:` registry — a single hook (tap or gate) and its transport.
@@ -684,7 +720,10 @@ pub(crate) struct HookCfg {
     pub(crate) timeout_ms: u64,
     /// Fallback when a GATE times out/errors/saturates — a NAME resolved against the same registry
     /// as any hook (default `weighted` = proceed as busbar normally would). Reserved terminals:
-    /// `weighted` | `reject` (fail closed — security gates set this) | `first`. Any other name is a
+    /// `nothing` (do not participate — a failing gate drops out and cannot displace another gate's
+    /// verdict; the posture for non-routing gates like compressors) | `weighted` (same behavior,
+    /// named as the ordering floor) | `reject` (fail closed — security gates set this) | `first`.
+    /// Any other name is a
     /// fallback HOOK (a built-in ranking strategy or another gate) fired when this one fails; its
     /// own `on_error` chains further, and boot validation proves every chain terminates (unknown
     /// names, taps, and cycles are boot errors).
@@ -1106,6 +1145,12 @@ pub(crate) struct DeployCfg {
     /// The top-level hook registry (`hooks:`) — named taps + gates. Optional; absent = empty.
     #[serde(default)]
     pub(crate) hooks: HashMap<String, HookCfg>,
+    /// The ADMIN auth chain (`admin_auth:`). Absent ⇒ the default `[admin-tokens]`.
+    #[serde(default = "default_admin_auth")]
+    pub(crate) admin_auth: Vec<String>,
+    /// `group_map:` — principal groups → operator-owned policy. Optional; absent = empty.
+    #[serde(default)]
+    pub(crate) group_map: HashMap<String, GroupMapEntry>,
     /// Hooks that fire on every request (`global_hooks:`). Optional; unioned at resolve with any hook
     /// carrying inline `global: true`.
     #[serde(default)]
@@ -1716,6 +1761,8 @@ pub(crate) fn resolve(
             models: deploy.models.clone(),
             pools: deploy.pools.clone(),
             hooks: deploy.hooks.clone(),
+            admin_auth: deploy.admin_auth.clone(),
+            group_map: deploy.group_map.clone(),
             // global_hooks = explicit `global_hooks:` list UNIONed with any hook carrying inline
             // `global: true`, deduped, order-stable (explicit list first, then inline in registry
             // iteration order). Dangling refs are caught by config_validate.
@@ -1917,6 +1964,8 @@ models:
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: None,
@@ -2465,6 +2514,8 @@ models:
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: None,
@@ -2552,6 +2603,8 @@ models: {}
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: Some(GovernanceCfg {
@@ -2578,6 +2631,8 @@ models: {}
         );
     }
 
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_resolve_accepts_enabled_governance_with_admin_token() {
         let defs = HashMap::new();
@@ -2589,6 +2644,8 @@ models: {}
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: Some(GovernanceCfg {
@@ -2642,6 +2699,8 @@ models: {}
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: None,
@@ -2706,6 +2765,8 @@ models: {}
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: None,
@@ -2778,6 +2839,8 @@ models: {}
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: None,
@@ -3002,6 +3065,8 @@ models: {}
             models: HashMap::new(),
             pools: HashMap::new(),
             hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
             global_hooks: Vec::new(),
             observability: None,
             governance: Some(GovernanceCfg {

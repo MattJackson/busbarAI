@@ -215,8 +215,10 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
 /// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
 pub(crate) async fn create_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     body: Bytes,
 ) -> Response {
+    let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -339,10 +341,11 @@ pub(crate) async fn create_key(
         let res = tokio::task::spawn_blocking(move || gov.create_key_with_aws(spec, now)).await;
         match res {
             Ok(Ok((key, secret, access_key_id, secret_access_key))) => {
-                audit::AUDIT.record(
+                audit::AUDIT.record_by(
                     "key.create",
                     &format!("key:{}", key.id),
                     audit::OUTCOME_APPLIED,
+                    &actor,
                 );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // bearer secret, shown exactly once
@@ -360,10 +363,11 @@ pub(crate) async fn create_key(
         let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
         match res {
             Ok(Ok((key, secret))) => {
-                audit::AUDIT.record(
+                audit::AUDIT.record_by(
                     "key.create",
                     &format!("key:{}", key.id),
                     audit::OUTCOME_APPLIED,
+                    &actor,
                 );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // shown exactly once
@@ -404,9 +408,11 @@ struct UpdateKeyReq {
 /// rejects them — otherwise PATCH would be a back door around those guards. 404 if the key is absent.
 pub(crate) async fn update_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Response {
+    let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -486,11 +492,11 @@ pub(crate) async fn update_key(
     .await;
     match res {
         Ok(Ok(Some(key))) => {
-            audit::AUDIT.record("key.patch", &resource, audit::OUTCOME_APPLIED);
+            audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_APPLIED, &actor);
             json_response(StatusCode::OK, key_meta(&key))
         }
         Ok(Ok(None)) => {
-            audit::AUDIT.record("key.patch", &resource, audit::OUTCOME_REJECTED);
+            audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_REJECTED, &actor);
             error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
         }
         Ok(Err(e)) => internal_error("update_key", &e),
@@ -588,8 +594,10 @@ pub(crate) async fn key_usage(
 /// than masquerading as a spurious 200.
 pub(crate) async fn delete_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     Path(id): Path<String>,
 ) -> Response {
+    let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -632,11 +640,11 @@ pub(crate) async fn delete_key(
     let resource = format!("key:{id}");
     match res {
         Ok(Ok(Some(()))) => {
-            audit::AUDIT.record("key.delete", &resource, audit::OUTCOME_APPLIED);
+            audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_APPLIED, &actor);
             json_response(StatusCode::OK, json!({"deleted": id}))
         }
         Ok(Ok(None)) => {
-            audit::AUDIT.record("key.delete", &resource, audit::OUTCOME_REJECTED);
+            audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_REJECTED, &actor);
             error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
         }
         Ok(Err(e)) => internal_error("delete_key", &e),
@@ -644,7 +652,10 @@ pub(crate) async fn delete_key(
     }
 }
 
-#[cfg(test)]
+// The admin-surface e2e tests authenticate through the `admin-tokens` module; a
+// `--no-default-features` binary compiles it OUT, which DISABLES the admin API wholesale (the
+// admin_auth chain all-Passes ⇒ denied) — so this module only applies when the module exists.
+#[cfg(all(test, feature = "auth-admin-tokens"))]
 mod tests {
     use crate::governance::{GovState, NewKeySpec, SqliteStore};
     use crate::test_support::TestApp;
@@ -2852,7 +2863,12 @@ mod tests {
                     })
                     .to_string(),
                 );
-                let r1 = super::create_key(crate::state::CurrentApp(app.clone()), body1).await;
+                let r1 = super::create_key(
+                    crate::state::CurrentApp(app.clone()),
+                    axum::Extension(crate::auth::AuthPrincipal(None)),
+                    body1,
+                )
+                .await;
                 let s1 = r1.status().as_u16();
 
                 // Request 2: references ONLY the configured pool — no warning expected.
@@ -2863,7 +2879,12 @@ mod tests {
                     })
                     .to_string(),
                 );
-                let r2 = super::create_key(crate::state::CurrentApp(app), body2).await;
+                let r2 = super::create_key(
+                    crate::state::CurrentApp(app),
+                    axum::Extension(crate::auth::AuthPrincipal(None)),
+                    body2,
+                )
+                .await;
                 let s2 = r2.status().as_u16();
                 (s1, s2)
             })
