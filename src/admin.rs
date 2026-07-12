@@ -497,6 +497,34 @@ pub(crate) async fn list_keys(State(app): State<Arc<App>>) -> Response {
     }
 }
 
+/// GET /admin/keys/:id — one key's metadata (id/name/pools/budgets/limits/enabled; never the
+/// secret or key_hash). 404 when no key with `id` exists. Fills the single-key read gap in the key
+/// surface (design-admin-api-v1 §2.1); it stays on the legacy `{type}` envelope + `key_meta` shape so
+/// it is consistent with the sibling key routes (the full `{code}`-envelope migration is a follow-up).
+pub(crate) async fn get_key(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    let Some(gov) = &app.governance else {
+        return disabled();
+    };
+    if let Some(resp) = reject_overlong_id(&id) {
+        return resp;
+    }
+    let gov = gov.clone();
+    let id2 = id.clone();
+    // The synchronous store read runs on the blocking pool (the SQLite backend is sync). Read via
+    // `all_keys` + find (the same accessor the list handler uses) — admin scale, no hot path.
+    let res = tokio::task::spawn_blocking(move || {
+        gov.all_keys()
+            .map(|keys| keys.into_iter().find(|k| k.id == id2))
+    })
+    .await;
+    match res {
+        Ok(Ok(Some(k))) => json_response(StatusCode::OK, key_meta(&k)),
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
+        Ok(Err(e)) => internal_error("get_key", &e),
+        Err(e) => join_error("get_key", &e),
+    }
+}
+
 /// GET /admin/keys/:id/usage — current-window usage counters.
 pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     let Some(gov) = &app.governance else {
@@ -850,6 +878,64 @@ mod tests {
             missing.json::<serde_json::Value>().await.unwrap()["error"]["code"],
             "not_found"
         );
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/keys/{id}` returns one key's metadata (never the secret/hash); 404 for an
+    /// unknown id. Fills the single-key read gap on the legacy key surface.
+    #[tokio::test]
+    async fn test_admin_v1_get_single_key() {
+        use crate::governance::NewKeySpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (minted, minted_secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "svc".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Found → 200 with metadata, no secret/hash.
+        let resp = client
+            .get(format!("http://{addr}/admin/v1/keys/{}", minted.id))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let text = resp.text().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["id"], minted.id);
+        assert_eq!(body["name"], "svc");
+        assert!(body.get("key_hash").is_none(), "never expose the hash");
+        assert!(
+            !text.contains(&minted_secret),
+            "never expose the secret on a read"
+        );
+
+        // Unknown id → 404.
+        let missing = client
+            .get(format!("http://{addr}/admin/v1/keys/vk_doesnotexist"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
 
         handle.abort();
     }

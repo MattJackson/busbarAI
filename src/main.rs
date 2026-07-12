@@ -1014,7 +1014,9 @@ fn build_router_with_limits(
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route(
             "/admin/keys/{id}",
-            axum::routing::delete(admin::delete_key).patch(admin::update_key),
+            get(admin::get_key)
+                .delete(admin::delete_key)
+                .patch(admin::update_key),
         )
         .route("/admin/keys/{id}/usage", get(admin::key_usage))
         // ── Admin API v1 — the FROZEN, additive-only surface tooling builds against ────────────────
@@ -1027,7 +1029,9 @@ fn build_router_with_limits(
         )
         .route(
             "/admin/v1/keys/{id}",
-            axum::routing::delete(admin::delete_key).patch(admin::update_key),
+            get(admin::get_key)
+                .delete(admin::delete_key)
+                .patch(admin::update_key),
         )
         .route("/admin/v1/keys/{id}/usage", get(admin::key_usage))
         // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery, admin,
