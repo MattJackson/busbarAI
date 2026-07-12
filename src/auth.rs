@@ -177,10 +177,14 @@ use crate::plugins::auth::tokens::TokensModule;
 pub(crate) struct AuthMiddleware {
     pub(crate) mode: AuthMode,
     pub(crate) client_tokens: Vec<String>,
-    /// The built-in `tokens` auth module (owns the pre-hashed allowlist), from the `tokens` plugin.
-    /// `validate_token`'s `Token` arm delegates its verdict to it. Slice 3 generalizes this single
-    /// module into the configured `auth:` plugin chain (dissolving `AuthMode`).
-    token_module: TokensModule,
+    /// The AUTH CHAIN — an ordered list of auth modules. `validate_token` runs it: the first module
+    /// to `Identify` admits, a `Reject` denies, and if every module `Pass`es (no usable credential
+    /// matched) a NON-EMPTY chain denies (fail-closed). An EMPTY chain admits unconditionally — that
+    /// is the `none`/`passthrough` open-front-door shape. Today the chain is `[tokens]` for
+    /// `mode: token` and `[]` otherwise (built from `AuthMode` in `new`), so behavior is byte-identical
+    /// while the token-specific branch is gone from `validate_token`. Slice-3-config turns this into
+    /// the configured `auth: [...]` chain and deletes `AuthMode`.
+    chain: Vec<Box<dyn AuthModule>>,
 }
 
 // MANUAL Debug that REDACTS the allowlist. A derived `Debug` would print every entry of
@@ -233,13 +237,38 @@ impl AuthMiddleware {
             }
         }
 
-        let token_module = TokensModule::new(&tokens);
+        // Build the auth chain from the mode (the transitional bridge until the config becomes a
+        // real `auth: [...]` list): `token` -> [tokens module]; `none`/`passthrough` -> [] (empty
+        // chain = open front door, admit unconditionally). Byte-identical to the pre-chain behavior.
+        let chain: Vec<Box<dyn AuthModule>> = if mode == AuthMode::Token {
+            vec![Box::new(TokensModule::new(&tokens))]
+        } else {
+            Vec::new()
+        };
 
         Self {
             mode,
             client_tokens: tokens,
-            token_module,
+            chain,
         }
+    }
+
+    /// Run the auth chain over the presented candidate credential. Empty chain -> admit (the
+    /// `none`/`passthrough` open front door). Otherwise the first `Identify` admits, a `Reject`
+    /// denies, and all-`Pass` (no module matched a presented credential) denies — fail-closed for a
+    /// configured chain. Constant-time within each module; the loop order is config order.
+    fn run_chain(&self, candidate: Option<&str>) -> bool {
+        if self.chain.is_empty() {
+            return true;
+        }
+        for module in &self.chain {
+            match module.authenticate(candidate) {
+                AuthOutcome::Identify => return true,
+                AuthOutcome::Reject => return false,
+                AuthOutcome::Pass => {}
+            }
+        }
+        false
     }
 
     /// Constant-time string comparison to avoid leaking how much of a token matches via timing.
@@ -317,20 +346,12 @@ impl AuthMiddleware {
         None
     }
 
-    /// Validate the request's token against the allowlist. `token` accepts a token extracted from
-    /// ANY supported carrier (see `extract_client_token`); the comparison is identical and
-    /// constant-time regardless of which header carried it.
+    /// Validate the request's token by running the AUTH CHAIN. `token` accepts a credential extracted
+    /// from ANY supported carrier (see `extract_client_token`); the comparison is identical and
+    /// constant-time regardless of which header carried it. No `AuthMode` branch here — the front-door
+    /// policy is entirely encoded in the chain shape (`[]` admits, `[tokens]` validates).
     pub(crate) fn validate_token(&self, token: Option<&str>) -> bool {
-        match self.mode {
-            // Delegate the Token-mode verdict to the built-in `tokens` auth module. The module owns
-            // the constant-time hash-fold (moved verbatim from here); only an `Identify` verdict
-            // admits. `Reject` (wrong/absent token) and `Pass` (no credential) both deny — identical
-            // to the pre-trait behavior where a missing/empty/non-matching token returned `false`.
-            AuthMode::Token => {
-                matches!(self.token_module.authenticate(token), AuthOutcome::Identify)
-            }
-            AuthMode::Passthrough | AuthMode::None => true,
-        }
+        self.run_chain(token)
     }
 }
 
