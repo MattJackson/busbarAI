@@ -57,6 +57,7 @@ impl AdminTransport for JsonRest {
             .route("/admin/v1/providers", get(list_providers))
             .route("/admin/v1/hooks", get(list_hooks))
             .route("/admin/v1/hooks/{name}", get(get_hook))
+            .route("/admin/v1/plugins", get(list_plugins))
             .layer(axum::Extension(service))
     }
 }
@@ -100,7 +101,7 @@ async fn info(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> R
     respond(StatusCode::OK, service.info().await)
 }
 
-/// `GET /admin/v1/pools` — pool topology for the fleet dashboard.
+/// `GET /admin/v1/pools` — pool topology read.
 async fn list_pools(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.list_pools().await)
 }
@@ -115,7 +116,7 @@ async fn list_providers(axum::Extension(service): axum::Extension<Arc<AdminServi
     respond(StatusCode::OK, service.list_providers().await)
 }
 
-/// `GET /admin/v1/hooks` — the hook registry (CP plugin-store view).
+/// `GET /admin/v1/hooks` — the hook registry read.
 async fn list_hooks(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.list_hooks().await)
 }
@@ -126,6 +127,16 @@ async fn get_hook(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
     respond(StatusCode::OK, service.get_hook(&name).await)
+}
+
+/// `GET /admin/v1/plugins?type=auth|hooks` — the plugin catalog for one type. A missing/unknown
+/// `type` is an `invalid_request` (the two types are distinct engine contracts).
+async fn list_plugins(
+    axum::Extension(service): axum::Extension<Arc<AdminService>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let ptype = q.get("type").map(String::as_str).unwrap_or("");
+    respond(StatusCode::OK, service.list_plugins(ptype).await)
 }
 
 /// Mount the admin v1 surface onto `router` using the given transport over the shared `App`. Called

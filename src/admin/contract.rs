@@ -30,7 +30,8 @@ pub(crate) enum Scope {
     /// Every read (`GET`) across config, keys, hooks, versions, audit, usage, info.
     ReadOnly,
     /// read-only + register/update/delete/PATCH-settings of `tap|gate|route` HOOK definitions ONLY.
-    /// Deliberately narrow (the Agent's scope): cannot mint keys, change auth, or wire chains.
+    /// Deliberately narrow (for automation that only registers hooks): cannot mint keys, change
+    /// auth, or wire chains.
     HooksRegister,
     /// Everything: keys, config apply/rollback, auth chains, group_map, cache.
     Full,
@@ -114,8 +115,8 @@ impl AdminError {
     }
 }
 
-/// The compiled-in plugin catalog + topology + uptime returned by `GET /admin/v1/info`. Powers CP
-/// version negotiation AND the compliance-by-compilation proof: `auth_modules`/`hook_plugins` reflect
+/// The compiled-in plugin catalog + topology + uptime returned by `GET /admin/v1/info`. Powers
+/// version negotiation for tooling AND the compliance-by-compilation proof: `auth_modules`/`hook_plugins` reflect
 /// the ACTUAL binary (feature-gated at compile time), not config, so `--no-default-features` shows a
 /// provably smaller surface. No LLM content, ever.
 #[derive(Debug, Clone, Serialize)]
@@ -139,7 +140,7 @@ pub(crate) struct BuildInfo {
     pub(crate) weighted_floor: bool,
 }
 
-/// Pool/model/provider counts for the fleet dashboard (`InfoView.topology`).
+/// Pool/model/provider counts (`InfoView.topology`).
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TopologyInfo {
     pub(crate) pools: usize,
@@ -181,7 +182,7 @@ pub(crate) struct ProviderView {
 }
 
 /// A hook definition in the registry read (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) — the
-/// CP plugin-store view. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a
+/// plugin catalog read. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a
 /// secret. `global` reports whether the hook fires on every request (named in `global_hooks:` or
 /// declared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +214,25 @@ pub(crate) struct HookTransportView {
     /// `"socket"` or `"webhook"` (or `"none"` for a misconfigured entry with neither).
     pub(crate) kind: &'static str,
     /// The socket path or webhook URL. `None` only if the definition set neither transport.
+    pub(crate) target: Option<String>,
+}
+
+/// One plugin in the plugin catalog (`GET /admin/v1/plugins?type=`). A plugin is either
+/// COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)
+/// or EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where
+/// activation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`
+/// where it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PluginView {
+    pub(crate) name: String,
+    /// `"auth"` or `"hooks"` — the plugin TYPE (each a distinct engine contract).
+    pub(crate) r#type: &'static str,
+    /// `"compiled-in"` or `"external"`.
+    pub(crate) loader: &'static str,
+    /// Whether the plugin is currently active, where tracked; `None` when activation is not summarized
+    /// at this level.
+    pub(crate) active: Option<bool>,
+    /// For an external plugin, its transport target (socket path / webhook URL). `None` for compiled-in.
     pub(crate) target: Option<String>,
 }
 

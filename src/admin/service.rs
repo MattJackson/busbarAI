@@ -14,8 +14,8 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, BuildInfo, HookTransportView, HookView, InfoView, ModelView, Page, PoolMemberView,
-    PoolView, ProviderView, TopologyInfo,
+    AdminError, BuildInfo, HookTransportView, HookView, InfoView, ModelView, Page, PluginView,
+    PoolMemberView, PoolView, ProviderView, TopologyInfo,
 };
 use crate::config::{HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, UserAccess};
 
@@ -28,6 +28,28 @@ static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceL
 /// is safe to call unconditionally at startup.
 pub(crate) fn mark_start() {
     let _ = PROCESS_START.set(std::time::Instant::now());
+}
+
+/// The auth modules COMPILED INTO this binary (feature-gated at compile time — real `#[cfg]` on each
+/// array element, so this reflects the ACTUAL binary and empties under `--no-default-features`). The
+/// single source for both `info`'s build proof and the `plugins?type=auth` catalog.
+fn auth_modules_compiled_in() -> Vec<&'static str> {
+    [
+        #[cfg(feature = "auth-tokens")]
+        "tokens",
+    ]
+    .to_vec()
+}
+
+/// The removable hook plugins COMPILED INTO this binary (feature-gated). Excludes the always-present,
+/// non-removable weighted SWRR floor, which is reported separately (as `weighted_floor` / the
+/// `weighted` compiled-in entry).
+fn hook_plugins_compiled_in() -> Vec<&'static str> {
+    [
+        #[cfg(feature = "hooks-ranking")]
+        "ranking",
+    ]
+    .to_vec()
 }
 
 /// The admin application core. Cheap to construct and clone-free to share (`Arc<App>` inside); a
@@ -45,21 +67,11 @@ impl AdminService {
     /// uptime, and pool/model/provider topology. Read scope. Infallible today, but returns `Result`
     /// for a uniform transport contract (every op is `Result<View, AdminError>`).
     pub(crate) async fn info(&self) -> Result<InfoView, AdminError> {
-        // The compiled-in plugin catalog, by type. Feature-gated at COMPILE time (real `#[cfg]` on
-        // each array element), so this reflects the ACTUAL binary — the weighted SWRR floor is always
-        // present; `tokens`/`ranking` vanish under `--no-default-features`, giving a provably smaller
-        // surface. `default auth = tokens` + `default hook = weighted` are the two OEM-default plugins;
-        // weighted is the one baked in (non-removable), so it appears as `weighted_floor` below, not here.
-        let auth_modules: Vec<&'static str> = [
-            #[cfg(feature = "auth-tokens")]
-            "tokens",
-        ]
-        .to_vec();
-        let hook_plugins: Vec<&'static str> = [
-            #[cfg(feature = "hooks-ranking")]
-            "ranking",
-        ]
-        .to_vec();
+        // The compiled-in plugin sets reflect the ACTUAL binary (feature-gated). `default auth =
+        // tokens` + `default hook = weighted` are the two OEM-default plugins; weighted is the one
+        // baked in (non-removable), so it appears as `weighted_floor` below, not in `hook_plugins`.
+        let auth_modules = auth_modules_compiled_in();
+        let hook_plugins = hook_plugins_compiled_in();
 
         let providers: std::collections::BTreeSet<&str> =
             self.app.lanes.iter().map(|l| l.provider.as_str()).collect();
@@ -80,8 +92,8 @@ impl AdminService {
         })
     }
 
-    /// `GET /admin/v1/pools` — the pool topology (name + member models/weights) for the fleet
-    /// dashboard. Read scope. Sorted by name for a stable, diff-friendly listing. Live per-member
+    /// `GET /admin/v1/pools` — the pool topology (name + member models/weights). Read scope. Sorted
+    /// by name for a stable, diff-friendly listing. Live per-member
     /// status is an additive follow-up (§6.9).
     pub(crate) async fn list_pools(&self) -> Result<Page<PoolView>, AdminError> {
         let mut pools: Vec<PoolView> = self
@@ -137,7 +149,7 @@ impl AdminService {
         Ok(Page::single(providers))
     }
 
-    /// `GET /admin/v1/hooks` — the hook registry (the CP plugin-store view). Read scope. Each entry
+    /// `GET /admin/v1/hooks` — the hook registry read. Read scope. Each entry
     /// is the DEFINITION (kind/transport/grants/ordering/stage), never a secret. Sorted by name.
     pub(crate) async fn list_hooks(&self) -> Result<Page<HookView>, AdminError> {
         let mut hooks: Vec<HookView> = self
@@ -157,6 +169,76 @@ impl AdminService {
             .get(name)
             .map(|cfg| self.hook_view(name, cfg))
             .ok_or_else(|| AdminError::NotFound(format!("hook `{name}`")))
+    }
+
+    /// `GET /admin/v1/plugins?type=auth|hooks` — the plugin catalog for one TYPE. Read
+    /// scope. Lists COMPILED-IN plugins (feature-gated, from the binary — the same source as `info`'s
+    /// build proof) and EXTERNAL plugins (registered over socket/webhook). An unknown/absent `type` is
+    /// an `invalid_request` (the two types are distinct engine contracts; a caller must pick one).
+    pub(crate) async fn list_plugins(&self, ptype: &str) -> Result<Page<PluginView>, AdminError> {
+        let mut plugins: Vec<PluginView> = Vec::new();
+        match ptype {
+            "auth" => {
+                // Compiled-in auth modules (feature-gated). Active = present in the auth chain.
+                let chain = self.app.auth.chain_names();
+                for name in auth_modules_compiled_in() {
+                    plugins.push(PluginView {
+                        name: name.to_string(),
+                        r#type: "auth",
+                        loader: "compiled-in",
+                        active: Some(chain.contains(&name)),
+                        target: None,
+                    });
+                }
+                // External auth modules (runtime-registered) — none until the auth-module registration
+                // endpoint lands (#56); the catalog shape is ready for them.
+            }
+            "hooks" => {
+                // The weighted SWRR floor is compiled in unconditionally (the non-removable default
+                // hook); activation is the per-pool default, not summarized here.
+                plugins.push(PluginView {
+                    name: "weighted".to_string(),
+                    r#type: "hooks",
+                    loader: "compiled-in",
+                    active: None,
+                    target: None,
+                });
+                for name in hook_plugins_compiled_in() {
+                    plugins.push(PluginView {
+                        name: name.to_string(),
+                        r#type: "hooks",
+                        loader: "compiled-in",
+                        active: None,
+                        target: None,
+                    });
+                }
+                // External hooks = the configured registry entries (socket/webhook). Configured ⇒
+                // active; the transport target is projected (operator config, not a secret).
+                let mut externals: Vec<PluginView> = self
+                    .app
+                    .hook_registry
+                    .iter()
+                    .map(|(name, cfg)| {
+                        let target = cfg.socket.clone().or_else(|| cfg.webhook.clone());
+                        PluginView {
+                            name: name.clone(),
+                            r#type: "hooks",
+                            loader: "external",
+                            active: Some(true),
+                            target,
+                        }
+                    })
+                    .collect();
+                externals.sort_by(|a, b| a.name.cmp(&b.name));
+                plugins.append(&mut externals);
+            }
+            other => {
+                return Err(AdminError::Validation(format!(
+                    "unknown plugin type `{other}`: expected `auth` or `hooks`"
+                )));
+            }
+        }
+        Ok(Page::single(plugins))
     }
 
     /// Project a registry `HookCfg` into the wire `HookView`. `global` is true when the hook is named

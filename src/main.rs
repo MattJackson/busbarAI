@@ -1017,7 +1017,7 @@ fn build_router_with_limits(
             axum::routing::delete(admin::delete_key).patch(admin::update_key),
         )
         .route("/admin/keys/{id}/usage", get(admin::key_usage))
-        // ── Admin API v1 — the FROZEN, additive-only surface tooling/CP build against ──────────────
+        // ── Admin API v1 — the FROZEN, additive-only surface tooling builds against ────────────────
         // Keys CRUD is served here on the legacy handlers under the versioned prefix (migration into
         // the layered service is a follow-up slice); the v1-NATIVE endpoints (`info`, and the config/
         // hooks/auth surface as it lands) are mounted via the `AdminTransport` adapter below.

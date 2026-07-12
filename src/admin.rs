@@ -867,6 +867,80 @@ mod tests {
         handle.abort();
     }
 
+    /// The plugin catalog (`GET /admin/v1/plugins?type=`) lists compiled-in plugins per type (the
+    /// same feature-gated source as `info`) plus external hooks from the registry, and rejects an
+    /// unknown/absent type with the stable `invalid_request` code.
+    #[tokio::test]
+    async fn test_admin_v1_plugins_catalog_by_type() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let gate = crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: Some("/run/busbar/h.sock".to_string()),
+            webhook: None,
+            timeout_ms: 5,
+            on_error: crate::config::PolicyOnError::default(),
+            prompt: crate::config::PromptAccess::No,
+            user: crate::config::UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global: false,
+        };
+        let app = TestApp::new().governance(gov).hook("myhook", gate).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let get = |q: &str| {
+            let url = format!("http://{addr}/admin/v1/plugins?type={q}");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // auth: the compiled-in tokens module (default build).
+        let auth: serde_json::Value = get("auth").await.json().await.unwrap();
+        let a_items = auth["items"].as_array().unwrap();
+        let tokens = a_items
+            .iter()
+            .find(|p| p["name"] == "tokens")
+            .expect("tokens compiled in");
+        assert_eq!(tokens["loader"], "compiled-in");
+        assert_eq!(tokens["type"], "auth");
+
+        // hooks: weighted floor (compiled-in) + ranking (compiled-in) + the external myhook.
+        let hooks: serde_json::Value = get("hooks").await.json().await.unwrap();
+        let h_items = hooks["items"].as_array().unwrap();
+        assert!(h_items
+            .iter()
+            .any(|p| p["name"] == "weighted" && p["loader"] == "compiled-in"));
+        let ext = h_items
+            .iter()
+            .find(|p| p["name"] == "myhook")
+            .expect("external hook listed");
+        assert_eq!(ext["loader"], "external");
+        assert_eq!(ext["active"], true);
+        assert_eq!(ext["target"], "/run/busbar/h.sock");
+
+        // Unknown type → 400 invalid_request.
+        let bad = get("nope").await;
+        assert_eq!(bad.status().as_u16(), 400);
+        let body: serde_json::Value = bad.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

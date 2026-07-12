@@ -129,7 +129,7 @@ pub(crate) struct App {
     /// (route/attempt/completion + synthetic rejected-completion) are follow-ups.
     pub(crate) tap_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
     /// The raw `hooks:` registry (name → definition) as configured, for the Admin API v1 hooks READ
-    /// surface (`GET /admin/v1/hooks`) and the CP plugin-store view. This is the DEFINITION set, distinct
+    /// surface (`GET /admin/v1/hooks`). This is the DEFINITION set, distinct
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty
     /// when no hooks are configured. Read-only after construction; the config-plane mutation surface
     /// swaps a new `App` snapshot rather than mutating this in place.

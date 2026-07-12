@@ -208,6 +208,13 @@ impl AuthMiddleware {
         }
     }
 
+    /// The ordered names of the auth chain's modules (`module.name()` for each). For the Admin API
+    /// v1 plugin catalog — reporting which compiled-in/external auth modules are ACTIVE (in the
+    /// chain). Never a secret: a module name is a plugin identifier, not a credential.
+    pub(crate) fn chain_names(&self) -> Vec<&'static str> {
+        self.chain.iter().map(|m| m.name()).collect()
+    }
+
     /// Whether the front door is OPEN — an empty auth chain admits every request unconditionally
     /// (the old `none`/`passthrough`). Governance, when enabled, supersedes this.
     pub(crate) fn is_open(&self) -> bool {
