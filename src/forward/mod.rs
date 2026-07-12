@@ -2822,77 +2822,110 @@ pub(crate) async fn forward_with_pool_parsed(
     // `x-busbar-route-policy` transparency header). It stays `None` on the default path AND when a
     // configured policy Abstains / errors-to-weighted (both fall through to SWRR, which is not a
     // "policy choice" worth advertising).
-    // ── GLOBAL DECISION GATES ────────────────────────────────────────────────────────────────────
-    // Fire the global (non-rewrite) `kind: gate` hooks for a verdict on this request, BEFORE pool
-    // routing. Today the REJECT arm is honored: a global guard/PII gate that says no short-circuits
-    // with a dialect-native 4xx and nothing dispatched — so a `global_hooks: [pii-guard]` reject gate
-    // now actually enforces (it was previously inert; only a pool's own `hook:` fired). Priority order
-    // makes the surfacing reject deterministic. restrict/order from a GLOBAL gate are a follow-up (this
-    // increment does not let a global gate reshape the candidate set — that reconcile lands next).
-    // ZERO COST when no global gate is configured (empty-loop).
-    for gate in &app.global_gates {
-        match decide_policy_order(
-            &app,
-            gate,
-            &cands,
-            &request_ctx,
-            v.as_ref().unwrap_or(&Value::Null),
-            pool_name,
-            ingress_protocol,
-            wants_stream,
-            caller_token,
-        )
-        .await
-        {
-            // The gate's deliberate REJECT verd — status clamped 400..=499 + message sanitized at the
-            // producing seam, so this arm can trust both. Dialect-native 4xx, nothing dispatched.
-            PolicyOutcome::RejectRequest {
-                status,
-                message,
-                name,
-            } => {
-                metrics::counter!(
-                    crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
-                    "policy" => name,
-                    "pool" => pool_name.to_string(),
-                    "status" => status.to_string(),
+    // ── PHASE-2 DECISION GATES (concurrent at t0) ───────────────────────────────────────────────
+    // Fire the GLOBAL decision gates and this pool's OWN gates for a verdict on this request,
+    // BEFORE pool routing. All gates fire CONCURRENTLY against the same t0 candidate set — reject
+    // and restrict COMMUTE (veto; intersect), and an order is re-validated against the FINAL
+    // (post-restrict) set — then the outcomes reconcile deterministically over ONE chain, sorted by
+    // ascending `priority` (stable: globals before pool gates on ties, then config order):
+    //   1. any reject ⇒ reject wins. The FIRST rejecting gate in chain order (the priority
+    //      tie-break) supplies the surfacing status/message; nothing is dispatched.
+    //   2. else restricts INTERSECT, applied in chain order; a gate whose intersection empties the
+    //      set applies ITS `on_empty` (weighted = advisory escape, that gate's restriction is
+    //      skipped; the fail-closed default rejects with a 503).
+    //   3. else the LAST ordering gate in the chain wins, filtered to the surviving candidate set
+    //      (an order captured at t0 may name members a restrict excluded — the filter is what makes
+    //      the concurrent firing sound). Empty after filtering = abstain (the pool's base ordering
+    //      below applies).
+    // The restriction persists across failover (hops select from the shrunk `cands`). ZERO COST
+    // when no gate is configured (both sources empty ⇒ the pass is skipped).
+    let pool_gates: &[(u16, crate::routing::ResolvedPolicy)] = app
+        .pool_runtime
+        .get(pool_name)
+        .map(|r| r.gates.as_slice())
+        .unwrap_or(&[]);
+    let mut gate_order: Option<(Vec<usize>, &'static str)> = None;
+    if !app.global_gates.is_empty() || !pool_gates.is_empty() {
+        // The chain: globals (pre-sorted ascending by priority) then pool gates (config order),
+        // stable-sorted by priority — ties keep globals-first, then config order.
+        let mut chain: Vec<&(u16, crate::routing::ResolvedPolicy)> =
+            app.global_gates.iter().chain(pool_gates.iter()).collect();
+        chain.sort_by_key(|(p, _)| *p);
+        // Every concurrently-firing gate borrows the same parsed body; the shared Null stands in
+        // for a non-JSON body (the same projection the sequential path used).
+        static NULL_BODY: Value = Value::Null;
+        let gate_body: &Value = v.as_ref().unwrap_or(&NULL_BODY);
+        let outcomes: Vec<PolicyOutcome> =
+            futures::future::join_all(chain.iter().map(|(_, gate)| {
+                decide_policy_order(
+                    &app,
+                    gate,
+                    &cands,
+                    &request_ctx,
+                    gate_body,
+                    pool_name,
+                    ingress_protocol,
+                    wants_stream,
+                    caller_token,
                 )
-                .increment(1);
-                tracing::info!(
-                    policy = name,
-                    pool = pool_name,
+            }))
+            .await;
+
+        // Reconcile 1: REJECT WINS. The first rejecting gate in chain order surfaces — that is the
+        // `priority` tie-break when several gates reject at once. A deliberate RejectRequest was
+        // status-clamped 400..=499 + message-sanitized at the producing seam; a fail-closed errored
+        // gate (`on_error: reject`) is a 503, never a silent proceed — it was declared load-bearing.
+        for outcome in &outcomes {
+            match outcome {
+                PolicyOutcome::RejectRequest {
                     status,
-                    message = %message,
-                    "global gate rejected the request"
-                );
-                return ingress_error(
-                    ingress_protocol,
-                    StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
-                    reject_kind_for_status(status),
-                    &message,
-                );
+                    message,
+                    name,
+                } => {
+                    metrics::counter!(
+                        crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                        "policy" => *name,
+                        "pool" => pool_name.to_string(),
+                        "status" => status.to_string(),
+                    )
+                    .increment(1);
+                    tracing::info!(
+                        policy = name,
+                        pool = pool_name,
+                        status,
+                        message = %message,
+                        "decision gate rejected the request"
+                    );
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN),
+                        reject_kind_for_status(*status),
+                        message,
+                    );
+                }
+                PolicyOutcome::Reject => {
+                    return ingress_error(
+                        ingress_protocol,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        KIND_OVERLOADED,
+                        "A required gate could not complete. Please retry shortly.",
+                    );
+                }
+                _ => {}
             }
-            // A fail-closed global gate (`on_error: reject`) that errored/timed out: 503, never a
-            // silent proceed — the gate was declared load-bearing.
-            PolicyOutcome::Reject => {
-                return ingress_error(
-                    ingress_protocol,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    KIND_OVERLOADED,
-                    "A required gate could not complete. Please retry shortly.",
-                );
-            }
-            // The gate's RESTRICT verb: a global compliance gate pins traffic to members carrying one
-            // of `tags_any`. Intersect the candidate set here, BEFORE pool routing, so the restriction
-            // PERSISTS across every failover hop (each hop selects from the shrunk `cands`) and the
-            // pool's own ordering never sees an excluded member. Successive global restricts intersect
-            // (each gate sees the prior's shrunk set). An empty intersection is fail-closed via the
-            // gate's `on_empty` (default reject; `weighted` is the advisory escape to the full pool).
-            PolicyOutcome::Restrict {
+        }
+
+        // Reconcile 2: RESTRICTS INTERSECT, in chain order (intersection commutes — the final set
+        // is order-independent; the chain order only decides WHOSE on_empty applies first when the
+        // set empties). Shrinking `cands` makes the restriction persist across every failover hop
+        // and keeps any ordering — gate or base — inside the eligible set.
+        for outcome in &outcomes {
+            if let PolicyOutcome::Restrict {
                 tags_any,
                 name,
                 on_empty,
-            } => {
+            } = outcome
+            {
                 let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
                 let restricted: Vec<WeightedLane> = cands
                     .iter()
@@ -2908,14 +2941,14 @@ pub(crate) async fn forward_with_pool_parsed(
                         tracing::info!(
                             policy = name,
                             pool = pool_name,
-                            "global gate restrict left no eligible lane; on_empty: weighted escape \
-                             to the full pool"
+                            "decision gate restrict left no eligible lane; on_empty: weighted \
+                             escape — this gate's restriction is skipped"
                         );
-                        // leave `cands` unchanged (full pool) and continue to the next global gate.
+                        // leave `cands` unchanged and continue reconciling the next restrict.
                     } else {
                         metrics::counter!(
                             crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
-                            "policy" => name,
+                            "policy" => *name,
                             "pool" => pool_name.to_string(),
                             "status" => "503".to_string(),
                         )
@@ -2923,7 +2956,7 @@ pub(crate) async fn forward_with_pool_parsed(
                         tracing::info!(
                             policy = name,
                             pool = pool_name,
-                            "global gate restrict left no eligible lane (on_empty: reject)"
+                            "decision gate restrict left no eligible lane (on_empty: reject)"
                         );
                         return ingress_error(
                             ingress_protocol,
@@ -2934,170 +2967,76 @@ pub(crate) async fn forward_with_pool_parsed(
                         );
                     }
                 } else {
-                    // Commit: shrink `cands` to the survivors so the restriction persists across
-                    // failover and the pool decision below orders only within the eligible set.
                     cands = restricted;
                     metrics::counter!(
                         crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
-                        "policy" => name,
+                        "policy" => *name,
                         "pool" => pool_name.to_string(),
                     )
                     .increment(1);
                 }
             }
-            // order / abstain / weighted from a GLOBAL gate: not honored this increment. A global gate
-            // that ORDERS is a no-op until the pool-vs-global order reconcile lands (in practice the
-            // pool's router-gate orders while globals reject/restrict).
-            _ => {}
+        }
+
+        // Reconcile 3: ORDER — LAST in the chain wins, re-validated against the FINAL candidate
+        // set (the t0 order may name members a restrict excluded). An order that filters to empty
+        // abstains — the pool's base ordering below applies.
+        let surviving: std::collections::HashSet<usize> = cands.iter().map(|wl| wl.idx).collect();
+        for outcome in outcomes {
+            if let PolicyOutcome::Order { order, name } = outcome {
+                let filtered: Vec<usize> = order
+                    .into_iter()
+                    .filter(|i| surviving.contains(i))
+                    .collect();
+                if !filtered.is_empty() {
+                    gate_order = Some((filtered, name));
+                }
+            }
+        }
+        if let Some((_, name)) = &gate_order {
+            metrics::counter!(
+                crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                "policy" => *name,
+                "pool" => pool_name.to_string(),
+            )
+            .increment(1);
         }
     }
 
     let mut chosen_policy_name: Option<&'static str> = None;
-    let policy_order: Option<Vec<usize>> = match app
-        .pool_runtime
-        .get(pool_name)
-        .and_then(|r| r.policy.as_ref())
-    {
-        // Default fast path: no policy ⇒ SWRR, byte-identical to pre-feature behavior. NOTHING below
-        // this arm runs — no projection, no async, one predictable branch.
-        None => None,
-        // A non-default policy is configured: build the projection, run the decision (bounded by its
-        // timeout), and coerce the outcome to a ranked order (or `None` ⇒ SWRR) per `on_error`.
-        Some(resolved) => {
-            let outcome = decide_policy_order(
-                &app,
-                resolved,
-                &cands,
-                &request_ctx,
-                v.as_ref().unwrap_or(&Value::Null),
-                pool_name,
-                ingress_protocol,
-                wants_stream,
-                caller_token,
-            )
-            .await;
-            match outcome {
-                // The policy returned a usable ranked order — record its name (for the
-                // `x-busbar-route-policy` header + the metric) and hand the order to the ordered walk.
-                PolicyOutcome::Order { order, name } => {
-                    chosen_policy_name = Some(name);
-                    metrics::counter!(
-                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
-                        "policy" => name,
-                        "pool" => pool_name.to_string(),
-                    )
-                    .increment(1);
-                    Some(order)
-                }
-                // Abstain / error-coerced-to-weighted: fall through to today's exact SWRR.
-                PolicyOutcome::Weighted => None,
-                // on_error == reject (and the policy errored/timed out / saturated): fail closed with a
-                // 503 rather than silently degrading. Never strands as a hang — a clean rejection.
-                PolicyOutcome::Reject => {
-                    return ingress_error(
-                        ingress_protocol,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        KIND_OVERLOADED,
-                        "The routing policy could not select an upstream. Please retry shortly.",
-                    );
-                }
-                // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
-                // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
-                // operator-visible counter. `status` was clamped to 400..=499 and `message`
-                // sanitized at the seam that constructed the outcome (for every producer, wire or
-                // direct), so this arm can trust both.
-                PolicyOutcome::RejectRequest {
-                    status,
-                    message,
-                    name,
-                } => {
-                    // The `status` label is hook-influenced but BOUNDED: the seam that built this
-                    // outcome clamps it to 400..=499 for every producer, so the worst-case series
-                    // fan-out is 100 per (policy, pool).
-                    metrics::counter!(
-                        crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
-                        "policy" => name,
-                        "pool" => pool_name.to_string(),
-                        "status" => status.to_string(),
-                    )
-                    .increment(1);
-                    // The message is safe to log: the seam that built this outcome sanitized it
-                    // (control/invisible chars stripped, length capped — for EVERY producer, not
-                    // just the wire transports), and it is the exact string the CLIENT receives.
-                    tracing::info!(
-                        policy = name,
-                        pool = pool_name,
-                        status,
-                        message = %message,
-                        "routing policy rejected the request"
-                    );
-                    return ingress_error(
-                        ingress_protocol,
-                        StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
-                        reject_kind_for_status(status),
-                        &message,
-                    );
-                }
-                // The hook's RESTRICT verb: intersect the failover candidate set with members
-                // carrying one of `tags_any`, then let SWRR pick among the survivors. Shrinking
-                // `cands` here makes the restriction PERSIST across every failover hop (each hop
-                // selects from this set) — the compliance guarantee ("only these lanes, ever"). An
-                // EMPTY intersection is fail-closed (`on_empty` default reject), never allow-all;
-                // an empty `tags_any` (fail-closed-normalized malformed restrict) forces it.
-                PolicyOutcome::Restrict {
-                    tags_any,
-                    name,
-                    on_empty,
-                } => {
-                    let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
-                    // Filter into a temp so the ORIGINAL `cands` survives for a weighted on_empty
-                    // escape; only commit the restriction when the intersection is non-empty.
-                    let restricted: Vec<WeightedLane> = cands
-                        .iter()
-                        .filter(|wl| {
-                            members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
-                                meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
-                            })
-                        })
-                        .cloned()
-                        .collect();
-                    if restricted.is_empty() {
-                        // Empty intersection → the gate's `on_empty`. `Weighted` is the advisory escape
-                        // (leave `cands` as the full pool → SWRR); default (and `First`, which has no
-                        // eligible "first") is fail-closed reject.
-                        if matches!(on_empty, crate::config::PolicyOnError::Weighted) {
-                            tracing::info!(
-                                policy = name,
-                                pool = pool_name,
-                                "routing policy restrict left no eligible lane; on_empty: weighted \
-                                 escape to full-pool SWRR"
-                            );
-                            None
-                        } else {
-                            metrics::counter!(
-                                crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
-                                "policy" => name,
-                                "pool" => pool_name.to_string(),
-                                "status" => "503".to_string(),
-                            )
-                            .increment(1);
-                            tracing::info!(
-                                policy = name,
-                                pool = pool_name,
-                                "routing policy restrict left no eligible lane (on_empty: reject)"
-                            );
-                            return ingress_error(
-                                ingress_protocol,
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                KIND_OVERLOADED,
-                                "No upstream satisfies the routing policy's restriction. Please \
-                                 retry shortly.",
-                            );
-                        }
-                    } else {
-                        // Commit the restriction: shrink `cands` to the survivors so it PERSISTS
-                        // across every failover hop, then let SWRR pick among them.
-                        cands = restricted;
+    let policy_order: Option<Vec<usize>> = if let Some((order, name)) = gate_order {
+        // A phase-2 gate ORDERED: it overrides the pool's base ordering (a gate's abstain was the
+        // reconciled fall-through to the base, handled above).
+        chosen_policy_name = Some(name);
+        Some(order)
+    } else {
+        match app
+            .pool_runtime
+            .get(pool_name)
+            .and_then(|r| r.policy.as_ref())
+        {
+            // Default fast path: no policy ⇒ SWRR, byte-identical to pre-feature behavior. NOTHING below
+            // this arm runs — no projection, no async, one predictable branch.
+            None => None,
+            // A non-default policy is configured: build the projection, run the decision (bounded by its
+            // timeout), and coerce the outcome to a ranked order (or `None` ⇒ SWRR) per `on_error`.
+            Some(resolved) => {
+                let outcome = decide_policy_order(
+                    &app,
+                    resolved,
+                    &cands,
+                    &request_ctx,
+                    v.as_ref().unwrap_or(&Value::Null),
+                    pool_name,
+                    ingress_protocol,
+                    wants_stream,
+                    caller_token,
+                )
+                .await;
+                match outcome {
+                    // The policy returned a usable ranked order — record its name (for the
+                    // `x-busbar-route-policy` header + the metric) and hand the order to the ordered walk.
+                    PolicyOutcome::Order { order, name } => {
                         chosen_policy_name = Some(name);
                         metrics::counter!(
                             crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
@@ -3105,7 +3044,126 @@ pub(crate) async fn forward_with_pool_parsed(
                             "pool" => pool_name.to_string(),
                         )
                         .increment(1);
-                        None
+                        Some(order)
+                    }
+                    // Abstain / error-coerced-to-weighted: fall through to today's exact SWRR.
+                    PolicyOutcome::Weighted => None,
+                    // on_error == reject (and the policy errored/timed out / saturated): fail closed with a
+                    // 503 rather than silently degrading. Never strands as a hang — a clean rejection.
+                    PolicyOutcome::Reject => {
+                        return ingress_error(
+                        ingress_protocol,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        KIND_OVERLOADED,
+                        "The routing policy could not select an upstream. Please retry shortly.",
+                    );
+                    }
+                    // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
+                    // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
+                    // operator-visible counter. `status` was clamped to 400..=499 and `message`
+                    // sanitized at the seam that constructed the outcome (for every producer, wire or
+                    // direct), so this arm can trust both.
+                    PolicyOutcome::RejectRequest {
+                        status,
+                        message,
+                        name,
+                    } => {
+                        // The `status` label is hook-influenced but BOUNDED: the seam that built this
+                        // outcome clamps it to 400..=499 for every producer, so the worst-case series
+                        // fan-out is 100 per (policy, pool).
+                        metrics::counter!(
+                            crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                            "policy" => name,
+                            "pool" => pool_name.to_string(),
+                            "status" => status.to_string(),
+                        )
+                        .increment(1);
+                        // The message is safe to log: the seam that built this outcome sanitized it
+                        // (control/invisible chars stripped, length capped — for EVERY producer, not
+                        // just the wire transports), and it is the exact string the CLIENT receives.
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            status,
+                            message = %message,
+                            "routing policy rejected the request"
+                        );
+                        return ingress_error(
+                            ingress_protocol,
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                            reject_kind_for_status(status),
+                            &message,
+                        );
+                    }
+                    // The hook's RESTRICT verb: intersect the failover candidate set with members
+                    // carrying one of `tags_any`, then let SWRR pick among the survivors. Shrinking
+                    // `cands` here makes the restriction PERSIST across every failover hop (each hop
+                    // selects from this set) — the compliance guarantee ("only these lanes, ever"). An
+                    // EMPTY intersection is fail-closed (`on_empty` default reject), never allow-all;
+                    // an empty `tags_any` (fail-closed-normalized malformed restrict) forces it.
+                    PolicyOutcome::Restrict {
+                        tags_any,
+                        name,
+                        on_empty,
+                    } => {
+                        let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
+                        // Filter into a temp so the ORIGINAL `cands` survives for a weighted on_empty
+                        // escape; only commit the restriction when the intersection is non-empty.
+                        let restricted: Vec<WeightedLane> = cands
+                            .iter()
+                            .filter(|wl| {
+                                members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                                    meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        if restricted.is_empty() {
+                            // Empty intersection → the gate's `on_empty`. `Weighted` is the advisory escape
+                            // (leave `cands` as the full pool → SWRR); default (and `First`, which has no
+                            // eligible "first") is fail-closed reject.
+                            if matches!(on_empty, crate::config::PolicyOnError::Weighted) {
+                                tracing::info!(
+                                policy = name,
+                                pool = pool_name,
+                                "routing policy restrict left no eligible lane; on_empty: weighted \
+                                 escape to full-pool SWRR"
+                            );
+                                None
+                            } else {
+                                metrics::counter!(
+                                    crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                                    "policy" => name,
+                                    "pool" => pool_name.to_string(),
+                                    "status" => "503".to_string(),
+                                )
+                                .increment(1);
+                                tracing::info!(
+                                policy = name,
+                                pool = pool_name,
+                                "routing policy restrict left no eligible lane (on_empty: reject)"
+                            );
+                                return ingress_error(
+                                ingress_protocol,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                KIND_OVERLOADED,
+                                "No upstream satisfies the routing policy's restriction. Please \
+                                 retry shortly.",
+                            );
+                            }
+                        } else {
+                            // Commit the restriction: shrink `cands` to the survivors so it PERSISTS
+                            // across every failover hop, then let SWRR pick among them.
+                            cands = restricted;
+                            chosen_policy_name = Some(name);
+                            metrics::counter!(
+                                crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                                "policy" => name,
+                                "pool" => pool_name.to_string(),
+                            )
+                            .increment(1);
+                            None
+                        }
                     }
                 }
             }
@@ -11021,7 +11079,7 @@ mod hook_seam_tests {
             on_empty: crate::config::PolicyOnError::Reject,
         };
         // Inject the global gate (Arc refcount is 1 right after build()).
-        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![gate];
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
 
         let body =
             serde_json::to_vec(&serde_json::json!({"model": "p", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}))
@@ -11074,7 +11132,7 @@ mod hook_seam_tests {
             send_user: false,
             on_empty: crate::config::PolicyOnError::Reject,
         };
-        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![gate];
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
 
         let body =
             serde_json::to_vec(&serde_json::json!({"model": "p", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}))
@@ -11327,6 +11385,7 @@ mod hook_seam_tests {
                         send_user: false,
                         on_empty: crate::config::PolicyOnError::Reject,
                     }),
+                    gates: Vec::new(),
                 },
             )
             .build();

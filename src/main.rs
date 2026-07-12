@@ -638,6 +638,9 @@ async fn main() {
                     &upstream_client,
                     default_hook.as_deref(),
                 ),
+                // This pool's decision gates, resolved once here (priority carried for the phase-2
+                // chain merge). NOT re-resolved on config apply yet — same scope caveat as `policy`.
+                gates: routing::resolve_pool_gates(pool_cfg, &cfg.hooks, &upstream_client),
             },
         );
     }

@@ -105,6 +105,12 @@ pub(crate) struct PoolRuntime {
     /// failover loop: `forward::decide_policy_order` invokes it per request and `pick_among` walks the
     /// resulting order.
     pub(crate) policy: Option<crate::routing::ResolvedPolicy>,
+    /// This pool's DECISION GATES (`hook:` / the non-strategy names in `hooks: [...]`), resolved once
+    /// at config load, each with its `priority`, in config order. Fired in the phase-2 decision
+    /// reconcile alongside the global gates (one priority-sorted chain; stable sort keeps
+    /// globals-before-pool on ties, then config order). Empty (the default) = no pool gates — the
+    /// phase-2 pass is skipped entirely when this and `global_gates` are both empty.
+    pub(crate) gates: Vec<(u16, crate::routing::ResolvedPolicy)>,
 }
 
 /// `Clone` is the config-apply enabler: cloning an `App` shares the live-state `Arc`s (store, auth,
@@ -140,13 +146,13 @@ pub(crate) struct App {
         bool,
         Arc<dyn crate::routing::RoutingPolicy>,
     )>,
-    /// GLOBAL DECISION gates — the non-rewrite `kind: gate` hooks in `global_hooks`, resolved to their
-    /// full `ResolvedPolicy` (transport + on_error/on_empty/grants). Fired on EVERY request to reach a
-    /// verdict, alongside a pool's own `hook:` gate. Today the REJECT arm is honored (a global guard/PII
-    /// gate that says no short-circuits before pool routing); restrict/order from globals are a
-    /// follow-up increment. Empty (the default) = no global gates, zero cost. Priority-ordered so the
-    /// surfacing reject is deterministic.
-    pub(crate) global_gates: Vec<crate::routing::ResolvedPolicy>,
+    /// GLOBAL DECISION gates — the non-rewrite `kind: gate` hooks in `global_hooks`, resolved to
+    /// their full `ResolvedPolicy` (transport + on_error/on_empty/grants), each with its `priority`.
+    /// Fired CONCURRENTLY on every request in the phase-2 decision reconcile, merged with the pool's
+    /// own gates into one priority-sorted chain (reject wins / restricts intersect / order
+    /// last-wins). Empty (the default) = no global gates, zero cost. Pre-sorted ascending by
+    /// priority so the merge's stable sort keeps globals-first on ties.
+    pub(crate) global_gates: Vec<(u16, crate::routing::ResolvedPolicy)>,
     /// The raw `hooks:` registry (name → definition) as configured, for the Admin API v1 hooks READ
     /// surface (`GET /admin/v1/hooks`). This is the DEFINITION set, distinct
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty

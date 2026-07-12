@@ -298,28 +298,14 @@ pub(crate) enum ResolvedPolicy {
 /// and thus converges with today's inline SWRR — so the hot path constructs no policy object, builds
 /// no projections, and takes the unchanged `select_weighted_in` branch.
 ///
-/// Every non-default transport is resolved here: a non-weighted native is looked up in the registry,
-/// a webhook is constructed over its validated URL + the shared client, and a socket wraps its path.
-/// A missing / invalid / unknown transport degrades to `None` (the default SWRR) so routing never
-/// strands a request — startup validation is what surfaces the misconfiguration. The resolved policy
-/// is stored on `PoolRuntime::policy` and consumed per-request by `forward::decide_policy_order`.
-pub(crate) fn resolve_policy(
-    cfg: &crate::config::PoolCfg,
-    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
-    client: &reqwest::Client,
-) -> Option<ResolvedPolicy> {
-    // A pool's first GATE takes the resolved-policy slot when present. Full composition — a gate's
-    // `order` reply falling back to the native `policy:` ordering — lands in the slice-4 seam; for now
-    // the gate resolves to one transport policy exactly as 1.2.1's `route: socket|webhook` did.
-    if let Some(hook_name) = cfg.gates.first() {
-        // A missing entry / non-gate kind is caught loudly by config_validate; if somehow unresolved
-        // here, degrade to None (default SWRR) rather than strand a request.
-        let hook = hooks.get(hook_name)?;
-        return resolve_gate_transport(hook, client);
-    }
-    // No gate: resolve the native `policy:` ordering. `weighted` ⇒ the zero-cost default path (no
-    // policy object, inline SWRR) — byte-identical to 1.2.1's `route: weighted` — so `native_name()`
-    // returns `None` here and we take the `?` short-circuit BELOW regardless of the ranking feature.
+/// This resolves the BASE only. A pool's GATES are resolved separately (`resolve_pool_gates`) and
+/// fire in the phase-2 decision reconcile — a gate's `order` overrides the base; its abstain falls
+/// through to the base. The resolved base is stored on `PoolRuntime::policy` and consumed
+/// per-request by `forward::decide_policy_order`.
+pub(crate) fn resolve_policy(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
+    // `weighted` ⇒ the zero-cost default path (no policy object, inline SWRR) — byte-identical to
+    // 1.2.1's `route: weighted` — so `native_name()` returns `None` here and we take the `?`
+    // short-circuit BELOW regardless of the ranking feature.
     let name = cfg.policy.native_name()?;
     // The non-weighted ranking strategies are the `hooks-ranking` plugin. When it's compiled OUT, a
     // `policy: cheapest` (etc.) is a config_validate BOOT ERROR, so this arm is unreachable in a
@@ -357,18 +343,19 @@ pub(crate) fn default_hook_name(
 }
 
 /// Resolve a pool's base ordering, honoring the `default:` hook. A pool that named NO base ordering
-/// (`base_named == false`) and has no gate of its own INHERITS the `default:` hook as its base (the
-/// default gate orders it) — the REPLACEMENT of the compiled-in `weighted` backstop, per the
-/// everything-is-a-hook model. A pool with its own gate, or one that explicitly named a base, keeps its
-/// choice (the default does NOT override it). When no `default:` hook is registered, this is exactly
-/// `resolve_policy` (the compiled-in backstop). Called once per pool at startup.
+/// (`base_named == false`) INHERITS the `default:` hook as its base (the default gate orders it) —
+/// the REPLACEMENT of the compiled-in `weighted` backstop, per the everything-is-a-hook model. A pool
+/// that explicitly named a base keeps its choice (the default does NOT override it); a pool's own
+/// GATES are orthogonal — they fire in the phase-2 reconcile ON TOP of whatever base resolves here.
+/// When no `default:` hook is registered, this is exactly `resolve_policy` (the compiled-in
+/// backstop). Called once per pool at startup.
 pub(crate) fn resolve_pool_ordering(
     cfg: &crate::config::PoolCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
     default_hook: Option<&str>,
 ) -> Option<ResolvedPolicy> {
-    if cfg.gates.is_empty() && !cfg.base_named {
+    if !cfg.base_named {
         if let Some(name) = default_hook {
             if let Some(hook) = hooks.get(name) {
                 // The default gate becomes this pool's base ordering.
@@ -376,7 +363,29 @@ pub(crate) fn resolve_pool_ordering(
             }
         }
     }
-    resolve_policy(cfg, hooks, client)
+    resolve_policy(cfg)
+}
+
+/// Resolve a pool's GATES (`hook:` / the non-strategy names in `hooks: [...]`) into their transports,
+/// preserving CONFIG ORDER and carrying each hook's `priority` — the firing site merges these with
+/// the global decision gates into one priority-sorted phase-2 chain (stable: ties keep globals-first,
+/// then config order). Unresolvable / dangling / wrong-kind refs are skipped here (config_validate
+/// surfaces them loudly at boot); a skip degrades to "gate absent", never a stranded request.
+pub(crate) fn resolve_pool_gates(
+    cfg: &crate::config::PoolCfg,
+    hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
+    client: &reqwest::Client,
+) -> Vec<(u16, ResolvedPolicy)> {
+    cfg.gates
+        .iter()
+        .filter_map(|name| {
+            let hook = hooks.get(name)?;
+            if hook.kind != crate::config::HookKind::Gate {
+                return None;
+            }
+            resolve_gate_transport(hook, client).map(|rp| (hook.priority, rp))
+        })
+        .collect()
 }
 
 /// Resolve a GATE hook's transport (socket or webhook) into a [`ResolvedPolicy`]. The prompt/identity
@@ -509,14 +518,15 @@ pub(crate) fn resolve_tap_hooks(
 /// `resolve_rewrite_hooks`; taps observe, they don't decide). These fire on EVERY request to reach a
 /// verdict (reject / restrict / order) alongside a pool's own `hook:` gate. Returns the full
 /// `ResolvedPolicy` for each (carrying `on_error`/`on_empty`/grants) so the firing site can run it
-/// through the same `decide_policy_order` machinery as a pool gate. Sorted by ascending `priority`
-/// (tie-break order, e.g. which reject message surfaces first). Unresolvable transports are skipped
-/// (config_validate surfaces them at boot).
+/// through the same `decide_policy_order` machinery as a pool gate, PLUS the hook's `priority` so
+/// the firing site can merge globals with a pool's own gates into one phase-2 chain. Sorted by
+/// ascending `priority` (the chain tie-break, e.g. which reject message surfaces). Unresolvable
+/// transports are skipped (config_validate surfaces them at boot).
 pub(crate) fn resolve_gate_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
     client: &reqwest::Client,
-) -> Vec<ResolvedPolicy> {
+) -> Vec<(u16, ResolvedPolicy)> {
     let mut ranked: Vec<(u16, ResolvedPolicy)> = Vec::new();
     for name in global_hooks {
         let Some(hook) = hooks.get(name) else {
@@ -532,7 +542,7 @@ pub(crate) fn resolve_gate_hooks(
         }
     }
     ranked.sort_by_key(|(p, _)| *p);
-    ranked.into_iter().map(|(_, rp)| rp).collect()
+    ranked
 }
 
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
@@ -650,8 +660,6 @@ mod tests {
     #[cfg(feature = "hooks-ranking")]
     #[test]
     fn native_policy_resolves_constructed_policy() {
-        let client = reqwest::Client::new();
-        let hooks = HashMap::new();
         for (policy, name) in [
             (PoolPolicy::Cheapest, "cheapest"),
             (PoolPolicy::Fastest, "fastest"),
@@ -659,7 +667,7 @@ mod tests {
             (PoolPolicy::Usage, "usage"),
         ] {
             let cfg = pool_policy(policy);
-            match resolve_policy(&cfg, &hooks, &client) {
+            match resolve_policy(&cfg) {
                 Some(ResolvedPolicy::Policy { policy, .. }) => {
                     assert_eq!(
                         policy.name(),
@@ -712,10 +720,18 @@ mod tests {
             "a pool that named its base keeps it; the default does not override"
         );
 
-        // base_named=false but its OWN gate ⇒ uses its own gate, not the default.
+        // base_named=false with its OWN gate ⇒ STILL inherits the default as its base — gates are
+        // orthogonal to the base ordering (they fire in the phase-2 reconcile on top of it), and
+        // its own gate resolves separately via resolve_pool_gates.
+        let gated = pool_with_hook("h");
         assert!(
-            resolve_pool_ordering(&pool_with_hook("h"), &hooks, &client, Some("def")).is_some(),
-            "a pool with its own gate keeps it"
+            resolve_pool_ordering(&gated, &hooks, &client, Some("def")).is_some(),
+            "an unnamed-base pool with its own gate still inherits the default as base"
+        );
+        assert_eq!(
+            resolve_pool_gates(&gated, &hooks, &client).len(),
+            1,
+            "the pool's own gate resolves separately, on top of the inherited base"
         );
 
         // No default registered ⇒ identical to resolve_policy (backstop): unnamed pool ⇒ None.
@@ -728,25 +744,24 @@ mod tests {
     /// `policy: weighted` (default / absent) collapses to the zero-cost default (`None`).
     #[test]
     fn weighted_policy_resolves_none_zero_cost() {
-        let client = reqwest::Client::new();
-        let hooks = HashMap::new();
         assert!(
-            resolve_policy(&pool_policy(PoolPolicy::Weighted), &hooks, &client).is_none(),
+            resolve_policy(&pool_policy(PoolPolicy::Weighted)).is_none(),
             "the weighted native must collapse to the zero-cost default path"
         );
     }
 
-    /// A pool `hook:` referencing an UNKNOWN registry entry degrades to `None` (default SWRR) — routing
-    /// never strands a request; config_validate is the loud gate that rejects the dangling ref at boot.
+    /// A pool gate referencing an UNKNOWN registry entry is skipped at resolution (gate absent) —
+    /// routing never strands a request; config_validate is the loud gate that rejects the dangling
+    /// ref at boot.
     #[test]
     fn unknown_hook_ref_falls_back_to_none() {
         let client = reqwest::Client::new();
         let hooks = HashMap::new();
-        assert!(resolve_policy(&pool_with_hook("nonexistent"), &hooks, &client).is_none());
+        assert!(resolve_pool_gates(&pool_with_hook("nonexistent"), &hooks, &client).is_empty());
     }
 
-    /// A pool `hook:` naming a socket gate resolves to a constructed socket policy (unix); an
-    /// empty socket path degrades to `None`.
+    /// A pool `hook:` naming a socket gate resolves to a constructed socket gate policy (unix); an
+    /// empty socket path degrades to gate-absent.
     #[cfg(unix)]
     #[test]
     fn socket_gate_resolves_constructed_policy() {
@@ -758,10 +773,16 @@ mod tests {
                 ..base_gate()
             },
         );
-        match resolve_policy(&pool_with_hook("h"), &hooks, &client) {
-            Some(ResolvedPolicy::Policy {
-                policy, timeout, ..
-            }) => {
+        match resolve_pool_gates(&pool_with_hook("h"), &hooks, &client)
+            .into_iter()
+            .next()
+        {
+            Some((
+                _,
+                ResolvedPolicy::Policy {
+                    policy, timeout, ..
+                },
+            )) => {
                 assert_eq!(policy.name(), "socket");
                 assert_eq!(
                     timeout,
@@ -769,12 +790,9 @@ mod tests {
                     "a gate with the default timeout resolves to the documented deadline, not 0ms",
                 );
             }
-            other => panic!(
-                "socket gate must resolve to a Policy, got none={}",
-                other.is_none()
-            ),
+            None => panic!("socket gate must resolve to a Policy"),
         }
-        // Empty socket path → None (default SWRR; validation is the loud gate).
+        // Empty socket path → gate absent (validation is the loud gate).
         let empty = registry(
             "h",
             HookCfg {
@@ -782,15 +800,13 @@ mod tests {
                 ..base_gate()
             },
         );
-        assert!(resolve_policy(&pool_with_hook("h"), &empty, &client).is_none());
+        assert!(resolve_pool_gates(&pool_with_hook("h"), &empty, &client).is_empty());
     }
 
     /// The plain default (`policy: weighted`, no hook) stays the zero-cost `None` path.
     #[test]
     fn weighted_default_resolves_none() {
-        let client = reqwest::Client::new();
-        let hooks = HashMap::new();
-        assert!(resolve_policy(&pool_policy(PoolPolicy::Weighted), &hooks, &client).is_none());
+        assert!(resolve_policy(&pool_policy(PoolPolicy::Weighted)).is_none());
     }
 
     /// SECURITY INVARIANT: `resolve_rewrite_hooks` admits ONLY `prompt: rw` GATES as rewrite hooks.
@@ -998,9 +1014,7 @@ mod tests {
     #[cfg(feature = "hooks-ranking")]
     #[test]
     fn native_resolve_forces_opt_in_flags_off() {
-        let client = reqwest::Client::new();
-        let hooks = HashMap::new();
-        match resolve_policy(&pool_policy(PoolPolicy::Cheapest), &hooks, &client) {
+        match resolve_policy(&pool_policy(PoolPolicy::Cheapest)) {
             Some(ResolvedPolicy::Policy {
                 send_prompt,
                 send_user,
@@ -1048,12 +1062,18 @@ mod tests {
             ),
         ));
         for (label, hooks) in cases {
-            match resolve_policy(&pool_with_hook("h"), &hooks, &client) {
-                Some(ResolvedPolicy::Policy {
-                    send_prompt,
-                    send_user,
-                    ..
-                }) => {
+            match resolve_pool_gates(&pool_with_hook("h"), &hooks, &client)
+                .into_iter()
+                .next()
+            {
+                Some((
+                    _,
+                    ResolvedPolicy::Policy {
+                        send_prompt,
+                        send_user,
+                        ..
+                    },
+                )) => {
                     assert!(
                         send_prompt,
                         "{label} must pass prompt:ro through as send_prompt"

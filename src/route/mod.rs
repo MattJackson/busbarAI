@@ -1318,6 +1318,7 @@ mod tests {
                 }),
                 breaker: None,
                 policy: None,
+                gates: Vec::new(),
             },
         );
         // App is behind Arc; rebuild with the populated map.
@@ -1343,6 +1344,7 @@ mod tests {
                 }),
                 breaker: None,
                 policy: None,
+                gates: Vec::new(),
             },
         );
         let inner = Arc::get_mut(&mut app).expect("sole owner");

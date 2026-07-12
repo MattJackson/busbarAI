@@ -1379,6 +1379,7 @@ mod tests {
                     affinity: None,
                     breaker: None,
                     policy: None,
+                    gates: Vec::new(),
                 },
             )
             .build();
