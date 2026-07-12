@@ -6,6 +6,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// The busbar-owned config overlay (persistence substrate for API-applied hook changes).
+pub(crate) mod overlay;
+
 // Re-export status_class_from_str for config validation
 pub(crate) use crate::breaker::status_class_from_str;
 
