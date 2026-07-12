@@ -196,11 +196,14 @@ async fn register_hook(State(handle): State<Arc<AppHandle>>, body: axum::body::B
             handle.swap(Arc::new(next));
             audit::AUDIT.record("hook.register", &resource, audit::OUTCOME_APPLIED);
             // Persist the new hook state to the overlay (best-effort; no-op when persistence disabled).
+            // Clear any tombstone for this name — a re-register un-deletes it.
             let cur = handle.load();
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
                 &cur.hook_registry,
                 &cur.global_hooks,
+                None,
+                Some(&req.name),
             );
             // Project the registered hook from the NEW (post-swap) snapshot for the 201 body.
             respond(
@@ -225,11 +228,14 @@ async fn delete_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
         Ok(next) => {
             handle.swap(Arc::new(next));
             audit::AUDIT.record("hook.delete", &resource, audit::OUTCOME_APPLIED);
+            // Tombstone this name so the deletion survives a restart even if the hook was base-defined.
             let cur = handle.load();
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
                 &cur.hook_registry,
                 &cur.global_hooks,
+                Some(&name),
+                None,
             );
             StatusCode::NO_CONTENT.into_response()
         }
