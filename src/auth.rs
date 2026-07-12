@@ -688,7 +688,20 @@ pub(crate) async fn auth_middleware(
         let required = crate::admin::v1::contract::required_scope(req.method(), &path);
         match scope {
             Some(s) if s.allows(required) => {}
-            _ => return Err(forbidden_response(required)),
+            _ => {
+                // Denied authorization is AUDITED (§6.7: failures leave a trail — a credential
+                // probing beyond its scope is exactly what an operator wants to see).
+                crate::admin::audit::AUDIT.record_by(
+                    "admin.forbidden",
+                    &path,
+                    crate::admin::audit::OUTCOME_REJECTED,
+                    principal
+                        .as_ref()
+                        .map(|p| p.id.as_str())
+                        .unwrap_or("anonymous"),
+                );
+                return Err(forbidden_response(required));
+            }
         }
         // MUTATION RATE LIMITS (§6.6): per-principal fixed windows, spent BEFORE the handler so
         // FAILED attempts count too (anti-enumeration). Config-plane mutations (apply/rollback)
