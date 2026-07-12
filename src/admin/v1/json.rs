@@ -369,4 +369,37 @@ mod tests {
         let resp = err_json(&AdminError::NotFound("hook".into()));
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    /// CONTRACT LOCK: the openapi Error-schema `code` enum must EXACTLY match the frozen `AdminError`
+    /// codes — no drift between the discovery doc and the taxonomy tooling actually receives. Every
+    /// variant's `code()` must appear in the enum, and the enum must list nothing else.
+    #[test]
+    fn openapi_error_enum_matches_admin_error_codes() {
+        use std::collections::BTreeSet;
+        let doc = openapi_doc();
+        let enum_codes: BTreeSet<String> = doc["components"]["schemas"]["Error"]["properties"]
+            ["error"]["properties"]["code"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        // The exhaustive set of AdminError codes — kept in lock-step with `AdminError::code`.
+        let actual_codes: BTreeSet<String> = [
+            AdminError::NotFound(String::new()),
+            AdminError::Forbidden {
+                needed: crate::admin::v1::contract::Scope::Full,
+            },
+            AdminError::Validation(String::new()),
+            AdminError::Conflict(String::new()),
+            AdminError::Internal,
+        ]
+        .iter()
+        .map(|e| e.code().to_string())
+        .collect();
+        assert_eq!(
+            enum_codes, actual_codes,
+            "openapi error-code enum drifted from AdminError::code"
+        );
+    }
 }
