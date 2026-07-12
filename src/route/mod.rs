@@ -1253,6 +1253,7 @@ mod tests {
             hook_registry: std::collections::HashMap::new(),
             global_hooks: Vec::new(),
             overlay_path: None,
+            config_version: 0,
             failover_cfg: None,
             pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),

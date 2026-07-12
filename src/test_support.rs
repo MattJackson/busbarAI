@@ -754,6 +754,7 @@ impl TestApp {
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
             overlay_path: self.overlay_path,
+            config_version: 0,
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,

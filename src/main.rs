@@ -701,6 +701,7 @@ async fn main() {
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
         overlay_path,
+        config_version: 0,
         failover_cfg,
         pool_runtime,
         fallback_pools,

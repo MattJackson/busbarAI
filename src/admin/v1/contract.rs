@@ -131,6 +131,9 @@ pub(crate) struct InfoView {
     /// config changes are durable across restarts; `false` = live-only (lost on restart). Lets tooling
     /// tell an operator whether their runtime changes will survive a restart.
     pub(crate) config_persistence: bool,
+    /// Monotonic config version — `0` at boot, +1 per API config apply. Drift-detection: re-read and
+    /// compare to tell whether the running config changed. Process-local (resets on restart).
+    pub(crate) config_version: u64,
 }
 
 /// The compiled-in feature proof (`InfoView.build`).

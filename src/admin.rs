@@ -1148,6 +1148,21 @@ mod tests {
         );
         assert_eq!(items[0]["name"], "compress");
 
+        // The config version bumped from 0 → 1 on the apply (drift-detection primitive).
+        let info: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            info["config_version"], 1,
+            "one apply bumped the config version"
+        );
+
         // GET one by name also sees it.
         let one = client
             .get(format!("http://{addr}/admin/v1/hooks/compress"))

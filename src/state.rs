@@ -155,6 +155,11 @@ pub(crate) struct App {
     /// boot); `None` (the default) = runtime changes are live but not persisted. Carried on `App` (not
     /// a global) so it is testable + survives config swaps (`App::clone` copies it).
     pub(crate) overlay_path: Option<std::path::PathBuf>,
+    /// Monotonic config version — `0` at boot, incremented by each API config apply (the swap builds
+    /// the next snapshot with `config_version + 1`). Exposed on `GET /admin/v1/info` so drift-detection
+    /// tooling can tell whether the running config changed since a prior read. Process-local (resets on
+    /// restart); durable version history + rollback is a follow-up.
+    pub(crate) config_version: u64,
     /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).

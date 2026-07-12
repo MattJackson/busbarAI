@@ -135,6 +135,7 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
 
     // ── build the next snapshot (clone shares live state; only config-derived fields change) ──
     let mut next = current.clone();
+    next.config_version = current.config_version.wrapping_add(1);
     let is_global = cfg.global;
     next.hook_registry.insert(name.to_string(), cfg);
     if is_global && !next.global_hooks.iter().any(|n| n == name) {
@@ -162,6 +163,7 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
         return Err(AdminError::NotFound(format!("hook `{name}`")));
     }
     let mut next = current.clone();
+    next.config_version = current.config_version.wrapping_add(1);
     next.hook_registry.remove(name);
     next.global_hooks.retain(|n| n != name);
     next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
@@ -212,6 +214,7 @@ impl AdminService {
                 providers: providers.len(),
             },
             config_persistence: self.app.overlay_path.is_some(),
+            config_version: self.app.config_version,
         })
     }
 
