@@ -39,7 +39,18 @@ pools:
 
 Each hook declares **exactly one transport** — `socket` (an absolute Unix-socket path; lazy-connect, so the hook may start after Busbar) or `webhook` (an `https://` URL, validated at boot against the SSRF blocklist: loopback sidecars allowed, RFC-1918 / link-local / CGNAT / cloud-metadata rejected).
 
-**Attach a hook** three ways: name it in a pool's `hooks:` list, list it in `global_hooks:`, or set `global: true` on the definition (sugar for "add me to `global_hooks`"). A pool's `hooks:` list carries its ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`) and/or a gate.
+**Attach a hook** three ways: name it in a pool's `hooks:` list, list it in `global_hooks:`, or set `global: true` on the definition (sugar for "add me to `global_hooks`"). A pool's `hooks:` list carries its ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`) and any number of gates.
+
+**Gates fire concurrently.** All of a request's decision gates — the pool's own and every global — fire at once against the same candidate set, then reconcile deterministically: any **reject** wins (the lowest-`priority` gate's status/message surfaces), **restrict**s intersect, and with several **order**s the last in the priority chain wins, re-validated against the post-restrict set. Added latency is the slowest gate, not the sum.
+
+**A tap picks its observation stage** with `at:` (default `request`):
+
+| `at:` | Observes | Extra payload |
+|---|---|---|
+| `request` | the effective (post-rewrite) request | prompt/identity per grants |
+| `route` | the routing decision | surviving candidate count |
+| `attempt` | every dispatch attempt | `attempt_number`, `target`, `remaining_candidates`, `previous_failure` |
+| `completion` | the outcome | `outcome: ok \| failed \| rejected_by_gate` + `status` — the **synthetic rejected completion**, so an audit tap sees denials, not just served traffic |
 
 ## Access grants — what a hook is trusted to see
 
@@ -69,8 +80,8 @@ A gate answers with exactly one of:
 
 ## Defaults and ordering
 
-- **`default: true`** on an ordering gate makes it the base ordering that any pool which named none inherits — replacing the built-in `weighted` floor (exactly as `auth: [sso]` replaces the built-in `tokens`). At most one hook may be the default (a boot error names both otherwise); a pool that named its own base, or brought its own gate, keeps its choice. No default set ⇒ the zero-cost inline `weighted` backstop.
-- **`priority: <n>`** orders the rewrite transform chain when more than one `rewrite` gate is global (highest first; each sees the prior's output).
+- **`default: true`** on an ordering gate makes it the base ordering that any pool which named none inherits — replacing the built-in `weighted` floor (exactly as `auth: [sso]` replaces the built-in `tokens`). At most one hook may be the default (a boot error names both otherwise); a pool that named its own base keeps its choice, and a pool's own gates layer ON TOP of whatever base it has. No default set ⇒ the zero-cost inline `weighted` backstop.
+- **`priority: <n>`** is the one ordering knob: it orders the rewrite transform chain (each rewrite sees the prior's output) and tie-breaks the concurrent decision reconcile — which reject's message surfaces, and which `order` counts as "last". Ties keep globals first, then config order.
 
 ## What Busbar guarantees when a hook misbehaves
 
@@ -81,6 +92,7 @@ A gate answers with exactly one of:
 | `on_error: weighted` (default) | Falls back to the weighted floor — a broken hook is indistinguishable from no hook |
 | `on_error: first` | Config order, deterministic |
 | `on_error: reject` | Fail closed with a 503 — for security gates, where an unscreened request is worse than none. Docs mandate this for security gates. |
+| `on_error: <hook-name>` | **A named fallback**: when this gate fails, that hook fires in its place (its decision is honored exactly as a primary's, projected per **its own** grants). Its own `on_error` chains further; Busbar proves at boot that every chain terminates — an unknown name, a tap, or a cycle is a startup error. `weighted`/`reject`/`first` are the reserved chain terminals; a ranking strategy name (`cheapest`, …) is also a valid, infallible fallback. |
 
 A `tap`, being fire-and-forget, has no `on_error` to speak of: its reply is discarded, its errors swallowed, its delivery bounded and dropped-under-pressure — it can never delay, reorder, or fail a request.
 

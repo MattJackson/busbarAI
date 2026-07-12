@@ -704,10 +704,11 @@ pub(crate) struct HookCfg {
     /// ties keep globals before pool gates, then config order.
     #[serde(default)]
     pub(crate) priority: u16,
-    /// TAP observation stage (`request`/`route`/`attempt`/`completion`). RESERVED: the tap-firing seam
-    /// lands in a later slice (no reader yet).
+    /// TAP observation stage (`request`/`route`/`attempt`/`completion`; unset = `request`).
+    /// `request` observes the (post-rewrite) request; `route` the post-reconcile candidate set;
+    /// `attempt` every dispatch attempt (the failover story); `completion` the outcome — including
+    /// the SYNTHETIC rejected completion, so audit taps see denials. Inert on a gate.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) at: Option<HookStage>,
     /// GATE restrict empty-intersection behavior (default `reject`, fail-closed; `weighted` is the
     /// advisory escape — the gate's restriction is skipped). Applied per gate in the phase-2
