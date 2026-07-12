@@ -7,7 +7,8 @@
 //! ordered **preference** of members — not a single pick. The ordered list feeds the failover loop
 //! Busbar already has (`forward::pick_among`): if the policy's #1 is tripped / excluded / at
 //! capacity, Busbar walks to #2 using the existing breaker machinery. One transport-agnostic trait
-//! (`RoutingPolicy`); webhook / socket / native are implementations.
+//! (`RoutingPolicy`); webhook / socket are the out-of-process implementations, and the built-in
+//! ranking hooks (`plugins::hooks::ranking`) are the in-process ones.
 //!
 //! ZERO-COST DEFAULT: a `route: weighted` (default / absent) pool resolves to `ResolvedPolicy::None`
 //! at config load and NEVER constructs any of the projection types or enters this module's async
@@ -16,7 +17,7 @@
 //! This surface is PRODUCTION-WIRED: `forward::decide_policy_order` builds the `RoutingRequest` +
 //! `Candidate` projections from the live store signals and invokes the resolved policy on every
 //! non-default request; `forward::pick_among` walks the ranked order through the existing failover
-//! loop. `resolve_policy` (below) constructs the native / webhook / socket transports once
+//! loop. `resolve_policy` (below) constructs the ranking-hook / webhook / socket transports once
 //! at config load.
 
 use std::sync::Arc;
