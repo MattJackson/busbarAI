@@ -766,22 +766,22 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule (hooks/pool-ref): a pool's `hook:` must name a registry entry that is a GATE (a tap can't
-    // influence routing). Dangling or wrong-kind references are startup errors that name the hook.
+    // Rule (hooks/pool-ref): every gate a pool names (`hook:` / the non-strategy names in
+    // `hooks: [...]`) must reference a registry entry that is a GATE (a tap can't influence
+    // routing). Dangling or wrong-kind references are startup errors that name the hook.
     for (pool_name, pool_cfg) in &cfg.pools {
-        let Some(hook_name) = pool_cfg.hook.as_deref() else {
-            continue;
-        };
-        match cfg.hooks.get(hook_name) {
-            None => errors.push(format!(
-                "pool '{pool_name}' references unknown hook '{hook_name}'; define it under \
-                 top-level `hooks:`"
-            )),
-            Some(h) if h.kind != crate::config::HookKind::Gate => errors.push(format!(
-                "pool '{pool_name}' hook '{hook_name}' is a tap, but a pool `hook:` must be a gate \
-                 (fire-and-wait); a tap cannot influence routing"
-            )),
-            Some(_) => {}
+        for hook_name in &pool_cfg.gates {
+            match cfg.hooks.get(hook_name) {
+                None => errors.push(format!(
+                    "pool '{pool_name}' references unknown hook '{hook_name}'; define it under \
+                     top-level `hooks:`"
+                )),
+                Some(h) if h.kind != crate::config::HookKind::Gate => errors.push(format!(
+                    "pool '{pool_name}' hook '{hook_name}' is a tap, but a pool `hook:` must be a \
+                     gate (fire-and-wait); a tap cannot influence routing"
+                )),
+                Some(_) => {}
+            }
         }
     }
 
@@ -1677,7 +1677,7 @@ mod tests {
             on_exhausted: None,
             affinity: None,
             policy: config::PoolPolicy::default(),
-            hook: None,
+            gates: Vec::new(),
             base_named: false,
         }
     }
@@ -4097,7 +4097,7 @@ models:
         let mut models = HashMap::new();
         models.insert("m1".to_string(), make_model("prov", 4));
         let mut pool = make_pool(vec![make_member("m1")]);
-        pool.hook = Some("h".to_string());
+        pool.gates = vec!["h".to_string()];
         let mut pools = HashMap::new();
         pools.insert("p1".to_string(), pool);
         let mut cfg = make_root_cfg(providers, models, pools);
@@ -4325,7 +4325,7 @@ models:
         let mut models = HashMap::new();
         models.insert("m1".to_string(), make_model("prov", 4));
         let mut pool = make_pool(vec![make_member("m1")]);
-        pool.hook = Some("h".to_string());
+        pool.gates = vec!["h".to_string()];
         let mut pools = HashMap::new();
         pools.insert("p1".to_string(), pool);
         let mut cfg = make_root_cfg(providers, models, pools);

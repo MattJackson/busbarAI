@@ -3900,7 +3900,7 @@ mod tests {
                 on_exhausted: None,
                 affinity: None,
                 policy: crate::config::PoolPolicy::default(),
-                hook: None,
+                gates: Vec::new(),
                 base_named: false,
             };
             let make = |error_map: std::collections::HashMap<String, String>| {

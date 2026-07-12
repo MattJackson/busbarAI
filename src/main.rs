@@ -1231,7 +1231,7 @@ mod tests {
             on_exhausted: None,
             affinity: None,
             policy: crate::config::PoolPolicy::default(),
-            hook: None,
+            gates: Vec::new(),
             base_named: false,
         }
     }

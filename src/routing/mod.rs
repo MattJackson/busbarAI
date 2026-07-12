@@ -308,10 +308,10 @@ pub(crate) fn resolve_policy(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
 ) -> Option<ResolvedPolicy> {
-    // A pool's `hook:` GATE takes the resolved-policy slot when present. Full composition — a gate's
+    // A pool's first GATE takes the resolved-policy slot when present. Full composition — a gate's
     // `order` reply falling back to the native `policy:` ordering — lands in the slice-4 seam; for now
     // the gate resolves to one transport policy exactly as 1.2.1's `route: socket|webhook` did.
-    if let Some(hook_name) = cfg.hook.as_deref() {
+    if let Some(hook_name) = cfg.gates.first() {
         // A missing entry / non-gate kind is caught loudly by config_validate; if somehow unresolved
         // here, degrade to None (default SWRR) rather than strand a request.
         let hook = hooks.get(hook_name)?;
@@ -368,7 +368,7 @@ pub(crate) fn resolve_pool_ordering(
     client: &reqwest::Client,
     default_hook: Option<&str>,
 ) -> Option<ResolvedPolicy> {
-    if cfg.hook.is_none() && !cfg.base_named {
+    if cfg.gates.is_empty() && !cfg.base_named {
         if let Some(name) = default_hook {
             if let Some(hook) = hooks.get(name) {
                 // The default gate becomes this pool's base ordering.
@@ -599,7 +599,7 @@ mod tests {
             on_exhausted: None,
             affinity: None,
             policy,
-            hook: None,
+            gates: Vec::new(),
             base_named: true,
         }
     }
@@ -613,7 +613,7 @@ mod tests {
             on_exhausted: None,
             affinity: None,
             policy: PoolPolicy::Weighted,
-            hook: Some(name.to_string()),
+            gates: vec![name.to_string()],
             base_named: false,
         }
     }
@@ -694,7 +694,7 @@ mod tests {
 
         // base_named=false + no gate ⇒ inherits the default gate as its base ordering.
         let mut unnamed = pool_with_hook("x");
-        unnamed.hook = None; // base_named is already false from pool_with_hook
+        unnamed.gates.clear(); // base_named is already false from pool_with_hook
         assert!(
             resolve_pool_ordering(&unnamed, &hooks, &client, Some("def")).is_some(),
             "an unnamed-base pool inherits the default hook as its ordering"
