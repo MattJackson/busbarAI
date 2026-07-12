@@ -403,9 +403,25 @@ impl<'de> Deserialize<'de> for PoolCfg {
             /// 1.3 optional gate reference into the top-level `hooks:` registry.
             #[serde(default)]
             hook: Option<String>,
+            /// 1.3 UNIFIED form (everything-is-a-hook): a pool names the hooks it wants — ordering
+            /// strategies (weighted/cheapest/…) and/or a gate — in ONE list. Desugars into the internal
+            /// (base policy, gate) representation. Transitional twin of `policy:`+`hook:`; setting both
+            /// forms on one pool is an error. This is the form `policy:`/`hook:` collapse INTO.
+            #[serde(default)]
+            hooks: Option<Vec<String>>,
             /// REMOVED in 1.3 — captured only to emit a migration error naming the fix.
             #[serde(default)]
             route: Option<String>,
+        }
+
+        // Is `name` one of the native ordering strategies (an ordering hook), vs a gate reference?
+        // The strategy set is fixed + known at parse time, so `hooks: [...]` classifies without the
+        // (not-yet-available) registry: a strategy name sets the base ordering; anything else is a gate.
+        fn is_strategy_name(name: &str) -> bool {
+            matches!(
+                name,
+                "weighted" | "cheapest" | "fastest" | "least_busy" | "usage"
+            )
         }
 
         let raw = RawPoolCfg::deserialize(deserializer)?;
@@ -436,29 +452,71 @@ impl<'de> Deserialize<'de> for PoolCfg {
             return Err(serde::de::Error::custom(msg));
         }
 
-        // Parse the `policy:` strategy scalar; reject the removed block form with the fix.
-        let policy = match raw.policy {
-            None => PoolPolicy::default(),
-            Some(PolicyField::Strategy(name)) => match name.as_str() {
-                "weighted" => PoolPolicy::Weighted,
-                "cheapest" => PoolPolicy::Cheapest,
-                "fastest" => PoolPolicy::Fastest,
-                "least_busy" => PoolPolicy::LeastBusy,
-                "usage" => PoolPolicy::Usage,
-                other => {
-                    return Err(serde::de::Error::custom(format!(
-                        "unknown pool policy '{other}': expected weighted, cheapest, fastest, \
-                         least_busy, or usage"
-                    )));
-                }
-            },
-            Some(PolicyField::LegacyBlock(_)) => {
+        fn parse_strategy<E: serde::de::Error>(name: &str) -> Result<PoolPolicy, E> {
+            match name {
+                "weighted" => Ok(PoolPolicy::Weighted),
+                "cheapest" => Ok(PoolPolicy::Cheapest),
+                "fastest" => Ok(PoolPolicy::Fastest),
+                "least_busy" => Ok(PoolPolicy::LeastBusy),
+                "usage" => Ok(PoolPolicy::Usage),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown pool policy '{other}': expected weighted, cheapest, fastest, \
+                     least_busy, or usage"
+                ))),
+            }
+        }
+
+        // Resolve the internal (base policy, gate) representation from EITHER the unified `hooks: [...]`
+        // list OR the legacy `policy:`+`hook:` pair — never both (ambiguous). The unified form is what
+        // the pair collapses into; the pair stays accepted through the transition.
+        let (policy, hook) = if let Some(names) = raw.hooks {
+            if raw.policy.is_some() || raw.hook.is_some() {
                 return Err(serde::de::Error::custom(
-                    "the `policy:` block was removed in 1.3; `policy:` is now a scalar strategy \
-                     (e.g. `policy: cheapest`). Move a hook's transport/timeout/on_error into a \
-                     named entry under top-level `hooks:` and reference it with `hook:`.",
+                    "a pool sets both `hooks:` and `policy:`/`hook:`; use ONE form — `hooks: [...]` \
+                     names the pool's ordering strategy and/or gate in a single list",
                 ));
             }
+            // Partition the list: ordering strategies set the base ranking; anything else is a gate ref
+            // (validated against the registry at startup). At most one of each for now — multi-gate
+            // concurrent fan-out is the next increment.
+            let mut policy: Option<PoolPolicy> = None;
+            let mut gate: Option<String> = None;
+            for name in names {
+                if is_strategy_name(&name) {
+                    if policy.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "a pool `hooks:` list names more than one ordering strategy; a pool has \
+                             one base ordering",
+                        ));
+                    }
+                    policy = Some(parse_strategy(&name)?);
+                } else {
+                    if gate.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "a pool `hooks:` list names more than one gate; multi-gate is not yet \
+                             supported (coming in a later 1.3 increment)",
+                        ));
+                    }
+                    gate = Some(name);
+                }
+            }
+            // No strategy named ⇒ the base is the default (resolved at startup: the `default:` hook if
+            // one exists, else the compiled-in `weighted` backstop). Placeholder is `weighted` here.
+            (policy.unwrap_or_default(), gate)
+        } else {
+            // Legacy pair. Parse the `policy:` strategy scalar; reject the removed block form.
+            let policy = match raw.policy {
+                None => PoolPolicy::default(),
+                Some(PolicyField::Strategy(name)) => parse_strategy(&name)?,
+                Some(PolicyField::LegacyBlock(_)) => {
+                    return Err(serde::de::Error::custom(
+                        "the `policy:` block was removed in 1.3; `policy:` is now a scalar strategy \
+                         (e.g. `policy: cheapest`). Move a hook's transport/timeout/on_error into a \
+                         named entry under top-level `hooks:` and reference it with `hook:`.",
+                    ));
+                }
+            };
+            (policy, raw.hook)
         };
 
         Ok(PoolCfg {
@@ -468,7 +526,7 @@ impl<'de> Deserialize<'de> for PoolCfg {
             on_exhausted: raw.on_exhausted,
             affinity: raw.affinity,
             policy,
-            hook: raw.hook,
+            hook,
         })
     }
 }
@@ -2013,6 +2071,49 @@ models:
                 .expect("policy + hook must parse");
         assert_eq!(pool.policy, PoolPolicy::Cheapest);
         assert_eq!(pool.hook.as_deref(), Some("smart-router"));
+    }
+
+    /// The unified `hooks: [...]` pool form desugars into the internal (base policy, gate) rep: an
+    /// ordering-strategy name sets the base ranking, any other name is a gate reference.
+    #[test]
+    fn test_pool_hooks_list_desugars() {
+        // strategy + gate
+        let pool: PoolCfg = serde_yaml::from_str("hooks: [cheapest, smart-router]\nmembers: []\n")
+            .expect("hooks list must parse");
+        assert_eq!(pool.policy, PoolPolicy::Cheapest);
+        assert_eq!(pool.hook.as_deref(), Some("smart-router"));
+
+        // gate only ⇒ base stays default (weighted placeholder; default: hook resolves at startup)
+        let g: PoolCfg = serde_yaml::from_str("hooks: [pii-guard]\nmembers: []\n")
+            .expect("gate-only list parses");
+        assert_eq!(g.policy, PoolPolicy::Weighted);
+        assert_eq!(g.hook.as_deref(), Some("pii-guard"));
+
+        // strategy only ⇒ base set, no gate
+        let s: PoolCfg =
+            serde_yaml::from_str("hooks: [fastest]\nmembers: []\n").expect("strategy-only parses");
+        assert_eq!(s.policy, PoolPolicy::Fastest);
+        assert!(s.hook.is_none());
+    }
+
+    /// Mixing the unified `hooks:` list with the legacy `policy:`/`hook:` pair is an error (pick one).
+    #[test]
+    fn test_pool_hooks_and_legacy_pair_conflict() {
+        let e =
+            serde_yaml::from_str::<PoolCfg>("hooks: [cheapest]\npolicy: fastest\nmembers: []\n")
+                .expect_err("both forms must error");
+        assert!(e.to_string().contains("both `hooks:` and"), "{e}");
+    }
+
+    /// Two ordering strategies in one `hooks:` list is an error (a pool has one base ordering).
+    #[test]
+    fn test_pool_hooks_two_strategies_error() {
+        let e = serde_yaml::from_str::<PoolCfg>("hooks: [cheapest, fastest]\nmembers: []\n")
+            .expect_err("two strategies must error");
+        assert!(
+            e.to_string().contains("more than one ordering strategy"),
+            "{e}"
+        );
     }
 
     /// An unknown `policy:` strategy fails loudly, naming the bad value.

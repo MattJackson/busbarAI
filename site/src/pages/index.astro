@@ -57,8 +57,8 @@ const features = [
 const hooks = [
   {
     title: 'Tap: watch every request',
-    body: 'Fire-and-forget observers on the path. A tap sees the full request and response and never blocks the hop — log to your SIEM, emit audit trails, meter usage, ship metrics. It runs alongside the request, so nothing waits on it.',
-    enables: 'A SIEM audit tap or a usage meter that sees every call, across every provider, from one place.',
+    body: 'Prometheus metrics and OTLP traces are already built in. A tap is for the rest: fire-and-forget observers that see the full request and response and send it wherever you need — your SIEM, a compliance archive, a custom audit trail. It runs alongside the request, so nothing waits on it.',
+    enables: 'Feed your own SIEM or audit store off every call, across every provider, without touching the request path.',
   },
   {
     title: 'Gate: decide on the path',
@@ -404,12 +404,11 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <h2>Program the path.</h2>
           <p>
             Reliability earns Busbar a spot between your app and your models. <strong>Hooks are what
-            that spot becomes.</strong> A hook is a mini-app for your AI that runs on the path — a
-            <strong>tap</strong> that watches, or a <strong>gate</strong> that decides: reject,
-            restrict, route, or rewrite. Because hooks fire on Busbar’s normalized IR, you write one
+            that spot becomes</strong> — a <strong>tap</strong> that watches, or a
+            <strong>gate</strong> that decides: reject, restrict, route, or rewrite. Because hooks
+            fire on Busbar’s normalized IR, you write one
             once and it runs against all six protocols and every provider, with failover and circuit
-            breaking underneath it, in one hop. It’s the plumbing every app needs between itself and
-            the LLM — and now it’s programmable.
+            breaking underneath it, in one hop. <strong>Busbar is where your AI middleware runs.</strong>
           </p>
         </div>
       </div>
