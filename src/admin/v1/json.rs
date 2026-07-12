@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{extract::Path, extract::Query, Extension, Router};
 use serde::Serialize;
 use serde_json::json;
@@ -45,6 +45,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/hooks/{name}", get(get_hook))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
+            .route("/admin/v1/config/validate", post(validate_config))
             .layer(Extension(service))
     }
 }
@@ -133,6 +134,39 @@ async fn list_plugins(
 /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode (no secrets).
 async fn get_auth(Extension(service): Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.get_auth().await)
+}
+
+/// The `POST /admin/v1/config/validate` request body: a full proposed config — the `config.yaml`
+/// deploy block + the `providers.yaml` definitions — mirroring the two files busbar loads at boot.
+#[derive(serde::Deserialize)]
+struct ValidateConfigReq {
+    /// The deploy config (operator-owned `config.yaml` shape).
+    config: crate::config::DeployCfg,
+    /// The provider definitions (`providers.yaml` shape), keyed by provider name. Optional: a config
+    /// that references no providers.yaml entries validates against an empty def set (and reports the
+    /// dangling references as errors).
+    #[serde(default)]
+    providers: std::collections::HashMap<String, crate::config::ProviderDef>,
+}
+
+/// `POST /admin/v1/config/validate` — dry-run validate a proposed config. A malformed body is an
+/// `invalid_request`; a well-formed body always returns 200 with the `{ok, errors}` verdict.
+async fn validate_config(
+    Extension(service): Extension<Arc<AdminService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: ValidateConfigReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed config body: {e}"
+            )))
+        }
+    };
+    respond(
+        StatusCode::OK,
+        service.validate_config(req.config, req.providers).await,
+    )
 }
 
 #[cfg(test)]

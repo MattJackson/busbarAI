@@ -973,6 +973,67 @@ mod tests {
         handle.abort();
     }
 
+    /// `POST /admin/v1/config/validate` dry-runs a proposed config: a malformed body is a 400
+    /// `invalid_request`; a well-formed body describing an INVALID config (here a provider reference
+    /// absent from the defs) returns 200 with `ok:false` and the resolution errors — never mutating.
+    #[tokio::test]
+    async fn test_admin_v1_config_validate_dry_run() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/v1/config/validate");
+
+        // Malformed body → 400 invalid_request (the REQUEST is broken, not the config).
+        let bad = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body("{\"config\": \"not-an-object\"}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400);
+        let body: serde_json::Value = bad.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+
+        // Well-formed body, invalid config: deploy references provider "openai" but the defs are empty
+        // → resolve fails with a dangling-provider error → 200 ok:false.
+        let proposed = serde_json::json!({
+            "config": {
+                "providers": { "openai": { "api_key_env": "OPENAI_KEY" } },
+                "models": {}
+            },
+            "providers": {}
+        });
+        let resp = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(proposed.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["ok"], false, "config with a dangling provider is invalid");
+        let errors = v["errors"].as_array().unwrap();
+        assert!(!errors.is_empty(), "invalid config must report errors");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap_or("").contains("openai")),
+            "the dangling provider is named in an error: {errors:?}"
+        );
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

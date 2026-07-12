@@ -269,6 +269,18 @@ impl<T> Page<T> {
     }
 }
 
+/// The result of `POST /admin/v1/config/validate` — a DRY-RUN: does a proposed config resolve +
+/// validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
+/// failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid
+/// request that describes an INVALID config is `ok: false`, not an HTTP error); only a MALFORMED request
+/// body is an `invalid_request`. Env-var interpolation is out of scope — this checks structure and
+/// cross-reference resolution, not runtime secret presence.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConfigValidateView {
+    pub(crate) ok: bool,
+    pub(crate) errors: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

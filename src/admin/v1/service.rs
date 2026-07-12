@@ -14,10 +14,12 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, AuthView, BuildInfo, HookTransportView, HookView, InfoView, ModelView, Page,
-    PluginView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
+    AdminError, AuthView, BuildInfo, ConfigValidateView, HookTransportView, HookView, InfoView,
+    ModelView, Page, PluginView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
 };
-use crate::config::{HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, UserAccess};
+use crate::config::{
+    DeployCfg, HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, ProviderDef, UserAccess,
+};
 
 /// Process start instant, for the `info` uptime read. Stamped ONCE at startup by `mark_start()`.
 /// A missing value (never stamped — e.g. a unit test that skips `main`) yields a `None` uptime
@@ -239,6 +241,30 @@ impl AdminService {
             }
         }
         Ok(Page::single(plugins))
+    }
+
+    /// `POST /admin/v1/config/validate` — DRY-RUN a proposed config: resolve (`config.yaml` deploy +
+    /// `providers.yaml` defs) then run the full boot-time `config_validate`, collecting every error at
+    /// once, WITHOUT applying anything. Always succeeds as an operation (`Result::Ok`) — the verdict is
+    /// in the view's `ok`/`errors`; a valid request describing an invalid config is `ok: false`, not an
+    /// error. Read scope (no mutation). Env interpolation is out of scope (structure + resolution only).
+    pub(crate) async fn validate_config(
+        &self,
+        deploy: DeployCfg,
+        defs: std::collections::HashMap<String, ProviderDef>,
+    ) -> Result<ConfigValidateView, AdminError> {
+        // Resolve first (cross-references config.yaml providers against providers.yaml defs); if that
+        // fails there is no RootCfg to hand to the semantic validator, so return the resolve errors.
+        match crate::config::resolve(&deploy, &defs) {
+            Err(errors) => Ok(ConfigValidateView { ok: false, errors }),
+            Ok(root) => match crate::config_validate::validate(&root) {
+                Ok(()) => Ok(ConfigValidateView {
+                    ok: true,
+                    errors: Vec::new(),
+                }),
+                Err(errors) => Ok(ConfigValidateView { ok: false, errors }),
+            },
+        }
     }
 
     /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode. Read scope. Never a
