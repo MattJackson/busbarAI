@@ -3900,6 +3900,7 @@ mod tests {
                 affinity: None,
                 policy: crate::config::PoolPolicy::default(),
                 hook: None,
+                base_named: false,
             };
             let make = |error_map: std::collections::HashMap<String, String>| {
                 let mut providers = HashMap::new();

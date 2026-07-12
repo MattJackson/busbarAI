@@ -1678,6 +1678,7 @@ mod tests {
             affinity: None,
             policy: config::PoolPolicy::default(),
             hook: None,
+            base_named: false,
         }
     }
 

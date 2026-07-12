@@ -365,6 +365,14 @@ pub(crate) struct PoolCfg {
     /// entry in the top-level `hooks:` registry; validated to be `kind: gate` at startup. `None` = no
     /// per-pool gate (pure native ordering). Singular for now; becomes a list additively in slice 4.
     pub(crate) hook: Option<String>,
+    /// Whether the pool EXPLICITLY named its base ordering strategy (via `policy:` or a strategy name
+    /// in `hooks: [...]`), vs leaving it defaulted. `false` (defaulted) is the pool that INHERITS the
+    /// `default:` hook when one is registered (else the compiled-in `weighted` backstop); `true` means
+    /// the operator picked a base, so the `default:` hook does NOT override it. `policy` alone can't
+    /// carry this — it defaults to `Weighted` indistinguishably from an explicit `weighted`. RESERVED:
+    /// the `default:`-resolution reader lands next; tracked now so the distinction survives parse.
+    #[allow(dead_code)]
+    pub(crate) base_named: bool,
 }
 
 /// Manual `Deserialize` for [`PoolCfg`] so 1.2.1 config keys become CLEAN-BREAK migration errors
@@ -469,7 +477,7 @@ impl<'de> Deserialize<'de> for PoolCfg {
         // Resolve the internal (base policy, gate) representation from EITHER the unified `hooks: [...]`
         // list OR the legacy `policy:`+`hook:` pair — never both (ambiguous). The unified form is what
         // the pair collapses into; the pair stays accepted through the transition.
-        let (policy, hook) = if let Some(names) = raw.hooks {
+        let (policy, hook, base_named) = if let Some(names) = raw.hooks {
             if raw.policy.is_some() || raw.hook.is_some() {
                 return Err(serde::de::Error::custom(
                     "a pool sets both `hooks:` and `policy:`/`hook:`; use ONE form — `hooks: [...]` \
@@ -501,10 +509,13 @@ impl<'de> Deserialize<'de> for PoolCfg {
                 }
             }
             // No strategy named ⇒ the base is the default (resolved at startup: the `default:` hook if
-            // one exists, else the compiled-in `weighted` backstop). Placeholder is `weighted` here.
-            (policy.unwrap_or_default(), gate)
+            // one exists, else the compiled-in `weighted` backstop). Placeholder is `weighted` here;
+            // `base_named` records whether a strategy WAS named so resolution knows to inherit or not.
+            let base_named = policy.is_some();
+            (policy.unwrap_or_default(), gate, base_named)
         } else {
             // Legacy pair. Parse the `policy:` strategy scalar; reject the removed block form.
+            let base_named = raw.policy.is_some();
             let policy = match raw.policy {
                 None => PoolPolicy::default(),
                 Some(PolicyField::Strategy(name)) => parse_strategy(&name)?,
@@ -516,7 +527,7 @@ impl<'de> Deserialize<'de> for PoolCfg {
                     ));
                 }
             };
-            (policy, raw.hook)
+            (policy, raw.hook, base_named)
         };
 
         Ok(PoolCfg {
@@ -527,6 +538,7 @@ impl<'de> Deserialize<'de> for PoolCfg {
             affinity: raw.affinity,
             policy,
             hook,
+            base_named,
         })
     }
 }
@@ -2056,11 +2068,13 @@ models:
             let pool: PoolCfg = serde_yaml::from_str(&yaml).expect("policy scalar must parse");
             assert_eq!(pool.policy, expected, "{name} must parse to its strategy");
             assert!(pool.hook.is_none());
+            assert!(pool.base_named, "an explicit policy: names the base");
         }
-        // Absent policy defaults to the zero-cost weighted strategy.
+        // Absent policy defaults to the zero-cost weighted strategy; base NOT named ⇒ inherits default:
         let absent: PoolCfg = serde_yaml::from_str("members: []\n").expect("absent parses");
         assert_eq!(absent.policy, PoolPolicy::Weighted);
         assert!(absent.hook.is_none());
+        assert!(!absent.base_named, "an absent policy did not name the base");
     }
 
     /// A pool `hook:` captures the gate reference verbatim (registry lookup happens at validation).
@@ -2077,23 +2091,29 @@ models:
     /// ordering-strategy name sets the base ranking, any other name is a gate reference.
     #[test]
     fn test_pool_hooks_list_desugars() {
-        // strategy + gate
+        // strategy + gate ⇒ base explicitly named
         let pool: PoolCfg = serde_yaml::from_str("hooks: [cheapest, smart-router]\nmembers: []\n")
             .expect("hooks list must parse");
         assert_eq!(pool.policy, PoolPolicy::Cheapest);
         assert_eq!(pool.hook.as_deref(), Some("smart-router"));
+        assert!(pool.base_named, "a named strategy sets base_named");
 
-        // gate only ⇒ base stays default (weighted placeholder; default: hook resolves at startup)
+        // gate only ⇒ base stays default (weighted placeholder); base NOT named ⇒ inherits default:
         let g: PoolCfg = serde_yaml::from_str("hooks: [pii-guard]\nmembers: []\n")
             .expect("gate-only list parses");
         assert_eq!(g.policy, PoolPolicy::Weighted);
         assert_eq!(g.hook.as_deref(), Some("pii-guard"));
+        assert!(
+            !g.base_named,
+            "a gate-only pool did not name its base ordering"
+        );
 
-        // strategy only ⇒ base set, no gate
+        // strategy only ⇒ base set, no gate, base named
         let s: PoolCfg =
             serde_yaml::from_str("hooks: [fastest]\nmembers: []\n").expect("strategy-only parses");
         assert_eq!(s.policy, PoolPolicy::Fastest);
         assert!(s.hook.is_none());
+        assert!(s.base_named);
     }
 
     /// Mixing the unified `hooks:` list with the legacy `policy:`/`hook:` pair is an error (pick one).

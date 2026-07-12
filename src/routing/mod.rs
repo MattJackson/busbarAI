@@ -535,6 +535,7 @@ mod tests {
             affinity: None,
             policy,
             hook: None,
+            base_named: true,
         }
     }
 
@@ -548,6 +549,7 @@ mod tests {
             affinity: None,
             policy: PoolPolicy::Weighted,
             hook: Some(name.to_string()),
+            base_named: false,
         }
     }
 

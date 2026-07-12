@@ -1218,6 +1218,7 @@ mod tests {
             affinity: None,
             policy: crate::config::PoolPolicy::default(),
             hook: None,
+            base_named: false,
         }
     }
 
