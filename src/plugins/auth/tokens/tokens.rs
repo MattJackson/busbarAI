@@ -48,14 +48,24 @@ impl AuthModule for TokensModule {
         // as a list-level timing oracle). `black_box` keeps the optimizer from reintroducing an
         // early exit. Byte-for-byte the pre-plugin fold from `AuthMiddleware::validate_token`.
         let candidate_hash = crate::sigv4::sha256_hex(token.as_bytes());
-        let found = self.hashed_tokens.iter().fold(0u8, |acc, allowed_hash| {
-            acc | u8::from(AuthMiddleware::constant_time_eq(
-                &candidate_hash,
-                allowed_hash,
-            ))
-        });
-        if std::hint::black_box(found) != 0 {
-            AuthOutcome::Identify
+        // `matched` doubles as the found flag AND the 1-based matched position, accumulated with
+        // bitwise-OR so every iteration does identical work (no early exit, no position-dependent
+        // branch — the matched index is derived arithmetically, preserving the timing stance).
+        let matched =
+            self.hashed_tokens
+                .iter()
+                .enumerate()
+                .fold(0usize, |acc, (i, allowed_hash)| {
+                    acc | ((i + 1)
+                        * usize::from(AuthMiddleware::constant_time_eq(
+                            &candidate_hash,
+                            allowed_hash,
+                        )))
+                });
+        if std::hint::black_box(matched) != 0 {
+            // The principal id is the allowlist POSITION (`tokens:<n>`, 1-based) — stable across
+            // restarts for a stable config, and never derived from the secret's bytes.
+            AuthOutcome::Identify(crate::auth::Principal::from_id(format!("tokens:{matched}")))
         } else {
             AuthOutcome::Reject
         }

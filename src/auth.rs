@@ -75,18 +75,50 @@ impl fmt::Debug for CallerToken {
     }
 }
 
+/// The authenticated PRINCIPAL — who the caller IS, established at the auth stage and keyed to by
+/// everything downstream (governance, audit attribution, the hook `send_user` projection, admin
+/// scopes). IDENTITY ONLY: a module returns who; policy (allowed pools, budgets, admin scope) is
+/// resolved by busbar from config (`group_map:`), never asserted by the module (design-hooks-v2
+/// §2.3). NEVER carries the credential itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Principal {
+    /// Stable identity handle (required): the virtual-key id for governance keys, a stable
+    /// module-scoped handle otherwise (e.g. `tokens:2`, an AD UPN).
+    pub(crate) id: String,
+    /// Display name, if the module knows one.
+    pub(crate) name: Option<String>,
+    /// Group memberships (external modules). Mapped to governance via config `group_map:`;
+    /// intersected with the module's `allowed_groups:` cap before mapping. Empty = no groups.
+    pub(crate) groups: Vec<String>,
+    /// Module-suggested cache TTL for this identification, seconds (clamped by the engine's hard
+    /// cap when the credential cache lands). `None` = engine default.
+    pub(crate) ttl_secs: Option<u64>,
+}
+
+impl Principal {
+    /// A principal with only a stable id — the common built-in-module shape.
+    pub(crate) fn from_id(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: None,
+            groups: Vec::new(),
+            ttl_secs: None,
+        }
+    }
+}
+
 /// The verdict of one auth module. The PAM-style trichotomy the 1.3 auth-plugin layer is built on
-/// (design-hooks-v2 §2): `Identify` = this module authenticated the caller (slice 3 attaches the
-/// `Principal`); `Reject` = a credential was presented but is invalid (fail-closed, stop the chain);
-/// `Pass` = "not mine" — no usable credential for this module, defer to the next module / the mode
-/// default. Slice 2 uses only the verdict; the principal payload lands in slice 3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (design-hooks-v2 §2): `Identify` = this module authenticated the caller and this is WHO —
+/// carries the [`Principal`]; `Reject` = a credential was presented but is invalid (fail-closed,
+/// stop the chain); `Pass` = "not mine" — no usable credential for this module, defer to the next
+/// module / the mode default.
+#[derive(Debug, Clone, PartialEq, Eq)]
 // The contract enum persists even when NO built-in auth module is compiled (a `--no-default-features`
 // / external-only build): an external `AuthModule` constructs these verdicts. Without a compiled-in
 // module the variants are unconstructed, hence allow(dead_code).
 #[allow(dead_code)]
 pub(crate) enum AuthOutcome {
-    Identify,
+    Identify(Principal),
     Reject,
     Pass,
 }
@@ -97,6 +129,16 @@ pub(crate) enum AuthOutcome {
 /// stays in the middleware, so a module never re-parses headers — it receives the already-extracted
 /// candidate and returns a verdict. (Slice 3 extends this with a configure/describe handshake and a
 /// `Principal` on `Identify`.)
+/// The whole CHAIN's verdict for one request: admitted-with-identity, admitted-anonymously (the
+/// empty-chain open front door), or denied. Distinct from the per-module [`AuthOutcome`] so the
+/// middleware can attach the principal (or its absence) to the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChainVerdict {
+    Identified(Principal),
+    Open,
+    Denied,
+}
+
 pub(crate) trait AuthModule: Send + Sync {
     /// Stable module name for config references, metrics, and audit (e.g. `"tokens"`). RESERVED:
     /// consumed by the slice-3 `auth:` chain + audit; no caller in slice 2.
@@ -218,22 +260,23 @@ impl AuthMiddleware {
         self.chain.is_empty()
     }
 
-    /// Run the auth chain over the presented candidate credential. Empty chain -> admit (the
-    /// `none`/`passthrough` open front door). Otherwise the first `Identify` admits, a `Reject`
-    /// denies, and all-`Pass` (no module matched a presented credential) denies — fail-closed for a
-    /// configured chain. Constant-time within each module; the loop order is config order.
-    fn run_chain(&self, candidate: Option<&str>) -> bool {
+    /// Run the auth chain over the presented candidate credential. Empty chain -> admit with NO
+    /// principal (the `none`/`passthrough` open front door — anonymous). Otherwise the first
+    /// `Identify` admits with its [`Principal`], a `Reject` denies, and all-`Pass` (no module
+    /// matched a presented credential) denies — fail-closed for a configured chain. Constant-time
+    /// within each module; the loop order is config order.
+    pub(crate) fn run_chain(&self, candidate: Option<&str>) -> ChainVerdict {
         if self.chain.is_empty() {
-            return true;
+            return ChainVerdict::Open;
         }
         for module in &self.chain {
             match module.authenticate(candidate) {
-                AuthOutcome::Identify => return true,
-                AuthOutcome::Reject => return false,
+                AuthOutcome::Identify(principal) => return ChainVerdict::Identified(principal),
+                AuthOutcome::Reject => return ChainVerdict::Denied,
                 AuthOutcome::Pass => {}
             }
         }
-        false
+        ChainVerdict::Denied
     }
 
     /// Constant-time string comparison to avoid leaking how much of a token matches via timing.
@@ -315,8 +358,11 @@ impl AuthMiddleware {
     /// from ANY supported carrier (see `extract_client_token`); the comparison is identical and
     /// constant-time regardless of which header carried it. No `AuthMode` branch here — the front-door
     /// policy is entirely encoded in the chain shape (`[]` admits, `[tokens]` validates).
+    // Thin admit/deny view over `run_chain` — kept for tests and callers that don't need the
+    // principal. The middleware itself calls `run_chain` (it attaches the principal).
+    #[allow(dead_code)]
     pub(crate) fn validate_token(&self, token: Option<&str>) -> bool {
-        self.run_chain(token)
+        !matches!(self.run_chain(token), ChainVerdict::Denied)
     }
 }
 
@@ -440,6 +486,16 @@ fn extract_admin_header_token(req: &Request<Body>) -> Option<String> {
         .map(String::from)
 }
 
+/// Request-extension carrier for the authenticated [`Principal`]. ALWAYS inserted by the auth
+/// middleware on admitted requests (`None` = the empty-chain anonymous front door), so downstream
+/// consumers (audit attribution, the hook `send_user` projection, admin scopes) can extract it
+/// without an is-it-there dance. Never carries the credential.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthPrincipal(
+    // Read by the admin scope-enforcement + audit-attribution consumers (next increments).
+    #[allow(dead_code)] pub(crate) Option<Principal>,
+);
+
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
@@ -474,7 +530,8 @@ pub(crate) async fn auth_middleware(
     // check and the governance virtual-key lookup, so every scheme is validated identically and in
     // constant time. Replaces the previous Bearer-only `bearer_token`.
     let client_token: Option<String> = AuthMiddleware::extract_client_token(&req);
-    let token_valid = app.auth.validate_token(client_token.as_deref());
+    let chain_verdict = app.auth.run_chain(client_token.as_deref());
+    let token_valid = !matches!(chain_verdict, ChainVerdict::Denied);
 
     // Thread the caller's token into request extensions for passthrough forwarding, using the same
     // multi-scheme carrier precedence as auth (Bearer / x-api-key / x-goog-api-key). Inserted BEFORE
@@ -551,6 +608,10 @@ pub(crate) async fn auth_middleware(
         if !authorized {
             return Err(unauthorized_response(&path));
         }
+        // The legacy single admin token identifies as the fixed operator principal (the
+        // admin-tokens module + scopes refine this).
+        req.extensions_mut()
+            .insert(AuthPrincipal(Some(Principal::from_id("admin"))));
         // INTENTIONAL governance bypass for the operator admin token. A successful admin auth attaches
         // an EMPTY `GovCtx::default()` (no resolved virtual key) and returns HERE — BEFORE the
         // virtual-key governance resolution below — so per-key controls (`allowed_pools`, budget, RPM/
@@ -694,6 +755,13 @@ pub(crate) async fn auth_middleware(
         };
         match gov.lookup(client_token) {
             Some(key) if key.enabled => {
+                // The governance principal: id = the virtual-key id (stable), name = its label.
+                req.extensions_mut().insert(AuthPrincipal(Some(Principal {
+                    id: key.id.clone(),
+                    name: Some(key.name.clone()),
+                    groups: Vec::new(),
+                    ttl_secs: None,
+                })));
                 req.extensions_mut()
                     .insert(crate::governance::GovCtx { key: Some(key) });
             }
@@ -706,6 +774,13 @@ pub(crate) async fn auth_middleware(
         if !token_valid {
             return Err(unauthorized_response(&path));
         }
+        // Attach WHO was identified: the chain's principal, or `None` for the empty-chain
+        // anonymous front door.
+        req.extensions_mut()
+            .insert(AuthPrincipal(match chain_verdict {
+                ChainVerdict::Identified(p) => Some(p),
+                ChainVerdict::Open | ChainVerdict::Denied => None,
+            }));
         req.extensions_mut()
             .insert(crate::governance::GovCtx::default());
     }
