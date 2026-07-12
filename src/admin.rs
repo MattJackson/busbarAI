@@ -1370,6 +1370,120 @@ mod tests {
         handle.abort();
     }
 
+    /// GOLDEN PATH: the whole config plane working together in one flow — register → live + version
+    /// bump + audit + persist → delete → gone + version bump + audit. A coherent-flow regression anchor
+    /// for the marquee feature (catches integration breaks the per-feature tests miss).
+    #[tokio::test]
+    async fn test_admin_v1_config_plane_golden_path() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("t".to_string())).unwrap());
+        let overlay = std::env::temp_dir().join(format!(
+            "busbar-golden-{}-{}.json",
+            std::process::id(),
+            crate::store::now()
+        ));
+        let _ = std::fs::remove_file(&overlay);
+        let app = TestApp::new()
+            .governance(gov)
+            .overlay_path(overlay.clone())
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let c = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let get = |p: String| {
+            let (c, url) = (c.clone(), format!("{base}{p}"));
+            async move {
+                c.get(url)
+                    .header("x-admin-token", "t")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let name = "golden_gate";
+
+        // Baseline: no hooks, version 0, persistence on.
+        assert_eq!(
+            get("/admin/v1/hooks".into()).await["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let info0 = get("/admin/v1/info".into()).await;
+        assert_eq!(info0["config_version"], 0);
+        assert_eq!(info0["config_persistence"], true);
+
+        // Register.
+        let created = c
+            .post(format!("{base}/admin/v1/hooks"))
+            .header("x-admin-token", "t")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({"name": name, "config":
+                    {"kind": "gate", "webhook": "http://127.0.0.1:9982/", "global": true}})
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+
+        // Live (read sees it), version bumped, persisted to disk.
+        assert!(get("/admin/v1/hooks".into()).await["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["name"] == name));
+        assert_eq!(get("/admin/v1/info".into()).await["config_version"], 1);
+        assert_eq!(get("/admin/v1/config".into()).await["version"], 1);
+        assert!(crate::config::overlay::read(&overlay)
+            .unwrap()
+            .hooks
+            .contains_key(name));
+        // Audit records it.
+        assert!(
+            get(format!("/admin/v1/audit?resource=hook:{name}")).await["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["action"] == "hook.register" && e["outcome"] == "applied")
+        );
+
+        // Delete.
+        let deleted = c
+            .delete(format!("{base}/admin/v1/hooks/{name}"))
+            .header("x-admin-token", "t")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status().as_u16(), 204);
+
+        // Gone, version bumped again, persisted removal.
+        assert_eq!(
+            get("/admin/v1/hooks".into()).await["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(get("/admin/v1/info".into()).await["config_version"], 2);
+        assert!(!crate::config::overlay::read(&overlay)
+            .unwrap()
+            .hooks
+            .contains_key(name));
+
+        let _ = std::fs::remove_file(&overlay);
+        handle.abort();
+    }
+
     /// Config-overlay PERSISTENCE: with an overlay path set, registering a hook over the API writes it
     /// to the overlay file, and merging that overlay onto a fresh base config (a "restart") restores
     /// the hook — so a runtime-registered hook survives a restart.
