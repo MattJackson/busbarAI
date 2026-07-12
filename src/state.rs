@@ -107,6 +107,12 @@ pub(crate) struct PoolRuntime {
     pub(crate) policy: Option<crate::routing::ResolvedPolicy>,
 }
 
+/// `Clone` is the config-apply enabler: cloning an `App` shares the live-state `Arc`s (store, auth,
+/// governance, client — the things that must SURVIVE a config change) and deep-copies the
+/// config-derived collections (lanes, pools, hooks, …). So `apply` builds the next snapshot as
+/// `let mut next = (*current).clone(); /* mutate config-derived fields */` and `AppHandle::swap`s it,
+/// while in-flight requests keep serving on the old snapshot and the SAME breaker/latency state.
+#[derive(Clone)]
 pub(crate) struct App {
     pub(crate) lanes: Vec<Lane>,
     pub(crate) store: Arc<dyn StateStore>,

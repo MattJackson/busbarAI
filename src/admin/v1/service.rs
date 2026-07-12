@@ -95,6 +95,50 @@ async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
     }
 }
 
+/// Build the next `App` snapshot with `name` registered/updated to `cfg` in the hook registry — the
+/// PURE core of `POST /admin/v1/hooks` (runtime hook registration). Validates the definition, clones
+/// the current snapshot (sharing the live-state `Arc`s), inserts the hook, updates the global-hook
+/// wiring, and RE-RESOLVES the rewrite/tap transports so a `global` hook takes effect immediately on
+/// swap. Lanes/store/pools/auth are UNTOUCHED, so the store's per-lane breaker state is preserved (no
+/// re-index — the safe, store-constraint-free subset of config apply). The caller `AppHandle::swap`s
+/// the returned snapshot. Pure + `Result` → unit-testable without the transport.
+#[allow(dead_code)] // wired by the POST /admin/v1/hooks endpoint (next increment).
+pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result<App, AdminError> {
+    // ── validate the definition (fail-closed, before any mutation) ──
+    if name.trim().is_empty() {
+        return Err(AdminError::Validation("hook name must not be empty".into()));
+    }
+    // Exactly one transport: socket XOR webhook.
+    if cfg.socket.is_none() == cfg.webhook.is_none() {
+        return Err(AdminError::Validation(
+            "a hook must set exactly one transport: `socket` or `webhook`".into(),
+        ));
+    }
+    // `prompt: rw` is a rewrite grant, meaningless (and unsafe) on a fire-and-forget tap.
+    if cfg.kind == HookKind::Tap && cfg.prompt == PromptAccess::Rw {
+        return Err(AdminError::Validation(
+            "`prompt: rw` is invalid on a `kind: tap` hook (a tap cannot rewrite)".into(),
+        ));
+    }
+
+    // ── build the next snapshot (clone shares live state; only config-derived fields change) ──
+    let mut next = current.clone();
+    let is_global = cfg.global;
+    next.hook_registry.insert(name.to_string(), cfg);
+    if is_global && !next.global_hooks.iter().any(|n| n == name) {
+        next.global_hooks.push(name.to_string());
+    }
+    // Re-resolve the FIRED transports from the new registry so a global hook is live after the swap.
+    next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+    );
+    next.tap_hooks =
+        crate::routing::resolve_tap_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    Ok(next)
+}
+
 /// The admin application core. Cheap to construct and clone-free to share (`Arc<App>` inside); a
 /// transport builds ONE and hands `Arc<AdminService>` to its routes.
 pub(crate) struct AdminService {
@@ -507,5 +551,80 @@ impl AdminService {
             timeout_ms: cfg.timeout_ms,
             global: cfg.global || self.app.global_hooks.iter().any(|n| n == name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{HookCfg, HookKind, PolicyOnError, PromptAccess, UserAccess};
+    use crate::test_support::TestApp;
+
+    fn hook(kind: HookKind, global: bool) -> HookCfg {
+        HookCfg {
+            kind,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9971/".to_string()),
+            timeout_ms: 5,
+            on_error: PolicyOnError::default(),
+            prompt: PromptAccess::No,
+            user: UserAccess::No,
+            priority: 0,
+            at: None,
+            on_empty: None,
+            global,
+        }
+    }
+
+    /// `build_with_hook` registers a GLOBAL tap into the registry + global wiring AND re-resolves it
+    /// into the fired tap transports — so after the caller swaps the returned snapshot, the tap is live.
+    /// Lanes/store are shared (unchanged), proving the store-constraint-free subset.
+    #[test]
+    fn build_with_hook_registers_and_wires_global_tap() {
+        let app = TestApp::new().build();
+        assert_eq!(app.tap_hooks.len(), 0, "fixture starts with no taps");
+        let next = build_with_hook(&app, "logger", hook(HookKind::Tap, true))
+            .expect("a valid global tap registers");
+        assert!(next.hook_registry.contains_key("logger"));
+        assert!(
+            next.global_hooks.iter().any(|n| n == "logger"),
+            "global tap wired into global_hooks"
+        );
+        assert_eq!(
+            next.tap_hooks.len(),
+            1,
+            "the global tap re-resolved into the fired tap transports (live after swap)"
+        );
+        // Live state is shared, not rebuilt: the store Arc is the SAME instance.
+        assert!(
+            std::sync::Arc::ptr_eq(&app.store, &next.store),
+            "the store (live breaker state) is preserved across the apply, not re-indexed"
+        );
+    }
+
+    /// Validation is fail-closed BEFORE any mutation: `prompt: rw` on a tap and a missing transport
+    /// both reject with `invalid_request`.
+    #[test]
+    fn build_with_hook_rejects_invalid_definitions() {
+        let app = TestApp::new().build();
+        let mut rw_tap = hook(HookKind::Tap, false);
+        rw_tap.prompt = PromptAccess::Rw;
+        assert!(matches!(
+            build_with_hook(&app, "t", rw_tap),
+            Err(AdminError::Validation(_))
+        ));
+
+        let mut no_transport = hook(HookKind::Gate, false);
+        no_transport.webhook = None;
+        assert!(matches!(
+            build_with_hook(&app, "x", no_transport),
+            Err(AdminError::Validation(_))
+        ));
+
+        let empty_name = hook(HookKind::Gate, false);
+        assert!(matches!(
+            build_with_hook(&app, "  ", empty_name),
+            Err(AdminError::Validation(_))
+        ));
     }
 }
