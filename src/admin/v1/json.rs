@@ -271,6 +271,23 @@ fn openapi_doc() -> serde_json::Value {
             }),
         );
     }
+    // Runtime hook registration: POST on the /hooks collection (merged onto its GET entry above).
+    if let Some(obj) = paths
+        .get_mut("/admin/v1/hooks")
+        .and_then(|p| p.as_object_mut())
+    {
+        obj.insert(
+            "post".to_string(),
+            json!({
+                "summary": "Register (or replace) a hook at runtime — live immediately",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "201": {"description": "Registered (body is the hook definition)"},
+                    "400": {"description": "Malformed body or invalid definition (`invalid_request`)"}
+                }
+            }),
+        );
+    }
     // Templated + non-GET routes.
     paths.insert(
         "/admin/v1/hooks/{name}".to_string(),
@@ -284,6 +301,18 @@ fn openapi_doc() -> serde_json::Value {
                 }],
                 "responses": {
                     "200": {"description": "OK"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            },
+            "delete": {
+                "summary": "Remove a hook at runtime — live immediately",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "204": {"description": "Removed"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
                 }
             }

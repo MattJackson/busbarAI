@@ -1660,6 +1660,16 @@ mod tests {
             .unwrap();
         assert!(codes.iter().any(|c| c == "not_found"));
 
+        // The runtime hook mutation methods are documented in the discovery contract.
+        assert!(
+            doc["paths"]["/admin/v1/hooks"]["post"].is_object(),
+            "POST /admin/v1/hooks (register) must be in the openapi doc"
+        );
+        assert!(
+            doc["paths"]["/admin/v1/hooks/{name}"]["delete"].is_object(),
+            "DELETE /admin/v1/hooks/{{name}} (remove) must be in the openapi doc"
+        );
+
         // DRIFT GUARD: every documented GET path is both listed in the doc AND actually mounted.
         for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
             assert!(

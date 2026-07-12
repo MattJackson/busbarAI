@@ -104,6 +104,27 @@ The virtual-key management surface (mint, inspect, adjust, revoke) is served und
 
 ---
 
+## Changing config over the API
+
+Busbar's config plane is live: an authenticated write takes effect immediately, with no restart and without disturbing in-flight requests. Under the hood an apply atomically swaps the running config snapshot — new requests see the new config; requests already in flight finish on the old one; and live reliability state (circuit breakers, latency) is preserved.
+
+### Hooks
+
+| Endpoint | Does |
+|---|---|
+| `POST /admin/v1/hooks` | Register (or replace) a hook at runtime. Body: `{ "name": "...", "config": { "kind": "gate\|tap", "webhook"\|"socket": "...", ... } }`. A `global: true` hook is live for the next request. Returns `201` with the hook definition. Invalid definitions (missing/both transports, `prompt: rw` on a `tap`) return `400 invalid_request` and change nothing |
+| `DELETE /admin/v1/hooks/{name}` | Remove a hook at runtime. `204` on success, `404 not_found` if unregistered |
+
+```bash
+# Register a global compression gate — live immediately
+curl -s -X POST -H "x-admin-token: $TOK" -H 'content-type: application/json' \
+  --data '{"name":"compress","config":{"kind":"gate","webhook":"http://127.0.0.1:8900/","prompt":"rw","global":true}}' \
+  http://localhost:8080/admin/v1/hooks
+
+# Remove it
+curl -s -X DELETE -H "x-admin-token: $TOK" http://localhost:8080/admin/v1/hooks/compress
+```
+
 ## Example
 
 ```bash
