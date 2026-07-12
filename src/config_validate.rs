@@ -777,8 +777,8 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                      top-level `hooks:`"
                 )),
                 Some(h) if h.kind != crate::config::HookKind::Gate => errors.push(format!(
-                    "pool '{pool_name}' hook '{hook_name}' is a tap, but a pool `hook:` must be a \
-                     gate (fire-and-wait); a tap cannot influence routing"
+                    "pool '{pool_name}' hook '{hook_name}' is a tap, but a hook named in a pool's \
+                     `hooks:` list must be a gate (fire-and-wait); a tap cannot influence routing"
                 )),
                 Some(_) => {}
             }
@@ -802,9 +802,10 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     for (pool_name, pool_cfg) in &cfg.pools {
         if pool_cfg.policy != crate::config::PoolPolicy::Weighted {
             errors.push(format!(
-                "pool '{pool_name}' uses policy: {:?} but this binary was built WITHOUT the \
-                 `hooks-ranking` feature — the built-in ranking strategies are absent. Rebuild with \
-                 default features, use `policy: weighted`, or reference an external ranking hook.",
+                "pool '{pool_name}' names the {:?} ranking strategy but this binary was built \
+                 WITHOUT the `hooks-ranking` feature — the built-in ranking strategies are absent. \
+                 Rebuild with default features, use `hooks: [weighted]` (or name no strategy), or \
+                 reference an external ranking hook.",
                 pool_cfg.policy
             ));
         }

@@ -356,18 +356,19 @@ pub(crate) struct PoolCfg {
     pub(crate) failover: Option<FailoverCfg>,
     pub(crate) on_exhausted: Option<OnExhaustedCfg>,
     pub(crate) affinity: Option<AffinityCfg>,
-    /// The pool's native ranking STRATEGY (`policy:`). `weighted` (default / absent) is today's SWRR
+    /// The pool's native ranking STRATEGY (a strategy name in `hooks: [...]`). `weighted`
+    /// (default / absent) is today's SWRR
     /// with ZERO added cost — no `RoutingPolicy` object, byte-identical hot path. `cheapest`/`fastest`/
     /// `least_busy`/`usage` resolve a native ordering policy that runs once before the failover loop.
     /// This is the pool's ranking FLOOR.
     pub(crate) policy: PoolPolicy,
-    /// The pool's GATES (`hook:` legacy single, or the non-strategy names in `hooks: [...]`). Each
-    /// names an entry in the top-level `hooks:` registry; validated to be `kind: gate` at startup.
+    /// The pool's GATES (the non-strategy names in `hooks: [...]`). Each names an entry in the
+    /// top-level `hooks:` registry; validated to be `kind: gate` at startup.
     /// Empty = no per-pool gate (pure native ordering). Config order is preserved — it is the
     /// phase-2 chain order (order last-wins; reject/restrict commute).
     pub(crate) gates: Vec<String>,
-    /// Whether the pool EXPLICITLY named its base ordering strategy (via `policy:` or a strategy name
-    /// in `hooks: [...]`), vs leaving it defaulted. `false` (defaulted) is the pool that INHERITS the
+    /// Whether the pool EXPLICITLY named its base ordering strategy (a strategy name in
+    /// `hooks: [...]`), vs leaving it defaulted. `false` (defaulted) is the pool that INHERITS the
     /// `default:` hook when one is registered (else the compiled-in `weighted` backstop); `true` means
     /// the operator picked a base, so the `default:` hook does NOT override it. `policy` alone can't
     /// carry this — it defaults to `Weighted` indistinguishably from an explicit `weighted`. RESERVED:
@@ -376,24 +377,15 @@ pub(crate) struct PoolCfg {
     pub(crate) base_named: bool,
 }
 
-/// Manual `Deserialize` for [`PoolCfg`] so 1.2.1 config keys become CLEAN-BREAK migration errors
-/// instead of silent surprises: the removed `route:` pool key and the removed `policy:` BLOCK (now a
-/// scalar strategy) each fail loudly with the exact fix. `policy:` parses to a [`PoolPolicy`]
-/// strategy; `hook:` captures the optional gate reference (validated against the registry at startup).
+/// Manual `Deserialize` for [`PoolCfg`] so retired config keys become CLEAN-BREAK migration errors
+/// instead of silent surprises: the removed 1.2.1 `route:` pool key AND the retired transitional
+/// `policy:`/`hook:` pair each fail loudly with the exact fix. `hooks: [...]` is THE pool form —
+/// one list naming an optional ordering strategy and any gates (everything is a hook).
 impl<'de> Deserialize<'de> for PoolCfg {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        // `policy:` is a scalar strategy in 1.3. Distinguish it from the removed 1.2.1 BLOCK form so a
-        // stale `policy: { socket: ... }` gets a migration message, not a bare type error.
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum PolicyField {
-            Strategy(String),
-            LegacyBlock(serde::de::IgnoredAny),
-        }
-
         #[derive(Deserialize)]
         struct RawPoolCfg {
             #[serde(default)]
@@ -406,16 +398,15 @@ impl<'de> Deserialize<'de> for PoolCfg {
             on_exhausted: Option<OnExhaustedCfg>,
             #[serde(default)]
             affinity: Option<AffinityCfg>,
-            /// 1.3 native strategy scalar (weighted|cheapest|fastest|least_busy|usage).
+            /// RETIRED transitional key — captured only to emit a migration error naming the fix.
             #[serde(default)]
-            policy: Option<PolicyField>,
-            /// 1.3 optional gate reference into the top-level `hooks:` registry.
+            policy: Option<serde::de::IgnoredAny>,
+            /// RETIRED transitional key — captured only to emit a migration error naming the fix.
             #[serde(default)]
-            hook: Option<String>,
-            /// 1.3 UNIFIED form (everything-is-a-hook): a pool names the hooks it wants — ordering
-            /// strategies (weighted/cheapest/…) and/or a gate — in ONE list. Desugars into the internal
-            /// (base policy, gate) representation. Transitional twin of `policy:`+`hook:`; setting both
-            /// forms on one pool is an error. This is the form `policy:`/`hook:` collapse INTO.
+            hook: Option<serde::de::IgnoredAny>,
+            /// THE pool form (everything-is-a-hook): a pool names the hooks it wants — an ordering
+            /// strategy (weighted/cheapest/…) and/or gates — in ONE list. Desugars into the internal
+            /// (base policy, gates) representation.
             #[serde(default)]
             hooks: Option<Vec<String>>,
             /// REMOVED in 1.3 — captured only to emit a migration error naming the fix.
@@ -435,30 +426,46 @@ impl<'de> Deserialize<'de> for PoolCfg {
 
         let raw = RawPoolCfg::deserialize(deserializer)?;
 
-        // The `route:` pool key is GONE in 1.3 (its two jobs split into `policy:` + `hook:`; `route`
-        // now means only the HTTP router). Name the fix per legacy value.
+        // The `route:` pool key is GONE in 1.3 (a pool names its hooks in one `hooks: [...]` list;
+        // `route` now means only the HTTP router). Name the fix per legacy value.
         if let Some(route) = raw.route.as_deref() {
             let msg = match route {
                 "weighted" | "cheapest" | "fastest" | "least_busy" | "usage" | "native" => {
-                    "the `route:` pool key was removed in 1.3; the native strategy moved to \
-                     `policy:` — write `policy: <name>` (e.g. `policy: cheapest`)."
+                    "the `route:` pool key was removed in 1.3; a pool names its ordering strategy \
+                     in its `hooks:` list — write `hooks: [<name>]` (e.g. `hooks: [cheapest]`)."
                 }
                 "socket" | "webhook" => {
                     "the `route: socket|webhook` transport was removed in 1.3; define the hook once \
                      under top-level `hooks:` (e.g. `hooks: { my-hook: { kind: gate, socket: ... } }`) \
-                     and reference it with `hook: my-hook`."
+                     and name it in the pool's list: `hooks: [my-hook]`."
                 }
                 "script" => {
                     "route: script (the embedded Rhai transport) was removed in 1.3. Define an \
-                     out-of-process gate under `hooks:` (kind: gate, socket:) and reference it with \
-                     `hook:`. See the 1.2.x -> 1.3 migration guide."
+                     out-of-process gate under top-level `hooks:` (kind: gate, socket:) and name it \
+                     in the pool's `hooks: [...]` list. See the 1.2.x -> 1.3 migration guide."
                 }
                 _ => {
-                    "the `route:` pool key was removed in 1.3. Use `policy:` for the native strategy \
-                     and `hook:` to reference a gate in the top-level `hooks:` registry."
+                    "the `route:` pool key was removed in 1.3. Name the pool's ordering strategy \
+                     and/or gates in its `hooks: [...]` list (definitions live under top-level \
+                     `hooks:`)."
                 }
             };
             return Err(serde::de::Error::custom(msg));
+        }
+
+        // The transitional `policy:`/`hook:` pool keys are RETIRED — `hooks: [...]` is the one form.
+        if raw.policy.is_some() {
+            return Err(serde::de::Error::custom(
+                "the `policy:` pool key was retired in 1.3; a pool names its ordering strategy in \
+                 its `hooks:` list — write `hooks: [<strategy>]` (e.g. `hooks: [cheapest]`).",
+            ));
+        }
+        if raw.hook.is_some() {
+            return Err(serde::de::Error::custom(
+                "the `hook:` pool key was retired in 1.3; name the gate in the pool's `hooks:` \
+                 list — write `hooks: [my-gate]` (an ordering strategy may share the list, e.g. \
+                 `hooks: [cheapest, my-gate]`).",
+            ));
         }
 
         fn parse_strategy<E: serde::de::Error>(name: &str) -> Result<PoolPolicy, E> {
@@ -475,16 +482,8 @@ impl<'de> Deserialize<'de> for PoolCfg {
             }
         }
 
-        // Resolve the internal (base policy, gate) representation from EITHER the unified `hooks: [...]`
-        // list OR the legacy `policy:`+`hook:` pair — never both (ambiguous). The unified form is what
-        // the pair collapses into; the pair stays accepted through the transition.
+        // Resolve the internal (base policy, gates) representation from the `hooks: [...]` list.
         let (policy, gates, base_named) = if let Some(names) = raw.hooks {
-            if raw.policy.is_some() || raw.hook.is_some() {
-                return Err(serde::de::Error::custom(
-                    "a pool sets both `hooks:` and `policy:`/`hook:`; use ONE form — `hooks: [...]` \
-                     names the pool's ordering strategy and/or gate in a single list",
-                ));
-            }
             // Partition the list: ordering strategies set the base ranking; anything else is a gate ref
             // (validated against the registry at startup). At most one strategy (a pool has ONE base
             // ordering); ANY number of gates, keeping list order — that is the phase-2 chain
@@ -510,20 +509,9 @@ impl<'de> Deserialize<'de> for PoolCfg {
             let base_named = policy.is_some();
             (policy.unwrap_or_default(), gates, base_named)
         } else {
-            // Legacy pair. Parse the `policy:` strategy scalar; reject the removed block form.
-            let base_named = raw.policy.is_some();
-            let policy = match raw.policy {
-                None => PoolPolicy::default(),
-                Some(PolicyField::Strategy(name)) => parse_strategy(&name)?,
-                Some(PolicyField::LegacyBlock(_)) => {
-                    return Err(serde::de::Error::custom(
-                        "the `policy:` block was removed in 1.3; `policy:` is now a scalar strategy \
-                         (e.g. `policy: cheapest`). Move a hook's transport/timeout/on_error into a \
-                         named entry under top-level `hooks:` and reference it with `hook:`.",
-                    ));
-                }
-            };
-            (policy, raw.hook.into_iter().collect(), base_named)
+            // No `hooks:` list ⇒ the defaults: weighted-placeholder base (base NOT named, so the
+            // `default:` hook — if registered — becomes the base at resolution), no gates.
+            (PoolPolicy::default(), Vec::new(), false)
         };
 
         Ok(PoolCfg {
@@ -2050,7 +2038,8 @@ models:
         );
     }
 
-    /// The pool `policy:` scalar parses each native strategy; absent defaults to weighted.
+    /// The `hooks: [...]` list parses each native strategy name as the base; absent defaults to
+    /// weighted with base NOT named (so the `default:` hook can replace it at resolution).
     #[test]
     fn test_pool_policy_strategies_parse() {
         for (name, expected) in [
@@ -2060,27 +2049,39 @@ models:
             ("usage", PoolPolicy::Usage),
             ("weighted", PoolPolicy::Weighted),
         ] {
-            let yaml = format!("policy: {name}\nmembers: []\n");
-            let pool: PoolCfg = serde_yaml::from_str(&yaml).expect("policy scalar must parse");
+            let yaml = format!("hooks: [{name}]\nmembers: []\n");
+            let pool: PoolCfg = serde_yaml::from_str(&yaml).expect("strategy name must parse");
             assert_eq!(pool.policy, expected, "{name} must parse to its strategy");
             assert!(pool.gates.is_empty());
-            assert!(pool.base_named, "an explicit policy: names the base");
+            assert!(pool.base_named, "a named strategy names the base");
         }
-        // Absent policy defaults to the zero-cost weighted strategy; base NOT named ⇒ inherits default:
+        // Absent hooks: defaults to the zero-cost weighted strategy; base NOT named ⇒ inherits default:
         let absent: PoolCfg = serde_yaml::from_str("members: []\n").expect("absent parses");
         assert_eq!(absent.policy, PoolPolicy::Weighted);
         assert!(absent.gates.is_empty());
-        assert!(!absent.base_named, "an absent policy did not name the base");
+        assert!(!absent.base_named, "an absent hooks: did not name the base");
     }
 
-    /// A pool `hook:` captures the gate reference verbatim (registry lookup happens at validation).
+    /// RETIRED transitional keys: the `policy:`/`hook:` pool pair each fail with a migration error
+    /// pointing at the `hooks: [...]` list.
     #[test]
-    fn test_pool_hook_reference_parses() {
-        let pool: PoolCfg =
-            serde_yaml::from_str("policy: cheapest\nhook: smart-router\nmembers: []\n")
-                .expect("policy + hook must parse");
-        assert_eq!(pool.policy, PoolPolicy::Cheapest);
-        assert_eq!(pool.gates, ["smart-router"]);
+    fn test_pool_policy_and_hook_keys_retired() {
+        let e = serde_yaml::from_str::<PoolCfg>("policy: cheapest\nmembers: []\n")
+            .expect_err("policy: must be a retirement error");
+        assert!(
+            e.to_string().contains("retired") && e.to_string().contains("hooks: [cheapest]"),
+            "policy: must point at the hooks list — got: {e}"
+        );
+        let e = serde_yaml::from_str::<PoolCfg>("hook: smart-router\nmembers: []\n")
+            .expect_err("hook: must be a retirement error");
+        assert!(
+            e.to_string().contains("retired") && e.to_string().contains("hooks: [my-gate]"),
+            "hook: must point at the hooks list — got: {e}"
+        );
+        // The block form of the retired key errors the same way (IgnoredAny swallows any shape).
+        let e = serde_yaml::from_str::<PoolCfg>("members: []\npolicy:\n  socket: /s\n")
+            .expect_err("policy block must be a retirement error");
+        assert!(e.to_string().contains("retired"), "{e}");
     }
 
     /// The unified `hooks: [...]` pool form desugars into the internal (base policy, gate) rep: an
@@ -2124,13 +2125,14 @@ models:
         assert!(pool.base_named);
     }
 
-    /// Mixing the unified `hooks:` list with the legacy `policy:`/`hook:` pair is an error (pick one).
+    /// The retired keys error even alongside a valid `hooks:` list (the retirement check fires
+    /// before desugar — no silent half-migration).
     #[test]
     fn test_pool_hooks_and_legacy_pair_conflict() {
         let e =
             serde_yaml::from_str::<PoolCfg>("hooks: [cheapest]\npolicy: fastest\nmembers: []\n")
-                .expect_err("both forms must error");
-        assert!(e.to_string().contains("both `hooks:` and"), "{e}");
+                .expect_err("a retired key alongside hooks: must error");
+        assert!(e.to_string().contains("retired"), "{e}");
     }
 
     /// Two ordering strategies in one `hooks:` list is an error (a pool has one base ordering).
@@ -2144,35 +2146,31 @@ models:
         );
     }
 
-    /// An unknown `policy:` strategy fails loudly, naming the bad value.
+    /// Any `policy:` value — known strategy or not — is the same retirement error (the key is gone).
     #[test]
     fn test_pool_policy_unknown_value_errors() {
         let err = serde_yaml::from_str::<PoolCfg>("policy: bogus\nmembers: []\n")
-            .expect_err("unknown policy must be a parse error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("bogus"),
-            "error must name the bad value: {msg}"
-        );
+            .expect_err("the retired policy: key must be a parse error");
+        assert!(err.to_string().contains("retired"), "{err}");
     }
 
-    /// CLEAN-BREAK migration errors: the removed `route:` pool key names its replacement per value,
-    /// and the removed `policy:` BLOCK form (a map) is rejected in favor of the scalar.
+    /// CLEAN-BREAK migration errors: the removed `route:` pool key names its replacement per value —
+    /// every arm points at the `hooks: [...]` pool list.
     #[test]
     fn test_legacy_keys_are_migration_errors() {
-        // route: <native> -> policy:
+        // route: <native> -> hooks: [<name>]
         let e = serde_yaml::from_str::<PoolCfg>("route: cheapest\nmembers: []\n")
             .expect_err("route: <native> must error");
         assert!(
-            e.to_string().contains("policy:"),
-            "route:<native> must point at policy: — got: {e}"
+            e.to_string().contains("hooks: [cheapest]"),
+            "route:<native> must point at the hooks list — got: {e}"
         );
-        // route: socket|webhook -> hooks: registry + hook:
+        // route: socket|webhook -> hooks: registry + pool hooks: [name]
         let e = serde_yaml::from_str::<PoolCfg>("route: socket\nmembers: []\n")
             .expect_err("route: socket must error");
         assert!(
-            e.to_string().contains("hooks:") && e.to_string().contains("hook:"),
-            "route: socket must point at the hooks registry — got: {e}"
+            e.to_string().contains("hooks: [my-hook]"),
+            "route: socket must point at the hooks registry + list — got: {e}"
         );
         // route: script -> gate under hooks:
         let e = serde_yaml::from_str::<PoolCfg>("route: script\nmembers: []\n")
@@ -2180,13 +2178,6 @@ models:
         assert!(
             e.to_string().contains("removed in 1.3"),
             "route: script must name the removal — got: {e}"
-        );
-        // The old policy: BLOCK (a map) is gone; policy: is now a scalar.
-        let e = serde_yaml::from_str::<PoolCfg>("members: []\npolicy:\n  socket: /s\n")
-            .expect_err("policy block must error");
-        assert!(
-            e.to_string().contains("scalar strategy"),
-            "policy: block must point at the scalar form — got: {e}"
         );
     }
 
