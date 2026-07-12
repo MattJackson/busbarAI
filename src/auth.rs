@@ -144,10 +144,10 @@ pub(crate) trait AuthModule: Send + Sync {
     fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome;
 }
 
-// The built-in `tokens` auth module IMPLEMENTATION lives in the `tokens` plugin
-// (`crate::plugins::token`), NOT in the engine core — the engine holds only the `AuthModule`
+// The built-in `tokens` auth module IMPLEMENTATION lives in the `tokens` auth plugin
+// (`crate::plugins::auth::tokens`), NOT in the engine core — the engine holds only the `AuthModule`
 // contract above. `grep token` in the engine is clean; the plugin is default-included and removable.
-use crate::plugins::token::TokensModule;
+use crate::plugins::auth::tokens::TokensModule;
 
 /// AuthMiddleware holds the resolved auth mode and token allowlist.
 pub(crate) struct AuthMiddleware {
