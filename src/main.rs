@@ -309,6 +309,8 @@ async fn main() {
     // First line in the logs: which build is running. Operators need this to confirm a deploy /
     // correlate logs to a release without shelling in to run `--version`.
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "busbar starting");
+    // Stamp process start for the `GET /admin/v1/info` uptime read.
+    admin::mark_start();
 
     // Resolve deployment + definitions into resolved RootCfg
     let cfg = config::resolve(&deploy, &defs)
@@ -1004,13 +1006,28 @@ fn build_router_with_limits(
         .route("/stats", get(endpoints::stats))
         .route("/healthz", get(endpoints::healthz))
         .route("/metrics", get(metrics::handler))
-        // virtual-key management API (admin-token guarded in auth_middleware).
+        // virtual-key management API (admin-token guarded in auth_middleware). The unversioned
+        // `/admin/keys*` routes are the DEPRECATED alias (design-admin-api-v1 §0.1); the canonical
+        // frozen surface is `/admin/v1/*`. Both point at the same handlers today.
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route(
             "/admin/keys/{id}",
             axum::routing::delete(admin::delete_key).patch(admin::update_key),
         )
         .route("/admin/keys/{id}/usage", get(admin::key_usage))
+        // ── Admin API v1 — the FROZEN, additive-only surface tooling/CP build against ──────────────
+        // Keys CRUD is served here on the legacy handlers under the versioned prefix (migration into
+        // the layered service is a follow-up slice); the v1-NATIVE endpoints (`info`, and the config/
+        // hooks/auth surface as it lands) are mounted via the `AdminTransport` adapter below.
+        .route(
+            "/admin/v1/keys",
+            post(admin::create_key).get(admin::list_keys),
+        )
+        .route(
+            "/admin/v1/keys/{id}",
+            axum::routing::delete(admin::delete_key).patch(admin::update_key),
+        )
+        .route("/admin/v1/keys/{id}/usage", get(admin::key_usage))
         // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery, admin,
         // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
@@ -1027,7 +1044,12 @@ fn build_router_with_limits(
         .fallback(route::protocol_dispatch)
         // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
         // treatment as the 404 fallback above.
-        .method_not_allowed_fallback(method_not_allowed_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler);
+    // Mount the Admin API v1 via the ports-and-adapters transport layer (a shared typed service
+    // behind a pluggable wire format). The JSON-REST adapter is the transport today; a GraphQL / MCP /
+    // gRPC adapter later is a one-line swap here over the SAME service.
+    let router = admin::transport::mount(router, &admin::JsonRest, app.clone());
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),
             auth::auth_middleware,

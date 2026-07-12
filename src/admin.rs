@@ -148,6 +148,21 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
     )
 }
 
+// ── Admin API v1 (the FROZEN surface — /admin/v1/*) ──────────────────────────────────────────────
+//
+// v1 is additive-only forever once 1.3 ships. It is built ports-and-adapters (Matthew 7/11): a typed
+// SERVICE + CONTRACT (the frozen operations, views, and stable error `code`s, transport-agnostic) with
+// pluggable TRANSPORT adapters over it. The JSON-REST adapter is the first transport; a GraphQL/gRPC
+// adapter later is a new `AdminTransport` impl calling the SAME service — no logic rewrite. The legacy
+// `/admin/keys` handlers below stay as a deprecated alias with their `{type}` envelope; every
+// `/admin/v1/*` route flows through the layered stack.
+pub(crate) mod contract;
+pub(crate) mod service;
+pub(crate) mod transport;
+
+pub(crate) use service::mark_start;
+pub(crate) use transport::JsonRest;
+
 /// Key metadata for API responses — deliberately omits `key_hash`.
 fn key_meta(k: &VirtualKey) -> Value {
     json!({
@@ -629,6 +644,64 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (addr, handle)
+    }
+
+    /// `GET /admin/v1/info` flows end-to-end through the ports-and-adapters stack (JSON-REST
+    /// transport → service → contract view): admin-token guarded, returns the version, the
+    /// compiled-in plugin proof (with the default build's `tokens`/`ranking` present + the always-on
+    /// `weighted_floor`), and the topology counts. Proves the transport is mounted and the frozen
+    /// v1 surface answers.
+    #[tokio::test]
+    async fn test_admin_v1_info_reports_version_features_and_topology() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+
+        // Wrong token → 401 (the v1 surface is admin-guarded like the rest of /admin).
+        let unauth = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unauth.status().as_u16(),
+            401,
+            "v1/info must be admin-guarded"
+        );
+
+        let resp = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "info must report the build version"
+        );
+        // The default build compiles both removable plugins in; `weighted_floor` is always true.
+        assert_eq!(body["build"]["weighted_floor"], serde_json::json!(true));
+        let auth_modules = body["build"]["auth_modules"].as_array().unwrap();
+        assert!(
+            auth_modules.iter().any(|m| m == "tokens"),
+            "default build has the tokens auth module compiled in: {auth_modules:?}"
+        );
+        let hook_plugins = body["build"]["hook_plugins"].as_array().unwrap();
+        assert!(
+            hook_plugins.iter().any(|m| m == "ranking"),
+            "default build has the ranking hook plugin compiled in: {hook_plugins:?}"
+        );
+        // Topology keys are present and numeric (exact counts depend on the TestApp fixture).
+        assert!(body["topology"]["pools"].is_number());
+        assert!(body["topology"]["models"].is_number());
+        assert!(body["topology"]["providers"].is_number());
+
+        handle.abort();
     }
 
     #[tokio::test]
