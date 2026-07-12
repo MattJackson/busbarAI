@@ -69,11 +69,22 @@ pub(crate) struct HookUser<'a> {
 }
 
 /// One candidate as seen by the hook. `idx` is the stable handle the hook echoes back in `order`;
-/// the rest are the live signals + operator metadata a policy ranks on.
+/// the rest are the live signals + operator metadata a policy ranks on. The contract projects
+/// EVERYTHING a built-in ranking strategy reads, so an external hook can implement any of them
+/// identically ("no hook is different"): `weight` (SWRR), `provider` (provider-preference),
+/// `context_max` (context-fit), plus the cost/latency/concurrency/headroom live signals.
 #[derive(Serialize)]
 pub(crate) struct HookCandidate<'a> {
     pub(crate) idx: usize,
     pub(crate) model: &'a str,
+    /// Upstream provider name — lets a hook prefer/avoid a provider (a provider-preference strategy).
+    pub(crate) provider: &'a str,
+    /// The configured SWRR weight — lets an external hook implement a weighted-variant strategy (the
+    /// signal the built-in `weighted` floor ranks on; projected so the contract is complete).
+    pub(crate) weight: u32,
+    /// Member context-window ceiling — lets a hook route by context-fit. `None` if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) context_max: Option<usize>,
     pub(crate) tier: Option<&'a str>,
     pub(crate) cost_per_mtok: Option<f64>,
     pub(crate) latency_ms: Option<f64>,
@@ -271,6 +282,9 @@ pub(crate) fn build<'a>(
             .map(|c| HookCandidate {
                 idx: c.idx,
                 model: c.model,
+                provider: c.provider,
+                weight: c.weight,
+                context_max: c.context_max,
                 tier: c.tier,
                 cost_per_mtok: c.cost_per_mtok,
                 latency_ms: c.latency_ms,

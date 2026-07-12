@@ -139,16 +139,14 @@ pub(crate) struct Candidate<'a> {
     /// Index into `app.lanes` — the failover loop's lingua franca.
     pub(crate) idx: usize,
     pub(crate) model: &'a str,
-    /// Upstream provider name. RESERVED for the gate/rewrite hook projections (1.3 hooks seam);
-    /// no reader yet.
-    #[allow(dead_code)]
+    /// Upstream provider name. Projected to the hook wire (`HookCandidate.provider`) so a hook can
+    /// implement a provider-preference strategy.
     pub(crate) provider: &'a str,
-    /// The existing SWRR weight (so a policy can fall back to it). RESERVED for the hook seam; no
-    /// reader yet.
-    #[allow(dead_code)]
+    /// The configured SWRR weight. Projected to the hook wire (`HookCandidate.weight`) so an external
+    /// hook can implement a weighted-variant strategy (the signal the built-in `weighted` floor uses).
     pub(crate) weight: u32,
-    /// Member context-window ceiling. RESERVED for the hook seam; no reader yet.
-    #[allow(dead_code)]
+    /// Member context-window ceiling. Projected to the hook wire (`HookCandidate.context_max`) so a
+    /// hook can route by context-fit.
     pub(crate) context_max: Option<usize>,
     // ── operator-declared member metadata (config) ───────────────────────────────────────────────
     pub(crate) tier: Option<&'a str>,
