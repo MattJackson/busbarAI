@@ -1,0 +1,218 @@
+---
+// The Hook Store — a marketing gallery of prebuilt hooks (NOT documentation).
+// Recaps what a hook is, then lists shippable hooks, each linking out to its
+// GitHub repo, with a CTA to submit your own. Uses PageLayout chrome/typography;
+// the card grid + CTA styles are scoped below.
+import PageLayout from '../layouts/PageLayout.astro';
+
+const GITHUB = 'https://github.com/MattJackson/busbarAI';
+
+// One entry per publishable hook. `kind` is tap | gate (the two hook types),
+// `status` gates the badge ('Available' → live repo link; 'Coming soon' →
+// no link yet). Keep copy tight and confident, matching the site voice.
+const hooks = [
+  {
+    name: 'Headroom',
+    kind: 'gate',
+    tagline: 'Context compression, on the path.',
+    body: 'A rewrite gate that trims and compacts a request’s context before it ships — so a long conversation stays under the window without your app rebuilding the prompt. Written once, it works against every protocol and provider Busbar speaks.',
+    repo: `${GITHUB}-headroom`,
+    status: 'Available',
+  },
+  {
+    name: 'Smart Router',
+    kind: 'gate',
+    tagline: 'Route by cost, latency, and live load.',
+    body: 'A routing gate that picks the backend per request from real signals — each member’s cost, latency, live concurrency, and rate headroom — instead of a static weight. The smart router you actually wanted, as a hook you can read and change.',
+    repo: `${GITHUB}`,
+    status: 'Available',
+    note: 'Read the write-up: <a href="/blog/smart-routing-today/">the smart router you want is a hook</a>.',
+  },
+  {
+    name: 'PII Guard',
+    kind: 'gate',
+    tagline: 'Redact sensitive data before it leaves.',
+    body: 'A gate that inspects and rewrites the request body, stripping or masking PII before it reaches any provider. One guard covers every model behind Busbar — the redaction rule lives in one place, not in every app.',
+    repo: null,
+    status: 'Coming soon',
+  },
+  {
+    name: 'SIEM Audit',
+    kind: 'tap',
+    tagline: 'Every call, in your security stack.',
+    body: 'A fire-and-forget tap that streams the full request and response to your SIEM or compliance archive without touching the hop. A complete, provider-agnostic audit trail for every AI call your org makes.',
+    repo: null,
+    status: 'Coming soon',
+  },
+];
+
+const kindLabel = { tap: 'Tap', gate: 'Gate' };
+---
+
+<PageLayout
+  title="Hook Store — prebuilt hooks for Busbar"
+  description="Prebuilt hooks for Busbar: mini-apps that run on the request path. Context compression, smart routing, PII redaction, SIEM audit — write once, run against all six protocols and every provider, with failover underneath. Browse the store or submit your own."
+>
+  <p class="kicker">Hook Store</p>
+  <h1>Prebuilt hooks for Busbar.</h1>
+  <p class="intro">
+    A hook runs on the request path — a <strong>tap</strong> that watches, or a
+    <strong>gate</strong> that decides: reject, restrict, route, or rewrite. Because hooks fire on
+    Busbar’s normalized IR, you write one once and it runs against all six protocols and every
+    provider, with failover and circuit breaking underneath it, in one hop.
+    <strong>Busbar is where your AI middleware runs</strong> — and this is where you pick up the
+    parts already built. Register any of them in a <code>hooks:</code> block or over the admin API.
+  </p>
+
+  <h2>In the store</h2>
+  <div class="hook-store">
+    {hooks.map((h) => (
+      <article class:list={['store-card', { 'is-soon': h.status !== 'Available' }]}>
+        <div class="store-head">
+          <span class:list={['store-kind', `kind-${h.kind}`]}>{kindLabel[h.kind]}</span>
+          <span class:list={['store-status', { 'status-soon': h.status !== 'Available' }]}>{h.status}</span>
+        </div>
+        <h3>{h.name}</h3>
+        <p class="store-tag">{h.tagline}</p>
+        <p class="store-body">{h.body}</p>
+        {h.note && <p class="store-note" set:html={h.note} />}
+        <div class="store-foot">
+          {h.repo
+            ? <a class="store-link" href={h.repo} target="_blank" rel="noopener">View on GitHub →</a>
+            : <span class="store-link store-link-off">Repo coming soon</span>}
+        </div>
+      </article>
+    ))}
+  </div>
+
+  <h2>Add yours to the store</h2>
+  <p>
+    Built a hook worth sharing — a guardrail, a router, an audit sink, something we haven’t thought
+    of? We’ll list it here and link straight to your repo. Tell us what it does and where it lives.
+  </p>
+  <div class="store-cta">
+    <a class="cta-btn" href="mailto:hello@getbusbar.com?subject=Hook%20for%20the%20store">Email hello@getbusbar.com</a>
+    <span class="cta-aside">or open a PR against <a href={GITHUB} target="_blank" rel="noopener">the repo</a>.</span>
+  </div>
+
+  <p class="note">
+    New to hooks? Start with <a href="/docs/hooks/">the hooks docs</a> for the config shape, the
+    tap/gate lifecycle, and how a hook falls back safely without ever blocking a request.
+  </p>
+
+  <style is:global>
+    /* HOOK STORE — a card gallery scoped to this page. Reuses the site's lime/navy
+       palette and card feel (borders, hover lift) from the homepage .feature cards. */
+    .hook-store {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 18px;
+      margin: 0 0 12px;
+    }
+    .store-card {
+      display: flex;
+      flex-direction: column;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 22px 22px 20px;
+      transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+    }
+    .store-card:hover {
+      border-color: #cbd5e1;
+      box-shadow: 0 12px 30px -14px rgba(15, 23, 42, 0.16);
+      transform: translateY(-2px);
+    }
+    .store-card.is-soon { background: var(--bg-soft); }
+    .store-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .store-kind {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      border-radius: 6px;
+      padding: 3px 9px;
+    }
+    .kind-tap { color: var(--charcoal); background: #f1f5f9; border: 1px solid var(--line); }
+    .kind-gate { color: #365314; background: var(--lime); }
+    .store-status {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #4d7c0f;
+    }
+    .store-status.status-soon { color: var(--muted); }
+    .store-card h3 {
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--slate);
+      margin: 0 0 6px;
+    }
+    .store-tag {
+      font-size: 14px;
+      font-weight: 600;
+      color: #4d7c0f;
+      margin: 0 0 12px;
+      line-height: 1.4;
+    }
+    .store-body {
+      font-size: 14.5px;
+      color: #475569;
+      line-height: 1.65;
+      margin: 0;
+    }
+    .store-note {
+      font-size: 13.5px;
+      color: var(--charcoal);
+      line-height: 1.6;
+      margin: 12px 0 0;
+    }
+    .store-foot {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .store-link {
+      font-size: 14px;
+      font-weight: 700;
+      color: #4d7c0f;
+      text-decoration: none;
+    }
+    .store-link:hover { color: var(--slate); }
+    .store-link-off { color: var(--muted-d); font-weight: 600; cursor: default; }
+
+    /* Submit CTA */
+    .store-cta {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin: 4px 0 24px;
+    }
+    .cta-btn {
+      display: inline-flex;
+      align-items: center;
+      background: var(--slate);
+      color: #fff !important;
+      font-weight: 600;
+      font-size: 15px;
+      padding: 11px 20px;
+      border-radius: 9px;
+      border: 1px solid var(--slate);
+      text-decoration: none !important;
+      transition: transform 0.12s ease, box-shadow 0.15s ease;
+    }
+    .cta-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 22px rgba(15, 23, 42, 0.18); color: #fff !important; }
+    .cta-aside { font-size: 14.5px; color: var(--muted); }
+
+    @media (max-width: 640px) {
+      .hook-store { grid-template-columns: 1fr; }
+    }
+  </style>
+</PageLayout>

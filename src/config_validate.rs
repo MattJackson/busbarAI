@@ -703,6 +703,15 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                  never replies). Use `kind: gate`, or lower to `prompt: ro`."
             ));
         }
+        // `default: true` marks the hook as a pool's base ORDERING — but a tap is fire-and-forget and
+        // never replies, so it can never order. A default tap is meaningless; reject it (the base
+        // must be an ordering gate, or the compiled-in backstop).
+        if hook.default && hook.kind == crate::config::HookKind::Tap {
+            errors.push(format!(
+                "hook '{hook_name}' is a tap with `default: true`, but a tap cannot be a pool's base \
+                 ordering (it never replies). Only a gate can be the default."
+            ));
+        }
     }
 
     // Rule (hooks/reserved-names): a hook in ANY layer (base config, and — once the admin API can
@@ -4188,6 +4197,34 @@ models:
                 "a single default must not trip the at-most-one rule; got: {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_hook_default_on_tap_rejected() {
+        // `default: true` on a tap is meaningless (a tap never orders) → boot error.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        let mut tap = gate_hook(Some("/run/busbar/t.sock"), None, 150);
+        tap.kind = config::HookKind::Tap;
+        tap.default = true;
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert("watcher".to_string(), tap);
+        let errs = validate(&cfg).expect_err("default tap must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("watcher") && e.contains("default") && e.contains("tap")),
+            "error must name the default tap; got: {errs:?}"
+        );
     }
 
     #[test]

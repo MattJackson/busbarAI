@@ -57,8 +57,8 @@ const features = [
 const hooks = [
   {
     title: 'Tap: watch every request',
-    body: 'Prometheus metrics and OTLP traces are already built in. A tap is for the rest: fire-and-forget observers that see the full request and response and send it wherever you need — your SIEM, a compliance archive, a custom audit trail. It runs alongside the request, so nothing waits on it.',
-    enables: 'Feed your own SIEM or audit store off every call, across every provider, without touching the request path.',
+    body: 'Fire-and-forget observers on the path. A tap sees the full request and response and never blocks the hop — feed a SIEM, a compliance archive, custom alerting, and more. It runs alongside the request, so nothing waits on it.',
+    enables: 'A SIEM feed or compliance archive that sees every call, across every provider, from one place.',
   },
   {
     title: 'Gate: decide on the path',
