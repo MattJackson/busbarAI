@@ -64,19 +64,19 @@ pub(crate) struct RoutingRequest<'a> {
     pub(crate) system_chars: usize,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
-    /// The request's prompt content — `Some` ONLY when the pool opted in via `policy.send_prompt`
-    /// (default off). The default projection is shape-only; this is the operator-gated exception
-    /// that lets a trusted hook screen content (PII, guardrails, audit). Borrows from the parsed
-    /// body where it can (bare-string content); only block-array flattening allocates, and that
-    /// cost is paid only behind the opt-in.
+    /// The request's prompt content — `Some` ONLY when the hook was granted `prompt: ro` or `rw`
+    /// (default `no`). The default projection is shape-only; this is the operator-granted exception
+    /// that lets a trusted hook screen content (PII, guardrails, audit) or rewrite it (`rw`). Borrows
+    /// from the parsed body where it can (bare-string content); only block-array flattening
+    /// allocates, and that cost is paid only behind the grant.
     pub(crate) prompt: Option<PromptProjection<'a>>,
-    /// Caller identity — `Some` ONLY when the pool opted in via `policy.send_user` (default off).
-    /// Carries the governance virtual-key `id`/`name` and the body's end-user field. NEVER the
-    /// caller's secret/token, regardless of configuration.
+    /// Caller identity — `Some` ONLY when the hook was granted `user: ro` (default `no`). Carries the
+    /// governance virtual-key `id`/`name` and the body's end-user field. NEVER the caller's
+    /// secret/token, regardless of configuration.
     pub(crate) identity: Option<CallerIdentity>,
 }
 
-/// The opt-in prompt content projection (`policy.send_prompt: true`). Text only: string content and
+/// The prompt content projection (the hook's `prompt: ro|rw` grant). Text only: string content and
 /// `{type:"text"}` blocks are flattened; non-text blocks (images, tool results) contribute no text
 /// (the payload carries text, not binary blobs), but their message entries remain — with empty
 /// text — so the projection stays index-aligned with the body's messages. `Cow`: bare-string
@@ -105,7 +105,7 @@ impl std::fmt::Debug for PromptProjection<'_> {
     }
 }
 
-/// The opt-in caller identity projection (`policy.send_user: true`). By construction this can never
+/// The caller identity projection (the hook's `user: ro` grant). By construction this can never
 /// carry a secret: the governance lookup resolves the token to its key record and only the record's
 /// `id`/`name` are projected.
 #[derive(Clone)]
@@ -207,7 +207,7 @@ pub(crate) enum RoutingDecision {
     /// being configured. A timeout / error / malformed response is coerced to this (per `on_error`).
     Abstain,
     /// REJECT the request: no upstream is dispatched and the caller receives a dialect-native error.
-    /// The verb that makes content-seeing hooks (`policy.send_prompt`) useful — a PII screen or
+    /// The verb that makes content-seeing hooks (`prompt: ro`/`rw`) useful — a PII screen or
     /// guardrail can stop a request before it leaves the network. The shipped transports produce
     /// this only via `wire::normalize` (status clamped to 4xx, message sanitized), and the forward
     /// seam RE-CLAMPS the status regardless — so no policy impl, shipped or future, can mint a
@@ -270,9 +270,11 @@ pub(crate) enum ResolvedPolicy {
         policy: Arc<dyn RoutingPolicy>,
         on_error: crate::config::PolicyOnError,
         timeout: std::time::Duration,
-        /// `policy.send_prompt` — build + send the prompt content projection (default false).
+        /// Derived from the hook's `prompt` grant (`ro`/`rw`) — build + send the prompt content
+        /// projection (default false, i.e. `prompt: no`).
         send_prompt: bool,
-        /// `policy.send_user` — build + send the caller identity projection (default false).
+        /// Derived from the hook's `user` grant (`ro`) — build + send the caller identity projection
+        /// (default false, i.e. `user: no`).
         send_user: bool,
         /// Gate `on_empty` — behavior when a `restrict` reply leaves an EMPTY candidate intersection.
         /// Default `Reject` (fail-closed; the spec default for a compliance restrict); `Weighted`
