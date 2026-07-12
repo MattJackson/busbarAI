@@ -1123,6 +1123,62 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/openapi.json` returns a valid OpenAPI 3.1 doc, and — the DRIFT GUARD — every GET
+    /// path it documents (from V1_GET_PATHS) actually resolves on the live router (never a phantom
+    /// endpoint in the discovery contract). Also asserts the stable error `code` enum is present.
+    #[tokio::test]
+    async fn test_admin_v1_openapi_paths_all_resolve() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let doc: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/openapi.json"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert_eq!(doc["info"]["title"], "Busbar Admin API");
+        // The stable error code enum is documented.
+        let codes = doc["components"]["schemas"]["Error"]["properties"]["error"]["properties"]
+            ["code"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(codes.iter().any(|c| c == "not_found"));
+
+        // DRIFT GUARD: every documented GET path is both listed in the doc AND actually mounted.
+        for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
+            assert!(
+                doc["paths"][path]["get"].is_object(),
+                "documented path {path} missing from openapi doc"
+            );
+            let status = client
+                .get(format!("http://{addr}{path}"))
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_ne!(
+                status.as_u16(),
+                404,
+                "openapi documents {path} but the router does not mount it (phantom endpoint)"
+            );
+        }
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

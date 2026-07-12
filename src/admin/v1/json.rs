@@ -47,6 +47,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/auth", get(get_auth))
             .route("/admin/v1/config", get(get_config))
             .route("/admin/v1/config/validate", post(validate_config))
+            .route("/admin/v1/openapi.json", get(openapi))
             .layer(Extension(service))
     }
 }
@@ -140,6 +141,126 @@ async fn get_auth(Extension(service): Extension<Arc<AdminService>>) -> Response 
 /// `GET /admin/v1/config` — the effective running config snapshot (redacted; no secrets).
 async fn get_config(Extension(service): Extension<Arc<AdminService>>) -> Response {
     respond(StatusCode::OK, service.get_config().await)
+}
+
+/// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
+/// test and the OpenAPI `paths`. Templated/POST routes are documented separately in `openapi_doc`.
+/// Adding a GET endpoint means adding it here so the doc + the drift guard both see it.
+pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
+    (
+        "/admin/v1/info",
+        "Version, compiled-in plugin proof, uptime, topology",
+    ),
+    ("/admin/v1/pools", "Pool topology (members + weights)"),
+    ("/admin/v1/models", "Model lanes + upstream providers"),
+    ("/admin/v1/providers", "Distinct providers + lane counts"),
+    ("/admin/v1/hooks", "Hook registry (definitions)"),
+    (
+        "/admin/v1/plugins",
+        "Plugin catalog by type (compiled-in + external)",
+    ),
+    (
+        "/admin/v1/auth",
+        "Ingress auth chain + upstream-credential mode",
+    ),
+    (
+        "/admin/v1/config",
+        "Effective running config snapshot (redacted)",
+    ),
+    ("/admin/v1/openapi.json", "This OpenAPI 3.1 document"),
+];
+
+/// Build the OpenAPI 3.1 document describing the v1 JSON-REST surface. Paths + methods + the stable
+/// error envelope are the machine-readable contract (tooling generates clients + branches on the error
+/// `code`). Response bodies are described loosely (not full struct schemas) today — the additive
+/// follow-up derives per-view schemas; paths/methods/error shape are the frozen part callers rely on.
+fn openapi_doc() -> serde_json::Value {
+    let mut paths = serde_json::Map::new();
+    for (path, summary) in V1_GET_PATHS {
+        paths.insert(
+            (*path).to_string(),
+            json!({
+                "get": {
+                    "summary": summary,
+                    "security": [{"adminToken": []}],
+                    "responses": {
+                        "200": {"description": "OK"},
+                        "401": {"description": "Missing/invalid admin credential"}
+                    }
+                }
+            }),
+        );
+    }
+    // Templated + non-GET routes.
+    paths.insert(
+        "/admin/v1/hooks/{name}".to_string(),
+        json!({
+            "get": {
+                "summary": "One hook definition",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/config/validate".to_string(),
+        json!({
+            "post": {
+                "summary": "Dry-run validate a proposed config",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "Verdict `{ok, errors}` (even for an invalid config)"},
+                    "400": {"description": "Malformed request body (error code `invalid_request`)"}
+                }
+            }
+        }),
+    );
+
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Busbar Admin API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "The frozen, additive-only /admin/v1 surface. Errors use the stable \
+                            envelope {\"error\":{\"code\",\"message\"}}; tooling branches on `code`."
+        },
+        "components": {
+            "securitySchemes": {
+                "adminToken": {"type": "apiKey", "in": "header", "name": "x-admin-token"}
+            },
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "properties": {
+                        "error": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "string",
+                                    "enum": ["not_found", "forbidden", "invalid_request",
+                                             "conflict", "internal"]},
+                                "message": {"type": "string"}
+                            },
+                            "required": ["code", "message"]
+                        }
+                    },
+                    "required": ["error"]
+                }
+            }
+        },
+        "paths": paths
+    })
+}
+
+/// `GET /admin/v1/openapi.json` — the OpenAPI 3.1 schema of the v1 surface (the discovery contract).
+async fn openapi() -> Response {
+    ok_json(StatusCode::OK, &openapi_doc())
 }
 
 /// The `POST /admin/v1/config/validate` request body: a full proposed config — the `config.yaml`
