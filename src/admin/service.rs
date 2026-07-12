@@ -14,8 +14,8 @@ use std::sync::Arc;
 use crate::state::App;
 
 use super::contract::{
-    AdminError, BuildInfo, HookTransportView, HookView, InfoView, ModelView, Page, PluginView,
-    PoolMemberView, PoolView, ProviderView, TopologyInfo,
+    AdminError, AuthView, BuildInfo, HookTransportView, HookView, InfoView, ModelView, Page,
+    PluginView, PoolMemberView, PoolView, ProviderView, TopologyInfo,
 };
 use crate::config::{HookCfg, HookKind, HookStage, PolicyOnError, PromptAccess, UserAccess};
 
@@ -239,6 +239,20 @@ impl AdminService {
             }
         }
         Ok(Page::single(plugins))
+    }
+
+    /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode. Read scope. Never a
+    /// secret: only module names and the mode. The mutation half (`PUT /admin/v1/auth`, with the
+    /// anti-self-lockout guard) lands with the config-plane write path.
+    pub(crate) async fn get_auth(&self) -> Result<AuthView, AdminError> {
+        Ok(AuthView {
+            chain: self.app.auth.chain_names(),
+            upstream_credentials: match self.app.upstream_creds() {
+                crate::auth::UpstreamCreds::Own => "own",
+                crate::auth::UpstreamCreds::Passthrough => "passthrough",
+            },
+            open: self.app.auth.is_open(),
+        })
     }
 
     /// Project a registry `HookCfg` into the wire `HookView`. `global` is true when the hook is named

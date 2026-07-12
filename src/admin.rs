@@ -941,6 +941,38 @@ mod tests {
         handle.abort();
     }
 
+    /// `GET /admin/v1/auth` reports the ingress chain + upstream-credential mode, never a secret. A
+    /// governance-only fixture (no explicit auth chain) is the open front door.
+    #[tokio::test]
+    async fn test_admin_v1_auth_read() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/auth"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(body["chain"].is_array());
+        assert_eq!(body["open"], true, "no explicit chain → open front door");
+        assert_eq!(body["upstream_credentials"], "own");
+        // Sanity: no secret-looking field leaked.
+        assert!(body.get("client_tokens").is_none());
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_reads() {
         // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key

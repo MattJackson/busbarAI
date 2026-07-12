@@ -236,6 +236,20 @@ pub(crate) struct PluginView {
     pub(crate) target: Option<String>,
 }
 
+/// The ingress auth chain read (`GET /admin/v1/auth`): the ordered module names that authenticate
+/// callers + the upstream-credential mode. Never a secret — module names and the mode are config
+/// identifiers, not credentials. An empty `chain` is the open front door (admits every request).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AuthView {
+    /// Ordered auth-chain module names (`[]` = open front door).
+    pub(crate) chain: Vec<&'static str>,
+    /// `"own"` (busbar signs egress with its configured key) or `"passthrough"` (forward the caller's
+    /// credential upstream).
+    pub(crate) upstream_credentials: &'static str,
+    /// Whether the front door is open (empty chain admits unconditionally).
+    pub(crate) open: bool,
+}
+
 /// A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
 /// (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
 #[derive(Debug, Clone, Serialize)]

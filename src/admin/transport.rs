@@ -58,6 +58,7 @@ impl AdminTransport for JsonRest {
             .route("/admin/v1/hooks", get(list_hooks))
             .route("/admin/v1/hooks/{name}", get(get_hook))
             .route("/admin/v1/plugins", get(list_plugins))
+            .route("/admin/v1/auth", get(get_auth))
             .layer(axum::Extension(service))
     }
 }
@@ -137,6 +138,11 @@ async fn list_plugins(
 ) -> Response {
     let ptype = q.get("type").map(String::as_str).unwrap_or("");
     respond(StatusCode::OK, service.list_plugins(ptype).await)
+}
+
+/// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode (no secrets).
+async fn get_auth(axum::Extension(service): axum::Extension<Arc<AdminService>>) -> Response {
+    respond(StatusCode::OK, service.get_auth().await)
 }
 
 /// Mount the admin v1 surface onto `router` using the given transport over the shared `App`. Called
