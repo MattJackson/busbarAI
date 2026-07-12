@@ -6,10 +6,8 @@
 //! `GovState` cache. Responses never include a key's `key_hash`; the plaintext secret is returned
 //! exactly once, on creation.
 
-use std::sync::Arc;
-
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Deserializer};
@@ -33,7 +31,6 @@ where
 }
 
 use crate::governance::{NewKeySpec, VirtualKey};
-use crate::state::App;
 
 /// Process-wide gate serializing the existence-sensitive critical sections of the key store.
 ///
@@ -215,7 +212,10 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
 }
 
 /// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
-pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Response {
+pub(crate) async fn create_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    body: Bytes,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -392,7 +392,7 @@ struct UpdateKeyReq {
 /// is kept at create-parity: a negative budget or a zero rate cap is a 400, exactly as `create_key`
 /// rejects them — otherwise PATCH would be a back door around those guards. 404 if the key is absent.
 pub(crate) async fn update_key(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(id): Path<String>,
     body: Bytes,
 ) -> Response {
@@ -481,7 +481,7 @@ pub(crate) async fn update_key(
 }
 
 /// GET /admin/keys — list key metadata (no secrets/hashes).
-pub(crate) async fn list_keys(State(app): State<Arc<App>>) -> Response {
+pub(crate) async fn list_keys(crate::state::CurrentApp(app): crate::state::CurrentApp) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -501,7 +501,10 @@ pub(crate) async fn list_keys(State(app): State<Arc<App>>) -> Response {
 /// secret or key_hash). 404 when no key with `id` exists. Fills the single-key read gap in the key
 /// surface (design-admin-api-v1 §2.1); it stays on the legacy `{type}` envelope + `key_meta` shape so
 /// it is consistent with the sibling key routes (the full `{code}`-envelope migration is a follow-up).
-pub(crate) async fn get_key(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+pub(crate) async fn get_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    Path(id): Path<String>,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -526,7 +529,10 @@ pub(crate) async fn get_key(State(app): State<Arc<App>>, Path(id): Path<String>)
 }
 
 /// GET /admin/keys/:id/usage — current-window usage counters.
-pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+pub(crate) async fn key_usage(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    Path(id): Path<String>,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -551,7 +557,10 @@ pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String
 /// DELETE /admin/keys/:id — revoke a key. Returns 404 when no key with `id` exists (REST/OpenAPI
 /// contract), so a typo'd or already-deleted id is distinguishable from an actual revocation rather
 /// than masquerading as a spurious 200.
-pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+pub(crate) async fn delete_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    Path(id): Path<String>,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -2212,7 +2221,7 @@ mod tests {
                     })
                     .to_string(),
                 );
-                let r1 = super::create_key(axum::extract::State(app.clone()), body1).await;
+                let r1 = super::create_key(crate::state::CurrentApp(app.clone()), body1).await;
                 let s1 = r1.status().as_u16();
 
                 // Request 2: references ONLY the configured pool — no warning expected.
@@ -2223,7 +2232,7 @@ mod tests {
                     })
                     .to_string(),
                 );
-                let r2 = super::create_key(axum::extract::State(app), body2).await;
+                let r2 = super::create_key(crate::state::CurrentApp(app), body2).await;
                 let s2 = r2.status().as_u16();
                 (s1, s2)
             })

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use axum::{
     body::Bytes,
-    extract::{OriginalUri, Path, State},
+    extract::{OriginalUri, Path},
     http::{HeaderMap, StatusCode},
     response::Response,
 };
@@ -646,7 +646,7 @@ pub(crate) use dispatch::operation_ingress;
 // envelope so the failure mode is at least Gemini-shaped.
 #[tracing::instrument(name = "gemini_ingress", skip_all)]
 pub(crate) async fn gemini_ingress(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(rest): Path<String>,
     OriginalUri(uri): OriginalUri,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
@@ -901,7 +901,7 @@ fn query_has_alt_sse(query: &str) -> bool {
 // stream=false.
 #[tracing::instrument(name = "bedrock_converse", skip_all)]
 pub(crate) async fn bedrock_converse(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(model_id): Path<String>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
@@ -928,7 +928,7 @@ pub(crate) async fn bedrock_converse(
 // ConverseStream.
 #[tracing::instrument(name = "bedrock_converse_stream", skip_all)]
 pub(crate) async fn bedrock_converse_stream(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(model_id): Path<String>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
@@ -1009,7 +1009,7 @@ fn percent_decode(s: &str) -> String {
 // POST /<name>/v1/messages   — name resolves to a pool (weighted) or a single model
 #[tracing::instrument(name = "named", skip_all, fields(pool = %name))]
 pub(crate) async fn named(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(name): Path<String>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,
@@ -1112,7 +1112,7 @@ pub(crate) async fn named(
 // POST /<provider>/<model>/v1/messages — ad-hoc direct
 #[tracing::instrument(name = "adhoc", skip_all, fields(provider = %provider, model = %model))]
 pub(crate) async fn adhoc(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path((provider, model)): Path<(String, String)>,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
     axum::extract::Extension(caller): axum::extract::Extension<crate::auth::CallerToken>,

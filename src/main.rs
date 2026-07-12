@@ -1055,9 +1055,13 @@ fn build_router_with_limits(
     // behind a pluggable wire format). The JSON-REST adapter is the transport today; a GraphQL / MCP /
     // gRPC adapter later is a one-line swap here over the SAME service.
     let router = admin::transport::mount(router, &admin::JsonV1, app.clone());
+    // The router's state is a swappable `AppHandle` (the config-apply hot-swap seam). Every handler
+    // reads the CURRENT snapshot via the `CurrentApp` extractor; the auth middleware loads it too.
+    // Until an admin apply calls `swap()`, this is behaviorally identical to a fixed `Arc<App>`.
+    let handle = std::sync::Arc::new(state::AppHandle::new(app));
     let router = router
         .layer(axum::middleware::from_fn_with_state(
-            app.clone(),
+            handle.clone(),
             auth::auth_middleware,
         ))
         // Cap request body size (buffered before the handler) to bound per-request memory. Driven by
@@ -1078,7 +1082,7 @@ fn build_router_with_limits(
             emit_server_timing,
             server_timing,
         ))
-        .with_state(app);
+        .with_state(handle);
 
     apply_inbound_concurrency_limit(router, max_inbound_concurrent)
 }

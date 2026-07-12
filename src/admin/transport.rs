@@ -19,7 +19,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::v1::service::AdminService;
-use crate::state::App;
+use crate::state::{App, AppHandle};
 
 /// The port a wire format implements to expose the admin surface. All state is the shared service; an
 /// adapter is otherwise a zero-sized strategy. `name()` labels the transport for logs/negotiation
@@ -28,18 +28,20 @@ pub(crate) trait AdminTransport {
     /// The stable wire name of this transport+version (`"json/v1"`, `"graphql/v1"`, `"mcp/v1"`, …).
     fn name(&self) -> &'static str;
 
-    /// Build the router exposing this transport's endpoints, all backed by the shared service.
-    fn router(&self, service: Arc<AdminService>) -> Router<Arc<App>>;
+    /// Build the router exposing this transport's endpoints, all backed by the shared service. The
+    /// state type is `Arc<AppHandle>` (the hot-swap seam) only so this router merges into the main one;
+    /// admin handlers pull the service from an extension layer and are agnostic to the state type.
+    fn router(&self, service: Arc<AdminService>) -> Router<Arc<AppHandle>>;
 }
 
 /// Mount an admin transport onto `router` over the shared `App`. Called from `main` once the `App` is
 /// built. Keeping this a free function (not inline in `main`) means swapping/adding a transport — or a
 /// new API version — is a one-line change at the call site.
 pub(crate) fn mount<T: AdminTransport>(
-    router: Router<Arc<App>>,
+    router: Router<Arc<AppHandle>>,
     transport: &T,
     app: Arc<App>,
-) -> Router<Arc<App>> {
+) -> Router<Arc<AppHandle>> {
     let service = Arc::new(AdminService::new(app));
     tracing::info!(transport = transport.name(), "admin API transport mounted");
     router.merge(transport.router(service))

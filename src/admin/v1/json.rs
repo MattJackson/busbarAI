@@ -21,7 +21,7 @@ use serde_json::json;
 use super::contract::AdminError;
 use super::service::AdminService;
 use crate::admin::transport::AdminTransport;
-use crate::state::App;
+use crate::state::AppHandle;
 
 /// The JSON-REST adapter for v1: the `/admin/v1/*` resource API with the stable
 /// `{"error":{"code","message"}}` envelope (design-admin-api-v1 §0.3). Zero-sized — every request
@@ -33,7 +33,7 @@ impl AdminTransport for JsonV1 {
         "json/v1"
     }
 
-    fn router(&self, service: Arc<AdminService>) -> Router<Arc<App>> {
+    fn router(&self, service: Arc<AdminService>) -> Router<Arc<AppHandle>> {
         // The service is shared across every route via an extension layer. Routes stay declarative;
         // each handler pulls `Arc<AdminService>` and maps the typed result onto the JSON wire.
         Router::new()

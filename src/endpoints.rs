@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
@@ -24,7 +23,7 @@ use crate::state::{now, App};
 /// `GovCtx`) means "all pools", so those callers see the full topology exactly as before: this
 /// preserves today's operator/admin behavior.
 pub(crate) async fn stats(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Extension(gov): Extension<GovCtx>,
 ) -> Response {
     let t = now();
@@ -114,7 +113,7 @@ pub(crate) async fn stats(
 /// `allowed_pools` sees only its visible pools and the models reachable through them —
 /// the model list must not leak topology the pool ACL hides.
 pub(crate) async fn list_models(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Extension(gov): Extension<GovCtx>,
     headers: axum::http::HeaderMap,
 ) -> Response {
@@ -123,7 +122,7 @@ pub(crate) async fn list_models(
 
 /// `GET /v1beta/models` — the same list in Gemini's dialect (their SDK's discovery path).
 pub(crate) async fn list_models_v1beta(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Extension(gov): Extension<GovCtx>,
     headers: axum::http::HeaderMap,
 ) -> Response {
@@ -234,7 +233,7 @@ fn list_models_dialect(
     Json(json!({ "object": "list", "data": data })).into_response()
 }
 
-pub(crate) async fn healthz(State(app): State<Arc<App>>) -> Response {
+pub(crate) async fn healthz(crate::state::CurrentApp(app): crate::state::CurrentApp) -> Response {
     let t = now();
     // Side-effect-FREE readiness check: `/healthz` is unauthenticated and high-frequency (k8s
     // liveness, load balancers), so it must NOT transition expired-Open lanes to HalfOpen or steal
@@ -297,7 +296,7 @@ mod tests {
     }
 
     async fn stats_json(app: Arc<App>, gov: GovCtx) -> Value {
-        let resp = stats(State(app), Extension(gov)).await;
+        let resp = stats(crate::state::CurrentApp(app), Extension(gov)).await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect /stats body");
@@ -367,7 +366,12 @@ mod tests {
     }
 
     async fn models_ids(app: Arc<App>, gov: GovCtx) -> Vec<String> {
-        let resp = list_models(State(app), Extension(gov), axum::http::HeaderMap::new()).await;
+        let resp = list_models(
+            crate::state::CurrentApp(app),
+            Extension(gov),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("collect /v1/models body");
@@ -427,9 +431,19 @@ mod tests {
 
     async fn models_body(app: Arc<App>, headers: axum::http::HeaderMap, beta: bool) -> Value {
         let resp = if beta {
-            list_models_v1beta(State(app), Extension(GovCtx::default()), headers).await
+            list_models_v1beta(
+                crate::state::CurrentApp(app),
+                Extension(GovCtx::default()),
+                headers,
+            )
+            .await
         } else {
-            list_models(State(app), Extension(GovCtx::default()), headers).await
+            list_models(
+                crate::state::CurrentApp(app),
+                Extension(GovCtx::default()),
+                headers,
+            )
+            .await
         };
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

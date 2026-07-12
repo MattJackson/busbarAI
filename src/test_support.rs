@@ -5410,7 +5410,7 @@ mod tests {
 
         // Attacker-chosen provider/model that isn't configured → 404, no upstream reached.
         let resp = route::adhoc(
-            State(app.clone()),
+            crate::state::CurrentApp(app.clone()),
             axum::extract::Path(("evil.example.com".to_string(), "../secret".to_string())),
             axum::extract::Extension(crate::governance::GovCtx::default()),
             axum::extract::Extension(crate::auth::CallerToken::default()),
@@ -5425,7 +5425,7 @@ mod tests {
 
         // Configured model but WRONG provider → 400 (must match the lane's provider).
         let resp2 = route::adhoc(
-            State(app),
+            crate::state::CurrentApp(app),
             axum::extract::Path(("wrong-provider".to_string(), "test-model".to_string())),
             axum::extract::Extension(crate::governance::GovCtx::default()),
             axum::extract::Extension(crate::auth::CallerToken::default()),

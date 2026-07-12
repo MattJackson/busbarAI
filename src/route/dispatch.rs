@@ -269,7 +269,7 @@ pub(crate) async fn operation_resolved(
 /// every operation → `operation_ingress` (the universal core). Unknown paths/methods keep the
 /// pre-collapse fallback shaping (native 404/405 envelopes, no proxy tells).
 pub(crate) async fn protocol_dispatch(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     OriginalUri(uri): OriginalUri,
     method: axum::http::Method,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
@@ -321,7 +321,7 @@ pub(crate) async fn protocol_dispatch(
             let rest =
                 crate::observability::percent_decode(path.split("/models/").nth(1).unwrap_or(""));
             gemini_ingress(
-                State(app),
+                crate::state::CurrentApp(app),
                 Path(rest),
                 OriginalUri(uri),
                 axum::extract::Extension(gov),
@@ -339,7 +339,7 @@ pub(crate) async fn protocol_dispatch(
                 .unwrap_or_default();
             if path.ends_with("/converse") {
                 bedrock_converse(
-                    State(app),
+                    crate::state::CurrentApp(app),
                     Path(model),
                     axum::extract::Extension(gov),
                     axum::extract::Extension(caller),
@@ -349,7 +349,7 @@ pub(crate) async fn protocol_dispatch(
                 .await
             } else if path.ends_with("/converse-stream") {
                 bedrock_converse_stream(
-                    State(app),
+                    crate::state::CurrentApp(app),
                     Path(model),
                     axum::extract::Extension(gov),
                     axum::extract::Extension(caller),
@@ -359,7 +359,7 @@ pub(crate) async fn protocol_dispatch(
                 .await
             } else if path.ends_with("/invoke") {
                 bedrock_invoke(
-                    State(app),
+                    crate::state::CurrentApp(app),
                     Path(model),
                     OriginalUri(uri),
                     axum::extract::Extension(gov),
@@ -406,7 +406,7 @@ pub(crate) async fn protocol_dispatch(
 /// bedrock RequestHandler reads the BODY and decides the operation (`textToImageParams` ⇒ image,
 /// `inputText` ⇒ embeddings). An unrecognized body is a clean 400 in the Bedrock dialect.
 pub(crate) async fn bedrock_invoke(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(model_id): Path<String>,
     OriginalUri(uri): OriginalUri,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,

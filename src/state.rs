@@ -173,3 +173,67 @@ impl App {
         self.auth.upstream_creds
     }
 }
+
+/// A swappable handle to the current `App` snapshot — the seam that lets an admin config `apply`
+/// replace the running configuration atomically WITHOUT restarting or blocking in-flight requests.
+///
+/// The router's state is `Arc<AppHandle>`. Every handler and the auth middleware call `load()` to get
+/// the CURRENT snapshot at that instant (an owned `Arc<App>`, no lock held across any `.await`).
+/// In-flight requests keep the snapshot they already loaded (the old `Arc<App>` stays alive until its
+/// last reference drops); new requests see the new one. `swap()` replaces the pointer under a brief
+/// write lock — the only writer is the admin apply path, so the read side is effectively uncontended
+/// (a `RwLock` read + `Arc` clone, ~tens of nanoseconds). Behaviorally identical to a fixed
+/// `Arc<App>` until something calls `swap()`.
+pub(crate) struct AppHandle {
+    current: std::sync::RwLock<Arc<App>>,
+}
+
+impl AppHandle {
+    pub(crate) fn new(app: Arc<App>) -> Self {
+        Self {
+            current: std::sync::RwLock::new(app),
+        }
+    }
+
+    /// The current `App` snapshot. Clones the `Arc` (cheap) and releases the read lock immediately.
+    /// A poisoned lock (a panic in a prior holder) still guards a valid `Arc<App>` — recover it rather
+    /// than propagate, since the guarded value is a single pointer with no inconsistent state to fear.
+    pub(crate) fn load(&self) -> Arc<App> {
+        self.current
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Atomically replace the current snapshot (the admin `apply` seam). RESERVED: the config-apply
+    /// mutation path is the only caller; wired when apply lands.
+    #[allow(dead_code)]
+    pub(crate) fn swap(&self, next: Arc<App>) {
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+}
+
+/// An axum extractor that yields the CURRENT `App` snapshot from the router's `Arc<AppHandle>` state.
+/// This is what lets every handler keep working with an `Arc<App>` while transparently reading the
+/// post-apply configuration: a handler takes `CurrentApp(app): CurrentApp` instead of
+/// `State(app): State<Arc<App>>`, and the rest of its body is unchanged (`app` is still `Arc<App>`).
+/// A local newtype is required because the orphan rule forbids `impl FromRef<_> for Arc<App>`.
+pub(crate) struct CurrentApp(pub(crate) Arc<App>);
+
+impl<S> axum::extract::FromRequestParts<S> for CurrentApp
+where
+    Arc<AppHandle>: axum::extract::FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // `State` extraction of the handle is Infallible (the handle is always present in state).
+        let axum::extract::State(handle) =
+            axum::extract::State::<Arc<AppHandle>>::from_request_parts(parts, state).await?;
+        Ok(CurrentApp(handle.load()))
+    }
+}

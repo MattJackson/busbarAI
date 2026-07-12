@@ -2,11 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use std::fmt;
-use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::State,
     http::{header::AUTHORIZATION, Request, StatusCode},
     middleware::Next,
     response::Response,
@@ -14,7 +12,6 @@ use axum::{
 
 use crate::config::AuthCfg;
 use crate::sigv4::{SIGV4_ALGORITHM, X_AMZ_CONTENT_SHA256, X_AMZ_DATE};
-use crate::state::App;
 
 /// The two non-`Authorization` headers that native vendor SDKs use to carry their API key:
 /// the Anthropic SDK sends `x-api-key`, the Gemini SDK sends `x-goog-api-key`. busbar accepts
@@ -445,7 +442,7 @@ fn extract_admin_header_token(req: &Request<Body>) -> Option<String> {
 
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
