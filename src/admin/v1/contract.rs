@@ -268,3 +268,31 @@ impl<T> Page<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stable error taxonomy is locked: each variant's `code` + HTTP status is the frozen wire
+    /// contract tooling branches on. A change here is a breaking change to v1 and must fail this test.
+    #[test]
+    fn admin_error_codes_and_statuses_are_frozen() {
+        let cases = [
+            (AdminError::NotFound("key".into()), "not_found", 404u16),
+            (
+                AdminError::Forbidden {
+                    needed: Scope::Full,
+                },
+                "forbidden",
+                403,
+            ),
+            (AdminError::Validation("bad".into()), "invalid_request", 400),
+            (AdminError::Conflict("stale".into()), "conflict", 409),
+            (AdminError::Internal, "internal", 500),
+        ];
+        for (e, code, status) in cases {
+            assert_eq!(e.code(), code, "frozen error code changed");
+            assert_eq!(e.http_status(), status, "frozen error status changed");
+        }
+    }
+}

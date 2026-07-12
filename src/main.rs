@@ -1050,7 +1050,7 @@ fn build_router_with_limits(
     // Mount the Admin API v1 via the ports-and-adapters transport layer (a shared typed service
     // behind a pluggable wire format). The JSON-REST adapter is the transport today; a GraphQL / MCP /
     // gRPC adapter later is a one-line swap here over the SAME service.
-    let router = admin::transport::mount(router, &admin::JsonRest, app.clone());
+    let router = admin::transport::mount(router, &admin::JsonV1, app.clone());
     let router = router
         .layer(axum::middleware::from_fn_with_state(
             app.clone(),

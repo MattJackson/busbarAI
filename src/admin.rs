@@ -148,20 +148,20 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
     )
 }
 
-// ── Admin API v1 (the FROZEN surface — /admin/v1/*) ──────────────────────────────────────────────
+// ── Admin API (the FROZEN surface — /admin/v1/*) ─────────────────────────────────────────────────
 //
-// v1 is additive-only forever once 1.3 ships. It is built ports-and-adapters (Matthew 7/11): a typed
-// SERVICE + CONTRACT (the frozen operations, views, and stable error `code`s, transport-agnostic) with
-// pluggable TRANSPORT adapters over it. The JSON-REST adapter is the first transport; a GraphQL/gRPC
-// adapter later is a new `AdminTransport` impl calling the SAME service — no logic rewrite. The legacy
-// `/admin/keys` handlers below stay as a deprecated alias with their `{type}` envelope; every
-// `/admin/v1/*` route flows through the layered stack.
-pub(crate) mod contract;
-pub(crate) mod service;
+// Built engine + swappable layers (Matthew 7/11), VERSION-FIRST: each API version (`v1`, later `v2`)
+// is a self-contained unit under its own directory holding that version's CONTRACT (typed views +
+// stable error codes), its SERVICE (typed operations over the shared engine), and its TRANSPORT wire
+// adapters (`json`, later `graphql`). The transport PORT (`AdminTransport` in `transport`) is shared
+// across versions and transports. Releasing v2 is a LAYER copy of `v1/`, not a rewrite; v1 never
+// breaks. The legacy `/admin/keys` handlers below stay as a deprecated alias with their `{type}`
+// envelope while keys migrate into the versioned service.
 pub(crate) mod transport;
+pub(crate) mod v1;
 
-pub(crate) use service::mark_start;
-pub(crate) use transport::JsonRest;
+pub(crate) use v1::json::JsonV1;
+pub(crate) use v1::service::mark_start;
 
 /// Key metadata for API responses — deliberately omits `key_hash`.
 fn key_meta(k: &VirtualKey) -> Value {
