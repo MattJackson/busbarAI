@@ -866,7 +866,10 @@ pub(crate) async fn auth_middleware(
             || method == axum::http::Method::PATCH
             || method == axum::http::Method::DELETE;
         if is_mutation {
-            let class = if path.starts_with("/admin/v1/config/") {
+            // The CONFIG class (10/min) is the blast-radius set: whole-config mutations AND the
+            // admin auth chain itself. Everything else that mutates (hooks, keys, cache flush)
+            // is the CRUD class (60/min).
+            let class = if path.starts_with("/admin/v1/config/") || path == "/admin/v1/auth" {
                 crate::admin::rate::MutationClass::Config
             } else {
                 crate::admin::rate::MutationClass::Crud

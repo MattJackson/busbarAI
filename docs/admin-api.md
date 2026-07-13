@@ -27,7 +27,7 @@ A missing or wrong credential is `401` on every endpoint — no admin read leaks
 
 The operator admin token holds `full`. Group-carrying principals (external modules) get the most permissive `admin_scope` their groups map to in `group_map:`; unmapped groups grant nothing. Insufficient scope is `403 forbidden` naming the scope that would have sufficed.
 
-**Mutation rate limits.** Mutations are budgeted per principal in one-minute windows: config-plane mutations (rollback) at 10/min, everything else at 60/min. Failed attempts count (anti-enumeration). Over-budget is `429 rate_limited`, and the event is audited. Reads are unmetered.
+**Mutation rate limits.** Mutations are budgeted per principal in one-minute windows: config-plane mutations (apply, reload, rollback, the admin auth chain PUT) at 10/min, everything else at 60/min. Failed attempts count (anti-enumeration). Over-budget is `429 rate_limited`, and the event is audited. Reads are unmetered.
 
 ## The error envelope
 
