@@ -182,6 +182,55 @@ fn page_cursor<T>(items: &mut Vec<T>, start: usize, limit: usize) -> Option<Stri
     }
 }
 
+/// Parse the optional `If-Match` header into the caller's expected config version (H3: ONE
+/// optimistic-concurrency mechanism across the whole surface — the RFC-7232 header, exactly as the
+/// keys resource already speaks it; there is no body-level `expected_version` twin). Grammar: the
+/// config-plane ETag is the config version quoted (`"42"`); a bare `42` is accepted leniently and
+/// `*` (RFC: "any current representation") matches unconditionally, i.e. no guard. Anything else is
+/// a 400 `invalid_request` — a malformed guard must never silently pass as "no guard".
+// The Err variant is the ready-to-return 400 `Response` — intentional (callers just `return` it);
+// a "large" Result is fine for a per-request handler helper.
+#[allow(clippy::result_large_err)]
+fn if_match_version(headers: &axum::http::HeaderMap) -> Result<Option<u64>, Response> {
+    let Some(raw) = headers.get(axum::http::header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let s = raw.to_str().unwrap_or("").trim();
+    if s == "*" {
+        return Ok(None);
+    }
+    let bare = s.strip_prefix("W/").unwrap_or(s); // weak tags compare by value here
+    let bare = bare.trim_matches('"');
+    bare.parse::<u64>().map(Some).map_err(|_| {
+        err_json(&AdminError::Validation(
+            "malformed If-Match: expected the config-plane ETag (a quoted config version, e.g. \
+             \"42\") or *"
+                .into(),
+        ))
+    })
+}
+
+/// The stale-guard rejection every version-guarded mutation shares: the caller's `If-Match` version
+/// vs the live one. `None` (absent / `*`) never rejects.
+fn stale_if_match(expected: Option<u64>, current: u64) -> Option<AdminError> {
+    match expected {
+        Some(v) if v != current => Some(AdminError::Conflict(format!(
+            "If-Match version {v} is stale (current is {current})"
+        ))),
+        _ => None,
+    }
+}
+
+/// Stamp the config-plane `ETag` (`"<config_version>"`) onto a response — the token `If-Match`
+/// guards against. Emitted on the version-guarded reads AND on every successful mutation (whose new
+/// version the caller chains into its next `If-Match`).
+fn with_config_etag(mut resp: Response, version: u64) -> Response {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("\"{version}\"")) {
+        resp.headers_mut().insert(axum::http::header::ETAG, v);
+    }
+    resp
+}
+
 // ── route handlers (thin: call the service, project onto the wire) ───────────────────────────────
 
 /// `GET /admin/v1/info` — version, compiled-in plugin proof, uptime, topology.
@@ -209,14 +258,22 @@ async fn list_providers(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).list_providers().await)
 }
 
-/// `GET /admin/v1/hooks` — the hook registry read.
+/// `GET /admin/v1/hooks` — the hook registry read (+ config-plane `ETag` for `If-Match` chaining).
 async fn list_hooks(State(handle): State<Arc<AppHandle>>) -> Response {
-    respond(StatusCode::OK, service(&handle).list_hooks().await)
+    let version = handle.load().config_version;
+    with_config_etag(
+        respond(StatusCode::OK, service(&handle).list_hooks().await),
+        version,
+    )
 }
 
-/// `GET /admin/v1/hooks/{name}` — one hook definition (404 if unregistered).
+/// `GET /admin/v1/hooks/{name}` — one hook definition (404 if unregistered; + config-plane `ETag`).
 async fn get_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
-    respond(StatusCode::OK, service(&handle).get_hook(&name).await)
+    let version = handle.load().config_version;
+    with_config_etag(
+        respond(StatusCode::OK, service(&handle).get_hook(&name).await),
+        version,
+    )
 }
 
 /// `GET /admin/v1/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
@@ -239,9 +296,14 @@ async fn get_auth(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).get_auth().await)
 }
 
-/// `GET /admin/v1/admin-auth` — the admin-plane auth config (the admin surface guard).
+/// `GET /admin/v1/admin-auth` — the admin-plane auth config (the admin surface guard;
+/// + config-plane `ETag` so a `PUT /admin/v1/admin-auth` can chain `If-Match` off this read).
 async fn get_admin_auth(State(handle): State<Arc<AppHandle>>) -> Response {
-    respond(StatusCode::OK, service(&handle).get_admin_auth().await)
+    let version = handle.load().config_version;
+    with_config_etag(
+        respond(StatusCode::OK, service(&handle).get_admin_auth().await),
+        version,
+    )
 }
 
 /// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests, per-key).
@@ -249,29 +311,29 @@ async fn get_usage(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).get_usage().await)
 }
 
-/// `GET /admin/v1/config` — the effective running config snapshot (redacted; no secrets).
+/// `GET /admin/v1/config` — the effective running config snapshot (redacted; no secrets;
+/// + config-plane `ETag` so apply/rollback callers chain `If-Match` off this read).
 async fn get_config(State(handle): State<Arc<AppHandle>>) -> Response {
-    respond(StatusCode::OK, service(&handle).get_config().await)
+    let version = handle.load().config_version;
+    with_config_etag(
+        respond(StatusCode::OK, service(&handle).get_config().await),
+        version,
+    )
 }
 
-/// The `POST /admin/v1/hooks` request body: the hook name + its definition.
+/// The `POST /admin/v1/hooks` request body: the hook name + its definition. Optimistic concurrency
+/// rides the `If-Match` header (H3) — never a body field.
 #[derive(serde::Deserialize)]
 struct RegisterHookReq {
     name: String,
     config: crate::config::HookCfg,
-    /// Optimistic-concurrency guard: reject with `conflict` when the CURRENT config version
-    /// differs (a concurrent mutation landed between your read and this write). Optional in the
-    /// transition; the release contract makes it mandatory.
-    #[serde(default)]
-    expected_version: Option<u64>,
 }
 
-/// The `PUT /admin/v1/hooks/{name}` body: the replacement definition (the name rides the path).
+/// The `PUT /admin/v1/hooks/{name}` body: the replacement definition (the name rides the path;
+/// optimistic concurrency rides `If-Match`).
 #[derive(serde::Deserialize)]
 struct PutHookReq {
     config: crate::config::HookCfg,
-    #[serde(default)]
-    expected_version: Option<u64>,
 }
 
 /// `POST /admin/v1/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
@@ -283,9 +345,14 @@ async fn register_hook(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let req: RegisterHookReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
@@ -316,14 +383,9 @@ async fn register_hook(
             req.name
         )));
     }
-    if let Some(expected) = req.expected_version {
-        if expected != current.config_version {
-            audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
-            return err_json(&AdminError::Conflict(format!(
-                "expected_version {expected} is stale (current is {})",
-                current.config_version
-            )));
-        }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
     }
     match build_with_hook(&current, &req.name, req.config) {
         Ok(next) => {
@@ -347,10 +409,14 @@ async fn register_hook(
                 None,
                 Some(&req.name),
             );
-            // Project the registered hook from the NEW (post-swap) snapshot for the 201 body.
-            respond(
-                StatusCode::CREATED,
-                service(&handle).get_hook(&req.name).await,
+            // Project the registered hook from the NEW (post-swap) snapshot for the 201 body; the
+            // new config-plane ETag rides along so the caller chains its next If-Match without a read.
+            with_config_etag(
+                respond(
+                    StatusCode::CREATED,
+                    service(&handle).get_hook(&req.name).await,
+                ),
+                installed.config_version,
             )
         }
         Err(e) => {
@@ -370,9 +436,14 @@ async fn put_hook(
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let req: PutHookReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
@@ -403,14 +474,9 @@ async fn put_hook(
              silently shadow operator file config)"
         )));
     }
-    if let Some(expected) = req.expected_version {
-        if expected != current.config_version {
-            audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
-            return err_json(&AdminError::Conflict(format!(
-                "expected_version {expected} is stale (current is {})",
-                current.config_version
-            )));
-        }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
     }
     match build_with_hook(&current, &name, req.config) {
         Ok(next) => {
@@ -432,7 +498,10 @@ async fn put_hook(
                 None,
                 Some(&name),
             );
-            respond(StatusCode::OK, service(&handle).get_hook(&name).await)
+            with_config_etag(
+                respond(StatusCode::OK, service(&handle).get_hook(&name).await),
+                installed.config_version,
+            )
         }
         Err(e) => {
             audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
@@ -451,11 +520,22 @@ async fn delete_hook(
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");
+    // Optimistic concurrency (H3): DELETE honors `If-Match` like every other config-plane mutation
+    // (it previously had NO guard — the one mutation verb missing it).
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
     // §6.3 escalation guard, keyed on the EXISTING hook's grants — a non-Full (hooks-register)
     // principal may not DELETE a content-seeing (`prompt`/`user`) or `global: true` gate. Such a
     // hook can only have been created by a Full admin (register/put block a narrow token from wiring
@@ -501,7 +581,11 @@ async fn delete_hook(
                 Some(&name),
                 None,
             );
-            StatusCode::NO_CONTENT.into_response()
+            // 204 still carries the NEW config-plane ETag — a scripted delete chain needs no re-read.
+            with_config_etag(
+                StatusCode::NO_CONTENT.into_response(),
+                installed.config_version,
+            )
         }
         Err(e) => {
             audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_REJECTED, &actor);
@@ -634,16 +718,11 @@ async fn config_diff(
     ok_json(StatusCode::OK, &body)
 }
 
-/// The `POST /admin/v1/config/rollback` request body.
+/// The `POST /admin/v1/config/rollback` request body. Optimistic concurrency rides `If-Match` (H3).
 #[derive(serde::Deserialize)]
 struct RollbackReq {
     /// The retained version to restore.
     version: u64,
-    /// Optimistic-concurrency guard: reject with `conflict` if the CURRENT config version differs
-    /// (someone mutated between your read and this rollback). Optional in v1 (mandatory with the
-    /// broader ETag sweep).
-    #[serde(default)]
-    expected_version: Option<u64>,
 }
 
 /// `POST /admin/v1/config/rollback` — restore a retained version's hook surface. The target is
@@ -653,9 +732,14 @@ struct RollbackReq {
 async fn rollback_config(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let req: RollbackReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -667,19 +751,14 @@ async fn rollback_config(
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("config:v{}", req.version);
-    if let Some(expected) = req.expected_version {
-        if expected != current.config_version {
-            audit::AUDIT.record_by(
-                "config.rollback",
-                &resource,
-                audit::OUTCOME_REJECTED,
-                &actor,
-            );
-            return err_json(&AdminError::Conflict(format!(
-                "expected_version {expected} is stale (current is {})",
-                current.config_version
-            )));
-        }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by(
+            "config.rollback",
+            &resource,
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&e);
     }
     let Some(target) = current.versions.get(req.version) else {
         audit::AUDIT.record_by(
@@ -714,12 +793,15 @@ async fn rollback_config(
                 None,
                 None,
             );
-            ok_json(
-                StatusCode::OK,
-                &json!({
-                    "restored_version": req.version,
-                    "new_version": cur.config_version,
-                }),
+            with_config_etag(
+                ok_json(
+                    StatusCode::OK,
+                    &json!({
+                        "restored_version": req.version,
+                        "new_version": cur.config_version,
+                    }),
+                ),
+                cur.config_version,
             )
         }
         Err(e) => {
@@ -737,9 +819,9 @@ async fn rollback_config(
 /// `PUT /admin/v1/admin-auth` — replace the ADMIN auth chain (`admin_auth:`) at runtime. Pairs with
 /// `GET /admin/v1/admin-auth`, which reports the same `admin_auth` chain (read-after-write coherent).
 /// Body:
-/// `{"admin_auth": ["module", ...], "expected_version"?: N}`. Guarded three ways:
+/// `{"admin_auth": ["module", ...]}`. Guarded three ways:
 /// - every name must be a compiled-in admin module (a typo can never silently drop auth);
-/// - optimistic concurrency via `expected_version` (409 `conflict` when stale);
+/// - optimistic concurrency via `If-Match` (409 `conflict` when stale);
 /// - **the D4 DRY-RUN GUARD**: the CALLING request's own credentials are re-evaluated against the
 ///   CANDIDATE chain, and unless they would still hold FULL scope under it the change is rejected
 ///   with 409 — you cannot lock yourself out with this endpoint. (A chain broken some other way
@@ -757,31 +839,28 @@ async fn put_auth(
     #[serde(deny_unknown_fields)]
     struct PutAuthBody {
         admin_auth: Vec<String>,
-        #[serde(default)]
-        expected_version: Option<u64>,
     }
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let req: PutAuthBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => return err_json(&AdminError::Validation(format!("invalid body: {e}"))),
     };
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
-    if let Some(expected) = req.expected_version {
-        if expected != current.config_version {
-            // Audit the rejected attempt (§6.7: every mutation attempt leaves a trail — uniform
-            // with every other stale-expected_version rejection in this file, and with put_auth's
-            // own dry-run-guard rejection below).
-            audit::AUDIT.record_by(
-                "auth.admin_chain_put",
-                "auth:admin_auth",
-                audit::OUTCOME_REJECTED,
-                principal.actor_id(),
-            );
-            return err_json(&AdminError::Conflict(format!(
-                "expected_version {expected} != current {}",
-                current.config_version
-            )));
-        }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        // Audit the rejected attempt (§6.7: every mutation attempt leaves a trail — uniform with
+        // every other stale-If-Match rejection in this file, and with put_auth's own
+        // dry-run-guard rejection below).
+        audit::AUDIT.record_by(
+            "auth.admin_chain_put",
+            "auth:admin_auth",
+            audit::OUTCOME_REJECTED,
+            principal.actor_id(),
+        );
+        return err_json(&e);
     }
     // Known-module validation (mirrors the boot rule): `admin-tokens` is the built-in; the
     // test-only stand-in exists in test builds only. An unknown name can never silently drop auth.
@@ -848,14 +927,17 @@ async fn put_auth(
         &installed.hook_registry,
         &installed.global_hooks,
     );
-    ok_json(
-        StatusCode::OK,
-        &json!({
-            "applied": true,
-            "admin_auth": req.admin_auth,
-            "config_version": cur.config_version,
-            "note": "live until the next config reload/restart returns to disk truth; persist by updating config.yaml"
-        }),
+    with_config_etag(
+        ok_json(
+            StatusCode::OK,
+            &json!({
+                "applied": true,
+                "admin_auth": req.admin_auth,
+                "config_version": cur.config_version,
+                "note": "live until the next config reload/restart returns to disk truth; persist by updating config.yaml"
+            }),
+        ),
+        cur.config_version,
     )
 }
 
@@ -953,9 +1035,12 @@ async fn reload_config(
                 &installed.hook_registry,
                 &installed.global_hooks,
             );
-            ok_json(
-                StatusCode::OK,
-                &json!({ "reloaded": true, "config_version": cur.config_version }),
+            with_config_etag(
+                ok_json(
+                    StatusCode::OK,
+                    &json!({ "reloaded": true, "config_version": cur.config_version }),
+                ),
+                cur.config_version,
             )
         }
         Err(e) => {
@@ -970,8 +1055,8 @@ async fn reload_config(
     }
 }
 
-/// The `POST /admin/v1/config/apply` body: a full proposed config (validate's exact shape) plus
-/// the optimistic-concurrency guard.
+/// The `POST /admin/v1/config/apply` body: a full proposed config (validate's exact shape).
+/// Optimistic concurrency rides `If-Match` (H3).
 #[derive(serde::Deserialize)]
 struct ApplyConfigReq {
     /// The deploy config (operator-owned `config.yaml` shape).
@@ -980,8 +1065,6 @@ struct ApplyConfigReq {
     /// on dangling references.
     #[serde(default)]
     providers: std::collections::HashMap<String, crate::config::ProviderDef>,
-    #[serde(default)]
-    expected_version: Option<u64>,
 }
 
 /// `POST /admin/v1/config/apply` — apply a FULL config carried in the request body, atomically:
@@ -993,9 +1076,14 @@ struct ApplyConfigReq {
 async fn apply_config(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let req: ApplyConfigReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -1006,19 +1094,14 @@ async fn apply_config(
     };
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
-    if let Some(expected) = req.expected_version {
-        if expected != current.config_version {
-            audit::AUDIT.record_by(
-                "config.apply",
-                "config:body",
-                audit::OUTCOME_REJECTED,
-                &actor,
-            );
-            return err_json(&AdminError::Conflict(format!(
-                "expected_version {expected} is stale (current is {})",
-                current.config_version
-            )));
-        }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by(
+            "config.apply",
+            "config:body",
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&e);
     }
     let base_hook_names: std::collections::HashSet<String> =
         req.config.hooks.keys().cloned().collect();
@@ -1052,14 +1135,17 @@ async fn apply_config(
                 &installed.hook_registry,
                 &installed.global_hooks,
             );
-            ok_json(
-                StatusCode::OK,
-                &json!({
-                    "applied": true,
-                    "config_version": cur.config_version,
-                    "note": "live until the next reload/restart returns to disk truth; persist by \
-                             updating config.yaml",
-                }),
+            with_config_etag(
+                ok_json(
+                    StatusCode::OK,
+                    &json!({
+                        "applied": true,
+                        "config_version": cur.config_version,
+                        "note": "live until the next reload/restart returns to disk truth; persist \
+                                 by updating config.yaml",
+                    }),
+                ),
+                cur.config_version,
             )
         }
         Err(e) => {
@@ -1074,12 +1160,10 @@ async fn apply_config(
     }
 }
 
-/// The `PATCH /admin/v1/hooks/{name}/settings` body.
+/// The `PATCH /admin/v1/hooks/{name}/settings` body. Optimistic concurrency rides `If-Match` (H3).
 #[derive(serde::Deserialize)]
 struct PatchSettingsReq {
     settings: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
-    expected_version: Option<u64>,
 }
 
 /// `PATCH /admin/v1/hooks/{name}/settings` — push an opaque settings map to the RUNNING hook and
@@ -1094,9 +1178,14 @@ async fn patch_hook_settings(
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let req: PatchSettingsReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -1136,14 +1225,9 @@ async fn patch_hook_settings(
             "hook `{name}` is defined in the base config file; edit config.yaml"
         )));
     }
-    if let Some(expected) = req.expected_version {
-        if expected != current.config_version {
-            audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
-            return err_json(&AdminError::Conflict(format!(
-                "expected_version {expected} is stale (current is {})",
-                current.config_version
-            )));
-        }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
     }
     let mut updated = existing.clone();
     updated.settings = req.settings;
@@ -1193,7 +1277,10 @@ async fn patch_hook_settings(
                 None,
                 Some(&name),
             );
-            respond(StatusCode::OK, service(&handle).get_hook(&name).await)
+            with_config_etag(
+                respond(StatusCode::OK, service(&handle).get_hook(&name).await),
+                installed.config_version,
+            )
         }
         Err(e) => {
             audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
@@ -1291,7 +1378,7 @@ fn openapi_doc() -> serde_json::Value {
                     "201": {"description": "Registered (body is the hook definition)"},
                     "400": {"description": "Malformed body or invalid definition (`invalid_request`)"},
                     "403": {"description": "hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)"},
-                    "409": {"description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `expected_version` (`conflict`, §6.4)"}
+                    "409": {"description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `If-Match` (`conflict`, §6.4)"}
                 }
             }),
         );
@@ -1324,7 +1411,7 @@ fn openapi_doc() -> serde_json::Value {
                     "400": {"description": "Invalid definition (error code `invalid_request`)"},
                     "403": {"description": "A `hooks-register` principal may not replace a hook into a content-seeing (`prompt`/`user`) or `global` form (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
-                    "409": {"description": "Base-defined hook, grant change, or stale expected_version (error code `conflict`)"}
+                    "409": {"description": "Base-defined hook, grant change, or stale `If-Match` (error code `conflict`)"}
                 }
             },
             "delete": {
@@ -1428,7 +1515,7 @@ fn openapi_doc() -> serde_json::Value {
                     "400": {"description": "Hook did not acknowledge (error code `invalid_request`); nothing committed"},
                     "403": {"description": "A `hooks-register` principal may not push settings to a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
-                    "409": {"description": "Base-defined hook or stale expected_version (error code `conflict`)"}
+                    "409": {"description": "Base-defined hook or stale `If-Match` (error code `conflict`)"}
                 }
             }
         }),
@@ -1459,7 +1546,7 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "`{applied, config_version, note}`"},
                     "400": {"description": "Invalid config (error code `invalid_request`); nothing changed"},
-                    "409": {"description": "`expected_version` stale (error code `conflict`)"}
+                    "409": {"description": "stale `If-Match` (error code `conflict`)"}
                 }
             }
         }),
@@ -1484,7 +1571,7 @@ fn openapi_doc() -> serde_json::Value {
             "responses": {
                 "200": {"description": "`{applied, admin_auth, config_version, note}`"},
                 "400": {"description": "Unknown module / malformed body (error code `invalid_request`)"},
-                "409": {"description": "Stale `expected_version`, or the new chain would lock the caller out (error code `conflict`)"}
+                "409": {"description": "Stale `If-Match`, or the new chain would lock the caller out (error code `conflict`)"}
             }
         });
     }
@@ -1510,7 +1597,7 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "`{restored_version, new_version}`"},
                     "404": {"description": "Target version not retained (error code `not_found`)"},
-                    "409": {"description": "`expected_version` stale (error code `conflict`)"},
+                    "409": {"description": "stale `If-Match` (error code `conflict`)"},
                     "400": {"description": "Snapshot fails re-validation (error code `invalid_request`)"}
                 }
             }
@@ -1639,6 +1726,45 @@ fn openapi_doc() -> serde_json::Value {
                         "x-busbar-required-scope".to_string(),
                         json!(crate::admin::v1::contract::required_scope(&m, path).as_str()),
                     );
+                }
+            }
+        }
+    }
+
+    // Stamp the `If-Match` header parameter onto every version-guarded mutation (H3: the ONE
+    // optimistic-concurrency mechanism across the surface). Driven by an explicit op list — NOT
+    // "every mutation" — because the unguarded ops (validate: stateless dry-run; reload: returns to
+    // disk truth unconditionally; cache/flush, key create/rotate: no versioned resource) must not
+    // advertise a guard they don't enforce. Keys PATCH/DELETE guard on the KEY's own ETag; the
+    // config-plane ops guard on the config-version ETag their reads emit.
+    const IF_MATCH_GUARDED: &[(&str, &str)] = &[
+        ("/admin/v1/hooks", "post"),
+        ("/admin/v1/hooks/{name}", "put"),
+        ("/admin/v1/hooks/{name}", "delete"),
+        ("/admin/v1/hooks/{name}/settings", "patch"),
+        ("/admin/v1/admin-auth", "put"),
+        ("/admin/v1/config/apply", "post"),
+        ("/admin/v1/config/rollback", "post"),
+        ("/admin/v1/keys/{id}", "patch"),
+        ("/admin/v1/keys/{id}", "delete"),
+    ];
+    for (path, method) in IF_MATCH_GUARDED {
+        if let Some(op) = paths
+            .get_mut(*path)
+            .and_then(|p| p.get_mut(*method))
+            .and_then(|op| op.as_object_mut())
+        {
+            let param = json!({
+                "name": "If-Match", "in": "header", "required": false,
+                "schema": {"type": "string"},
+                "description": "Optimistic concurrency: the resource's ETag from a prior read \
+                                (or the ETag returned by the previous mutation). Stale = 409 \
+                                `conflict`, nothing changes; absent or `*` = unconditional."
+            });
+            match op.get_mut("parameters").and_then(|p| p.as_array_mut()) {
+                Some(params) => params.push(param),
+                None => {
+                    op.insert("parameters".to_string(), json!([param]));
                 }
             }
         }

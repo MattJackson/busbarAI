@@ -188,6 +188,24 @@ fn key_etag(k: &VirtualKey) -> String {
     crate::sigv4::sha256_hex(meta.to_string().as_bytes())[..16].to_string()
 }
 
+/// Parse the optional `If-Match` header for a KEY mutation (PATCH/DELETE `/keys/{id}`): the key's
+/// own ETag from a prior GET, quotes/weak-prefix stripped. `*` (RFC 7232: "any current
+/// representation") matches any existing key, i.e. no guard — `None`. Shared by PATCH and DELETE so
+/// the two verbs can never diverge on grammar.
+fn parse_key_if_match(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let s = v.trim();
+            s.strip_prefix("W/")
+                .unwrap_or(s)
+                .trim_matches('"')
+                .to_string()
+        })
+        .filter(|s| s != "*")
+}
+
 fn key_meta(k: &VirtualKey) -> Value {
     json!({
         "id": k.id,
@@ -552,10 +570,7 @@ pub(crate) async fn update_key(
     // the write, so it is deferred INTO the gated write closure below (a separate pre-read here
     // would leave a window in which a concurrent PATCH mutates the row between the check and this
     // write, defeating the guard). Absent header = the transitional unguarded path.
-    let if_match: Option<String> = headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().trim_matches('"').to_string());
+    let if_match = parse_key_if_match(&headers);
     // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
     // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
     // only the byte length via `parse_err_log` — no raw error, no input fragment.
@@ -848,6 +863,7 @@ pub(crate) async fn delete_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
@@ -856,9 +872,14 @@ pub(crate) async fn delete_key(
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
     }
-    // Existence check before delete: `usage_for` resolves the key by id and returns Ok(None) when it
-    // does not exist (the store's `delete_key` silently no-ops a zero-row delete, so we cannot rely
-    // on it to signal not-found). Use the public GovState API rather than reaching into the store.
+    // Optimistic concurrency (optional `If-Match`, H3 — every mutation verb on the surface honors
+    // it): the caller's ETag is compared against the CURRENT record inside the gated critical
+    // section below, so the delete only lands on the exact record state the caller last read.
+    let if_match = parse_key_if_match(&headers);
+    // Existence check before delete: the key RECORD is looked up first and `None` means not-found
+    // (the store's `delete_key` silently no-ops a zero-row delete, so we cannot rely on it to signal
+    // not-found). Use the public GovState API rather than reaching into the store. The record (not a
+    // bare existence bit) is needed anyway: the optional If-Match guard compares its ETag.
     //
     // Both store calls (the lookup and the delete) run on ONE `spawn_blocking` task so neither
     // blocks a Tokio worker thread, matching the request-path discipline. Running them on the same
@@ -877,29 +898,52 @@ pub(crate) async fn delete_key(
     // lookup→delete runs under the lock on the blocking thread. `spawn_blocking` is uncancellable once
     // scheduled, so even if the client drops this request the critical section completes while still
     // holding the gate — the gate can never be released mid-sequence by an outer-future drop.
-    let now = crate::store::now();
+    /// The three delete outcomes the gated critical section distinguishes.
+    enum DeleteOutcome {
+        Deleted,
+        NotFound,
+        EtagStale,
+    }
     let gov = gov.clone();
     let id_for_task = id.clone();
     let res = tokio::task::spawn_blocking(move || {
         let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
-        match gov.usage_for(&id_for_task, now) {
-            Ok(None) => Ok(None),
-            Ok(Some(_)) => gov.delete_key(&id_for_task).map(Some),
-            Err(e) => Err(e),
+        // The key RECORD (not just existence) is read under the gate: the If-Match compare must be
+        // atomic with the delete, exactly like PATCH's compare-and-put.
+        let key = gov.all_keys()?.into_iter().find(|k| k.id == id_for_task);
+        match key {
+            None => Ok(DeleteOutcome::NotFound),
+            Some(k) => {
+                if let Some(expected) = &if_match {
+                    if key_etag(&k) != *expected {
+                        return Ok(DeleteOutcome::EtagStale);
+                    }
+                }
+                gov.delete_key(&id_for_task)
+                    .map(|()| DeleteOutcome::Deleted)
+            }
         }
     })
     .await;
     let resource = format!("key:{id}");
     match res {
-        Ok(Ok(Some(()))) => {
+        Ok(Ok(DeleteOutcome::Deleted)) => {
             audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_APPLIED, &actor);
             // 204 No Content — the SAME success shape as `DELETE /admin/v1/hooks/{name}` (was a
             // bespoke `200 {"deleted": id}` found nowhere else on the surface). (contract H4.)
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(Ok(None)) => {
+        Ok(Ok(DeleteOutcome::NotFound)) => {
             audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_REJECTED, &actor);
             error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
+        Ok(Ok(DeleteOutcome::EtagStale)) => {
+            audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(
+                StatusCode::CONFLICT,
+                ERR_TYPE_CONFLICT,
+                "If-Match ETag is stale: the key changed since you read it",
+            )
         }
         Ok(Err(e)) => internal_error("delete_key", &e),
         Err(e) => join_error("delete_key", &e),
@@ -1485,7 +1529,7 @@ mod tests {
 
     /// `POST /admin/v1/config/apply`: a body-carried full config swaps in atomically — the new
     /// topology is live, the surviving identity keeps its tripped health, and a stale
-    /// expected_version is a 409 that changes nothing.
+    /// If-Match is a 409 that changes nothing.
     #[tokio::test]
     async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
         crate::metrics::init();
@@ -1549,12 +1593,12 @@ mod tests {
         assert_eq!(m0["usable"], false, "carried trip: {m0}");
         assert_eq!(ma["usable"], true, "fresh lane: {ma}");
 
-        // Stale expected_version: 409, nothing applied.
+        // Stale If-Match: 409, nothing applied (H3: concurrency rides the header, never the body).
         let stale = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+            .header("if-match", "\"0\"")
             .body(
                 serde_json::json!({
                     "config": {"listen": "127.0.0.1:0", "providers": {}, "models": {}, "pools": {}},
-                    "expected_version": 0
                 })
                 .to_string(),
             )
@@ -1562,6 +1606,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stale.status().as_u16(), 409);
+        // A malformed If-Match is a 400 invalid_request, never a silent unguarded write.
+        let malformed = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+            .header("if-match", "\"not-a-version\"")
+            .body(
+                serde_json::json!({
+                    "config": {"listen": "127.0.0.1:0", "providers": {}, "models": {}, "pools": {}},
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(malformed.status().as_u16(), 400);
 
         handle.abort();
     }
@@ -2285,7 +2342,7 @@ providers: {}
     /// `PUT /admin/v1/admin-auth` end-to-end with the D4 dry-run guard: a chain that would lock the
     /// CALLER out is a 409 and nothing changes; a chain the caller survives applies atomically
     /// (the old credential stops working on the very next request, the surviving one carries on);
-    /// unknown modules and stale expected_version reject.
+    /// unknown modules and a stale If-Match reject.
     #[tokio::test]
     async fn test_admin_v1_put_auth_dry_run_guard() {
         crate::metrics::init();
@@ -2336,14 +2393,18 @@ providers: {}
             "unknown module is invalid_request"
         );
 
-        // Stale expected_version: 409.
-        let r = put(
-            "admintok",
-            serde_json::json!({"admin_auth": ["admin-tokens"], "expected_version": 999}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(r.status().as_u16(), 409, "stale expected_version conflicts");
+        // Stale If-Match: 409 (H3: concurrency rides the header; a body-level twin no longer parses
+        // — deny_unknown_fields makes a leftover `expected_version` field a loud 400, not a no-op).
+        let r = client
+            .put(format!("http://{addr}/admin/v1/admin-auth"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .header("if-match", "\"999\"")
+            .body(serde_json::json!({"admin_auth": ["admin-tokens"]}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 409, "stale If-Match conflicts");
 
         // THE D4 GUARD: the operator token would NOT survive a chain of only the external module
         // (its credential has no grp: shape — all-Pass denies). 409, and the operator still works.
@@ -2671,7 +2732,7 @@ providers: {}
     }
 
     /// `PUT /admin/v1/hooks/{name}`: replaces an overlay hook live; 404 for an unknown name;
-    /// 409 for a grant change (immutability) and for a stale expected_version.
+    /// 409 for a grant change (immutability) and for a stale If-Match.
     #[tokio::test]
     async fn test_admin_v1_put_hook_replaces_live_with_guards() {
         crate::metrics::init();
@@ -2741,22 +2802,46 @@ providers: {}
             .unwrap();
         assert_eq!(escalate.status().as_u16(), 409, "grants are immutable");
 
-        // Stale expected_version is a 409 conflict.
+        // Stale If-Match is a 409 conflict (H3: concurrency rides the header).
         let stale = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .header("if-match", "\"0\"")
             .body(
                 serde_json::json!({
                     "config": {"kind": "tap", "webhook": "http://127.0.0.1:9973/"},
-                    "expected_version": 0
                 })
                 .to_string(),
             )
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            stale.status().as_u16(),
-            409,
-            "stale expected_version conflicts"
+        assert_eq!(stale.status().as_u16(), 409, "stale If-Match conflicts");
+
+        // The current ETag (from the GET above / the PUT response) applies cleanly: read it live.
+        let live = admin(client.get(format!("http://{addr}/admin/v1/hooks/rep")))
+            .send()
+            .await
+            .unwrap();
+        let etag = live
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .expect("config-plane reads emit the ETag")
+            .to_string();
+        let fresh = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .header("if-match", etag)
+            .body(
+                serde_json::json!({
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9973/"},
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fresh.status().as_u16(), 200, "current If-Match applies");
+        assert!(
+            fresh.headers().get(reqwest::header::ETAG).is_some(),
+            "the mutation response carries the NEW ETag for chaining"
         );
 
         handle.abort();
@@ -2764,7 +2849,7 @@ providers: {}
 
     /// The config version-history cycle: mutations record attributed versions; diff explains a
     /// change; rollback restores a prior hook surface LIVE as a NEW version; unknown targets 404
-    /// and a stale expected_version conflicts.
+    /// and a stale If-Match conflicts.
     #[tokio::test]
     async fn test_admin_v1_config_versions_rollback_and_diff() {
         crate::metrics::init();
@@ -2846,7 +2931,7 @@ providers: {}
             "the rolled-back hook is live again"
         );
 
-        // Guard rails: unknown target = 404; stale expected_version = 409.
+        // Guard rails: unknown target = 404; stale If-Match = 409 (H3).
         let missing = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
             .header("content-type", "application/json")
             .body(serde_json::json!({"version": 999}).to_string())
@@ -2856,7 +2941,8 @@ providers: {}
         assert_eq!(missing.status().as_u16(), 404);
         let stale = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
             .header("content-type", "application/json")
-            .body(serde_json::json!({"version": 1, "expected_version": 0}).to_string())
+            .header("if-match", "\"0\"")
+            .body(serde_json::json!({"version": 1}).to_string())
             .send()
             .await
             .unwrap();
