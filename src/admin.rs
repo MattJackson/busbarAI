@@ -166,8 +166,11 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 // stable error codes), its SERVICE (typed operations over the shared engine), and its TRANSPORT wire
 // adapters (`json`, later `graphql`). The transport PORT (`AdminTransport` in `transport`) is shared
 // across versions and transports. Releasing v2 is a LAYER copy of `v1/`, not a rewrite; v1 never
-// breaks. The legacy `/admin/keys` handlers below stay as a deprecated alias with their `{type}`
-// envelope while keys migrate into the versioned service.
+// breaks. The `/admin/keys` handlers below are mounted under BOTH the deprecated `/admin/keys`
+// alias and the canonical `/admin/v1/keys` prefix (main.rs), so they speak the ONE frozen v1
+// contract: the `{error:{code,message}}` envelope with the stable code enum (contract H1) — not a
+// bespoke `{type}` envelope. Keys are a first-class v1 resource served by these handlers until they
+// migrate into the versioned service module.
 pub(crate) mod audit;
 pub(crate) mod rate;
 pub(crate) mod transport;
@@ -779,8 +782,10 @@ pub(crate) async fn get_key(
     match res {
         Ok(Ok(Some(k))) => {
             let etag = key_etag(&k);
-            let mut meta = key_meta(&k);
-            meta["etag"] = json!(etag);
+            // ETag lives ONLY in the HTTP `ETag` header (RFC 7232), not duplicated into the JSON
+            // body — one authoritative surface, matching how config/hooks/auth expose their
+            // concurrency token. (contract H4.)
+            let meta = key_meta(&k);
             let mut resp = json_response(StatusCode::OK, meta);
             if let Ok(v) = axum::http::HeaderValue::from_str(&format!("\"{etag}\"")) {
                 resp.headers_mut().insert(axum::http::header::ETAG, v);
@@ -871,7 +876,9 @@ pub(crate) async fn delete_key(
     match res {
         Ok(Ok(Some(()))) => {
             audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_APPLIED, &actor);
-            json_response(StatusCode::OK, json!({"deleted": id}))
+            // 204 No Content — the SAME success shape as `DELETE /admin/v1/hooks/{name}` (was a
+            // bespoke `200 {"deleted": id}` found nowhere else on the surface). (contract H4.)
+            StatusCode::NO_CONTENT.into_response()
         }
         Ok(Ok(None)) => {
             audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_REJECTED, &actor);
@@ -2431,14 +2438,18 @@ providers: {}
 
         // If-Match: stale = 409 untouched; current etag = applied.
         let id = a["id"].as_str().unwrap();
-        let got: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/keys/{id}")))
+        let got = admin(client.get(format!("http://{addr}/admin/v1/keys/{id}")))
             .send()
             .await
-            .unwrap()
-            .json()
-            .await
             .unwrap();
-        let etag = got["etag"].as_str().unwrap().to_string();
+        // ETag is header-only now (H4) — strip the surrounding quotes to feed back as If-Match.
+        let etag = got
+            .headers()
+            .get(axum::http::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
         let stale = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
             .header("if-match", "\"deadbeefdeadbeef\"")
             .body(serde_json::json!({"rpm_limit": 5}).to_string())
@@ -4801,7 +4812,11 @@ providers: {}
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 200, "existing key deletes with 200");
+        assert_eq!(
+            resp.status().as_u16(),
+            204,
+            "existing key deletes with 204 No Content (H4)"
+        );
         handle.abort();
     }
 
@@ -4831,8 +4846,8 @@ providers: {}
     }
 
     #[tokio::test]
-    async fn test_delete_key_is_not_idempotent_200() {
-        // After a successful delete, a second delete of the same id must 404 (proves the 200 was a
+    async fn test_delete_key_is_not_idempotent_204() {
+        // After a successful delete, a second delete of the same id must 404 (proves the 204 was a
         // real revocation, not a no-op masquerading as success).
         crate::metrics::init();
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -4859,7 +4874,7 @@ providers: {}
             .send()
             .await
             .unwrap();
-        assert_eq!(first.status().as_u16(), 200);
+        assert_eq!(first.status().as_u16(), 204);
         let second = client
             .delete(&url)
             .header("x-admin-token", "admintok")
@@ -4871,11 +4886,11 @@ providers: {}
     }
 
     #[tokio::test]
-    async fn test_concurrent_delete_returns_exactly_one_200() {
+    async fn test_concurrent_delete_returns_exactly_one_204() {
         // Regression (MEDIUM/correctness, TOCTOU): two concurrent DELETEs of the SAME id must not
-        // both observe the key and both return 200 (which would imply two revocations of one row in
+        // both observe the key and both return 204 (which would imply two revocations of one row in
         // an audit trail). The delete handler serializes its lookup→delete critical section, so the
-        // winner returns 200 and every loser returns 404. Fire a burst and assert exactly one 200.
+        // winner returns 204 and every loser returns 404. Fire a burst and assert exactly one 204.
         crate::metrics::init();
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
@@ -4915,14 +4930,14 @@ providers: {}
         let mut not_found = 0;
         for t in tasks {
             match t.await.unwrap() {
-                200 => ok += 1,
+                204 => ok += 1,
                 404 => not_found += 1,
                 other => panic!("unexpected status {other} from concurrent delete"),
             }
         }
         assert_eq!(
             ok, 1,
-            "exactly one concurrent delete must report a 200 revocation"
+            "exactly one concurrent delete must report a 204 revocation"
         );
         assert_eq!(
             not_found, 7,
@@ -4965,7 +4980,7 @@ providers: {}
             .send()
             .await
             .unwrap();
-        assert_eq!(del.status().as_u16(), 200, "the key is revoked");
+        assert_eq!(del.status().as_u16(), 204, "the key is revoked");
 
         // PATCH the now-deleted key → 404, and it must NOT recreate the row.
         let patched = client
@@ -5406,10 +5421,10 @@ providers: {}
         release_tx.send(()).unwrap();
         let del_status = delete_task.await.unwrap();
         // The PATCH's put_key resurrected/updated the row (it ran to completion despite cancellation),
-        // so the DELETE that follows under the gate observes it and revokes it: 200. (The point of this
-        // test is the BLOCKING, not the final status — but it must be a coherent 200, not a 404.)
+        // so the DELETE that follows under the gate observes it and revokes it: 204. (The point of this
+        // test is the BLOCKING, not the final status — but it must be a coherent 204, not a 404.)
         assert_eq!(
-            del_status, 200,
+            del_status, 204,
             "the DELETE runs after the gate frees and revokes the (now-present) key"
         );
         handle.abort();

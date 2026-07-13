@@ -2327,7 +2327,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.status().as_u16(), 204);
         let r = client
             .get(format!("{base}/admin/keys"))
             .bearer_auth("admintok")

@@ -1533,7 +1533,7 @@ fn openapi_doc() -> serde_json::Value {
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
-                    "200": {"description": "Revoked"},
+                    "204": {"description": "Revoked — No Content"},
                     "404": {"description": "Unknown key (error code `not_found`)"}
                 }
             }
