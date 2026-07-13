@@ -2990,12 +2990,54 @@ fn gate_rejected(mut resp: Response) -> Response {
 /// delegate. The ingress hot path (`route::forward_resolved`) instead calls
 /// [`forward_with_pool_parsed`] directly with the `Value` it ALREADY parsed to resolve the model —
 /// so a normal request parses the body once across the route+forward layers, not twice.
+///
+/// Carries NO pre-resolved governance key — a virtual-key caller still resolves via the token
+/// `lookup` inside `decide_policy_order`. Real ingress routes that hold a `GovCtx` (whose key may be
+/// a SYNTHESIZED group/SSO principal key the token can't resolve to) must call
+/// [`forward_with_pool_keyed`] and pass `gov.key.as_ref()` so the routing-signal path is not blind.
+///
+/// Test-only convenience now: every production ingress route holds a `GovCtx` and goes through
+/// [`forward_with_pool_keyed`]; this bytes-only, key-less form survives solely for the many tests
+/// that construct a request from raw bytes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_with_pool(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     body: Bytes,
     caller_token: Option<&str>,
+    pool_name: &str,
+    affinity_key: Option<&str>,
+    ingress_protocol: &str,
+    op: crate::handlers::Op,
+    usage_sink: Option<UsageSink>,
+) -> Response {
+    forward_with_pool_keyed(
+        app,
+        cands,
+        body,
+        caller_token,
+        None,
+        pool_name,
+        affinity_key,
+        ingress_protocol,
+        op,
+        usage_sink,
+    )
+    .await
+}
+
+/// [`forward_with_pool`] plus the caller's pre-resolved governance key (`GovCtx.key`). The named /
+/// ad-hoc anthropic-dialect routes use this so a GROUP/SSO principal — whose bearer token is not a
+/// virtual-key secret and so never resolves via the `lookup` fallback — still projects
+/// `rate_headroom` / `identity` into a pool's routing policy, matching the universal dispatch path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_with_pool_keyed(
+    app: Arc<App>,
+    cands: Vec<WeightedLane>,
+    body: Bytes,
+    caller_token: Option<&str>,
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -3021,9 +3063,7 @@ pub(crate) async fn forward_with_pool(
         Some(v),
         APPLICATION_JSON,
         caller_token,
-        // The thin bytes-only wrapper (tests / ad-hoc routes) carries no pre-resolved GovCtx; a
-        // virtual-key caller still resolves via the token `lookup` inside `decide_policy_order`.
-        None,
+        resolved_gov_key,
         pool_name,
         affinity_key,
         ingress_protocol,
@@ -13039,6 +13079,79 @@ mod hook_seam_tests {
             "a group principal's synthesized key id must project, not fall through to None"
         );
         assert_eq!(key_name.as_deref(), Some("eng-oncall"));
+    }
+
+    /// REGRESSION (audit c1r11): the named / ad-hoc anthropic routes go through `forward_with_pool`,
+    /// which carries NO resolved key — so the c1r10 fallback never fired there and a group principal
+    /// on `/{pool}/v1/messages` was still routing-signal-blind. `forward_with_pool_keyed` threads
+    /// `GovCtx.key` down; this exercises that path end-to-end via a pool's `send_user` policy.
+    #[tokio::test]
+    async fn forward_with_pool_keyed_threads_group_key_to_pool_policy() {
+        let seen = Arc::new(StdMutex::new(None));
+        let policy = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: seen.clone(),
+                reject: None,
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: true,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        let mut rt = pool_runtime_with(&[(0, &[])], Vec::new());
+        rt.policy = Some(policy);
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime("p", rt)
+            .build();
+        let synth = crate::governance::VirtualKey {
+            id: "eng-oncall".to_string(),
+            key_hash: "principal:eng-oncall".to_string(),
+            name: "eng-oncall".to_string(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        };
+        let body = Bytes::from(serde_json::to_vec(&body()).unwrap());
+        let cands = vec![WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
+        // The forward will fail to reach the fake upstream, but the routing policy captures FIRST.
+        // caller_token is a non-vkey SSO bearer → lookup misses; only the threaded key can save it.
+        let _ = forward_with_pool_keyed(
+            app,
+            cands,
+            body,
+            Some("sso-jwt-not-a-vkey-secret"),
+            Some(&synth),
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::chat("anthropic"),
+            None,
+        )
+        .await;
+        let captured = seen.lock().unwrap().clone().expect("pool policy ran");
+        let (key_id, _name, _user) = captured.identity.expect("identity present");
+        assert_eq!(
+            key_id.as_deref(),
+            Some("eng-oncall"),
+            "forward_with_pool_keyed must thread the group key into the pool policy, not pass None"
+        );
     }
 
     /// DEFENSE IN DEPTH at the seam: the shipped transports clamp/sanitize in `wire::normalize`,

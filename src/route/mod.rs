@@ -12,7 +12,6 @@ use axum::{
 };
 use serde_json::Value;
 
-use crate::forward::forward_with_pool;
 use crate::state::{App, WeightedLane};
 
 /// enforce a virtual key's allowed-pools list against the resolved target pool. No-op
@@ -1049,11 +1048,14 @@ pub(crate) async fn named(
         let affinity_key = headers
             .get(affinity_header_for(&app, &name))
             .and_then(|v| v.to_str().ok());
-        let resp = forward_with_pool(
+        let resp = crate::forward::forward_with_pool_keyed(
             app.clone(),
             cands.clone(),
             body,
             caller_token,
+            // Thread the resolved/synthesized key so a group/SSO principal's usage/send_user pool
+            // policy sees rate_headroom/identity here too (not just the universal dispatch path).
+            gov.key.as_ref(),
             &name,
             affinity_key,
             "anthropic",
@@ -1066,7 +1068,7 @@ pub(crate) async fn named(
     if let Some(&i) = app.by_model.get(&name) {
         // Model-based routing: anthropic ingress, lane-default breaker OperationHandler (empty pool name → the
         // op_handler shared by all direct/ad-hoc routes, surfaced by /stats and /healthz), no affinity.
-        let resp = crate::forward::forward_with_pool(
+        let resp = crate::forward::forward_with_pool_keyed(
             app.clone(),
             vec![WeightedLane {
                 reasoning: None,
@@ -1076,6 +1078,7 @@ pub(crate) async fn named(
             }],
             body,
             caller_token,
+            gov.key.as_ref(),
             "",
             None,
             "anthropic",
@@ -1146,7 +1149,7 @@ pub(crate) async fn adhoc(
         Some(&i) if app.lanes[i].provider == provider => {
             // Single lane with weight=1 (default for ad-hoc routing): anthropic ingress, lane-default
             // breaker OperationHandler (empty pool name), no affinity.
-            let resp = crate::forward::forward_with_pool(
+            let resp = crate::forward::forward_with_pool_keyed(
                 app.clone(),
                 vec![WeightedLane {
                     reasoning: None,
@@ -1156,6 +1159,7 @@ pub(crate) async fn adhoc(
                 }],
                 body,
                 caller_token,
+                gov.key.as_ref(),
                 "",
                 None,
                 "anthropic",
