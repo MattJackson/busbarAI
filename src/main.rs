@@ -1188,6 +1188,10 @@ pub(crate) fn build_app_from_config(
             || Arc::new(admin::rate::MutationLimiter::new()),
             |p| p.mutation_limiter.clone(),
         ),
+        idempotency_cache: prior.map_or_else(
+            || Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            |p| p.idempotency_cache.clone(),
+        ),
         base_hook_names,
         admin_chain: cfg.admin_auth.clone(),
         group_map: cfg.group_map.clone(),

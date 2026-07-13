@@ -102,6 +102,7 @@ const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
 pub(crate) const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
 pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
 const ERR_TYPE_INTERNAL: &str = "internal_error";
+const ERR_TYPE_CONFLICT: &str = "conflict_error";
 
 /// Maximum byte lengths for admin-API path / body fields (defense-in-depth DB/log-bloat guards).
 /// A real minted key id is `vk_` + 16 hex chars (19 chars); 64 is generous headroom.
@@ -164,6 +165,13 @@ pub(crate) use v1::json::JsonV1;
 pub(crate) use v1::service::mark_start;
 
 /// Key metadata for API responses — deliberately omits `key_hash`.
+/// A key record's ETag: a short digest of its mutable metadata. Changes whenever any PATCHable
+/// field changes, so `If-Match` detects a concurrent modification (409, no lost update).
+fn key_etag(k: &VirtualKey) -> String {
+    let meta = key_meta(k);
+    crate::sigv4::sha256_hex(meta.to_string().as_bytes())[..16].to_string()
+}
+
 fn key_meta(k: &VirtualKey) -> Value {
     json!({
         "id": k.id,
@@ -218,9 +226,30 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
 pub(crate) async fn create_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    // IDEMPOTENT MINT (optional `Idempotency-Key`): a retried POST with the same key inside the
+    // ~10min window returns the FIRST response verbatim (including the once-shown secret — the
+    // standard idempotency contract: a retry is the same request, not a second mint) instead of
+    // double-creating. Bounded: stale entries are swept on every use.
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if let Some(ref k) = idem_key {
+        let now = crate::store::now();
+        let mut cache = app
+            .idempotency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
+        if let Some((_, cached)) = cache.get(k) {
+            return json_response(StatusCode::CREATED, cached.clone());
+        }
+    }
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -356,6 +385,12 @@ pub(crate) async fn create_key(
                                                 // never returned by any read API, mirroring the bearer `secret`.
                 body["aws_access_key_id"] = json!(access_key_id);
                 body["aws_secret_access_key"] = json!(secret_access_key);
+                if let Some(ref k) = idem_key {
+                    app.idempotency_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(k.clone(), (crate::store::now(), body.clone()));
+                }
                 json_response(StatusCode::CREATED, body)
             }
             Ok(Err(e)) => internal_error("create_key", &e),
@@ -373,6 +408,12 @@ pub(crate) async fn create_key(
                 );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // shown exactly once
+                if let Some(ref k) = idem_key {
+                    app.idempotency_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(k.clone(), (crate::store::now(), body.clone()));
+                }
                 json_response(StatusCode::CREATED, body)
             }
             Ok(Err(e)) => internal_error("create_key", &e),
@@ -412,6 +453,7 @@ pub(crate) async fn update_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
@@ -420,6 +462,44 @@ pub(crate) async fn update_key(
     };
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
+    }
+    // OPTIMISTIC CONCURRENCY (optional `If-Match`): compare the caller's ETag against the CURRENT
+    // record before mutating — a stale tag is a 409, never a lost update. Absent header = the
+    // transitional unguarded path (mandatory at the release contract).
+    if let Some(if_match) = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_matches('"').to_string())
+    {
+        let gov2 = gov.clone();
+        let id2 = id.clone();
+        let current = tokio::task::spawn_blocking(move || {
+            gov2.all_keys()
+                .map(|keys| keys.into_iter().find(|k| k.id == id2))
+        })
+        .await;
+        match current {
+            Ok(Ok(Some(k))) => {
+                if key_etag(&k) != if_match {
+                    audit::AUDIT.record_by(
+                        "key.patch",
+                        &format!("key:{id}"),
+                        audit::OUTCOME_REJECTED,
+                        &actor,
+                    );
+                    return error_response(
+                        StatusCode::CONFLICT,
+                        ERR_TYPE_CONFLICT,
+                        "If-Match ETag is stale: the key changed since you read it",
+                    );
+                }
+            }
+            Ok(Ok(None)) => {
+                return error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+            }
+            Ok(Err(e)) => return internal_error("update_key", &e),
+            Err(e) => return join_error("update_key", &e),
+        }
     }
     // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
     // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
@@ -608,7 +688,16 @@ pub(crate) async fn get_key(
     })
     .await;
     match res {
-        Ok(Ok(Some(k))) => json_response(StatusCode::OK, key_meta(&k)),
+        Ok(Ok(Some(k))) => {
+            let etag = key_etag(&k);
+            let mut meta = key_meta(&k);
+            meta["etag"] = json!(etag);
+            let mut resp = json_response(StatusCode::OK, meta);
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("\"{etag}\"")) {
+                resp.headers_mut().insert(axum::http::header::ETAG, v);
+            }
+            resp
+        }
         Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
         Ok(Err(e)) => internal_error("get_key", &e),
         Err(e) => join_error("get_key", &e),
@@ -1566,6 +1655,79 @@ providers: {}
             limited_at.is_some(),
             "the limiter never fired in 22 attempts"
         );
+
+        handle.abort();
+    }
+
+    /// Idempotent mint + optimistic concurrency: a retried POST with the same Idempotency-Key
+    /// returns the FIRST response (same id + secret, no double-create); a PATCH with a stale
+    /// If-Match is a 409 that changes nothing; a fresh If-Match succeeds.
+    #[tokio::test]
+    async fn test_admin_v1_key_idempotent_mint_and_if_match() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // Same Idempotency-Key twice → identical response, ONE key.
+        let mint = |k: &'static str| {
+            admin(client.post(format!("http://{addr}/admin/v1/keys")))
+                .header("idempotency-key", k)
+                .body(serde_json::json!({"name": "idem"}).to_string())
+                .send()
+        };
+        let a: serde_json::Value = mint("abc").await.unwrap().json().await.unwrap();
+        let b: serde_json::Value = mint("abc").await.unwrap().json().await.unwrap();
+        assert_eq!(a["id"], b["id"], "replay returns the same key");
+        assert_eq!(
+            a["secret"], b["secret"],
+            "replay returns the FIRST response verbatim"
+        );
+        let listed: serde_json::Value = admin(client.get(format!(
+            "http://{addr}/admin/v1/keys?prefix={}",
+            a["id"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(listed["total"], 1, "no double-create: {listed}");
+
+        // If-Match: stale = 409 untouched; current etag = applied.
+        let id = a["id"].as_str().unwrap();
+        let got: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/keys/{id}")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let etag = got["etag"].as_str().unwrap().to_string();
+        let stale = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
+            .header("if-match", "\"deadbeefdeadbeef\"")
+            .body(serde_json::json!({"rpm_limit": 5}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status().as_u16(), 409, "stale If-Match conflicts");
+        let fresh = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
+            .header("if-match", format!("\"{etag}\""))
+            .body(serde_json::json!({"rpm_limit": 5}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fresh.status().as_u16(), 200, "current If-Match applies");
 
         handle.abort();
     }
@@ -3639,6 +3801,7 @@ providers: {}
                 let r1 = super::create_key(
                     crate::state::CurrentApp(app.clone()),
                     axum::Extension(crate::auth::AuthPrincipal(None)),
+                    axum::http::HeaderMap::new(),
                     body1,
                 )
                 .await;
@@ -3655,6 +3818,7 @@ providers: {}
                 let r2 = super::create_key(
                     crate::state::CurrentApp(app),
                     axum::Extension(crate::auth::AuthPrincipal(None)),
+                    axum::http::HeaderMap::new(),
                     body2,
                 )
                 .await;

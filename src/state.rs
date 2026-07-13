@@ -197,6 +197,12 @@ pub(crate) struct App {
     /// Per-principal ADMIN MUTATION rate limiter (§6.6). Arc-shared across apply snapshots so the
     /// windows survive every swap.
     pub(crate) mutation_limiter: Arc<crate::admin::rate::MutationLimiter>,
+    /// Idempotency-Key replay cache for key minting (bounded, ~10min TTL): a retried POST with the
+    /// same key returns the FIRST response verbatim instead of double-creating. Arc-shared across
+    /// swaps. Maps key → (created_at, cached 201 body).
+    #[allow(clippy::type_complexity)]
+    pub(crate) idempotency_cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, serde_json::Value)>>>,
     /// Config VERSION HISTORY — every successful config-plane mutation records its snapshot here.
     /// Arc-shared across apply snapshots (survives every swap); bounded ring (see
     /// `admin::versions`).

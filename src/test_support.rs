@@ -759,6 +759,9 @@ impl TestApp {
             global_hooks: self.global_hooks,
             versions: std::sync::Arc::new(crate::admin::versions::VersionLog::new()),
             mutation_limiter: std::sync::Arc::new(crate::admin::rate::MutationLimiter::new()),
+            idempotency_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
             group_map: std::collections::HashMap::new(),

@@ -1258,6 +1258,7 @@ mod tests {
             global_hooks: Vec::new(),
             versions: Arc::new(crate::admin::versions::VersionLog::new()),
             mutation_limiter: Arc::new(crate::admin::rate::MutationLimiter::new()),
+            idempotency_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
             group_map: std::collections::HashMap::new(),
