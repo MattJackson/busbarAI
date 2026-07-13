@@ -520,6 +520,20 @@ mod tests {
     use super::*;
     use axum::http::Method;
 
+    /// GOLDEN WIRE LITERALS: the mount constants pinned byte-for-byte. Everything else in the app
+    /// DERIVES paths from these constants (no hand-written absolute path anywhere) — so this pin is
+    /// the ONE place a path change must be made deliberately, and the tripwire that catches an
+    /// accidental edit sailing through the derived code.
+    #[test]
+    fn mount_constants_are_the_frozen_wire_literals() {
+        assert_eq!(API_ROOT, "/api");
+        assert_eq!(ADMIN_PREFIX, "/api/v1/admin");
+        assert!(
+            ADMIN_PREFIX.starts_with(API_ROOT),
+            "the admin prefix hangs off the native-API root"
+        );
+    }
+
     /// The §1 authorization matrix, test-locked: reads are read-only, hook-definition mutations
     /// are hooks-register, everything else (keys, config, auth, cache) is full. Unknown methods
     /// fail closed to full.

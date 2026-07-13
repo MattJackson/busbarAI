@@ -4157,9 +4157,12 @@ providers: {}
         );
 
         // DRIFT GUARD: every documented GET path is both listed in the doc AND actually mounted.
-        for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
+        // V1_GET_PATHS entries are RELATIVE; the wire path derives from the contract prefix (whose
+        // literal value is pinned by its own golden test in contract.rs).
+        for (rel, _) in crate::admin::v1::json::V1_GET_PATHS {
+            let path = format!("{}{rel}", crate::admin::v1::contract::ADMIN_PREFIX);
             assert!(
-                doc["paths"][path]["get"].is_object(),
+                doc["paths"][&path]["get"].is_object(),
                 "documented path {path} missing from openapi doc"
             );
             let status = client
@@ -4195,7 +4198,8 @@ providers: {}
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
 
-        for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
+        for (rel, _) in crate::admin::v1::json::V1_GET_PATHS {
+            let path = format!("{}{rel}", crate::admin::v1::contract::ADMIN_PREFIX);
             // No token → 401.
             let none = client
                 .get(format!("http://{addr}{path}"))

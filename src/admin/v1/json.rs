@@ -102,6 +102,13 @@ fn service(handle: &Arc<AppHandle>) -> AdminService {
     AdminService::new(handle.load())
 }
 
+/// Absolute admin path from a RELATIVE one — `contract::ADMIN_PREFIX` + `rel`. The OpenAPI doc keys
+/// (which document the WIRE, so they must be absolute) are all built through this, so no absolute
+/// path is ever hand-written here and none can drift from the mount grammar.
+fn ap(rel: &str) -> String {
+    format!("{}{rel}", crate::admin::v1::contract::ADMIN_PREFIX)
+}
+
 /// §6.3 BODY-DERIVED AUTHORIZATION REFINEMENT for hook registration. The route matrix admits a
 /// `hooks-register` principal to POST/PUT `/api/v1/admin/hooks*`, but that scope is "define a hook,
 /// don't wire it into a security-critical path". A non-`Full` caller therefore may NOT register a
@@ -1323,47 +1330,49 @@ async fn hook_schema(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
     ok_json(StatusCode::OK, &json!({ "name": name, "schema": schema }))
 }
 
-/// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
-/// test and the OpenAPI `paths`. Templated/POST routes are documented separately in `openapi_doc`.
-/// Adding a GET endpoint means adding it here so the doc + the drift guard both see it.
+/// The stable v1 GET endpoints (RELATIVE path, summary), the single source for both the
+/// router-mount drift test and the OpenAPI `paths`. Paths are relative to `contract::ADMIN_PREFIX`
+/// (no absolute path is hand-written anywhere — the `ap` helper derives them). Templated/POST
+/// routes are documented separately in `openapi_doc`. Adding a GET endpoint means adding it here so
+/// the doc + the drift guard both see it.
 pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
-        "/api/v1/admin/info",
+        "/info",
         "Version, compiled-in plugin proof, uptime, topology",
     ),
-    ("/api/v1/admin/pools", "Pool topology (members + weights)"),
-    ("/api/v1/admin/models", "Model lanes + upstream providers"),
-    ("/api/v1/admin/providers", "Distinct providers + lane counts"),
-    ("/api/v1/admin/hooks", "Hook registry (definitions)"),
+    ("/pools", "Pool topology (members + weights)"),
+    ("/models", "Model lanes + upstream providers"),
+    ("/providers", "Distinct providers + lane counts"),
+    ("/hooks", "Hook registry (definitions)"),
     (
-        "/api/v1/admin/plugins",
+        "/plugins",
         "Plugin catalog by type (compiled-in + external)",
     ),
     (
-        "/api/v1/admin/auth",
+        "/auth",
         "Ingress auth chain + upstream-credential mode",
     ),
     (
-        "/api/v1/admin/admin-auth",
+        "/admin-auth",
         "Admin-plane auth config (the admin surface guard)",
     ),
     (
-        "/api/v1/admin/usage",
+        "/usage",
         "Fleet usage aggregation (spend/tokens/requests, per-key)",
     ),
     (
-        "/api/v1/admin/config",
+        "/config",
         "Effective running config snapshot (redacted)",
     ),
     (
-        "/api/v1/admin/audit",
+        "/audit",
         "Admin audit log — every mutation with its outcome (newest first). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
     ),
     (
-        "/api/v1/admin/config/versions",
+        "/config/versions",
         "Config version history (newest first; id/ts/principal/summary). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
     ),
-    ("/api/v1/admin/openapi.json", "This OpenAPI 3.1 document"),
+    ("/openapi.json", "This OpenAPI 3.1 document"),
 ];
 
 /// Build the OpenAPI 3.1 document describing the v1 JSON-REST surface. Paths + methods + the stable
@@ -1374,7 +1383,7 @@ fn openapi_doc() -> serde_json::Value {
     let mut paths = serde_json::Map::new();
     for (path, summary) in V1_GET_PATHS {
         paths.insert(
-            (*path).to_string(),
+            ap(path),
             json!({
                 "get": {
                     "summary": summary,
@@ -1388,10 +1397,7 @@ fn openapi_doc() -> serde_json::Value {
         );
     }
     // Runtime hook registration: POST on the /hooks collection (merged onto its GET entry above).
-    if let Some(obj) = paths
-        .get_mut("/api/v1/admin/hooks")
-        .and_then(|p| p.as_object_mut())
-    {
+    if let Some(obj) = paths.get_mut(&ap("/hooks")).and_then(|p| p.as_object_mut()) {
         obj.insert(
             "post".to_string(),
             json!({
@@ -1408,7 +1414,7 @@ fn openapi_doc() -> serde_json::Value {
     }
     // Templated + non-GET routes.
     paths.insert(
-        "/api/v1/admin/hooks/{name}".to_string(),
+        ap("/hooks/{name}"),
         json!({
             "get": {
                 "summary": "One hook definition",
@@ -1454,7 +1460,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/pools/{name}".to_string(),
+        ap("/pools/{name}"),
         json!({
             "get": {
                 "summary": "Live per-member status of one pool (breaker/concurrency/latency)",
@@ -1471,7 +1477,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/hooks/{name}/health".to_string(),
+        ap("/hooks/{name}/health"),
         json!({
             "get": {
                 "summary": "Best-effort hook transport reachability",
@@ -1488,7 +1494,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/config/diff".to_string(),
+        ap("/config/diff"),
         json!({
             "get": {
                 "summary": "Structured hook-surface diff between two retained versions",
@@ -1507,7 +1513,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/config/versions/{v}".to_string(),
+        ap("/config/versions/{v}"),
         json!({
             "get": {
                 "summary": "One retained config version, with its hook-surface snapshot",
@@ -1524,7 +1530,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/hooks/{name}/settings".to_string(),
+        ap("/hooks/{name}/settings"),
         json!({
             "patch": {
                 "summary": "Push an opaque settings map to the running hook; COMMIT ON ACK",
@@ -1544,7 +1550,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/hooks/{name}/schema".to_string(),
+        ap("/hooks/{name}/schema"),
         json!({
             "get": {
                 "summary": "The hook's self-described settings JSON Schema (describe proxy)",
@@ -1561,7 +1567,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/config/apply".to_string(),
+        ap("/config/apply"),
         json!({
             "post": {
                 "summary": "Apply a full config from the request body, atomically (live until next reload/restart; health preserved by lane identity)",
@@ -1575,7 +1581,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/config/reload".to_string(),
+        ap("/config/reload"),
         json!({
             "post": {
                 "summary": "Re-read config.yaml/providers.yaml from disk and apply atomically (health state preserved by lane identity)",
@@ -1587,7 +1593,7 @@ fn openapi_doc() -> serde_json::Value {
             }
         }),
     );
-    if let Some(auth_path) = paths.get_mut("/api/v1/admin/admin-auth") {
+    if let Some(auth_path) = paths.get_mut(&ap("/admin-auth")) {
         auth_path["put"] = json!({
             "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
             "security": [{"adminToken": []}],
@@ -1599,7 +1605,7 @@ fn openapi_doc() -> serde_json::Value {
         });
     }
     paths.insert(
-        "/api/v1/admin/auth/cache/flush".to_string(),
+        ap("/auth/cache/flush"),
         json!({
             "post": {
                 "summary": "Flush the credential cache — one module's partition (`{module}`) or everything (empty body). Instant revocation of the cached-allow window",
@@ -1612,7 +1618,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/config/rollback".to_string(),
+        ap("/config/rollback"),
         json!({
             "post": {
                 "summary": "Restore a retained version's hook surface (re-validated; a NEW version)",
@@ -1627,7 +1633,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/config/validate".to_string(),
+        ap("/config/validate"),
         json!({
             "post": {
                 "summary": "Dry-run validate a proposed config",
@@ -1643,7 +1649,7 @@ fn openapi_doc() -> serde_json::Value {
     // Virtual-key management (mounted in main.rs, not the v1 router, but part of the frozen v1
     // surface — must be discoverable). The secret is shown ONCE at create/rotate and never read back.
     paths.insert(
-        "/api/v1/admin/keys".to_string(),
+        ap("/keys"),
         json!({
             "get": {
                 "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=. Paginate: ?limit=, ?cursor= (opaque)",
@@ -1666,7 +1672,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/keys/{id}".to_string(),
+        ap("/keys/{id}"),
         json!({
             "get": {
                 "summary": "One key's metadata + `ETag` (never the secret/hash)",
@@ -1700,7 +1706,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/keys/{id}/usage".to_string(),
+        ap("/keys/{id}/usage"),
         json!({
             "get": {
                 "summary": "Current-window usage for one key (spend / tokens / requests)",
@@ -1714,7 +1720,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/api/v1/admin/keys/{id}/rotate".to_string(),
+        ap("/keys/{id}/rotate"),
         json!({
             "post": {
                 "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving",
@@ -1761,19 +1767,19 @@ fn openapi_doc() -> serde_json::Value {
     // advertise a guard they don't enforce. Keys PATCH/DELETE guard on the KEY's own ETag; the
     // config-plane ops guard on the config-version ETag their reads emit.
     const IF_MATCH_GUARDED: &[(&str, &str)] = &[
-        ("/api/v1/admin/hooks", "post"),
-        ("/api/v1/admin/hooks/{name}", "put"),
-        ("/api/v1/admin/hooks/{name}", "delete"),
-        ("/api/v1/admin/hooks/{name}/settings", "patch"),
-        ("/api/v1/admin/admin-auth", "put"),
-        ("/api/v1/admin/config/apply", "post"),
-        ("/api/v1/admin/config/rollback", "post"),
-        ("/api/v1/admin/keys/{id}", "patch"),
-        ("/api/v1/admin/keys/{id}", "delete"),
+        ("/hooks", "post"),
+        ("/hooks/{name}", "put"),
+        ("/hooks/{name}", "delete"),
+        ("/hooks/{name}/settings", "patch"),
+        ("/admin-auth", "put"),
+        ("/config/apply", "post"),
+        ("/config/rollback", "post"),
+        ("/keys/{id}", "patch"),
+        ("/keys/{id}", "delete"),
     ];
     for (path, method) in IF_MATCH_GUARDED {
         if let Some(op) = paths
-            .get_mut(*path)
+            .get_mut(&ap(path))
             .and_then(|p| p.get_mut(*method))
             .and_then(|op| op.as_object_mut())
         {
@@ -1940,8 +1946,8 @@ mod tests {
     }
 
     /// Structural lock on the discovery doc: OpenAPI 3.1, an info.version that matches the crate,
-    /// and every path under the frozen `/api/v1/admin/` prefix (the deprecated aliases are documented
-    /// elsewhere; v1's own doc never mixes prefixes).
+    /// and every path under the ONE contract prefix (whose literal value is pinned by the golden
+    /// test in contract.rs) — the doc never mixes prefixes.
     #[test]
     fn openapi_doc_is_31_and_v1_prefixed() {
         let doc = openapi_doc();
@@ -1950,10 +1956,11 @@ mod tests {
             "discovery doc is OpenAPI 3.1"
         );
         assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
+        let prefix = format!("{}/", crate::admin::v1::contract::ADMIN_PREFIX);
         for path in doc["paths"].as_object().unwrap().keys() {
             assert!(
-                path.starts_with("/api/v1/admin/"),
-                "{path} escaped the frozen /api/v1/admin/ prefix"
+                path.starts_with(&prefix),
+                "{path} escaped the frozen {prefix} prefix"
             );
         }
     }
