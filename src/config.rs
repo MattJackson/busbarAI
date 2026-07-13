@@ -464,7 +464,11 @@ impl<'de> Deserialize<'de> for PoolCfg {
         fn is_strategy_name(name: &str) -> bool {
             matches!(
                 name,
-                "weighted" | "cheapest" | "fastest" | "least_busy" | "usage"
+                ON_ERROR_WEIGHTED
+                    | STRATEGY_CHEAPEST
+                    | STRATEGY_FASTEST
+                    | STRATEGY_LEAST_BUSY
+                    | STRATEGY_USAGE
             )
         }
 
@@ -474,7 +478,8 @@ impl<'de> Deserialize<'de> for PoolCfg {
         // `route` now means only the HTTP router). Name the fix per legacy value.
         if let Some(route) = raw.route.as_deref() {
             let msg = match route {
-                "weighted" | "cheapest" | "fastest" | "least_busy" | "usage" | "native" => {
+                ON_ERROR_WEIGHTED | STRATEGY_CHEAPEST | STRATEGY_FASTEST | STRATEGY_LEAST_BUSY
+                | STRATEGY_USAGE | "native" => {
                     "the `route:` pool key was removed in 1.3; a pool names its ordering strategy \
                      in its `hooks:` list — write `hooks: [<name>]` (e.g. `hooks: [cheapest]`)."
                 }
@@ -514,11 +519,11 @@ impl<'de> Deserialize<'de> for PoolCfg {
 
         fn parse_strategy<E: serde::de::Error>(name: &str) -> Result<PoolPolicy, E> {
             match name {
-                "weighted" => Ok(PoolPolicy::Weighted),
-                "cheapest" => Ok(PoolPolicy::Cheapest),
-                "fastest" => Ok(PoolPolicy::Fastest),
-                "least_busy" => Ok(PoolPolicy::LeastBusy),
-                "usage" => Ok(PoolPolicy::Usage),
+                ON_ERROR_WEIGHTED => Ok(PoolPolicy::Weighted),
+                STRATEGY_CHEAPEST => Ok(PoolPolicy::Cheapest),
+                STRATEGY_FASTEST => Ok(PoolPolicy::Fastest),
+                STRATEGY_LEAST_BUSY => Ok(PoolPolicy::LeastBusy),
+                STRATEGY_USAGE => Ok(PoolPolicy::Usage),
                 other => Err(serde::de::Error::custom(format!(
                     "unknown pool policy '{other}': expected weighted, cheapest, fastest, \
                      least_busy, or usage"
@@ -590,15 +595,15 @@ pub(crate) enum PoolPolicy {
 impl PoolPolicy {
     /// The ranking-registry name for this strategy (`plugins::hooks::ranking::native_policy`).
     /// `weighted` returns `None` — it IS the zero-cost inline-SWRR default and constructs no policy
-    /// object. String literals (not the ranking plugin's constants) so this stays engine-level and
+    /// object. Engine-level `STRATEGY_*` consts (not the ranking plugin's constants) so this
     /// compiles when the `hooks-ranking` plugin is removed; the plugin matches the same names.
     pub(crate) fn native_name(&self) -> Option<&'static str> {
         match self {
             PoolPolicy::Weighted => None,
-            PoolPolicy::Cheapest => Some("cheapest"),
-            PoolPolicy::Fastest => Some("fastest"),
-            PoolPolicy::LeastBusy => Some("least_busy"),
-            PoolPolicy::Usage => Some("usage"),
+            PoolPolicy::Cheapest => Some(STRATEGY_CHEAPEST),
+            PoolPolicy::Fastest => Some(STRATEGY_FASTEST),
+            PoolPolicy::LeastBusy => Some(STRATEGY_LEAST_BUSY),
+            PoolPolicy::Usage => Some(STRATEGY_USAGE),
         }
     }
 }
@@ -690,6 +695,15 @@ fn default_on_error() -> String {
     ON_ERROR_NOTHING.to_string()
 }
 
+/// The native ranking-strategy names — shared by the pool `hooks:` classifier/parser,
+/// `PoolPolicy::native_name`, `RESERVED_HOOK_NAMES`, and the config validator's built-in-strategy
+/// check, so the vocabulary cannot drift. `weighted` is NOT listed here: it is the zero-cost
+/// inline-SWRR floor and its name is owned by `ON_ERROR_WEIGHTED` below.
+pub(crate) const STRATEGY_CHEAPEST: &str = "cheapest";
+pub(crate) const STRATEGY_FASTEST: &str = "fastest";
+pub(crate) const STRATEGY_LEAST_BUSY: &str = "least_busy";
+pub(crate) const STRATEGY_USAGE: &str = "usage";
+
 /// The RESERVED on_error terminal names — every fallback chain must bottom out on one.
 pub(crate) const ON_ERROR_WEIGHTED: &str = "weighted";
 pub(crate) const ON_ERROR_REJECT: &str = "reject";
@@ -728,10 +742,10 @@ pub(crate) const RESERVED_HOOK_NAMES: &[&str] = &[
     ON_ERROR_FIRST,
     ON_ERROR_NOTHING,
     // native ranking strategies (PoolPolicy::native_name)
-    "cheapest",
-    "fastest",
-    "least_busy",
-    "usage",
+    STRATEGY_CHEAPEST,
+    STRATEGY_FASTEST,
+    STRATEGY_LEAST_BUSY,
+    STRATEGY_USAGE,
     // built-in auth modules (AuthModule::name)
     "tokens",
     "admin-tokens",

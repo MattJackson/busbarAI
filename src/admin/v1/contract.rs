@@ -33,6 +33,16 @@ pub(crate) const PATH_ADMIN_AUTH: &str = "/admin-auth";
 pub(crate) const PATH_CONFIG_VALIDATE: &str = "/config/validate";
 pub(crate) const PATH_HOOKS: &str = "/hooks";
 
+/// Shared pagination limit policy (§0.4, one cursor grammar → one limit policy) for the admin
+/// lists: `?limit=` hard cap and default page size, used by the keys list (admin.rs) and the
+/// audit list (json.rs).
+pub(crate) const LIST_LIMIT_MAX: usize = 1000;
+pub(crate) const LIST_LIMIT_DEFAULT: usize = 200;
+/// The versions list's DELIBERATELY smaller default page (100, not the shared 200): each item
+/// carries full config-version metadata, heavier than a key/audit row. The hard cap is still the
+/// shared `LIST_LIMIT_MAX`.
+pub(crate) const VERSIONS_LIMIT_DEFAULT: usize = 100;
+
 /// The three built-in authorization scopes, totally ordered `ReadOnly ⊂ HooksRegister ⊂ Full`
 /// (design-admin-api-v1 §1). Authorization is checked on the PRINCIPAL per endpoint and is NEVER
 /// derived from the request body, so a crafted request cannot escalate. `Ord` derives from

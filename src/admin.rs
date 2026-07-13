@@ -94,7 +94,11 @@ struct CreateKeyReq {
 /// another. Validate at the ingress (key creation) so an operator gets a 400 with the allowed set
 /// instead of a silently-misenforcing key. Kept in lock-step with the arms of
 /// `governance::budget_window`.
-const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
+const VALID_BUDGET_PERIODS: &[&str] = &[
+    crate::governance::BUDGET_PERIOD_TOTAL,
+    crate::governance::BUDGET_PERIOD_DAILY,
+    crate::governance::BUDGET_PERIOD_MONTHLY,
+];
 
 /// Error-type taxonomy strings used by the admin API and by `main.rs` (which references them via
 /// `crate::admin::ERR_TYPE_*`). The two values shared with the forward/OpenAI-family vocabulary
@@ -767,14 +771,17 @@ pub(crate) async fn list_keys(
     // pagination grammar, one limit policy; an unbounded default response is exactly what
     // pagination exists to prevent — re-audit M9).
     let limit = match q.get("limit") {
-        None => 200,
+        None => crate::admin::v1::contract::LIST_LIMIT_DEFAULT,
         Some(v) => match v.parse::<usize>() {
-            Ok(n) => n.min(1000),
+            Ok(n) => n.min(crate::admin::v1::contract::LIST_LIMIT_MAX),
             Err(_) => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     ERR_TYPE_INVALID_REQUEST,
-                    "invalid `limit`: expected an integer (max 1000)",
+                    format!(
+                        "invalid `limit`: expected an integer (max {})",
+                        crate::admin::v1::contract::LIST_LIMIT_MAX
+                    ),
                 )
             }
         },

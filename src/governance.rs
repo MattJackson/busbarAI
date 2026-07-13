@@ -42,11 +42,11 @@ pub(crate) const SECS_PER_DAY: u64 = 86_400;
 
 // ── Budget-period sentinel tokens (matched in `budget_window`) ───────────────────────────────────
 /// The "all-time" budget window sentinel: a single window from epoch 0.
-const BUDGET_PERIOD_TOTAL: &str = "total";
+pub(crate) const BUDGET_PERIOD_TOTAL: &str = "total";
 /// The "daily" budget window sentinel: resets at UTC midnight.
-const BUDGET_PERIOD_DAILY: &str = "daily";
+pub(crate) const BUDGET_PERIOD_DAILY: &str = "daily";
 /// The "monthly" budget window sentinel: resets at UTC first-of-month.
-const BUDGET_PERIOD_MONTHLY: &str = "monthly";
+pub(crate) const BUDGET_PERIOD_MONTHLY: &str = "monthly";
 
 // ── Virtual-key / bearer-secret formats ──────────────────────────────────────────────────────────
 /// The `"vk_"` prefix prepended to the 16-hex-char hash prefix to form a virtual-key id.

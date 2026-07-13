@@ -688,8 +688,8 @@ async fn get_audit(Query(q): Query<std::collections::HashMap<String, String>>) -
     let limit = q
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(200)
-        .min(1000);
+        .unwrap_or(super::contract::LIST_LIMIT_DEFAULT)
+        .min(super::contract::LIST_LIMIT_MAX);
     let start = match cursor_offset(&q) {
         Ok(n) => n,
         Err(resp) => return resp,
@@ -714,8 +714,8 @@ async fn list_config_versions(
     let limit = q
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
-        .min(1000);
+        .unwrap_or(super::contract::VERSIONS_LIMIT_DEFAULT)
+        .min(super::contract::LIST_LIMIT_MAX);
     let start = match cursor_offset(&q) {
         Ok(n) => n,
         Err(resp) => return resp,

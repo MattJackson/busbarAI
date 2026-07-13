@@ -800,7 +800,13 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             // A built-in ranking strategy is infallible (sync, no I/O) — it terminates the chain.
             // Compiled out (`--no-default-features`), naming one is a boot error, never a silent
             // degrade (the same compliance-by-compilation stance as the pool strategy rule).
-            if matches!(current, "cheapest" | "fastest" | "least_busy" | "usage") {
+            if matches!(
+                current,
+                crate::config::STRATEGY_CHEAPEST
+                    | crate::config::STRATEGY_FASTEST
+                    | crate::config::STRATEGY_LEAST_BUSY
+                    | crate::config::STRATEGY_USAGE
+            ) {
                 if cfg!(not(feature = "hooks-ranking")) {
                     errors.push(format!(
                         "hook '{hook_name}' on_error names the built-in ranking strategy \
