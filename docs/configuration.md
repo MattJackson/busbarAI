@@ -210,6 +210,7 @@ auth:
 | `chain` | list<string> | no | `[]` | The ordered authentication chain — each name is a compiled-in auth module (the built-in is `tokens`). `[]` (default) is the open front door: no client authentication, development only, loud startup warning. An unknown module name is a startup error. |
 | `upstream_credentials` | string | no | `own` | Whose key hits the provider: `own` (Busbar's configured lane credential) or `passthrough` (forward the caller's own token upstream — Busbar holds no keys). |
 | `client_tokens` | list<string> | no | `[]` | The `tokens` module's allowlist (env-interpolated). Required to be non-empty when `tokens` is in the chain. All comparisons are constant-time (no timing oracle). Inert when `tokens` is not in the chain. |
+| `modules` | map | no | `{}` | Per-module trust-boundary caps, keyed by module name — see below. |
 | `mode` | string | no | n/a | **Removed in 1.3** (was `token`/`passthrough`/`none`). The `auth` block rejects unknown keys, so a stale `mode:` is a hard parse error. Mapping: `mode: token` → `chain: [tokens]`; `mode: none` → `chain: []`; `mode: passthrough` → `chain: []` + `upstream_credentials: passthrough`. |
 
 **Token extraction order:** `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key`. Blank values are treated as absent.
@@ -231,6 +232,54 @@ auth:
 - **With governance** (`chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 All other five ingress protocols use bearer-style auth and work with every chain configuration.
+
+#### `auth.modules` — per-module trust-boundary caps
+
+An auth module is a fully trusted endpoint: a module asserting `groups: ["busbar-admins"]` IS
+asserting an admin. Two operator-owned caps bound any module's blast radius, applying wherever
+the module appears (the data-plane `chain` or `admin_auth`):
+
+```yaml
+auth:
+  modules:
+    corp-ad:
+      allowed_groups: [llm-users, busbar-viewers]   # groups this module may assert
+      max_admin_scope: read-only                    # ceiling regardless of group_map
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `allowed_groups` | absent (no cap) | Busbar intersects the module's returned groups with this allowlist BEFORE `group_map` resolution — a module cannot claim a group you did not pre-authorize for it. |
+| `max_admin_scope` | `read-only` | Ceiling on the admin scope obtainable through this module, regardless of what `group_map` grants: `read-only` \| `hooks-register` \| `full`. `full` is an explicit opt-in, warned at startup. The built-in `admin-tokens` operator credential is exempt (it is the root credential). |
+
+---
+
+### `admin_auth` and `group_map`
+
+The admin API (`/admin/v1/*`) authenticates through its own chain — `admin_auth:` (default
+`[admin-tokens]`, the single operator token) — and `group_map:` maps identity-provider GROUPS to
+authority, both admin and data-plane:
+
+```yaml
+admin_auth: [admin-tokens]
+
+group_map:
+  busbar-admins:  { admin_scope: full }
+  busbar-viewers: { admin_scope: read-only }
+  llm-users:      { allowed_pools: [my-pool], rpm_limit: 600 }
+```
+
+| Field | Notes |
+|---|---|
+| `admin_scope` | The admin authority this group grants: `read-only` \| `hooks-register` \| `full`. Absent = none. The most permissive of a principal's mapped groups wins (then the module ceiling applies). |
+| `allowed_pools` | DATA-PLANE grant: pools this group may target. Setting it (even `[]` = every pool) is what grants inference access at all; a group with only `admin_scope` confers none. Pool lists union across a principal's groups. |
+| `rpm_limit` / `tpm_limit` / `max_budget_cents` | Rate and spend caps for principals granted through this group — enforced by exactly the machinery a virtual key uses, keyed by the principal. Most-permissive union: a granting group without a cap lifts that axis; otherwise the max wins. |
+
+Unmapped groups grant nothing (fail closed): with governance enabled, an identified principal
+whose groups earn no `allowed_pools` grant is rejected outright.
+
+The admin chain is live-mutable over the API (`PUT /admin/v1/auth`) with an anti-lockout guard —
+see the [Admin API guide](./admin-api.md).
 
 ---
 

@@ -57,7 +57,30 @@ clear startup error telling you exactly what to write instead.
   access, and audit all follow the authenticated principal, whoever issued it.
 - **Admin API lockdown.** The admin API authenticates through its own pluggable chain, with
   scoped principals (read-only, hooks-register, full) replacing the single shared admin
-  token, and every mutation in the audit log attributed to the person who made it.
+  token, and every mutation in the audit log attributed to the person who made it. The chain
+  itself is live-mutable — `PUT /admin/v1/auth` — and guarded so a change that would lock the
+  caller out is refused instead of applied.
+- **The rewrite verb.** A trusted gate (`prompt: rw`) can replace the request body before
+  dispatch — context compression, redaction — across all six protocols at once, because it
+  fires on the normalized form. Rewrites persist across failover, token accounting uses the
+  rewritten body (the savings are real and measured), and a malformed or slow rewrite proceeds
+  with the original body untouched — a broken compressor can never corrupt a request.
+- **Live hook settings.** Push a settings map to a running hook over the admin API; the change
+  commits only when the hook acknowledges it, and a restarted hook always receives its current
+  settings before any traffic. Hooks can also describe their own settings schema, served
+  verbatim by the API.
+- **Config reload, and health that survives everything.** `POST /admin/v1/config/reload`
+  re-reads your config files and applies them atomically — and lane health (circuit breakers,
+  cooldowns, learned latency) is carried across by model identity, not list position, so a
+  reorder or an added model never resets what Busbar has learned. The same health state now
+  persists across restarts too: kill Busbar, fix the config, start it again — sub-second, and
+  it comes back remembering which lanes were misbehaving. `--safe-mode` boots from your base
+  config alone when an API-applied overlay is the problem.
+- **Group-based governance.** Map identity-provider groups to authority in one place:
+  `group_map:` grants admin scopes and data-plane access (allowed pools, rate limits, budgets)
+  to groups, and a group-mapped user is governed by exactly the machinery a virtual key uses.
+  Per-module caps bound what any auth module can assert: an allowlist of groups it may claim,
+  and a ceiling on the admin scope obtainable through it.
 
 ### Changed
 
