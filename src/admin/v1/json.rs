@@ -729,7 +729,18 @@ async fn list_config_versions(
 }
 
 /// `GET /api/v1/admin/config/versions/{v}` — one retained version WITH its hook-surface snapshot.
-async fn get_config_version(State(handle): State<Arc<AppHandle>>, Path(v): Path<u64>) -> Response {
+/// The `{v}` segment is bound as a STRING and parsed here (not `Path<u64>`): a typed extractor
+/// rejects a non-numeric segment with axum's OWN plain-text 400, escaping the frozen envelope —
+/// parsing in-handler lets a malformed version speak `invalid_request` like every other 400.
+async fn get_config_version(
+    State(handle): State<Arc<AppHandle>>,
+    Path(v): Path<String>,
+) -> Response {
+    let Ok(v) = v.parse::<u64>() else {
+        return err_json(&AdminError::Validation(format!(
+            "config version must be a non-negative integer; got `{v}`"
+        )));
+    };
     match handle.load().versions.get(v) {
         Some(cv) => {
             // Project the snapshot through the ONE wire HookView shape (against the SNAPSHOT's own
