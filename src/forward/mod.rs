@@ -2322,9 +2322,11 @@ fn system_text_chars(v: &Value, ingress_protocol: &str) -> usize {
 
 /// Total chars across the system prompt + every conversation turn's text content, DIALECT-AWARE.
 /// `content` is a bare string or an array of blocks carrying `text` (Anthropic text blocks,
-/// Bedrock `[{text}]`, Responses `input_text` items all match on the `text` key); gemini turns
-/// carry `parts[].text` instead. A best-effort projection over the pristine ingress body —
-/// never fails, never allocates per char.
+/// Bedrock `[{text}]`, or Responses `input_text` blocks NESTED inside a message's `content[]`);
+/// gemini turns carry `parts[].text` instead. The Responses API ALSO allows a TOP-LEVEL typed item
+/// directly in `input[]` (`{type: "input_text", text: "…"}`, no `content` key) — that text lives at
+/// the item root, so a responses turn with no `content` falls back to its own `text` key (mirroring
+/// the proto reader). A best-effort projection over the pristine ingress body — never fails.
 fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> usize {
     let mut total = system_chars;
     if let Some(turns) = conversation_turns(v, ingress_protocol) {
@@ -2340,6 +2342,13 @@ fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> u
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                             total += t.chars().count();
                         }
+                    }
+                }
+                // A top-level Responses `input_text`/`output_text` item carries its text at the
+                // item root, not under `content` — count it so the SIZE signal is not blinded.
+                _ if ingress_protocol == "responses" => {
+                    if let Some(t) = m.get("text").and_then(Value::as_str) {
+                        total += t.chars().count();
                     }
                 }
                 _ => {}
@@ -2462,12 +2471,28 @@ fn build_prompt_projection<'a>(
         Some(turns) => turns
             .iter()
             .map(|m| {
-                let role: Cow<'_, str> =
-                    Cow::Borrowed(m.get("role").and_then(|r| r.as_str()).unwrap_or(""));
                 let text = if ingress_protocol == "gemini" {
                     flatten_gemini_parts(m)
+                } else if ingress_protocol == "responses" && m.get("content").is_none() {
+                    // A top-level Responses typed item (`{type: "input_text"/"output_text", text}`)
+                    // carries its text at the item root, not under `content`.
+                    m.get("text")
+                        .and_then(Value::as_str)
+                        .map_or(Cow::Borrowed(""), Cow::Borrowed)
                 } else {
                     flatten_content(m.get("content"))
+                };
+                let role: Cow<'_, str> = match m.get("role").and_then(|r| r.as_str()) {
+                    Some(r) => Cow::Borrowed(r),
+                    // Top-level typed item without a `role`: infer from its `type` so a `prompt: rw`
+                    // hook sees the correct speaker (`output_text` = assistant, else user).
+                    None if ingress_protocol == "responses" => {
+                        match m.get("type").and_then(Value::as_str) {
+                            Some("output_text") => Cow::Borrowed("assistant"),
+                            _ => Cow::Borrowed("user"),
+                        }
+                    }
+                    None => Cow::Borrowed(""),
                 };
                 (role, text)
             })
@@ -11587,6 +11612,33 @@ mod hook_opt_in_projection_tests {
         let req = build_rewrite_request(&v, "p", "responses", false, true);
         assert_eq!(req.message_count, 1);
         assert_eq!(req.total_chars, 15);
+
+        // REGRESSION (audit c1r9): TOP-LEVEL typed items in `input[]` carry text at the item ROOT
+        // (`{type:"input_text", text}`), not under `content`. They must project (not blank) and
+        // count toward the SIZE signal, with role inferred from `type`.
+        let v: Value = serde_json::json!({
+            "input": [
+                {"type": "input_text", "text": "hello"},
+                {"type": "output_text", "text": "hi back"}
+            ]
+        });
+        let p = build_prompt_projection(&v, "responses");
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".into(), "hello".into()),
+                ("assistant".into(), "hi back".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>,
+            "top-level input_text/output_text items must project with inferred roles, not blank"
+        );
+        assert_eq!(
+            total_text_chars(&v, "responses", 0),
+            5 + 7,
+            "top-level item text must count toward the size signal, not read as 0"
+        );
+        let req = build_rewrite_request(&v, "p", "responses", false, true);
+        assert_eq!(req.message_count, 2);
+        assert_eq!(req.total_chars, 12);
     }
 
     /// REGRESSION (audit c1r7): the `max_tokens` routing SIZE signal must be dialect-aware. The

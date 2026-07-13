@@ -2970,6 +2970,81 @@ providers: {}
         handle.abort();
     }
 
+    /// REGRESSION (audit c1r9): the UNKNOWN-NAME 404 on `PUT /hooks/{name}` and
+    /// `PATCH /hooks/{name}/settings` must be AUDITED (like DELETE's 404) — an unaudited 404 lets a
+    /// principal probe which hook names exist by response code alone, with no trail.
+    #[tokio::test]
+    async fn test_admin_v1_hook_mutation_404_is_audited() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Two uniquely-named, NEVER-registered hooks so the audit assertions can't collide.
+        let put_name = "ghost_put_hook_q3";
+        let patch_name = "ghost_patch_hook_q3";
+
+        let put_resp = client
+            .put(format!("http://{addr}/admin/v1/hooks/{put_name}"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9978/"}})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 404, "PUT on an unknown hook is a 404");
+
+        let patch_resp = client
+            .patch(format!(
+                "http://{addr}/admin/v1/hooks/{patch_name}/settings"
+            ))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"settings": {"k": "v"}}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_resp.status(),
+            404,
+            "PATCH on an unknown hook is a 404"
+        );
+
+        // Both 404s must appear in the audit log as REJECTED, resource-named.
+        for (name, action) in [(put_name, "hook.replace"), (patch_name, "hook.settings")] {
+            let filtered: serde_json::Value = client
+                .get(format!("http://{addr}/admin/v1/audit?resource=hook:{name}"))
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let entry = filtered["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["resource"] == format!("hook:{name}"))
+                .unwrap_or_else(|| panic!("the {action} 404 must be recorded in the audit log"));
+            assert_eq!(entry["action"], action);
+            assert_eq!(
+                entry["outcome"], "rejected",
+                "the unknown-name 404 is a rejected mutation, audited"
+            );
+        }
+
+        handle.abort();
+    }
+
     /// `GET /admin/v1/keys` supports `?prefix=` and `?enabled=` filters (§2.1): a full-id prefix
     /// returns just that key; a non-matching prefix returns none; `?enabled=true` includes a fresh key.
     #[tokio::test]

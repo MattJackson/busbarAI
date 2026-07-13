@@ -361,6 +361,9 @@ async fn put_hook(
     let current = handle.load();
     let resource = format!("hook:{name}");
     if !current.hook_registry.contains_key(&name) {
+        // Audit the 404 like every other reject in this handler (and like DELETE's 404) — otherwise
+        // an attacker can probe which hook names exist via the response code with no audit trail.
+        audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     }
     if current.base_hook_names.contains(&name) {
@@ -1059,6 +1062,9 @@ async fn patch_hook_settings(
     let current = handle.load();
     let resource = format!("hook:{name}");
     let Some(existing) = current.hook_registry.get(&name) else {
+        // Audit the 404 like the other rejects here (and DELETE) — a missing audit row on the
+        // unknown-name path lets a narrow token probe which hooks exist by response code alone.
+        audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
     // §6.3 escalation guard, keyed on the EXISTING hook's grants (PATCH changes settings, not
