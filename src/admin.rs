@@ -463,44 +463,15 @@ pub(crate) async fn update_key(
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
     }
-    // OPTIMISTIC CONCURRENCY (optional `If-Match`): compare the caller's ETag against the CURRENT
-    // record before mutating — a stale tag is a 409, never a lost update. Absent header = the
-    // transitional unguarded path (mandatory at the release contract).
-    if let Some(if_match) = headers
+    // OPTIMISTIC CONCURRENCY (optional `If-Match`): the caller's ETag is compared against the
+    // CURRENT record — a stale tag is a 409, never a lost update. The compare must be ATOMIC with
+    // the write, so it is deferred INTO the gated write closure below (a separate pre-read here
+    // would leave a window in which a concurrent PATCH mutates the row between the check and this
+    // write, defeating the guard). Absent header = the transitional unguarded path.
+    let if_match: Option<String> = headers
         .get(axum::http::header::IF_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().trim_matches('"').to_string())
-    {
-        let gov2 = gov.clone();
-        let id2 = id.clone();
-        let current = tokio::task::spawn_blocking(move || {
-            gov2.all_keys()
-                .map(|keys| keys.into_iter().find(|k| k.id == id2))
-        })
-        .await;
-        match current {
-            Ok(Ok(Some(k))) => {
-                if key_etag(&k) != if_match {
-                    audit::AUDIT.record_by(
-                        "key.patch",
-                        &format!("key:{id}"),
-                        audit::OUTCOME_REJECTED,
-                        &actor,
-                    );
-                    return error_response(
-                        StatusCode::CONFLICT,
-                        ERR_TYPE_CONFLICT,
-                        "If-Match ETag is stale: the key changed since you read it",
-                    );
-                }
-            }
-            Ok(Ok(None)) => {
-                return error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
-            }
-            Ok(Err(e)) => return internal_error("update_key", &e),
-            Err(e) => return join_error("update_key", &e),
-        }
-    }
+        .map(|v| v.trim().trim_matches('"').to_string());
     // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
     // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
     // only the byte length via `parse_err_log` — no raw error, no input fragment.
@@ -566,18 +537,45 @@ pub(crate) async fn update_key(
     // handler. If the client drops the request, the already-scheduled closure still runs to completion
     // holding the gate — so a dropped outer future can never release the gate while the lookup→write
     // is still in flight (which would re-open the resurrection / double-revoke races).
+    // The If-Match compare and the write run TOGETHER under the existence gate, so the record the
+    // ETag was checked against is the same record that gets updated — no concurrent PATCH can slip
+    // between them and defeat the guard (the lost-update the separate pre-read allowed).
+    enum UpdateOutcome {
+        Updated(Box<crate::governance::VirtualKey>),
+        NotFound,
+        EtagStale,
+    }
     let resource = format!("key:{id}");
-    let res = tokio::task::spawn_blocking(move || {
-        let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
-        gov.update_key(&id, enabled, rpm, tpm, budget)
-    })
-    .await;
+    let res =
+        tokio::task::spawn_blocking(move || -> crate::governance::StoreResult<UpdateOutcome> {
+            let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tag) = &if_match {
+                match gov.all_keys()?.into_iter().find(|k| k.id == id) {
+                    Some(k) if key_etag(&k) != *tag => return Ok(UpdateOutcome::EtagStale),
+                    None => return Ok(UpdateOutcome::NotFound),
+                    Some(_) => {}
+                }
+            }
+            Ok(match gov.update_key(&id, enabled, rpm, tpm, budget)? {
+                Some(key) => UpdateOutcome::Updated(Box::new(key)),
+                None => UpdateOutcome::NotFound,
+            })
+        })
+        .await;
     match res {
-        Ok(Ok(Some(key))) => {
+        Ok(Ok(UpdateOutcome::Updated(key))) => {
             audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_APPLIED, &actor);
             json_response(StatusCode::OK, key_meta(&key))
         }
-        Ok(Ok(None)) => {
+        Ok(Ok(UpdateOutcome::EtagStale)) => {
+            audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(
+                StatusCode::CONFLICT,
+                ERR_TYPE_CONFLICT,
+                "If-Match ETag is stale: the key changed since you read it",
+            )
+        }
+        Ok(Ok(UpdateOutcome::NotFound)) => {
             audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_REJECTED, &actor);
             error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
         }
