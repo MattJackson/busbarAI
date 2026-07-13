@@ -12,8 +12,11 @@ interface Props {
   author?: string;
   /** GitHub Discussion URL for this post's comment thread (rendered as the Comments CTA). */
   discussion?: string;
+  /** Per-post social card (absolute path under the site, e.g. /og/claude-code.png). Falls back to the shared card. */
+  ogImage?: string;
 }
-const { title, description, datePublished, author, discussion } = Astro.props;
+const { title, description, datePublished, author, discussion, ogImage } = Astro.props;
+const ogImageUrl = new URL(ogImage || '/og-card.png', 'https://getbusbar.com').href;
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const YEAR = new Date().getFullYear();
@@ -42,8 +45,9 @@ const ARTICLE = datePublished
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="https://getbusbar.com/og-card.png" />
+    <meta property="og:image" content={ogImageUrl} />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content={ogImageUrl} />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(ARTICLE)} />
   </head>
@@ -142,6 +146,36 @@ const ARTICLE = datePublished
       /* POST */
       .post-wrap { min-height: calc(100vh - 64px - 200px); padding: 64px 28px 96px; }
       .post { max-width: 720px; margin: 0 auto; }
+      /* Tables in blog prose (e.g. the Headroom benchmark). */
+      .post table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 1.6rem 0;
+        font-size: 0.95rem;
+        font-variant-numeric: tabular-nums;
+      }
+      .post th, .post td {
+        padding: 0.55rem 0.4rem;
+        text-align: left;
+        border-bottom: 1px solid #e2e8f0;
+      }
+      .post th:first-child, .post td:first-child { width: 99%; padding-left: 0; }
+      .post th:not(:first-child), .post td:not(:first-child) {
+        text-align: right;
+        white-space: nowrap;
+        width: 4.5rem;
+        padding-left: 1.4rem;
+      }
+      .post thead th {
+        font-weight: 600;
+        color: var(--muted);
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        border-bottom-width: 2px;
+        border-bottom-color: #cbd5e1;
+      }
+      .post tbody tr:last-child td { border-bottom: none; }
       .post-back { display: inline-block; font-size: 14px; color: var(--muted); margin-bottom: 28px; }
       .post-back:hover { color: var(--slate); }
       .post-meta { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; margin: 0 0 12px; }
@@ -160,8 +194,11 @@ const ARTICLE = datePublished
       .post-body em { color: var(--muted); }
       .post-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
       .post-body pre { background: var(--slate); color: #e2e8f0; border-radius: 10px; padding: 18px 20px; overflow-x: auto; margin: 0 0 20px; }
+      .post-body img { display: block; max-width: 100%; height: auto; margin: 8px auto 22px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 30px rgba(15,23,42,0.10); }
       .post-body pre code { background: none; border: none; padding: 0; color: inherit; font-size: 13.5px; }
       .post-body blockquote { margin: 0 0 22px; padding: 4px 0 4px 20px; border-left: 3px solid var(--lime); color: #475569; font-size: 17px; }
+      .post-body img { display: block; max-width: min(100%, 620px); height: auto; margin: 10px auto 24px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 1px 3px rgba(15,23,42,0.06); }
+      .post-body img + em { display: block; text-align: center; font-size: 13.5px; color: var(--muted); margin: -14px 0 26px; }
 
       /* COMMENTS (giscus) */
       .post-comments { max-width: 720px; margin: 64px auto 0; padding-top: 36px; border-top: 1px solid var(--line); }
