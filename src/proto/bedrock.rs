@@ -1989,7 +1989,15 @@ impl super::StreamFraming for BedrockStreamFraming {
         // exactly-one-metadata invariant holds even against a hostile backend. A well-behaved egress
         // (all 6 readers) emits at most one terminal stop-delta, so this is byte-identical for real
         // streams; once emitted, a repeat call yields only the (idempotent) stop frame.
-        let has_usage = usage.input_tokens != 0 || usage.output_tokens != 0;
+        // Cache-only usage counts too: a FULL cache hit can carry `input_tokens == 0 &&
+        // output_tokens == 0` yet non-zero `cache_read_input_tokens` / `cache_creation_input_tokens`.
+        // Omitting the cache fields deferred the metadata frame and later flushed a ZERO-usage
+        // `metadata` frame, so the Bedrock client SDK's stream-metadata callback under-reported the
+        // cache tokens on the wire. Include them so the real usage is emitted inline. (audit c2r4.)
+        let has_usage = usage.input_tokens != 0
+            || usage.output_tokens != 0
+            || usage.cache_read_input_tokens.unwrap_or(0) != 0
+            || usage.cache_creation_input_tokens.unwrap_or(0) != 0;
         if !self.emitted {
             if has_usage {
                 events.push(crate::ir::IrStreamEvent::MessageDelta {
@@ -8709,6 +8717,43 @@ mod tests {
             metadata_delta_count(&second),
             0,
             "second call must emit ZERO metadata deltas (the !emitted guard suppresses the duplicate); got {second:?}"
+        );
+    }
+
+    /// REGRESSION (audit c2r4): a CACHE-ONLY stop-delta (`input_tokens == 0 && output_tokens == 0`
+    /// but non-zero cache tokens — a full cache hit) must emit its `metadata` frame INLINE with the
+    /// real cache tokens, not defer it and later flush a zero-usage frame. `has_usage` now includes
+    /// the cache fields.
+    #[test]
+    fn cache_only_usage_emits_metadata_inline() {
+        fn metadata_delta_count(events: &[crate::ir::IrStreamEvent]) -> usize {
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        crate::ir::IrStreamEvent::MessageDelta {
+                            stop_reason: None,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        }
+        let usage = crate::ir::IrUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(4096), // full cache hit
+        };
+        let mut framing = BedrockStreamFraming::default();
+        let evs = framing
+            .on_combined_stop_delta(crate::ir::IrStopReason::EndTurn, None, &usage)
+            .expect("stop-delta returns events");
+        assert_eq!(
+            metadata_delta_count(&evs),
+            1,
+            "a cache-only stop-delta must emit ONE metadata frame inline with the real cache tokens, not defer a zero-usage frame; got {evs:?}"
         );
     }
 

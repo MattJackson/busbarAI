@@ -109,6 +109,9 @@ async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
 /// (PATCH) so all three write paths enforce ONE limit with no drift.
 pub(crate) const MAX_SETTINGS_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_SETTINGS_KEYS: usize = 256;
+/// Upper bound on a hook name (a registry key persisted to the state file + every audit row).
+/// Generous headroom over any real hook name; guards the durable-state/audit/reconnect path.
+pub(crate) const MAX_HOOK_NAME_LEN: usize = 256;
 
 /// Fail-closed size check for a hook's `settings` map — see the cap rationale above.
 pub(crate) fn validate_hook_settings_size(
@@ -135,6 +138,16 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     // ── validate the definition (fail-closed, before any mutation) ──
     if name.trim().is_empty() {
         return Err(AdminError::Validation("hook name must not be empty".into()));
+    }
+    // Cap the name length. The name is a registry key that gets written VERBATIM into the overlay
+    // state file and every audit row (and echoed on the wire); without a bound a `hooks-register`
+    // token could POST a name up to the body-size cap (~MB), bloating the durable state / audit /
+    // reconnect path — the same defensive posture as the key-id / settings caps. (found: audit c2r4.)
+    if name.len() > MAX_HOOK_NAME_LEN {
+        return Err(AdminError::Validation(format!(
+            "hook name is {} chars; must be <= {MAX_HOOK_NAME_LEN}",
+            name.len()
+        )));
     }
     // The `settings` map rides register/PUT too — cap it here so it is bounded on EVERY write path,
     // not just PATCH (found: audit c1r12 — register/PUT were missing the cap PATCH already had).
@@ -877,6 +890,25 @@ mod tests {
         ok.settings
             .insert("level".to_string(), serde_json::json!("info"));
         assert!(build_with_hook(&app, "fine", ok).is_ok());
+    }
+
+    /// REGRESSION (audit c2r4): the hook NAME (a registry key persisted to the state file + every
+    /// audit row) must be length-capped, like the key id / settings map — else a `hooks-register`
+    /// token could POST a megabyte-long name and bloat the durable state / audit / reconnect path.
+    #[test]
+    fn build_with_hook_caps_oversized_name() {
+        let app = TestApp::new().build();
+        let huge = "n".repeat(MAX_HOOK_NAME_LEN + 1);
+        assert!(
+            matches!(
+                build_with_hook(&app, &huge, hook(HookKind::Tap, false)),
+                Err(AdminError::Validation(_))
+            ),
+            "a name over the cap must reject"
+        );
+        // A name AT the cap is fine.
+        let at_cap = "n".repeat(MAX_HOOK_NAME_LEN);
+        assert!(build_with_hook(&app, &at_cap, hook(HookKind::Tap, false)).is_ok());
     }
 
     /// Validation is fail-closed BEFORE any mutation: `prompt: rw` on a tap and a missing transport
