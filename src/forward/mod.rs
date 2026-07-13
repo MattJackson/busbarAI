@@ -2528,6 +2528,7 @@ async fn decide_policy_order(
     ingress_protocol: &str,
     wants_stream: bool,
     caller_token: Option<&str>,
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
 ) -> PolicyOutcome {
     use crate::routing::{
         Candidate, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingRequest,
@@ -2566,15 +2567,20 @@ async fn decide_policy_order(
         return PolicyOutcome::Weighted;
     }
 
-    // ONE governance key lookup serves both consumers: the per-key rate headroom (always, same
-    // value across candidates today — rate limits are per-key; see `Candidate.rate_headroom`) and,
-    // behind `policy.send_user`, the caller identity projection. The secret is CONSUMED here by
-    // `lookup`; only the returned key RECORD flows forward — nothing downstream sees the token.
+    // ONE governance key serves both consumers: the per-key rate headroom (always, same value
+    // across candidates today — rate limits are per-key; see `Candidate.rate_headroom`) and, behind
+    // `policy.send_user`, the caller identity projection. A virtual-key caller resolves via
+    // `lookup` (which CONSUMES the secret; only the returned key RECORD flows forward — nothing
+    // downstream sees the token). A GROUP/SSO principal's token is NOT a virtual-key secret, so
+    // `lookup` misses — fall back to the key the auth layer already SYNTHESIZED for it (carried in
+    // `GovCtx.key`, threaded here as `resolved_gov_key`). Without this fallback `rate_headroom` and
+    // `identity` were silently `None` for every group principal, blinding usage/identity policies.
     let gov = app.governance.as_ref();
     let gov_key = match (gov, caller_token) {
         (Some(g), Some(tok)) => g.lookup(tok),
         _ => None,
-    };
+    }
+    .or_else(|| resolved_gov_key.cloned());
     let rate_headroom: Option<f64> = match (gov, gov_key.as_ref()) {
         (Some(g), Some(key)) => g.rate_headroom(key, now()),
         _ => None,
@@ -3015,6 +3021,9 @@ pub(crate) async fn forward_with_pool(
         Some(v),
         APPLICATION_JSON,
         caller_token,
+        // The thin bytes-only wrapper (tests / ad-hoc routes) carries no pre-resolved GovCtx; a
+        // virtual-key caller still resolves via the token `lookup` inside `decide_policy_order`.
+        None,
         pool_name,
         affinity_key,
         ingress_protocol,
@@ -3044,6 +3053,7 @@ pub(crate) async fn forward_with_pool_parsed(
     v: Option<Value>,
     req_content_type: &str,
     caller_token: Option<&str>,
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -3076,6 +3086,7 @@ pub(crate) async fn forward_with_pool_parsed(
         v,
         req_content_type,
         caller_token,
+        resolved_gov_key,
         pool_name,
         affinity_key,
         ingress_protocol,
@@ -3125,6 +3136,9 @@ async fn forward_with_pool_parsed_inner(
     // The ingress request Content-Type — the byte-level codec's parse hint (multipart boundary).
     req_content_type: &str,
     caller_token: Option<&str>,
+    // The key the auth layer already resolved/synthesized for this caller (`GovCtx.key`) — used as
+    // the routing-signal source when the token is not a virtual-key secret (group/SSO principals).
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -3410,6 +3424,7 @@ async fn forward_with_pool_parsed_inner(
                     ingress_protocol,
                     wants_stream,
                     caller_token,
+                    resolved_gov_key,
                 )
             }))
             .await;
@@ -3574,6 +3589,7 @@ async fn forward_with_pool_parsed_inner(
                     ingress_protocol,
                     wants_stream,
                     caller_token,
+                    resolved_gov_key,
                 )
                 .await;
                 match outcome {
@@ -11826,6 +11842,7 @@ mod hook_seam_tests {
             "anthropic",
             false,
             None,
+            None,
         )
         .await;
         let captured = seen.lock().unwrap().clone();
@@ -12938,6 +12955,7 @@ mod hook_seam_tests {
             "anthropic",
             false,
             Some(&secret),
+            None,
         )
         .await;
         let captured = seen.lock().unwrap().clone().expect("policy called");
@@ -12948,6 +12966,79 @@ mod hook_seam_tests {
         // The secret NEVER rides the projection, under any configuration.
         assert_ne!(key_id.as_deref(), Some(secret.as_str()));
         assert_ne!(key_name.as_deref(), Some(secret.as_str()));
+    }
+
+    /// REGRESSION (audit c1r10): a GROUP/SSO principal's token is not a virtual-key secret, so the
+    /// `decide_policy_order` token `lookup` MISSES — but the auth layer already synthesized a key
+    /// for it (`GovCtx.key`, threaded as `resolved_gov_key`). The identity projection must fall back
+    /// to that synthesized key so `send_user` policies see the caller, instead of silently `None`.
+    #[tokio::test]
+    async fn send_user_falls_back_to_synthesized_group_key_identity() {
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let seen = Arc::new(StdMutex::new(None));
+        let resolved = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: seen.clone(),
+                reject: None,
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: true,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        let cands = vec![WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
+        // A synthesized principal key exactly as the auth layer builds one for a group/SSO caller:
+        // id/name carry the principal, key_hash is a non-secret marker never inserted into by_hash.
+        let synth = crate::governance::VirtualKey {
+            id: "eng-oncall".to_string(),
+            key_hash: "principal:eng-oncall".to_string(),
+            name: "eng-oncall".to_string(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        };
+        let rc = RequestCtx::new(60);
+        let v = body();
+        // caller_token is the RAW SSO bearer — NOT a virtual-key secret, so lookup would miss.
+        decide_policy_order(
+            &app,
+            &resolved,
+            &cands,
+            &rc,
+            &v,
+            "p",
+            "anthropic",
+            false,
+            Some("sso-jwt-not-a-vkey-secret"),
+            Some(&synth),
+        )
+        .await;
+        let captured = seen.lock().unwrap().clone().expect("policy called");
+        let (key_id, key_name, _user) = captured.identity.expect("identity present");
+        assert_eq!(
+            key_id.as_deref(),
+            Some("eng-oncall"),
+            "a group principal's synthesized key id must project, not fall through to None"
+        );
+        assert_eq!(key_name.as_deref(), Some("eng-oncall"));
     }
 
     /// DEFENSE IN DEPTH at the seam: the shipped transports clamp/sanitize in `wire::normalize`,

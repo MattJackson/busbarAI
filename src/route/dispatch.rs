@@ -241,6 +241,10 @@ pub(crate) async fn operation_resolved(
             &req_ct_owned
         },
         caller_token,
+        // The key the auth layer resolved/synthesized for this caller — lets the routing-signal
+        // path project rate_headroom/identity for group/SSO principals whose token is not a
+        // virtual-key secret (so a token `lookup` would miss).
+        gov.key.as_ref(),
         pool_name,
         affinity_key.as_deref(),
         proto,
