@@ -1145,6 +1145,89 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// `POST /admin/v1/config/apply`: a body-carried full config swaps in atomically — the new
+    /// topology is live, the surviving identity keeps its tripped health, and a stale
+    /// expected_version is a 409 that changes nothing.
+    #[tokio::test]
+    async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new()
+            .lane(crate::test_support::LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .governance(gov)
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .store
+            .record_hard_down(0, "tripped before apply");
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        let body = serde_json::json!({
+            "providers": {
+                "test-provider": {"protocol": "anthropic", "base_url": "http://127.0.0.1:1/", "api_key_env": "BUSBAR_TEST_APPLY_NO_KEY"}
+            },
+            "config": {
+                "listen": "127.0.0.1:0",
+                "providers": {"test-provider": {"api_key_env": "BUSBAR_TEST_APPLY_NO_KEY"}},
+                "models": {
+                    "m0": {"provider": "test-provider", "max_concurrent": 4},
+                    "m-applied": {"provider": "test-provider", "max_concurrent": 4}
+                },
+                "pools": {"apply-pool": {"members": [{"target": "m0"}, {"target": "m-applied"}]}}
+            }
+        });
+        let resp = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+
+        let pool: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/pools/apply-pool")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let members = pool["members"].as_array().unwrap();
+        let m0 = members.iter().find(|m| m["model"] == "m0").unwrap();
+        let ma = members.iter().find(|m| m["model"] == "m-applied").unwrap();
+        assert_eq!(m0["usable"], false, "carried trip: {m0}");
+        assert_eq!(ma["usable"], true, "fresh lane: {ma}");
+
+        // Stale expected_version: 409, nothing applied.
+        let stale = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+            .body(
+                serde_json::json!({
+                    "config": {"listen": "127.0.0.1:0", "providers": {}, "models": {}, "pools": {}},
+                    "expected_version": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status().as_u16(), 409);
+
+        handle.abort();
+    }
+
     /// `POST /admin/v1/config/reload`: re-reads disk truth and swaps it in atomically — the new
     /// topology is live, surviving lanes keep their learned health BY IDENTITY (a breaker tripped
     /// before the reload is still tripped after it), and an invalid disk config rejects with 400

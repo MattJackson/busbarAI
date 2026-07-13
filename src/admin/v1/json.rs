@@ -63,6 +63,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/config/diff", get(config_diff))
             .route("/admin/v1/config/rollback", post(rollback_config))
             .route("/admin/v1/config/reload", post(reload_config))
+            .route("/admin/v1/config/apply", post(apply_config))
             .route("/admin/v1/openapi.json", get(openapi))
     }
 }
@@ -638,6 +639,108 @@ async fn reload_config(
     }
 }
 
+/// The `POST /admin/v1/config/apply` body: a full proposed config (validate's exact shape) plus
+/// the optimistic-concurrency guard.
+#[derive(serde::Deserialize)]
+struct ApplyConfigReq {
+    /// The deploy config (operator-owned `config.yaml` shape).
+    config: crate::config::DeployCfg,
+    /// The provider definitions (`providers.yaml` shape). Optional — empty validates/fails loudly
+    /// on dangling references.
+    #[serde(default)]
+    providers: std::collections::HashMap<String, crate::config::ProviderDef>,
+    #[serde(default)]
+    expected_version: Option<u64>,
+}
+
+/// `POST /admin/v1/config/apply` — apply a FULL config carried in the request body, atomically:
+/// resolve + validate (an invalid config is a 400 that changes nothing), build a complete new
+/// `App` reusing process-lifetime state, carry every surviving lane's health BY STABLE IDENTITY
+/// (D1), swap. The body-carried twin of `config/reload` (disk) — Terraform/CI push the config they
+/// hold instead of writing files. NOTE: an applied config is LIVE but not written to disk — the
+/// next reload/restart returns to disk truth (+overlay); the response says so.
+async fn apply_config(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let req: ApplyConfigReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed config body: {e}"
+            )))
+        }
+    };
+    let current = handle.load();
+    if let Some(expected) = req.expected_version {
+        if expected != current.config_version {
+            audit::AUDIT.record_by(
+                "config.apply",
+                "config:body",
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            return err_json(&AdminError::Conflict(format!(
+                "expected_version {expected} is stale (current is {})",
+                current.config_version
+            )));
+        }
+    }
+    let base_hook_names: std::collections::HashSet<String> =
+        req.config.hooks.keys().cloned().collect();
+    let outcome = crate::config::resolve(&req.config, &req.providers)
+        .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))
+        .and_then(|cfg| {
+            crate::build_app_from_config(
+                cfg,
+                req.config.governance.clone(),
+                current.overlay_path.clone(),
+                base_hook_names,
+                (current.config_path.clone(), current.providers_path.clone()),
+                Some(&current),
+            )
+        });
+    match outcome {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            audit::AUDIT.record_by(
+                "config.apply",
+                "config:body",
+                audit::OUTCOME_APPLIED,
+                &actor,
+            );
+            let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                "config.apply (request body)",
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
+            ok_json(
+                StatusCode::OK,
+                &json!({
+                    "applied": true,
+                    "config_version": cur.config_version,
+                    "note": "live until the next reload/restart returns to disk truth; persist by \
+                             updating config.yaml",
+                }),
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "config.apply",
+                "config:body",
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            err_json(&AdminError::Validation(e))
+        }
+    }
+}
+
 /// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
 /// test and the OpenAPI `paths`. Templated/POST routes are documented separately in `openapi_doc`.
 /// Adding a GET endpoint means adding it here so the doc + the drift guard both see it.
@@ -815,6 +918,20 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "The version (metadata + hooks + global_hooks)"},
                     "404": {"description": "Pruned or never recorded (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/config/apply".to_string(),
+        json!({
+            "post": {
+                "summary": "Apply a full config from the request body, atomically (live until next reload/restart; health preserved by lane identity)",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{applied, config_version, note}`"},
+                    "400": {"description": "Invalid config (error code `invalid_request`); nothing changed"},
+                    "409": {"description": "`expected_version` stale (error code `conflict`)"}
                 }
             }
         }),
