@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// `build_prompt_projection` flattens both Anthropic content shapes: bare-string content and

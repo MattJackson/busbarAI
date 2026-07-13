@@ -1,4 +1,3 @@
-
 use super::*;
 
 // Gemini's URL embeds the model; non-Gemini protocols keep their fixed path.

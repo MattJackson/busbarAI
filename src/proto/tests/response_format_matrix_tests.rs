@@ -1,4 +1,3 @@
-
 //! THE REGRESSION NET for the `response_format` bug class. Before the typed `IrResponseFormat`
 //! layer, the same "writer echoes a foreign shape cross-protocol → backend 400" bug surfaced once
 //! per writer (openai → cohere → gemini → responses). Now the IR is typed, so a writer physically

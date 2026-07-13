@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ir::{IrBlockMeta, IrDelta, IrStreamEvent, StreamDecodeState};
 

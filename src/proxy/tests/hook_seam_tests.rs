@@ -1,4 +1,3 @@
-
 //! Tests for `decide_policy_order`'s NEW seams: the `send_prompt`/`send_user` opt-in gating
 //! (the flags decide whether the projections are built AND what the policy actually sees), and
 //! the `RoutingDecision::Reject` → `PolicyOutcome::RejectRequest` mapping — plus the reject

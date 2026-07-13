@@ -1,4 +1,3 @@
-
 use crate::governance::{GovState, NewKeySpec, SqliteStore};
 use crate::test_support::TestApp;
 use std::sync::Arc;

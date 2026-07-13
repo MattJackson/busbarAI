@@ -1,4 +1,3 @@
-
 use super::*;
 
 // A trivial OperationHandler + RequestHandler prove the trait objects are object-safe and the no-OperationHandler lookup works.

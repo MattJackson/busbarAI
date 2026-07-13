@@ -1,4 +1,3 @@
-
 /// `admin_scope_for`: the operator principal is full; group-carrying principals resolve
 /// through group_map (most permissive wins, unmapped grants nothing); a groupless non-operator
 /// principal gets nothing; the open posture (no principal) is full.

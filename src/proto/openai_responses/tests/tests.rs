@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// LOW (lossless-by-target): the Responses create API models no `top_k`. A request carrying

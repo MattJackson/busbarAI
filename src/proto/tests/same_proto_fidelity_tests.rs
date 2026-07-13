@@ -1,4 +1,3 @@
-
 use super::StreamTranslate;
 
 // Feed `input` (in one or more chunks) through a same-proto translator and return the

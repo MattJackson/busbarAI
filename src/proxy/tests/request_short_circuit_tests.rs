@@ -1,4 +1,3 @@
-
 use super::translate_request_cross_protocol;
 use crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY;
 use crate::proto::Protocol;

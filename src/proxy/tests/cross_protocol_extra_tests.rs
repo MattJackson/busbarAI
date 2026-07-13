@@ -1,4 +1,3 @@
-
 use crate::proto::Protocol;
 
 /// Structural class fix: on a CROSS-protocol request hop the source-protocol-only passthrough

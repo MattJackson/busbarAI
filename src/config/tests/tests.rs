@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// The hook config types are round-trippable (Deserialize + Serialize) — the foundation for the

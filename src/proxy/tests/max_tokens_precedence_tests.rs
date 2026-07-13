@@ -1,4 +1,3 @@
-
 use crate::ir::variant::{EgressPrep, IrReq};
 use crate::ir::IrRequest;
 use crate::proto::Protocol;

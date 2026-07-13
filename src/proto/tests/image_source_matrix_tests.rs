@@ -1,4 +1,3 @@
-
 //! Regression net for the image-source bug class (closed by the typed `IrImageSource`). The key
 //! invariant: a writer can NEVER emit a corrupt block from a misread sentinel — a `Vendor`
 //! reference it doesn't own is dropped, a neutral `Base64`/`Url` is projected natively.

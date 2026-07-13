@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// The cached streaming-CT set aggregated from the writer vtable must be exactly the SSE +

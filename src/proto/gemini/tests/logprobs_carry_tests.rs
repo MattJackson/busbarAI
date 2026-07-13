@@ -1,4 +1,3 @@
-
 //! Cross-protocol logprobs (OpenAI<->Gemini): the ask (request) and the data (response,
 //! buffered AND streaming) must cross the seam in both directions via the neutral IR.
 use crate::proto::{Protocol, ProtocolReader};

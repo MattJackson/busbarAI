@@ -1,4 +1,3 @@
-
 //! Regression net for the stop_reason bug class (closed by the typed `IrStopReason`). EVERY
 //! variant, projected by EVERY writer, must land on a value VALID in that protocol's finish enum —
 //! never an off-spec token. A writer physically cannot leak a foreign value (it matches a typed

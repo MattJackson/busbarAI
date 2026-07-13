@@ -1,4 +1,3 @@
-
 use crate::ir::{IrBlock, IrResponse, IrRole, IrUsage};
 use crate::proto::bedrock::bedrock_response_to_eventstream;
 

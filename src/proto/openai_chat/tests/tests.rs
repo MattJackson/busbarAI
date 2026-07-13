@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ir::{IrBlock, IrBlockMeta, IrDelta, IrMessage, IrRole, IrStreamEvent, IrUsage};
 

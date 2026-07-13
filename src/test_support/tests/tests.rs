@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::auth::AuthMiddleware;
 use crate::config::AuthCfg;

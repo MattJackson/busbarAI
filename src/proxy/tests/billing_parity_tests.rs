@@ -1,4 +1,3 @@
-
 use crate::proto::StreamTranslate;
 
 /// Drive a SAME-PROTOCOL streaming translator with `frames` and return the IR A-tap (input, output)

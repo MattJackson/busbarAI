@@ -1,4 +1,3 @@
-
 //! REGRESSION (A1): the WON-but-undispatched single-flight recovery probe must be released when
 //! the `pick_among` future is dropped (client disconnect) while parked on the permit await — none
 //! of the explicit early-returns run on drop. `ProbeGuard`'s `Drop` enforces that. These unit

@@ -1,4 +1,3 @@
-
 use super::{record_ir_usage, stable_hash, UsageSink};
 use crate::ir::IrUsage;
 use std::sync::Arc;

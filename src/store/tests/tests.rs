@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn make_lane_data(id: usize, max_permits: usize) -> LaneData {

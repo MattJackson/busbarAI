@@ -1,4 +1,3 @@
-
 //! The gated cross-protocol reasoning/thinking carry. The GATE lives at
 //! `IrReq::prepare_for_egress` (per-lane `reasoning` flag); these tests cover the codec halves
 //! (read the ask, project it) plus the gate itself, the clamp, and the sampling-knob omission.

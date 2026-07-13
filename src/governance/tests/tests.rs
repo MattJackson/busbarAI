@@ -1,4 +1,3 @@
-
 /// The re-key union semantics: pools union (`[]` = every pool), caps are most-permissive
 /// (a granting group without a cap lifts it; otherwise max wins), and a principal whose
 /// groups never set `allowed_pools` gets NO synthetic key (admin-only groups confer no

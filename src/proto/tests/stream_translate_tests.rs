@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// STRUCTURAL ROUND-TRIP MATRIX (the test class that would have caught the cohere object-shape

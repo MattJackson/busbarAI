@@ -1,4 +1,3 @@
-
 //! The two OpenAI<->Anthropic analog carries: `user` <-> `metadata.user_id` and
 //! `parallel_tool_calls` <-> `!tool_choice.disable_parallel_tool_use`. Same switch, different
 //! spelling/location — these must CROSS the seam instead of dying in `extra`.

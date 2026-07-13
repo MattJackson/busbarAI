@@ -1,4 +1,3 @@
-
 //! Tests for the routing-policy ORDERED WALK in `pick_among` (the audit-sensitive seam). The walk
 //! must dispatch in the policy's ranked order while honoring EXACTLY the same health filter SWRR
 //! honors (a tripped / dead / at-capacity preferred lane is skipped to the next), and fall through
