@@ -830,7 +830,11 @@ pub(crate) async fn get_key(
     }
 }
 
-/// GET /admin/keys/:id/usage — current-window usage counters.
+/// GET /api/v1/admin/keys/{id}/usage — the key's BUDGET-window counters (the enforcement view:
+/// spend/tokens/requests against its own budget window; the fleet FinOps series lives on `/usage`)
+/// plus `rate_headroom`: the fraction `[0,1]` of the tightest configured RPM/TPM limit still
+/// available in the current 60s window (`null` when the key has no rate caps) — a client can back
+/// off BEFORE hitting a 429 instead of discovering the cap by tripping it (key-06).
 pub(crate) async fn key_usage(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(id): Path<String>,
@@ -844,12 +848,28 @@ pub(crate) async fn key_usage(
     let now = crate::store::now();
     let gov2 = gov.clone();
     let id2 = id.clone();
-    let res = tokio::task::spawn_blocking(move || gov2.usage_for(&id2, now)).await;
+    // One blocking hop fetches BOTH the usage counters and the key record (the record feeds the
+    // in-memory `rate_headroom` read, which needs the configured caps).
+    let res = tokio::task::spawn_blocking(move || {
+        let usage = gov2.usage_for(&id2, now)?;
+        let key = gov2.all_keys()?.into_iter().find(|k| k.id == id2);
+        Ok::<_, crate::governance::StoreError>(usage.map(|u| (u, key)))
+    })
+    .await;
     match res {
-        Ok(Ok(Some(u))) => json_response(
-            StatusCode::OK,
-            json!({"id": id, "spend_cents": u.spend_cents, "tokens": u.tokens, "requests": u.requests}),
-        ),
+        Ok(Ok(Some((u, key)))) => {
+            let headroom = key.and_then(|k| gov.rate_headroom(&k, now));
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "id": id,
+                    "spend_cents": u.spend_cents,
+                    "tokens": u.tokens,
+                    "requests": u.requests,
+                    "rate_headroom": headroom,
+                }),
+            )
+        }
         Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
         Ok(Err(e)) => internal_error("key_usage", &e),
         Err(e) => join_error("key_usage", &e),
@@ -4391,7 +4411,7 @@ providers: {}
             "list must not leak secrets"
         );
 
-        // usage
+        // usage — an UNCAPPED key reports `rate_headroom: null` (nothing to be near).
         let usage = client
             .get(format!("http://{addr}/api/v1/admin/keys/{id}/usage"))
             .header("x-admin-token", "admintok")
@@ -4401,6 +4421,37 @@ providers: {}
         assert_eq!(usage.status().as_u16(), 200);
         let ub: serde_json::Value = usage.json().await.unwrap();
         assert_eq!(ub["id"], id);
+        assert!(
+            ub["rate_headroom"].is_null(),
+            "uncapped key has no headroom signal: {ub}"
+        );
+
+        // A rate-CAPPED key reports its headroom fraction (a fresh window = fully available, 1.0),
+        // so a client can back off BEFORE tripping a 429 (key-06).
+        let capped: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": "k-capped", "rpm_limit": 10}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let capped_id = capped["id"].as_str().unwrap();
+        let ub: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/admin/keys/{capped_id}/usage"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            ub["rate_headroom"], 1.0,
+            "fresh capped key is fully available: {ub}"
+        );
         handle.abort();
     }
 

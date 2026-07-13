@@ -1714,7 +1714,7 @@ fn openapi_doc() -> serde_json::Value {
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
-                    "200": {"description": "Usage counters"},
+                    "200": {"description": "Budget-window counters + `rate_headroom` (fraction of the tightest RPM/TPM cap left; null = uncapped)"},
                     "404": {"description": "Unknown key (error code `not_found`)"}
                 }
             }
