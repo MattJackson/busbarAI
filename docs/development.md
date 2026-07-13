@@ -30,7 +30,7 @@ and the two common extension tasks.
 | `proto/{anthropic,openai_chat,openai_responses,openai_family,gemini,bedrock,cohere}.rs` | Each protocol's Reader (wire→IR + error extraction) and Writer (IR→wire + auth + paths). Bedrock's writer overrides `sign_request` for SigV4. |
 | `sigv4.rs` | Hand-rolled AWS SigV4 (RustCrypto sha2 + hmac, no AWS SDK): `sign_v4`, `signing_key`, `uri_encode_path`, `format_amz_time`, `sha256_hex`. |
 | `governance.rs` | Virtual keys + budgets + rate limits (ADR-0009): `GovState`, `VirtualKey`, the `Store` trait + `SqliteStore`, budget/rate windows, key hashing. |
-| `admin.rs` | The `/admin/keys` management handlers (create/list/delete/usage). |
+| `admin.rs` | The `/api/v1/admin/keys` management handlers (create/list/delete/usage). |
 | `handlers.rs` | `/stats` and `/healthz` handlers. |
 | `health.rs` | Active health probing: `spawn_probers`, `probe_lane` (uses each protocol's `probe_body`). |
 | `metrics.rs` | Prometheus recorder init + the `busbar_*` metric name constants. |

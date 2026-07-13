@@ -34,11 +34,11 @@ and measured.
 It also speaks the two management messages:
 
 - **configure** — busbar's first message on every connection, and the live push behind
-  `PATCH /admin/v1/hooks/compressor/settings`. The hook applies `min_savings_pct` and acks by
+  `PATCH /api/v1/admin/hooks/compressor/settings`. The hook applies `min_savings_pct` and acks by
   echoing the pushed `settings_version`; a bad value gets no ack, so busbar keeps the old settings
   and the operator's PATCH gets a 400.
 - **describe** — answers with the settings JSON schema, served verbatim at
-  `GET /admin/v1/hooks/compressor/schema`.
+  `GET /api/v1/admin/hooks/compressor/schema`.
 
 ## Fail-safe
 

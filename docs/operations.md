@@ -242,16 +242,16 @@ the admin API returns `401`.
 
 | Method · Route | Purpose |
 |---|---|
-| `POST /admin/keys` | Mint a virtual key. The plaintext secret is returned **once**. Pass `"issue_aws_credential": true` to also mint an AWS credential pair for Bedrock-SDK clients (see below). |
-| `GET /admin/keys` | List key metadata (never secrets/hashes). |
-| `GET /admin/keys/{id}/usage` | Current-window usage: `spend_cents`, `tokens`, `requests`. |
-| `PATCH /admin/keys/{id}` | Update key fields (budget, rate limits, allowed pools). Three-state: absent = unchanged, `null` = clear to unlimited, value = set. |
-| `DELETE /admin/keys/{id}` | Revoke a key. |
+| `POST /api/v1/admin/keys` | Mint a virtual key. The plaintext secret is returned **once**. Pass `"issue_aws_credential": true` to also mint an AWS credential pair for Bedrock-SDK clients (see below). |
+| `GET /api/v1/admin/keys` | List key metadata (never secrets/hashes). |
+| `GET /api/v1/admin/keys/{id}/usage` | Current-window usage: `spend_cents`, `tokens`, `requests`. |
+| `PATCH /api/v1/admin/keys/{id}` | Update key fields (budget, rate limits, allowed pools). Three-state: absent = unchanged, `null` = clear to unlimited, value = set. |
+| `DELETE /api/v1/admin/keys/{id}` | Revoke a key. |
 
 ### Creating a key
 
 ```bash
-curl -s -X POST http://localhost:8080/admin/keys \
+curl -s -X POST http://localhost:8080/api/v1/admin/keys \
   -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
   -H "content-type: application/json" \
   -d '{
@@ -301,7 +301,7 @@ Create-key fields:
 | `503` on every request | `/stats`, are all lanes `dead` or in cooldown? Check `dead_reason`. |
 | A lane stuck `dead` with `billing` reason | Upstream wallet/quota; the lane recovers on a successful probe once funded. Consider `health.mode: dead`. |
 | A lane stuck `dead` with `auth` reason | Wrong/expired key in the provider's `api_key_env`. |
-| `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /admin/keys/{id}/usage`. |
+| `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /api/v1/admin/keys/{id}/usage`. |
 | `403` from busbar | The virtual key's `allowed_pools` doesn't include the target. |
 | Startup panic: "unset environment variable" | A `${VAR}` (possibly in a comment) isn't exported. |
 | Startup panic: "not found in providers.yaml" | A `config.yaml` provider name isn't in the catalog. |

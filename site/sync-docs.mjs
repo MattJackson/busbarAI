@@ -27,7 +27,7 @@ const PAGES = {
   'hooks': 'Your logic on the request path: the routing policy hook and the request-log hook, what each receives, what you control, and the fail-safe guarantees.',
   'operations': 'Running Busbar in production: process configuration, TLS and mTLS, health and readiness, metrics to watch, the admin API, and troubleshooting.',
   'architecture': 'A request traced end to end: the superset IR, the reader/writer seams behind protocols-not-providers, and failure disposition.',
-  'admin-api': 'The frozen /admin/v1 management contract: reads, the config plane, hook lifecycle, keys, audit, and scopes.',
+  'admin-api': 'The frozen /api/v1/admin management contract: reads, the config plane, hook lifecycle, keys, audit, and scopes.',
   'migration-1.3': 'The one-page 1.2.x to 1.3 config migration: every removed key and its exact replacement.',
 };
 

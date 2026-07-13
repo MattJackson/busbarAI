@@ -110,12 +110,12 @@ What this achieves:
 - **Session affinity**: callers with `x-session-id` headers stay pinned to the same member while it is healthy.
 - **Overflow**: if all primary members are exhausted, traffic spills to `claude-haiku`. If haiku is also exhausted, `least_bad` picks the member with the soonest recovery rather than returning 503.
 - **Health probing**: `anthropic` lanes are re-probed on trip (`mode: dead`), so a recovered Anthropic backend is brought back promptly without waiting for organic traffic to probe it.
-- **Governance**: each team gets a virtual key with per-pool ACLs and token-based rate limits. Mint keys with `POST /admin/keys`.
+- **Governance**: each team gets a virtual key with per-pool ACLs and token-based rate limits. Mint keys with `POST /api/v1/admin/keys`.
 
 To mint a key for a team:
 
 ```bash
-curl -s -X POST http://localhost:8080/admin/keys \
+curl -s -X POST http://localhost:8080/api/v1/admin/keys \
   -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

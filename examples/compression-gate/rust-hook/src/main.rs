@@ -9,8 +9,8 @@
 //!
 //! It speaks all five wire messages:
 //!   configure — busbar's FIRST message on every connection (and a live push on
-//!               `PATCH /admin/v1/hooks/{name}/settings`): apply the settings, ack the version.
-//!   describe  — reply with a JSON schema for those settings (`GET /admin/v1/hooks/{name}/schema`).
+//!               `PATCH /api/v1/admin/hooks/{name}/settings`): apply the settings, ack the version.
+//!   describe  — reply with a JSON schema for those settings (`GET /api/v1/admin/hooks/{name}/schema`).
 //!   transform — the rewrite pass: prompt text in, `{"rewrite": ...}` or `{}` (abstain) out.
 //!   (decide / notify never reach a pure rewrite gate, but unknown messages get a safe `{}`.)
 //!

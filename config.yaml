@@ -246,6 +246,6 @@ pools:
 # governance:
 #   enabled: true
 #   db_path: /var/lib/busbar/governance.db
-#   admin_token: "$BUSBAR_ADMIN_TOKEN"        # guards the /admin/keys API; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
+#   admin_token: "$BUSBAR_ADMIN_TOKEN"        # guards the /api/v1/admin/keys API; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
 #   price_per_request_cents: 1                # flat per-request budget charge
 #   price_per_1k_tokens_cents: 50             # plus per-1000-token charge (from response usage)

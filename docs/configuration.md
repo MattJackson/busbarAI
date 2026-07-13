@@ -256,7 +256,7 @@ auth:
 
 ### `admin_auth` and `group_map`
 
-The admin API (`/admin/v1/*`) authenticates through its own chain — `admin_auth:` (default
+The admin API (`/api/v1/admin/*`) authenticates through its own chain — `admin_auth:` (default
 `[admin-tokens]`, the single operator token) — and `group_map:` maps identity-provider GROUPS to
 authority, both admin and data-plane:
 
@@ -278,7 +278,7 @@ group_map:
 Unmapped groups grant nothing (fail closed): with governance enabled, an identified principal
 whose groups earn no `allowed_pools` grant is rejected outright.
 
-The admin chain is live-mutable over the API (`PUT /admin/v1/auth`) with an anti-lockout guard —
+The admin chain is live-mutable over the API (`PUT /api/v1/admin/auth`) with an anti-lockout guard —
 see the [Admin API guide](./admin-api.md).
 
 ---
@@ -558,7 +558,7 @@ pools:
 | `on_empty` | string | `reject` | A restrict gate's empty-intersection behavior: `reject` (fail closed, 503) or `weighted` (advisory escape — that gate's restriction is skipped). |
 | `global` | boolean | `false` | Fire on every request (overlay on top of each pool's own hooks) — inline sugar for listing the name in `global_hooks:`. |
 | `default` | boolean | `false` | Make this hook THE base ordering for pools that named no strategy (replacement, not overlay). At most one hook may set it — a second is a startup error. |
-| `settings` | map | `{}` | Opaque settings pushed to the hook via the `configure` wire message: as the first message on every socket (re)connection, and live via `PATCH /admin/v1/hooks/{name}/settings` (commit-on-ack). Busbar never interprets the contents. |
+| `settings` | map | `{}` | Opaque settings pushed to the hook via the `configure` wire message: as the first message on every socket (re)connection, and live via `PATCH /api/v1/admin/hooks/{name}/settings` (commit-on-ack). Busbar never interprets the contents. |
 
 The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed the ordering strategies and gate candidates. Gate observability: the `x-busbar-route-policy` / `x-busbar-route-target` response headers name the deciding hook and chosen lane.
 
@@ -793,7 +793,7 @@ governance:
 |---|---|---|---|---|---|
 | `enabled` | bool | no | `false` | n/a | Master switch. |
 | `db_path` | string | no | `busbar-governance.db` | n/a | Path to the SQLite file. The directory must exist and be writable. |
-| `admin_token` | string | no | none (admin API disabled) | Must be non-empty (non-whitespace) when `enabled: true` | Guards the `/admin/keys` API. If absent when `enabled: true`, Busbar refuses to start (the admin API would be silently inaccessible). |
+| `admin_token` | string | no | none (admin API disabled) | Must be non-empty (non-whitespace) when `enabled: true` | Guards the `/api/v1/admin/keys` API. If absent when `enabled: true`, Busbar refuses to start (the admin API would be silently inaccessible). |
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
 | `budget_on_store_error` | string | no | `allow` | `allow` or `deny` | Behavior when the budget store errors during the atomic admission check-and-charge. `allow` (default) fails open, the request proceeds, preserving availability on a store hiccup. `deny` fails closed, the request is rejected, providing a hard budget guarantee for security/regulated deployments. A definitive over-budget result always rejects regardless of this setting. |
@@ -815,11 +815,11 @@ governance:
 
 | Route | Method | Description |
 |---|---|---|
-| `/admin/keys` | `POST` | Mint a new virtual key. Returns plaintext bearer `secret` once. Pass `"issue_aws_credential": true` to also receive `aws_access_key_id` + `aws_secret_access_key` for Bedrock-SDK clients (both shown once). |
-| `/admin/keys` | `GET` | List all keys (metadata only; no secrets). |
-| `/admin/keys/{id}` | `PATCH` | Update key fields. Three-state semantics: absent = unchanged, `null` = clear to unlimited, value = set. |
-| `/admin/keys/{id}/usage` | `GET` | Current-window spend, tokens, and request count. |
-| `/admin/keys/{id}` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
+| `/api/v1/admin/keys` | `POST` | Mint a new virtual key. Returns plaintext bearer `secret` once. Pass `"issue_aws_credential": true` to also receive `aws_access_key_id` + `aws_secret_access_key` for Bedrock-SDK clients (both shown once). |
+| `/api/v1/admin/keys` | `GET` | List all keys (metadata only; no secrets). |
+| `/api/v1/admin/keys/{id}` | `PATCH` | Update key fields. Three-state semantics: absent = unchanged, `null` = clear to unlimited, value = set. |
+| `/api/v1/admin/keys/{id}/usage` | `GET` | Current-window spend, tokens, and request count. |
+| `/api/v1/admin/keys/{id}` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
 
 See [operations.md](operations.md) for the full admin API payload schemas and virtual key fields, including the `issue_aws_credential` Bedrock SigV4 option.
 

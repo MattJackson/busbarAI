@@ -103,7 +103,7 @@ injection shim normalises both into the same internal model/pool selection so th
 rest of the pipeline is protocol-agnostic.
 
 Management/observability routes (`/stats`, `/healthz`, `/metrics`,
-`/admin/keys...`) are handled separately.
+`/api/v1/admin/keys...`) are handled separately.
 
 ### 2. Authentication
 
@@ -125,7 +125,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
   passthrough forwarding.
 - **Bedrock ingress** has two modes depending on governance:
   - *Without governance* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
-  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth.rs`.
+  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth.rs`.
 
 ### 3. Governance checks
 

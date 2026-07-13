@@ -292,12 +292,12 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
                 <span>Translate</span><span>Route</span><span>Failover</span>
               </div>
               <div class="bb-tags">
-                <span>Governance</span><span>Security</span><span>Observability</span>
+                <span>Governance</span><span>Security</span><span>Observability</span><span>AI Middleware</span>
               </div>
               <div class="bb-sub">one endpoint · :8080</div>
             </div>
             <svg class="hook-line" viewBox="0 0 2 34" preserveAspectRatio="none" aria-hidden="true"><line x1="1" y1="0" x2="1" y2="34" /></svg>
-            <a class="hook-out" href="#hooks">Hooks · mini-apps for your AI on the path</a>
+            <a class="hook-out" href="#hooks">Hooks: AI middleware on the path</a>
           </div>
 
           <div class="link-zone" aria-hidden="true">
@@ -445,7 +445,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         <div
           class="diagram diagram-mini"
           role="img"
-          aria-label="Your applications call Busbar with one Busbar token. Busbar applies Governance, Security, and Observability, then forwards to your single provider: one key, kept in one place."
+          aria-label="Your applications call Busbar with one Busbar token. Busbar applies Governance, Security, Observability, and AI Middleware, then forwards to your single provider: one key, kept in one place."
         >
           <div class="col">
             <div class="col-label">Your apps</div>
@@ -458,7 +458,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             <div class="busbar-box">
               <div class="bb-title"><img src={glyphWhite.src} alt="" width="20" height="20" /> Busbar</div>
               <div class="bb-tags">
-                <span>Governance</span><span>Security</span><span>Observability</span>
+                <span>Governance</span><span>Security</span><span>Observability</span><span>AI Middleware</span>
               </div>
               <div class="bb-sub">one endpoint · :8080</div>
             </div>
@@ -588,7 +588,9 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         --bg-soft: #f8fafc;
       }
       * { box-sizing: border-box; }
-      html { scroll-behavior: smooth; overflow-x: clip; }
+      /* Offset in-page anchor jumps (#hooks, #adopt, …) by the 64px sticky nav so a section
+         heading lands below the bar instead of hidden under it. */
+      html { scroll-behavior: smooth; overflow-x: clip; scroll-padding-top: 80px; }
       body {
         margin: 0;
         background: var(--bg);

@@ -58,7 +58,7 @@ clear startup error telling you exactly what to write instead.
 - **Admin API lockdown.** The admin API authenticates through its own pluggable chain, with
   scoped principals (read-only, hooks-register, full) replacing the single shared admin
   token, and every mutation in the audit log attributed to the person who made it. The chain
-  itself is live-mutable (`PUT /admin/v1/auth`) and guarded so a change that would lock the
+  itself is live-mutable (`PUT /api/v1/admin/admin-auth`) and guarded so a change that would lock the
   caller out is refused instead of applied.
 - **The rewrite verb.** A trusted gate (`prompt: rw`) can replace the request body before
   dispatch, context compression and redaction, across all six protocols at once, because it
@@ -69,7 +69,7 @@ clear startup error telling you exactly what to write instead.
   commits only when the hook acknowledges it, and a restarted hook always receives its current
   settings before any traffic. Hooks can also describe their own settings schema, served
   verbatim by the API.
-- **Config reload, and health that survives everything.** `POST /admin/v1/config/reload`
+- **Config reload, and health that survives everything.** `POST /api/v1/admin/config/reload`
   re-reads your config files and applies them atomically, and lane health (circuit breakers,
   cooldowns, learned latency) is carried across by model identity, not list position, so a
   reorder or an added model never resets what Busbar has learned. The same health state now
@@ -84,6 +84,12 @@ clear startup error telling you exactly what to write instead.
 
 ### Changed
 
+- **The management API lives under one root: `/api/v1/admin/…`.** Every Busbar-native API
+  mounts under `/api/<version>/<area>/` — cleanly separated from the data-plane protocol paths
+  (which are dictated by the vendor SDKs and don't move). The key-management endpoints that
+  previously lived at `/admin/keys*` are now `/api/v1/admin/keys*`; scripts calling the old
+  paths need a one-line URL update. Future surfaces (and a future `v2`) slot in under the same
+  root without new top-level paths.
 - Completion telemetry now carries usage for every operation type (chat tokens, embeddings,
   images, audio, rerank) plus a request id that correlates a request across hook stages.
 
