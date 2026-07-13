@@ -20,7 +20,7 @@ models:
     provider: bedrock
     max_concurrent: 10
     max_requests: -1
-    upstream_model: amazon.nova-lite-v1:0   # the real Bedrock modelId that answers
+    upstream_model: amazon.nova-pro-v1:0   # the real Bedrock modelId that answers
 
 pools:
   claude-code:

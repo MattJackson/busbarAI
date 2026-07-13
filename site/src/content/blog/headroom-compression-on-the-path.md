@@ -1,7 +1,7 @@
 ---
 title: "Headroom: context compression on the path"
 description: "A rewrite gate that compresses an agent's context before it ships. One integration on Busbar's normalized IR covers every protocol and provider. Measured: ~50% fewer input tokens for sub-millisecond overhead."
-date: 2026-07-14
+date: 2026-07-15
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---

@@ -1,7 +1,7 @@
 ---
 title: "Run Claude Code through Busbar"
 description: "Point Claude Code at Busbar with one environment variable — get observability, failover, and budgets for the agent you already use. Then the twist: because Busbar translates between protocols, you can point Claude Code at a Gemini or Bedrock model instead."
-date: 2026-07-12
+date: 2026-07-13
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---
@@ -36,9 +36,9 @@ or against Gemini**, without Claude Code knowing it's not talking to Anthropic a
 Same agent you know. Different brain behind it. You change one line of Busbar config, not one line of
 Claude Code.
 
-## The demo: Claude Code, driven by Amazon Nova
+## The demo: Claude Code, driven by Amazon Nova Pro
 
-I actually ran this. Here's a Busbar pool named `claude-code` whose one member is Amazon's Nova Lite,
+I actually ran this. Here's a Busbar pool named `claude-code` whose one member is Amazon's Nova Pro,
 on AWS Bedrock:
 
 ```yaml
@@ -46,7 +46,7 @@ on AWS Bedrock:
 models:
   amazon-nova:
     provider: bedrock
-    upstream_model: amazon.nova-lite-v1:0   # the real model that answers
+    upstream_model: amazon.nova-pro-v1:0   # the real model that answers
 pools:
   claude-code:
     members:
@@ -54,8 +54,8 @@ pools:
 ```
 
 Point Claude Code at the pool. The one *new* variable is the base URL — Busbar routes by the pool in
-the URL, so that's the whole redirect. The other is the API key Claude Code already uses, set to a
-Busbar-issued token:
+the URL, so that redirect is the whole integration. The other is the API key Claude Code already uses,
+set to a Busbar-issued token:
 
 ```sh
 export ANTHROPIC_BASE_URL="http://localhost:8080/claude-code"   # the one that redirects it
@@ -63,28 +63,34 @@ export ANTHROPIC_API_KEY="vk_…"                                 # already set 
 claude
 ```
 
-Then I launched the real Claude Code window and gave it a small agentic task — run a few shell
-commands, one at a time, then report back. That's the kind of thing that makes it loop through several
-tool calls, and every one of those turns was answered by Nova:
+Nova itself wants two small tweaks — an output-token cap and prompt caching off (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`,
+`DISABLE_PROMPT_CACHING`) — but those are about Nova's limits, not about Claude Code, which runs unchanged.
 
-![The real Claude Code window running an agentic task, every turn answered by Amazon Nova on Bedrock through Busbar](/demo/claude-nova.gif)
+Then I launched the real Claude Code window and asked it to *build* something — a small Python web app
+that serves an interactive Sudoku game — the kind of task that loops through writing a file, a compile
+check, and several turns. Every one of those turns was answered by Nova:
 
-That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It plans, runs each
-`Bash` command in turn, and reports `DONE`. The model behind every step is Amazon Nova; the `<thinking>`
-blocks are Nova's, not Claude's. Busbar translated each Anthropic request into a Bedrock Converse call
-and the response back again — the agent never knew.
+![The real Claude Code window building a Python Sudoku web app, every turn answered by Amazon Nova Pro on Bedrock through Busbar](/demo/claude-nova.gif)
 
-The receipt, because "trust me" isn't a demo. AWS Bedrock's own CloudWatch usage for `nova-lite`, wholly
-independent of anything Busbar reports, climbed with every turn:
+That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It writes `app.py` (an
+`http.server` that serves a 9×9 Sudoku grid), runs `python3 -m py_compile` to check it, and reports
+back. The model behind every step is Amazon Nova; the `<thinking>` blocks are Nova's, not Claude's.
+Busbar translated each Anthropic request into a Bedrock Converse call and the response back again — the
+agent never knew.
+
+The receipt, because "trust me" isn't a demo. I read AWS Bedrock's own CloudWatch usage for Nova Pro —
+wholly independent of anything Busbar reports — right before the run and right after it:
 
 ```console
-$ aws cloudwatch get-metric-statistics --namespace AWS/Bedrock \
-    --metric-name Invocations --dimensions Name=ModelId,Value=amazon.nova-lite-v1:0 ...
-72.0
+# before
+nova-pro   invocations=15   input_tokens=26,472
+# after
+nova-pro   invocations=42   input_tokens=81,636
 ```
 
-The agent thinks it talked to Anthropic. AWS's own console says it was Nova. To swap in Gemini, or to put
-Claude behind two keys with failover, or to add a compression hook — you edit the pool, not the agent.
+Twenty-seven invocations and ~55,000 input tokens, all from one Claude Code session that believed it
+was talking to Anthropic. AWS's own console says it was Nova. To swap in Gemini, or to put Claude behind
+two keys with failover, or to add a compression hook — you edit the pool, not the agent.
 
 ## The simple version
 
