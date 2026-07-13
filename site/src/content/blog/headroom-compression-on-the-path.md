@@ -51,10 +51,17 @@ a time (`busbar;dur`, µs):
 Two things I like about that. **Busbar itself is 22 microseconds (µs)** — the gateway isn't where
 your latency goes. And **Headroom adds ~550 µs** to compress the history, with a tail that barely
 moves: p99 is only about 1.1× p50, because Busbar and the hook are both single Rust binaries with
-no garbage collector to pause the path. The compression is real, too — the mock upstream tallied
-the tokens it actually received, confirming **2,832 → 1,422 input tokens, a 50% cut**, shipped to
-the provider. Short conversational chats, where there's nothing worth trimming, pass through
-byte-identical: the hook abstained 100% of the time on them.
+no garbage collector to pause the path.
+
+A word on what this benchmark is *not*. I wasn't measuring how good Headroom's compression is —
+that's their craft, and the [Headroom project](https://headroomlabs-ai.github.io/headroom/) reports
+higher ratios than the ~50% I saw here (66–94% on some content types), with more to gain from
+tuning the keep-ratio. The mock upstream did confirm the compressed prompt really shipped (2,832 →
+1,422 input tokens at the default settings, byte-checked at the provider), so the plumbing is sound.
+But the number I care about is the *cost of running that middleware on Busbar* — ~550 µs — because
+the pitch isn't "Busbar compresses well," it's "Busbar is the fastest place to put middleware like
+Headroom on your request path." And when there's nothing to trim — a short conversational chat —
+the hook abstains and the request passes through byte-identical.
 
 That trade is decisive, and it's almost free. On a request whose model call takes two seconds,
 550 µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
