@@ -37,7 +37,7 @@ proceeds with its original body untouched. A broken compressor can never corrupt
 ## What it costs, and what it saves
 
 I measured it two ways, both reproducible. First the hook alone, driven directly over its socket
-with no Busbar in the loop: a compression call runs about 0.15ms on a 2KB history and 0.72ms on a
+with no Busbar in the loop: a compression call runs about 150 microseconds (µs) on a 2KB history and 720µs on a
 16KB one. Then the honest end-to-end test: the same request stream through two identical Busbar
 configs that differ only by the hook, with a recording mock upstream so I could confirm the
 smaller prompt actually reached the provider.
@@ -45,25 +45,27 @@ smaller prompt actually reached the provider.
 On an 11KB noisy tool-log history, the hook cut input tokens from **2,832 to 1,422 per request, a
 50% reduction**, and the mock confirmed the compressed body is what shipped upstream. It held
 across cross-protocol (anthropic in, openai out) and same-protocol paths alike. Measured one
-request at a time, so the number is the real per-request cost rather than queueing: Busbar alone
-is about **0.16ms**, and Headroom adds about **0.62ms** to compress the history, so the total
-added latency is under a millisecond. Short conversational chats, where there's nothing worth trimming,
-pass through byte-identical: the hook abstained 100% of the time on them.
+request at a time, the hook adds about **620 microseconds (µs)** to a request — the with-hook minus
+without-hook delta, so the benchmark harness's own round-trip floor cancels out and what's left is
+the compression plus its socket round trip. That rides on top of Busbar's own overhead, which its
+[benchmark](https://getbusbar.com/docs/benchmark/) clocks in the tens of µs. Total added latency:
+well under a millisecond. Short conversational chats, where there's nothing worth trimming, pass
+through byte-identical — the hook abstained 100% of the time on them.
 
 That trade is decisive, and it's almost free. On a request whose model call takes two seconds,
-0.6ms of compression is 0.03% of the request, and it buys a prompt half the size that bills for
+620µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
 half the input tokens.
 
 And here's the number that matters for anyone deciding *where* to run compression. Headroom ships
 as an HTTP proxy today and reports a **52ms median overhead** in production, which they rightly
 note is negligible against inference. Run that exact same compression core as a co-located socket
-gate on Busbar's path and the overhead is **0.6ms**: no separate proxy service, no network hop
-between the gateway and the compressor.
+gate on Busbar's path and the added latency is **sub-millisecond**: no separate proxy service, no
+network hop between the gateway and the compressor.
 
-| running Headroom as… | overhead | reach |
+| running Headroom as… | added latency | reach |
 |---|---|---|
 | its own HTTP proxy | 52ms median | the traffic you point at it |
-| a gate on Busbar | 0.6ms median | all six protocols, with failover underneath |
+| a gate on Busbar | ~620µs median | all six protocols, with failover underneath |
 
 That's the division of labor I think is right: **Headroom does the compression, Busbar does the
 placement.** Same core, same savings, one fewer moving part to run, and it now covers every
