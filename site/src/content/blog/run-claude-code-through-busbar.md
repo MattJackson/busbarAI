@@ -53,32 +53,33 @@ pools:
       - target: amazon-nova
 ```
 
-Point Claude Code at the pool. The only integration is the base URL:
+Point Claude Code at the pool. The one *new* variable is the base URL — Busbar routes by the pool in
+the URL, so that's the whole redirect. The other is the API key Claude Code already uses, set to a
+Busbar-issued token:
 
 ```sh
-export ANTHROPIC_BASE_URL="http://localhost:8080/claude-code"
-export ANTHROPIC_API_KEY="vk_…"        # a Busbar-issued token
-export ANTHROPIC_MODEL="claude-code"   # the pool name
+export ANTHROPIC_BASE_URL="http://localhost:8080/claude-code"   # the one that redirects it
+export ANTHROPIC_API_KEY="vk_…"                                 # already set — now a Busbar token
 claude
 ```
 
-Then I gave it a small agentic task — create a file, read it back, count the words, list the
-directory — the kind of thing that makes Claude Code loop through several tool calls. Every one of
+Then I launched the real Claude Code TUI and gave it a small agentic task — create a file, read it
+back, list the directory — the kind of thing that makes it loop through a few tool calls. Every one of
 those turns was answered by Nova:
 
-![Claude Code running an agentic task through Busbar, every turn answered by Amazon Nova on Bedrock](/demo/claude-nova.gif)
+![The real Claude Code TUI running an agentic task, every turn answered by Amazon Nova on Bedrock through Busbar](/demo/claude-nova.gif)
 
-That's the real CLI. Claude Code plans, writes `notes.txt`, reads it back, writes `count.txt`, runs
-`ls`, and reports DONE — and the model behind every step is Nova, not Claude. One agentic prompt fanned
-out into about ten back-and-forth calls, and Busbar translated each Anthropic request into a Bedrock
-Converse call and the response back again.
+That's the actual Claude Code window — same welcome screen, same tool-call rendering. It plans, writes
+`notes.txt` with the words "busbar demo", reads it back, runs `ls`, and reports done. The model behind
+every step is Amazon Nova, and Busbar translated each Anthropic request into a Bedrock Converse call and
+the response back again — the agent never knew.
 
 Two sets of receipts, because "trust me" isn't a demo. Busbar counts every call it routes to the
 Bedrock backend:
 
 ```console
 $ curl -s localhost:8080/metrics -H "authorization: Bearer vk_…" | grep claude-code
-busbar_requests_total{ingress_protocol="anthropic",pool="claude-code",outcome="ok"} 19
+busbar_requests_total{ingress_protocol="anthropic",pool="claude-code",outcome="ok"} 28
 ```
 
 And AWS Bedrock's own CloudWatch usage for `nova-lite` — independent of anything Busbar reports:
@@ -86,11 +87,9 @@ And AWS Bedrock's own CloudWatch usage for `nova-lite` — independent of anythi
 ```console
 $ aws cloudwatch get-metric-statistics --namespace AWS/Bedrock \
     --metric-name Invocations   --dimensions Name=ModelId,Value=amazon.nova-lite-v1:0 ...
-17.0
+32.0
 $ ... --metric-name InputTokenCount ...
-9839.0
-$ ... --metric-name OutputTokenCount ...
-900.0
+66157.0
 ```
 
 The agent thinks it talked to Anthropic. Busbar's metrics and AWS's own console agree it was Nova. To
