@@ -47,10 +47,15 @@ Each hook declares **exactly one transport** — `socket` (an absolute Unix-sock
 
 | `at:` | Observes | Extra payload |
 |---|---|---|
-| `request` | the effective (post-rewrite) request | prompt/identity per grants |
+| `request` | the effective (post-rewrite) request | prompt text per the `prompt: ro` grant |
 | `route` | the routing decision | surviving candidate count |
-| `attempt` | every dispatch attempt | `attempt_number`, `target`, `remaining_candidates`, `previous_failure` |
-| `completion` | the outcome | `outcome: ok \| failed \| rejected_by_gate` + `status` — the **synthetic rejected completion**, so an audit tap sees denials, not just served traffic |
+| `attempt` | every dispatch attempt | `attempt_number`, `model` (the dispatched member), `remaining_candidates`, `previous_failure` |
+| `completion` | the outcome | `outcome` + `status` — including the **synthetic rejected completion**, so an audit tap sees denials, not just served traffic |
+
+The completion `outcome` vocabulary is `ok | failed | rejected_by_gate | rejected_by_auth` and is
+**append-only** — treat unknown outcomes as "not ok", never crash on one. In 1.3 the `user:` grant
+projects identity on **gate decision payloads only**; tap and transform payloads omit identity
+(adding it later is an append-only change — key your parser on field presence).
 
 ## Access grants — what a hook is trusted to see
 
@@ -97,14 +102,64 @@ A gate answers with exactly one of:
 
 A `tap`, being fire-and-forget, has no `on_error` to speak of: its reply is discarded, its errors swallowed, its delivery bounded and dropped-under-pressure — it can never delay, reorder, or fail a request.
 
-## Live settings: `configure` and `describe`
+## The wire, precisely
 
-Beyond the decision traffic, the wire carries two management messages, so a hook can be reconfigured without a redeploy:
+One JSON message per line on a socket; one POST body per message on a webhook. The projection is
+**byte-identical across both transports**, so a hook graduates webhook → socket without logic
+changes. The rules a hook author must know:
 
-- **`configure`** — Busbar pushes the hook's opaque `settings` map (from config or the admin API), stamped with a `settings_version` and Busbar's version. It is the **first message on every socket (re)connection** — a hook that crashes and reconnects always hears its current settings before any request traffic — and it is pushed live when an operator calls `PATCH /api/v1/admin/hooks/{name}/settings`. That PATCH is **commit-on-ack**: the hook must answer with an acknowledgment echoing the pushed `settings_version` (5s deadline) or Busbar commits nothing and the operator gets a 400 — a hook can never end up running settings Busbar doesn't know it accepted.
-- **`describe`** — Busbar asks the hook to describe its own settings schema; the reply is served verbatim at `GET /api/v1/admin/hooks/{name}/schema`. Optional: a hook that doesn't answer simply reports `schema: null`.
+- **Message discrimination.** A message with a top-level `configure`, `describe`, or `status` key
+  is a **management** message. Everything else is a **per-request** message and its `op` field says
+  which kind: `decide` (a gate's blocking decision — answer it), `transform` (a rewrite pass —
+  answer it), `notify` (a tap observation — **never answer it**; on a socket, Busbar does not read
+  a reply and an answered notify queues bytes forever).
+- **Evolvability.** The wire is **append-only**: Busbar may add fields and message kinds at any
+  time. A hook MUST ignore unknown fields, MUST treat unknown `op` values and unknown management
+  keys as "not for me" (reply `{}` on a socket; `200 {}` on a webhook), and may attach extra fields
+  to its own replies (Busbar ignores unknowns symmetrically).
+- **Optional fields are absent, not `null`.** Key your parser on field **presence** (e.g.
+  `"tier" in candidate`), never on null-ness, and never on key order.
+- **Abstain is an explicit reply.** `{}` (or `{"abstain": true}`) is the abstain. An **empty body,
+  a non-2xx webhook status, a closed socket, or a missing newline is a transport ERROR**, not an
+  abstain — it routes to the gate's `on_error`. Under the default `on_error: nothing` the two look
+  identical; under `on_error: reject` an "abstain via 204" fails every request. A webhook's reject
+  must ride a **200** response body — a 4xx/5xx status is the hook *erroring*, not rejecting.
+- **Transform precedence.** A `transform` reply is read as **reject > rewrite > abstain** — a
+  rewrite gate that also screens (a compressor with a PII check) returns `{"reject": ...}` and the
+  request stops, exactly as on the decide path. `restrict`/`order` are decide-path verbs and are
+  ignored on a transform reply.
 
-Both are as fail-safe as everything else on the wire: a hook that ignores `configure` (never acks) keeps its previous settings; neither message can delay or fail request traffic.
+## Management messages: `configure`, `describe`, `status`
+
+- **`configure`** — Busbar pushes the hook's opaque `settings` map, stamped with the hook's
+  **registry name**, a `settings_version`, and Busbar's version. It is the **first message on every
+  socket connection, always** — including a hook with no settings (an empty `settings: {}` is valid
+  desired-state), so a (re)started hook always hears its identity, current settings, and Busbar's
+  version before any traffic. It is also pushed live by
+  `PATCH /api/v1/admin/hooks/{name}/settings`. **One ack rule for both deliveries**: reply
+  `{"ack": {"settings_version": <the exact version sent>}}` (5s deadline). On the PATCH, no exact
+  ack = nothing commits (the operator gets a 400); on the connection preamble, no exact ack =
+  the connection is not used.
+- **`describe`** (`{"describe": true}`) — reply with your settings **JSON Schema, bare** (the reply
+  IS the schema — no wrapper); Busbar serves it verbatim at `GET /api/v1/admin/hooks/{name}/schema`.
+  Optional: don't answer (or `{}`) and the API reports `schema: null`.
+- **`status`** (`{"status": true}`) — the control-plane read: reply your **observed** state —
+  `{"status": {"settings_version": N, "settings": {...}, "metrics": {...}}}` — and Busbar surfaces
+  it at `GET /api/v1/admin/hooks/{name}/status` with a desired-vs-reported **drift** verdict. The
+  `metrics` map is how your hook feeds its own operational data to the control plane (a Headroom
+  compressor reports `chars_saved_total`; a dashboard built on Busbar sees what each plug is doing)
+  instead of running its own dashboard. Entry shape:
+  `"<name>": {"type": "counter"|"gauge", "value": <number>, "help": "..."}` — names match
+  `^[a-z][a-z0-9_]{0,63}$` (counters SHOULD end `_total`), values are finite numbers, `help` ≤ 200
+  chars. Busbar validates and BOUNDS entries (64 per reply); malformed entries are dropped
+  individually, never the reply. Optional: reply `{}` and Busbar treats status as unsupported.
+- **Reserved:** the reply field name **`report`** is reserved on per-request replies for per-request
+  hook data (attached to the completion-stage tap payload in a future release) — do not use it for
+  anything else.
+
+All three are as fail-safe as everything else on the wire: a hook that ignores them keeps working;
+none of them can delay or fail request traffic (management calls ride fresh connections, never the
+request-path connection).
 
 ## Managing hooks over the API
 

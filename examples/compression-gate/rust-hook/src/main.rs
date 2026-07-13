@@ -31,6 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// savings aren't worth a body swap — abstain and busbar proceeds untouched. Shared across
 /// connections so a live settings push retunes every future request at once.
 static MIN_SAVINGS_PCT: AtomicU64 = AtomicU64::new(10);
+/// Lifetime characters removed by compression — the hook's own operational metric, self-reported
+/// via the `status` message (monotonic counter; busbar exposes it on the admin API / Prometheus).
+static TOKENS_SAVED: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     let path = std::env::args()
@@ -61,8 +64,11 @@ fn main() {
     }
 }
 
-/// One JSON line in, one JSON line out. Dispatch on the top-level message kind; anything
-/// unrecognized gets `{}` — busbar reads that as abstain / not-acked, never as an error.
+/// One JSON line in, one JSON line out. Dispatch per the wire contract: MANAGEMENT messages are
+/// key-discriminated (`configure` / `describe` / `status`); everything else is a PER-REQUEST
+/// message whose `op` field says which kind (`decide` / `transform` / `notify`). Anything
+/// unrecognized — including future ops — gets `{}`: busbar reads that as abstain / unsupported,
+/// never as an error (the append-only evolvability rule).
 fn handle_line(line: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return "{}\n".into();
@@ -73,10 +79,21 @@ fn handle_line(line: &str) -> String {
     if v.get("describe").is_some() {
         return describe();
     }
-    if let Some(req) = v.get("request") {
-        return transform(req);
+    if v.get("status").is_some() {
+        return status();
     }
-    "{}\n".into()
+    match v.get("op").and_then(|o| o.as_str()) {
+        Some("transform") => {
+            if let Some(req) = v.get("request") {
+                return transform(req);
+            }
+            "{}\n".into()
+        }
+        // A tap notify is fire-and-forget (busbar never reads a reply); a decide from this rw gate
+        // is unreachable (rw gates fire on the transform pass) — abstain on both, and on any
+        // future op we don't recognize.
+        _ => "{}\n".into(),
+    }
 }
 
 /// Apply a pushed settings map and ACK by echoing its version — the echo is what commits the PATCH
@@ -92,15 +109,35 @@ fn configure(cfg: &serde_json::Value) -> String {
     format!("{{\"ack\":{{\"settings_version\":{version}}}}}\n")
 }
 
-/// Answer `describe` with the settings schema the admin API serves verbatim.
+/// Answer `describe` with the BARE settings JSON Schema — busbar proxies the reply VERBATIM at
+/// `GET /api/v1/admin/hooks/{name}/schema`, so wrapping it (the old `{"schema": {...}}` form)
+/// double-nests on the admin API.
 fn describe() -> String {
     concat!(
-        r#"{"schema":{"type":"object","properties":{"min_savings_pct":"#,
+        r#"{"type":"object","properties":{"min_savings_pct":"#,
         r#"{"type":"integer","minimum":0,"maximum":100,"#,
-        r#""description":"rewrite only when the body shrinks by at least this percent"}}}}"#,
+        r#""description":"rewrite only when the body shrinks by at least this percent"}}}"#,
         "\n"
     )
     .into()
+}
+
+/// Answer `status` with OBSERVED state: the settings this process is actually running + its own
+/// operational metrics — the control-plane read busbar surfaces at
+/// `GET /api/v1/admin/hooks/{name}/status` (and a dashboard built on busbar sees per-plug data).
+fn status() -> String {
+    let pct = MIN_SAVINGS_PCT.load(Ordering::Relaxed);
+    let compressed = TOKENS_SAVED.load(Ordering::Relaxed);
+    format!(
+        concat!(
+            r#"{{"status":{{"settings":{{"min_savings_pct":{pct}}},"#,
+            r#""metrics":{{"chars_saved_total":{{"type":"counter","value":{saved},"#,
+            r#""help":"characters removed by whitespace compression"}}}}}}}}"#,
+            "\n"
+        ),
+        pct = pct,
+        saved = compressed,
+    )
 }
 
 /// The rewrite pass: collapse whitespace runs in every message; reply with the smaller body only
@@ -130,6 +167,8 @@ fn transform(req: &serde_json::Value) -> String {
     if (saved_pct as u64) < MIN_SAVINGS_PCT.load(Ordering::Relaxed) {
         return "{}\n".into(); // not worth a body swap — busbar proceeds untouched
     }
+    // Count the committed savings — self-reported via `status` as `chars_saved_total`.
+    TOKENS_SAVED.fetch_add((before - after) as u64, Ordering::Relaxed);
     format!(
         "{{\"rewrite\":{{\"messages\":{}}}}}\n",
         serde_json::to_string(&compressed).unwrap()
@@ -180,25 +219,54 @@ mod tests {
     /// hook), and cargo runs `#[test]`s in parallel — separate tests mutating it would race.
     #[test]
     fn five_message_wire_lifecycle() {
-        // describe → the settings schema.
+        // describe → the BARE settings schema (busbar proxies it verbatim — no wrapper).
         let r = handle_line(r#"{"describe":true}"#);
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(
-            v["schema"]["properties"]["min_savings_pct"]["type"],
-            "integer"
+        assert_eq!(v["properties"]["min_savings_pct"]["type"], "integer");
+        assert!(
+            v.get("schema").is_none(),
+            "no wrapper: the reply IS the schema"
         );
 
-        // transform → rewrite when the collapse clears the (default 10%) threshold; body form out.
+        // transform (per-request messages carry the `op` discriminator) → rewrite when the collapse
+        // clears the (default 10%) threshold; body form out.
         let spaced = "hello      world\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n!";
-        let line = serde_json::json!({"request": {"messages": [{"role": "user", "text": spaced}]}});
+        let line = serde_json::json!({"op": "transform", "request": {"messages": [{"role": "user", "text": spaced}]}});
         let r = handle_line(&line.to_string());
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["rewrite"]["messages"][0]["content"], "hello world !");
 
+        // status → observed settings + self-reported metrics (the committed rewrite counted).
+        let r = handle_line(r#"{"status":true}"#);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["status"]["settings"]["min_savings_pct"], 10);
+        assert_eq!(
+            v["status"]["metrics"]["chars_saved_total"]["type"],
+            "counter"
+        );
+        assert!(
+            v["status"]["metrics"]["chars_saved_total"]["value"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
         // transform → abstain below the threshold, and abstain when no prompt was projected.
-        let tight = serde_json::json!({"request": {"messages": [{"role": "user", "text": "already tight"}]}});
+        let tight = serde_json::json!({"op": "transform", "request": {"messages": [{"role": "user", "text": "already tight"}]}});
         assert_eq!(handle_line(&tight.to_string()).trim(), "{}");
-        assert_eq!(handle_line(r#"{"request":{"pool":"p"}}"#).trim(), "{}");
+        assert_eq!(
+            handle_line(r#"{"op":"transform","request":{"pool":"p"}}"#).trim(),
+            "{}"
+        );
+        // a NOTIFY (tap) or an unknown future op → the safe `{}` (append-only evolvability).
+        assert_eq!(
+            handle_line(r#"{"op":"notify","request":{"pool":"p"}}"#).trim(),
+            "{}"
+        );
+        assert_eq!(
+            handle_line(r#"{"op":"someday-new","request":{}}"#).trim(),
+            "{}"
+        );
 
         // configure → ack echoes the pushed version and the setting applies…
         let r = handle_line(

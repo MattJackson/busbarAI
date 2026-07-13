@@ -172,9 +172,9 @@ pub(crate) struct HookContext {
 
 /// The CONFIGURE message (D2) — the FIRST line busbar sends on every socket connection (and the
 /// push a settings PATCH makes before committing): the hook's current desired-state settings.
-/// Top-level `configure` key discriminates it from decide/transform payloads (which carry
-/// `request`/`candidates`/`context`), so a hook branches on the first key. Idempotent
-/// desired-state: re-sending the same settings must be a no-op for the hook.
+/// The top-level `configure` KEY (presence, never key order) discriminates it as a management
+/// message; per-request payloads carry the `op` field instead. Idempotent desired-state:
+/// re-sending the same settings must be a no-op for the hook.
 #[derive(Serialize)]
 pub(crate) struct ConfigureMsg<'a> {
     pub(crate) configure: ConfigureBody<'a>,
