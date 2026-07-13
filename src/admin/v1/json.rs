@@ -79,6 +79,17 @@ fn service(handle: &Arc<AppHandle>) -> AdminService {
     AdminService::new(handle.load())
 }
 
+/// Serializes config-plane MUTATIONS (hook register/replace/delete, config apply/reload/rollback,
+/// settings, auth chain) so each `read current → build next → swap → record` runs atomically with
+/// respect to the others. READS stay lock-free (`handle.load()`), and mutations are rare
+/// admin-only operations, so this never touches request-serving latency. Without it, two
+/// concurrent mutations both read version N, both build N+1, and one swap is silently lost while
+/// the version log gains two divergent N+1 entries; and a settings PATCH could have another
+/// mutation slip in during its (up to 5s) configure-ack await. The lock is held only across the
+/// SYNC build+swap+record — never across a network await (the settings push happens BEFORE the
+/// lock, then the version is re-validated under it).
+static CONFIG_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── JSON wire helpers (v1) ───────────────────────────────────────────────────────────────────────
 
 /// Serialize a successful view to the JSON body with the given status. `view` is any `contract` view
@@ -222,6 +233,7 @@ async fn register_hook(
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
     };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{}", req.name);
     if let Some(expected) = req.expected_version {
@@ -284,6 +296,7 @@ async fn put_hook(
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
     };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");
     if !current.hook_registry.contains_key(&name) {
@@ -343,6 +356,7 @@ async fn delete_hook(
     Path(name): Path<String>,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");
     match build_without_hook(&current, &name) {
@@ -512,6 +526,7 @@ async fn rollback_config(
             )))
         }
     };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("config:v{}", req.version);
     if let Some(expected) = req.expected_version {
@@ -609,6 +624,7 @@ async fn put_auth(
         Ok(b) => b,
         Err(e) => return err_json(&AdminError::Validation(format!("invalid body: {e}"))),
     };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     if let Some(expected) = req.expected_version {
         if expected != current.config_version {
@@ -751,6 +767,7 @@ async fn reload_config(
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let (Some(config_path), Some(providers_path)) =
         (current.config_path.clone(), current.providers_path.clone())
@@ -843,6 +860,7 @@ async fn apply_config(
             )))
         }
     };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     if let Some(expected) = req.expected_version {
         if expected != current.config_version {
@@ -985,16 +1003,31 @@ async fn patch_hook_settings(
     }
     let mut updated = existing.clone();
     updated.settings = req.settings;
-    let settings_version = current.config_version.wrapping_add(1);
+    let pre_push_version = current.config_version;
+    let settings_version = pre_push_version.wrapping_add(1);
     // PUSH first, COMMIT on ack — a hook that never acked never sees committed state it doesn't
-    // hold (§6.5: no partial config ever goes live).
-    if let Err(e) =
-        crate::routing::push_configure(&updated, &name, settings_version, &current.client).await
+    // hold (§6.5: no partial config ever goes live). The client is captured here; the load() that
+    // feeds the actual swap is re-taken AFTER the await, under the mutation lock.
+    let client = current.client.clone();
+    if let Err(e) = crate::routing::push_configure(&updated, &name, settings_version, &client).await
     {
         audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::Validation(format!(
             "hook did not acknowledge the settings push: {e}"
         )));
+    }
+    // COMMIT under the mutation lock, guarding the configure-ack await window: if any config-plane
+    // mutation landed while we were awaiting the ack, `current` is stale and swapping on it would
+    // clobber that change (and reuse its version number). Re-validate the version under the lock;
+    // a change means "config moved during your push" → 409, retry (the ack was for a now-stale
+    // snapshot). Version unchanged ⇒ `current` is still the live snapshot, so the build is sound.
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    if current.config_version != pre_push_version {
+        audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(
+            "config changed during the settings push; retry".to_string(),
+        ));
     }
     match build_with_hook(&current, &name, updated) {
         Ok(next) => {
