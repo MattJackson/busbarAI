@@ -142,6 +142,36 @@ const ARTICLE = datePublished
       /* POST */
       .post-wrap { min-height: calc(100vh - 64px - 200px); padding: 64px 28px 96px; }
       .post { max-width: 720px; margin: 0 auto; }
+      /* Tables in blog prose (e.g. the Headroom benchmark). */
+      .post table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 1.6rem 0;
+        font-size: 0.95rem;
+        font-variant-numeric: tabular-nums;
+      }
+      .post th, .post td {
+        padding: 0.55rem 0.4rem;
+        text-align: left;
+        border-bottom: 1px solid #e2e8f0;
+      }
+      .post th:first-child, .post td:first-child { width: 99%; padding-left: 0; }
+      .post th:not(:first-child), .post td:not(:first-child) {
+        text-align: right;
+        white-space: nowrap;
+        width: 4.5rem;
+        padding-left: 1.4rem;
+      }
+      .post thead th {
+        font-weight: 600;
+        color: var(--muted);
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        border-bottom-width: 2px;
+        border-bottom-color: #cbd5e1;
+      }
+      .post tbody tr:last-child td { border-bottom: none; }
       .post-back { display: inline-block; font-size: 14px; color: var(--muted); margin-bottom: 28px; }
       .post-back:hover { color: var(--slate); }
       .post-meta { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; margin: 0 0 12px; }

@@ -17,7 +17,7 @@ retrievals: on every turn the model re-reads a pile of noise you're paying for b
 usual fix is to trim it in your application, and then to trim it again differently for the next
 provider, because their limits and dialects differ. It's real work, and you do it more than once.
 
-The [Headroom](https://github.com/headroomlabs-ai/headroom) project, by Tejas Chopra, already
+The [Headroom](https://headroomlabs-ai.github.io/headroom/) project, by Tejas Chopra, already
 solves the hard part: a fast BM25 compressor (no model, no network) that strips that boilerplate
 down while keeping what the request actually needs. What was missing was a way to run it in front
 of every model you call without wiring it into every app.
@@ -50,7 +50,7 @@ a time (`busbar;dur`, µs):
 
 Two things I like about that. **Busbar itself is 22 microseconds (µs)** — as our own
 [benchmark](/docs/benchmark/) has shown, the gateway isn't where your latency goes. And **Headroom
-adds ~550 µs** to compress the history, with a tail that barely
+adds 547 µs** to compress the history, with a tail that barely
 moves: p99 is only about 1.1× p50, because Busbar and the hook are both single Rust binaries with
 no garbage collector to pause the path.
 
@@ -59,13 +59,13 @@ that's their craft, and the [Headroom project](https://headroomlabs-ai.github.io
 higher ratios than the ~50% I saw here (66–94% on some content types), with more to gain from
 tuning the keep-ratio. The mock upstream did confirm the compressed prompt really shipped (2,832 →
 1,422 input tokens at the default settings, byte-checked at the provider), so the plumbing is sound.
-But the number I care about is the *cost of running that middleware on Busbar* — ~550 µs — because
+But the number I care about is the *cost of running that middleware on Busbar* — 547 µs — because
 the pitch isn't "Busbar compresses well," it's "Busbar is the fastest place to put middleware like
 Headroom on your request path." And when there's nothing to trim — a short conversational chat —
 the hook abstains and the request passes through byte-identical.
 
 That trade is decisive, and it's almost free. On a request whose model call takes two seconds,
-550 µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
+547 µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
 half the input tokens.
 
 For scale, Headroom ships as an HTTP proxy today and reports a **52ms median overhead** in
