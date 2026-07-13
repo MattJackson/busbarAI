@@ -2172,7 +2172,16 @@ fn apply_rewrite_to_body(
             let framed: Vec<Value> = pairs
                 .into_iter()
                 .map(|(role, text)| {
-                    let g_role = if role == "assistant" { "model" } else { "user" };
+                    // Accept BOTH the canonical `assistant` AND the gemini-native `model` on the
+                    // hook's reply — a hook that echoes the role it was PROJECTED (see the
+                    // gemini-role canonicalization in build_prompt_projection) or one written to the
+                    // gemini vocabulary must both round-trip to `model`, not silently fall through to
+                    // `user` and corrupt every assistant turn. (found: audit c1r14.)
+                    let g_role = if role == "assistant" || role == "model" {
+                        "model"
+                    } else {
+                        "user"
+                    };
                     serde_json::json!({ "role": g_role, "parts": [{ "text": text }] })
                 })
                 .collect();
@@ -2536,6 +2545,12 @@ fn build_prompt_projection<'a>(
                     flatten_content(m.get("content"))
                 };
                 let role: Cow<'_, str> = match m.get("role").and_then(|r| r.as_str()) {
+                    // CANONICALIZE the gemini-native assistant role `model` → `assistant` so a
+                    // `prompt: rw` hook sees the SAME canonical-IR vocabulary on every dialect (the
+                    // hook contract promises normalized IR). Without this a hook that echoes the role
+                    // it received emitted `model`, which the gemini write-back then mapped to `user`,
+                    // silently corrupting assistant turns. Mirrors the responses arm below. (c1r14.)
+                    Some("model") if ingress_protocol == "gemini" => Cow::Borrowed("assistant"),
                     Some(r) => Cow::Borrowed(r),
                     // Top-level typed item without a `role`: infer from its `type` so a `prompt: rw`
                     // hook sees the correct speaker (`output_text` = assistant, else user).
@@ -3768,6 +3783,17 @@ async fn forward_with_pool_parsed_inner(
                         name,
                         on_empty,
                     } => {
+                        // Capture this restrict so it PERSISTS across a `fallback_pool` hop, exactly
+                        // as the GATE reconcile arm does. Shrinking `cands` below only covers in-pool
+                        // failover; the fallback pool rebuilds candidates independently and consults
+                        // `enforce_restricts`. The gate arm was the c1r13 fix; this BASE routing-policy
+                        // arm (pool `route:` hook) is the sibling path that was still leaking a
+                        // compliance restrict at the pool boundary. (found: audit c1r14.)
+                        request_ctx.active_restricts.push(RestrictConstraint {
+                            tags_any: tags_any.clone(),
+                            on_empty: on_empty.clone(),
+                            name,
+                        });
                         let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
                         // Filter into a temp so the ORIGINAL `cands` survives for a weighted on_empty
                         // escape; only commit the restriction when the intersection is non-empty.
@@ -6221,6 +6247,57 @@ mod usage_tap_tests {
         let before = b2.clone();
         assert!(!super::apply_rewrite_to_body(&mut b2, &blocky, "bedrock"));
         assert_eq!(b2, before, "non-text rewrite leaves bedrock untouched");
+    }
+
+    /// REGRESSION (audit c1r14): the gemini rewrite-hook role vocabulary must round-trip. Gemini
+    /// assistant turns are natively `role: "model"`; the projection now CANONICALIZES that to
+    /// `assistant` (so the hook sees canonical IR), AND the write-back accepts BOTH `assistant` and
+    /// `model` — so a hook that echoes the role it received no longer corrupts assistant turns into
+    /// user turns.
+    #[test]
+    fn gemini_rewrite_role_round_trips_model_and_assistant() {
+        use crate::routing::wire::RewriteReply;
+
+        // Projection canonicalizes the gemini-native `model` role to `assistant`.
+        let g_body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [{"text": "hello"}]}
+            ]
+        });
+        let p = super::build_prompt_projection(&g_body, "gemini");
+        assert_eq!(
+            p.messages[1].0, "assistant",
+            "a gemini `model` turn must project as canonical `assistant`, not leak `model`"
+        );
+
+        // Write-back: a hook reply echoing the gemini-native `model` role must map back to `model`,
+        // NOT fall through to `user`.
+        let echo_model = RewriteReply {
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "u"}),
+                serde_json::json!({"role": "model", "content": "m"}),
+            ],
+            tools: vec![],
+        };
+        let mut g = serde_json::json!({"contents": [{"role":"user","parts":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(&mut g, &echo_model, "gemini"));
+        assert_eq!(
+            g["contents"][1]["role"], "model",
+            "a hook echoing `model` must round-trip to `model`, not corrupt to `user`"
+        );
+        // Canonical `assistant` still works too.
+        let echo_assistant = RewriteReply {
+            messages: vec![serde_json::json!({"role": "assistant", "content": "a"})],
+            tools: vec![],
+        };
+        let mut g2 = serde_json::json!({"contents": [{"role":"user","parts":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(
+            &mut g2,
+            &echo_assistant,
+            "gemini"
+        ));
+        assert_eq!(g2["contents"][0]["role"], "model");
     }
 
     /// `apply_global_rewrites` fires the hooks in order and each sees the prior's output (a true
@@ -11701,7 +11778,9 @@ mod hook_opt_in_projection_tests {
             p.messages,
             vec![
                 ("user".into(), "hello".into()),
-                ("model".into(), "part one\npart two".into()),
+                // Gemini-native `model` is CANONICALIZED to `assistant` for the hook's IR view
+                // (audit c1r14) — the hook sees the same vocabulary on every dialect.
+                ("assistant".into(), "part one\npart two".into()),
             ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
         );
         // SIZE signals agree with the projection (minus join separators).
@@ -12270,6 +12349,73 @@ mod hook_seam_tests {
         assert_eq!(
             rc_none.enforce_restricts(&app, "fb", cands).unwrap().len(),
             2
+        );
+    }
+
+    /// REGRESSION (audit c1r14), END-TO-END: a BASE routing-policy (`route:` hook) `Restrict` must
+    /// persist across a `fallback_pool` spill exactly like a gate restrict. Primary pool's only
+    /// baa-eligible lane is dead → the request exhausts and spills to a fallback pool whose lane is
+    /// NOT baa-tagged; the compliance restrict must FAIL CLOSED there, not serve the ineligible lane.
+    #[tokio::test]
+    async fn base_policy_restrict_persists_across_fallback_pool_hop() {
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "primary",
+                    crate::proto::Protocol::anthropic(),
+                    "http://localhost",
+                )
+                .dead("down for test"),
+            )
+            .lane(LaneSpec::new(
+                "fbmember",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime("p", {
+                let mut rt = pool_runtime_with(&[(0, &["baa"])], Vec::new());
+                rt.policy = Some(canned_gate(
+                    Canned::Restrict(vec!["baa".to_string()]),
+                    "compliance",
+                ));
+                rt
+            })
+            .fallback_pool("fb", &[(1, 1)])
+            .pool_runtime("fb", pool_runtime_with(&[(1, &[])], Vec::new()))
+            .on_exhausted("p", crate::config::OnExhausted::FallbackPool("fb".into()))
+            .build();
+
+        let resp = forward_with_pool(
+            app,
+            vec![WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            Bytes::from(chat_body()),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "a base-policy compliance restrict must fail closed at the fallback boundary"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("restriction"),
+            "the 503 must be the compliance fail-closed, not a generic transport 503: {text}"
         );
     }
 
