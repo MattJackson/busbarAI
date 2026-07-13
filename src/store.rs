@@ -1050,9 +1050,15 @@ impl InMemoryStore {
         let mut duration = if streak == 0 {
             cfg.base_cooldown_secs
         } else {
+            // `base * 2^streak`, saturating. NOTE: `checked_shl` only guards the shift COUNT (>= 64),
+            // NOT value overflow — `10u64.checked_shl(63)` is `Some(0)` (the high bits shift out), so
+            // an even `base_cooldown_secs` at `streak >= 63` WRAPPED TO 0, giving a zero cooldown
+            // (tripped cell re-admits instantly) exactly when the lane is failing hardest. Compute in
+            // u128 (base < 2^64, shift <= 63 → product < 2^127, no overflow) then saturate to u64.
+            // (found: audit c2r3.)
             let shift = streak.min(63);
-            cfg.base_cooldown_secs
-                .checked_shl(shift)
+            let shifted = (cfg.base_cooldown_secs as u128) << shift;
+            u64::try_from(shifted)
                 .unwrap_or(u64::MAX)
                 .min(cfg.max_cooldown_secs)
         };
@@ -2980,6 +2986,42 @@ mod tests {
                 cd >= 1,
                 "base_cooldown_secs=1 must never yield a 0 cooldown (t={t} gave {cd})"
             );
+        }
+    }
+
+    /// REGRESSION (audit c2r3): the exponential backoff `base * 2^streak` must SATURATE, never wrap.
+    /// `checked_shl` guards only the shift COUNT (>= 64), not value overflow — `10u64.checked_shl(63)`
+    /// is `Some(0)` — so an EVEN `base_cooldown_secs` at a high streak wrapped to a ZERO cooldown
+    /// (tripped cell re-admits instantly) exactly when the lane is failing hardest.
+    #[test]
+    fn backoff_saturates_not_wraps_at_high_streak() {
+        set_now_for_test(0);
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let lane = store.get_lane(0).clone();
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 10, // EVEN base — the wrap-to-0 case
+            max_cooldown_secs: 3600,
+            honor_retry_after: false,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                consecutive_n: 2,
+            },
+        };
+        // Drive the streak to the danger zone (>= 63) and sweep the jitter seed.
+        for streak in [63u32, 64, 100, 1000] {
+            lane.streak().store(streak, Ordering::Relaxed);
+            for t in 0..80u64 {
+                set_now_for_test(t);
+                let cd =
+                    InMemoryStore::compute_cooldown_with_retry_after(&*lane, t, &cfg, None, 3600);
+                assert!(
+                    cd >= 1,
+                    "even base at streak {streak} must saturate toward max, never wrap to 0 (t={t} gave {cd})"
+                );
+            }
         }
     }
 

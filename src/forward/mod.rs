@@ -5264,6 +5264,11 @@ async fn forward_once(
     op: crate::handlers::Op,
     req_content_type: &str,
     usage_sink: Option<UsageSink>,
+    // The selected pool member's `reasoning` override (`WeightedLane.reasoning`), resolved by the
+    // caller from its candidate slice. `None` = no member override → fall back to the lane flag. The
+    // degraded path has no `cands` in scope, so the caller passes the already-resolved override here
+    // (mirrors the hot path's `effective_reasoning`). (found: audit c2r3.)
+    reasoning_override: Option<bool>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting. An OPAQUE (non-JSON) body — multipart/binary
     // operations — parses to `None` and relays/translates at the byte level, exactly like the main
@@ -5338,8 +5343,9 @@ async fn forward_once(
         op,
         v,
         req_content_type,
-        // Degraded path selects by pool cell, not member row: lane-level flag only.
-        app.lanes[i].reasoning,
+        // Honor the pool member's `reasoning` override (as the hot path does via
+        // `effective_reasoning`), falling back to the lane-level flag. (found: audit c2r3.)
+        reasoning_override.unwrap_or(app.lanes[i].reasoning),
         body,
     ) {
         Ok(p) => p,
@@ -6087,6 +6093,11 @@ async fn handle_fallback_pool(
             // Clone per attempt: a transient transport failure retries the next member, so the sink
             // must survive into the next loop iteration; only a successful stream consumes it.
             usage_sink.clone(),
+            // The selected member's `reasoning` override from this fallback pool's candidate slice.
+            fallback_cands
+                .iter()
+                .find(|w| w.idx == i)
+                .and_then(|w| w.reasoning),
         )
         .await
         {
@@ -6146,6 +6157,11 @@ async fn handle_least_bad(
         op,
         req_content_type,
         usage_sink,
+        // The least-bad member's `reasoning` override from this pool's candidate slice.
+        cands
+            .iter()
+            .find(|w| w.idx == soonest_idx)
+            .and_then(|w| w.reasoning),
     )
     .await
     {

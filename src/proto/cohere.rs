@@ -1499,6 +1499,13 @@ impl ProtocolWriter for CohereWriter {
                 if let crate::ir::IrBlock::Text { text, .. } = b {
                     Some(text.as_str())
                 } else {
+                    // A non-text system block (image/thinking/tool/…) has no Cohere v2 analog — the
+                    // system prompt carries text only. WARN on the drop so the loss is operator-
+                    // visible in observability, mirroring the Gemini writer's warn for the same case
+                    // (the Gemini writer's comment even claims cohere already warns). (audit c2r3.)
+                    tracing::warn!(
+                        "dropping non-text system block on Cohere egress: Cohere v2 system prompt carries text only"
+                    );
                     None
                 }
             })

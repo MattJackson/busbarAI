@@ -588,6 +588,17 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         // affinity. Validate it at boot: ASCII only, non-empty, and a sane <= 64-char bound.
         if let Some(affinity) = &pool_cfg.affinity {
             if let Some(header_name) = &affinity.header_name {
+                // Non-empty: an empty header name is not a valid HTTP field-name, and it PASSES the
+                // ASCII + length checks (`"".is_ascii()` is true, `0 > 64` is false) yet silently
+                // disables affinity at runtime (`headers.get("")` is always None) — the exact
+                // "silently disable affinity" failure this validator's own comment promises to
+                // catch. (found: audit c2r3.)
+                if header_name.is_empty() {
+                    errors.push(format!(
+                        "pool '{}' affinity.header_name must not be empty (an empty HTTP header field-name silently disables session affinity)",
+                        pool_name
+                    ));
+                }
                 if !header_name.is_ascii() {
                     errors.push(format!(
                         "pool '{}' affinity.header_name '{}' must be ASCII (an HTTP header field-name cannot contain non-ASCII bytes)",
@@ -4178,6 +4189,28 @@ models:
         assert!(
             validate(&cfg).is_ok(),
             "the supported 'session' affinity mode must validate"
+        );
+    }
+
+    /// REGRESSION (audit c2r3): an EMPTY `affinity.header_name` must be REJECTED at boot. It passes
+    /// the ASCII + length checks but silently disables session affinity at runtime
+    /// (`headers.get("")` is always None) — the exact silent-disable the validator's comment promises
+    /// to catch.
+    #[test]
+    fn test_validate_rejects_empty_affinity_header_name() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.affinity = Some(config::AffinityCfg {
+            mode: config::AffinityMode::Session,
+            header_name: Some(String::new()),
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let err = validate(&cfg).expect_err("empty header_name must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("must not be empty")),
+            "the error must name the empty-header-name problem: {err:?}"
         );
     }
 
