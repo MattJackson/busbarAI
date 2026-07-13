@@ -611,6 +611,12 @@ async fn delete_hook(
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");
+    // EXISTENCE before the concurrency guard — the same status precedence PUT/PATCH use, so all
+    // three verbs answer a stale guard on a nonexistent hook identically (404, not 409).
+    if !current.hook_registry.contains_key(&name) {
+        audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::NotFound(format!("hook `{name}`")));
+    }
     // Optimistic concurrency (H3): DELETE honors `If-Match` like every other config-plane mutation
     // (it previously had NO guard — the one mutation verb missing it).
     if let Some(e) = stale_if_match(expected, current.config_version) {
@@ -1775,7 +1781,7 @@ fn openapi_doc() -> serde_json::Value {
             "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
             "security": [{"adminToken": []}],
             "responses": {
-                "200": {"description": "`{applied, admin_auth, config_version, note}`"},
+                "200": {"description": "The resource + apply metadata: `{configured, modules, applied, config_version, note}`"},
                 "400": {"description": "Unknown module / malformed body (error code `invalid_request`)"},
                 "409": {"description": "Stale `If-Match` (`version_conflict`), or the new chain would lock the caller out (error code `conflict`)"}
             }
@@ -1801,7 +1807,7 @@ fn openapi_doc() -> serde_json::Value {
                 "summary": "Restore a retained version's hook surface (re-validated; a NEW version)",
                 "security": [{"adminToken": []}],
                 "responses": {
-                    "200": {"description": "`{restored_version, new_version}`"},
+                    "200": {"description": "`{restored_version, config_version}`"},
                     "404": {"description": "Target version not retained (error code `not_found`)"},
                     "409": {"description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"},
                     "400": {"description": "Snapshot fails re-validation (error code `invalid_request`)"}
@@ -1823,8 +1829,9 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
 
-    // Virtual-key management (mounted in main.rs, not the v1 router, but part of the frozen v1
-    // surface — must be discoverable). The secret is shown ONCE at create/rotate and never read back.
+    // Virtual-key management (mounted in the v1 router like everything else; handlers live in
+    // crate::admin while they migrate into the service). The secret is shown ONCE at create/rotate
+    // and never read back.
     paths.insert(
         ap("/keys"),
         json!({
@@ -1872,12 +1879,14 @@ fn openapi_doc() -> serde_json::Value {
                 }
             },
             "delete": {
-                "summary": "Revoke a key — it stops resolving immediately",
+                "summary": "Revoke a key — it stops resolving immediately. Optional `If-Match` (the key's ETag)",
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
                     "204": {"description": "Revoked — No Content"},
-                    "404": {"description": "Unknown key (error code `not_found`)"}
+                    "400": {"description": "Malformed `If-Match` (error code `invalid_request`)"},
+                    "404": {"description": "Unknown key (error code `not_found`)"},
+                    "409": {"description": "Stale `If-Match` ETag (error code `version_conflict` — re-read and retry)"}
                 }
             }
         }),
@@ -1900,12 +1909,13 @@ fn openapi_doc() -> serde_json::Value {
         ap("/keys/{id}/rotate"),
         json!({
             "post": {
-                "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving",
+                "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving. Honors an `Idempotency-Key` header (per-principal, op+id-scoped, ~10min replay)",
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
-                    "200": {"description": "Rotated (body includes the once-shown new secret)"},
-                    "404": {"description": "Unknown key (error code `not_found`)"}
+                    "200": {"description": "Rotated (body includes the once-shown new secret; an Idempotency-Key retry replays it verbatim)"},
+                    "404": {"description": "Unknown key (error code `not_found`)"},
+                    "409": {"description": "An Idempotency-Key request is already in flight (error code `conflict`)"}
                 }
             }
         }),

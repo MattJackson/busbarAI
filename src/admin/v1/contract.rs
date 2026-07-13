@@ -709,6 +709,8 @@ mod tests {
     fn admin_error_codes_and_statuses_are_frozen() {
         let cases = [
             (AdminError::NotFound("key".into()), "not_found", 404u16),
+            (AdminError::Unauthorized, "unauthorized", 401),
+            (AdminError::MethodNotAllowed, "method_not_allowed", 405),
             (
                 AdminError::Forbidden {
                     needed: Scope::Full,
@@ -717,7 +719,12 @@ mod tests {
                 403,
             ),
             (AdminError::Validation("bad".into()), "invalid_request", 400),
-            (AdminError::Conflict("stale".into()), "conflict", 409),
+            (
+                AdminError::VersionConflict("stale".into()),
+                "version_conflict",
+                409,
+            ),
+            (AdminError::Conflict("state".into()), "conflict", 409),
             (AdminError::RateLimited, "rate_limited", 429),
             (AdminError::Internal, "internal", 500),
         ];

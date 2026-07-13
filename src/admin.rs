@@ -733,12 +733,11 @@ pub(crate) async fn list_keys(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let Some(gov) = &app.governance else {
-        return disabled_empty_list();
-    };
-    let gov = gov.clone();
-    // Strict query parsing (re-audit L): an unparseable filter value is a loud 400, never a
-    // silently-dropped filter (which would return MORE keys than the caller asked for).
+    // Strict query parsing FIRST (re-audit L6): a malformed filter/cursor is a loud 400 on every
+    // server — governance-off must not fork the validation behavior (200-empty only for a VALID
+    // query).
+    // An unparseable filter value is a loud 400, never a silently-dropped filter (which would
+    // return MORE keys than the caller asked for).
     let enabled = match q.get("enabled") {
         None => None,
         Some(v) => match v.parse::<bool>() {
@@ -786,6 +785,10 @@ pub(crate) async fn list_keys(
         },
         None => 0,
     };
+    let Some(gov) = &app.governance else {
+        return disabled_empty_list();
+    };
+    let gov = gov.clone();
     let res = tokio::task::spawn_blocking(move || gov.all_keys()).await;
     match res {
         Ok(Ok(keys)) => {
