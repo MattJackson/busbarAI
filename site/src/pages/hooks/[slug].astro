@@ -66,6 +66,7 @@ const ICONS: Record<string, string> = {
       <h2>Install it</h2>
       <p set:html={hook.install.note}></p>
       {hook.install.code && <pre class="install-code"><code>{hook.install.code}</code></pre>}
+      {hook.install.foot && <p class="install-foot" set:html={hook.install.foot}></p>}
       <p class="install-foot">
         See the <a href="/docs/hooks/">hooks docs</a> for the full config shape and lifecycle.
       </p>

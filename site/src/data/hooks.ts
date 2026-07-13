@@ -34,7 +34,7 @@ export interface Hook {
   // "Our hook" links shown top-right on the detail page (our GitHub, install info)
   // — clearly OUR side: our page, our hook, how to get it.
   hookRepo?: string;
-  install?: { note: string; code?: string };
+  install?: { note: string; code?: string; foot?: string };
   // When a hook wraps someone else's open-source project, `spotlight` credits it
   // loudly on the detail page — the point is free advertising for the creator,
   // not quiet attribution. `links` render as a labelled resource list.
@@ -55,13 +55,13 @@ export const hooks: Hook[] = [
     name: 'Headroom',
     kind: 'gate',
     tagline: 'Context compression, on the path.',
-    body: 'A rewrite gate that trims and compacts a request’s context before it ships, so a long conversation stays under the window without your app rebuilding the prompt. Written once, it works against every protocol and provider Busbar speaks. Measured: about 50% fewer input tokens on noisy histories for ~4ms added; short chats pass through untouched.',
+    body: 'A rewrite gate that trims and compacts a request’s context before it ships, so a long conversation stays under the window without your app rebuilding the prompt. Written once, it works against every protocol and provider Busbar speaks. Measured: about 50% fewer input tokens on noisy histories for sub-millisecond overhead; short chats pass through untouched.',
     repo: 'https://github.com/GetBusbar/Hooks/tree/main/Headroom',
     status: 'Available',
     href: '/hooks/headroom',
     hookRepo: 'https://github.com/GetBusbar/Hooks/tree/main/Headroom',
     install: {
-      note: 'Run the hook binary (it owns a Unix socket), then register it in your Busbar config under a <code>hooks:</code> block, or attach it live over the admin API:',
+      note: 'The hook is a small Rust binary you run yourself; Busbar connects to it over a Unix socket. Build it from source (needs a <a href="https://rustup.rs" target="_blank" rel="noopener">Rust toolchain</a>, nothing else) — this also pins the <code>headroom-core</code> revision:<br><br><code>git clone https://github.com/GetBusbar/Hooks</code><br><code>cd Hooks/Headroom &amp;&amp; cargo build --release</code><br><br>Run it (it owns the socket; Busbar lazy-connects, so start order doesn’t matter and it reconnects across restarts — you own its lifecycle, Busbar never spawns it):<br><br><code>HEADROOM_SOCKET=/run/busbar/headroom.sock ./target/release/headroom-hook</code><br><br>Then point Busbar at the socket, or register it live over the admin API:',
       code: `hooks:
   headroom:
     kind: gate
@@ -69,13 +69,14 @@ export const hooks: Hook[] = [
     prompt: rw          # the rewrite grant
     global: true        # attach to every request
     on_error: nothing   # a broken compressor never touches a request`,
+      foot: 'The socket transport is Unix-only (Linux + macOS, any arch). On Windows, run the hook on a Linux host or container and register it as a <code>webhook:</code> sidecar instead of <code>socket:</code> — same wire, same replies, over HTTP.',
     },
     note: 'Powered by the open-source <a href="https://github.com/headroomlabs-ai/headroom" target="_blank" rel="noopener">Headroom</a> project.',
     detail: [
       'Every tool call, DB query, file read, and RAG retrieval your agent makes is mostly boilerplate — noise the model pays to read on every request. Trimming it away usually means bespoke work in each app, rebuilt for every provider whose limits differ.',
       'The <a href="https://github.com/headroomlabs-ai/headroom" target="_blank" rel="noopener">Headroom</a> project already solves the hard part: it compresses that boilerplate away before it hits the model, so the LLM sees less noise, responds faster, and costs less. The Busbar hook is a thin <strong>rewrite gate</strong> that runs it on the path — it hands each request to Headroom before it ships, no app changes required.',
       'Because the gate fires on Busbar’s normalized IR, that one integration covers every wire protocol and provider at once, with failover and circuit breaking underneath it. Headroom does the compression; Busbar puts it in front of every model you call.',
-      'Measured, reproducibly (the rig ships in the repo): on an 11KB noisy tool-log history the hook cuts input tokens from 2,832 to 1,422 per request, a 50% reduction confirmed at the upstream, for about 4ms of added latency at the median. Compression itself runs 0.15ms on a 2KB history and 0.72ms at 16KB. Short conversational chats abstain and pass through byte-identical. If the hook is ever slow, wrong, or down, the request proceeds with its original body.',
+      'Measured, reproducibly (the rig ships in the repo): on an 11KB noisy tool-log history the hook cuts input tokens from 2,832 to 1,422 per request, a 50% reduction confirmed at the upstream. Measured one request at a time, Busbar itself is about 0.16ms and Headroom adds about 0.62ms to compress the history, so the total added latency is under a millisecond; on a two-second inference call that is 0.03% of the request. For comparison, Headroom’s own HTTP proxy reports a 52ms median overhead in production (negligible against inference, as they note); running the same core as a co-located socket gate removes the network hop and drops the floor to sub-millisecond. Short conversational chats abstain and pass through byte-identical, and if the hook is ever slow, wrong, or down the request proceeds with its original body.',
     ],
     spotlight: {
       project: 'Headroom',
