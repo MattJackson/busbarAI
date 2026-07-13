@@ -65,6 +65,7 @@ mod router;
 mod routing;
 mod sigv4;
 mod state;
+mod state_persist;
 mod store;
 #[cfg(test)]
 mod test_support;
@@ -166,6 +167,10 @@ USAGE:
 
 ENVIRONMENT:
     BUSBAR_PROVIDERS    path to providers.yaml  (default: /etc/busbar/providers.yaml)
+    BUSBAR_STATE_FILE   state-snapshot path ('' disables; default: busbar-state.json next to config)
+
+Flags:
+    --safe-mode         boot on base config.yaml alone (quarantine the persisted overlay)
     BUSBAR_CONFIG       path to config.yaml     (default: /etc/busbar/config.yaml)
     RUST_LOG            log level: error|warn|info|debug|trace  (default: info)
 
@@ -280,7 +285,9 @@ async fn main() {
     let config_path = std::path::PathBuf::from(
         std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into()),
     );
-    let loaded = load_config_from_disk(&config_path, &providers_path).unwrap_or_else(|e| die(e));
+    let safe_mode = std::env::args().any(|a| a == "--safe-mode");
+    let loaded =
+        load_config_from_disk(&config_path, &providers_path, safe_mode).unwrap_or_else(|e| die(e));
     let LoadedConfig {
         deploy,
         defs,
@@ -343,6 +350,36 @@ async fn main() {
     app.versions
         .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
 
+    // D3 RESTORE: bring back the persisted process state (health by lane identity, audit ring,
+    // version history) so the restart forgot nothing. Fail-soft in every direction.
+    let state_file = state_persist::resolve_path(Some(&config_path));
+    if let Some(ref sf) = state_file {
+        if let Some(persisted) = state_persist::read(sf, store::now()) {
+            let restored = persisted.health.len();
+            // Rebuild the store WITH restored health (identity-keyed, so it survives any config
+            // edits made while busbar was down). The app was just built and is not yet served, so
+            // rebuilding its store here is safe; the swap-in happens before the first request.
+            // (Simplest correct wiring: restore INTO the existing store's lanes by identity.)
+            app.store.restore_health(&persisted.health);
+            crate::admin::audit::AUDIT.load(persisted.audit);
+            app.versions.load(persisted.versions);
+            // Re-record the boot floor ON TOP of the restored history (a fresh boot version entry).
+            app.versions.record(
+                app.config_version,
+                "system",
+                "boot (state restored)",
+                &app.hook_registry,
+                &app.global_hooks,
+            );
+            tracing::info!(path = %sf.display(), lanes = restored, "state restored from snapshot");
+        }
+    } else {
+        tracing::info!(
+            "state persistence disabled (no config path / BUSBAR_STATE_FILE empty); restarts \
+             start with fresh health state"
+        );
+    }
+
     // configure the request-log webhook (reusing the pooled client). No-op if unset.
     observability::configure_webhook(
         observability_cfg.request_log_webhook_url.clone(),
@@ -356,12 +393,18 @@ async fn main() {
     // Build the router with the operator-configured ingress body cap + optional inbound-concurrency
     // layer (0 = unlimited / no layer, today's default). `cfg` is moved field-by-field below, so read
     // the two values first.
-    let router = build_router_with_limits(
+    let (router, app_handle) = build_router_with_limits(
         app,
         req_body_max,
         max_inbound,
         observability_cfg.emit_server_timing,
     );
+
+    // D3 SNAPSHOTTER: persist process state every ~30s (and once more on graceful shutdown below)
+    // so a restart — including an upgrade — forgets nothing.
+    if let Some(ref sf) = state_file {
+        state_persist::spawn_snapshotter(app_handle.clone(), sf.clone());
+    }
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -394,6 +437,16 @@ async fn main() {
             if let Err(e) = tls::serve(listener, router, server_config, shutdown_signal()).await {
                 die(format!("server error: {e}"));
             }
+        }
+    }
+    // D3: one FINAL state snapshot after the graceful drain, so the freshest health picture is
+    // what the next boot restores (the periodic 30s tick could be up to 30s stale).
+    if let Some(ref sf) = state_file {
+        let app = app_handle.load();
+        if let Err(e) = state_persist::write(sf, &state_persist::capture(&app)) {
+            tracing::warn!(path = %sf.display(), error = %e, "final state snapshot failed");
+        } else {
+            tracing::info!(path = %sf.display(), "state snapshot written on shutdown");
         }
     }
     observability::shutdown_tracing();
@@ -642,6 +695,7 @@ pub(crate) struct LoadedConfig {
 pub(crate) fn load_config_from_disk(
     config_path: &std::path::Path,
     providers_path: &std::path::Path,
+    safe_mode: bool,
 ) -> Result<LoadedConfig, String> {
     let raw_providers = std::fs::read_to_string(providers_path).map_err(|e| {
         format!(
@@ -673,6 +727,21 @@ pub(crate) fn load_config_from_disk(
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
     let base_hook_names: std::collections::HashSet<String> = deploy.hooks.keys().cloned().collect();
+    if safe_mode {
+        // `--safe-mode` (D3): boot on the operator-owned base config ALONE — the persisted overlay
+        // (API-registered hooks) is quarantined, not deleted. The escape hatch for "an applied
+        // hook is harming traffic and re-applies itself every boot".
+        tracing::warn!(
+            "SAFE MODE: config overlay NOT merged — running on base config.yaml alone (the \
+             overlay file is untouched; boot without --safe-mode to re-apply it)"
+        );
+        return Ok(LoadedConfig {
+            deploy,
+            defs,
+            overlay_path,
+            base_hook_names,
+        });
+    }
     if let Some(ref p) = overlay_path {
         if let Some(doc) = config::overlay::read(p) {
             tracing::info!(
@@ -1155,6 +1224,7 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         crate::config::DEFAULT_MAX_INBOUND_CONCURRENT,
         crate::config::DEFAULT_EMIT_SERVER_TIMING,
     )
+    .0
 }
 
 /// Router builder with EXPLICIT limits, so a test can assert the body-size and inbound-concurrency
@@ -1166,7 +1236,7 @@ fn build_router_with_limits(
     request_body_max_bytes: usize,
     max_inbound_concurrent: usize,
     emit_server_timing: bool,
-) -> Router {
+) -> (Router, std::sync::Arc<state::AppHandle>) {
     let router = Router::new()
         .route("/stats", get(endpoints::stats))
         .route("/healthz", get(endpoints::healthz))
@@ -1246,9 +1316,12 @@ fn build_router_with_limits(
             emit_server_timing,
             server_timing,
         ))
-        .with_state(handle);
+        .with_state(handle.clone());
 
-    apply_inbound_concurrency_limit(router, max_inbound_concurrent)
+    (
+        apply_inbound_concurrency_limit(router, max_inbound_concurrent),
+        handle,
+    )
 }
 
 /// OUTERMOST inbound-concurrency cap. `max_inbound_concurrent == 0` (the default) returns the router

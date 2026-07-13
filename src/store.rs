@@ -446,8 +446,12 @@ pub(crate) trait StateStore: Send + Sync + 'static {
 
     /// Export every lane's PORTABLE health state, keyed by stable identity (D1) — the input to a
     /// state-carrying store rebuild (config apply) and to the persistence snapshotter (D3).
-    #[allow(dead_code)] // bin-target consumer is the config-apply core (next slice)
     fn export_health(&self) -> Vec<LaneHealthSnapshot>;
+
+    /// Restore health state IN PLACE by stable identity (D3 boot restore — runs before the first
+    /// request is served). Lanes without a matching snapshot are untouched; snapshots without a
+    /// matching lane are dropped.
+    fn restore_health(&self, restored: &[LaneHealthSnapshot]);
 }
 
 /// Bounded sliding window of recent request outcomes, each tagged success/error, used to compute
@@ -525,6 +529,58 @@ struct BreakerCell {
     // (`cell_ready_breaker`/`cell_acquire_breaker` selection) does NOT take this lock — it stays
     // lock-free; only the (comparatively rare) transitions serialize against each other.
     transition_lock: std::sync::Mutex<()>,
+}
+
+impl InMemoryStore {
+    /// The identity-keyed restore shared by the state-carrying constructor (config apply) and the
+    /// in-place boot restore (D3): apply each matching snapshot's lane-global fields and recreate
+    /// its per-pool breaker cells eagerly (a restored Open cell blocks dispatch from request one).
+    fn restore_health_impl(&self, restored: &[LaneHealthSnapshot]) {
+        for (idx, lane) in self.lanes.iter().enumerate() {
+            let Some(snap) = restored
+                .iter()
+                .find(|s| s.model == lane.model && s.provider == lane.provider)
+            else {
+                continue;
+            };
+            lane.budget.store(snap.budget, Ordering::Relaxed);
+            lane.breaker_state
+                .store(snap.breaker_state, Ordering::Relaxed);
+            lane.cooldown_until
+                .store(snap.cooldown_until, Ordering::Relaxed);
+            lane.streak.store(snap.streak, Ordering::Relaxed);
+            lane.dead.store(snap.dead, Ordering::Relaxed);
+            *lane.dead_reason.lock().unwrap_or_else(|e| e.into_inner()) = snap.dead_reason.clone();
+            lane.ok.store(snap.ok, Ordering::Relaxed);
+            lane.err.store(snap.err, Ordering::Relaxed);
+            lane.client_fault
+                .store(snap.client_fault, Ordering::Relaxed);
+            lane.latency_ewma_bits
+                .store(snap.latency_ewma_bits, Ordering::Relaxed);
+            let mut map = self.pool_cells.write().unwrap_or_else(|e| e.into_inner());
+            let cells = map.entry(idx).or_default();
+            for cs in &snap.cells {
+                // In-place restore may find the cell already lazily created — restore INTO it.
+                if let Some((_, cell)) = cells.iter().find(|(p, _)| p.as_ref() == cs.pool) {
+                    cell.breaker_state
+                        .store(cs.breaker_state, Ordering::Relaxed);
+                    cell.cooldown_until
+                        .store(cs.cooldown_until, Ordering::Relaxed);
+                    cell.streak.store(cs.streak, Ordering::Relaxed);
+                    cell.err.store(cs.err, Ordering::Relaxed);
+                } else {
+                    let cell = Arc::new(BreakerCell::new());
+                    cell.breaker_state
+                        .store(cs.breaker_state, Ordering::Relaxed);
+                    cell.cooldown_until
+                        .store(cs.cooldown_until, Ordering::Relaxed);
+                    cell.streak.store(cs.streak, Ordering::Relaxed);
+                    cell.err.store(cs.err, Ordering::Relaxed);
+                    cells.push((cs.pool.clone().into_boxed_str(), cell));
+                }
+            }
+        }
+    }
 }
 
 impl BreakerCell {
@@ -814,41 +870,7 @@ impl InMemoryStore {
     ) -> Self {
         let store =
             Self::new_with_limits(lanes, hard_down_cooldown_secs, max_honored_retry_after_secs);
-        for (idx, lane) in store.lanes.iter().enumerate() {
-            let Some(snap) = restored
-                .iter()
-                .find(|s| s.model == lane.model && s.provider == lane.provider)
-            else {
-                continue;
-            };
-            lane.budget.store(snap.budget, Ordering::Relaxed);
-            lane.breaker_state
-                .store(snap.breaker_state, Ordering::Relaxed);
-            lane.cooldown_until
-                .store(snap.cooldown_until, Ordering::Relaxed);
-            lane.streak.store(snap.streak, Ordering::Relaxed);
-            lane.dead.store(snap.dead, Ordering::Relaxed);
-            *lane.dead_reason.lock().unwrap_or_else(|e| e.into_inner()) = snap.dead_reason.clone();
-            lane.ok.store(snap.ok, Ordering::Relaxed);
-            lane.err.store(snap.err, Ordering::Relaxed);
-            lane.client_fault
-                .store(snap.client_fault, Ordering::Relaxed);
-            lane.latency_ewma_bits
-                .store(snap.latency_ewma_bits, Ordering::Relaxed);
-            // Recreate the per-pool breaker cells eagerly with their restored FSM state.
-            let mut map = store.pool_cells.write().unwrap_or_else(|e| e.into_inner());
-            let cells = map.entry(idx).or_default();
-            for cs in &snap.cells {
-                let cell = Arc::new(BreakerCell::new());
-                cell.breaker_state
-                    .store(cs.breaker_state, Ordering::Relaxed);
-                cell.cooldown_until
-                    .store(cs.cooldown_until, Ordering::Relaxed);
-                cell.streak.store(cs.streak, Ordering::Relaxed);
-                cell.err.store(cs.err, Ordering::Relaxed);
-                cells.push((cs.pool.clone().into_boxed_str(), cell));
-            }
-        }
+        store.restore_health_impl(restored);
         store
     }
 
@@ -2439,6 +2461,10 @@ impl StateStore for InMemoryStore {
                 -1
             },
         }
+    }
+
+    fn restore_health(&self, restored: &[LaneHealthSnapshot]) {
+        self.restore_health_impl(restored);
     }
 
     fn export_health(&self) -> Vec<LaneHealthSnapshot> {

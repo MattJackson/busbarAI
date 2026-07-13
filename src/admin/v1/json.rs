@@ -593,18 +593,19 @@ async fn reload_config(
                 .into(),
         ));
     };
-    let outcome = crate::load_config_from_disk(&config_path, &providers_path).and_then(|loaded| {
-        let cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
-            .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
-        crate::build_app_from_config(
-            cfg,
-            loaded.deploy.governance.clone(),
-            loaded.overlay_path,
-            loaded.base_hook_names,
-            (Some(config_path), Some(providers_path)),
-            Some(&current),
-        )
-    });
+    let outcome =
+        crate::load_config_from_disk(&config_path, &providers_path, false).and_then(|loaded| {
+            let cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
+                .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
+            crate::build_app_from_config(
+                cfg,
+                loaded.deploy.governance.clone(),
+                loaded.overlay_path,
+                loaded.base_hook_names,
+                (Some(config_path), Some(providers_path)),
+                Some(&current),
+            )
+        });
     match outcome {
         Ok(next) => {
             handle.swap(Arc::new(next));

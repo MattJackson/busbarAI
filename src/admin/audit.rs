@@ -17,7 +17,7 @@ use serde::Serialize;
 /// outcome)`, and `prev_hash` is the preceding entry's `hash`. Recomputing the chain detects any
 /// altered/reordered/deleted entry (detection, not prevention — a compromised host can still rewrite
 /// the whole chain; prevention is shipping the log off-box to a SIEM).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub(crate) struct AuditEntry {
     /// Monotonic sequence number (1-based), unique within a process lifetime.
     pub(crate) seq: u64,
@@ -29,7 +29,7 @@ pub(crate) struct AuditEntry {
     pub(crate) resource: String,
     /// Stable outcome token: `applied` (mutation committed) | `rejected` (validation/conflict, nothing
     /// changed).
-    pub(crate) outcome: &'static str,
+    pub(crate) outcome: String,
     /// WHO — the authenticated principal id that attempted the mutation (`admin` for the operator
     /// token; a virtual-key id or an external module's principal id otherwise; `anonymous` for the
     /// explicit open admin posture). Attribution, never a credential.
@@ -99,7 +99,7 @@ impl AuditLog {
             ts: crate::store::now(),
             action: action.to_string(),
             resource: resource.to_string(),
-            outcome,
+            outcome: outcome.to_string(),
             principal: principal.to_string(),
             prev_hash,
             hash: String::new(),
@@ -109,6 +109,24 @@ impl AuditLog {
             q.pop_front();
         }
         q.push_back(entry);
+    }
+
+    /// Export the retained ring, oldest first — the persistence snapshotter's input (D3).
+    pub(crate) fn export(&self) -> Vec<AuditEntry> {
+        let q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        q.iter().cloned().collect()
+    }
+
+    /// Seed the ring from a persisted snapshot (boot restore). Replaces the current contents and
+    /// resumes the sequence AFTER the highest restored seq, so post-restart entries chain onto the
+    /// restored history without seq reuse.
+    pub(crate) fn load(&self, entries: Vec<AuditEntry>) {
+        let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let max_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
+        q.clear();
+        q.extend(entries);
+        self.seq
+            .store(max_seq + 1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Verify the tamper-evidence chain over the RETAINED entries: every entry's `hash` recomputes
@@ -165,6 +183,31 @@ pub(crate) static AUDIT: AuditLog = AuditLog::new();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_load_roundtrip_resumes_chain() {
+        let log = AuditLog::new();
+        log.record_by("hook.register", "hook:a", OUTCOME_APPLIED, "admin");
+        log.record_by("hook.delete", "hook:a", OUTCOME_REJECTED, "admin");
+        let exported = log.export();
+        assert_eq!(exported.len(), 2);
+
+        // Restore into a fresh log (a fresh boot): chain intact, sequence resumes AFTER max seq.
+        let restored = AuditLog::new();
+        restored.load(exported);
+        assert!(restored.verify(), "restored chain must verify");
+        restored.record_by("hook.register", "hook:b", OUTCOME_APPLIED, "admin");
+        let all = restored.list(10);
+        assert_eq!(all.len(), 3);
+        assert!(
+            all[0].seq > all[1].seq,
+            "post-restore entries continue the sequence"
+        );
+        assert!(
+            restored.verify(),
+            "chain still verifies across the restore boundary"
+        );
+    }
 
     #[test]
     fn record_and_list_newest_first() {
