@@ -97,6 +97,15 @@ A gate answers with exactly one of:
 
 A `tap`, being fire-and-forget, has no `on_error` to speak of: its reply is discarded, its errors swallowed, its delivery bounded and dropped-under-pressure — it can never delay, reorder, or fail a request.
 
+## Live settings: `configure` and `describe`
+
+Beyond the decision traffic, the wire carries two management messages, so a hook can be reconfigured without a redeploy:
+
+- **`configure`** — Busbar pushes the hook's opaque `settings` map (from config or the admin API), stamped with a `settings_version` and Busbar's version. It is the **first message on every socket (re)connection** — a hook that crashes and reconnects always hears its current settings before any request traffic — and it is pushed live when an operator calls `PATCH /admin/v1/hooks/{name}/settings`. That PATCH is **commit-on-ack**: the hook must answer with an acknowledgment echoing the pushed `settings_version` (5s deadline) or Busbar commits nothing and the operator gets a 400 — a hook can never end up running settings Busbar doesn't know it accepted.
+- **`describe`** — Busbar asks the hook to describe its own settings schema; the reply is served verbatim at `GET /admin/v1/hooks/{name}/schema`. Optional: a hook that doesn't answer simply reports `schema: null`.
+
+Both are as fail-safe as everything else on the wire: a hook that ignores `configure` (never acks) keeps its previous settings; neither message can delay or fail request traffic.
+
 ## Managing hooks over the API
 
 Hooks are also lifecycle-managed over the frozen admin API — register, inspect, health-check, and remove at runtime, with a tamper-evident audit trail, and (opt-in) persistence across restart. See the [Admin API guide](./admin-api.md).

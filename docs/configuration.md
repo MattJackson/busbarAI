@@ -508,6 +508,7 @@ pools:
 | `on_empty` | string | `reject` | A restrict gate's empty-intersection behavior: `reject` (fail closed, 503) or `weighted` (advisory escape — that gate's restriction is skipped). |
 | `global` | boolean | `false` | Fire on every request (overlay on top of each pool's own hooks) — inline sugar for listing the name in `global_hooks:`. |
 | `default` | boolean | `false` | Make this hook THE base ordering for pools that named no strategy (replacement, not overlay). At most one hook may set it — a second is a startup error. |
+| `settings` | map | `{}` | Opaque settings pushed to the hook via the `configure` wire message: as the first message on every socket (re)connection, and live via `PATCH /admin/v1/hooks/{name}/settings` (commit-on-ack). Busbar never interprets the contents. |
 
 The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed the ordering strategies and gate candidates. Gate observability: the `x-busbar-route-policy` / `x-busbar-route-target` response headers name the deciding hook and chosen lane.
 

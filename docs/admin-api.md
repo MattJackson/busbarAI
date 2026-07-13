@@ -118,6 +118,8 @@ The virtual-key management surface (mint, inspect, adjust, revoke) is served und
 | `GET /admin/v1/keys/{id}/usage` | Current-window spend/tokens/requests |
 | `POST /admin/v1/keys/{id}/rotate` | Mint a **fresh secret in place**: same id (budgets, rate windows, usage history, and audit attribution carry over), the old secret stops resolving immediately, the new secret is returned exactly once |
 
+Mint (`POST /admin/v1/keys`) accepts an **`Idempotency-Key` header**: a retried request with the same key (~10 min window) returns the first response verbatim instead of double-creating. `GET /admin/v1/keys/{id}` returns an **`ETag`** (also an `etag` body field); `PATCH` accepts **`If-Match`** and rejects a stale tag with `409` before mutating — no lost updates.
+
 > The unversioned `/admin/keys*` routes remain as a deprecated alias for back-compatibility. New tooling should use `/admin/v1/`.
 
 ---
@@ -136,6 +138,10 @@ Busbar's config plane is live: an authenticated write takes effect immediately, 
 | `PUT /admin/v1/hooks/{name}` | Replace an existing **overlay** hook definition, live. `404` for an unknown name (PUT replaces; POST creates); `409 conflict` for a base-config-defined hook (edit the file — the API never silently shadows it) or a grant change (`kind`/`prompt`/`user` are immutable; delete and re-register to change them) |
 | `DELETE /admin/v1/hooks/{name}` | Remove a hook at runtime. `204` on success, `404 not_found` if unregistered |
 | `POST /admin/v1/config/rollback` | Restore a retained version's hook surface. Body: `{ "version": N, "expected_version": M? }`. The target is **re-validated against current reality** before the swap; the result is a NEW version (history is append-only). `404` for a pruned/unknown target; `409` on a stale `expected_version` |
+| `POST /admin/v1/config/reload` | **Re-read config.yaml + providers.yaml from disk and apply atomically** — the boot pipeline at runtime, under normal admin auth. Lane-set changes are fully live: surviving models keep their learned health (breakers, latency) **by identity**; new lanes start fresh; an invalid disk config is `400` and changes nothing. The GitOps primitive: push config, call reload, no restart |
+| `POST /admin/v1/config/apply` | The body-carried twin of reload: `{ "config": {...}, "providers": {...}, "expected_version": N? }` (validate's exact shape). Same atomicity + health preservation. Applied config is **live until the next reload/restart** returns to disk truth — persist by updating config.yaml |
+| `PATCH /admin/v1/hooks/{name}/settings` | Push an opaque settings map to the **running** hook and **commit on ack**: busbar sends the `configure` wire message (5s deadline) and only a version-echoing acknowledgment commits the change (audited, versioned, persisted). A hook that nacks/times out commits nothing (`400`). Socket hooks also receive committed settings as the first message on every (re)connection — a restarted hook never runs blind |
+| `GET /admin/v1/hooks/{name}/schema` | The hook's **self-described settings schema** (the `describe` wire message, proxied verbatim; `schema: null` when the hook doesn't answer) |
 
 `POST`/`PUT` hook mutations also accept `expected_version` (the current `config_version` you read) for optimistic concurrency — a stale write is `409 conflict`, never a lost update.
 
