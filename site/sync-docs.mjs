@@ -27,9 +27,16 @@ const PAGES = {
   'hooks': 'Your logic on the request path: the routing policy hook and the request-log hook, what each receives, what you control, and the fail-safe guarantees.',
   'operations': 'Running Busbar in production: process configuration, TLS and mTLS, health and readiness, metrics to watch, the admin API, and troubleshooting.',
   'architecture': 'A request traced end to end: the superset IR, the reader/writer seams behind protocols-not-providers, and failure disposition.',
+  'admin-api': 'The frozen /admin/v1 management contract: reads, the config plane, hook lifecycle, keys, audit, and scopes.',
+  'migration-1.3': 'The one-page 1.2.x to 1.3 config migration: every removed key and its exact replacement.',
 };
 
 const esc = (s) => s.replace(/"/g, '\\"');
+
+// Starlight slugifies content paths (dots become dashes: migration-1.3 -> migration-1-3), so both
+// the emitted filename and every rewritten inter-doc link must use the slugified form or the
+// sidebar/route lookups miss.
+const slugify = (name) => name.replace(/\./g, '-');
 
 for (const [slug, description] of Object.entries(PAGES)) {
   const raw = readFileSync(join(docsDir, `${slug}.md`), 'utf8');
@@ -47,12 +54,12 @@ for (const [slug, description] of Object.entries(PAGES)) {
   let body = lines.join('\n');
   // Rewrite inter-doc links: (foo.md) / (./foo.md) / (docs/foo.md) -> (/docs/foo/) ; README -> /
   body = body
-    .replace(/\]\((?:\.\/)?(?:docs\/)?([a-z0-9-]+)\.md(#[^)]*)?\)/gi, (_m, name, hash) =>
-      name.toLowerCase() === 'readme' ? `](/${hash || ''})` : `](/docs/${name}/${hash || ''})`)
+    .replace(/\]\((?:\.\/)?(?:docs\/)?([a-z0-9.-]+)\.md(#[^)]*)?\)/gi, (_m, name, hash) =>
+      name.toLowerCase() === 'readme' ? `](/${hash || ''})` : `](/docs/${slugify(name)}/${hash || ''})`)
     .replace(/\]\(\.\.\/README\.md(#[^)]*)?\)/gi, (_m, hash) => `](/${hash || ''})`);
 
   const frontmatter = `---\ntitle: "${esc(title)}"\ndescription: "${esc(description)}"\n---\n\n`;
-  writeFileSync(join(outDir, `${slug}.md`), frontmatter + body);
+  writeFileSync(join(outDir, `${slugify(slug)}.md`), frontmatter + body);
   console.log(`synced docs/${slug}.md -> src/content/docs/docs/${slug}.md  (title: ${title})`);
 }
 

@@ -9,7 +9,7 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
-## [Unreleased]
+## [1.3.0], 2026-07-13
 
 The API release. Everything you could only do by editing YAML and restarting, you can now do
 over an authenticated, audited API. And the routing hook grew into a hook system: gates,
