@@ -222,6 +222,34 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
     )
 }
 
+/// An in-flight idempotency RESERVATION. `create_key` inserts a `Null`-body sentinel under the
+/// cache lock the instant it decides to mint (atomic with the "already cached?" check), so a
+/// concurrent retry with the same `Idempotency-Key` sees the reservation and is rejected instead
+/// of double-minting. This guard clears that sentinel on drop UNLESS the mint committed — so a
+/// request that fails after reserving frees the key for a legitimate retry, while a successful
+/// mint (which replaced the sentinel with its real 201 body and disarmed the guard) keeps it.
+struct IdemReservation {
+    cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (u64, serde_json::Value)>>,
+    >,
+    key: String,
+    committed: bool,
+}
+
+impl Drop for IdemReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Only remove if it is STILL the pending sentinel — never clobber a real committed body
+        // (a success path that already replaced it).
+        if matches!(c.get(&self.key), Some((_, v)) if v.is_null()) {
+            c.remove(&self.key);
+        }
+    }
+}
+
 /// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
 pub(crate) async fn create_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
@@ -246,10 +274,36 @@ pub(crate) async fn create_key(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
-        if let Some((_, cached)) = cache.get(k) {
-            return json_response(StatusCode::CREATED, cached.clone());
+        match cache.get(k) {
+            // A COMPLETED prior mint (the real 201 object): replay it verbatim.
+            Some((_, cached)) if !cached.is_null() => {
+                return json_response(StatusCode::CREATED, cached.clone());
+            }
+            // An IN-FLIGHT reservation (Null sentinel): a concurrent request with the same key is
+            // still minting. Reject rather than double-mint (the TOCTOU a separate check+insert
+            // allowed); the client's retry succeeds once the first completes or the reservation
+            // expires.
+            Some(_) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    ERR_TYPE_CONFLICT,
+                    "a request with this Idempotency-Key is already in flight",
+                );
+            }
+            // First time: RESERVE under this SAME lock hold, so a concurrent request observes the
+            // reservation instead of an empty slot.
+            None => {
+                cache.insert(k.clone(), (now, serde_json::Value::Null));
+            }
         }
     }
+    // Clears the reservation if we return before committing (parse / validation / mint failure);
+    // disarmed on success, where the real body replaces the sentinel.
+    let mut idem_reservation = idem_key.as_ref().map(|k| IdemReservation {
+        cache: app.idempotency_cache.clone(),
+        key: k.clone(),
+        committed: false,
+    });
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -391,6 +445,11 @@ pub(crate) async fn create_key(
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(k.clone(), (crate::store::now(), body.clone()));
                 }
+                // Mint committed and the sentinel replaced by the real body — disarm the guard so
+                // it does not remove the now-cached response.
+                if let Some(g) = idem_reservation.as_mut() {
+                    g.committed = true;
+                }
                 json_response(StatusCode::CREATED, body)
             }
             Ok(Err(e)) => internal_error("create_key", &e),
@@ -413,6 +472,11 @@ pub(crate) async fn create_key(
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(k.clone(), (crate::store::now(), body.clone()));
+                }
+                // Mint committed and the sentinel replaced by the real body — disarm the guard so
+                // it does not remove the now-cached response.
+                if let Some(g) = idem_reservation.as_mut() {
+                    g.committed = true;
                 }
                 json_response(StatusCode::CREATED, body)
             }
@@ -2148,6 +2212,47 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(fresh.status().as_u16(), 200, "current If-Match applies");
+
+        handle.abort();
+    }
+
+    /// The idempotency RESERVATION frees itself on a FAILED mint: a POST that reserves an
+    /// Idempotency-Key then fails validation must NOT leave a stuck in-flight sentinel — a
+    /// subsequent valid retry under the SAME key mints normally (not a spurious 409/replay).
+    #[tokio::test]
+    async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let post = |body: &'static str| {
+            client
+                .post(format!("http://{addr}/admin/v1/keys"))
+                .header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "reuse-key")
+                .body(body)
+                .send()
+        };
+
+        // Reserve the key, then fail validation (unknown budget_period).
+        let bad = post(r#"{"name": "x", "budget_period": "fortnightly"}"#)
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400, "invalid body is a 400");
+
+        // The SAME key now mints normally — the reservation was cleared, not stuck in-flight.
+        let good = post(r#"{"name": "x"}"#).await.unwrap();
+        assert_eq!(
+            good.status().as_u16(),
+            201,
+            "a valid retry under the same key mints (reservation freed on the prior failure)"
+        );
 
         handle.abort();
     }
