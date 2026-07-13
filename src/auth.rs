@@ -214,11 +214,38 @@ impl AuthMiddleware {
     /// matched a presented credential) denies — fail-closed for a configured chain. Constant-time
     /// within each module; the loop order is config order.
     pub(crate) fn run_chain(&self, candidate: Option<&str>) -> ChainVerdict {
+        self.run_chain_cached(candidate, None)
+    }
+
+    /// [`run_chain`] with the CREDENTIAL CACHE consulted around each `cacheable()` module
+    /// (design-hooks-v2 §2.5). The cache stores the module's RAW verdict; the `allowed_groups:`
+    /// intersection is applied AFTER retrieval, so a config change to the caps takes effect
+    /// immediately even for cached identities. In-process modules report `cacheable() == false`
+    /// and never touch the cache (caching a microsecond compare only widens revocation).
+    pub(crate) fn run_chain_cached(
+        &self,
+        candidate: Option<&str>,
+        cache: Option<&crate::auth_cache::CredentialCache>,
+    ) -> ChainVerdict {
         if self.chain.is_empty() {
             return ChainVerdict::Open;
         }
+        let now = crate::store::now();
         for module in &self.chain {
-            match module.authenticate(candidate) {
+            let cache_here = match (cache, candidate) {
+                (Some(c), Some(cred)) if module.cacheable() => Some((c, cred)),
+                _ => None,
+            };
+            let outcome = cache_here
+                .and_then(|(c, cred)| c.get(module.name(), cred, now))
+                .unwrap_or_else(|| {
+                    let o = module.authenticate(candidate);
+                    if let Some((c, cred)) = cache_here {
+                        c.put(module.name(), cred, &o, now);
+                    }
+                    o
+                });
+            match outcome {
                 AuthOutcome::Identify(mut principal) => {
                     // `allowed_groups:` intersection (design-hooks-v2 §2.4), BEFORE group_map — a
                     // module cannot assert a group the operator did not pre-authorize for it.
@@ -467,7 +494,30 @@ fn run_admin_chain(
     if app.admin_chain.is_empty() {
         return (ChainVerdict::Open, None);
     }
+    // One composite credential string for the cache key: an admin credential legitimately rides
+    // two carriers, and both participate in the identity of "what was presented".
+    let composite = match (bearer, header) {
+        (None, None) => None,
+        (b, h) => Some(format!("b:{}\nh:{}", b.unwrap_or(""), h.unwrap_or(""))),
+    };
+    let now = crate::store::now();
     for name in &app.admin_chain {
+        // The built-in admin-tokens module is in-process and NEVER cached (caching a microsecond
+        // compare only widens the rotation window); external admin modules are the cache's case.
+        let cacheable = name != "admin-tokens";
+        if let Some(cred) = composite.as_deref().filter(|_| cacheable) {
+            if let Some(outcome) = app.credential_cache.get(name, cred, now) {
+                match outcome {
+                    AuthOutcome::Identify(mut principal) => {
+                        intersect_allowed_groups(app, name, &mut principal);
+                        let cap = module_admin_scope_cap(app, name);
+                        return (ChainVerdict::Identified(principal), cap);
+                    }
+                    AuthOutcome::Reject => return (ChainVerdict::Denied, None),
+                    AuthOutcome::Pass => continue,
+                }
+            }
+        }
         let outcome = match name.as_str() {
             #[cfg(feature = "auth-admin-tokens")]
             "admin-tokens" => busbar_auth_admin_tokens::authenticate_admin_tokens(
@@ -498,6 +548,9 @@ fn run_admin_chain(
                 AuthOutcome::Pass
             }
         };
+        if let Some(cred) = composite.as_deref().filter(|_| cacheable) {
+            app.credential_cache.put(name, cred, &outcome, now);
+        }
         match outcome {
             AuthOutcome::Identify(mut principal) => {
                 // TRUST-BOUNDARY CAPS (design-hooks-v2 §2.4), applied at the moment of identity:
@@ -690,7 +743,9 @@ pub(crate) async fn auth_middleware(
     // check and the governance virtual-key lookup, so every scheme is validated identically and in
     // constant time. Replaces the previous Bearer-only `bearer_token`.
     let client_token: Option<String> = AuthMiddleware::extract_client_token(&req);
-    let chain_verdict = app.auth.run_chain(client_token.as_deref());
+    let chain_verdict = app
+        .auth
+        .run_chain_cached(client_token.as_deref(), Some(&app.credential_cache));
     let token_valid = !matches!(chain_verdict, ChainVerdict::Denied);
 
     // Thread the caller's token into request extensions for passthrough forwarding, using the same

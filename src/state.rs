@@ -210,6 +210,9 @@ pub(crate) struct App {
     /// The ADMIN auth chain (`admin_auth:` module names, default `[admin-tokens]`) — executed by
     /// the auth middleware for `/admin` paths. Empty = the explicit OPEN admin posture (dev).
     pub(crate) admin_chain: Vec<String>,
+    /// The credential cache (design-hooks-v2 §2.5) — Arc-shared ACROSS config swaps (like the
+    /// mutation limiter): an apply/reload must not silently re-open every cached-allow window.
+    pub(crate) credential_cache: Arc<crate::auth_cache::CredentialCache>,
     /// Per-module trust-boundary caps (`auth.modules:`) — consulted by BOTH chains at Identify
     /// time (allowed_groups intersection) and at admin scope resolution (max_admin_scope ceiling).
     pub(crate) auth_modules: std::collections::HashMap<String, crate::config::AuthModuleCfg>,

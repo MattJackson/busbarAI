@@ -59,6 +59,13 @@ pub trait AuthModule: Send + Sync {
     fn name(&self) -> &'static str;
     /// Judge the presented candidate credential. Constant-time and side-effect-free.
     fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome;
+    /// Whether the engine may CACHE this module's verdicts (the credential cache). Default
+    /// `false`: an in-process module is microseconds and caching its verdicts would only widen
+    /// the revocation window. A module that does real I/O per call (a directory lookup over a
+    /// socket) overrides to `true`.
+    fn cacheable(&self) -> bool {
+        false
+    }
 }
 
 /// Constant-time string comparison to avoid leaking how much of a token matches via timing.

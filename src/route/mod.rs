@@ -1261,6 +1261,7 @@ mod tests {
             idempotency_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
+            credential_cache: StdArc::new(crate::auth_cache::CredentialCache::new()),
             auth_modules: std::collections::HashMap::new(),
             group_map: std::collections::HashMap::new(),
             config_path: None,

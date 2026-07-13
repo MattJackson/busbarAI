@@ -68,6 +68,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/config/diff", get(config_diff))
             .route("/admin/v1/config/rollback", post(rollback_config))
             .route("/admin/v1/config/reload", post(reload_config))
+            .route("/admin/v1/auth/cache/flush", post(flush_credential_cache))
             .route("/admin/v1/config/apply", post(apply_config))
             .route("/admin/v1/openapi.json", get(openapi))
     }
@@ -574,6 +575,46 @@ async fn rollback_config(
             err_json(&e)
         }
     }
+}
+
+/// `POST /admin/v1/auth/cache/flush` — INSTANT REVOCATION of the credential cache's
+/// cached-allow window (design-hooks-v2 §2.5). Body `{"module": "<name>"}` flushes one module's
+/// partition; no/empty body flushes everything. The deny path never needed this (`Reject` is
+/// never cached); this closes the Identify window when a directory changes NOW.
+async fn flush_credential_cache(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    body: axum::body::Bytes,
+) -> Response {
+    let app = handle.load();
+    let module: Option<String> = if body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(v) => match v.get("module") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(m)) => Some(m.clone()),
+                Some(_) => {
+                    return err_json(&AdminError::Validation(
+                        "`module` must be a string (the auth module whose partition to flush)"
+                            .into(),
+                    ))
+                }
+            },
+            Err(_) => return err_json(&AdminError::Validation("body must be JSON".into())),
+        }
+    };
+    let flushed = match module.as_deref() {
+        Some(m) => app.credential_cache.flush_module(m),
+        None => app.credential_cache.flush_all(),
+    };
+    audit::AUDIT.record_by(
+        "auth.cache_flush",
+        module.as_deref().unwrap_or("*"),
+        audit::OUTCOME_APPLIED,
+        principal.actor_id(),
+    );
+    ok_json(StatusCode::OK, &json!({ "flushed": flushed }))
 }
 
 /// `POST /admin/v1/config/reload` — re-run the BOOT disk-load pipeline (config.yaml +
@@ -1089,6 +1130,19 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "`{reloaded, config_version}`"},
                     "400": {"description": "Disk config invalid or no config files (error code `invalid_request`); nothing changed"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/auth/cache/flush".to_string(),
+        json!({
+            "post": {
+                "summary": "Flush the credential cache — one module's partition (`{module}`) or everything (empty body). Instant revocation of the cached-allow window",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{flushed}` — entries dropped"},
+                    "400": {"description": "Malformed body (error code `invalid_request`)"}
                 }
             }
         }),

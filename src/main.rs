@@ -39,6 +39,7 @@
 
 mod admin;
 mod auth;
+mod auth_cache;
 mod billing;
 mod breaker;
 mod config;
@@ -1193,6 +1194,10 @@ pub(crate) fn build_app_from_config(
         ),
         base_hook_names,
         admin_chain: cfg.admin_auth.clone(),
+        credential_cache: prior.map_or_else(
+            || Arc::new(auth_cache::CredentialCache::new()),
+            |p| p.credential_cache.clone(),
+        ),
         auth_modules: cfg
             .auth
             .as_ref()

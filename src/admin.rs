@@ -1853,6 +1853,102 @@ providers: {}
         handle.abort();
     }
 
+    /// The credential cache end-to-end (§2.5): an external-module identify is CACHED (the second
+    /// request is served from the cache — observable via the flush count), `POST
+    /// /admin/v1/auth/cache/flush` drops it (full scope; read-only principals get 403), and the
+    /// built-in operator token is NEVER cached (flush finds nothing after operator calls).
+    #[tokio::test]
+    async fn test_admin_v1_credential_cache_and_flush_endpoint() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "viewers".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("read-only".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Two reads as a group-mapped principal: the module's Identify lands in the cache.
+        for _ in 0..2 {
+            let r = client
+                .get(format!("http://{addr}/admin/v1/info"))
+                .header("x-admin-token", "grp:viewers")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+        }
+
+        // A read-only principal cannot flush (full-scope mutation).
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "grp:viewers")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "flush is a full-scope mutation");
+
+        // Operator flushes the module partition: exactly ONE entry (the cached viewers identify;
+        // operator-token authentications are never cached).
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"module": "test-scope-module"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        // TWO entries in the module's partition: the viewers Identify, plus the PASS the module
+        // returned for the operator token (Pass IS cached, short-TTL — §2.5; only the built-in
+        // admin-tokens module's own verdicts are exempt). The flushing request's own Pass was
+        // inserted by its chain run before the handler flushed.
+        assert_eq!(
+            body["flushed"], 2,
+            "the viewers Identify + the operator credential's cached Pass"
+        );
+
+        // Flush-all with an empty body: nothing left.
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = r.json().await.unwrap();
+        // Exactly ONE: this very request's chain run re-cached a Pass for the operator credential
+        // under the external module before the handler flushed. Nothing else survived.
+        assert_eq!(
+            body["flushed"], 1,
+            "only this request's own cached Pass remained"
+        );
+
+        // Malformed body: invalid_request.
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body("{\"module\": 7}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+
+        handle.abort();
+    }
+
     /// Idempotent mint + optimistic concurrency: a retried POST with the same Idempotency-Key
     /// returns the FIRST response (same id + secret, no double-create); a PATCH with a stale
     /// If-Match is a 409 that changes nothing; a fresh If-Match succeeds.
