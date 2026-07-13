@@ -1489,7 +1489,9 @@ async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
             "desired": {"settings": hook.settings, "settings_version": desired_version},
             "reported": serde_json::Value::Null,
             "drift": serde_json::Value::Null,
-            "metrics": {},
+            // `metrics` is INVARIANTLY an array — `[]` here (not `{}`) so a strict consumer decoding
+            // it as an array never has to special-case the no-status branch (busbar-ui review R5).
+            "metrics": [],
             "as_of": as_of,
             "source": "live",
             "note": "hook did not answer status (unsupported or unreachable)",
