@@ -1043,21 +1043,8 @@ async fn patch_hook_settings(
     // snapshot size and per-reconnect wire traffic. Cap the serialized size and the key count as
     // defense-in-depth (admin-gated, but a compromised hooks-register token should not be able to
     // bloat the durable state / reconnect path). The caps are far past any real hook's settings.
-    const MAX_SETTINGS_BYTES: usize = 64 * 1024;
-    const MAX_SETTINGS_KEYS: usize = 256;
-    if req.settings.len() > MAX_SETTINGS_KEYS {
-        return err_json(&AdminError::Validation(format!(
-            "settings has too many keys ({}, max {MAX_SETTINGS_KEYS})",
-            req.settings.len()
-        )));
-    }
-    if let Ok(bytes) = serde_json::to_vec(&req.settings) {
-        if bytes.len() > MAX_SETTINGS_BYTES {
-            return err_json(&AdminError::Validation(format!(
-                "settings too large ({} bytes, max {MAX_SETTINGS_BYTES})",
-                bytes.len()
-            )));
-        }
+    if let Err(e) = crate::admin::v1::service::validate_hook_settings_size(&req.settings) {
+        return err_json(&e);
     }
     let current = handle.load();
     let resource = format!("hook:{name}");
@@ -1267,9 +1254,10 @@ fn openapi_doc() -> serde_json::Value {
                 }],
                 "responses": {
                     "200": {"description": "The replaced hook"},
+                    "400": {"description": "Invalid definition (error code `invalid_request`)"},
+                    "403": {"description": "A `hooks-register` principal may not replace a hook into a content-seeing (`prompt`/`user`) or `global` form (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
-                    "409": {"description": "Base-defined hook, grant change, or stale expected_version (error code `conflict`)"},
-                    "400": {"description": "Invalid definition (error code `invalid_request`)"}
+                    "409": {"description": "Base-defined hook, grant change, or stale expected_version (error code `conflict`)"}
                 }
             },
             "delete": {
@@ -1370,6 +1358,7 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "Acked + committed (the updated hook)"},
                     "400": {"description": "Hook did not acknowledge (error code `invalid_request`); nothing committed"},
+                    "403": {"description": "A `hooks-register` principal may not push settings to a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
                     "409": {"description": "Base-defined hook or stale expected_version (error code `conflict`)"}
                 }
@@ -1825,5 +1814,24 @@ mod tests {
             enum_codes, actual_codes,
             "openapi error-code enum drifted from AdminError::code"
         );
+    }
+
+    /// REGRESSION (audit c1r12): the §6.3 escalation 403 fires on PUT `/hooks/{name}` and PATCH
+    /// `/hooks/{name}/settings` (a `hooks-register` principal touching a content-seeing / global
+    /// hook), exactly as it does on POST `/hooks` — so all three must DOCUMENT the 403.
+    #[test]
+    fn openapi_hook_escalation_endpoints_document_403() {
+        let doc = openapi_doc();
+        let cases = [
+            ("/admin/v1/hooks", "post"),
+            ("/admin/v1/hooks/{name}", "put"),
+            ("/admin/v1/hooks/{name}/settings", "patch"),
+        ];
+        for (path, method) in cases {
+            assert!(
+                doc["paths"][path][method]["responses"]["403"].is_object(),
+                "{method} {path} can 403 on §6.3 escalation but its openapi omits it"
+            );
+        }
     }
 }

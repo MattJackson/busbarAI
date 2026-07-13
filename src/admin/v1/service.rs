@@ -102,11 +102,43 @@ async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
 /// swap. Lanes/store/pools/auth are UNTOUCHED, so the store's per-lane breaker state is preserved (no
 /// re-index — the safe, store-constraint-free subset of config apply). The caller `AppHandle::swap`s
 /// the returned snapshot. Pure + `Result` → unit-testable without the transport.
+/// The `settings` map is persisted VERBATIM into the state file and re-sent to the hook binary on
+/// every reconnect, so an unbounded map bloats the durable state and amplifies the reconnect path.
+/// These caps are far past any real hook's settings; a compromised `hooks-register` token must not
+/// be able to blow them out. Shared by `build_with_hook` (register / PUT) and `patch_hook_settings`
+/// (PATCH) so all three write paths enforce ONE limit with no drift.
+pub(crate) const MAX_SETTINGS_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SETTINGS_KEYS: usize = 256;
+
+/// Fail-closed size check for a hook's `settings` map — see the cap rationale above.
+pub(crate) fn validate_hook_settings_size(
+    settings: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), AdminError> {
+    if settings.len() > MAX_SETTINGS_KEYS {
+        return Err(AdminError::Validation(format!(
+            "settings has too many keys ({}, max {MAX_SETTINGS_KEYS})",
+            settings.len()
+        )));
+    }
+    if let Ok(bytes) = serde_json::to_vec(settings) {
+        if bytes.len() > MAX_SETTINGS_BYTES {
+            return Err(AdminError::Validation(format!(
+                "settings too large ({} bytes, max {MAX_SETTINGS_BYTES})",
+                bytes.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result<App, AdminError> {
     // ── validate the definition (fail-closed, before any mutation) ──
     if name.trim().is_empty() {
         return Err(AdminError::Validation("hook name must not be empty".into()));
     }
+    // The `settings` map rides register/PUT too — cap it here so it is bounded on EVERY write path,
+    // not just PATCH (found: audit c1r12 — register/PUT were missing the cap PATCH already had).
+    validate_hook_settings_size(&cfg.settings)?;
     // Exactly one transport: socket XOR webhook.
     if cfg.socket.is_none() == cfg.webhook.is_none() {
         return Err(AdminError::Validation(
@@ -806,6 +838,45 @@ mod tests {
             demoted.hook_registry.contains_key("logger"),
             "the hook definition itself survives — only its global membership is dropped"
         );
+    }
+
+    /// REGRESSION (audit c1r12): the `settings` map size cap enforced by PATCH must ALSO gate
+    /// register/PUT (both funnel through `build_with_hook`) — else an unbounded map could be
+    /// registered/replaced, bloating the durable state and the reconnect path the cap protects.
+    #[test]
+    fn build_with_hook_caps_oversized_settings() {
+        let app = TestApp::new().build();
+        // Just over the key cap.
+        let mut too_many = hook(HookKind::Tap, false);
+        for i in 0..=MAX_SETTINGS_KEYS {
+            too_many
+                .settings
+                .insert(format!("k{i}"), serde_json::json!(1));
+        }
+        assert!(
+            matches!(
+                build_with_hook(&app, "big", too_many),
+                Err(AdminError::Validation(_))
+            ),
+            "a settings map over the key cap must reject at register/PUT, not just PATCH"
+        );
+
+        // Just over the byte cap (few keys, huge value).
+        let mut too_big = hook(HookKind::Tap, false);
+        too_big.settings.insert(
+            "blob".to_string(),
+            serde_json::json!("x".repeat(MAX_SETTINGS_BYTES + 1)),
+        );
+        assert!(matches!(
+            build_with_hook(&app, "big", too_big),
+            Err(AdminError::Validation(_))
+        ));
+
+        // A modest settings map still registers.
+        let mut ok = hook(HookKind::Tap, false);
+        ok.settings
+            .insert("level".to_string(), serde_json::json!("info"));
+        assert!(build_with_hook(&app, "fine", ok).is_ok());
     }
 
     /// Validation is fail-closed BEFORE any mutation: `prompt: rw` on a tap and a missing transport
