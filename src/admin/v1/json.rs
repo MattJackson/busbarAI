@@ -94,6 +94,13 @@ impl AdminTransport for JsonV1 {
             )
             .route("/keys/{id}/usage", get(crate::admin::key_usage))
             .route("/keys/{id}/rotate", post(crate::admin::rotate_key))
+            // EVERY response on this surface speaks the frozen envelope — including an unmatched
+            // path (404 `not_found`) and a matched path with the wrong method (405
+            // `method_not_allowed`). Without these, axum's nest semantics leak an empty-body 405
+            // from the inner MethodRouter and fall unmatched paths through to the data plane's
+            // vendor-native shaping (re-audit HIGH-1).
+            .fallback(|| async { err_json(&AdminError::NotFound("resource".into())) })
+            .method_not_allowed_fallback(|| async { err_json(&AdminError::MethodNotAllowed) })
     }
 }
 
@@ -163,7 +170,7 @@ fn ok_json<T: Serialize>(status: StatusCode, view: &T) -> Response {
 /// Project an `AdminError` onto the stable v1 JSON error envelope
 /// `{"error":{"code":<stable>,"message":<human>}}` with the error's HTTP status. Tooling branches on
 /// `code`; `message` is human-only.
-fn err_json(e: &AdminError) -> Response {
+pub(crate) fn err_json(e: &AdminError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         status,
@@ -275,8 +282,17 @@ async fn list_pools(
     State(handle): State<Arc<AppHandle>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    if q.get("detail").map(String::as_str) == Some("true") {
-        return respond(StatusCode::OK, service(&handle).list_pools_detailed().await);
+    match q.get("detail").map(String::as_str) {
+        Some("true") => {
+            return respond(StatusCode::OK, service(&handle).list_pools_detailed().await)
+        }
+        // Strict: an unrecognized value is a loud 400, never a silently-ignored flag.
+        Some(other) if other != "false" => {
+            return err_json(&AdminError::Validation(
+                "invalid `detail`: expected true|false".into(),
+            ))
+        }
+        _ => {}
     }
     respond(StatusCode::OK, service(&handle).list_pools().await)
 }
@@ -426,6 +442,9 @@ async fn register_hook(
         audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&e);
     }
+    // Upsert status honesty: 201 only when the name is NEW; a same-grant re-register (an idempotent
+    // refresh) is a 200 replace — standard upsert semantics, so POST/PUT overlap is explicit.
+    let existed = current.hook_registry.contains_key(&req.name);
     match build_with_hook(&current, &req.name, req.config) {
         Ok(next) => {
             let installed = Arc::new(next);
@@ -452,7 +471,11 @@ async fn register_hook(
             // new config-plane ETag rides along so the caller chains its next If-Match without a read.
             with_config_etag(
                 respond(
-                    StatusCode::CREATED,
+                    if existed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::CREATED
+                    },
                     service(&handle).get_hook(&req.name).await,
                 ),
                 installed.config_version,
@@ -683,17 +706,32 @@ async fn list_config_versions(
 /// `GET /api/v1/admin/config/versions/{v}` — one retained version WITH its hook-surface snapshot.
 async fn get_config_version(State(handle): State<Arc<AppHandle>>, Path(v): Path<u64>) -> Response {
     match handle.load().versions.get(v) {
-        Some(cv) => ok_json(
-            StatusCode::OK,
-            &json!({
-                "version": cv.version,
-                "ts": cv.ts,
-                "principal": cv.principal,
-                "summary": cv.summary,
-                "hooks": cv.hook_registry,
-                "global_hooks": cv.global_hooks,
-            }),
-        ),
+        Some(cv) => {
+            // Project the snapshot through the ONE wire HookView shape (against the SNAPSHOT's own
+            // global wiring) — never the raw HookCfg file shape, so a consumer parses hooks with a
+            // single schema whether it reads /hooks or a retained version (re-audit M6).
+            let hooks: std::collections::BTreeMap<&String, _> = cv
+                .hook_registry
+                .iter()
+                .map(|(name, cfg)| {
+                    (
+                        name,
+                        crate::admin::v1::service::project_hook_view(name, cfg, &cv.global_hooks),
+                    )
+                })
+                .collect();
+            ok_json(
+                StatusCode::OK,
+                &json!({
+                    "version": cv.version,
+                    "ts": cv.ts,
+                    "principal": cv.principal,
+                    "summary": cv.summary,
+                    "hooks": hooks,
+                    "global_hooks": cv.global_hooks,
+                }),
+            )
+        }
         None => err_json(&AdminError::NotFound(format!(
             "config version {v} (pruned or never recorded)"
         ))),
@@ -716,10 +754,22 @@ async fn config_diff(
         ));
     };
     let app = handle.load();
-    let (Some(a), Some(b)) = (app.versions.get(from), app.versions.get(to)) else {
-        return err_json(&AdminError::NotFound(format!(
-            "config version {from} and/or {to} (pruned or never recorded)"
-        )));
+    // Name exactly WHICH version is missing — "and/or" made a consumer re-probe both.
+    let a = match app.versions.get(from) {
+        Some(v) => v,
+        None => {
+            return err_json(&AdminError::NotFound(format!(
+                "config version {from} (pruned or never recorded)"
+            )))
+        }
+    };
+    let b = match app.versions.get(to) {
+        Some(v) => v,
+        None => {
+            return err_json(&AdminError::NotFound(format!(
+                "config version {to} (pruned or never recorded)"
+            )))
+        }
     };
     let mut added: Vec<&String> = b
         .hook_registry
@@ -837,7 +887,8 @@ async fn rollback_config(
                     StatusCode::OK,
                     &json!({
                         "restored_version": req.version,
-                        "new_version": cur.config_version,
+                        // The post-rollback version under the SAME name every other mutation uses.
+                        "config_version": cur.config_version,
                     }),
                 ),
                 cur.config_version,
@@ -966,12 +1017,15 @@ async fn put_auth(
         &installed.hook_registry,
         &installed.global_hooks,
     );
+    // The response IS the resource (the same {configured, modules} shape GET /admin-auth returns,
+    // so a Terraform provider uses the PUT response as post-state — re-audit M5) + apply metadata.
     with_config_etag(
         ok_json(
             StatusCode::OK,
             &json!({
+                "configured": !req.admin_auth.is_empty(),
+                "modules": req.admin_auth,
                 "applied": true,
-                "admin_auth": req.admin_auth,
                 "config_version": cur.config_version,
                 "note": "live until the next config reload/restart returns to disk truth; persist by updating config.yaml"
             }),
@@ -1416,7 +1470,8 @@ fn openapi_doc() -> serde_json::Value {
                 "summary": "Register (or replace) a hook at runtime — live immediately",
                 "security": [{"adminToken": []}],
                 "responses": {
-                    "201": {"description": "Registered (body is the hook definition)"},
+                    "201": {"description": "Registered — the name is NEW (body is the hook definition)"},
+                    "200": {"description": "Replaced — the name existed (same-grant re-register; body is the hook definition)"},
                     "400": {"description": "Malformed body or invalid definition (`invalid_request`)"},
                     "403": {"description": "hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)"},
                     "409": {"description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `If-Match` (`conflict`, §6.4)"}
@@ -1763,10 +1818,117 @@ fn openapi_doc() -> serde_json::Value {
                     _ => continue,
                 };
                 if let Some(op) = op.as_object_mut() {
+                    let scope = crate::admin::v1::contract::required_scope(&m, path);
+                    op.insert("x-busbar-required-scope".to_string(), json!(scope.as_str()));
+                    // Both accepted credential carriers, on every op (re-audit M8).
                     op.insert(
-                        "x-busbar-required-scope".to_string(),
-                        json!(crate::admin::v1::contract::required_scope(&m, path).as_str()),
+                        "security".to_string(),
+                        json!([{"adminToken": []}, {"bearerAuth": []}]),
                     );
+                    // The always-possible responses, stamped algorithmically so no hand-written
+                    // entry can forget them (re-audit M7): 401 (bad/missing credential), 403
+                    // (authenticated but under-scoped), and 429 on every mutation (the
+                    // per-principal mutation budget).
+                    if let Some(responses) = op.get_mut("responses").and_then(|r| r.as_object_mut())
+                    {
+                        responses.entry("401").or_insert(json!(
+                            {"description": "Missing/invalid admin credential (error code `unauthorized`)"}
+                        ));
+                        responses.entry("403").or_insert(json!({"description": format!(
+                            "Authenticated but under-scoped: requires `{}` (error code `forbidden`)",
+                            scope.as_str()
+                        )}));
+                        if m != axum::http::Method::GET && m != axum::http::Method::HEAD {
+                            responses.entry("429").or_insert(json!(
+                                {"description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"}
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Machine-readable QUERY PARAMETERS for the list/filter GETs (re-audit M7) — previously prose-
+    // only, so generated clients had no query surface. Stamped from one table.
+    /// (name, description, required) — one documented query parameter.
+    type QueryParam = (&'static str, &'static str, bool);
+    const QUERY_PARAMS: &[(&str, &[QueryParam])] = &[
+        (
+            "/keys",
+            &[
+                ("enabled", "Filter by enabled state (`true`|`false`)", false),
+                ("prefix", "Filter by key-id prefix", false),
+                ("limit", "Page size (default 200, max 1000)", false),
+                (
+                    "cursor",
+                    "Opaque continuation cursor from `next_cursor`",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "/audit",
+            &[
+                (
+                    "action",
+                    "Filter by exact action (e.g. `hook.register`)",
+                    false,
+                ),
+                (
+                    "resource",
+                    "Filter by exact resource (e.g. `hook:x`)",
+                    false,
+                ),
+                ("limit", "Page size (default 200, max 1000)", false),
+                (
+                    "cursor",
+                    "Opaque continuation cursor from `next_cursor`",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "/config/versions",
+            &[
+                ("limit", "Page size (default 100, max 1000)", false),
+                (
+                    "cursor",
+                    "Opaque continuation cursor from `next_cursor`",
+                    false,
+                ),
+            ],
+        ),
+        (
+            "/plugins",
+            &[("type", "Plugin type: `auth` | `hooks` (required)", true)],
+        ),
+        (
+            "/pools",
+            &[(
+                "detail",
+                "`true` inlines each member's live status (same row shape as /pools/{name})",
+                false,
+            )],
+        ),
+    ];
+    for (path, params) in QUERY_PARAMS {
+        if let Some(op) = paths
+            .get_mut(&ap(path))
+            .and_then(|p| p.get_mut("get"))
+            .and_then(|op| op.as_object_mut())
+        {
+            let list: Vec<serde_json::Value> = params
+                .iter()
+                .map(|(name, desc, required)| {
+                    json!({"name": name, "in": "query", "required": required,
+                           "schema": {"type": "string"}, "description": desc})
+                })
+                .collect();
+            match op.get_mut("parameters").and_then(|p| p.as_array_mut()) {
+                Some(existing) => existing.extend(list),
+                None => {
+                    op.insert("parameters".to_string(), json!(list));
                 }
             }
         }
@@ -1821,7 +1983,9 @@ fn openapi_doc() -> serde_json::Value {
         },
         "components": {
             "securitySchemes": {
-                "adminToken": {"type": "apiKey", "in": "header", "name": "x-admin-token"}
+                "adminToken": {"type": "apiKey", "in": "header", "name": "x-admin-token"},
+                "bearerAuth": {"type": "http", "scheme": "bearer",
+                               "description": "The same operator credential via Authorization: Bearer"}
             },
             "schemas": {
                 "Error": {

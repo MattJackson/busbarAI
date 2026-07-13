@@ -749,7 +749,8 @@ fn forbidden_response(needed: crate::admin::v1::contract::Scope) -> Response {
         .expect("static forbidden response")
 }
 
-/// A 429 in the frozen admin error envelope — the per-principal mutation budget is spent.
+/// A 429 in the frozen admin error envelope — the per-principal mutation budget is spent. Carries
+/// `Retry-After: 60` (the fixed window length): a compliant client backs off without guessing.
 fn rate_limited_response() -> Response {
     let e = crate::admin::v1::contract::AdminError::RateLimited;
     let body = serde_json::json!({
@@ -757,6 +758,7 @@ fn rate_limited_response() -> Response {
     })
     .to_string();
     Response::builder()
+        .header(axum::http::header::RETRY_AFTER, "60")
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
@@ -909,7 +911,12 @@ pub(crate) async fn auth_middleware(
             let rel = path
                 .strip_prefix(crate::admin::v1::contract::ADMIN_PREFIX)
                 .unwrap_or(&path);
-            let class = if rel.starts_with("/config/") || rel == "/admin-auth" {
+            // `/config/validate` is a stateless dry-run (read-only scope, no blast radius) — it
+            // meters in the roomy CRUD class so a CI pipeline linting configs never contends with
+            // the 10/min budget that guards real config mutations (re-audit M3).
+            let class = if (rel.starts_with("/config/") && rel != "/config/validate")
+                || rel == "/admin-auth"
+            {
                 crate::admin::rate::MutationClass::Config
             } else {
                 crate::admin::rate::MutationClass::Crud

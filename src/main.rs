@@ -514,6 +514,21 @@ pub(crate) fn fallback_error_response(
     message: &str,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // The NATIVE-API root speaks the frozen admin envelope for EVERY response — including unmatched
+    // paths and wrong methods, which previously fell through to the vendor-native shaping below and
+    // leaked `{error:{type}}` bodies onto a surface that promises `{error:{code}}` (re-audit HIGH-1).
+    // Boundary-safe: exact root or root + '/'.
+    {
+        use crate::admin::v1::contract::{AdminError, API_ROOT};
+        if path == API_ROOT || path.starts_with(&format!("{API_ROOT}/")) {
+            let e = if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+                AdminError::MethodNotAllowed
+            } else {
+                AdminError::NotFound("resource".into())
+            };
+            return crate::admin::v1::json::err_json(&e);
+        }
+    }
     let proto = proto_for_path(path);
     let protocol = proto::protocol_for(proto);
     let body = match &protocol {

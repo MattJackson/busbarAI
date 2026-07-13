@@ -98,6 +98,12 @@ pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
     // Match RELATIVE to the one true prefix so the matrix can never drift from the mount grammar.
     // A path outside the prefix (impossible for a mounted admin route) fails closed to `full`.
     let rel = path.strip_prefix(ADMIN_PREFIX).unwrap_or(path);
+    // `POST /config/validate` is a STATELESS DRY-RUN — a read in POST clothing (the body is the
+    // config to lint, far past URL length limits). A read-only CI token must be able to lint
+    // configs (re-audit M3; the service doc always said "Read scope" — now the matrix agrees).
+    if rel == "/config/validate" {
+        return Scope::ReadOnly;
+    }
     if is_mutation && (rel == "/hooks" || rel.starts_with("/hooks/")) {
         return Scope::HooksRegister;
     }
@@ -120,6 +126,8 @@ pub(crate) enum AdminError {
     /// No/invalid admin credential (the auth middleware could not authenticate the caller).
     /// `code = unauthorized`. Distinct from `forbidden` (authenticated but under-scoped).
     Unauthorized,
+    /// The path exists on the surface but not with this HTTP method. `code = method_not_allowed`.
+    MethodNotAllowed,
     /// The principal's scope is insufficient for the endpoint. `code = forbidden`. Carries the scope
     /// that WOULD have sufficed, for a precise client message (never leaks other principals' data).
     Forbidden { needed: Scope },
@@ -142,6 +150,7 @@ impl AdminError {
         match self {
             AdminError::NotFound(_) => "not_found",
             AdminError::Unauthorized => "unauthorized",
+            AdminError::MethodNotAllowed => "method_not_allowed",
             AdminError::Forbidden { .. } => "forbidden",
             AdminError::Validation(_) => "invalid_request",
             AdminError::Conflict(_) => "conflict",
@@ -155,6 +164,7 @@ impl AdminError {
         match self {
             AdminError::NotFound(_) => 404,
             AdminError::Unauthorized => 401,
+            AdminError::MethodNotAllowed => 405,
             AdminError::Forbidden { .. } => 403,
             AdminError::Validation(_) => 400,
             AdminError::Conflict(_) => 409,
@@ -170,6 +180,7 @@ impl AdminError {
             AdminError::Unauthorized => {
                 "missing or invalid admin credential (Bearer or x-admin-token)".to_string()
             }
+            AdminError::MethodNotAllowed => "method not allowed for this resource".to_string(),
             AdminError::Forbidden { needed } => {
                 format!(
                     "insufficient scope: this endpoint requires `{}`",
@@ -258,7 +269,7 @@ pub(crate) struct PoolDetailView {
 }
 
 /// One member's live status within a pool. The breaker signal is the release-exposed
-/// `usable`/`cooldown_remaining_s` pair (a lane in breaker cooldown reports `usable: false` with the
+/// `usable`/`cooldown_remaining_seconds` pair (a lane in breaker cooldown reports `usable: false` with the
 /// seconds remaining) — the same summary `/stats` surfaces.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct PoolMemberStatusView {
@@ -267,8 +278,9 @@ pub(crate) struct PoolMemberStatusView {
     /// Whether the lane can currently take dispatch (breaker closed / recovered). `false` while a
     /// tripped breaker cools down or the lane is dead.
     pub(crate) usable: bool,
-    /// Seconds until a tripped breaker's cooldown elapses; `0` when not cooling down.
-    pub(crate) cooldown_remaining_s: u64,
+    /// Seconds until a tripped breaker's cooldown elapses; `0` when not cooling down. (`_seconds`
+    /// suffix — the one unit-suffix spelling across the surface, like `uptime_seconds`.)
+    pub(crate) cooldown_remaining_seconds: u64,
     /// Free concurrency slots on this lane right now (lane-global; permits are shared across pools).
     pub(crate) available_concurrency: usize,
     /// In-flight requests on this lane right now.
@@ -511,8 +523,12 @@ pub(crate) struct UsageView {
     pub(crate) total: UsageBreakdown,
     /// Per-(model, provider) aggregation — cost attribution by model (the FinOps unit).
     pub(crate) by_model: Vec<ModelUsageView>,
-    /// Per-key aggregation (same raw-split shape).
+    /// Per-key aggregation (same raw-split shape). CAPPED at the top 1000 rows by spend (the
+    /// FinOps-relevant ordering); `by_key_truncated` says the cap fired — never a silent cut.
     pub(crate) by_key: Vec<KeyUsageView>,
+    /// True when `by_key` was truncated to the cap (a deployment with more active keys than the
+    /// cap). `by_model` is never capped (bounded by the configured model fleet).
+    pub(crate) by_key_truncated: bool,
 }
 
 /// A metering window: `[start, end)` epoch seconds.

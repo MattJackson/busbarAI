@@ -166,11 +166,11 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 // stable error codes), its SERVICE (typed operations over the shared engine), and its TRANSPORT wire
 // adapters (`json`, later `graphql`). The transport PORT (`AdminTransport` in `transport`) is shared
 // across versions and transports. Releasing v2 is a LAYER copy of `v1/`, not a rewrite; v1 never
-// breaks. The `/admin/keys` handlers below are mounted under BOTH the deprecated `/admin/keys`
-// alias and the canonical `/api/v1/admin/keys` prefix (main.rs), so they speak the ONE frozen v1
-// contract: the `{error:{code,message}}` envelope with the stable code enum (contract H1) — not a
-// bespoke `{type}` envelope. Keys are a first-class v1 resource served by these handlers until they
-// migrate into the versioned service module.
+// breaks. The keys handlers below are mounted ONLY at the canonical `/api/v1/admin/keys*` routes
+// (via the JsonV1 router — the pre-release `/admin/keys` alias is gone), and speak the ONE frozen
+// v1 contract: the `{error:{code,message}}` envelope with the stable code enum (contract H1). Keys
+// are a first-class v1 resource served by these handlers until they migrate into the versioned
+// service module.
 pub(crate) mod audit;
 pub(crate) mod rate;
 pub(crate) mod transport;
@@ -189,21 +189,31 @@ fn key_etag(k: &VirtualKey) -> String {
 }
 
 /// Parse the optional `If-Match` header for a KEY mutation (PATCH/DELETE `/keys/{id}`): the key's
-/// own ETag from a prior GET, quotes/weak-prefix stripped. `*` (RFC 7232: "any current
-/// representation") matches any existing key, i.e. no guard — `None`. Shared by PATCH and DELETE so
+/// own ETag from a prior GET (16 lowercase hex chars — see `key_etag`), quotes/weak-prefix
+/// stripped. `*` (RFC 7232: "any current representation") matches any existing key, i.e. no guard —
+/// `Ok(None)`. Anything that cannot be a key ETag is a 400 `invalid_request` — the SAME terminal
+/// the config-plane parser gives a malformed guard, never a retriable-looking 409 that a client
+/// with a header bug would re-read and retry forever (re-audit M4). Shared by PATCH and DELETE so
 /// the two verbs can never diverge on grammar.
-fn parse_key_if_match(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(axum::http::header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            let s = v.trim();
-            s.strip_prefix("W/")
-                .unwrap_or(s)
-                .trim_matches('"')
-                .to_string()
-        })
-        .filter(|s| s != "*")
+#[allow(clippy::result_large_err)] // Err = the ready-to-return 400 Response (callers just return it)
+fn parse_key_if_match(headers: &axum::http::HeaderMap) -> Result<Option<String>, Response> {
+    let Some(raw) = headers.get(axum::http::header::IF_MATCH) else {
+        return Ok(None);
+    };
+    let s = raw.to_str().unwrap_or("").trim();
+    if s == "*" {
+        return Ok(None);
+    }
+    let bare = s.strip_prefix("W/").unwrap_or(s).trim_matches('"');
+    if bare.len() == 16 && bare.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(Some(bare.to_string()))
+    } else {
+        Err(error_response(
+            StatusCode::BAD_REQUEST,
+            ERR_TYPE_INVALID_REQUEST,
+            "malformed If-Match: expected the key's ETag (16 hex chars, quoted) or *",
+        ))
+    }
 }
 
 fn key_meta(k: &VirtualKey) -> Value {
@@ -220,11 +230,38 @@ fn key_meta(k: &VirtualKey) -> Value {
     })
 }
 
-fn disabled() -> Response {
+/// Governance-off semantics (re-audit HIGH-2): ONE rule across the keys surface, chosen so no
+/// status is ambiguous —
+/// - collection READS (`GET /keys`) answer 200 with an EMPTY page (`disabled_empty_list`): with
+///   governance off the keyspace is truthfully empty, and a 404 on a collection reads as a
+///   mount/path error to every REST client;
+/// - single-resource READS keep 404 `not_found` (also truthful — no such key exists);
+/// - WRITES (create/patch/delete/rotate) answer 409 `conflict` (`disabled_write`): the request
+///   conflicts with the server's configured state, with an actionable message. Previously every
+///   handler returned 404 — making `not_found` mean two different things forever.
+fn disabled_write() -> Response {
+    error_response(
+        StatusCode::CONFLICT,
+        ERR_TYPE_CONFLICT,
+        "governance is not enabled on this server; enable `governance:` in config.yaml to manage \
+         virtual keys",
+    )
+}
+
+/// `GET /keys` with governance off: the truthful empty page in the standard cursor envelope.
+fn disabled_empty_list() -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({ "items": [], "next_cursor": serde_json::Value::Null }),
+    )
+}
+
+/// Single-resource read with governance off: no key can exist, so `not_found` is truthful.
+fn disabled_read() -> Response {
     error_response(
         StatusCode::NOT_FOUND,
         ERR_TYPE_NOT_FOUND,
-        "governance/admin API is not enabled",
+        "key not found (governance is not enabled on this server)",
     )
 }
 
@@ -343,7 +380,7 @@ pub(crate) async fn create_key(
         committed: false,
     });
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_write();
     };
     // Parse the body via the depth-guarded `crate::json` seam, NOT axum's stock `Json<T>` extractor,
     // whose `JsonRejection` body echoes the raw serde `Display` — a fragment of the offending input.
@@ -560,7 +597,7 @@ pub(crate) async fn update_key(
 ) -> Response {
     let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_write();
     };
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
@@ -570,7 +607,10 @@ pub(crate) async fn update_key(
     // the write, so it is deferred INTO the gated write closure below (a separate pre-read here
     // would leave a window in which a concurrent PATCH mutates the row between the check and this
     // write, defeating the guard). Absent header = the transitional unguarded path.
-    let if_match = parse_key_if_match(&headers);
+    let if_match = match parse_key_if_match(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
     // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
     // only the byte length via `parse_err_log` — no raw error, no input fragment.
@@ -690,16 +730,45 @@ pub(crate) async fn list_keys(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_empty_list();
     };
     let gov = gov.clone();
-    let enabled = q.get("enabled").and_then(|s| s.parse::<bool>().ok());
+    // Strict query parsing (re-audit L): an unparseable filter value is a loud 400, never a
+    // silently-dropped filter (which would return MORE keys than the caller asked for).
+    let enabled = match q.get("enabled") {
+        None => None,
+        Some(v) => match v.parse::<bool>() {
+            Ok(b) => Some(b),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    ERR_TYPE_INVALID_REQUEST,
+                    "invalid `enabled` filter: expected true|false",
+                )
+            }
+        },
+    };
     let prefix = q.get("prefix").cloned();
     // PAGINATION (design-admin-api-v1 §0.4): the ONE cursor envelope shared by every admin list —
     // `?limit=` bounds the page, `?cursor=` (opaque) resumes after the prior one, and the response is
     // `{items, next_cursor}` (next_cursor present iff more rows remain). No `total`, no `?offset=` —
     // one pagination grammar across keys/audit/versions/topology.
-    let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok());
+    // Default 200 / hard cap 1000 — the SAME limit policy as the audit/versions lists (one
+    // pagination grammar, one limit policy; an unbounded default response is exactly what
+    // pagination exists to prevent — re-audit M9).
+    let limit = match q.get("limit") {
+        None => 200,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => n.min(1000),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    ERR_TYPE_INVALID_REQUEST,
+                    "invalid `limit`: expected an integer (max 1000)",
+                )
+            }
+        },
+    };
     let start = match q.get("cursor") {
         Some(c) => match crate::admin::v1::contract::decode_offset_cursor(c) {
             Some(n) => n,
@@ -728,7 +797,7 @@ pub(crate) async fn list_keys(
             let page: Vec<_> = filtered
                 .into_iter()
                 .skip(start)
-                .take(limit.unwrap_or(usize::MAX))
+                .take(limit)
                 .map(key_meta)
                 .collect();
             // More rows past this page → hand back the next opaque cursor; else None (end of list).
@@ -753,10 +822,50 @@ pub(crate) async fn rotate_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let actor = principal.actor_id().to_string();
+    // IDEMPOTENT ROTATE (optional `Idempotency-Key`, re-audit M10): rotate is the one other
+    // destructive, secret-bearing POST — a network-level retry without this mints TWICE and the
+    // first (lost) response's secret is silently dead. Same mechanics as create's idempotent mint
+    // (principal-scoped cache + in-flight reservation), with the cache key additionally scoped by
+    // operation + key id so a create and a rotate sharing a header value can never replay each
+    // other's response.
+    let idem_ckey: Option<(String, String)> = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(|k| (actor.clone(), format!("rotate:{id}:{k}")));
+    if let Some(ref ck) = idem_ckey {
+        let now = crate::store::now();
+        let mut cache = app
+            .idempotency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
+        match cache.get(ck) {
+            Some((_, cached)) if !cached.is_null() => {
+                return json_response(StatusCode::OK, cached.clone());
+            }
+            Some(_) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    ERR_TYPE_CONFLICT,
+                    "a request with this Idempotency-Key is already in flight",
+                );
+            }
+            None => {
+                cache.insert(ck.clone(), (now, serde_json::Value::Null));
+            }
+        }
+    }
+    let mut idem_reservation = idem_ckey.as_ref().map(|ck| IdemReservation {
+        cache: app.idempotency_cache.clone(),
+        key: ck.clone(),
+        committed: false,
+    });
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_write();
     };
     let gov = gov.clone();
     let gid = id.clone();
@@ -777,6 +886,18 @@ pub(crate) async fn rotate_key(
             audit::AUDIT.record_by("key.rotate", &resource, audit::OUTCOME_APPLIED, &actor);
             let mut body = key_meta(&key);
             body["secret"] = json!(secret); // shown exactly once, exactly like mint
+                                            // COMMIT the idempotency slot with the real response (replaces the reservation) and
+                                            // disarm the drop-guard — a retry inside the window replays THIS body verbatim.
+            if let Some(ref ck) = idem_ckey {
+                let mut cache = app
+                    .idempotency_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                cache.insert(ck.clone(), (crate::store::now(), body.clone()));
+                if let Some(r) = idem_reservation.as_mut() {
+                    r.committed = true;
+                }
+            }
             json_response(StatusCode::OK, body)
         }
         Ok(Ok(None)) => {
@@ -797,7 +918,7 @@ pub(crate) async fn get_key(
     Path(id): Path<String>,
 ) -> Response {
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_read();
     };
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
@@ -840,7 +961,7 @@ pub(crate) async fn key_usage(
     Path(id): Path<String>,
 ) -> Response {
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_read();
     };
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
@@ -858,11 +979,29 @@ pub(crate) async fn key_usage(
     .await;
     match res {
         Ok(Ok(Some((u, key)))) => {
-            let headroom = key.and_then(|k| gov.rate_headroom(&k, now));
+            let headroom = key.as_ref().and_then(|k| gov.rate_headroom(k, now));
+            // Label the numbers (re-audit L): WHICH budget window these counters cover
+            // (`budget_period` + its start epoch) and when the read was taken — a consumer can
+            // cache, align, and reset-detect without guessing.
+            let (period, window_start) = key
+                .as_ref()
+                .map(|k| {
+                    (
+                        k.budget_period.clone(),
+                        crate::governance::budget_window(&k.budget_period, now),
+                    )
+                })
+                .map_or(
+                    (serde_json::Value::Null, serde_json::Value::Null),
+                    |(p, w)| (json!(p), json!(w)),
+                );
             json_response(
                 StatusCode::OK,
                 json!({
                     "id": id,
+                    "budget_period": period,
+                    "window_start": window_start,
+                    "as_of": now,
                     "spend_cents": u.spend_cents,
                     "tokens": u.tokens,
                     "requests": u.requests,
@@ -887,7 +1026,7 @@ pub(crate) async fn delete_key(
 ) -> Response {
     let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
-        return disabled();
+        return disabled_write();
     };
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
@@ -895,7 +1034,10 @@ pub(crate) async fn delete_key(
     // Optimistic concurrency (optional `If-Match`, H3 — every mutation verb on the surface honors
     // it): the caller's ETag is compared against the CURRENT record inside the gated critical
     // section below, so the delete only lands on the exact record state the caller last read.
-    let if_match = parse_key_if_match(&headers);
+    let if_match = match parse_key_if_match(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     // Existence check before delete: the key RECORD is looked up first and `None` means not-found
     // (the store's `delete_key` silently no-ops a zero-row delete, so we cannot rely on it to signal
     // not-found). Use the public GovState API rather than reaching into the store. The record (not a
@@ -1195,6 +1337,116 @@ mod tests {
 
     /// `GET /api/v1/admin/pools/{name}` projects each member's LIVE status (usable/cooldown/concurrency/
     /// inflight/tallies) from the store; 404s an unknown pool.
+    /// Re-audit HIGH-1: EVERY response under the native-API root speaks the frozen envelope —
+    /// including unmatched paths (404 `not_found`) and wrong methods (405 `method_not_allowed`),
+    /// which previously fell through to the data plane's vendor-native shaping (`error.type`).
+    #[tokio::test]
+    async fn test_api_root_unmatched_paths_speak_the_admin_envelope() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Unmatched path INSIDE the admin nest + an /api path outside any surface: both 404 in the
+        // admin envelope (`code`, never a vendor `type`).
+        for path in ["/api/v1/admin/nonexistent", "/api/junk"] {
+            let r = client
+                .get(format!("http://{addr}{path}"))
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 404, "{path}");
+            let body: serde_json::Value = r.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "not_found", "{path}: {body}");
+            assert!(
+                body["error"]["type"].is_null(),
+                "{path}: never the vendor envelope: {body}"
+            );
+        }
+
+        // Wrong method on a real endpoint: 405 in the envelope with the frozen code.
+        let r = client
+            .delete(format!("http://{addr}/api/v1/admin/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 405);
+        assert_eq!(
+            r.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "method_not_allowed"
+        );
+        handle.abort();
+    }
+
+    /// Re-audit HIGH-2: governance-off semantics are UNAMBIGUOUS — collection reads answer the
+    /// truthful empty page, single reads a truthful 404, and writes a 409 `conflict` with an
+    /// actionable message (previously everything was 404, making `not_found` mean two things).
+    #[tokio::test]
+    async fn test_keys_surface_governance_disabled_semantics() {
+        crate::metrics::init();
+        let mut app = TestApp::new().build(); // NO governance
+        {
+            // Open admin posture (explicit empty chain) — this test probes HANDLER semantics, not
+            // auth; with governance off there is no admin token for the default chain to accept.
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = Vec::new();
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Collection read: 200 empty page in the standard envelope.
+        let r = client
+            .get(format!("http://{addr}/api/v1/admin/keys"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "collection GET is 200-empty");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["items"].as_array().unwrap().len(), 0);
+        assert!(body["next_cursor"].is_null());
+
+        // Single-resource read: truthful 404.
+        let r = client
+            .get(format!("http://{addr}/api/v1/admin/keys/vk_x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 404);
+
+        // Write: 409 conflict with the actionable message.
+        let r = client
+            .post(format!("http://{addr}/api/v1/admin/keys"))
+            .json(&serde_json::json!({"name": "k"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            409,
+            "writes conflict with server state"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "conflict");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("governance"),
+            "actionable message: {body}"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn test_admin_v1_pool_detail_live_status() {
         use crate::test_support::LaneSpec;
@@ -1236,7 +1488,7 @@ mod tests {
         assert_eq!(m["weight"], 5);
         // Live-status fields present + typed. A fresh lane is usable with no cooldown.
         assert_eq!(m["usable"], true);
-        assert_eq!(m["cooldown_remaining_s"], 0);
+        assert_eq!(m["cooldown_remaining_seconds"], 0);
         assert!(m["available_concurrency"].is_number());
         assert!(m["inflight"].is_number());
         assert!(m["ok"].is_number());
@@ -3024,7 +3276,7 @@ providers: {}
         assert_eq!(rb.status().as_u16(), 200);
         let rb_body: serde_json::Value = rb.json().await.unwrap();
         assert_eq!(rb_body["restored_version"], 1);
-        assert_eq!(rb_body["new_version"], 3);
+        assert_eq!(rb_body["config_version"], 3); // the post-rollback version, under the uniform name
         let restored = admin(client.get(format!("http://{addr}/api/v1/admin/hooks/rbk")))
             .send()
             .await

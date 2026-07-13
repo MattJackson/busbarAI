@@ -488,7 +488,7 @@ impl AdminService {
                     model: self.app.lanes[m.idx].model.clone(),
                     weight: m.weight,
                     usable: snap.usable,
-                    cooldown_remaining_s: snap.cooldown_remaining_s,
+                    cooldown_remaining_seconds: snap.cooldown_remaining_s,
                     available_concurrency: self.app.store.available_permits(m.idx),
                     inflight: snap.inflight,
                     latency_ms: self.app.store.lane_latency_ms(m.idx),
@@ -720,6 +720,7 @@ impl AdminService {
             total: UsageBreakdown::default(),
             by_model: Vec::new(),
             by_key: Vec::new(),
+            by_key_truncated: false,
         };
         let Some(gov) = self.app.governance.clone() else {
             return Ok(empty());
@@ -782,7 +783,7 @@ impl AdminService {
                 }
             })
             .collect();
-        let by_key = by_key
+        let mut by_key: Vec<KeyUsageView> = by_key
             .into_iter()
             .map(|(id, mut usage)| {
                 usage.spend_micros = derive_spend_micros(&usage, prices);
@@ -793,6 +794,18 @@ impl AdminService {
                 }
             })
             .collect();
+        // Bound the response (no memory/latency cliff at fleet scale — 3rd-party review R2 #1):
+        // keep the TOP spenders (the rows a FinOps consumer actually wants first), ordered
+        // spend-desc then id for determinism, and SAY when the cap fired.
+        const BY_KEY_CAP: usize = 1000;
+        by_key.sort_by(|a, b| {
+            b.usage
+                .spend_micros
+                .cmp(&a.usage.spend_micros)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let by_key_truncated = by_key.len() > BY_KEY_CAP;
+        by_key.truncate(BY_KEY_CAP);
         Ok(UsageView {
             window,
             as_of: now,
@@ -800,6 +813,7 @@ impl AdminService {
             total,
             by_model,
             by_key,
+            by_key_truncated,
         })
     }
 
@@ -838,9 +852,19 @@ impl AdminService {
         })
     }
 
-    /// Project a registry `HookCfg` into the wire `HookView`. `global` is true when the hook is named
-    /// in `global_hooks:` OR declares inline `global: true` — the two ways a hook is globally wired.
+    /// Project a registry `HookCfg` into the wire `HookView` against the LIVE global wiring.
     fn hook_view(&self, name: &str, cfg: &HookCfg) -> HookView {
+        project_hook_view(name, cfg, &self.app.global_hooks)
+    }
+}
+
+/// Project a `HookCfg` into the ONE wire `HookView` shape, against an explicit global-wiring list —
+/// shared by the live reads (`self.app.global_hooks`) AND the version-history read (the SNAPSHOT's
+/// own wiring), so a hook has exactly one wire representation everywhere (re-audit M6: the versions
+/// endpoint previously serialized the raw `HookCfg` file shape — a second, accidental wire schema).
+/// `global` is true when the hook is named in the wiring list OR declares inline `global: true`.
+pub(crate) fn project_hook_view(name: &str, cfg: &HookCfg, global_hooks: &[String]) -> HookView {
+    {
         let (transport_kind, target) = match (&cfg.socket, &cfg.webhook) {
             (Some(path), _) => ("socket", Some(path.clone())),
             (None, Some(url)) => ("webhook", Some(url.clone())),
@@ -875,7 +899,7 @@ impl AdminService {
             on_error: cfg.on_error.clone(),
             timeout_ms: cfg.timeout_ms,
             settings: cfg.settings.clone(),
-            global: cfg.global || self.app.global_hooks.iter().any(|n| n == name),
+            global: cfg.global || global_hooks.iter().any(|n| n == name),
         }
     }
 }
