@@ -4,6 +4,7 @@ description: "Point Claude Code at Busbar with one environment variable — get 
 date: 2026-07-13
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
+ogImage: "/og/claude-code-busbar.png"
 ---
 
 Claude Code is great as we all know, but on its own it's a black box pointed straight at
@@ -66,29 +67,31 @@ claude
 Nova itself wants two small tweaks — an output-token cap and prompt caching off (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`,
 `DISABLE_PROMPT_CACHING`) — but those are about Nova's limits, not about Claude Code, which runs unchanged.
 
-Then I launched the real Claude Code window and gave it an agentic coding task — write two small Python
-files (a FizzBuzz and a prime printer), then list the folder and report back. The kind of thing that
-loops through several tool calls, each one answered by Nova:
+Then I launched the real Claude Code window and gave it an agentic coding task — write a small Sudoku
+web app across three files (`app.py`, an `http.server` serving a 9×9 grid; `solver.py`, a backtracking
+solver; and a `README.md`), then list the folder and report back. The kind of thing that loops through
+several tool calls, each one answered by Nova:
 
-![The real Claude Code window writing Python code, every turn answered by Amazon Nova Pro on Bedrock through Busbar](/demo/claude-nova.gif)
+![The real Claude Code window building a Sudoku web app, every turn answered by Amazon Nova Pro on Bedrock through Busbar](/demo/claude-nova.gif)
 
-That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It writes `fizzbuzz.py`
-and `primes.py`, runs `ls -la`, and reports `DONE`. The model behind every step is Amazon Nova; the
-`<thinking>` blocks are Nova's, not Claude's. Busbar translated each Anthropic request into a Bedrock
-Converse call and the response back again — the agent never knew.
+That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It writes all three files,
+runs `ls -la`, and reports `DONE`. The model behind every step is Amazon Nova; the `<thinking>` blocks
+are Nova's, not Claude's. Busbar translated each Anthropic request into a Bedrock Converse call and the
+response back again — the agent never knew.
 
-The receipt, because "trust me" isn't a demo. I read AWS Bedrock's own CloudWatch usage for Nova Pro —
-wholly independent of anything Busbar reports — right before the run and right after it:
+The receipt, because "trust me" isn't a demo. Bedrock's usage counter starts at zero, and I read AWS's
+own CloudWatch numbers for Nova Pro — wholly independent of anything Busbar reports — right before the
+run and right after it:
 
 ```console
 # before
-nova-pro   invocations=42   input_tokens=81,636
+nova-pro   invocations=0   input_tokens=0
 # after
-nova-pro   invocations=46   input_tokens=86,535
+nova-pro   invocations=8   input_tokens=17,880
 ```
 
-Every turn ticked the counters up on AWS's own console — one Claude Code session that believed it was
-talking to Anthropic, served entirely by Nova. To swap in Gemini, or to put Claude behind two keys with
+Zero to eight invocations, ~17,900 input tokens — one Claude Code session that believed it was talking
+to Anthropic, served entirely by Nova. To swap in Gemini, or to put Claude behind two keys with
 failover, or to add a compression hook — you edit the pool, not the agent.
 
 ## The simple version

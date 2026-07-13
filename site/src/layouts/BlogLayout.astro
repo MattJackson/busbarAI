@@ -12,8 +12,11 @@ interface Props {
   author?: string;
   /** GitHub Discussion URL for this post's comment thread (rendered as the Comments CTA). */
   discussion?: string;
+  /** Per-post social card (absolute path under the site, e.g. /og/claude-code.png). Falls back to the shared card. */
+  ogImage?: string;
 }
-const { title, description, datePublished, author, discussion } = Astro.props;
+const { title, description, datePublished, author, discussion, ogImage } = Astro.props;
+const ogImageUrl = new URL(ogImage || '/og-card.png', 'https://getbusbar.com').href;
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const YEAR = new Date().getFullYear();
@@ -42,8 +45,9 @@ const ARTICLE = datePublished
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:type" content="article" />
-    <meta property="og:image" content="https://getbusbar.com/og-card.png" />
+    <meta property="og:image" content={ogImageUrl} />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content={ogImageUrl} />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(ARTICLE)} />
   </head>

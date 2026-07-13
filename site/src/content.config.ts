@@ -16,6 +16,8 @@ export const collections = {
       authorTitle: z.string().default('Founder, Busbar'),
       // GitHub Discussion URL for the post's comment thread (rendered as the Comments CTA).
       discussion: z.string().url().optional(),
+      // Per-post social card (path under public/); falls back to the site-wide /og-card.png.
+      ogImage: z.string().optional(),
     }),
   }),
 };
