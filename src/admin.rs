@@ -119,17 +119,30 @@ fn json_response(status: StatusCode, body: Value) -> Response {
         .into_response()
 }
 
-/// Admin error envelope — the SAME vendor object shape the proxy emits
-/// (`{"error":{"message":...,"type":...}}`, see `forward::ingress_error`), so a client parses admin
-/// and proxy errors with one code path instead of a flat `{"error":"<string>"}` special case. The
-/// `type` taxonomy mirrors `forward::cross_protocol_error_kind`: `invalid_request_error` for 4xx
-/// client errors, `not_found_error` for 404, `internal_error` for 5xx. `message` carries only
-/// caller-safe text — store/DB details are logged server-side (see `internal_error`/`join_error`)
-/// and never reach this body.
+/// Admin error envelope — the FROZEN v1 shape `{"error":{"code":...,"message":...}}` with the
+/// canonical `code` enum (`not_found`/`invalid_request`/`conflict`/`internal`/…), IDENTICAL to every
+/// other `/admin/v1` resource (see `admin::v1::contract::AdminError::code`). These legacy key
+/// handlers previously spoke a DIFFERENT envelope (`{message,type}` with `*_error` values); that
+/// split forced a client/Terraform provider to branch on `error.code` for config/hooks/auth but on
+/// `error.type` for keys, with different values. Since `/admin/v1` freezes at 1.3, keys must speak
+/// the one contract (audit: admin contract H1). `message` carries only caller-safe text — store/DB
+/// details are logged server-side (see `internal_error`) and never reach this body.
 fn error_response(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+    // Map the legacy `*_error` type onto the frozen v1 `code` enum, byte-for-byte matching
+    // `AdminError::code()` so keys and non-keys emit the SAME code for the same condition.
+    let code = match error_type {
+        ERR_TYPE_NOT_FOUND => "not_found",
+        ERR_TYPE_INVALID_REQUEST => "invalid_request",
+        ERR_TYPE_CONFLICT => "conflict",
+        ERR_TYPE_INTERNAL => "internal",
+        // Every caller passes one of the four above; fall back safely to the generic 4xx/5xx code
+        // rather than leaking an unmapped token onto the frozen wire.
+        _ if status.is_server_error() => "internal",
+        _ => "invalid_request",
+    };
     json_response(
         status,
-        json!({"error": {"message": message.into(), "type": error_type}}),
+        json!({"error": {"code": code, "message": message.into()}}),
     )
 }
 
@@ -4197,9 +4210,9 @@ providers: {}
                 "400 body must name budget_period: {body}"
             );
             assert_eq!(
-                body["error"]["type"],
-                "invalid_request_error", // golden wire-contract literal (kept bare on purpose)
-                "400 error type must be invalid_request_error: {body}"
+                body["error"]["code"],
+                "invalid_request", // frozen v1 envelope: keys speak the SAME code enum (H1)
+                "400 error code must be invalid_request: {body}"
             );
         }
 
@@ -4296,9 +4309,9 @@ providers: {}
                 "the 400 body on {path} must be the generic envelope; got {text}"
             );
             assert_eq!(
-                body["error"]["type"],
-                "invalid_request_error", // golden wire-contract literal (kept bare on purpose)
-                "the 400 error type must be invalid_request_error; got {text}"
+                body["error"]["code"],
+                "invalid_request", // frozen v1 envelope: keys speak the SAME code enum (H1)
+                "the 400 error code must be invalid_request; got {text}"
             );
         }
 
@@ -4813,7 +4826,7 @@ providers: {}
         );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["message"], "key not found");
-        assert_eq!(body["error"]["type"], "not_found_error"); // golden wire-contract literal (kept bare on purpose)
+        assert_eq!(body["error"]["code"], "not_found"); // frozen v1 envelope: keys speak the SAME code enum (H1)
         handle.abort();
     }
 
