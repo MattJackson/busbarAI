@@ -1610,6 +1610,8 @@ pub(crate) struct LaneData {
     pub(crate) attempt_timeout_ms: Option<u64>,
     /// Operator-declared reasoning-capability flag (see `ModelCfg::reasoning`).
     pub(crate) reasoning: bool,
+    /// Operator-declared prompt-caching capability flag (see `ModelCfg::prompt_caching`).
+    pub(crate) prompt_caching: bool,
 }
 
 /// Helper for weighted selection tests - creates a lane with specific weight.
@@ -1632,6 +1634,7 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
         upstream_model: None,
         attempt_timeout_ms: None,
         reasoning: false,
+        prompt_caching: false,
     };
     (lane, (id as u32) + 1) // weight = id + 1 (so lane 0 has weight 1, lane 1 has weight 2, etc.)
 }
@@ -2618,6 +2621,7 @@ mod tests {
             upstream_model: None,
             attempt_timeout_ms: None,
             reasoning: false,
+            prompt_caching: false,
         }
     }
 

@@ -1782,6 +1782,7 @@ mod tests {
     fn make_model(provider: &str, max_concurrent: usize) -> config::ModelCfg {
         config::ModelCfg {
             reasoning: None,
+            prompt_caching: None,
             max_requests: -1,
             provider: provider.into(),
             max_concurrent,

@@ -376,6 +376,16 @@ pub(crate) struct ModelCfg {
     /// is byte-exact and ignores the flag.
     #[serde(default)]
     pub(crate) reasoning: Option<bool>,
+    /// Operator declaration that THIS model accepts prompt-cache markers on dialects where the
+    /// marker is model-gated (Bedrock Converse `cachePoint`: Claude accepts it, Amazon Nova
+    /// hard-rejects it with 400 "extraneous key"). Same family as `reasoning` — busbar keeps no
+    /// model database, the operator asserts what they deployed. When absent/false, cross-protocol
+    /// `cache_control` breakpoints headed to such a dialect are DROPPED at the seam with a warn
+    /// (the request proceeds uncached — fail-safe, never a translation-induced 400). Dialects
+    /// whose cache form is universally accepted (Anthropic `cache_control`) ignore this flag, as
+    /// does same-protocol passthrough (byte-exact).
+    #[serde(default)]
+    pub(crate) prompt_caching: Option<bool>,
 }
 
 fn neg1() -> i64 {

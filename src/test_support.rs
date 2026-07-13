@@ -588,6 +588,7 @@ impl LaneSpec {
     fn to_lane(&self) -> crate::state::Lane {
         crate::state::Lane {
             reasoning: false,
+            prompt_caching: false,
             model: self.model.clone(),
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
@@ -611,6 +612,7 @@ impl LaneSpec {
     fn to_lane_data(&self) -> crate::store::LaneData {
         crate::store::LaneData {
             reasoning: false,
+            prompt_caching: false,
             model: self.model.clone(),
             provider: self.provider.clone(),
             max: self.max,
@@ -3928,6 +3930,7 @@ mod tests {
 
             let model = crate::config::ModelCfg {
                 reasoning: None,
+                prompt_caching: None,
                 max_requests: -1,
                 provider: "p".into(),
                 max_concurrent: 10,

@@ -39,6 +39,10 @@ pub(crate) struct Lane {
     /// Operator-declared: this model accepts reasoning/thinking request params (the cross-protocol
     /// reasoning-carry gate). A pool member's `reasoning` overrides it. See `ModelCfg::reasoning`.
     pub(crate) reasoning: bool,
+    /// Operator-declared: this model accepts prompt-cache markers on model-gated dialects
+    /// (Bedrock `cachePoint`). Gates the cross-protocol cache-breakpoint carry; see
+    /// `ModelCfg::prompt_caching`.
+    pub(crate) prompt_caching: bool,
     /// Optional default max output tokens, injected at the cross-protocol translation seam when the
     /// source request omitted `max_tokens` (legal for OpenAI) but this lane's protocol REQUIRES it
     /// (Anthropic Messages — see `ProtocolWriter::requires_max_tokens`). Falls back to

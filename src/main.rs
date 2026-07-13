@@ -856,6 +856,7 @@ pub(crate) fn build_app_from_config(
             upstream_model: mc.upstream_model.clone(),
             attempt_timeout_ms: mc.attempt_timeout_ms,
             reasoning: mc.reasoning.unwrap_or(false),
+            prompt_caching: mc.prompt_caching.unwrap_or(false),
         });
 
         eprintln!(
@@ -915,6 +916,7 @@ pub(crate) fn build_app_from_config(
             upstream_model: ld.upstream_model.clone(),
             attempt_timeout_ms: ld.attempt_timeout_ms,
             reasoning: ld.reasoning,
+            prompt_caching: ld.prompt_caching,
             default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
         });
     }

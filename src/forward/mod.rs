@@ -426,6 +426,10 @@ fn translate_request_cross_protocol(
                 global_default_max_tokens: app.default_max_tokens,
                 reasoning_allowed,
                 reasoning_budgets: app.reasoning_effort_budgets,
+                // The cache twin of `reasoning_allowed`: a lane whose writer's cache marker is
+                // model-gated (Bedrock) must assert `prompt_caching` to receive breakpoints.
+                prompt_caching_allowed: app.lanes[i].prompt_caching
+                    || !app.lanes[i].protocol.writer().cache_markers_model_gated(),
             });
             ir_req.set_model(app.lanes[i].wire_model());
             return Ok(eh.write_request(&ir_req).to_vec());
@@ -488,6 +492,8 @@ fn translate_request_cross_protocol(
                     global_default_max_tokens: app.default_max_tokens,
                     reasoning_allowed,
                     reasoning_budgets: app.reasoning_effort_budgets,
+                    prompt_caching_allowed: app.lanes[i].prompt_caching
+                        || !app.lanes[i].protocol.writer().cache_markers_model_gated(),
                 });
                 let Some(eh) = egress_handler else {
                     return Err(Box::new(ingress_error(
@@ -6692,6 +6698,7 @@ mod auth_style_tests {
     fn lane_with_auth(auth: Option<&str>) -> Lane {
         Lane {
             reasoning: false,
+            prompt_caching: false,
             default_max_tokens: None,
             model: "gpt-4o".to_string(),
             provider: "azure".to_string(),
@@ -7000,6 +7007,7 @@ mod max_tokens_precedence_tests {
     fn anthropic_lane(default_max_tokens: Option<u32>) -> Lane {
         Lane {
             reasoning: false,
+            prompt_caching: false,
             default_max_tokens,
             model: "claude".to_string(),
             provider: "anthropic".to_string(),
@@ -7033,6 +7041,7 @@ mod max_tokens_precedence_tests {
             global_default_max_tokens: global,
             reasoning_allowed: true,
             reasoning_budgets: crate::ir::REASONING_BUDGET_DEFAULTS,
+            prompt_caching_allowed: true,
         };
         let apply = |ir: IrRequest, lane: &Lane, global: u32| -> Option<u32> {
             let mut req = IrReq::Chat(ir);
@@ -11322,6 +11331,7 @@ mod probe_guard_tests {
     fn lane(max: usize) -> LaneData {
         LaneData {
             reasoning: false,
+            prompt_caching: false,
             model: "m0".into(),
             provider: "p0".into(),
             max,

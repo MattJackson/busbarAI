@@ -6684,6 +6684,7 @@ mod reasoning_carry_tests {
             global_default_max_tokens: 32000,
             reasoning_allowed: allowed,
             reasoning_budgets: [1024, 2048, 3072, 4096],
+            prompt_caching_allowed: true,
         };
         let ir = crate::proto::openai_chat::OpenAiReader
             .read_request(&openai_effort_body("high"))

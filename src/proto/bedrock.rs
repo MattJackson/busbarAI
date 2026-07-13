@@ -2055,6 +2055,14 @@ impl ProtocolWriter for BedrockWriter {
         "/model"
     }
 
+    /// Converse's `cachePoint` marker is validated per-model: Anthropic Claude accepts it, Amazon
+    /// Nova 400s with "extraneous key [cachePoint] is not permitted". Cross-protocol cache asks
+    /// therefore need the lane's `prompt_caching` capability assertion before this writer may
+    /// project them (see `cache_markers_model_gated` on the trait).
+    fn cache_markers_model_gated(&self) -> bool {
+        true
+    }
+
     fn upstream_path_for(&self, model: &str) -> String {
         format!("/model/{}/converse", model)
     }
