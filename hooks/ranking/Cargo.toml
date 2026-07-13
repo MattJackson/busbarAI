@@ -1,0 +1,16 @@
+[package]
+name = "busbar-hooks-ranking"
+version = "1.2.1"
+edition = "2021"
+rust-version = "1.87"
+description = "The built-in ranking hooks for busbar: cheapest / fastest / least_busy / usage order-gates over the routing-policy contract."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../../api" }
+async-trait = "0.1"
+
+[dev-dependencies]
+# The native policies are sync; the async-trait wrapper still makes `decide` async, so the tests
+# need a (current-thread) runtime to drive it.
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -1,3 +1,6 @@
+[workspace]
+members = ["api", "auth/tokens", "auth/admin-tokens", "hooks/ranking"]
+
 [package]
 name = "busbar"
 version = "1.2.1"
@@ -15,6 +18,14 @@ name = "busbar"
 path = "src/main.rs"
 
 [dependencies]
+# The plugin CONTRACTS (auth-module trait, routing-policy trait, projections) — the one crate both
+# the engine and every plugin build against. See api/.
+busbar-api = { path = "api" }
+# The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
+# so the matching feature (below) compiles each IN or OUT of the binary.
+busbar-auth-tokens = { path = "auth/tokens", optional = true }
+busbar-auth-admin-tokens = { path = "auth/admin-tokens", optional = true }
+busbar-hooks-ranking = { path = "hooks/ranking", optional = true }
 axum = "0.8"
 # Already present transitively (axum's middleware stack). Pulled in directly ONLY for
 # `GlobalConcurrencyLimitLayer` — the OUTERMOST inbound-concurrency cap applied when the operator
@@ -132,15 +143,15 @@ rustls-pki-types = { version = "1", default-features = false, features = ["std"]
 # symbols). `auth.chain: [tokens]` then BOOT-ERRORS instead of silently opening. A regulated
 # deployment ships tokens OUT and wires its own auth module (SAML/AD/OIDC) in the private repo.
 default = ["auth-tokens", "auth-admin-tokens", "hooks-ranking"]
-auth-tokens = []
+auth-tokens = ["dep:busbar-auth-tokens"]
 # The built-in `admin-tokens` ADMIN auth plugin (the single operator admin token) — same
 # default-on, removable, compliance-by-compilation stance. Removed, `admin_auth: [admin-tokens]`
 # (the default) boot-errors and an external admin module must be wired.
-auth-admin-tokens = []
+auth-admin-tokens = ["dep:busbar-auth-admin-tokens"]
 # The built-in RANKING hooks (cheapest/fastest/least_busy/usage) are also a default-on, removable
 # feature. `--no-default-features` drops them; `weighted` stays (it's the engine's inline SWRR floor,
 # not a plugin). A pool `policy: cheapest` (etc.) is then a boot error.
-hooks-ranking = []
+hooks-ranking = ["dep:busbar-hooks-ranking"]
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.

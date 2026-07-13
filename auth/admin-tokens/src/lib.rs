@@ -11,15 +11,15 @@
 //! arrives on two carriers, and the constant-time both-carriers fold must live INSIDE the module —
 //! selecting a carrier before the compare would reintroduce the timing observable the fold kills).
 
-use crate::auth::{AuthMiddleware, AuthOutcome, Principal};
+use busbar_api::{constant_time_eq, sha256_hex, AuthOutcome, Principal};
 
 /// The fixed principal id the operator admin token identifies as. The built-in operator credential
 /// carries FULL admin scope by definition (it is the root credential the deployment was born with);
 /// group-mapped external principals get their scope from `group_map:` instead.
-pub(crate) const ADMIN_TOKENS_PRINCIPAL_ID: &str = "admin";
+pub const ADMIN_TOKENS_PRINCIPAL_ID: &str = "admin";
 
 /// Judge the presented admin credential carriers against the configured admin token hash
-/// (SHA-256 hex, pre-computed at `GovState` construction).
+/// (SHA-256 hex, pre-computed at engine construction).
 ///
 /// Timing stance (unchanged from the pre-plugin inline check): BOTH carrier comparisons run
 /// UNCONDITIONALLY and fold with bitwise-OR — a request presenting both a Bearer and an
@@ -29,7 +29,7 @@ pub(crate) const ADMIN_TOKENS_PRINCIPAL_ID: &str = "admin";
 ///
 /// `None` hash (no admin token configured) ⇒ `Pass` — this module has nothing to judge; a chain
 /// that ends all-`Pass` is denied (fail-closed), preserving "admin API disabled without a token".
-pub(crate) fn authenticate_admin_tokens(
+pub fn authenticate_admin_tokens(
     configured_hash: Option<&str>,
     bearer: Option<&str>,
     header: Option<&str>,
@@ -43,22 +43,12 @@ pub(crate) fn authenticate_admin_tokens(
     }
     let bearer_match = u8::from(
         bearer
-            .map(|b| {
-                AuthMiddleware::constant_time_eq(
-                    &crate::sigv4::sha256_hex(b.as_bytes()),
-                    configured_hash,
-                )
-            })
+            .map(|b| constant_time_eq(&sha256_hex(b.as_bytes()), configured_hash))
             .unwrap_or(false),
     );
     let header_match = u8::from(
         header
-            .map(|h| {
-                AuthMiddleware::constant_time_eq(
-                    &crate::sigv4::sha256_hex(h.as_bytes()),
-                    configured_hash,
-                )
-            })
+            .map(|h| constant_time_eq(&sha256_hex(h.as_bytes()), configured_hash))
             .unwrap_or(false),
     );
     if std::hint::black_box(bearer_match | header_match) != 0 {
@@ -73,7 +63,7 @@ mod tests {
     use super::*;
 
     fn hash(s: &str) -> String {
-        crate::sigv4::sha256_hex(s.as_bytes())
+        sha256_hex(s.as_bytes())
     }
 
     #[test]

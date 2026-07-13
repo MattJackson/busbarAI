@@ -45,8 +45,8 @@ jobs:
         if: steps.diff.outputs.changed == 'true'
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
 
       - name: Bump patch version
         if: steps.diff.outputs.changed == 'true'

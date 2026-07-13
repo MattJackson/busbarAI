@@ -58,7 +58,6 @@ mod metrics;
 mod net_guard;
 mod observability;
 mod operation;
-mod plugins;
 mod proto;
 mod route;
 mod router;

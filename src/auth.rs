@@ -75,60 +75,11 @@ impl fmt::Debug for CallerToken {
     }
 }
 
-/// The authenticated PRINCIPAL — who the caller IS, established at the auth stage and keyed to by
-/// everything downstream (governance, audit attribution, the hook `send_user` projection, admin
-/// scopes). IDENTITY ONLY: a module returns who; policy (allowed pools, budgets, admin scope) is
-/// resolved by busbar from config (`group_map:`), never asserted by the module (design-hooks-v2
-/// §2.3). NEVER carries the credential itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Principal {
-    /// Stable identity handle (required): the virtual-key id for governance keys, a stable
-    /// module-scoped handle otherwise (e.g. `tokens:2`, an AD UPN).
-    pub(crate) id: String,
-    /// Display name, if the module knows one.
-    pub(crate) name: Option<String>,
-    /// Group memberships (external modules). Mapped to governance via config `group_map:`;
-    /// intersected with the module's `allowed_groups:` cap before mapping. Empty = no groups.
-    pub(crate) groups: Vec<String>,
-    /// Module-suggested cache TTL for this identification, seconds (clamped by the engine's hard
-    /// cap when the credential cache lands). `None` = engine default.
-    pub(crate) ttl_secs: Option<u64>,
-}
+// The auth CONTRACT — [`Principal`], [`AuthOutcome`], the [`AuthModule`] trait, and the
+// constant-time credential primitives — lives in the `busbar-api` crate (the one crate both the
+// engine and every plugin build against). Re-exported here so engine-internal paths are unchanged.
+pub(crate) use busbar_api::{AuthModule, AuthOutcome, Principal};
 
-impl Principal {
-    /// A principal with only a stable id — the common built-in-module shape.
-    pub(crate) fn from_id(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            name: None,
-            groups: Vec::new(),
-            ttl_secs: None,
-        }
-    }
-}
-
-/// The verdict of one auth module. The PAM-style trichotomy the 1.3 auth-plugin layer is built on
-/// (design-hooks-v2 §2): `Identify` = this module authenticated the caller and this is WHO —
-/// carries the [`Principal`]; `Reject` = a credential was presented but is invalid (fail-closed,
-/// stop the chain); `Pass` = "not mine" — no usable credential for this module, defer to the next
-/// module / the mode default.
-#[derive(Debug, Clone, PartialEq, Eq)]
-// The contract enum persists even when NO built-in auth module is compiled (a `--no-default-features`
-// / external-only build): an external `AuthModule` constructs these verdicts. Without a compiled-in
-// module the variants are unconstructed, hence allow(dead_code).
-#[allow(dead_code)]
-pub(crate) enum AuthOutcome {
-    Identify(Principal),
-    Reject,
-    Pass,
-}
-
-/// One authentication module — a swappable implementation of the fixed `auth` engine stage. The
-/// built-in `tokens` module implements it today; SAML/AD/OIDC modules implement the same trait in
-/// the private repo. Extraction of the credential carriers (Bearer / x-api-key / x-goog-api-key)
-/// stays in the middleware, so a module never re-parses headers — it receives the already-extracted
-/// candidate and returns a verdict. (Slice 3 extends this with a configure/describe handshake and a
-/// `Principal` on `Identify`.)
 /// The whole CHAIN's verdict for one request: admitted-with-identity, admitted-anonymously (the
 /// empty-chain open front door), or denied. Distinct from the per-module [`AuthOutcome`] so the
 /// middleware can attach the principal (or its absence) to the request.
@@ -139,21 +90,13 @@ pub(crate) enum ChainVerdict {
     Denied,
 }
 
-pub(crate) trait AuthModule: Send + Sync {
-    /// Stable module name for config references, metrics, and audit (e.g. `"tokens"`). RESERVED:
-    /// consumed by the slice-3 `auth:` chain + audit; no caller in slice 2.
-    #[allow(dead_code)]
-    fn name(&self) -> &'static str;
-    /// Judge the presented candidate credential. Constant-time and side-effect-free.
-    fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome;
-}
-
-// The built-in `tokens` auth module IMPLEMENTATION lives in the `tokens` auth plugin
-// (`crate::plugins::auth::tokens`), NOT in the engine core — the engine holds only the `AuthModule`
-// contract above. `grep token` in the engine is clean; the plugin is default-included and REMOVABLE
-// (the `auth-tokens` feature; a `--no-default-features` build contains no token auth code at all).
+// The built-in `tokens` auth module IMPLEMENTATION lives in its own WORKSPACE CRATE
+// (`auth/tokens/`), NOT in the engine core — the engine holds only the `AuthModule` contract
+// (re-exported above from `busbar-api`). `grep token` in the engine is clean; the plugin is
+// default-included and REMOVABLE (the `auth-tokens` feature; a `--no-default-features` build
+// contains no token auth code at all).
 #[cfg(feature = "auth-tokens")]
-use crate::plugins::auth::tokens::TokensModule;
+use busbar_auth_tokens::TokensModule;
 
 /// AuthMiddleware holds the resolved auth chain, the upstream-credential mode, and the token allowlist.
 pub(crate) struct AuthMiddleware {
@@ -279,26 +222,11 @@ impl AuthMiddleware {
         ChainVerdict::Denied
     }
 
-    /// Constant-time string comparison to avoid leaking how much of a token matches via timing.
-    /// `#[inline(never)]` + `black_box` keep the optimizer from turning the accumulation loop into
-    /// an early-exit branch (which would reintroduce a timing signal). The length check is a
-    /// deliberate fast-path: token *length* is not treated as secret.
-    #[inline(never)]
+    /// Constant-time string comparison — the single timing-safe primitive, now provided by the
+    /// `busbar-api` contract crate (plugins compare with the SAME primitive). Kept as an associated
+    /// fn so engine call sites are unchanged.
     pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
-        let a_bytes = a.as_bytes();
-        let b_bytes = b.as_bytes();
-
-        if a_bytes.len() != b_bytes.len() {
-            return false;
-        }
-
-        // XOR all bytes and OR the results together. If any bit differs, result > 0.
-        let mut result: u8 = 0;
-        for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
-            result |= x ^ y;
-        }
-
-        std::hint::black_box(result) == 0
+        busbar_api::constant_time_eq(a, b)
     }
 
     /// Extract the token from an `Authorization: Bearer <token>` header (scheme match is
@@ -510,6 +438,9 @@ impl AuthPrincipal {
 /// legitimately arrives as `Authorization: Bearer` or `X-Admin-Token`, and the constant-time
 /// both-carriers fold lives inside the module. Unknown / compiled-out names are skipped with a
 /// loud log (config_validate rejects them at boot).
+// With admin-tokens compiled out (and outside test builds) no chain arm reads the carriers — the
+// loop still runs for the unknown-name log + fail-closed deny, so the parameters stay.
+#[cfg_attr(not(any(feature = "auth-admin-tokens", test)), allow(unused_variables))]
 fn run_admin_chain(
     app: &crate::state::App,
     bearer: Option<&str>,
@@ -521,7 +452,7 @@ fn run_admin_chain(
     for name in &app.admin_chain {
         let outcome = match name.as_str() {
             #[cfg(feature = "auth-admin-tokens")]
-            "admin-tokens" => crate::plugins::auth::admin_tokens::authenticate_admin_tokens(
+            "admin-tokens" => busbar_auth_admin_tokens::authenticate_admin_tokens(
                 app.governance.as_ref().and_then(|g| g.admin_token_hash()),
                 bearer,
                 header,
@@ -581,7 +512,7 @@ fn admin_scope_for(
     // admin-tokens itself.
     if p.groups.is_empty() {
         #[cfg(feature = "auth-admin-tokens")]
-        if p.id == crate::plugins::auth::admin_tokens::ADMIN_TOKENS_PRINCIPAL_ID {
+        if p.id == busbar_auth_admin_tokens::ADMIN_TOKENS_PRINCIPAL_ID {
             return Some(Scope::Full);
         }
         return None;

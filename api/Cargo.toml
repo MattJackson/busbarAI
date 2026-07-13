@@ -1,0 +1,13 @@
+[package]
+name = "busbar-api"
+version = "1.2.1"
+edition = "2021"
+rust-version = "1.87"
+description = "The busbar engine's plugin contracts: the auth-module trait, the hook/routing-policy trait, and their projection types."
+license = "Apache-2.0"
+
+[dependencies]
+serde_json = "1"
+async-trait = "0.1"
+sha2 = "0.11.0"
+hex = "0.4.3"

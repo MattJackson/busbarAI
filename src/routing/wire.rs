@@ -253,15 +253,10 @@ pub(crate) fn parse_restrict(value: &serde_json::Value) -> Option<RestrictReply>
     Some(RestrictReply { tags_any })
 }
 
-/// A parsed, validated `rewrite` reply: the replacement message body and any injected tools. Both are
-/// opaque dialect-agnostic JSON arrays busbar re-renders per target protocol. FAIL-CLOSED —
-/// `parse_rewrite` returns `None` for a malformed rewrite so the caller proceeds with the ORIGINAL
-/// body, never a corrupted one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RewriteReply {
-    pub(crate) messages: Vec<serde_json::Value>,
-    pub(crate) tools: Vec<serde_json::Value>,
-}
+/// A parsed, validated `rewrite` reply — part of the hook contract (`busbar-api`); re-exported so
+/// engine-internal paths are unchanged. FAIL-CLOSED: `parse_rewrite` (below) returns `None` for a
+/// malformed rewrite so the caller proceeds with the ORIGINAL body, never a corrupted one.
+pub(crate) use busbar_api::RewriteReply;
 
 /// Parse the untyped `rewrite` value fail-closed. A well-formed rewrite is `{"messages": [...],
 /// "tools"?: [...]}` with a NON-EMPTY messages array; anything else yields `None` (proceed with the

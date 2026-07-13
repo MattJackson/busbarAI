@@ -8,7 +8,7 @@
 //! Busbar already has (`forward::pick_among`): if the policy's #1 is tripped / excluded / at
 //! capacity, Busbar walks to #2 using the existing breaker machinery. One transport-agnostic trait
 //! (`RoutingPolicy`); webhook / socket are the out-of-process implementations, and the built-in
-//! ranking hooks (`plugins::hooks::ranking`) are the in-process ones.
+//! ranking hooks (the `hooks/ranking/` workspace crate) are the in-process ones.
 //!
 //! ZERO-COST DEFAULT: a `route: weighted` (default / absent) pool resolves to `ResolvedPolicy::None`
 //! at config load and NEVER constructs any of the projection types or enters this module's async
@@ -39,251 +39,14 @@ pub(crate) mod socket;
 pub(crate) mod webhook;
 pub(crate) mod wire;
 
-/// A read-only, cheaply-constructed projection of the request for routing decisions. Built ONCE per
-/// request from the pristine ingress `serde_json::Value` BEFORE the failover loop, and ONLY for
-/// non-default pools. Borrows where possible; owns only small derived scalars. A policy never
-/// touches the mutable IR or `App`.
-#[derive(Debug, Clone)]
-pub(crate) struct RoutingRequest<'a> {
-    pub(crate) pool: &'a str,
-    pub(crate) ingress_protocol: &'a str,
-    /// The model the caller asked for (may be a pool name or a member model), if any. RESERVED for
-    /// the gate/rewrite hook projections (1.3 hooks seam) — the shared webhook/socket wire
-    /// (`wire::HookReqProjection`) omits it today, so it has no reader yet.
-    #[allow(dead_code)]
-    pub(crate) requested_model: Option<&'a str>,
-    pub(crate) message_count: usize,
-    /// Number of tool definitions on the request. RESERVED for the hook seam (no reader yet).
-    #[allow(dead_code)]
-    pub(crate) tool_count: usize,
-    pub(crate) has_tools: bool,
-    /// Sum of all text-block chars across system + messages. A v1 SIZE signal (NOT a token count).
-    pub(crate) total_chars: usize,
-    /// System-prompt text chars only. RESERVED for the hook seam (no reader yet).
-    #[allow(dead_code)]
-    pub(crate) system_chars: usize,
-    pub(crate) max_tokens: Option<u32>,
-    pub(crate) stream: bool,
-    /// The request's prompt content — `Some` ONLY when the hook was granted `prompt: ro` or `rw`
-    /// (default `no`). The default projection is shape-only; this is the operator-granted exception
-    /// that lets a trusted hook screen content (PII, guardrails, audit) or rewrite it (`rw`). Borrows
-    /// from the parsed body where it can (bare-string content); only block-array flattening
-    /// allocates, and that cost is paid only behind the grant.
-    pub(crate) prompt: Option<PromptProjection<'a>>,
-    /// Caller identity — `Some` ONLY when the hook was granted `user: ro` (default `no`). Carries the
-    /// governance virtual-key `id`/`name` and the body's end-user field. NEVER the caller's
-    /// secret/token, regardless of configuration.
-    pub(crate) identity: Option<CallerIdentity>,
-}
-
-/// The prompt content projection (the hook's `prompt: ro|rw` grant). Text only: string content and
-/// `{type:"text"}` blocks are flattened; non-text blocks (images, tool results) contribute no text
-/// (the payload carries text, not binary blobs), but their message entries remain — with empty
-/// text — so the projection stays index-aligned with the body's messages. `Cow`: bare-string
-/// content borrows straight from the parsed body (the common case, zero copies); only block
-/// arrays allocate a joined string.
-#[derive(Clone)]
-pub(crate) struct PromptProjection<'a> {
-    /// The system prompt's text, flattened (bare string, or text blocks concatenated).
-    pub(crate) system: Option<std::borrow::Cow<'a, str>>,
-    /// Every message as `(role, flattened text)`, in request order.
-    pub(crate) messages: Vec<(std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
-}
-
-/// Debug REDACTS the content: this struct exists precisely because the operator opted prompt text
-/// into the hook payload, and a stray `{:?}` on the routing path (a debug log while chasing a hook
-/// issue) must not fan that text out into log aggregators. Shapes only.
-impl std::fmt::Debug for PromptProjection<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromptProjection")
-            .field(
-                "system_chars",
-                &self.system.as_deref().map(|s| s.chars().count()),
-            )
-            .field("message_count", &self.messages.len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// The caller identity projection (the hook's `user: ro` grant). By construction this can never
-/// carry a secret: the governance lookup resolves the token to its key record and only the record's
-/// `id`/`name` are projected.
-#[derive(Clone)]
-pub(crate) struct CallerIdentity {
-    /// Governance virtual-key id (stable handle), if the caller authenticated with a virtual key.
-    pub(crate) key_id: Option<String>,
-    /// Governance virtual-key display name.
-    pub(crate) key_name: Option<String>,
-    /// The request body's end-user identifier (`user` in OpenAI dialect, `metadata.user_id` in
-    /// Anthropic dialect), if the caller supplied one.
-    pub(crate) user: Option<String>,
-}
-
-/// Debug shows the operator-facing key labels but REDACTS the end-user identifier — it is caller
-/// PII that the operator opted into the hook payload, not into every debug log on the routing path.
-impl std::fmt::Debug for CallerIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CallerIdentity")
-            .field("key_id", &self.key_id)
-            .field("key_name", &self.key_name)
-            .field("user", &self.user.as_deref().map(|_| "<redacted>"))
-            .finish()
-    }
-}
-
-/// One routable member, with the metadata + live signals a policy ranks on. Projected from
-/// `app.lanes[idx]` + the pool member config + the store. `idx` is the stable handle the failover
-/// loop already speaks.
-#[derive(Debug, Clone)]
-pub(crate) struct Candidate<'a> {
-    /// Index into `app.lanes` — the failover loop's lingua franca.
-    pub(crate) idx: usize,
-    pub(crate) model: &'a str,
-    /// Upstream provider name. Projected to the hook wire (`HookCandidate.provider`) so a hook can
-    /// implement a provider-preference strategy.
-    pub(crate) provider: &'a str,
-    /// The configured SWRR weight. Projected to the hook wire (`HookCandidate.weight`) so an external
-    /// hook can implement a weighted-variant strategy (the signal the built-in `weighted` floor uses).
-    pub(crate) weight: u32,
-    /// Member context-window ceiling. Projected to the hook wire (`HookCandidate.context_max`) so a
-    /// hook can route by context-fit.
-    pub(crate) context_max: Option<usize>,
-    // ── operator-declared member metadata (config) ───────────────────────────────────────────────
-    pub(crate) tier: Option<&'a str>,
-    pub(crate) cost_per_mtok: Option<f64>,
-    /// Free-form operator tags. Projected to the hook wire (`wire::HookCandidate.tags`, omitted
-    /// when empty).
-    pub(crate) tags: &'a [String],
-    // ── live signals (read per-request from the store at the seam) ───────────────────────────────
-    /// Rolling EWMA of recent end-to-end latency for this lane, in milliseconds. `None` until the
-    /// lane has served at least one request.
-    pub(crate) latency_ms: Option<f64>,
-    /// Currently-available concurrency permits on this lane's semaphore (free slots). A `least_busy`
-    /// policy prefers the lane with the most headroom.
-    pub(crate) available_concurrency: usize,
-    /// Per-lane lifetime request budget remaining (`None` = unlimited). The `usage` policy prefers
-    /// the lane with the most budget left; cheap (read from the store).
-    pub(crate) budget_remaining: Option<i64>,
-    /// Rate-limit HEADROOM as a fraction in `[0.0, 1.0]`: how much of the request's governance
-    /// rate budget (the tighter of the caller key's RPM / TPM limit) is still available this window —
-    /// `1.0` is fully-unused, `0.0` is at the cap. `None` when no rate limit applies (governance
-    /// disabled, or the key has neither RPM nor TPM set). Populated at the seam from
-    /// `governance::GovState::rate_headroom`. The `usage` policy prefers the candidate with the MOST
-    /// headroom (furthest from a provider 429). Rate limits are per-KEY in Busbar today, so this value
-    /// is currently the same across a request's candidates — `usage` then ranks deterministically by
-    /// `idx` — but the field is per-candidate so a future per-lane rate signal drops in without a
-    /// contract change.
-    pub(crate) rate_headroom: Option<f64>,
-}
-
-/// Read-only context a policy may consult beyond the request + candidates themselves.
-#[derive(Debug, Clone)]
-pub(crate) struct RoutingContext<'a> {
-    pub(crate) pool: &'a str,
-    /// Per-KEY governance budget remaining for this request, when known/plumbed. `None` when
-    /// governance is disabled or per-key budget is not visible at the seam (v1 default).
-    pub(crate) budget_remaining: Option<i64>,
-}
-
-/// A boxed, thread-safe policy error. Kept dependency-free (no `anyhow`/`thiserror`) so the routing
-/// contract adds no new crate. A transport surfaces transient failures (a webhook 500, a socket
-/// disconnect, a marshaling error) as this; the caller coerces any `Err` to the pool's `on_error` fallback,
-/// so an error NEVER propagates to the client — it degrades to weighted/reject/first.
-pub(crate) type PolicyError = Box<dyn std::error::Error + Send + Sync>;
-
-/// The result of a policy decision. `Ok(Abstain)` is the clean "no opinion" path; `Err` is coerced
-/// to `on_error` by the caller (never surfaced to the client).
-pub(crate) type PolicyResult = Result<RoutingDecision, PolicyError>;
-
-/// The decision: an ordered preference, or an explicit abstention.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RoutingDecision {
-    /// Ranked preference, most-preferred first. Entries are candidate `idx` values. The list MAY be
-    /// a subset (a policy can drop a candidate); any omitted candidate is treated as LOWEST priority,
-    /// NOT excluded — the failover loop can still reach it after the ranked ones are exhausted, so a
-    /// broken policy never strands a healthy lane. Duplicates and unknown idxs are ignored.
-    Prefer(Vec<usize>),
-    /// "No preference" — fall back to the pool's default (weighted/SWRR). Identical to the policy not
-    /// being configured. A timeout / error / malformed response is coerced to this (per `on_error`).
-    Abstain,
-    /// REJECT the request: no upstream is dispatched and the caller receives a dialect-native error.
-    /// The verb that makes content-seeing hooks (`prompt: ro`/`rw`) useful — a PII screen or
-    /// guardrail can stop a request before it leaves the network. The shipped transports produce
-    /// this only via `wire::normalize` (status clamped to 4xx, message sanitized), and the forward
-    /// seam RE-CLAMPS the status regardless — so no policy impl, shipped or future, can mint a
-    /// 5xx, a success, or a header-injecting message through this path.
-    Reject { status: u16, message: String },
-    /// RESTRICT the candidate set to members carrying ANY of these `tags` — a compliance gate ("only
-    /// BAA-covered lanes"). Unlike `Prefer` (deprioritize-not-exclude), restrict EXCLUDES every
-    /// non-matching member from the failover set entirely and persists across hops. An empty
-    /// intersection is the gate's `on_empty` (default fail-closed reject), never allow-all. Produced
-    /// only via `wire::normalize` (fail-closed: a malformed restrict yields empty `tags_any` → the
-    /// on_empty path, never a silent allow-all).
-    Restrict { tags_any: Vec<String> },
-}
-
-/// THE transport-agnostic contract. webhook / socket / script / native all implement this.
-#[async_trait::async_trait]
-pub(crate) trait RoutingPolicy: Send + Sync + 'static {
-    /// Rank candidates for this request. MUST be cancel-safe and SHOULD respect `budget` (a
-    /// wall-clock deadline; the caller also wraps the call in a hard `timeout`). Returning `Err` or
-    /// exceeding the deadline is handled by the caller per `on_error`; an impl SHOULD prefer
-    /// `Ok(Abstain)` over erroring when it simply has no opinion.
-    async fn decide(
-        &self,
-        req: &RoutingRequest<'_>,
-        candidates: &[Candidate<'_>],
-        ctx: &RoutingContext<'_>,
-        budget: std::time::Duration,
-    ) -> PolicyResult;
-
-    /// Stable transport/policy name for metrics + the `x-busbar-route` header
-    /// (e.g. `"webhook"`, `"socket"`, `"weighted"`, `"cheapest"`).
-    fn name(&self) -> &'static str;
-
-    /// REWRITE phase (`prompt: rw` gate): send the request projection and return the hook's `rewrite`
-    /// reply — the replacement message body (+ optional injected tools), FAIL-CLOSED (`None` = proceed
-    /// with the ORIGINAL body). Distinct from `decide` (which ranks): this is the transform-pass call.
-    /// DEFAULT `None`: in-process ranking hooks never rewrite; only the out-of-process socket/webhook
-    /// transports override it. The caller enforces the `rw` grant (only a `rw` hook reaches here) and
-    /// applies the returned body; a malformed/oversize/timed-out rewrite yields `None`.
-    #[allow(dead_code)] // dispatched by the forward global-hooks transform seam next (slice-4 step)
-    async fn transform(
-        &self,
-        _req: &RoutingRequest<'_>,
-        _budget: std::time::Duration,
-    ) -> Option<wire::RewriteReply> {
-        None
-    }
-
-    /// PUSH a settings map to the hook (D2, `PATCH /admin/v1/hooks/{name}/settings`): send the
-    /// `configure` message and wait for the ack, bounded by `budget`. `Ok(())` = the hook
-    /// acknowledged (the caller commits); any error/nack/timeout = NOT committed. Default: this
-    /// transport cannot be configured (in-process natives have no settings).
-    async fn configure(
-        &self,
-        _hook_name: &str,
-        _settings: &serde_json::Map<String, serde_json::Value>,
-        _settings_version: u64,
-        _budget: std::time::Duration,
-    ) -> Result<(), PolicyError> {
-        Err("this hook transport does not support configure".into())
-    }
-
-    /// Ask the hook to DESCRIBE its settings schema (D2, `GET /admin/v1/hooks/{name}/schema`).
-    /// `None` = the transport/hook doesn't answer describe. Proxied verbatim.
-    async fn describe(&self, _budget: std::time::Duration) -> Option<serde_json::Value> {
-        None
-    }
-
-    /// TAP (fire-and-forget): WRITE the pre-serialized request projection (JSON bytes, no trailing
-    /// newline — the transport frames it) to the hook and return. A tap is write-only in steady
-    /// state, so NO reply is read. Best-effort and bounded by `budget`; ANY error is swallowed,
-    /// because a tap can NEVER delay or fail the served request (the caller SPAWNS this off the
-    /// request path, which is why it takes owned bytes, not a borrowed projection). DEFAULT no-op:
-    /// in-process policies are not taps; only the out-of-process socket/webhook transports override it.
-    async fn notify(&self, _projection: &[u8], _budget: std::time::Duration) {}
-}
+// The HOOK CONTRACT — the `RoutingPolicy` trait and the read-only projections it is invoked with
+// (`RoutingRequest`, `Candidate`, `RoutingContext`, `RoutingDecision`, …) — lives in the
+// `busbar-api` crate (the one crate both the engine and every plugin build against). Re-exported
+// here so engine-internal paths are unchanged.
+pub(crate) use busbar_api::{
+    CallerIdentity, Candidate, PolicyError, PolicyResult, PromptProjection, RoutingContext,
+    RoutingDecision, RoutingPolicy, RoutingRequest,
+};
 
 /// The per-pool routing policy resolved ONCE at config load. `None` is the zero-cost default
 /// (`route: weighted` / absent): no policy object, no projection, the inline SWRR hot path. Stored
@@ -351,7 +114,7 @@ pub(crate) fn resolve_policy(cfg: &crate::config::PoolCfg) -> Option<ResolvedPol
     // running server; degrade to None (SWRR) as belt-and-suspenders.
     #[cfg(feature = "hooks-ranking")]
     {
-        let policy = crate::plugins::hooks::ranking::native_policy(name)?;
+        let policy = busbar_hooks_ranking::native_policy(name)?;
         Some(ResolvedPolicy::Policy {
             policy,
             on_error: crate::config::PolicyOnError::default(),
@@ -580,7 +343,7 @@ fn resolve_on_error_chain<'a>(
         // A built-in ranking strategy: sync, no I/O, cannot fail — one link, then done. Compiled
         // out, the name falls through to the registry lookup below (and validation errored at boot).
         #[cfg(feature = "hooks-ranking")]
-        if let Some(policy) = crate::plugins::hooks::ranking::native_policy(current) {
+        if let Some(policy) = busbar_hooks_ranking::native_policy(current) {
             chain.push(FallbackHook {
                 policy,
                 timeout: policy_timeout(crate::config::DEFAULT_POLICY_TIMEOUT_MS),
@@ -733,29 +496,6 @@ fn gate_socket_transport(_hook: &crate::config::HookCfg) -> Option<Arc<dyn Routi
          weighted. Use a `webhook:` hook for an out-of-process gate here."
     );
     None
-}
-
-impl RoutingDecision {
-    /// Normalize a raw ranked list into a clean `Prefer`/`Abstain`: drop unknown idxs (not in
-    /// `valid`), dedup while preserving first-seen order, and coerce an empty result to `Abstain`.
-    /// Shared by every transport so the same liberal-in-what-you-accept rules hold everywhere.
-    pub(crate) fn from_ranked(
-        raw: impl IntoIterator<Item = usize>,
-        valid: &std::collections::HashSet<usize>,
-    ) -> RoutingDecision {
-        let mut seen = std::collections::HashSet::new();
-        let mut order = Vec::new();
-        for idx in raw {
-            if valid.contains(&idx) && seen.insert(idx) {
-                order.push(idx);
-            }
-        }
-        if order.is_empty() {
-            RoutingDecision::Abstain
-        } else {
-            RoutingDecision::Prefer(order)
-        }
-    }
 }
 
 #[cfg(test)]

@@ -28,13 +28,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build
-        run: cargo build --locked --verbose
+        run: cargo build --workspace --locked --verbose
 
       - name: Test
-        run: cargo test --locked --verbose
+        run: cargo test --workspace --locked --verbose
 
   # Compliance-by-compilation gate: busbar must build + lint clean with the built-in `tokens` auth
   # plugin COMPILED OUT (`--no-default-features`), so a regulated deployment can ship a binary that
@@ -67,6 +67,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
       - name: Test
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
