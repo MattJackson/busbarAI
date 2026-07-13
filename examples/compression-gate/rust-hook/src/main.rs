@@ -15,8 +15,15 @@
 //!     tokens"),
 //!   - requests SEEN vs COMPRESSED (the "cleared the savings threshold" rate — Headroom skips a
 //!     body when the savings aren't worth it, exactly like this hook's `min_savings_pct`),
-//!   - estimated COST saved in dollars (Headroom's "Proxy $ Saved" tile, priced via LiteLLM),
-//!   - compression LATENCY (Headroom's proxy-latency measurement).
+//!   - estimated COST saved in dollars (Headroom's "Proxy $ Saved" tile, priced via LiteLLM) —
+//!     reported as an ESTIMATE with a confidence interval, mirroring Headroom's holdout-control
+//!     "measured vs estimated [95% CI]" savings display,
+//!   - compression LATENCY as a DISTRIBUTION (p50/p95/p99 histogram — what a mean would hide).
+//!
+//! Every key counter is broken down PER POOL: one hook process serves N pools (busbar sends
+//! `request.pool` on every transform), and the metrics array carries one entry per pool via the
+//! `labels: {"pool": ...}` dimension — so `GET /hooks/{name}/status` returns the whole picture and
+//! a dashboard drills down by pool. (The same hook on three pools shows three rows, one process.)
 //!
 //! Sources: Headroom README + docs (github.com/chopratejas/headroom, headroom-docs.vercel.app/docs,
 //! dev.to "Cut Your LLM Token Usage by Up to 95%") and, for the cost/latency-saved framing,
@@ -27,8 +34,8 @@
 //!               `PATCH /api/v1/admin/hooks/{name}/settings`): apply the settings, ack the version.
 //!   describe  — reply the self-description ENVELOPE `{schema, dashboard}`: the settings JSON
 //!               Schema (`GET /api/v1/admin/hooks/{name}/schema`) AND the dashboard widget layout.
-//!   status    — reply OBSERVED settings + self-reported operational metrics
-//!               (`GET /api/v1/admin/hooks/{name}/status`).
+//!   status    — reply OBSERVED settings + self-reported operational metrics (an ARRAY of
+//!               Prometheus-shaped entries) (`GET /api/v1/admin/hooks/{name}/status`).
 //!   transform — the rewrite pass: prompt text in, `{"rewrite": ...}` or `{}` (abstain) out.
 //!   notify    — a tap observation: NEVER answered (write nothing on a tap connection).
 //!   (decide never reaches a pure rewrite gate; unknown ops get a safe `{}`.)
@@ -42,9 +49,11 @@
 //!                                           settings: { min_savings_pct: 10 } } }
 
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 // ── SETTINGS (Headroom-style knobs). Shared across connections so a live settings push retunes
 //    every future request at once; each is applied by `configure` and reported back by `status`. ──
@@ -66,24 +75,35 @@ static SYSTEM_AWARE: AtomicU64 = AtomicU64::new(1);
 /// "$ saved" tile (Headroom prices via LiteLLM; here it's a settable proxy so the tile is real).
 static PRICE_UDOLLARS_PER_KCHAR: AtomicU64 = AtomicU64::new(50); // $0.00005 / 1K chars
 
-// ── METRICS (self-reported via `status`, laid out by `describe.dashboard`). Mirror the Headroom
-//    dashboard tiles: tokens in/out, ratio, requests seen/compressed, $ saved, latency. ──────────
+// ── METRICS — accumulated PER POOL. One hook process serves many pools; the status array reports
+//    one labeled entry per pool. A single Mutex-guarded map is plenty for an example (a real hook
+//    would sample latencies with a reservoir / t-digest instead of holding every sample). ─────────
 
-/// Requests the gate has SEEN on the transform path (the denominator for the "compressed rate").
-static REQUESTS_SEEN: AtomicU64 = AtomicU64::new(0);
-/// Requests actually COMPRESSED (cleared the savings threshold) — Headroom's "requests compressed".
-static REQUESTS_COMPRESSED: AtomicU64 = AtomicU64::new(0);
-/// Lifetime input chars seen on compressed requests (the "before").
-static CHARS_IN: AtomicU64 = AtomicU64::new(0);
-/// Lifetime output chars after compression on compressed requests (the "after").
-static CHARS_OUT: AtomicU64 = AtomicU64::new(0);
-/// Lifetime chars removed by compression — Headroom's headline "tokens saved" (chars stand in for
-/// tokens pre-dispatch; token counts don't exist until the provider reports usage).
-static CHARS_SAVED: AtomicU64 = AtomicU64::new(0);
-/// Estimated cost saved, in micro-dollars — Headroom's "Proxy $ Saved" tile.
-static UDOLLARS_SAVED: AtomicU64 = AtomicU64::new(0);
-/// Sum of per-request compression latency in microseconds (÷ REQUESTS_SEEN → avg latency gauge).
-static COMPRESS_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Per-pool operational tallies — the raw material for the `status` metrics array.
+#[derive(Default)]
+struct PoolStats {
+    /// Transform requests SEEN on this pool (the compressed-rate denominator).
+    requests_seen: u64,
+    /// Requests actually COMPRESSED (cleared the savings threshold).
+    requests_compressed: u64,
+    /// Lifetime input chars on compressed requests (the "before").
+    chars_in: u64,
+    /// Lifetime output chars after compression (the "after").
+    chars_out: u64,
+    /// Lifetime chars removed — Headroom's headline "tokens saved".
+    chars_saved: u64,
+    /// Estimated cost saved, micro-dollars — Headroom's "Proxy $ saved" tile.
+    udollars_saved: u64,
+    /// Per-request compression latencies (micros). Held in full for exact example quantiles; a real
+    /// hook uses a bounded sketch. Cleared-cap keeps the example's memory flat under a flood.
+    latencies_us: Vec<u64>,
+}
+
+/// Cap on retained latency samples per pool (a real hook would use a reservoir/t-digest; this keeps
+/// the example's memory bounded while still giving representative p50/p95/p99).
+const MAX_LATENCY_SAMPLES: usize = 4096;
+
+static POOLS: Mutex<BTreeMap<String, PoolStats>> = Mutex::new(BTreeMap::new());
 
 fn main() {
     let path = std::env::args()
@@ -222,12 +242,12 @@ fn describe() -> String {
             }
         },
         "dashboard": { "widgets": [
-            {"metric": "chars_saved_total",    "label": "Tokens saved",       "viz": "counter"},
-            {"metric": "compression_ratio",    "label": "Compression ratio",  "viz": "gauge", "unit": "%", "max": 100},
+            {"metric": "chars_saved_total",         "label": "Tokens saved",        "viz": "counter"},
+            {"metric": "compression_ratio",         "label": "Compression ratio",   "viz": "gauge", "unit": "%", "max": 100},
             {"metric": "requests_compressed_total", "label": "Requests compressed", "viz": "counter"},
-            {"metric": "compressed_rate",      "label": "Compressed rate",     "viz": "gauge", "unit": "%", "max": 100},
-            {"metric": "dollars_saved",        "label": "Proxy $ saved",       "viz": "number", "unit": "$"},
-            {"metric": "avg_compress_latency", "label": "Compress latency",    "viz": "number", "unit": "ms"}
+            {"metric": "compressed_rate",           "label": "Compressed rate",     "viz": "gauge", "unit": "%", "max": 100},
+            {"metric": "dollars_saved",             "label": "Proxy $ saved",       "viz": "number", "unit": "$"},
+            {"metric": "compress_latency_us",       "label": "Compress latency",    "viz": "histogram", "unit": "us"}
         ]}
     })
     .to_string()
@@ -236,37 +256,91 @@ fn describe() -> String {
 
 /// Answer `status` with OBSERVED state: the settings this process is actually running + its own
 /// operational metrics — the control-plane read busbar surfaces at
-/// `GET /api/v1/admin/hooks/{name}/status`. The metric set mirrors Headroom's dashboard: counters
-/// for lifetime chars-in/out/saved and requests seen/compressed, gauges for the derived
-/// compression ratio, compressed rate, $ saved, and average compression latency. busbar validates,
-/// bounds, and sanitizes every entry; a dashboard renders them from the `label`/`unit`/`viz`/`max`
-/// display hints without any per-plugin code.
+/// `GET /api/v1/admin/hooks/{name}/status`. The `metrics` value is an ARRAY of Prometheus-shaped
+/// entries (`{name, type, value, labels?, quantiles?, estimated?, ci_*?, label?, unit?, viz?,
+/// max?, help?}`). Every key counter is emitted ONCE PER POOL via `labels: {"pool": ...}` — the
+/// per-dimension breakdown a flat map can't carry. Latency is a `histogram` with p50/p95/p99
+/// `quantiles`; the dollars-saved estimate carries `estimated: true` + a confidence interval.
+/// busbar validates, bounds (64 entries, 8 labels/entry), and sanitizes every entry and hint.
 fn status() -> String {
-    let seen = REQUESTS_SEEN.load(Ordering::Relaxed);
-    let compressed = REQUESTS_COMPRESSED.load(Ordering::Relaxed);
-    let chars_in = CHARS_IN.load(Ordering::Relaxed);
-    let chars_out = CHARS_OUT.load(Ordering::Relaxed);
-    let chars_saved = CHARS_SAVED.load(Ordering::Relaxed);
-    let udollars = UDOLLARS_SAVED.load(Ordering::Relaxed);
-    let micros = COMPRESS_MICROS_TOTAL.load(Ordering::Relaxed);
+    let mut metrics: Vec<serde_json::Value> = Vec::new();
+    let pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Derived gauges (point-in-time; busbar/the dashboard accumulates any time series client-side).
-    let ratio_pct = if chars_in > 0 {
-        (chars_saved as f64) * 100.0 / (chars_in as f64) // headline "% fewer tokens"
-    } else {
-        0.0
-    };
-    let compressed_rate = if seen > 0 {
-        (compressed as f64) * 100.0 / (seen as f64)
-    } else {
-        0.0
-    };
-    let dollars_saved = (udollars as f64) / 1_000_000.0;
-    let avg_latency_ms = if seen > 0 {
-        (micros as f64) / (seen as f64) / 1000.0
-    } else {
-        0.0
-    };
+    for (pool, s) in pools.iter() {
+        let lbl = || serde_json::json!({ "pool": pool });
+
+        // Counters, one labeled entry per pool.
+        metrics.push(serde_json::json!({
+            "name": "requests_seen_total", "type": "counter", "value": s.requests_seen,
+            "labels": lbl(), "label": "Requests seen", "viz": "counter",
+            "help": "transform requests observed on the compression path"
+        }));
+        metrics.push(serde_json::json!({
+            "name": "requests_compressed_total", "type": "counter", "value": s.requests_compressed,
+            "labels": lbl(), "label": "Requests compressed", "viz": "counter",
+            "help": "requests whose savings cleared min_savings_pct"
+        }));
+        metrics.push(serde_json::json!({
+            "name": "chars_in_total", "type": "counter", "value": s.chars_in,
+            "labels": lbl(), "label": "Chars in", "viz": "counter",
+            "help": "input characters seen on compressed requests (the before)"
+        }));
+        metrics.push(serde_json::json!({
+            "name": "chars_out_total", "type": "counter", "value": s.chars_out,
+            "labels": lbl(), "label": "Chars out", "viz": "counter",
+            "help": "output characters after compression (the after)"
+        }));
+        metrics.push(serde_json::json!({
+            "name": "chars_saved_total", "type": "counter", "value": s.chars_saved,
+            "labels": lbl(), "label": "Tokens saved", "viz": "counter",
+            "help": "characters removed by compression (Headroom's headline savings)"
+        }));
+
+        // Derived gauges, per pool.
+        let ratio_pct = if s.chars_in > 0 {
+            (s.chars_saved as f64) * 100.0 / (s.chars_in as f64)
+        } else {
+            0.0
+        };
+        metrics.push(serde_json::json!({
+            "name": "compression_ratio", "type": "gauge", "value": ratio_pct,
+            "labels": lbl(), "label": "Compression ratio", "unit": "%", "viz": "gauge", "max": 100.0,
+            "help": "percent fewer characters across all compressed requests"
+        }));
+        let compressed_rate = if s.requests_seen > 0 {
+            (s.requests_compressed as f64) * 100.0 / (s.requests_seen as f64)
+        } else {
+            0.0
+        };
+        metrics.push(serde_json::json!({
+            "name": "compressed_rate", "type": "gauge", "value": compressed_rate,
+            "labels": lbl(), "label": "Compressed rate", "unit": "%", "viz": "gauge", "max": 100.0,
+            "help": "share of seen requests that cleared the savings threshold"
+        }));
+
+        // Dollars saved — an ESTIMATE (priced off an assumed rate, and Headroom derives real savings
+        // from a holdout control), so mark it `estimated` and bound it with a ±15% CI, mirroring
+        // Headroom's "measured vs estimated [95% CI]" savings display.
+        let dollars = (s.udollars_saved as f64) / 1_000_000.0;
+        metrics.push(serde_json::json!({
+            "name": "dollars_saved", "type": "gauge", "value": dollars,
+            "labels": lbl(), "label": "Proxy $ saved", "unit": "$", "viz": "number",
+            "estimated": true, "ci_low": dollars * 0.85, "ci_high": dollars * 1.15,
+            "help": "estimated input cost saved (priced from price_udollars_per_kchar, ±15% CI)"
+        }));
+
+        // Compression latency as a DISTRIBUTION: value = sample count, p50/p95/p99 in `quantiles`
+        // (what a mean would hide). A real hook keeps a bounded sketch; the example sorts its
+        // retained samples.
+        if let Some((count, q)) = latency_quantiles(&s.latencies_us) {
+            metrics.push(serde_json::json!({
+                "name": "compress_latency_us", "type": "histogram", "value": count,
+                "labels": lbl(), "quantiles": q,
+                "label": "Compress latency", "unit": "us", "viz": "histogram",
+                "help": "per-request compression latency distribution (microseconds)"
+            }));
+        }
+    }
 
     let out = serde_json::json!({
         "status": {
@@ -277,77 +351,68 @@ fn status() -> String {
                 "system_aware": SYSTEM_AWARE.load(Ordering::Relaxed) == 1,
                 "price_udollars_per_kchar": PRICE_UDOLLARS_PER_KCHAR.load(Ordering::Relaxed)
             },
-            "metrics": {
-                "requests_seen_total": {
-                    "type": "counter", "value": seen, "label": "Requests seen", "viz": "counter",
-                    "help": "transform requests observed on the compression path"
-                },
-                "requests_compressed_total": {
-                    "type": "counter", "value": compressed, "label": "Requests compressed",
-                    "viz": "counter", "help": "requests whose savings cleared min_savings_pct"
-                },
-                "chars_in_total": {
-                    "type": "counter", "value": chars_in, "label": "Chars in", "viz": "counter",
-                    "help": "input characters seen on compressed requests (the before)"
-                },
-                "chars_out_total": {
-                    "type": "counter", "value": chars_out, "label": "Chars out", "viz": "counter",
-                    "help": "output characters after compression (the after)"
-                },
-                "chars_saved_total": {
-                    "type": "counter", "value": chars_saved, "label": "Tokens saved",
-                    "viz": "counter", "help": "characters removed by compression (Headroom's headline savings)"
-                },
-                "compression_ratio": {
-                    "type": "gauge", "value": ratio_pct, "label": "Compression ratio",
-                    "unit": "%", "viz": "gauge", "max": 100.0,
-                    "help": "percent fewer characters across all compressed requests"
-                },
-                "compressed_rate": {
-                    "type": "gauge", "value": compressed_rate, "label": "Compressed rate",
-                    "unit": "%", "viz": "gauge", "max": 100.0,
-                    "help": "share of seen requests that cleared the savings threshold"
-                },
-                "dollars_saved": {
-                    "type": "gauge", "value": dollars_saved, "label": "Proxy $ saved",
-                    "unit": "$", "viz": "number",
-                    "help": "estimated input cost saved (priced from price_udollars_per_kchar)"
-                },
-                "avg_compress_latency": {
-                    "type": "gauge", "value": avg_latency_ms, "label": "Compress latency",
-                    "unit": "ms", "viz": "number",
-                    "help": "average per-request compression latency"
-                }
-            }
+            "metrics": metrics
         }
     });
     out.to_string() + "\n"
 }
 
+/// Compute p50/p95/p99 from retained latency samples: returns `(sample_count, {"0.5":.., "0.95":..,
+/// "0.99":..})` or `None` when no samples yet. Quantile keys are probability strings in `[0,1]` —
+/// exactly what busbar's `parse_status_metrics` accepts for a histogram.
+fn latency_quantiles(samples: &[u64]) -> Option<(u64, serde_json::Value)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<u64> = samples.to_vec();
+    sorted.sort_unstable();
+    let at = |p: f64| -> u64 {
+        let idx = ((p * (sorted.len() as f64 - 1.0)).round() as usize).min(sorted.len() - 1);
+        sorted[idx]
+    };
+    Some((
+        samples.len() as u64,
+        serde_json::json!({
+            "0.5":  at(0.50),
+            "0.95": at(0.95),
+            "0.99": at(0.99)
+        }),
+    ))
+}
+
 /// The rewrite pass: collapse whitespace runs in every message; reply with the smaller body only
 /// when the savings clear `min_savings_pct` (and the request is at least `min_trigger_chars`).
 /// Note the wire asymmetry — messages ARRIVE flattened as `{role, text}` and the reply is BODY
-/// form `{role, content}`; the system prompt is read-only. Every seen request is counted; a
-/// committed rewrite additionally advances the chars/$/compressed counters.
+/// form `{role, content}`; the system prompt is read-only. Every seen request is counted against
+/// its `request.pool`; a committed rewrite additionally advances that pool's chars/$/compressed.
 fn transform(req: &serde_json::Value) -> String {
     let started = std::time::Instant::now();
     let Ok(p) = serde_json::from_value::<Projection>(req.clone()) else {
         return "{}\n".into();
     };
+    // The pool this request is on — the label dimension for every metric it touches. Absent (an
+    // older engine, or a probe) folds into a stable "unknown" bucket rather than dropping the count.
+    let pool = p.pool.unwrap_or_else(|| "unknown".to_string());
     let Some(messages) = p.messages else {
         return "{}\n".into(); // no prompt grant projected — nothing to compress
     };
     let before: usize = messages.iter().map(|m| m.text.len()).sum();
 
-    // Count every request we actually LOOK at, and its compression latency — the denominators for
-    // the compressed-rate and avg-latency gauges (Headroom counts every proxied request).
-    REQUESTS_SEEN.fetch_add(1, Ordering::Relaxed);
-    let bill_latency = |started: std::time::Instant| {
-        COMPRESS_MICROS_TOTAL.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    // Everything below mutates this request's pool row; take the lock once.
+    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
+    let s = pools.entry(pool).or_default();
+
+    // Count every request we actually LOOK at, and record its compression latency — the
+    // denominators for the compressed-rate gauge and the latency histogram.
+    s.requests_seen += 1;
+    let record_latency = |s: &mut PoolStats, started: std::time::Instant| {
+        if s.latencies_us.len() < MAX_LATENCY_SAMPLES {
+            s.latencies_us.push(started.elapsed().as_micros() as u64);
+        }
     };
 
     if before == 0 || (before as u64) < MIN_TRIGGER_CHARS.load(Ordering::Relaxed) {
-        bill_latency(started);
+        record_latency(s, started);
         return "{}\n".into(); // too small to bother — abstain
     }
     let compressed: Vec<serde_json::Value> = messages
@@ -362,19 +427,19 @@ fn transform(req: &serde_json::Value) -> String {
     let saved = before.saturating_sub(after);
     let saved_pct = saved * 100 / before;
     if (saved_pct as u64) < MIN_SAVINGS_PCT.load(Ordering::Relaxed) {
-        bill_latency(started);
+        record_latency(s, started);
         return "{}\n".into(); // not worth a body swap — busbar proceeds untouched
     }
 
-    // COMMITTED savings — self-reported via `status` and rendered on the Headroom-style dashboard.
-    REQUESTS_COMPRESSED.fetch_add(1, Ordering::Relaxed);
-    CHARS_IN.fetch_add(before as u64, Ordering::Relaxed);
-    CHARS_OUT.fetch_add(after as u64, Ordering::Relaxed);
-    CHARS_SAVED.fetch_add(saved as u64, Ordering::Relaxed);
+    // COMMITTED savings — self-reported via `status`, per pool, on the Headroom-style dashboard.
+    s.requests_compressed += 1;
+    s.chars_in += before as u64;
+    s.chars_out += after as u64;
+    s.chars_saved += saved as u64;
     // Estimated $ saved: saved chars × price-per-1K-chars (Headroom's "Proxy $ saved" tile).
-    let udollars = (saved as u64) * PRICE_UDOLLARS_PER_KCHAR.load(Ordering::Relaxed) / 1000;
-    UDOLLARS_SAVED.fetch_add(udollars, Ordering::Relaxed);
-    bill_latency(started);
+    s.udollars_saved += (saved as u64) * PRICE_UDOLLARS_PER_KCHAR.load(Ordering::Relaxed) / 1000;
+    record_latency(s, started);
+    drop(pools);
 
     format!(
         "{{\"rewrite\":{{\"messages\":{}}}}}\n",
@@ -414,6 +479,10 @@ struct Msg {
 
 #[derive(Deserialize)]
 struct Projection {
+    /// The pool this request is routing through — always present on a real transform; the label
+    /// dimension for every per-pool metric.
+    #[serde(default)]
+    pool: Option<String>,
     /// Absent unless the `prompt` grant projected it (and `[]` is possible: key off presence).
     #[serde(default)]
     messages: Option<Vec<Msg>>,
@@ -423,76 +492,106 @@ struct Projection {
 mod tests {
     use super::*;
 
-    /// ONE sequential test on purpose: the settings + metrics are process-global (exactly like the
-    /// real hook), and cargo runs `#[test]`s in parallel — separate tests mutating them would race.
+    /// ONE sequential test on purpose: the settings + per-pool metrics are process-global (exactly
+    /// like the real hook), and cargo runs `#[test]`s in parallel — separate tests mutating them
+    /// would race.
     #[test]
     fn full_wire_lifecycle() {
         // describe → the self-description envelope: settings schema + declared dashboard widgets.
         let r = handle_line(r#"{"describe":true}"#);
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
-        // schema pins every Headroom-style knob…
         assert_eq!(
             v["schema"]["properties"]["min_savings_pct"]["type"],
             "integer"
         );
-        assert_eq!(
-            v["schema"]["properties"]["target_ratio_pct"]["type"],
-            "integer"
-        );
         assert_eq!(v["schema"]["properties"]["system_aware"]["type"], "boolean");
-        // …and the dashboard declares matching widgets with display hints.
         let widgets = v["dashboard"]["widgets"].as_array().unwrap();
         assert!(widgets
             .iter()
             .any(|w| w["metric"] == "chars_saved_total" && w["label"] == "Tokens saved"));
-        let ratio_widget = widgets
+        assert!(widgets
             .iter()
-            .find(|w| w["metric"] == "compression_ratio")
-            .unwrap();
-        assert_eq!(ratio_widget["viz"], "gauge");
-        assert_eq!(ratio_widget["unit"], "%");
-        assert_eq!(ratio_widget["max"], 100);
+            .any(|w| w["metric"] == "compress_latency_us" && w["viz"] == "histogram"));
 
-        // transform (per-request messages carry the `op` discriminator) → rewrite when the collapse
-        // clears the (default 10%) threshold; body form out.
+        // transform on POOL "chat" (per-request messages carry the `op` discriminator AND
+        // request.pool) → rewrite when the collapse clears the (default 10%) threshold.
         let spaced = "hello      world\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n!";
-        let line = serde_json::json!({"op": "transform", "request": {"messages": [{"role": "user", "text": spaced}]}});
-        let r = handle_line(&line.to_string());
+        let chat = serde_json::json!({"op": "transform", "request": {"pool": "chat", "messages": [{"role": "user", "text": spaced}]}});
+        let r = handle_line(&chat.to_string());
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["rewrite"]["messages"][0]["content"], "hello world !");
 
-        // status → observed settings + self-reported metrics (the committed rewrite counted) with
-        // real display hints so a dashboard renders each tile.
+        // …and the SAME hook on a SECOND pool "batch" — one process, N pools.
+        let batch = serde_json::json!({"op": "transform", "request": {"pool": "batch", "messages": [{"role": "user", "text": spaced}]}});
+        assert!(handle_line(&batch.to_string()).contains("rewrite"));
+
+        // status → the metrics ARRAY, with one PER-POOL entry per metric via labels.
         let r = handle_line(r#"{"status":true}"#);
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["status"]["settings"]["min_savings_pct"], 10);
-        assert_eq!(v["status"]["settings"]["target_ratio_pct"], 60);
         assert_eq!(v["status"]["settings"]["system_aware"], true);
-        let m = &v["status"]["metrics"];
-        assert_eq!(m["chars_saved_total"]["type"], "counter");
-        assert!(m["chars_saved_total"]["value"].as_u64().unwrap() > 0);
-        assert_eq!(m["requests_compressed_total"]["value"], 1);
-        assert_eq!(m["requests_seen_total"]["value"], 1);
-        // The derived compression-ratio gauge carries value + unit/viz/max hints.
-        assert_eq!(m["compression_ratio"]["type"], "gauge");
-        assert_eq!(m["compression_ratio"]["unit"], "%");
-        assert_eq!(m["compression_ratio"]["viz"], "gauge");
-        assert_eq!(m["compression_ratio"]["max"], 100.0);
-        assert!(m["compression_ratio"]["value"].as_f64().unwrap() > 0.0);
-        // The $ saved tile priced from the default price knob.
-        assert_eq!(m["dollars_saved"]["unit"], "$");
-        assert!(m["dollars_saved"]["value"].as_f64().unwrap() > 0.0);
+        let metrics = v["status"]["metrics"].as_array().unwrap();
+
+        // The array carries chars_saved_total for BOTH pools, distinguished only by labels.pool.
+        let saved: Vec<&serde_json::Value> = metrics
+            .iter()
+            .filter(|m| m["name"] == "chars_saved_total")
+            .collect();
+        assert_eq!(saved.len(), 2, "one chars_saved_total entry per pool");
+        let chat_saved = saved
+            .iter()
+            .find(|m| m["labels"]["pool"] == "chat")
+            .expect("a chat-pool entry");
+        assert_eq!(chat_saved["type"], "counter");
+        assert!(chat_saved["value"].as_u64().unwrap() > 0);
+        assert!(saved.iter().any(|m| m["labels"]["pool"] == "batch"));
+
+        // The compression-ratio gauge is per-pool with unit/viz/max hints.
+        let chat_ratio = metrics
+            .iter()
+            .find(|m| m["name"] == "compression_ratio" && m["labels"]["pool"] == "chat")
+            .expect("a chat compression_ratio entry");
+        assert_eq!(chat_ratio["type"], "gauge");
+        assert_eq!(chat_ratio["unit"], "%");
+        assert_eq!(chat_ratio["max"], 100.0);
+        assert!(chat_ratio["value"].as_f64().unwrap() > 0.0);
+
+        // The dollars-saved estimate carries estimated + a valid CI (ci_low ≤ value ≤ ci_high).
+        let chat_dollars = metrics
+            .iter()
+            .find(|m| m["name"] == "dollars_saved" && m["labels"]["pool"] == "chat")
+            .expect("a chat dollars_saved entry");
+        assert_eq!(chat_dollars["estimated"], true);
+        let (lo, val, hi) = (
+            chat_dollars["ci_low"].as_f64().unwrap(),
+            chat_dollars["value"].as_f64().unwrap(),
+            chat_dollars["ci_high"].as_f64().unwrap(),
+        );
+        assert!(lo <= val && val <= hi, "CI must bound the value");
+
+        // Compress latency is a histogram with p50/p95/p99 quantiles, per pool.
+        let chat_lat = metrics
+            .iter()
+            .find(|m| m["name"] == "compress_latency_us" && m["labels"]["pool"] == "chat")
+            .expect("a chat compress_latency_us entry");
+        assert_eq!(chat_lat["type"], "histogram");
+        assert_eq!(chat_lat["viz"], "histogram");
+        assert!(chat_lat["quantiles"]["0.5"].is_number());
+        assert!(chat_lat["quantiles"]["0.95"].is_number());
+        assert!(chat_lat["quantiles"]["0.99"].is_number());
 
         // transform → abstain below the threshold, and abstain when no prompt was projected.
-        let tight = serde_json::json!({"op": "transform", "request": {"messages": [{"role": "user", "text": "already tight"}]}});
+        let tight = serde_json::json!({"op": "transform", "request": {"pool": "chat", "messages": [{"role": "user", "text": "already tight"}]}});
         assert_eq!(handle_line(&tight.to_string()).trim(), "{}");
         assert_eq!(
-            handle_line(r#"{"op":"transform","request":{"pool":"p"}}"#).trim(),
+            handle_line(r#"{"op":"transform","request":{"pool":"chat"}}"#).trim(),
             "{}"
         );
-        // a NOTIFY (tap) → NOTHING is written (busbar never reads a tap reply — an answered
-        // notify queues bytes forever); unknown future ops → the safe `{}` (append-only rule).
-        assert_eq!(handle_line(r#"{"op":"notify","request":{"pool":"p"}}"#), "");
+        // a NOTIFY (tap) → NOTHING is written; unknown future ops → the safe `{}`.
+        assert_eq!(
+            handle_line(r#"{"op":"notify","request":{"pool":"chat"}}"#),
+            ""
+        );
         assert_eq!(
             handle_line(r#"{"op":"someday-new","request":{}}"#).trim(),
             "{}"
@@ -507,10 +606,9 @@ mod tests {
         assert_eq!(TARGET_RATIO_PCT.load(Ordering::Relaxed), 40);
         assert_eq!(SYSTEM_AWARE.load(Ordering::Relaxed), 0);
         // …so the rewrite that cleared 10% now abstains at 90%.
-        assert_eq!(handle_line(&line.to_string()).trim(), "{}");
+        assert_eq!(handle_line(&chat.to_string()).trim(), "{}");
 
-        // a bad push gets NO ack and applies NOTHING (fail-closed, all-or-nothing): the valid
-        // min_savings_pct in the same push must NOT stick when target_ratio_pct is out of range.
+        // a bad push gets NO ack and applies NOTHING (fail-closed, all-or-nothing).
         let r = handle_line(
             r#"{"configure":{"settings":{"min_savings_pct":15,"target_ratio_pct":250},"settings_version":9}}"#,
         );

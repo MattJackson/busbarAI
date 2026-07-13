@@ -56,10 +56,18 @@ knobs:
 ## Data — reported via `status.metrics` + a declared dashboard
 
 `status` returns the hook's **observed** settings plus its own operational metrics, surfaced at
-`GET /api/v1/admin/hooks/headroom/status` (with a desired-vs-reported drift verdict). Each metric
-carries display hints (`label`/`unit`/`viz`/`max`) so a dashboard renders it without per-plugin
-code; the matching widget layout is declared in `describe.dashboard`, so **one** declaration drives
-both the config form and the dashboard tiles. The metric set mirrors Headroom's dashboard:
+`GET /api/v1/admin/hooks/headroom/status` (with a desired-vs-reported drift verdict). `metrics` is
+an **array** of Prometheus/OpenMetrics-shaped entries
+(`{name, type, value, labels?, quantiles?, estimated?, ci_low?, ci_high?, label?, unit?, viz?,
+max?, help?}`). Each entry carries display hints (`label`/`unit`/`viz`/`max`) so a dashboard renders
+it without per-plugin code; the matching widget layout is declared in `describe.dashboard`, so
+**one** declaration drives both the config form and the dashboard tiles.
+
+**Every counter/gauge is reported PER POOL.** One hook process serves N pools; the hook reads
+`request.pool` on each transform, accumulates per pool, and emits one entry per pool via the
+`labels: {"pool": ...}` dimension — so a single `status` read returns the whole per-pool breakdown
+(the "same hook on 3 pools" picture) and a dashboard drills down by label. The metric set mirrors
+Headroom's dashboard:
 
 | Metric | Type | Hint | What it is |
 |---|---|---|---|
@@ -69,11 +77,13 @@ both the config form and the dashboard tiles. The metric set mirrors Headroom's 
 | `chars_saved_total` | counter | counter | Characters removed — Headroom's headline "tokens saved". |
 | `compression_ratio` | gauge | gauge `%` max 100 | Percent fewer characters across all compressed requests. |
 | `compressed_rate` | gauge | gauge `%` max 100 | Share of seen requests that cleared the threshold. |
-| `dollars_saved` | gauge | number `$` | Estimated input cost saved (Headroom's "Proxy $ saved" tile). |
-| `avg_compress_latency` | gauge | number `ms` | Average per-request compression latency. |
+| `dollars_saved` | gauge | number `$` | Estimated input cost saved (`estimated: true` + `ci_low`/`ci_high`, mirroring Headroom's holdout-control savings). |
+| `compress_latency_us` | histogram | histogram `us` | Per-request compression latency distribution (`quantiles` p50/p95/p99). |
 
-Counters end `_total` and metric names match `^[a-z][a-z0-9_]{0,63}$`; busbar validates, bounds
-(64 entries/reply), and sanitizes every entry and hint.
+Counters end `_total` and metric names + label keys match `^[a-z][a-z0-9_]{0,63}$`; a `histogram`
+carries its distribution in `quantiles` (probability-string keys in `[0,1]`) and an estimate carries
+`estimated` + a `ci_low`/`ci_high` interval. busbar validates, bounds (64 entries/reply, 8
+labels/entry), and sanitizes every entry, hint, and label value.
 
 ## Fail-safe
 
