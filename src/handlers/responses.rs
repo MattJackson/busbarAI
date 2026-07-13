@@ -8,6 +8,10 @@
 use crate::handlers::{EgressCtx, OperationHandler, RequestHandler};
 use crate::operation::Operation;
 
+/// Endpoint paths — each appears on BOTH the egress side (`upstream_path`) and the ingress match
+/// (`resolve_operation`); single-sourced so the two sides cannot drift.
+const PATH_RESPONSES: &str = "/v1/responses";
+
 pub(crate) struct ResponsesRequestHandler;
 /// This protocol's OWN chat instance — delete this line (and the registry arm) and this
 /// protocol's chat 404s via the standard no-handler path; everything else keeps working.
@@ -32,9 +36,9 @@ impl RequestHandler for ResponsesRequestHandler {
         }
     }
     fn upstream_path(&self, _ctx: &EgressCtx) -> String {
-        "/v1/responses".into()
+        PATH_RESPONSES.into()
     }
     fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
-        path.ends_with("/v1/responses").then_some(Operation::Chat)
+        path.ends_with(PATH_RESPONSES).then_some(Operation::Chat)
     }
 }

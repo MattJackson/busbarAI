@@ -19,6 +19,17 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// Endpoint paths — each appears on BOTH the egress side (`upstream_path`) and the ingress match
+/// (`resolve_operation`); single-sourced so the two sides cannot drift.
+const PATH_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const PATH_EMBEDDINGS: &str = "/v1/embeddings";
+const PATH_MODERATIONS: &str = "/v1/moderations";
+const PATH_IMAGES_GENERATIONS: &str = "/v1/images/generations";
+const PATH_AUDIO_TRANSCRIPTIONS: &str = "/v1/audio/transcriptions";
+const PATH_AUDIO_SPEECH: &str = "/v1/audio/speech";
+/// Egress-only (OpenAI ships no rerank surface; the arm is unreachable in practice).
+const PATH_RERANK: &str = "/v1/rerank";
+
 pub(crate) struct OpenAiRequestHandler;
 /// This protocol's OWN chat instance — delete this line (and the registry arm) and this
 /// protocol's chat 404s via the standard no-handler path; everything else keeps working.
@@ -48,31 +59,31 @@ impl RequestHandler for OpenAiRequestHandler {
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {
         match ctx.operation {
-            Operation::Chat => "/v1/chat/completions".into(),
-            Operation::Embeddings => "/v1/embeddings".into(),
-            Operation::Moderation => "/v1/moderations".into(),
-            Operation::Image => "/v1/images/generations".into(),
-            Operation::Transcription => "/v1/audio/transcriptions".into(),
-            Operation::Speech => "/v1/audio/speech".into(),
+            Operation::Chat => PATH_CHAT_COMPLETIONS.into(),
+            Operation::Embeddings => PATH_EMBEDDINGS.into(),
+            Operation::Moderation => PATH_MODERATIONS.into(),
+            Operation::Image => PATH_IMAGES_GENERATIONS.into(),
+            Operation::Transcription => PATH_AUDIO_TRANSCRIPTIONS.into(),
+            Operation::Speech => PATH_AUDIO_SPEECH.into(),
             // Unreachable in practice: no handler above means Rerank never reaches egress here.
-            Operation::Rerank => "/v1/rerank".into(),
+            Operation::Rerank => PATH_RERANK.into(),
         }
     }
     fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
         // OpenAI names the operation in the path — the body is never needed.
-        if path.ends_with("/v1/chat/completions") {
+        if path.ends_with(PATH_CHAT_COMPLETIONS) {
             Some(Operation::Chat)
-        } else if path.ends_with("/v1/embeddings") {
+        } else if path.ends_with(PATH_EMBEDDINGS) {
             Some(Operation::Embeddings)
-        } else if path.ends_with("/v1/moderations") {
+        } else if path.ends_with(PATH_MODERATIONS) {
             Some(Operation::Moderation)
         } else if path.contains("/v1/images/") {
             Some(Operation::Image)
-        } else if path.ends_with("/v1/audio/transcriptions")
+        } else if path.ends_with(PATH_AUDIO_TRANSCRIPTIONS)
             || path.ends_with("/v1/audio/translations")
         {
             Some(Operation::Transcription)
-        } else if path.ends_with("/v1/audio/speech") {
+        } else if path.ends_with(PATH_AUDIO_SPEECH) {
             Some(Operation::Speech)
         } else {
             None

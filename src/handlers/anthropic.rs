@@ -9,6 +9,10 @@
 use crate::handlers::{EgressCtx, OperationHandler, RequestHandler};
 use crate::operation::Operation;
 
+/// Endpoint paths — each appears on BOTH the egress side (`upstream_path`) and the ingress match
+/// (`resolve_operation`); single-sourced so the two sides cannot drift.
+const PATH_MESSAGES: &str = "/v1/messages";
+
 pub(crate) struct AnthropicRequestHandler;
 /// This protocol's OWN chat instance — delete this line (and the registry arm) and this
 /// protocol's chat 404s via the standard no-handler path; everything else keeps working.
@@ -34,9 +38,9 @@ impl RequestHandler for AnthropicRequestHandler {
     }
     fn upstream_path(&self, _ctx: &EgressCtx) -> String {
         // The Messages API (chat only); streaming is negotiated via the `stream` flag + SSE Accept.
-        "/v1/messages".into()
+        PATH_MESSAGES.into()
     }
     fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
-        path.ends_with("/v1/messages").then_some(Operation::Chat)
+        path.ends_with(PATH_MESSAGES).then_some(Operation::Chat)
     }
 }

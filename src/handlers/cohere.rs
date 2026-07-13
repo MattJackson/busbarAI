@@ -13,6 +13,12 @@ use crate::operation::Operation;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
+/// Endpoint paths — each appears on BOTH the egress side (`upstream_path`) and the ingress match
+/// (`resolve_operation`); single-sourced so the two sides cannot drift.
+const PATH_CHAT: &str = "/v2/chat";
+const PATH_EMBED: &str = "/v2/embed";
+const PATH_RERANK: &str = "/v2/rerank";
+
 pub(crate) struct CohereRequestHandler;
 /// This protocol's OWN chat instance — delete this line (and the registry arm) and this
 /// protocol's chat 404s via the standard no-handler path; everything else keeps working.
@@ -39,24 +45,24 @@ impl RequestHandler for CohereRequestHandler {
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {
         match ctx.operation {
-            Operation::Chat => "/v2/chat".into(),
-            Operation::Rerank => "/v2/rerank".into(),
-            Operation::Embeddings => "/v2/embed".into(),
+            Operation::Chat => PATH_CHAT.into(),
+            Operation::Rerank => PATH_RERANK.into(),
+            Operation::Embeddings => PATH_EMBED.into(),
             // Enumerated (not `_`) so adding an operation is a compile error here — the same
             // removability/symmetry gate operation_handler enforces. Unreachable: operation_handler
             // returns None for these, so egress path resolution is never reached.
             Operation::Moderation
             | Operation::Image
             | Operation::Transcription
-            | Operation::Speech => "/v2/embed".into(),
+            | Operation::Speech => PATH_EMBED.into(),
         }
     }
     fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
-        if path.ends_with("/v2/chat") {
+        if path.ends_with(PATH_CHAT) {
             Some(Operation::Chat)
-        } else if path.ends_with("/v2/embed") {
+        } else if path.ends_with(PATH_EMBED) {
             Some(Operation::Embeddings)
-        } else if path.ends_with("/v2/rerank") {
+        } else if path.ends_with(PATH_RERANK) {
             Some(Operation::Rerank)
         } else {
             None
