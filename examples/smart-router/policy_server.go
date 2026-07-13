@@ -1,4 +1,4 @@
-// Smart-router policy sidecar for busbar (`route: webhook`), in Go.
+// Smart-router policy sidecar for busbar (a `webhook:` ordering gate), in Go.
 //
 // Busbar POSTs a projection of the request + the pool's candidates before each
 // request's failover loop; this sidecar classifies the request into a task
@@ -8,7 +8,7 @@
 // max_tokens), not content.
 //
 // Fail-safe: if this process is slow, down, or wrong, busbar coerces the decision
-// to the pool's on_error (default: weighted) after policy.timeout_ms (default
+// to the hook's on_error (for an ordering hook, weighted) after its timeout_ms (default
 // 1ms by default; raise it for hooks that do I/O). A broken sidecar never blocks a request.
 //
 // Build/run:  go run policy_server.go [addr]   (default 127.0.0.1:8787)
