@@ -740,13 +740,15 @@ async fn put_auth(
         let known = name == "admin-tokens" || (cfg!(test) && name == "test-scope-module");
         if !known {
             return err_json(&AdminError::Validation(format!(
-                "admin_auth names unknown module '{name}'; the built-in admin module is                  `admin-tokens` (external admin modules are registered at compile time)"
+                "admin_auth names unknown module '{name}'; the built-in admin module is \
+                 `admin-tokens` (external admin modules are registered at compile time)"
             )));
         }
     }
     if req.admin_auth.is_empty() {
         tracing::warn!(
-            "PUT /admin/v1/auth applied an EMPTY admin_auth chain — the admin API is now the              open (anonymous, full-authority) dev posture"
+            "PUT /admin/v1/auth applied an EMPTY admin_auth chain — the admin API is now the \
+             open (anonymous, full-authority) dev posture"
         );
     }
     // Candidate app with the new chain.
@@ -775,7 +777,9 @@ async fn put_auth(
             principal.actor_id(),
         );
         return err_json(&AdminError::Conflict(
-            "the new admin_auth chain would not grant THIS caller full scope — refusing to lock              you out. Authenticate with a credential the new chain accepts (at full scope) and              retry, or change the chain in config.yaml and restart"
+            "the new admin_auth chain would not grant THIS caller full scope — refusing to lock \
+             you out. Authenticate with a credential the new chain accepts (at full scope) and \
+             retry, or change the chain in config.yaml and restart"
                 .into(),
         ));
     }
