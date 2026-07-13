@@ -336,7 +336,8 @@ async fn get_admin_auth(State(handle): State<Arc<AppHandle>>) -> Response {
     )
 }
 
-/// `GET /api/v1/admin/usage` — fleet usage aggregation (spend/tokens/requests, per-key).
+/// `GET /api/v1/admin/usage` — the fleet METERING read: current UTC-day bucket, raw token split
+/// per (model, provider) and per key + derived spend_micros (see the service/contract docs).
 async fn get_usage(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).get_usage().await)
 }
@@ -1358,7 +1359,7 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     ),
     (
         "/usage",
-        "Fleet usage aggregation (spend/tokens/requests, per-key)",
+        "Metering: current UTC-day bucket — {window, as_of, currency, total, by_model, by_key}, raw token split + derived spend_micros",
     ),
     (
         "/config",

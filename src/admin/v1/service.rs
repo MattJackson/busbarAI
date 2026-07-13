@@ -15,13 +15,37 @@ use crate::state::App;
 
 use super::contract::{
     AdminAuthView, AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView,
-    HookHealthView, HookTransportView, HookView, InfoView, KeyUsageView, ModelView, Page,
-    PluginView, PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView,
-    TopologyInfo, UsageTotals, UsageView,
+    HookHealthView, HookTransportView, HookView, InfoView, KeyUsageView, ModelUsageView, ModelView,
+    Page, PluginView, PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView,
+    TopologyInfo, UsageBreakdown, UsageView, UsageWindow, USAGE_CURRENCY,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PromptAccess, ProviderDef, UserAccess,
 };
+
+/// Micro-units of the usage currency per cent (1 cent = 10 000 micro-USD). The `spend_micros`
+/// derivation unit — integer math, sub-cent precise, no float drift.
+const MICROS_PER_CENT: i64 = 10_000;
+/// Micro-units per token per (cent-per-1000-tokens): `MICROS_PER_CENT / 1000` — a price of
+/// 1¢ per 1k tokens is exactly 10 micro-USD per token, so per-token spend needs no division.
+const TOKEN_MICROS_PER_1K_CENT: i64 = MICROS_PER_CENT / 1_000;
+
+/// Derive busbar's spend ESTIMATE (micro-USD) for one aggregation row from the operator's
+/// configured global prices: `requests × per-request-fee + billable-tokens × per-token price`.
+/// Billable = input + cache-read + cache-creation + output (the same normalized additive-cache
+/// convention `record_tokens` bills budgets with). i128 intermediates clamp — never wrap.
+fn derive_spend_micros(b: &UsageBreakdown, (per_request_cents, per_1k_cents): (i64, i64)) -> i64 {
+    let billable = b
+        .tokens_input
+        .saturating_add(b.tokens_cache_read)
+        .saturating_add(b.tokens_cache_creation)
+        .saturating_add(b.tokens_output);
+    let request_fee =
+        (b.requests as i128) * (per_request_cents.max(0) as i128) * (MICROS_PER_CENT as i128);
+    let token_fee =
+        (billable as i128) * (per_1k_cents.max(0) as i128) * (TOKEN_MICROS_PER_1K_CENT as i128);
+    i64::try_from(request_fee + token_fee).unwrap_or(i64::MAX)
+}
 
 /// Process start instant, for the `info` uptime read. Stamped ONCE at startup by `mark_start()`.
 /// A missing value (never stamped — e.g. a unit test that skips `main`) yields a `None` uptime
@@ -637,54 +661,109 @@ impl AdminService {
         })
     }
 
-    /// `GET /api/v1/admin/usage` — fleet usage aggregation (spend/tokens/requests totals + per-key
-    /// breakdown) from governance's counters. Read scope. Empty when governance is disabled. The
-    /// per-key store reads run on a blocking thread (the SQLite store is synchronous), so the async
-    /// runtime is never blocked. Never returns a secret — ids/names only.
+    /// `GET /api/v1/admin/usage` — the fleet METERING read (FinOps surface): the current UTC-day
+    /// bucket's raw consumption, aggregated per (model, provider) and per key, each row carrying the
+    /// full token SPLIT plus a DERIVED `spend_micros` (computed here at read time from the
+    /// operator's configured global prices — raw counts are what's stored, so a consumer with its
+    /// own price catalog reconstructs cost from the split instead). `requests` counts DELIVERED
+    /// responses (the metering tap), not admissions; budget-enforcement state stays on
+    /// `GET /keys/{id}/usage`. Read scope. Empty aggregations when governance is disabled. The
+    /// store reads run on a blocking thread; never returns a secret — ids/names only.
     pub(crate) async fn get_usage(&self) -> Result<UsageView, AdminError> {
-        let Some(gov) = self.app.governance.clone() else {
-            return Ok(UsageView {
-                total: UsageTotals::default(),
-                keys: Vec::new(),
-            });
-        };
         let now = crate::store::now();
-        let joined = tokio::task::spawn_blocking(move || -> Result<UsageView, ()> {
-            let keys = gov.all_keys().map_err(|_| ())?;
-            let mut total = UsageTotals::default();
-            let mut per_key = Vec::with_capacity(keys.len());
-            for k in keys {
-                let u = gov.usage_for(&k.id, now).map_err(|_| ())?.unwrap_or(
-                    crate::governance::Usage {
-                        spend_cents: 0,
-                        tokens: 0,
-                        requests: 0,
-                    },
-                );
-                total.spend_cents = total.spend_cents.saturating_add(u.spend_cents);
-                total.tokens = total.tokens.saturating_add(u.tokens);
-                total.requests = total.requests.saturating_add(u.requests);
-                per_key.push(KeyUsageView {
-                    id: k.id,
-                    name: k.name,
-                    spend_cents: u.spend_cents,
-                    tokens: u.tokens,
-                    requests: u.requests,
-                });
-            }
-            per_key.sort_by(|a, b| a.id.cmp(&b.id));
-            Ok(UsageView {
-                total,
-                keys: per_key,
-            })
+        let bucket = crate::governance::metering_bucket(now);
+        let window = UsageWindow {
+            start: bucket,
+            end: bucket + crate::governance::METERING_BUCKET_SECS,
+        };
+        let empty = || UsageView {
+            window,
+            as_of: now,
+            currency: USAGE_CURRENCY,
+            total: UsageBreakdown::default(),
+            by_model: Vec::new(),
+            by_key: Vec::new(),
+        };
+        let Some(gov) = self.app.governance.clone() else {
+            return Ok(empty());
+        };
+        type Fetched = (
+            Vec<crate::governance::MeteringRow>,
+            std::collections::HashMap<String, String>,
+            (i64, i64),
+        );
+        let joined = tokio::task::spawn_blocking(move || -> Result<Fetched, ()> {
+            let rows = gov.metering_for(bucket).map_err(|_| ())?;
+            // id → display name, for the by_key rows (a deleted key's history keeps its id).
+            let names = gov
+                .all_keys()
+                .map_err(|_| ())?
+                .into_iter()
+                .map(|k| (k.id, k.name))
+                .collect();
+            Ok((rows, names, gov.prices()))
         })
         .await;
-        match joined {
-            Ok(Ok(view)) => Ok(view),
-            // A store failure or a blocking-join failure is an internal error (details logged upstream
-            // in the store layer); the caller never sees store internals.
-            Ok(Err(())) | Err(_) => Err(AdminError::Internal),
+        let (rows, names, prices) = match joined {
+            Ok(Ok(f)) => f,
+            // A store failure or a blocking-join failure is an internal error (details logged
+            // upstream in the store layer); the caller never sees store internals.
+            Ok(Err(())) | Err(_) => return Err(AdminError::Internal),
+        };
+        // Aggregate in memory — a bucket is bounded by (keys × models) accumulation rows.
+        let mut total = UsageBreakdown::default();
+        let mut by_model: std::collections::BTreeMap<(String, String), UsageBreakdown> =
+            std::collections::BTreeMap::new();
+        let mut by_key: std::collections::BTreeMap<String, UsageBreakdown> =
+            std::collections::BTreeMap::new();
+        for r in &rows {
+            for b in [
+                &mut total,
+                by_model
+                    .entry((r.model.clone(), r.provider.clone()))
+                    .or_default(),
+                by_key.entry(r.key_id.clone()).or_default(),
+            ] {
+                b.tokens_input = b.tokens_input.saturating_add(r.tokens_input);
+                b.tokens_output = b.tokens_output.saturating_add(r.tokens_output);
+                b.tokens_cache_read = b.tokens_cache_read.saturating_add(r.tokens_cache_read);
+                b.tokens_cache_creation = b
+                    .tokens_cache_creation
+                    .saturating_add(r.tokens_cache_creation);
+                b.requests = b.requests.saturating_add(r.requests);
+            }
         }
+        total.spend_micros = derive_spend_micros(&total, prices);
+        let by_model = by_model
+            .into_iter()
+            .map(|((model, provider), mut usage)| {
+                usage.spend_micros = derive_spend_micros(&usage, prices);
+                ModelUsageView {
+                    model,
+                    provider,
+                    usage,
+                }
+            })
+            .collect();
+        let by_key = by_key
+            .into_iter()
+            .map(|(id, mut usage)| {
+                usage.spend_micros = derive_spend_micros(&usage, prices);
+                KeyUsageView {
+                    name: names.get(&id).cloned(),
+                    id,
+                    usage,
+                }
+            })
+            .collect();
+        Ok(UsageView {
+            window,
+            as_of: now,
+            currency: USAGE_CURRENCY,
+            total,
+            by_model,
+            by_key,
+        })
     }
 
     /// `GET /api/v1/admin/auth` — the ingress auth chain + upstream-credential mode. Read scope. Never a

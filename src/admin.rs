@@ -1330,16 +1330,18 @@ mod tests {
         handle.abort();
     }
 
-    /// `GET /api/v1/admin/usage` aggregates governance's per-key counters into fleet totals + a per-key
-    /// breakdown. A freshly minted key appears with zero usage; totals reflect it. Never leaks the
-    /// secret (id/name only).
+    /// `GET /api/v1/admin/usage` is the METERING read: the current UTC-day bucket aggregated per
+    /// (model, provider) and per key, each row carrying the raw token SPLIT plus busbar's DERIVED
+    /// `spend_micros` (from the configured global prices), under a `window`/`as_of`/`currency`
+    /// header. Never leaks the secret (id/name only).
     #[tokio::test]
-    async fn test_admin_v1_usage_aggregates_per_key() {
+    async fn test_admin_v1_usage_meters_by_model_and_key() {
         use crate::governance::NewKeySpec;
         crate::metrics::init();
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
-        // Mint a key directly so the fleet has something to aggregate.
+        // Prices: 1¢/request + 50¢/1k tokens — the derivation inputs the assertions replay.
+        let gov = Arc::new(GovState::new(store, 1, 50, Some("admintok".to_string())).unwrap());
+        let now = crate::store::now();
         let (minted, minted_secret) = gov
             .create_key(
                 NewKeySpec {
@@ -1350,9 +1352,30 @@ mod tests {
                     rpm_limit: None,
                     tpm_limit: None,
                 },
-                crate::store::now(),
+                now,
             )
             .unwrap();
+        // Two responses metered against one model (split preserved), one against another model.
+        let usage = crate::ir::IrUsage {
+            input_tokens: 700,
+            output_tokens: 200,
+            cache_read_input_tokens: Some(100),
+            cache_creation_input_tokens: None,
+        };
+        // On a runtime `record_metering` offloads (fire-and-forget) — run the setup writes on a
+        // plain thread (no tokio context → the write happens inline) and join, so the GET below
+        // deterministically sees them.
+        {
+            let gov = gov.clone();
+            let key_id = minted.id.clone();
+            std::thread::spawn(move || {
+                gov.record_metering(&key_id, "gpt-x", "openai", Some(&usage), now);
+                gov.record_metering(&key_id, "gpt-x", "openai", Some(&usage), now);
+                gov.record_metering(&key_id, "claude-z", "anthropic", None, now);
+            })
+            .join()
+            .unwrap();
+        }
         let app = TestApp::new().governance(gov).build();
         let router = crate::build_router(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1369,17 +1392,47 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert!(body["total"]["spend_cents"].is_number());
-        assert!(body["total"]["tokens"].is_number());
-        assert!(body["total"]["requests"].is_number());
-        let keys = body["keys"].as_array().unwrap();
-        let entry = keys
-            .iter()
-            .find(|k| k["name"] == "team-a")
-            .expect("minted key appears in usage");
-        assert_eq!(entry["id"], minted.id);
-        assert_eq!(entry["spend_cents"], 0, "fresh key has no spend");
-        // The secret is never present in the usage body.
+        // Window/freshness/currency header (the audit's #2/#3 findings).
+        assert_eq!(body["currency"], "USD");
+        assert!(body["as_of"].as_u64().unwrap() >= now);
+        let (start, end) = (
+            body["window"]["start"].as_u64().unwrap(),
+            body["window"]["end"].as_u64().unwrap(),
+        );
+        assert_eq!(end - start, 86_400, "one UTC-day metering bucket");
+        assert!((start..end).contains(&now));
+
+        // Totals: raw split + derived spend. 3 requests; billable = 2×(700+200+100) = 2000 tokens.
+        // spend = 3 req × 1¢ + 2000 tokens × 50¢/1k = 3¢ + 100¢ = 103¢ = 1_030_000 micro-USD.
+        assert_eq!(body["total"]["requests"], 3);
+        assert_eq!(body["total"]["tokens_input"], 1400);
+        assert_eq!(body["total"]["tokens_output"], 400);
+        assert_eq!(body["total"]["tokens_cache_read"], 200);
+        assert_eq!(body["total"]["tokens_cache_creation"], 0);
+        assert_eq!(body["total"]["spend_micros"], 1_030_000);
+
+        // Per-model attribution (the FinOps unit): each row carries the same split shape.
+        let by_model = body["by_model"].as_array().unwrap();
+        assert_eq!(by_model.len(), 2, "{by_model:?}");
+        let x = by_model.iter().find(|m| m["model"] == "gpt-x").unwrap();
+        assert_eq!(x["provider"], "openai");
+        assert_eq!(x["requests"], 2);
+        assert_eq!(x["tokens_input"], 1400);
+        // 2 req × 1¢ + 2000 × 50¢/1k = 102¢
+        assert_eq!(x["spend_micros"], 1_020_000);
+        let z = by_model.iter().find(|m| m["model"] == "claude-z").unwrap();
+        assert_eq!(
+            z["requests"], 1,
+            "a flat (zero-token) response still counts"
+        );
+        assert_eq!(z["spend_micros"], 10_000, "1 req × 1¢ = 10_000 micro-USD");
+
+        // Per-key attribution names the key; the secret never appears anywhere in the body.
+        let by_key = body["by_key"].as_array().unwrap();
+        assert_eq!(by_key.len(), 1);
+        assert_eq!(by_key[0]["id"], minted.id);
+        assert_eq!(by_key[0]["name"], "team-a");
+        assert_eq!(by_key[0]["requests"], 3);
         let text = body.to_string();
         assert!(
             !text.contains(&minted_secret),
@@ -5255,6 +5308,18 @@ providers: {}
             window_start: u64,
         ) -> crate::governance::StoreResult<crate::governance::Usage> {
             self.inner.get_usage(key_id, window_start)
+        }
+        fn add_metering(
+            &self,
+            delta: &crate::governance::MeteringDelta,
+        ) -> crate::governance::StoreResult<()> {
+            self.inner.add_metering(delta)
+        }
+        fn list_metering(
+            &self,
+            bucket: u64,
+        ) -> crate::governance::StoreResult<Vec<crate::governance::MeteringRow>> {
+            self.inner.list_metering(bucket)
         }
         fn charge_within_budget(
             &self,

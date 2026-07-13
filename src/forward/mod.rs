@@ -1336,6 +1336,20 @@ where
                                 sink.charged_at,
                                 tokens,
                             );
+                            // Metering (raw per-model consumption series, token SPLIT preserved):
+                            // attribute to the SERVING lane — `lane_idx` is the lane that actually
+                            // answered, post-failover. Same pinned epoch as the budget charges (#29).
+                            if let Some(lane) =
+                                this.app.as_ref().and_then(|a| a.lanes.get(this.lane_idx))
+                            {
+                                sink.gov.record_metering(
+                                    &sink.key_id,
+                                    &lane.model,
+                                    &lane.provider,
+                                    ir_usage.as_ref(),
+                                    sink.charged_at,
+                                );
+                            }
                         }
                     }
                     if !done.is_empty() {
@@ -1377,15 +1391,22 @@ impl<S, P> Drop for FirstByteBody<S, P> {
         {
             return;
         }
-        let tokens = self
-            .translate
-            .as_ref()
-            .and_then(|t| t.usage())
-            .map(|u| u.billable_tokens())
-            .unwrap_or(0);
+        let usage = self.translate.as_ref().and_then(|t| t.usage()).cloned();
+        let tokens = usage.as_ref().map(|u| u.billable_tokens()).unwrap_or(0);
         if tokens > 0 {
             sink.gov
                 .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
+            // Meter the delivered-then-dropped partial too (same serving-lane attribution as the
+            // natural-end site) — the tokens were really consumed against this model.
+            if let Some(lane) = self.app.as_ref().and_then(|a| a.lanes.get(self.lane_idx)) {
+                sink.gov.record_metering(
+                    &sink.key_id,
+                    &lane.model,
+                    &lane.provider,
+                    usage.as_ref(),
+                    sink.charged_at,
+                );
+            }
         }
     }
 }
@@ -1971,7 +1992,11 @@ pub(crate) fn egress_accept(egress_protocol: &str, wants_stream: bool) -> &'stat
 /// meters through the existing sink (identical numbers for chat — the Billing round-trip preserves
 /// the additive-cache convention). Non-token meters (duration/characters/images/flat) are carried in
 /// the client-visible body today and priced by the 1.3 engine; nothing to record here yet.
-fn record_resp_usage(ir: &crate::ir::variant::IrResp, usage_sink: &Option<UsageSink>) {
+fn record_resp_usage(
+    ir: &crate::ir::variant::IrResp,
+    usage_sink: &Option<UsageSink>,
+    lane: Option<(&str, &str)>,
+) {
     if let Some(crate::billing::Billing::Tokens(t)) = ir.usage() {
         let usage = crate::ir::IrUsage {
             input_tokens: t.input,
@@ -1979,11 +2004,25 @@ fn record_resp_usage(ir: &crate::ir::variant::IrResp, usage_sink: &Option<UsageS
             cache_creation_input_tokens: t.cache_creation,
             cache_read_input_tokens: t.cache_read,
         };
-        record_ir_usage(&usage, usage_sink);
+        record_ir_usage(&usage, usage_sink, lane);
+    } else if let Some(sink) = usage_sink {
+        // A delivered response with NO token usage (a flat-fee op, e.g. moderations) still METERS as
+        // one request against the serving model — FinOps consumers count requests per model even
+        // when nothing token-bills.
+        if let Some((model, provider)) = lane {
+            sink.gov
+                .record_metering(&sink.key_id, model, provider, None, sink.charged_at);
+        }
     }
 }
 
-fn record_ir_usage(usage: &crate::ir::IrUsage, usage_sink: &Option<UsageSink>) {
+/// `lane` is the SERVING lane's `(model, provider)` — the per-model metering attribution. `None`
+/// (an unknown/unresolvable lane) still bills the budget but records no metering row.
+fn record_ir_usage(
+    usage: &crate::ir::IrUsage,
+    usage_sink: &Option<UsageSink>,
+    lane: Option<(&str, &str)>,
+) {
     if let Some(sink) = usage_sink {
         // `billable_tokens` saturates internally — operands are UPSTREAM-CONTROLLED token counts, so
         // an unchecked `+` could panic on overflow in debug / wrap in release (#18). Saturates to
@@ -1994,6 +2033,12 @@ fn record_ir_usage(usage: &crate::ir::IrUsage, usage_sink: &Option<UsageSink>) {
             // the buffered-path token fee and the per-request fee never split across windows (#29).
             sink.gov
                 .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
+        }
+        // Metering (raw per-model consumption series) records the SPLIT — even a zero-token
+        // delivered response counts its request. Same pinned epoch as the budget charges (#29).
+        if let Some((model, provider)) = lane {
+            sink.gov
+                .record_metering(&sink.key_id, model, provider, Some(usage), sink.charged_at);
         }
     }
 }
@@ -4794,7 +4839,11 @@ async fn forward_with_pool_parsed_inner(
                             );
                         }
                         if let Some(Ok(mut ir)) = decoded {
-                            record_resp_usage(&ir, &usage_sink);
+                            record_resp_usage(
+                                &ir,
+                                &usage_sink,
+                                Some((&app.lanes[i].model, &app.lanes[i].provider)),
+                            );
                             ir.prepare_for_ingress(ingress_protocol, now());
                             if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
                                 .and_then(|rh| rh.operation_handler(op.operation))
@@ -4837,7 +4886,11 @@ async fn forward_with_pool_parsed_inner(
                                 // delivering this body (every exit from this block is a delivered
                                 // response). No FirstByteBody on this buffered path, so bill here —
                                 // straight from the IR usage the egress reader just decoded (Change A).
-                                record_resp_usage(&ir, &usage_sink);
+                                record_resp_usage(
+                                    &ir,
+                                    &usage_sink,
+                                    Some((&app.lanes[i].model, &app.lanes[i].provider)),
+                                );
                                 // OPERATION-BLIND ingress preparation: the IR reshapes ITSELF for
                                 // delivery in the caller's dialect (chat: native-identity strip, the
                                 // protocol-agnostic `created` boundary signal, tool-id remap — see
@@ -5731,7 +5784,11 @@ async fn forward_once(
                         );
                     }
                     if let Some(Ok(mut ir)) = decoded {
-                        record_resp_usage(&ir, &usage_sink);
+                        record_resp_usage(
+                            &ir,
+                            &usage_sink,
+                            Some((&app.lanes[i].model, &app.lanes[i].provider)),
+                        );
                         ir.prepare_for_ingress(ingress_protocol, now());
                         if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
                             .and_then(|rh| rh.operation_handler(op.operation))
@@ -5766,7 +5823,11 @@ async fn forward_once(
                             // (every exit below is a delivered response). No FirstByteBody on this
                             // buffered path, so bill from the IR usage just decoded (Change A,
                             // mirrors the main path).
-                            record_resp_usage(&ir, &usage_sink);
+                            record_resp_usage(
+                                &ir,
+                                &usage_sink,
+                                Some((&app.lanes[i].model, &app.lanes[i].provider)),
+                            );
                             // OPERATION-BLIND ingress preparation (identity strip, `created`
                             // boundary signal, tool-id remap) — the SAME seam transform the main
                             // path applies; relocated verbatim into `IrResp::prepare_for_ingress`.
@@ -6424,7 +6485,7 @@ mod usage_tap_tests {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
         };
-        record_ir_usage(&usage, &sink);
+        record_ir_usage(&usage, &sink, None);
 
         // The 100c token fee must be in the charged_at day's window...
         let in_window = gov
@@ -6488,7 +6549,7 @@ mod usage_tap_tests {
             cache_read_input_tokens: None,
         };
         // Must NOT panic (the assertion is reaching this line at all under a debug-overflow build).
-        record_ir_usage(&usage, &sink);
+        record_ir_usage(&usage, &sink, None);
     }
 
     #[test]

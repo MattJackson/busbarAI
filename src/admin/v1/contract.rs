@@ -463,31 +463,77 @@ pub(crate) struct EffectiveConfigView {
     pub(crate) global_hooks: Vec<String>,
 }
 
-/// Fleet usage aggregation (`GET /api/v1/admin/usage`) — spend/tokens/requests totals plus a per-key
-/// breakdown, read from governance's per-key counters. The data-plane half of metering. Empty (zero
-/// totals, no keys) when governance is disabled. No secrets — key ids/names only, never a token.
+/// The currency the operator-configured prices (`price_per_request_cents`,
+/// `price_per_1k_tokens_cents`) — and therefore every derived `spend_micros` — are denominated in.
+pub(crate) const USAGE_CURRENCY: &str = "USD";
+
+/// Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle (Matthew):
+/// busbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token
+/// SPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer
+/// with its own (special/negotiated) price catalog reconstructs cost independently; `spend_micros`
+/// is busbar's DERIVED estimate from the operator's configured global prices, computed at read time
+/// (raw counts are what's stored — a price change re-prices history consistently).
+///
+/// Time base: one fixed UTC-day bucket (`window`), deliberately decoupled from per-key budget
+/// windows so per-model aggregation across keys is well-defined. Budget ENFORCEMENT state (cents
+/// spent against a key's own budget window) lives on `GET /keys/{id}/usage`, not here. Empty
+/// aggregations when governance is disabled. No secrets — key ids/names only, never a token.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UsageView {
-    pub(crate) total: UsageTotals,
-    pub(crate) keys: Vec<KeyUsageView>,
+    /// The UTC-day metering bucket this response aggregates: `[start, end)` epoch seconds.
+    pub(crate) window: UsageWindow,
+    /// Freshness marker: the epoch this read was computed at (counters accumulate live).
+    pub(crate) as_of: u64,
+    /// The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`).
+    pub(crate) currency: &'static str,
+    pub(crate) total: UsageBreakdown,
+    /// Per-(model, provider) aggregation — cost attribution by model (the FinOps unit).
+    pub(crate) by_model: Vec<ModelUsageView>,
+    /// Per-key aggregation (same raw-split shape).
+    pub(crate) by_key: Vec<KeyUsageView>,
 }
 
-/// Aggregate spend/tokens/requests across all keys (the fleet totals).
-#[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct UsageTotals {
-    pub(crate) spend_cents: i64,
-    pub(crate) tokens: u64,
+/// A metering window: `[start, end)` epoch seconds.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct UsageWindow {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+/// The raw consumption counts + the derived spend estimate — the one shape shared by `total`,
+/// `by_model` rows, and `by_key` rows, so a consumer writes ONE aggregation reader.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct UsageBreakdown {
+    /// Uncached input tokens (normalized additive-cache convention).
+    pub(crate) tokens_input: u64,
+    pub(crate) tokens_output: u64,
+    pub(crate) tokens_cache_read: u64,
+    pub(crate) tokens_cache_creation: u64,
     pub(crate) requests: u64,
+    /// Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,
+    /// sub-cent precise, no float drift), from the operator's configured global prices. A consumer
+    /// with its own per-model catalog recomputes from the raw token split instead.
+    pub(crate) spend_micros: i64,
 }
 
-/// One key's usage in the fleet breakdown: the key id/name (never the secret) + its counters.
+/// One (model, provider) row of the per-model aggregation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModelUsageView {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    #[serde(flatten)]
+    pub(crate) usage: UsageBreakdown,
+}
+
+/// One key's row of the per-key aggregation: the key id/name (never the secret) + its counts.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct KeyUsageView {
     pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) spend_cents: i64,
-    pub(crate) tokens: u64,
-    pub(crate) requests: u64,
+    /// The key's display name; `None` when the key was deleted after metering accumulated (history
+    /// outlives the key — the id still attributes it).
+    pub(crate) name: Option<String>,
+    #[serde(flatten)]
+    pub(crate) usage: UsageBreakdown,
 }
 
 /// The admin-plane auth read (`GET /api/v1/admin/admin-auth`) — which modules guard the ADMIN surface

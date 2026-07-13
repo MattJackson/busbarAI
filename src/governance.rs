@@ -265,6 +265,51 @@ impl GovState {
         self.add_rate_tokens(key_id, now, tokens);
     }
 
+    /// Record one completed response's RAW consumption into the per-(key, day-bucket, model,
+    /// provider) metering series — observability/FinOps data, NEVER enforcement (budgets stay on
+    /// `record_tokens`/`charge_within_budget`). Carries the token SPLIT (input / output /
+    /// cache-read / cache-creation — each prices differently) so a consumer with its own price
+    /// catalog can reconstruct cost from the raw counts; busbar's derived spend is computed at read
+    /// time. Zero-token responses still count the request (a flat-fee op is a request against a
+    /// model). Best-effort: the write is offloaded to the blocking pool and errors are logged.
+    pub(crate) fn record_metering(
+        &self,
+        key_id: &str,
+        model: &str,
+        provider: &str,
+        usage: Option<&crate::ir::IrUsage>,
+        now: u64,
+    ) {
+        let delta = MeteringDelta {
+            key_id: key_id.to_string(),
+            bucket: metering_bucket(now),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            tokens_input: usage.map(|u| u.input_tokens).unwrap_or(0),
+            tokens_output: usage.map(|u| u.output_tokens).unwrap_or(0),
+            tokens_cache_read: usage.and_then(|u| u.cache_read_input_tokens).unwrap_or(0),
+            tokens_cache_creation: usage
+                .and_then(|u| u.cache_creation_input_tokens)
+                .unwrap_or(0),
+        };
+        self.offload_store_write("metering record failed", key_id, move |s| {
+            s.add_metering(&delta)
+        });
+    }
+
+    /// Every metering row for `bucket` (a [`metering_bucket`] day start) — the raw material of the
+    /// usage read's by-model / by-key aggregations. Synchronous store read; admin-plane callers run
+    /// it via `spawn_blocking`.
+    pub(crate) fn metering_for(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+        self.store.list_metering(bucket)
+    }
+
+    /// The operator-configured prices `(per_request_cents, per_1k_tokens_cents)` — the inputs of the
+    /// usage read's DERIVED `spend_micros` (raw counts are stored; spend is computed at read time).
+    pub(crate) fn prices(&self) -> (i64, i64) {
+        (self.price_per_request_cents, self.price_per_1k_tokens_cents)
+    }
+
     /// Acquire the `rate` map for writing, recovering from a poisoned lock rather than panicking.
     ///
     /// A panic while any holder owns this lock marks it poisoned; a plain `.write().unwrap()` would
@@ -1262,6 +1307,52 @@ pub(crate) struct Usage {
     pub(crate) requests: u64,
 }
 
+/// Seconds in a metering day bucket. Metering is a TIME SERIES in fixed UTC-day buckets —
+/// deliberately decoupled from the per-key budget windows the enforcement counters use, so
+/// per-model aggregation ACROSS keys has one well-defined time base.
+pub(crate) const METERING_BUCKET_SECS: u64 = 86_400;
+
+/// Floor an epoch to its UTC-day metering bucket start.
+pub(crate) fn metering_bucket(now: u64) -> u64 {
+    now - (now % METERING_BUCKET_SECS)
+}
+
+/// One per-(key, model, provider) metering accumulation from a completed response — RAW consumption
+/// counts, never money. Spend is DERIVED at read time from the operator's configured prices, and a
+/// third party with its own (special/negotiated) price catalog reconstructs cost from these counts:
+/// input, output, cache-read, and cache-creation tokens all price differently, so each is carried
+/// separately (design: expose the inputs of the cost computation, not just busbar's own result).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeteringDelta {
+    pub(crate) key_id: String,
+    /// The UTC-day bucket this response is attributed to (see [`metering_bucket`]); derived from the
+    /// request's pinned header-arrival epoch, same as the budget charges (#29).
+    pub(crate) bucket: u64,
+    /// The SERVING lane's configured model name (post-failover — the lane that actually answered).
+    pub(crate) model: String,
+    /// The serving lane's provider name.
+    pub(crate) provider: String,
+    /// Uncached input tokens (the normalized additive-cache convention, per `billing::TokenUsage`).
+    pub(crate) tokens_input: u64,
+    pub(crate) tokens_output: u64,
+    pub(crate) tokens_cache_read: u64,
+    pub(crate) tokens_cache_creation: u64,
+}
+
+/// One accumulated metering row read back for a bucket (the raw material of `GET usage` by_model /
+/// by_key aggregations — the service aggregates in memory; buckets are bounded by (keys × models)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeteringRow {
+    pub(crate) key_id: String,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) tokens_input: u64,
+    pub(crate) tokens_output: u64,
+    pub(crate) tokens_cache_read: u64,
+    pub(crate) tokens_cache_creation: u64,
+    pub(crate) requests: u64,
+}
+
 pub(crate) type StoreResult<T> = Result<T, StoreError>;
 
 #[derive(Debug)]
@@ -1319,6 +1410,15 @@ pub(crate) trait Store: Send + Sync + 'static {
         count_request: bool,
     ) -> StoreResult<()>;
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
+
+    /// Accumulate one completed response's RAW consumption into the per-(key, bucket, model,
+    /// provider) metering row (UPSERT/add; +1 request). Metering is observability — best-effort,
+    /// never consulted for enforcement (budgets stay on `add_usage`/`charge_within_budget`).
+    fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()>;
+
+    /// Every metering row accumulated in `bucket` (a [`metering_bucket`] day start), for the usage
+    /// read's by-model / by-key aggregations.
+    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>>;
 
     /// ATOMIC budget check-and-charge (the HARD-cap primitive). In a SINGLE store round-trip, charge
     /// `cost_cents` (the flat per-request fee) + one request to the key's `window_start` counter IFF
@@ -1452,6 +1552,18 @@ CREATE TABLE IF NOT EXISTS usage_counters (
     requests     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (key_id, window_start)
 );
+CREATE TABLE IF NOT EXISTS usage_metering (
+    key_id                TEXT NOT NULL,
+    bucket                INTEGER NOT NULL,
+    model                 TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    tokens_input          INTEGER NOT NULL DEFAULT 0,
+    tokens_output         INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read     INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_creation INTEGER NOT NULL DEFAULT 0,
+    requests              INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (key_id, bucket, model, provider)
+);
 ";
 
 /// Embedded SQLite store (the default `Store`). The single `Connection` is mutex-guarded; the
@@ -1563,6 +1675,59 @@ impl SqliteStore {
             ],
         )?;
         Ok(())
+    }
+
+    fn add_metering_inner(conn: &Mutex<Connection>, d: &MeteringDelta) -> StoreResult<()> {
+        let conn = Self::lock_conn_raw(conn);
+        conn.execute(
+            "INSERT INTO usage_metering (key_id, bucket, model, provider,
+                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,1)
+             ON CONFLICT(key_id, bucket, model, provider) DO UPDATE SET
+                 tokens_input          = tokens_input + excluded.tokens_input,
+                 tokens_output         = tokens_output + excluded.tokens_output,
+                 tokens_cache_read     = tokens_cache_read + excluded.tokens_cache_read,
+                 tokens_cache_creation = tokens_cache_creation + excluded.tokens_cache_creation,
+                 requests              = requests + 1",
+            params![
+                d.key_id,
+                d.bucket as i64,
+                d.model,
+                d.provider,
+                i64::try_from(d.tokens_input).unwrap_or(i64::MAX),
+                i64::try_from(d.tokens_output).unwrap_or(i64::MAX),
+                i64::try_from(d.tokens_cache_read).unwrap_or(i64::MAX),
+                i64::try_from(d.tokens_cache_creation).unwrap_or(i64::MAX),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_metering_inner(conn: &Mutex<Connection>, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+        let conn = Self::lock_conn_raw(conn);
+        let mut stmt = conn.prepare(
+            "SELECT key_id, model, provider,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests
+             FROM usage_metering WHERE bucket = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![bucket as i64], |r| {
+                // DI-3 posture (matches get_usage): clamp a corrupt negative stored counter to 0
+                // instead of wrapping a negative i64 to a huge u64 via `as`.
+                let u = |v: i64| v.max(0) as u64;
+                Ok(MeteringRow {
+                    key_id: r.get(0)?,
+                    model: r.get(1)?,
+                    provider: r.get(2)?,
+                    tokens_input: u(r.get(3)?),
+                    tokens_output: u(r.get(4)?),
+                    tokens_cache_read: u(r.get(5)?),
+                    tokens_cache_creation: u(r.get(6)?),
+                    requests: u(r.get(7)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn charge_within_budget_inner(
@@ -1855,6 +2020,14 @@ impl Store for SqliteStore {
             tokens,
             count_request,
         )
+    }
+
+    fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
+        Self::add_metering_inner(&self.conn, delta)
+    }
+
+    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+        Self::list_metering_inner(&self.conn, bucket)
     }
 
     fn charge_within_budget(
@@ -2429,6 +2602,120 @@ mod tests {
         assert_eq!(
             u.requests, 0,
             "a negative stored request counter must clamp to 0"
+        );
+    }
+
+    /// The metering series: `add_metering` UPSERTs per (key, bucket, model, provider) with the raw
+    /// token SPLIT preserved and +1 request per call; `list_metering` reads exactly one bucket; a
+    /// second bucket never bleeds in.
+    #[test]
+    fn test_metering_accumulates_split_per_key_model_and_bucket() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let day = metering_bucket(1_700_000_123); // mid-day epoch floors to its bucket start
+        assert_eq!(day % METERING_BUCKET_SECS, 0);
+        let d = |model: &str, input: u64, output: u64| MeteringDelta {
+            key_id: "vk_a".into(),
+            bucket: day,
+            model: model.into(),
+            provider: "openai".into(),
+            tokens_input: input,
+            tokens_output: output,
+            tokens_cache_read: 7,
+            tokens_cache_creation: 3,
+        };
+        // Two responses on the same (key, model) accumulate; a different model is its own row.
+        s.add_metering(&d("gpt-x", 100, 20)).unwrap();
+        s.add_metering(&d("gpt-x", 50, 10)).unwrap();
+        s.add_metering(&d("gpt-y", 1, 2)).unwrap();
+        // A different bucket must NOT appear in this bucket's read.
+        s.add_metering(&MeteringDelta {
+            bucket: day + METERING_BUCKET_SECS,
+            ..d("gpt-x", 999, 999)
+        })
+        .unwrap();
+
+        let mut rows = s.list_metering(day).unwrap();
+        rows.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(rows.len(), 2, "two models in this bucket: {rows:?}");
+        let x = &rows[0];
+        assert_eq!((x.model.as_str(), x.provider.as_str()), ("gpt-x", "openai"));
+        assert_eq!(
+            (x.tokens_input, x.tokens_output, x.requests),
+            (150, 30, 2),
+            "raw split accumulates + one request per response"
+        );
+        assert_eq!(
+            (x.tokens_cache_read, x.tokens_cache_creation),
+            (14, 6),
+            "cache reads/writes carry separately (they price differently)"
+        );
+        assert_eq!(rows[1].model, "gpt-y");
+        assert_eq!(rows[1].requests, 1);
+    }
+
+    /// `GovState::record_metering` end-to-end (no tokio runtime → the offload runs inline): the
+    /// IrUsage split lands in the store under the request's day bucket; a `None` usage (flat-fee op)
+    /// still counts the request.
+    #[test]
+    fn test_record_metering_from_ir_usage_and_flat() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = GovState::new(store, 0, 0, None).unwrap();
+        let now = 1_700_000_500;
+        let usage = crate::ir::IrUsage {
+            input_tokens: 11,
+            output_tokens: 22,
+            cache_read_input_tokens: Some(5),
+            cache_creation_input_tokens: None,
+        };
+        gov.record_metering("vk_m", "claude-z", "anthropic", Some(&usage), now);
+        gov.record_metering("vk_m", "claude-z", "anthropic", None, now); // flat-fee op
+        let rows = gov.metering_for(metering_bucket(now)).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(
+            (r.key_id.as_str(), r.model.as_str(), r.provider.as_str()),
+            ("vk_m", "claude-z", "anthropic")
+        );
+        assert_eq!(
+            (
+                r.tokens_input,
+                r.tokens_output,
+                r.tokens_cache_read,
+                r.tokens_cache_creation,
+                r.requests
+            ),
+            (11, 22, 5, 0, 2),
+            "split preserved; the flat-fee response still counted its request"
+        );
+    }
+
+    /// DI-3 parity with `get_usage`: a direct-DB negative metering counter clamps to 0 on read.
+    #[test]
+    fn test_negative_metering_counters_clamp_to_zero_on_read() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        {
+            let conn = s.lock_conn();
+            conn.execute(
+                "INSERT INTO usage_metering (key_id, bucket, model, provider,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests)
+                 VALUES ('kneg', 0, 'm', 'p', -5, -1, -2, -3, -4)",
+                [],
+            )
+            .unwrap();
+        }
+        let rows = s.list_metering(0).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(
+            (
+                r.tokens_input,
+                r.tokens_output,
+                r.tokens_cache_read,
+                r.tokens_cache_creation,
+                r.requests
+            ),
+            (0, 0, 0, 0, 0),
+            "negative stored metering counters clamp to 0"
         );
     }
 

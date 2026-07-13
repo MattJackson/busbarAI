@@ -1837,6 +1837,18 @@ mod tests {
         ) -> crate::governance::StoreResult<crate::governance::Usage> {
             self.0.get_usage(k, w)
         }
+        fn add_metering(
+            &self,
+            d: &crate::governance::MeteringDelta,
+        ) -> crate::governance::StoreResult<()> {
+            self.0.add_metering(d)
+        }
+        fn list_metering(
+            &self,
+            b: u64,
+        ) -> crate::governance::StoreResult<Vec<crate::governance::MeteringRow>> {
+            self.0.list_metering(b)
+        }
         fn charge_within_budget(
             &self,
             _k: &str,
