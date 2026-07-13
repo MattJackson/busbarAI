@@ -62,6 +62,7 @@ impl AdminTransport for JsonV1 {
             .route("/admin/v1/config/versions/{v}", get(get_config_version))
             .route("/admin/v1/config/diff", get(config_diff))
             .route("/admin/v1/config/rollback", post(rollback_config))
+            .route("/admin/v1/config/reload", post(reload_config))
             .route("/admin/v1/openapi.json", get(openapi))
     }
 }
@@ -569,6 +570,74 @@ async fn rollback_config(
     }
 }
 
+/// `POST /admin/v1/config/reload` — re-run the BOOT disk-load pipeline (config.yaml +
+/// providers.yaml + env interpolation from the boot-time environment + overlay merge), validate,
+/// build a complete new `App` reusing process-lifetime state (client pool, governance DB, version
+/// history, rate windows) with every surviving lane's health RESTORED BY STABLE IDENTITY, and
+/// atomically swap it in. A NORMAL admin call under the NORMAL admin auth chain — no second
+/// credential path exists (D3). Invalid disk config = `invalid_request`, nothing changes. The
+/// GitOps primitive: push config, call reload, no restart, no health amnesia.
+async fn reload_config(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let current = handle.load();
+    let (Some(config_path), Some(providers_path)) =
+        (current.config_path.clone(), current.providers_path.clone())
+    else {
+        return err_json(&AdminError::Validation(
+            "this busbar was started without config files (ephemeral mode); reload has no disk \
+             truth to read"
+                .into(),
+        ));
+    };
+    let outcome = crate::load_config_from_disk(&config_path, &providers_path).and_then(|loaded| {
+        let cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
+            .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
+        crate::build_app_from_config(
+            cfg,
+            loaded.deploy.governance.clone(),
+            loaded.overlay_path,
+            loaded.base_hook_names,
+            (Some(config_path), Some(providers_path)),
+            Some(&current),
+        )
+    });
+    match outcome {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            audit::AUDIT.record_by(
+                "config.reload",
+                "config:disk",
+                audit::OUTCOME_APPLIED,
+                &actor,
+            );
+            let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                "config.reload (from disk)",
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
+            ok_json(
+                StatusCode::OK,
+                &json!({ "reloaded": true, "config_version": cur.config_version }),
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "config.reload",
+                "config:disk",
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            err_json(&AdminError::Validation(e))
+        }
+    }
+}
+
 /// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
 /// test and the OpenAPI `paths`. Templated/POST routes are documented separately in `openapi_doc`.
 /// Adding a GET endpoint means adding it here so the doc + the drift guard both see it.
@@ -746,6 +815,19 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "The version (metadata + hooks + global_hooks)"},
                     "404": {"description": "Pruned or never recorded (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/config/reload".to_string(),
+        json!({
+            "post": {
+                "summary": "Re-read config.yaml/providers.yaml from disk and apply atomically (health state preserved by lane identity)",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{reloaded, config_version}`"},
+                    "400": {"description": "Disk config invalid or no config files (error code `invalid_request`); nothing changed"}
                 }
             }
         }),

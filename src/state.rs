@@ -207,6 +207,11 @@ pub(crate) struct App {
     /// `group_map:` — principal groups → operator policy (admin scope today). Read by the admin
     /// authorization resolution; unmapped groups grant nothing (fail closed).
     pub(crate) group_map: HashMap<String, crate::config::GroupMapEntry>,
+    /// The config.yaml path busbar booted from — `POST /admin/v1/config/reload` re-runs the boot
+    /// disk-load pipeline against it. `None` (tests / ephemeral) ⇒ reload is `invalid_request`.
+    pub(crate) config_path: Option<std::path::PathBuf>,
+    /// The providers.yaml path (same role as `config_path`).
+    pub(crate) providers_path: Option<std::path::PathBuf>,
     /// The config-overlay path (`BUSBAR_CONFIG_OVERLAY`), if persistence is enabled. `Some` = an
     /// API-applied hook change is written here so it survives a restart (re-merged onto base config at
     /// boot); `None` (the default) = runtime changes are live but not persisted. Carried on `App` (not

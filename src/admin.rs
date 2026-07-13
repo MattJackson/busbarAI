@@ -1145,6 +1145,165 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// `POST /admin/v1/config/reload`: re-reads disk truth and swaps it in atomically — the new
+    /// topology is live, surviving lanes keep their learned health BY IDENTITY (a breaker tripped
+    /// before the reload is still tripped after it), and an invalid disk config rejects with 400
+    /// changing nothing.
+    #[tokio::test]
+    async fn test_admin_v1_config_reload_swaps_disk_truth_and_carries_health() {
+        crate::metrics::init();
+        let dir = std::env::temp_dir().join(format!("busbar-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let providers_path = dir.join("providers.yaml");
+        let config_path = dir.join("config.yaml");
+        std::fs::write(
+            &providers_path,
+            "test-provider:
+  protocol: anthropic
+  base_url: http://127.0.0.1:1/
+  api_key_env: BUSBAR_TEST_RELOAD_NO_SUCH_KEY
+",
+        )
+        .unwrap();
+        // Disk truth: the SAME identity as the running lane (m0 @ test-provider) plus a NEW model.
+        std::fs::write(
+            &config_path,
+            "listen: 127.0.0.1:0
+providers:
+  test-provider:
+    api_key_env: BUSBAR_TEST_RELOAD_NO_SUCH_KEY
+models:
+  m0:
+    provider: test-provider
+    max_concurrent: 4
+  m-new:
+    provider: test-provider
+    max_concurrent: 4
+pools:
+  reload-pool:
+    members:
+      - target: m0
+      - target: m-new
+",
+        )
+        .unwrap();
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new()
+            .lane(crate::test_support::LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .governance(gov)
+            .build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.config_path = Some(config_path.clone());
+            inner.providers_path = Some(providers_path.clone());
+            // Trip m0's default-cell breaker hard so the carried state is unmistakable.
+            inner.store.record_hard_down(0, "tripped before reload");
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| req.header("x-admin-token", "admintok");
+
+        // Reload: disk truth replaces the synthetic topology.
+        let resp = admin(client.post(format!("http://{addr}/admin/v1/config/reload")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+        let models: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/models")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let names: Vec<&str> = models["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"m-new"),
+            "the reloaded topology is live: {names:?}"
+        );
+
+        // The surviving identity (m0 @ test-provider) carried its tripped health state.
+        let pool: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/pools/reload-pool")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let members = pool["members"].as_array().unwrap();
+        let m0 = members
+            .iter()
+            .find(|m| m["model"] == "m0")
+            .expect("m0 present");
+        let m_new = members
+            .iter()
+            .find(|m| m["model"] == "m-new")
+            .expect("m-new present");
+        assert_eq!(
+            m0["usable"], false,
+            "m0's pre-reload trip must survive by identity: {m0}"
+        );
+        assert_eq!(
+            m_new["usable"], true,
+            "the new lane starts healthy: {m_new}"
+        );
+
+        // Invalid disk config: 400, nothing changes.
+        std::fs::write(
+            &config_path,
+            "listen: 127.0.0.1:0
+models:
+  broken:
+    provider: nope
+    max_concurrent: 1
+providers: {}
+",
+        )
+        .unwrap();
+        let before: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/info")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let bad = admin(client.post(format!("http://{addr}/admin/v1/config/reload")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400, "invalid disk config rejects");
+        let after: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/info")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            before["config_version"], after["config_version"],
+            "a rejected reload changes nothing"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Per-principal mutation rate limits: the config class (apply/rollback) caps at 10/min per
     /// principal — the 11th attempt in the window is a 429 in the frozen envelope, and FAILED
     /// attempts count (these are all 404s — anti-enumeration).

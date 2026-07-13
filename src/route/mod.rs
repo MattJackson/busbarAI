@@ -1261,6 +1261,8 @@ mod tests {
             base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
             group_map: std::collections::HashMap::new(),
+            config_path: None,
+            providers_path: None,
             overlay_path: None,
             config_version: 0,
             failover_cfg: None,

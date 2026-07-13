@@ -272,55 +272,21 @@ async fn main() {
     // acceptable trade for a daemon/k8s readiness path. Emission macros are no-ops until then.
     std::thread::spawn(metrics::init);
 
-    // Read providers.yaml (shipped definitions)
-    let providers_path =
-        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into());
-    let raw_providers = std::fs::read_to_string(&providers_path).unwrap_or_else(|e| {
-        die(format!(
-            "cannot read providers file '{providers_path}': {e} (set {ENV_PROVIDERS})"
-        ))
-    });
-    let interpolated_providers = config::interpolate_env(&raw_providers)
-        .unwrap_or_else(|e| die(format!("providers.yaml: {e}")));
-    let defs: HashMap<String, config::ProviderDef> = serde_yaml::from_str(&interpolated_providers)
-        .unwrap_or_else(|e| die(format!("providers.yaml: invalid YAML: {e}")));
-
-    // Read config.yaml (deployment)
-    let config_path = std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
-    let raw_config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-        die(format!(
-            "cannot read config file '{config_path}': {e} (set {ENV_CONFIG})"
-        ))
-    });
-    let interpolated_config =
-        config::interpolate_env(&raw_config).unwrap_or_else(|e| die(format!("config.yaml: {e}")));
-    let mut deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
-        .unwrap_or_else(|e| die(format!("config.yaml: invalid YAML: {e}")));
-
-    // Config-overlay persistence (opt-in via `BUSBAR_CONFIG_OVERLAY`): install the path, then MERGE
-    // any previously-persisted overlay (API-applied hook changes) into the deploy config BEFORE
-    // resolve, so a runtime-registered hook survives a restart. Effective = base (this config.yaml,
-    // untouched) + overlay. Absent/corrupt overlay is fail-soft (boot proceeds on base alone). Disabled
-    // (env unset) leaves boot completely unchanged.
-    let overlay_path = std::env::var("BUSBAR_CONFIG_OVERLAY")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from);
-    // The BASE-defined hook names, captured BEFORE the overlay merges in API-registered hooks:
-    // the admin API refuses to PUT-replace a base hook (409 — operator file config is edited in
-    // the file, not silently shadowed via the API; deletion works live but base re-appears on
-    // restart, the documented overlay edge).
-    let base_hook_names: std::collections::HashSet<String> = deploy.hooks.keys().cloned().collect();
-    if let Some(ref p) = overlay_path {
-        if let Some(doc) = config::overlay::read(p) {
-            tracing::info!(
-                path = %p.display(),
-                hooks = doc.hooks.len(),
-                "merging persisted config overlay onto base config"
-            );
-            config::overlay::merge_into(&mut deploy, doc);
-        }
-    }
+    // Locate the two config files (env-overridable paths) and run the shared disk-load pipeline —
+    // the SAME pipeline `POST /admin/v1/config/reload` re-runs at runtime.
+    let providers_path = std::path::PathBuf::from(
+        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into()),
+    );
+    let config_path = std::path::PathBuf::from(
+        std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into()),
+    );
+    let loaded = load_config_from_disk(&config_path, &providers_path).unwrap_or_else(|e| die(e));
+    let LoadedConfig {
+        deploy,
+        defs,
+        overlay_path,
+        base_hook_names,
+    } = loaded;
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
@@ -337,16 +303,10 @@ async fn main() {
     // Stamp process start for the `GET /admin/v1/info` uptime read.
     admin::mark_start();
 
-    // Resolve deployment + definitions into resolved RootCfg
+    // Resolve deployment + definitions into resolved RootCfg (semantic validation runs inside
+    // build_app_from_config — the one construction path).
     let cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
-    // Validate configuration before building lanes
-    if let Err(validation_errors) = config_validate::validate(&cfg) {
-        for err in &validation_errors {
-            eprintln!("[error] {}", err);
-        }
-        std::process::exit(1);
-    }
 
     // Metadata-SSRF protection status (discoverability). When the nuclear `allow_all_metadata` is set
     // the guard is OFF — that is a security-relevant degradation, so WARN. Otherwise report the count
@@ -367,8 +327,15 @@ async fn main() {
     let req_body_max = cfg.limits.request_body_max_bytes;
     let max_inbound = cfg.limits.max_inbound_concurrent;
     let app = Arc::new(
-        build_app_from_config(cfg, governance_cfg, overlay_path, base_hook_names, None)
-            .unwrap_or_else(|e| die(e)),
+        build_app_from_config(
+            cfg,
+            governance_cfg,
+            overlay_path,
+            base_hook_names,
+            (Some(config_path.clone()), Some(providers_path.clone())),
+            None,
+        )
+        .unwrap_or_else(|e| die(e)),
     );
 
     // Record the BOOT snapshot as version 0 so the version history always has a rollback floor
@@ -660,6 +627,70 @@ async fn reshape_oversized_413(
     )
 }
 
+/// Everything the DISK half of configuration produces, shared by boot and runtime reload.
+pub(crate) struct LoadedConfig {
+    pub(crate) deploy: config::DeployCfg,
+    pub(crate) defs: HashMap<String, config::ProviderDef>,
+    pub(crate) overlay_path: Option<std::path::PathBuf>,
+    pub(crate) base_hook_names: std::collections::HashSet<String>,
+}
+
+/// The disk-load pipeline: read providers.yaml + config.yaml, env-interpolate (from the process's
+/// boot-time environment — a live reload cannot see edited env files; documented), capture the
+/// BASE hook names, then merge the persisted overlay (opt-in, fail-soft). Shared verbatim by boot
+/// and `POST /admin/v1/config/reload`, so a reload IS a boot-equivalent read of disk truth.
+pub(crate) fn load_config_from_disk(
+    config_path: &std::path::Path,
+    providers_path: &std::path::Path,
+) -> Result<LoadedConfig, String> {
+    let raw_providers = std::fs::read_to_string(providers_path).map_err(|e| {
+        format!(
+            "cannot read providers file '{}': {e} (set {ENV_PROVIDERS})",
+            providers_path.display()
+        )
+    })?;
+    let interpolated_providers =
+        config::interpolate_env(&raw_providers).map_err(|e| format!("providers.yaml: {e}"))?;
+    let defs: HashMap<String, config::ProviderDef> = serde_yaml::from_str(&interpolated_providers)
+        .map_err(|e| format!("providers.yaml: invalid YAML: {e}"))?;
+
+    let raw_config = std::fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "cannot read config file '{}': {e} (set {ENV_CONFIG})",
+            config_path.display()
+        )
+    })?;
+    let interpolated_config =
+        config::interpolate_env(&raw_config).map_err(|e| format!("config.yaml: {e}"))?;
+    let mut deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
+        .map_err(|e| format!("config.yaml: invalid YAML: {e}"))?;
+
+    // Config-overlay persistence (opt-in via `BUSBAR_CONFIG_OVERLAY`): capture the BASE hook names
+    // BEFORE the overlay merges in API-registered hooks (the admin API refuses to PUT-replace a
+    // base hook), then merge. Absent/corrupt overlay is fail-soft.
+    let overlay_path = std::env::var("BUSBAR_CONFIG_OVERLAY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    let base_hook_names: std::collections::HashSet<String> = deploy.hooks.keys().cloned().collect();
+    if let Some(ref p) = overlay_path {
+        if let Some(doc) = config::overlay::read(p) {
+            tracing::info!(
+                path = %p.display(),
+                hooks = doc.hooks.len(),
+                "merging persisted config overlay onto base config"
+            );
+            config::overlay::merge_into(&mut deploy, doc);
+        }
+    }
+    Ok(LoadedConfig {
+        deploy,
+        defs,
+        overlay_path,
+        base_hook_names,
+    })
+}
+
 /// Build a complete `App` from a RESOLVED config — the ONE construction path shared by boot
 /// (`prior = None`) and the config plane's apply/reload (`prior = Some(current)`). On apply,
 /// process-lifetime state is REUSED from the prior snapshot (HTTP client pool, governance key DB,
@@ -673,6 +704,7 @@ pub(crate) fn build_app_from_config(
     governance_cfg: Option<config::GovernanceCfg>,
     overlay_path: Option<std::path::PathBuf>,
     base_hook_names: std::collections::HashSet<String>,
+    config_paths: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
     prior: Option<&state::App>,
 ) -> Result<state::App, String> {
     // Install the resolved operational limits process-wide BEFORE any subsystem reads them —
@@ -681,6 +713,14 @@ pub(crate) fn build_app_from_config(
     // (translate-body cap, metrics gauge limit, webhook timeout, governance sqlite/sweep, health
     // probe fallbacks, routing policy timeout) read the installed values.
     limits::install(&cfg.limits);
+    // Semantic validation — the same gate boot has always had, now on the ONE construction path
+    // so an apply/reload validates identically and an invalid config changes nothing.
+    if let Err(validation_errors) = config_validate::validate(&cfg) {
+        return Err(format!(
+            "config validation failed:\n  - {}",
+            validation_errors.join("\n  - ")
+        ));
+    }
     let auth_cfg = cfg
         .auth
         .clone()
@@ -1082,6 +1122,8 @@ pub(crate) fn build_app_from_config(
         base_hook_names,
         admin_chain: cfg.admin_auth.clone(),
         group_map: cfg.group_map.clone(),
+        config_path: config_paths.0,
+        providers_path: config_paths.1,
         overlay_path,
         config_version: prior.map_or(0, |p| p.config_version.wrapping_add(1)),
         failover_cfg,
