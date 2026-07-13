@@ -1,0 +1,29 @@
+# Demo: Claude Code (Anthropic protocol) → Busbar → Amazon Nova on Bedrock.
+# The agent speaks Anthropic; Busbar translates to Bedrock Converse and back.
+listen: "127.0.0.1:8080"
+
+auth:
+  chain: [tokens]
+  upstream_credentials: own
+  client_tokens:
+    - "${BUSBAR_CLIENT_TOKEN}"
+
+observability:
+  emit_server_timing: true
+
+providers:
+  bedrock:
+    api_key_env: AWS_BEDROCK_CREDS
+
+models:
+  amazon-nova:
+    provider: bedrock
+    max_concurrent: 10
+    max_requests: -1
+    upstream_model: amazon.nova-lite-v1:0   # the real Bedrock modelId that answers
+
+pools:
+  claude-code:
+    members:
+      - target: amazon-nova
+        weight: 1
