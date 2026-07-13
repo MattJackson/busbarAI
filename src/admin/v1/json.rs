@@ -57,7 +57,7 @@ impl AdminTransport for JsonV1 {
             )
             .route("/admin/v1/hooks/{name}/schema", get(hook_schema))
             .route("/admin/v1/plugins", get(list_plugins))
-            .route("/admin/v1/auth", get(get_auth))
+            .route("/admin/v1/auth", get(get_auth).put(put_auth))
             .route("/admin/v1/admin-auth", get(get_admin_auth))
             .route("/admin/v1/usage", get(get_usage))
             .route("/admin/v1/config", get(get_config))
@@ -575,6 +575,114 @@ async fn rollback_config(
             err_json(&e)
         }
     }
+}
+
+/// `PUT /admin/v1/auth` — replace the ADMIN auth chain (`admin_auth:`) at runtime. Body:
+/// `{"admin_auth": ["module", ...], "expected_version"?: N}`. Guarded three ways:
+/// - every name must be a compiled-in admin module (a typo can never silently drop auth);
+/// - optimistic concurrency via `expected_version` (409 `conflict` when stale);
+/// - **the D4 DRY-RUN GUARD**: the CALLING request's own credentials are re-evaluated against the
+///   CANDIDATE chain, and unless they would still hold FULL scope under it the change is rejected
+///   with 409 — you cannot lock yourself out with this endpoint. (A chain broken some other way
+///   is fix-config + restart: sub-second, health persists.)
+///
+/// Applied live and atomically (config-version bump, audited); like `config/apply`, the change is
+/// live until the next reload/restart returns to disk truth — persist by updating config.yaml.
+async fn put_auth(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PutAuthBody {
+        admin_auth: Vec<String>,
+        #[serde(default)]
+        expected_version: Option<u64>,
+    }
+    let req: PutAuthBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return err_json(&AdminError::Validation(format!("invalid body: {e}"))),
+    };
+    let current = handle.load();
+    if let Some(expected) = req.expected_version {
+        if expected != current.config_version {
+            return err_json(&AdminError::Conflict(format!(
+                "expected_version {expected} != current {}",
+                current.config_version
+            )));
+        }
+    }
+    // Known-module validation (mirrors the boot rule): `admin-tokens` is the built-in; the
+    // test-only stand-in exists in test builds only. An unknown name can never silently drop auth.
+    for name in &req.admin_auth {
+        let known = name == "admin-tokens" || (cfg!(test) && name == "test-scope-module");
+        if !known {
+            return err_json(&AdminError::Validation(format!(
+                "admin_auth names unknown module '{name}'; the built-in admin module is                  `admin-tokens` (external admin modules are registered at compile time)"
+            )));
+        }
+    }
+    if req.admin_auth.is_empty() {
+        tracing::warn!(
+            "PUT /admin/v1/auth applied an EMPTY admin_auth chain — the admin API is now the              open (anonymous, full-authority) dev posture"
+        );
+    }
+    // Candidate app with the new chain.
+    let mut next = (*current).clone();
+    next.config_version = current.config_version.wrapping_add(1);
+    next.admin_chain = req.admin_auth.clone();
+    // D4 DRY-RUN GUARD: this very request's carriers, evaluated under the CANDIDATE chain.
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::auth::AuthMiddleware::extract_bearer_token);
+    let header_tok = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let survives = matches!(
+        crate::auth::dry_run_admin_scope(&next, bearer.as_deref(), header_tok.as_deref()),
+        Some(crate::admin::v1::contract::Scope::Full)
+    );
+    if !survives {
+        audit::AUDIT.record_by(
+            "auth.admin_chain_put",
+            "auth:admin_auth",
+            audit::OUTCOME_REJECTED,
+            principal.actor_id(),
+        );
+        return err_json(&AdminError::Conflict(
+            "the new admin_auth chain would not grant THIS caller full scope — refusing to lock              you out. Authenticate with a credential the new chain accepts (at full scope) and              retry, or change the chain in config.yaml and restart"
+                .into(),
+        ));
+    }
+    handle.swap(Arc::new(next));
+    audit::AUDIT.record_by(
+        "auth.admin_chain_put",
+        "auth:admin_auth",
+        audit::OUTCOME_APPLIED,
+        principal.actor_id(),
+    );
+    let cur = handle.load();
+    cur.versions.record(
+        cur.config_version,
+        principal.actor_id(),
+        "auth.admin_chain_put",
+        &cur.hook_registry,
+        &cur.global_hooks,
+    );
+    ok_json(
+        StatusCode::OK,
+        &json!({
+            "applied": true,
+            "admin_auth": req.admin_auth,
+            "config_version": cur.config_version,
+            "note": "live until the next config reload/restart returns to disk truth; persist by updating config.yaml"
+        }),
+    )
 }
 
 /// `POST /admin/v1/auth/cache/flush` — INSTANT REVOCATION of the credential cache's
@@ -1134,6 +1242,17 @@ fn openapi_doc() -> serde_json::Value {
             }
         }),
     );
+    if let Some(auth_path) = paths.get_mut("/admin/v1/auth") {
+        auth_path["put"] = json!({
+            "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
+            "security": [{"adminToken": []}],
+            "responses": {
+                "200": {"description": "`{applied, admin_auth, config_version, note}`"},
+                "400": {"description": "Unknown module / malformed body (error code `invalid_request`)"},
+                "409": {"description": "Stale `expected_version`, or the new chain would lock the caller out (error code `conflict`)"}
+            }
+        });
+    }
     paths.insert(
         "/admin/v1/auth/cache/flush".to_string(),
         json!({

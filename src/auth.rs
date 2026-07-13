@@ -277,7 +277,7 @@ impl AuthMiddleware {
     /// Extract the token from an `Authorization: Bearer <token>` header (scheme match is
     /// case-insensitive). Splits on the first space rather than byte-slicing, so a malformed header
     /// with a multibyte character in the scheme position can't panic on a UTF-8 boundary.
-    fn extract_bearer_token(auth_header: &str) -> Option<String> {
+    pub(crate) fn extract_bearer_token(auth_header: &str) -> Option<String> {
         let (scheme, token) = auth_header.split_once(' ')?;
         if scheme.eq_ignore_ascii_case(AUTH_SCHEME_BEARER) && !token.is_empty() {
             Some(token.to_string())
@@ -613,6 +613,29 @@ fn module_admin_scope_cap(
             .and_then(Scope::parse)
             .unwrap_or(Scope::ReadOnly),
     )
+}
+
+/// D4 DRY-RUN: evaluate what EFFECTIVE admin scope the presented carriers would earn under
+/// `app`'s admin chain (chain verdict → group_map resolution → module ceiling), without serving
+/// anything. `None` = denied / no grant. `PUT /admin/v1/auth` runs the CALLER through the
+/// CANDIDATE chain with this before committing — a chain that would lock the caller out is
+/// rejected instead of applied (Matthew's D4 ruling; restart remains the backstop).
+pub(crate) fn dry_run_admin_scope(
+    app: &crate::state::App,
+    bearer: Option<&str>,
+    header: Option<&str>,
+) -> Option<crate::admin::v1::contract::Scope> {
+    let (verdict, cap) = run_admin_chain(app, bearer, header);
+    let principal = match verdict {
+        ChainVerdict::Identified(p) => Some(p),
+        ChainVerdict::Open => None,
+        ChainVerdict::Denied => return None,
+    };
+    let scope = admin_scope_for(principal.as_ref(), &app.group_map);
+    match (scope, cap) {
+        (Some(s), Some(c)) => Some(std::cmp::min(s, c)),
+        (s, _) => s,
+    }
 }
 
 /// Resolve a principal's ADMIN SCOPE — the authorization half, operator-owned by construction:

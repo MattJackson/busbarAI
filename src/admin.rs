@@ -1949,6 +1949,132 @@ providers: {}
         handle.abort();
     }
 
+    /// `PUT /admin/v1/auth` end-to-end with the D4 dry-run guard: a chain that would lock the
+    /// CALLER out is a 409 and nothing changes; a chain the caller survives applies atomically
+    /// (the old credential stops working on the very next request, the surviving one carries on);
+    /// unknown modules and stale expected_version reject.
+    #[tokio::test]
+    async fn test_admin_v1_put_auth_dry_run_guard() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            // Chain starts as BOTH modules (so both credentials work); group_map + an explicit
+            // full ceiling make `grp:admins` a full principal through the external stand-in.
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "admins".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                },
+            );
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: None,
+                    max_admin_scope: Some("full".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let put = |tok: &'static str, body: serde_json::Value| {
+            client
+                .put(format!("http://{addr}/admin/v1/auth"))
+                .header("x-admin-token", tok)
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send()
+        };
+
+        // Unknown module: 400, nothing changes.
+        let r = put("admintok", serde_json::json!({"admin_auth": ["saml"]}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            400,
+            "unknown module is invalid_request"
+        );
+
+        // Stale expected_version: 409.
+        let r = put(
+            "admintok",
+            serde_json::json!({"admin_auth": ["admin-tokens"], "expected_version": 999}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 409, "stale expected_version conflicts");
+
+        // THE D4 GUARD: the operator token would NOT survive a chain of only the external module
+        // (its credential has no grp: shape — all-Pass denies). 409, and the operator still works.
+        let r = put(
+            "admintok",
+            serde_json::json!({"admin_auth": ["test-scope-module"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            409,
+            "a chain that locks the caller out is refused"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "conflict");
+        let r = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "nothing changed on the refusal");
+
+        // The SAME change made by a caller who survives it (a full group-mapped principal through
+        // the external module) applies…
+        let r = put(
+            "grp:admins",
+            serde_json::json!({"admin_auth": ["test-scope-module"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            200,
+            "the surviving caller's change applies"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["applied"], true);
+
+        // …after which the operator token no longer authenticates (it is not in the chain)…
+        let r = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "the dropped module's credential stops working immediately"
+        );
+
+        // …and the surviving credential carries on.
+        let r = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "grp:admins")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+
+        handle.abort();
+    }
+
     /// Idempotent mint + optimistic concurrency: a retried POST with the same Idempotency-Key
     /// returns the FIRST response (same id + secret, no double-create); a PATCH with a stale
     /// If-Match is a 409 that changes nothing; a fresh If-Match succeeds.
