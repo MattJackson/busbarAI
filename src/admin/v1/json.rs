@@ -1194,7 +1194,8 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "201": {"description": "Registered (body is the hook definition)"},
                     "400": {"description": "Malformed body or invalid definition (`invalid_request`)"},
-                    "409": {"description": "Grant change on an existing hook (`conflict`, §6.4 immutability)"}
+                    "403": {"description": "hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)"},
+                    "409": {"description": "Grant change on an existing hook, or stale `expected_version` (`conflict`, §6.4)"}
                 }
             }),
         );
@@ -1424,6 +1425,93 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "Verdict `{ok, errors}` (even for an invalid config)"},
                     "400": {"description": "Malformed request body (error code `invalid_request`)"}
+                }
+            }
+        }),
+    );
+
+    // Virtual-key management (mounted in main.rs, not the v1 router, but part of the frozen v1
+    // surface — must be discoverable). The secret is shown ONCE at create/rotate and never read back.
+    paths.insert(
+        "/admin/v1/keys".to_string(),
+        json!({
+            "get": {
+                "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "Key metadata list + total"},
+                    "401": {"description": "Missing/invalid admin credential"}
+                }
+            },
+            "post": {
+                "summary": "Mint a virtual key. The secret is returned EXACTLY once. Honors an `Idempotency-Key` header (per-principal ~10min replay)",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "201": {"description": "Created (body includes the once-shown secret)"},
+                    "400": {"description": "Malformed body / invalid budget or rate (`invalid_request`)"},
+                    "409": {"description": "An Idempotency-Key request is already in flight (`conflict`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/keys/{id}".to_string(),
+        json!({
+            "get": {
+                "summary": "One key's metadata + `ETag` (never the secret/hash)",
+                "security": [{"adminToken": []}],
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {
+                    "200": {"description": "Key metadata (+ `ETag` header)"},
+                    "404": {"description": "Unknown key (`not_found`)"}
+                }
+            },
+            "patch": {
+                "summary": "Update budget / rate / enabled. Optional `If-Match` for optimistic concurrency",
+                "security": [{"adminToken": []}],
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {
+                    "200": {"description": "Updated metadata"},
+                    "400": {"description": "Invalid budget/rate (`invalid_request`)"},
+                    "404": {"description": "Unknown key (`not_found`)"},
+                    "409": {"description": "Stale `If-Match` ETag (`conflict`)"}
+                }
+            },
+            "delete": {
+                "summary": "Revoke a key — it stops resolving immediately",
+                "security": [{"adminToken": []}],
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {
+                    "200": {"description": "Revoked"},
+                    "404": {"description": "Unknown key (`not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/keys/{id}/usage".to_string(),
+        json!({
+            "get": {
+                "summary": "Current-window usage for one key (spend / tokens / requests)",
+                "security": [{"adminToken": []}],
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {
+                    "200": {"description": "Usage counters"},
+                    "404": {"description": "Unknown key (`not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/keys/{id}/rotate".to_string(),
+        json!({
+            "post": {
+                "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving",
+                "security": [{"adminToken": []}],
+                "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {
+                    "200": {"description": "Rotated (body includes the once-shown new secret)"},
+                    "404": {"description": "Unknown key (`not_found`)"}
                 }
             }
         }),

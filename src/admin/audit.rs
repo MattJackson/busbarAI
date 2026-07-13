@@ -14,7 +14,7 @@ use serde::Serialize;
 
 /// One admin audit record. `outcome` is a stable token tooling can branch on. The record is
 /// HASH-CHAINED for tamper-EVIDENCE (§6.7): `hash = sha256(prev_hash | seq | ts | action | resource |
-/// outcome)`, and `prev_hash` is the preceding entry's `hash`. Recomputing the chain detects any
+/// outcome | principal)`, and `prev_hash` is the preceding entry's `hash`. Recomputing the chain detects any
 /// altered/reordered/deleted entry (detection, not prevention — a compromised host can still rewrite
 /// the whole chain; prevention is shipping the log off-box to a SIEM).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -37,7 +37,7 @@ pub(crate) struct AuditEntry {
     /// The preceding entry's `hash` (empty for the first entry of the process, or the oldest retained
     /// entry whose predecessor was pruned).
     pub(crate) prev_hash: String,
-    /// `sha256(prev_hash | seq | ts | action | resource | outcome)` — the tamper-evidence digest.
+    /// `sha256(prev_hash | seq | ts | action | resource | outcome | principal)` — the tamper-evidence digest.
     pub(crate) hash: String,
 }
 
