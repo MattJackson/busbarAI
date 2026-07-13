@@ -26,6 +26,13 @@ pub(crate) const API_ROOT: &str = "/api";
 /// of truth, drift-proof by construction — see `admin::transport::mount`).
 pub(crate) const ADMIN_PREFIX: &str = "/api/v1/admin";
 
+/// Relative (post-`ADMIN_PREFIX`) path segments matched in more than one place — the scope matrix
+/// (`required_scope`), auth.rs's mutation-rate classifier, and the json.rs router/OpenAPI builder —
+/// single-sourced here so the three surfaces cannot drift.
+pub(crate) const PATH_ADMIN_AUTH: &str = "/admin-auth";
+pub(crate) const PATH_CONFIG_VALIDATE: &str = "/config/validate";
+pub(crate) const PATH_HOOKS: &str = "/hooks";
+
 /// The three built-in authorization scopes, totally ordered `ReadOnly ⊂ HooksRegister ⊂ Full`
 /// (design-admin-api-v1 §1). Authorization is checked on the PRINCIPAL per endpoint and is NEVER
 /// derived from the request body, so a crafted request cannot escalate. `Ord` derives from
@@ -101,10 +108,10 @@ pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
     // `POST /config/validate` is a STATELESS DRY-RUN — a read in POST clothing (the body is the
     // config to lint, far past URL length limits). A read-only CI token must be able to lint
     // configs (re-audit M3; the service doc always said "Read scope" — now the matrix agrees).
-    if rel == "/config/validate" {
+    if rel == PATH_CONFIG_VALIDATE {
         return Scope::ReadOnly;
     }
-    if is_mutation && (rel == "/hooks" || rel.starts_with("/hooks/")) {
+    if is_mutation && (rel == PATH_HOOKS || rel.starts_with("/hooks/")) {
         return Scope::HooksRegister;
     }
     Scope::Full

@@ -22,7 +22,7 @@ const X_API_KEY: &str = "x-api-key";
 const X_GOOG_API_KEY: &str = "x-goog-api-key";
 
 /// The header name for the operator admin token carrier (busbar-proprietary surface).
-const X_ADMIN_TOKEN: &str = "x-admin-token";
+pub(crate) const X_ADMIN_TOKEN: &str = "x-admin-token";
 /// The Bearer auth-scheme token (case-insensitive match in `extract_bearer_token`).
 const AUTH_SCHEME_BEARER: &str = "bearer";
 /// The liveness-probe path that bypasses auth entirely.
@@ -758,7 +758,10 @@ fn rate_limited_response() -> Response {
     })
     .to_string();
     Response::builder()
-        .header(axum::http::header::RETRY_AFTER, "60")
+        .header(
+            axum::http::header::RETRY_AFTER,
+            crate::admin::rate::MUTATION_RATE_WINDOW_SECS.to_string(),
+        )
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
@@ -914,8 +917,9 @@ pub(crate) async fn auth_middleware(
             // `/config/validate` is a stateless dry-run (read-only scope, no blast radius) — it
             // meters in the roomy CRUD class so a CI pipeline linting configs never contends with
             // the 10/min budget that guards real config mutations (re-audit M3).
-            let class = if (rel.starts_with("/config/") && rel != "/config/validate")
-                || rel == "/admin-auth"
+            let class = if (rel.starts_with("/config/")
+                && rel != crate::admin::v1::contract::PATH_CONFIG_VALIDATE)
+                || rel == crate::admin::v1::contract::PATH_ADMIN_AUTH
             {
                 crate::admin::rate::MutationClass::Config
             } else {

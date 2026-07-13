@@ -10,6 +10,11 @@
 
 use std::collections::HashMap;
 
+/// Fixed mutation-rate window length (seconds). Also the `Retry-After` value `auth.rs`'s
+/// `rate_limited_response` advertises on a 429 — derived from this const so the advertised
+/// back-off always equals the real window.
+pub(crate) const MUTATION_RATE_WINDOW_SECS: u64 = 60;
+
 /// The mutation classes with distinct budgets. `Config` = apply/rollback (the blast-radius class);
 /// `Crud` = everything else that mutates (hooks, keys).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,7 +63,7 @@ impl MutationLimiter {
     /// Returns `false` when the budget for the current window is exhausted (the caller responds
     /// 429 and audits). Never panics (poisoned lock recovered).
     pub(crate) fn check(&self, principal: &str, class: MutationClass, now: u64) -> bool {
-        let window = now - (now % 60);
+        let window = now - (now % MUTATION_RATE_WINDOW_SECS);
         let mut guard = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
         // Opportunistic sweep: drop every entry from a PAST window (each principal-class re-inserts

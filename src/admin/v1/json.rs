@@ -19,7 +19,7 @@ use axum::{extract::Path, extract::Query, Router};
 use serde::Serialize;
 use serde_json::json;
 
-use super::contract::AdminError;
+use super::contract::{AdminError, PATH_ADMIN_AUTH, PATH_CONFIG_VALIDATE, PATH_HOOKS};
 use super::service::{build_with_hook, build_with_registry, build_without_hook, AdminService};
 use crate::admin::audit;
 use crate::admin::transport::AdminTransport;
@@ -56,7 +56,7 @@ impl AdminTransport for JsonV1 {
             .route("/pools/{name}", get(get_pool))
             .route("/models", get(list_models))
             .route("/providers", get(list_providers))
-            .route("/hooks", get(list_hooks).post(register_hook))
+            .route(PATH_HOOKS, get(list_hooks).post(register_hook))
             .route(
                 "/hooks/{name}",
                 get(get_hook).put(put_hook).delete(delete_hook),
@@ -67,11 +67,11 @@ impl AdminTransport for JsonV1 {
             .route("/hooks/{name}/status", get(hook_status))
             .route("/plugins", get(list_plugins))
             .route("/auth", get(get_auth))
-            .route("/admin-auth", get(get_admin_auth).put(put_auth))
+            .route(PATH_ADMIN_AUTH, get(get_admin_auth).put(put_auth))
             .route("/usage", get(get_usage))
             .route("/config", get(get_config))
             .route("/audit", get(get_audit))
-            .route("/config/validate", post(validate_config))
+            .route(PATH_CONFIG_VALIDATE, post(validate_config))
             .route("/config/versions", get(list_config_versions))
             .route("/config/versions/{v}", get(get_config_version))
             .route("/config/diff", get(config_diff))
@@ -1004,7 +1004,7 @@ async fn put_auth(
         .and_then(|v| v.to_str().ok())
         .and_then(crate::auth::AuthMiddleware::extract_bearer_token);
     let header_tok = headers
-        .get("x-admin-token")
+        .get(crate::auth::X_ADMIN_TOKEN)
         .and_then(|v| v.to_str().ok())
         .filter(|t| !t.is_empty())
         .map(str::to_string);
@@ -1508,7 +1508,7 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     ),
     ("/models", "Model lanes + upstream providers"),
     ("/providers", "Distinct providers + lane counts"),
-    ("/hooks", "Hook registry (definitions)"),
+    (PATH_HOOKS, "Hook registry (definitions)"),
     (
         "/plugins",
         "Plugin catalog by type (compiled-in + external)",
@@ -1518,7 +1518,7 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
         "Ingress auth chain + upstream-credential mode",
     ),
     (
-        "/admin-auth",
+        PATH_ADMIN_AUTH,
         "Admin-plane auth config (the admin surface guard)",
     ),
     (
@@ -1562,7 +1562,10 @@ fn openapi_doc() -> serde_json::Value {
         );
     }
     // Runtime hook registration: POST on the /hooks collection (merged onto its GET entry above).
-    if let Some(obj) = paths.get_mut(&ap("/hooks")).and_then(|p| p.as_object_mut()) {
+    if let Some(obj) = paths
+        .get_mut(&ap(PATH_HOOKS))
+        .and_then(|p| p.as_object_mut())
+    {
         obj.insert(
             "post".to_string(),
             json!({
@@ -1776,7 +1779,7 @@ fn openapi_doc() -> serde_json::Value {
             }
         }),
     );
-    if let Some(auth_path) = paths.get_mut(&ap("/admin-auth")) {
+    if let Some(auth_path) = paths.get_mut(&ap(PATH_ADMIN_AUTH)) {
         auth_path["put"] = json!({
             "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
             "security": [{"adminToken": []}],
@@ -1816,7 +1819,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        ap("/config/validate"),
+        ap(PATH_CONFIG_VALIDATE),
         json!({
             "post": {
                 "summary": "Dry-run validate a proposed config",
@@ -2069,11 +2072,11 @@ fn openapi_doc() -> serde_json::Value {
     // advertise a guard they don't enforce. Keys PATCH/DELETE guard on the KEY's own ETag; the
     // config-plane ops guard on the config-version ETag their reads emit.
     const IF_MATCH_GUARDED: &[(&str, &str)] = &[
-        ("/hooks", "post"),
+        (PATH_HOOKS, "post"),
         ("/hooks/{name}", "put"),
         ("/hooks/{name}", "delete"),
         ("/hooks/{name}/settings", "patch"),
-        ("/admin-auth", "put"),
+        (PATH_ADMIN_AUTH, "put"),
         ("/config/apply", "post"),
         ("/config/rollback", "post"),
         ("/keys/{id}", "patch"),
@@ -2112,7 +2115,7 @@ fn openapi_doc() -> serde_json::Value {
         },
         "components": {
             "securitySchemes": {
-                "adminToken": {"type": "apiKey", "in": "header", "name": "x-admin-token"},
+                "adminToken": {"type": "apiKey", "in": "header", "name": crate::auth::X_ADMIN_TOKEN},
                 "bearerAuth": {"type": "http", "scheme": "bearer",
                                "description": "The same operator credential via Authorization: Bearer"}
             },

@@ -298,6 +298,12 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
     )
 }
 
+/// The request header carrying a client-chosen idempotency token on the two replayable admin
+/// mutations (key mint + key rotate).
+const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+/// Replay window (seconds, ~10 min) for the idempotency cache; stale entries are swept on use.
+const IDEMPOTENCY_TTL_SECS: u64 = 600;
+
 /// An in-flight idempotency RESERVATION. `create_key` inserts a `Null`-body sentinel under the
 /// cache lock the instant it decides to mint (atomic with the "already cached?" check), so a
 /// concurrent retry with the same `Idempotency-Key` sees the reservation and is rejected instead
@@ -340,7 +346,7 @@ pub(crate) async fn create_key(
     // standard idempotency contract: a retry is the same request, not a second mint) instead of
     // double-creating. Bounded: stale entries are swept on every use.
     let idem_key = headers
-        .get("idempotency-key")
+        .get(IDEMPOTENCY_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
         .map(str::to_string);
@@ -353,7 +359,7 @@ pub(crate) async fn create_key(
             .idempotency_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
+        cache.retain(|_, (t, _)| now.saturating_sub(*t) < IDEMPOTENCY_TTL_SECS);
         match cache.get(ck) {
             // A COMPLETED prior mint (the real 201 object): replay it verbatim.
             Some((_, cached)) if !cached.is_null() => {
@@ -840,7 +846,7 @@ pub(crate) async fn rotate_key(
     // operation + key id so a create and a rotate sharing a header value can never replay each
     // other's response.
     let idem_ckey: Option<(String, String)> = headers
-        .get("idempotency-key")
+        .get(IDEMPOTENCY_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
         .map(|k| (actor.clone(), format!("rotate:{id}:{k}")));
@@ -850,7 +856,7 @@ pub(crate) async fn rotate_key(
             .idempotency_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
+        cache.retain(|_, (t, _)| now.saturating_sub(*t) < IDEMPOTENCY_TTL_SECS);
         match cache.get(ck) {
             Some((_, cached)) if !cached.is_null() => {
                 return json_response(StatusCode::OK, cached.clone());
