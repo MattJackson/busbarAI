@@ -273,10 +273,13 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             .as_deref()
             .map(host_is_private_or_loopback)
             .unwrap_or(false);
+        // Case-INSENSITIVE scheme check (RFC 3986 §3.1) — a raw `starts_with("https://")` rejected
+        // the valid uppercase spelling reqwest would accept, and diverged from the webhook guard's
+        // `scheme_is`. (found: audit c2r5.)
         let scheme_ok =
-            base_url.starts_with("https://") || (host_is_local && base_url.starts_with("http://"));
+            scheme_is(base_url, "https") || (host_is_local && scheme_is(base_url, "http"));
         if !scheme_ok {
-            errors.push(if base_url.starts_with("http://") {
+            errors.push(if scheme_is(base_url, "http") {
                 // An http:// scheme that failed the check ⇒ the host is public (or unparseable):
                 // plaintext to a public host would leak the key.
                 format!(
@@ -1301,12 +1304,25 @@ fn percent_decode_host(host: &str) -> String {
 /// reason over the EXACT host the connecting stack will, so neither can be bypassed by an authority
 /// trick (backslash, userinfo flip, percent-encoded dots, trailing dot) that only one of them
 /// normalized away.
+/// `url`'s scheme equals `scheme`, compared CASE-INSENSITIVELY per RFC 3986 §3.1 — the same guard
+/// `observability::scheme_is` uses for webhook URLs. A raw `starts_with("https://")` rejects the
+/// valid uppercase spelling `HTTPS://host/` that reqwest's `Url::parse` lowercases and accepts, so
+/// the provider base_url scheme check must match the webhook guard's case-insensitivity. (audit c2r5.)
+fn scheme_is(url: &str, scheme: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case(scheme))
+}
+
+/// Strip an `http`/`https` scheme case-insensitively, returning the authority+path remainder.
+fn strip_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")).then_some(rest)
+}
+
 fn extract_normalized_host(url: &str) -> Option<String> {
-    // Strip the scheme. The host extraction is scheme-agnostic; accept either prefix so an
-    // `http://` upstream is still run through the metadata block.
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
+    // Strip the scheme (case-insensitively — see `scheme_is`). The host extraction is
+    // scheme-agnostic; accept either prefix so an `http://` upstream is still metadata-checked.
+    let rest = strip_scheme(url)?;
     // Normalize backslashes to forward slashes BEFORE splitting the authority. `https` is a WHATWG
     // "special" scheme, so reqwest's `url` crate converts every `\` to `/` while parsing — meaning a
     // `base_url` like `https://10.0.0.1\x.allowed.com` is parsed by reqwest with authority `10.0.0.1`
@@ -4190,6 +4206,28 @@ models:
             validate(&cfg).is_ok(),
             "the supported 'session' affinity mode must validate"
         );
+    }
+
+    /// REGRESSION (audit c2r5): the provider `base_url` scheme check is CASE-INSENSITIVE (RFC 3986
+    /// §3.1) — an uppercase `HTTPS://` (which reqwest lowercases and accepts) must validate, not be
+    /// rejected with a misleading "must use http or https". Mirrors the webhook guard's `scheme_is`.
+    #[test]
+    fn test_validate_accepts_uppercase_url_scheme() {
+        let (mut providers, models, _) = valid_maps();
+        // Point an existing provider at an uppercase-scheme https URL.
+        if let Some((_, p)) = providers.iter_mut().next() {
+            p.base_url = "HTTPS://api.example.com".to_string();
+        }
+        let cfg = make_root_cfg(providers, models, HashMap::new());
+        assert!(
+            validate(&cfg).is_ok(),
+            "an uppercase HTTPS:// scheme is RFC-valid and must not be rejected: {:?}",
+            validate(&cfg)
+        );
+        // The scheme helper itself is case-insensitive and anchored on `://`.
+        assert!(scheme_is("HTTPS://h", "https"));
+        assert!(scheme_is("Http://h", "http"));
+        assert!(!scheme_is("httpsx://h", "https"));
     }
 
     /// REGRESSION (audit c2r3): an EMPTY `affinity.header_name` must be REJECTED at boot. It passes
