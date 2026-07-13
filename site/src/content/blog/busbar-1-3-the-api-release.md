@@ -1,156 +1,101 @@
 ---
-title: "Busbar 1.3: The API Release"
-description: "Everything you could only do by editing YAML and restarting, you now do over one authenticated, audited, frozen HTTP API — read the running config, apply a validated change atomically, roll back to any version, mint and revoke keys, register hooks. And the routing hook grew into a hook system: gates, taps, and rewrites on every request."
+title: "Busbar 1.3: your code on the request path"
+description: "Hooks put your logic on the normalized request path across all six protocols. Auth becomes a pluggable chain you can compile out. And the admin API v1 is frozen: the surface tools get to build on."
 date: 2026-07-14
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---
 
-For its whole life so far, Busbar has been driven by a file. You wrote `config.yaml`, you restarted the process, and the running gateway was whatever the file said the last time it booted. That is a fine way to run a daemon and a terrible way to run a **control plane**. A control plane is something other software drives, and other software does not SSH in and edit YAML.
+**Busbar 1.3 is the API release.** 1.0 froze the data plane: the six wire protocols your apps
+speak. 1.3 freezes the two surfaces everything else builds on. **Hooks**, the sanctioned
+attachment points for your own code on the request path, and **admin API v1**, the management
+contract that will only ever grow.
 
-So the headline of **1.3 is the API**. Everything the config file can express, the API can now do — over one authenticated surface, live, with no restart and no file edit. Read the running config. Apply a validated change atomically. Roll back to any previous version. Register, replace, or remove a hook. Mint, rotate, or revoke a key. Adjust budgets and rate limits. From Terraform, Ansible, CI, or a dashboard you build yourself. The whole surface is **`/api/v1/admin`**, versioned, and frozen additive-only.
+## Hooks: write it once, it runs on everything
 
-And the second half of the release: the routing hook I've written about grew up into a hook **system**. What was one seam — rank a pool's members — is now gates, taps, and rewrites, firing concurrently on every request, on the normalized IR, so one hook works across all six protocols at once.
+A hook is your own code. A compiled binary on a local Unix socket (~8µs a call) or an HTTPS
+sidecar in any language, running on Busbar's normalized IR: the canonical form every request
+takes after lossless translation from whatever dialect the caller spoke. That placement is the
+whole point. Write a PII screen, a smart router, or a context compressor once and it runs against
+all six protocols and every fronted provider, with failover and circuit breaking underneath it.
 
-## The config file stops being the only way in
+Two kinds, one rule. A **tap** watches: audit, metering, SIEM. It can never delay a request. A
+**gate** decides: reject the request, restrict which pool members may serve it, re-order the
+failover walk, or rewrite the body before it ships. Rewrite is the one I'm most excited about;
+compression and redaction on the wire, with token accounting on the rewritten body, so the
+savings are real and measured. The rule is enforced structurally, not by convention: a hook can
+steer, observe, or rewrite, but it can never break the request path. Slow, crashed, or wrong
+degrades to a safe default. Every time.
 
-Here's the part I care about. This is not a handful of read endpoints bolted onto the side. It is a full config plane, and it holds the same contract the boot pipeline does.
+Hooks are also live infrastructure now. Register and remove them at runtime over the admin API;
+push settings to a running hook, committed only when the hook acknowledges; read back the schema
+the hook describes for itself. And a hook reports its own operational state: `GET
+/api/v1/admin/hooks/{name}/status` is the control-plane read — it live-queries the hook and
+returns the settings it is actually running against Busbar's desired copy, with a **drift**
+verdict, plus the hook's self-reported metrics. A dashboard built on Busbar sees what every plug
+is doing, over the same API. No per-plugin dashboards.
 
-An apply atomically swaps the running config snapshot: new requests see the new config, requests already in flight finish on the old one, and — this is the load-bearing part — surviving lanes keep their learned health **by identity**, not by list position. Reorder your pool members, add a model, and Busbar does not forget which lanes were misbehaving. The health state now even survives a restart: kill Busbar, fix the config, start it again, and it comes back sub-second still remembering which breakers were tripped.
+## Auth is a chain, and you can compile it out
 
-```bash
-# Read the config ETag, then apply a change guarded against it
-ETAG=$(curl -sI -H "x-admin-token: $TOK" \
-  http://localhost:8080/api/v1/admin/config | grep -i ^etag | cut -d' ' -f2)
+Authentication is no longer a mode. It's a chain of modules, PAM-style: the first module to
+identify the caller admits them, a reject stops everything, and modules that don't recognize the
+credential defer down the chain. Today's token auth is now just the first link, and it's
+architecturally identical to anything you'd write yourself.
 
-curl -s -X POST -H "x-admin-token: $TOK" -H "If-Match: $ETAG" \
-  -H 'content-type: application/json' \
-  --data @proposed.json \
-  http://localhost:8080/api/v1/admin/config/apply
-```
+Every built-in lives in its own crate behind a default-on feature. Want to see how tokens work?
+Read `auth/tokens/`; it's about 70 lines against the same contract external modules use. Need to
+prove your deployment contains no token-auth code at all? Build without it. The module, its
+comparison fold, and the allowlist are absent from the binary. **Compliance by compilation**,
+checkable from the symbols. Identity maps to authority in config (`group_map:`), never asserted
+by a module, and admin principals carry scopes: read-only sees, hooks-register can attach hooks
+but can't mint keys, full does everything.
 
-Your hand-written `config.yaml` is never touched. API-applied changes persist to a Busbar-owned overlay file (set `BUSBAR_CONFIG_OVERLAY`), and the effective config is base plus overlay — both human-readable, so "who set this, and when" is always answerable. If an overlay ever goes bad, `--safe-mode` boots from your base config alone. And every mutation lands in an audit log: who changed what, when, attributed to the principal that made it. See the [Admin API guide](/docs/admin-api/).
+## Admin API v1: frozen, so you can build on it
 
-## Endpoints are the easy part. The contract is the product.
+`/api/v1/admin/*` is now a stable contract, additive-only from here. Pools, keys, usage, hooks,
+config: reads for dashboards, mutations with optimistic concurrency, per-principal mutation rate
+limits, and a tamper-evident audit log that attributes every attempt, including the denied ones.
+The whole surface is discoverable from the binary itself (`openapi.json`), with the required scope
+stamped on every operation.
 
-Anyone can expose a hundred routes. What makes an API something you build tooling against for years is that its shape does not move and its edges are consistent. I spent this release on that, not on the route count.
+What makes it a contract and not just a pile of endpoints is that every edge is consistent. One
+error envelope everywhere, and you branch on a frozen `code`, never on the human message, with a
+deliberate split baked into the taxonomy: a retryable `version_conflict` (your `If-Match` is
+stale, re-read and retry) versus a terminal `conflict` (server state a retry can't fix), alongside
+`unauthorized`, `method_not_allowed`, and the rest. One list envelope, `{items, next_cursor}`,
+with opaque cursors. One concurrency mechanism, RFC-7232 `If-Match`/ETag, on every mutable
+resource, no body-level twin to keep in sync. And an `Idempotency-Key` on the secret-minting POSTs,
+so a retried key mint returns the first response verbatim instead of double-minting. I put the
+whole wire through several independent contract-audit rounds and fixed every finding before the
+freeze.
 
-One error envelope, everywhere. Every `/api/v1/admin` error — including a `401`, a `404` on an unmatched path, a `405` on a wrong method — is the same JSON shape, and you branch on a **frozen `code`**, never on the human-facing message:
+Metering is built on the same principle: expose the inputs of cost, not just a number. `GET
+/api/v1/admin/usage` reports per-model and per-key consumption as the raw token split, input,
+output, cache-read, cache-creation, each of which prices differently, with a `spend_micros`
+derived at read time from your configured prices. A consumer with its own negotiated pricing
+reconstructs cost exactly from the split.
 
-```json
-{ "error": { "code": "version_conflict", "message": "If-Match `41` is stale" } }
-```
+Config management got the same treatment. Validate a candidate config without applying it. Apply
+one atomically: in-flight requests finish on the old snapshot, new ones see the new one, and
+surviving lanes keep their learned health. Breakers, cooldowns, latency profiles, all carried by
+model identity across the swap. Reload from disk with one call. Roll back to a retained version.
+And because learned health now persists across restarts, the recovery story for a truly broken
+config is the honest one: fix it and restart. Sub-second, and Busbar comes back remembering which
+lanes were misbehaving.
 
-The taxonomy has one deliberate split that matters if you build automation: a retryable **`version_conflict`** (your `If-Match` is stale — re-read for a fresh ETag and retry) versus a terminal **`conflict`** (the request contradicts server state in a way a retry cannot fix — governance disabled, a base-defined hook, a self-lockout guard). Your retry loop distinguishes those two without ever string-matching a message.
+## Still one binary
 
-Around that error shape sits the rest of one consistent contract:
+Everything above ships in the same single static Rust binary. We roughly doubled the surface (hooks,
+auth chains, the whole config plane) and the `FROM scratch` Docker image is still about 5 MB. The
+default path, with no hooks and no chains configured, is byte-identical to 1.2; the zero-cost floor
+is a design rule, not an accident. Over 2,000 tests, the full suite green with every plugin compiled
+out, on Linux, macOS, and Windows.
 
-- **One list envelope** — `{items, next_cursor}` — with opaque cursors. Round-trip `next_cursor` verbatim; a foreign or malformed cursor is a loud `400`, never a silent skip.
-- **One concurrency mechanism** — RFC-7232 `If-Match`/ETag on every mutable resource. There is no second body-level `expected_version` twin to keep in sync. A malformed `If-Match` is a `400`, never silently treated as "no guard".
-- **`Idempotency-Key`** on both secret-minting POSTs (`POST /keys`, `POST /keys/{id}/rotate`), so a retried mint returns the first response verbatim — including the once-shown secret — instead of double-minting.
-- **A self-describing `openapi.json`** — the OpenAPI 3.1 schema of the whole surface, with each operation annotated with its required scope. Point a client generator at it.
+## What's next
 
-I put the wire through **three independent contract-audit rounds on the Admin API and two on the hook wire**, and fixed every finding before the freeze. That freeze is the actual deliverable: v1 is additive-only. New fields may appear; no field is ever removed or repurposed; no error `code` ever changes meaning; the mount prefix and the scope matrix are pinned by tests. A breaking change would ship as `/admin/v2/` alongside v1 — never in place. Build against v1 and it keeps working. If you've ever built tooling on an API that quietly re-shaped a field under you, you know why I spent the release here.
+Hooks make Busbar the place your middleware runs; the frozen admin API makes it the thing your
+tooling manages. Next is filling both ecosystems in, starting with a context-compression hook
+we'll have more to say about very soon.
 
-## The routing hook grew into a hook system
-
-The other half of 1.3. For the last few posts the hook has been one thing: rank a pool's members. Now hooks are **control-plane citizens** with three jobs.
-
-Every hook is one of two kinds. A **tap** watches — fire-and-forget observation (logging, audit, metering, shipping to a SIEM) that can never delay or fail a request, and picks its stage with `at:` (`request`, `route`, `attempt`, `completion`, including the synthetic rejected-completion so an audit tap sees denials, not just served traffic). A **gate** decides — fire-and-wait, answering with exactly one reply arm:
-
-| Arm | Effect |
-|---|---|
-| nothing / abstain | no opinion; Busbar proceeds as it would |
-| **reject** | no upstream dispatched; caller gets a dialect-native error (status clamped 400–499) |
-| **restrict** | only members carrying these `tags` may serve — and it holds across failover |
-| **order** | rank the surviving candidates; that becomes the failover walk |
-| **rewrite** | replace the request body before dispatch |
-
-Routes rank, gates decide, taps watch. The `restrict` arm is the one I'm most pleased with: a gate can reply "only members tagged `baa` may serve this," and the restriction persists across every failover hop — compliance-constrained routing (data residency, BAA-only lanes) without teaching your router a thing about compliance.
-
-Hooks are defined once by name and referenced anywhere — in a pool's `hooks:` list (which carries both its ranking strategy and any gates) or in `global_hooks:` to fire on every request:
-
-```yaml
-hooks:
-  request-log:  { kind: tap,  socket: /run/busbar/log.sock,  prompt: ro }
-  pii-guard:    { kind: gate, socket: /run/busbar/pii.sock,  prompt: ro, on_error: reject }
-  headroom:     { kind: gate, socket: /run/busbar/hr.sock,   prompt: rw, global: true }
-
-global_hooks: [request-log, pii-guard]     # attach to EVERY request
-
-pools:
-  chat:
-    hooks: [cheapest, pii-guard]           # base ordering + a gate
-    members:
-      - target: claude-opus
-      - target: claude-opus-bedrock
-        tags: ["baa"]
-```
-
-All of a request's gates fire **concurrently** against the same candidate set, then reconcile deterministically: any reject wins, restrictions intersect, the last order in the priority chain ranks what survives. So the added latency is the slowest gate, not the sum.
-
-Three properties make this safe to run on the request path, and they are structural, not conventional. It's **fail-safe**: a slow, crashed, or wrong hook degrades to a safe default per its `on_error` and can never block, hang, or fail a request. It's **grant-gated**: by default a hook sees shapes — sizes, counts, flags, live lane signals — never prompt text or caller identity; content and identity arrive only by explicit per-hook grant (`prompt:`/`user:`), and those grants are immutable after registration, so you cannot wire a hook in blind and quietly raise it to read content later. And it's **cross-protocol by construction**: hooks fire on the normalized IR, after the request is understood and before dispatch, so **one hook works across every protocol and provider at once**. The full contract is in the [hooks guide](/docs/hooks/).
-
-## The rewrite arm, across all six protocols
-
-The newest arm deserves its own note. A trusted gate carrying `prompt: rw` can replace the request body before dispatch — context compression, redaction — and because it fires on the normalized form, one rewrite hook works across all six protocols at once. Rewrites persist across failover, token accounting is on the provider-reported usage of the **rewritten** body (so the savings are real and measured, not estimated off to the side), and a malformed or slow rewrite proceeds with the original body untouched. A broken compressor can never corrupt a request. That's the subject of the next post — a compression gate that reports its own savings.
-
-## "Your AI Control Plane" now extends to what runs on it
-
-Here's where the two halves of the release meet. Busbar is your AI control plane — and in 1.3 that reaches past Busbar itself to the hooks running on it. A hook **self-describes its settings** and **self-reports its own operational metrics**, both over the same frozen Admin API that manages everything else:
-
-```bash
-# Push new settings to a running hook — commits only on the hook's version-echoing ack
-curl -s -X PATCH -H "x-admin-token: $TOK" -H 'content-type: application/json' \
-  --data '{"min_savings_pct":25}' \
-  http://localhost:8080/api/v1/admin/hooks/headroom/settings
-
-# Is it running what we pushed? desired vs reported, with a drift verdict
-curl -s -H "x-admin-token: $TOK" \
-  http://localhost:8080/api/v1/admin/hooks/headroom/status
-```
-
-`GET /hooks/{name}/schema` proxies the hook's own settings JSON Schema verbatim — one declaration that any tooling reading JSON Schema renders as a config form. `GET /hooks/{name}/status` live-queries the hook over its transport and returns `{name, desired, reported, drift, metrics, as_of, source}` — the settings it is *actually* running against Busbar's desired copy, with a **drift** verdict you can alert on, plus its self-reported metrics.
-
-The point: a dashboard built on Busbar sees what every plug is doing, through one API. No per-plugin dashboards, no second box to run. I'll walk the whole self-reporting wire — schema, drift, and the Prometheus-shaped metrics array — in the next post on the Headroom compression gate.
-
-## FinOps: Busbar exposes the inputs of cost, not just its own number
-
-`GET /api/v1/admin/usage` is the fleet FinOps read, and it's built on one principle. It reports per-model and per-key consumption as the **raw token split** — input, output, cache-read, and cache-creation, each of which prices differently — in fixed UTC-day buckets:
-
-```json
-{
-  "window": { "start": 1782950400, "end": 1783036800 },
-  "as_of": 1782998113,
-  "currency": "USD",
-  "total": { "tokens_input": 91240, "tokens_output": 30112,
-             "tokens_cache_read": 402000, "tokens_cache_creation": 12050,
-             "requests": 512, "spend_micros": 1834200 },
-  "by_model": [ { "model": "smart", "provider": "anthropic", "tokens_input": 91240 } ],
-  "by_key":   [ { "id": "vk_ab12cd34ef56ab78", "name": "ci", "tokens_input": 91240 } ],
-  "by_key_truncated": false
-}
-```
-
-`spend_micros` is derived at read time from your configured prices — a convenience, and explicitly a **mutable estimate**, never a ledger charge. The reason the raw split is right there next to it: a consumer with its own negotiated per-model pricing reconstructs cost *exactly* from the split, using its own price catalog. Busbar exposes the inputs of cost, not just its own number. And every unit stays attributable — an over-cap `by_key` list carries an `others` remainder so `total == sum(by_key) + others` always holds.
-
-## Auth, governance, and health, briefly
-
-A few more things landed under the same banner, so I'll keep them short:
-
-- **Auth is a pluggable chain.** Authentication is now an ordered chain of modules — each identifies the caller, rejects, or passes to the next. Token auth is the first module and the default, and it's removable. Auth always fails closed. Budgets, rate limits, pool access, and audit all follow the authenticated principal, whoever issued it.
-- **The admin surface has its own chain and scopes.** A scope ladder — `read-only` ⊂ `hooks-register` ⊂ `full`, derived from method + path, never the body — replaces the single shared admin token. Mint a CI token that can only lint configs, or only register hooks. The chain itself is live-mutable via `PUT /admin-auth`, and guarded so a change that would lock the caller out is refused, not applied.
-- **Group-based governance.** `group_map:` grants admin scopes and data-plane access (allowed pools, rate limits, budgets) to identity-provider groups in one place, and a group-mapped user is governed by exactly the machinery a virtual key uses.
-- **Config reload and durable health.** `POST /config/reload` re-reads your files and applies them atomically — the GitOps primitive: push config, call reload, no restart, no health amnesia.
-
-## Migrating from 1.2
-
-One breaking change, and it's a clean cut. 1.3 reshapes how hooks and policies are configured: hooks are now defined once by name and referenced everywhere, which means the old inline `policy:` block and the transport-named `route:` values (`route: socket`, `route: webhook`) are **removed**. A pool's `route:` now takes a hook name or a native strategy name (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`).
-
-Existing configs need a one-time update — and there are no silent fallbacks. An old-form key reports a clear startup error naming exactly what to write instead. The `route: script` embedded Rhai policy, deprecated in 1.2.1, is also gone; a compiled hook over a socket or an HTTP webhook does the same job with real process isolation. The full walkthrough is the 1.2.x → 1.3 migration guide (`docs/migration-1.3.md`).
-
-## What this sets up
-
-1.3 turns Busbar from a gateway you configure into a control plane you drive. The config file still works exactly as before — it's just no longer the only door. Everything else drives it over a contract that won't move under you, and the hooks running on it report themselves through that same contract.
-
-Get it at **[getbusbar.com](https://getbusbar.com)**. The next post takes the rewrite arm and the self-reporting wire and puts them together: a compression gate you configure and watch entirely through the API, with no second dashboard. If you're building tooling against Busbar, the [Admin API](/docs/admin-api/) and [hooks](/docs/hooks/) guides are the contract — I'd love to hear what you build on it.
+Get it at **[getbusbar.com](https://getbusbar.com)**. If you're running multi-provider LLM
+traffic in production, I'd love to talk.
