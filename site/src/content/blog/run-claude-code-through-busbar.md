@@ -6,7 +6,7 @@ author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---
 
-Claude Code is the best coding agent I've used, and on its own it's a black box pointed straight at
+Claude Code is great as we all know, but on its own it's a black box pointed straight at
 one provider. You can't see what it spends, you can't fail it over when a key rate-limits mid-session,
 and you can't put anything on its path. I wanted it to stay exactly as good as it is — and become
 something I can see, steer, and rely on. That's the whole reason to run it through a control plane.
