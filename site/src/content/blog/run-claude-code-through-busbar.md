@@ -83,12 +83,12 @@ wholly independent of anything Busbar reports — right before the run and right
 
 ```console
 # before
-nova-pro   invocations=15   input_tokens=26,472
+nova-pro   invocations=23   input_tokens=41,726
 # after
-nova-pro   invocations=42   input_tokens=81,636
+nova-pro   invocations=46   input_tokens=86,535
 ```
 
-Twenty-seven invocations and ~55,000 input tokens, all from one Claude Code session that believed it
+Twenty-three invocations and ~45,000 input tokens, all from one Claude Code session that believed it
 was talking to Anthropic. AWS's own console says it was Nova. To swap in Gemini, or to put Claude behind
 two keys with failover, or to add a compression hook — you edit the pool, not the agent.
 
