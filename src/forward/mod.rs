@@ -2745,7 +2745,7 @@ fn coerce_on_error(
 /// this increment: the default signal bucket plus the stage object — never prompt content or caller
 /// identity, regardless of grant (never over-shares; a granted tap still gets content at the
 /// `request` stage).
-struct StageShape<'a> {
+pub(crate) struct StageShape<'a> {
     pool: &'a str,
     ingress_protocol: &'a str,
     message_count: usize,
@@ -2756,7 +2756,7 @@ struct StageShape<'a> {
 }
 
 /// Capture the stage-tap shape from the parsed body (`None` = an opaque/binary body: zeroed shape).
-fn capture_stage_shape<'a>(
+pub(crate) fn capture_stage_shape<'a>(
     v: Option<&Value>,
     pool: &'a str,
     ingress_protocol: &'a str,
@@ -2796,7 +2796,7 @@ fn capture_stage_shape<'a>(
 /// projection + stage object ONCE, then spawn one detached task per tap. A tap can never delay,
 /// reorder, or fail the request; a serialization failure silently skips the fire (observation is
 /// best-effort). ZERO COST when the stage has no taps (first-line empty check).
-fn fire_stage_taps(
+pub(crate) fn fire_stage_taps(
     taps: &[(
         std::time::Duration,
         bool,
@@ -11869,6 +11869,52 @@ mod hook_seam_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("tap was never delivered");
+    }
+
+    /// STAGE TAPS: an UNAUTHENTICATED request fires the synthetic `rejected_by_auth` completion
+    /// (through the real auth middleware) — audit taps see auth denials too. Requires the tokens
+    /// module (featureless builds have no data-plane auth to reject with).
+    #[cfg(feature = "auth-tokens")]
+    #[tokio::test]
+    async fn completion_tap_fires_synthetic_rejected_by_auth() {
+        crate::metrics::init();
+        let (server, state, tap) = webhook_tap().await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .auth(Arc::new(crate::auth::AuthMiddleware::new(
+                &serde_yaml::from_str::<crate::config::AuthCfg>(
+                    "chain: [tokens]\nclient_tokens: [good-token]\n",
+                )
+                .unwrap(),
+            )))
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_completion = vec![tap];
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/p/v1/messages"))
+            .header("x-api-key", "wrong-token")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "completion");
+        assert_eq!(payload["stage"]["outcome"], "rejected_by_auth");
+        assert_eq!(payload["stage"]["status"], 401);
+        serve.abort();
+        server.shutdown().await;
     }
 
     /// STAGE TAPS: a completion tap fires with the SYNTHETIC `rejected_by_gate` outcome when a

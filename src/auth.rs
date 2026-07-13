@@ -614,6 +614,30 @@ fn rate_limited_response() -> Response {
         .expect("static rate-limited response")
 }
 
+/// Fire the synthetic `rejected_by_auth` completion taps (fire-and-forget) and return the native
+/// 401 — so audit taps see auth denials, not just served traffic (design-hooks-v2 §3.2). The
+/// request body is unparsed at the auth stage, so the shape is the zeroed default bucket with the
+/// path-inferred protocol.
+fn unauthorized_with_completion_taps(app: &crate::state::App, path: &str) -> Response {
+    if !app.tap_hooks_completion.is_empty() {
+        let shape = crate::forward::capture_stage_shape(None, "", proto_for_path(path), false);
+        crate::forward::fire_stage_taps(
+            &app.tap_hooks_completion,
+            &shape,
+            crate::routing::wire::HookStageProjection {
+                at: "completion",
+                target: None,
+                attempt_number: None,
+                remaining_candidates: None,
+                previous_failure: None,
+                outcome: Some("rejected_by_auth"),
+                status: Some(401),
+            },
+        );
+    }
+    unauthorized_response(path)
+}
+
 /// Axum middleware layer that validates auth before routing.
 pub(crate) async fn auth_middleware(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
@@ -874,7 +898,7 @@ pub(crate) async fn auth_middleware(
         // explicit removes that latent hash-collision dependency rather than relying on the absence
         // of a `sha256("")` entry in the key store.
         let Some(client_token) = client_token.as_deref().filter(|t| !t.is_empty()) else {
-            return Err(unauthorized_response(&path));
+            return Err(unauthorized_with_completion_taps(&app, &path));
         };
         match gov.lookup(client_token) {
             Some(key) if key.enabled => {
@@ -890,12 +914,12 @@ pub(crate) async fn auth_middleware(
             }
             // A resolved-but-disabled key and a no-such-key both reject. Spelled out (no `_ =>`
             // catch-all) so a future `GovKey` field or lookup outcome can't silently fall through.
-            Some(_) | None => return Err(unauthorized_response(&path)),
+            Some(_) | None => return Err(unauthorized_with_completion_taps(&app, &path)),
         }
     } else {
         // Governance disabled: enforce the static-allowlist token check on every non-admin path.
         if !token_valid {
-            return Err(unauthorized_response(&path));
+            return Err(unauthorized_with_completion_taps(&app, &path));
         }
         // Attach WHO was identified: the chain's principal, or `None` for the empty-chain
         // anonymous front door.
