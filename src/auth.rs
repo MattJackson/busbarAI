@@ -526,6 +526,20 @@ fn run_admin_chain(
                 bearer,
                 header,
             ),
+            // TEST-ONLY external-module stand-in: lets the e2e suite exercise group-mapped,
+            // NON-full principals (unreachable with admin-tokens alone). Credential grammar:
+            // `grp:<group>` identifies as a principal carrying exactly that group. Compiled out
+            // of release binaries entirely.
+            #[cfg(test)]
+            "test-scope-module" => match bearer.or(header).and_then(|t| t.strip_prefix("grp:")) {
+                Some(group) => {
+                    let mut p = Principal::from_id(format!("test:{group}"));
+                    p.groups = vec![group.to_string()];
+                    AuthOutcome::Identify(p)
+                }
+                // Not my credential shape — defer to the next module (the PAM contract).
+                None => AuthOutcome::Pass,
+            },
             other => {
                 tracing::error!(
                     module = other,

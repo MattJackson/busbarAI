@@ -1659,6 +1659,122 @@ providers: {}
         handle.abort();
     }
 
+    /// The scope LADDER end-to-end with group-mapped NON-full principals (via the test-only
+    /// external module): read-only reads but cannot mint (403, audited); hooks-register registers
+    /// hooks but cannot mint keys; an unmapped group gets nothing at all (403 even on reads);
+    /// the operator token stays full.
+    #[tokio::test]
+    async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "viewers".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("read-only".to_string()),
+                },
+            );
+            inner.group_map.insert(
+                "registrars".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("hooks-register".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let with = |tok: &'static str, req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", tok)
+                .header("content-type", "application/json")
+        };
+        let hook_body = serde_json::json!({
+            "name": "scoped-hook",
+            "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        })
+        .to_string();
+        let key_body = serde_json::json!({"name": "k"}).to_string();
+
+        // read-only: GET 200, mutations 403 with the frozen envelope.
+        let r = with(
+            "grp:viewers",
+            client.get(format!("http://{addr}/admin/v1/info")),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "read-only can read");
+        let r = with(
+            "grp:viewers",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "read-only cannot mint");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "forbidden");
+        let r = with(
+            "grp:viewers",
+            client.post(format!("http://{addr}/admin/v1/hooks")),
+        )
+        .body(hook_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "read-only cannot register hooks");
+
+        // hooks-register: hook lifecycle yes, keys no (the escalation guard).
+        let r = with(
+            "grp:registrars",
+            client.post(format!("http://{addr}/admin/v1/hooks")),
+        )
+        .body(hook_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "hooks-register registers hooks");
+        let r = with(
+            "grp:registrars",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "hooks-register cannot mint keys");
+
+        // Unmapped group: authenticated but zero grants — 403 even on reads.
+        let r = with(
+            "grp:strangers",
+            client.get(format!("http://{addr}/admin/v1/info")),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "unmapped groups grant nothing");
+
+        // The operator token is still full.
+        let r = with(
+            "admintok",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "operator token stays full");
+
+        handle.abort();
+    }
+
     /// Idempotent mint + optimistic concurrency: a retried POST with the same Idempotency-Key
     /// returns the FIRST response (same id + secret, no double-create); a PATCH with a stale
     /// If-Match is a 409 that changes nothing; a fresh If-Match succeeds.
