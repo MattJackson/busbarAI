@@ -37,7 +37,7 @@ write `hooks: [<name>]``.
 
 ---
 
-## 2. Routing hooks: `route: socket|webhook` + `policy:` block → `hooks:` registry + pool list
+## 2. External hooks: the `policy:` block → a named `hooks:` entry
 
 A hook (webhook sidecar or Unix-socket binary) is now **defined once** in a top-level `hooks:`
 registry and **referenced by name** from a pool's `hooks: [...]` list. The inline `policy:` block is
@@ -90,7 +90,7 @@ Note `kind:` — a hook is a `gate` (fire-and-wait: it can rank, reject, restric
 
 ---
 
-## 3. Payload opt-ins: `policy.send_prompt` / `send_user` → hook `prompt:` / `user:` grants
+## 3. Hook grants: `send_prompt`/`send_user` → `prompt:`/`user:`
 
 The two payload opt-ins became explicit, monotonic access grants on the hook definition:
 
