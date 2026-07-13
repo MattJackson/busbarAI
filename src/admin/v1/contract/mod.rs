@@ -1,0 +1,625 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
+//! The Admin API v1 CONTRACT — transport-agnostic types shared by every adapter.
+//!
+//! This is the frozen surface expressed in Rust: the operation VIEWS (what a read returns), the
+//! stable ERROR taxonomy (`AdminError` → stable `code` + HTTP status), and the authorization SCOPE
+//! model. It knows nothing about HTTP, JSON, or GraphQL — a transport adapter (`super::transport`)
+//! projects these into a wire format, and the service (`super::service`) produces them. Because the
+//! contract lives here as typed Rust, a second transport reuses it verbatim and `openapi.json` can be
+//! generated from the same structs.
+//!
+//! ADDITIVE-ONLY (design-admin-api-v1 §0.2): fields may be ADDED to a view; an error `code` string is
+//! never removed or repurposed once shipped. Serde `Serialize` derives give the JSON projection for
+//! free; a non-JSON transport maps the same fields differently.
+
+use serde::Serialize;
+
+/// The root every busbar-NATIVE API surface mounts under (`/api/<version>/<area>/…`). The data
+/// plane (the six mimicked SDK wire protocols) is deliberately OUTSIDE this root — its paths are
+/// dictated by the upstream SDKs, not by busbar.
+pub(crate) const API_ROOT: &str = "/api";
+
+/// The frozen Admin API v1 path prefix — `API_ROOT` + version + area. Every admin endpoint hangs
+/// off this; the router nest, the scope matrix, and the OpenAPI doc all derive from it (one source
+/// of truth, drift-proof by construction — see `admin::transport::mount`).
+pub(crate) const ADMIN_PREFIX: &str = "/api/v1/admin";
+
+/// Relative (post-`ADMIN_PREFIX`) path segments matched in more than one place — the scope matrix
+/// (`required_scope`), auth.rs's mutation-rate classifier, and the json.rs router/OpenAPI builder —
+/// single-sourced here so the three surfaces cannot drift.
+pub(crate) const PATH_ADMIN_AUTH: &str = "/admin-auth";
+pub(crate) const PATH_CONFIG_VALIDATE: &str = "/config/validate";
+pub(crate) const PATH_HOOKS: &str = "/hooks";
+
+/// Shared pagination limit policy (§0.4, one cursor grammar → one limit policy) for the admin
+/// lists: `?limit=` hard cap and default page size, used by the keys list (admin.rs) and the
+/// audit list (json.rs).
+pub(crate) const LIST_LIMIT_MAX: usize = 1000;
+pub(crate) const LIST_LIMIT_DEFAULT: usize = 200;
+/// The versions list's DELIBERATELY smaller default page (100, not the shared 200): each item
+/// carries full config-version metadata, heavier than a key/audit row. The hard cap is still the
+/// shared `LIST_LIMIT_MAX`.
+pub(crate) const VERSIONS_LIMIT_DEFAULT: usize = 100;
+
+/// The three built-in authorization scopes, totally ordered `ReadOnly ⊂ HooksRegister ⊂ Full`
+/// (design-admin-api-v1 §1). Authorization is checked on the PRINCIPAL per endpoint and is NEVER
+/// derived from the request body, so a crafted request cannot escalate. `Ord` derives from
+/// declaration order (low → high), so `principal_scope >= required` is the check.
+///
+/// The full variant set is the FROZEN authorization contract; the per-endpoint scope checks that
+/// compare these land with the config/hooks/auth endpoints (upcoming slices), so the set is
+/// deliberately ahead of its first consumer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Scope {
+    /// Every read (`GET`) across config, keys, hooks, versions, audit, usage, info.
+    ReadOnly,
+    /// read-only + register/update/delete/PATCH-settings of `tap|gate|route` HOOK definitions ONLY.
+    /// Deliberately narrow (for automation that only registers hooks): cannot mint keys, change
+    /// auth, or wire chains.
+    HooksRegister,
+    /// Everything: keys, config apply/rollback, auth chains, group_map, cache.
+    Full,
+}
+
+impl Scope {
+    /// The stable wire token for this scope (used in `openapi.json` annotations and `info`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Scope::ReadOnly => "read-only",
+            Scope::HooksRegister => "hooks-register",
+            Scope::Full => "full",
+        }
+    }
+
+    /// Parse a config-side scope token (`group_map.<g>.admin_scope`). `None` = unknown token —
+    /// config_validate rejects it at boot; runtime callers treat it as no grant (fail closed).
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        match token {
+            "read-only" => Some(Scope::ReadOnly),
+            "hooks-register" => Some(Scope::HooksRegister),
+            "full" => Some(Scope::Full),
+            _ => None,
+        }
+    }
+
+    /// Whether a principal holding `self` may call an endpoint requiring `needed`. The scopes are
+    /// a strict ladder (`read-only ⊂ hooks-register ⊂ full`), encoded in the derive(Ord) variant
+    /// order above.
+    pub(crate) fn allows(self, needed: Scope) -> bool {
+        self >= needed
+    }
+}
+
+/// The AUTHORIZATION MATRIX (design-admin-api-v1 §1, §6.3): the scope an admin endpoint requires,
+/// derived from METHOD + PATH — never from the body (a crafted request cannot escalate). The
+/// ladder: every read is `read-only`; the hook-DEFINITION lifecycle (`/api/v1/admin/hooks*` mutations)
+/// is `hooks-register` (deliberately narrow — automation can register itself but cannot mint keys
+/// or change auth); every other mutation — keys, config apply/rollback, auth chains, group_map,
+/// cache — is `full`. Unknown methods fail closed to `full`. Body-derived refinements (§6.3: a
+/// `hooks-register` principal must not register a hook wired into a security-critical path) are
+/// enforced at the service layer, where the body is parsed.
+pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
+    use axum::http::Method;
+    if method == Method::GET || method == Method::HEAD {
+        return Scope::ReadOnly;
+    }
+    // Only the enumerated mutation verbs earn the narrower hooks scope; anything else (OPTIONS,
+    // TRACE, extension methods) fails closed to `full`.
+    let is_mutation = method == Method::POST
+        || method == Method::PUT
+        || method == Method::PATCH
+        || method == Method::DELETE;
+    // Match RELATIVE to the one true prefix so the matrix can never drift from the mount grammar.
+    // A path outside the prefix (impossible for a mounted admin route) fails closed to `full`.
+    let rel = path.strip_prefix(ADMIN_PREFIX).unwrap_or(path);
+    // `POST /config/validate` is a STATELESS DRY-RUN — a read in POST clothing (the body is the
+    // config to lint, far past URL length limits). A read-only CI token must be able to lint
+    // configs (re-audit M3; the service doc always said "Read scope" — now the matrix agrees).
+    if rel == PATH_CONFIG_VALIDATE {
+        return Scope::ReadOnly;
+    }
+    if is_mutation && (rel == PATH_HOOKS || rel.starts_with("/hooks/")) {
+        return Scope::HooksRegister;
+    }
+    Scope::Full
+}
+
+/// The stable v1 error taxonomy. Each variant maps to a fixed `code` (the machine-stable branch key
+/// tooling switches on — NEVER `message`) and an HTTP status the JSON-REST adapter uses. A non-HTTP
+/// transport reads `code` and ignores the status. Adding a variant is additive; an existing
+/// `code` string is frozen.
+///
+/// Some variants are exercised only by endpoints in upcoming slices (conflict/forbidden land with the
+/// mutation surface); the taxonomy is defined whole so the frozen contract + its test lock exist from
+/// the start.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum AdminError {
+    /// The named resource does not exist. `code = not_found`.
+    NotFound(String),
+    /// No/invalid admin credential (the auth middleware could not authenticate the caller).
+    /// `code = unauthorized`. Distinct from `forbidden` (authenticated but under-scoped).
+    Unauthorized,
+    /// The path exists on the surface but not with this HTTP method. `code = method_not_allowed`.
+    MethodNotAllowed,
+    /// The principal's scope is insufficient for the endpoint. `code = forbidden`. Carries the scope
+    /// that WOULD have sufficed, for a precise client message (never leaks other principals' data).
+    Forbidden { needed: Scope },
+    /// The request is structurally invalid (bad field, unknown enum, failed validation). `code =
+    /// invalid_request`.
+    Validation(String),
+    /// Optimistic-concurrency mismatch: the caller's `If-Match` is STALE — re-read the resource
+    /// and retry. `code = version_conflict`. Split from `conflict` (external review R3): a client
+    /// must distinguish RETRYABLE (this) from TERMINAL state conflicts without string-matching the
+    /// human message.
+    VersionConflict(String),
+    /// A TERMINAL state conflict: the request contradicts server state in a way a retry cannot fix
+    /// (governance disabled, base-defined hook, immutable grant change, in-flight idempotency
+    /// reservation). `code = conflict`.
+    Conflict(String),
+    /// The principal exhausted its per-minute mutation budget (§6.6). `code = rate_limited`.
+    RateLimited,
+    /// An internal failure (store/plugin). `code = internal`. The human `message` is generic; details
+    /// are logged server-side, never returned.
+    Internal,
+}
+
+impl AdminError {
+    /// The FROZEN stable code. Tooling branches on this string; it never changes for a shipped variant.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            AdminError::NotFound(_) => "not_found",
+            AdminError::Unauthorized => "unauthorized",
+            AdminError::MethodNotAllowed => "method_not_allowed",
+            AdminError::Forbidden { .. } => "forbidden",
+            AdminError::Validation(_) => "invalid_request",
+            AdminError::VersionConflict(_) => "version_conflict",
+            AdminError::Conflict(_) => "conflict",
+            AdminError::RateLimited => "rate_limited",
+            AdminError::Internal => "internal",
+        }
+    }
+
+    /// The HTTP status the JSON-REST adapter returns for this error. A non-HTTP transport ignores it.
+    pub(crate) fn http_status(&self) -> u16 {
+        match self {
+            AdminError::NotFound(_) => 404,
+            AdminError::Unauthorized => 401,
+            AdminError::MethodNotAllowed => 405,
+            AdminError::Forbidden { .. } => 403,
+            AdminError::Validation(_) => 400,
+            AdminError::VersionConflict(_) => 409,
+            AdminError::Conflict(_) => 409,
+            AdminError::RateLimited => 429,
+            AdminError::Internal => 500,
+        }
+    }
+
+    /// The human-facing message. Caller-safe only — internal store/plugin detail never lands here.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            AdminError::NotFound(what) => format!("{what} not found"),
+            AdminError::Unauthorized => {
+                "missing or invalid admin credential (Bearer or x-admin-token)".to_string()
+            }
+            AdminError::MethodNotAllowed => "method not allowed for this resource".to_string(),
+            AdminError::Forbidden { needed } => {
+                format!(
+                    "insufficient scope: this endpoint requires `{}`",
+                    needed.as_str()
+                )
+            }
+            AdminError::Validation(msg) => msg.clone(),
+            AdminError::VersionConflict(msg) => msg.clone(),
+            AdminError::Conflict(msg) => msg.clone(),
+            AdminError::RateLimited => {
+                "admin mutation rate limit exceeded; retry next minute".to_string()
+            }
+            AdminError::Internal => "internal error".to_string(),
+        }
+    }
+}
+
+/// The compiled-in plugin catalog + topology + uptime returned by `GET /api/v1/admin/info`. Powers
+/// version negotiation for tooling AND the compliance-by-compilation proof: `auth_modules`/`hook_plugins` reflect
+/// the ACTUAL binary (feature-gated at compile time), not config, so `--no-default-features` shows a
+/// provably smaller surface. No LLM content, ever.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InfoView {
+    /// busbar semantic version (`CARGO_PKG_VERSION`).
+    pub(crate) version: &'static str,
+    pub(crate) build: BuildInfo,
+    /// Seconds since process start, or `None` if the start instant was never stamped.
+    pub(crate) uptime_seconds: Option<u64>,
+    /// Epoch seconds of process start — the BOOT EPOCH marker: `config_version` (and any
+    /// process-local counter) resets on restart, so a consumer that sees `started_at` change knows
+    /// to read a counter reset as "new epoch", never as "reverted" (audit minor #2 / #4).
+    pub(crate) started_at: Option<u64>,
+    pub(crate) topology: TopologyInfo,
+    /// Whether config-overlay persistence is enabled (`BUSBAR_CONFIG_OVERLAY` set): `true` = API-applied
+    /// config changes are durable across restarts; `false` = live-only (lost on restart). Lets tooling
+    /// tell an operator whether their runtime changes will survive a restart.
+    pub(crate) config_persistence: bool,
+    /// Monotonic config version — `0` at boot, +1 per API config apply. Drift-detection: re-read and
+    /// compare to tell whether the running config changed. Process-local (resets on restart).
+    pub(crate) config_version: u64,
+}
+
+/// The compiled-in feature proof (`InfoView.build`).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BuildInfo {
+    /// Auth modules baked into this binary (e.g. `["tokens"]`; empty under `--no-default-features`).
+    pub(crate) auth_modules: Vec<&'static str>,
+    /// Hook plugins baked into this binary (e.g. `["ranking"]`).
+    pub(crate) hook_plugins: Vec<&'static str>,
+    /// The inline SWRR floor — ALWAYS `true` (compiled in unconditionally, non-removable).
+    pub(crate) weighted_floor: bool,
+}
+
+/// Pool/model/provider counts (`InfoView.topology`).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct TopologyInfo {
+    pub(crate) pools: usize,
+    pub(crate) models: usize,
+    pub(crate) providers: usize,
+}
+
+/// A pool in the topology read (`GET /api/v1/admin/pools`). Summary shape today: name + the member
+/// models and their weights. LIVE per-member status (breaker state, available concurrency, latency
+/// EWMA, budget/rate headroom — design-admin-api-v1 §6.9) is an additive follow-up; the field set
+/// only grows.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolView {
+    pub(crate) name: String,
+    pub(crate) members: Vec<PoolMemberView>,
+}
+
+/// One member of a pool: the model it targets and its SWRR weight.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolMemberView {
+    pub(crate) model: String,
+    pub(crate) weight: u32,
+}
+
+/// The LIVE per-pool detail read (`GET /api/v1/admin/pools/{name}`) — the reliability/capacity dashboard
+/// data (design-admin-api-v1 §6.9): each member's breaker state, concurrency headroom, in-flight
+/// count, latency EWMA, and success/error tallies, read from the SAME store signals the routing seam
+/// ranks on. No LLM content, no credentials.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolDetailView {
+    pub(crate) name: String,
+    pub(crate) members: Vec<PoolMemberStatusView>,
+}
+
+/// One member's live status within a pool. The breaker signal is the release-exposed
+/// `usable`/`cooldown_remaining_seconds` pair (a lane in breaker cooldown reports `usable: false` with the
+/// seconds remaining) — the same summary `/stats` surfaces.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PoolMemberStatusView {
+    pub(crate) model: String,
+    pub(crate) weight: u32,
+    /// Whether the lane can currently take dispatch (breaker closed / recovered). `false` while a
+    /// tripped breaker cools down or the lane is dead.
+    pub(crate) usable: bool,
+    /// Seconds until a tripped breaker's cooldown elapses; `0` when not cooling down. (`_seconds`
+    /// suffix — the one unit-suffix spelling across the surface, like `uptime_seconds`.)
+    pub(crate) cooldown_remaining_seconds: u64,
+    /// Free concurrency slots on this lane right now (lane-global; permits are shared across pools).
+    pub(crate) available_concurrency: usize,
+    /// In-flight requests on this lane right now.
+    pub(crate) inflight: i64,
+    /// Latency EWMA in milliseconds, or `None` if no sample yet.
+    pub(crate) latency_ms: Option<f64>,
+    /// Successful and errored request tallies for this lane.
+    pub(crate) ok: u64,
+    pub(crate) err: u64,
+    /// Whether the lane is hard-down/dead (distinct from a transiently-tripped breaker).
+    pub(crate) dead: bool,
+    /// MONOTONIC count of Closed→Open breaker trips on this lane. Breaker episodes are transient
+    /// and can open+close entirely between two polls — a consumer alerting on trips diffs this
+    /// count instead of trying to catch the live edge (audit #5). Carried across config apply and
+    /// restart with the rest of the learned health.
+    pub(crate) trip_count: u64,
+    /// Epoch seconds of the most recent trip; `None` = never tripped.
+    pub(crate) last_trip_at: Option<u64>,
+}
+
+/// A model lane in the topology read (`GET /api/v1/admin/models`): the config key + its upstream
+/// provider. No credentials, ever.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModelView {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+}
+
+/// A provider in the topology read (`GET /api/v1/admin/providers`): the provider name + how many model
+/// lanes route through it.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderView {
+    pub(crate) provider: String,
+    pub(crate) model_count: usize,
+}
+
+/// A hook definition in the registry read (`GET /api/v1/admin/hooks`, `GET /api/v1/admin/hooks/{name}`) — the
+/// plugin catalog read. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a
+/// secret. `global` reports whether the hook fires on every request (named in `global_hooks:` or
+/// declared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HookView {
+    pub(crate) name: String,
+    /// `"tap"` (fire-and-forget) or `"gate"` (fire-and-wait).
+    pub(crate) kind: &'static str,
+    pub(crate) transport: HookTransportView,
+    /// Prompt access grant: `"no"` | `"ro"` | `"rw"`.
+    pub(crate) prompt: &'static str,
+    /// Caller-identity access grant: `"no"` | `"ro"`.
+    pub(crate) user: &'static str,
+    /// Rewrite/reject ordering key (transform-chain order + reject tie-break).
+    pub(crate) priority: u16,
+    /// TAP observation stage (`"request"`/`"route"`/`"attempt"`/`"completion"`), or `None` for a gate.
+    pub(crate) at: Option<&'static str>,
+    /// Gate fallback on timeout/error — a CLOSED, unambiguous string union (audit #8): one of the
+    /// reserved terminals (`"weighted"` | `"reject"` | `"first"` | `"nothing"`) or the NAME of the
+    /// fallback hook the chain continues through. Unambiguous by construction: the terminal words
+    /// are ILLEGAL hook names on every write path (`config::RESERVED_HOOK_NAMES`), so a value in
+    /// the terminal set is always a terminal and anything else is always a hook reference.
+    pub(crate) on_error: String,
+    /// Gate decision deadline in milliseconds.
+    pub(crate) timeout_ms: u64,
+    /// The hook's opaque settings map (operator/API-owned; pushed via the configure wire). Never
+    /// interpreted by busbar; never a secret by contract (hook settings are operator config).
+    pub(crate) settings: serde_json::Map<String, serde_json::Value>,
+    /// Whether this hook fires on every request (globally wired).
+    pub(crate) global: bool,
+}
+
+/// The transport half of a `HookView`: which wire the hook speaks and its target (socket path or
+/// webhook URL — operator config, not a secret). Exactly one of `socket`/`webhook` is set.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HookTransportView {
+    /// `"socket"` or `"webhook"` (or `"none"` for a misconfigured entry with neither).
+    pub(crate) kind: &'static str,
+    /// The socket path or webhook URL. `None` only if the definition set neither transport.
+    pub(crate) target: Option<String>,
+}
+
+/// The live health of one hook's transport (`GET /api/v1/admin/hooks/{name}/health`). BEST-EFFORT: for a
+/// socket transport `reachable` is `Some(true/false)` from a short-timeout connect probe; for a webhook
+/// (or on a non-unix host) it is `None` (probed on demand, not here) with a `detail` note. Never fires
+/// the hook — just checks whether the endpoint accepts a connection. Additive-only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HookHealthView {
+    pub(crate) name: String,
+    pub(crate) transport: HookTransportView,
+    /// `Some(true)` = the transport accepted a connection; `Some(false)` = it did not; `None` = not
+    /// probed here (webhook / non-unix).
+    pub(crate) reachable: Option<bool>,
+    /// A short human note on the probe (why `None`, or the connect error class). Never a secret.
+    pub(crate) detail: Option<String>,
+}
+
+/// One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either
+/// COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)
+/// or EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where
+/// activation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`
+/// where it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PluginView {
+    pub(crate) name: String,
+    /// `"auth"` or `"hooks"` — the plugin TYPE (each a distinct engine contract).
+    pub(crate) r#type: &'static str,
+    /// `"compiled-in"` or `"external"`.
+    pub(crate) loader: &'static str,
+    /// Whether the plugin is currently active, where tracked; `None` when activation is not summarized
+    /// at this level.
+    pub(crate) active: Option<bool>,
+    /// For an external plugin, its transport target (socket path / webhook URL). `None` for compiled-in.
+    pub(crate) target: Option<String>,
+}
+
+/// The ingress auth chain read (`GET /api/v1/admin/auth`): the ordered module names that authenticate
+/// callers + the upstream-credential mode. Never a secret — module names and the mode are config
+/// identifiers, not credentials. An empty `chain` is the open front door (admits every request).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AuthView {
+    /// Ordered auth-chain module names (`[]` = open front door).
+    pub(crate) chain: Vec<&'static str>,
+    /// `"own"` (busbar signs egress with its configured key) or `"passthrough"` (forward the caller's
+    /// credential upstream).
+    pub(crate) upstream_credentials: &'static str,
+    /// Whether the front door is open (empty chain admits unconditionally).
+    pub(crate) open: bool,
+}
+
+/// A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
+/// (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Page<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+impl<T> Page<T> {
+    /// A single-page result (no further pages). The topology reads are small and unpaginated today.
+    pub(crate) fn single(items: Vec<T>) -> Self {
+        Self {
+            items,
+            next_cursor: None,
+        }
+    }
+}
+
+/// The pagination cursor is OPAQUE by contract — clients must round-trip it verbatim, never parse it.
+/// Under the hood it is just the hex of a tagged byte offset (`o:<n>`); the encoding is an
+/// implementation detail that can change to a keyset cursor later without a wire break. Dependency-free
+/// (no base64 crate) — hex keeps it URL-safe.
+pub(crate) fn encode_offset_cursor(offset: usize) -> String {
+    use std::fmt::Write;
+    format!("o:{offset}")
+        .bytes()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Decode an opaque `?cursor=` back to its byte offset. Returns `None` for any malformed/foreign
+/// cursor so the transport can answer `invalid_request` rather than silently ignoring it.
+pub(crate) fn decode_offset_cursor(cursor: &str) -> Option<usize> {
+    if cursor.is_empty() || !cursor.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..cursor.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(cursor.get(i..i + 2)?, 16).ok())
+        .collect();
+    let s = String::from_utf8(bytes?).ok()?;
+    s.strip_prefix("o:")?.parse::<usize>().ok()
+}
+
+#[cfg(test)]
+#[path = "tests/cursor_tests.rs"]
+mod cursor_tests;
+
+/// The EFFECTIVE config snapshot (`GET /api/v1/admin/config`) — the running configuration as busbar
+/// resolved it, for drift detection (compare against your desired config) and one-shot inspection.
+/// Composed from the same REDACTED reads as the individual endpoints (auth chain names, pool/model/
+/// provider topology, hook definitions, global-hook wiring) — so it carries NO secret: no client
+/// tokens, no provider keys, no hook payloads. Additive-only; the source-layer annotation (base vs
+/// overlay) lands with the config overlay substrate.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EffectiveConfigView {
+    /// The monotonic config version at the time of this read (see `InfoView.config_version`) — so a
+    /// drift-detection read gets the config AND its version in one call.
+    pub(crate) version: u64,
+    pub(crate) auth: AuthView,
+    pub(crate) pools: Vec<PoolView>,
+    pub(crate) models: Vec<ModelView>,
+    pub(crate) providers: Vec<ProviderView>,
+    pub(crate) hooks: Vec<HookView>,
+    /// Names fired on every request (`global_hooks:` + any inline `global: true`).
+    pub(crate) global_hooks: Vec<String>,
+}
+
+/// The currency the operator-configured prices (`price_per_request_cents`,
+/// `price_per_1k_tokens_cents`) — and therefore every derived `spend_micros` — are denominated in.
+pub(crate) const USAGE_CURRENCY: &str = "USD";
+
+/// Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle (Matthew):
+/// busbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token
+/// SPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer
+/// with its own (special/negotiated) price catalog reconstructs cost independently; `spend_micros`
+/// is busbar's DERIVED estimate from the operator's configured global prices, computed at read time
+/// (raw counts are what's stored — a price change re-prices history consistently).
+///
+/// Time base — THE PINNED SHAPE RULING (external review R3 #1): a usage response is ALWAYS exactly
+/// ONE fixed UTC-day metering bucket (`window`). `?window=<bucket-start-epoch>` selects a PAST
+/// bucket (default: the current one); a multi-window series is the CLIENT fetching N buckets — or
+/// a future additive `?from=&to=` returning an ARRAY OF THIS SAME PER-BUCKET SHAPE, never a
+/// differently-shaped merged view. Billing periods aggregate client-side from day buckets (raw
+/// counts are stored, so the math is exact). Deliberately decoupled from per-key budget windows so
+/// per-model aggregation across keys is well-defined; budget ENFORCEMENT state lives on
+/// `GET /keys/{id}/usage`, not here. Empty aggregations when governance is disabled. No secrets —
+/// key ids/names only, never a token.
+///
+/// LEDGER RULE (one loud contract sentence): `spend_micros` is a MUTABLE ESTIMATE — derived at
+/// read time from the operator's CURRENT prices, so a price change re-prices history. Never store
+/// it as a ledger charge; bill from the raw token split.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct UsageView {
+    /// The UTC-day metering bucket this response aggregates: `[start, end)` epoch seconds.
+    pub(crate) window: UsageWindow,
+    /// Freshness marker: the epoch this read was computed at (counters accumulate live).
+    pub(crate) as_of: u64,
+    /// The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`).
+    pub(crate) currency: &'static str,
+    pub(crate) total: UsageBreakdown,
+    /// Per-(model, provider) aggregation — cost attribution by model (the FinOps unit).
+    pub(crate) by_model: Vec<ModelUsageView>,
+    /// Per-key aggregation (same raw-split shape). CAPPED at the top 1000 rows by spend (the
+    /// FinOps-relevant ordering); `by_key_truncated` says the cap fired — never a silent cut.
+    pub(crate) by_key: Vec<KeyUsageView>,
+    /// True when `by_key` was truncated to the cap (a deployment with more active keys than the
+    /// cap). `by_model` is never capped (bounded by the configured model fleet).
+    pub(crate) by_key_truncated: bool,
+    /// The summed remainder BEYOND the `by_key` cap — present exactly when `by_key_truncated`, so
+    /// every unit of consumption is attributable at least to "others" (FinOps completeness:
+    /// `total == sum(by_key) + others`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) others: Option<UsageBreakdown>,
+}
+
+/// A metering window: `[start, end)` epoch seconds.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct UsageWindow {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+/// The raw consumption counts + the derived spend estimate — the one shape shared by `total`,
+/// `by_model` rows, and `by_key` rows, so a consumer writes ONE aggregation reader.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub(crate) struct UsageBreakdown {
+    /// Uncached input tokens (normalized additive-cache convention).
+    pub(crate) tokens_input: u64,
+    pub(crate) tokens_output: u64,
+    pub(crate) tokens_cache_read: u64,
+    pub(crate) tokens_cache_creation: u64,
+    pub(crate) requests: u64,
+    /// Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,
+    /// sub-cent precise, no float drift), from the operator's configured global prices. A consumer
+    /// with its own per-model catalog recomputes from the raw token split instead.
+    pub(crate) spend_micros: i64,
+}
+
+/// One (model, provider) row of the per-model aggregation.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ModelUsageView {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    #[serde(flatten)]
+    pub(crate) usage: UsageBreakdown,
+}
+
+/// One key's row of the per-key aggregation: the key id/name (never the secret) + its counts.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct KeyUsageView {
+    pub(crate) id: String,
+    /// The key's display name; `None` when the key was deleted after metering accumulated (history
+    /// outlives the key — the id still attributes it).
+    pub(crate) name: Option<String>,
+    #[serde(flatten)]
+    pub(crate) usage: UsageBreakdown,
+}
+
+/// The admin-plane auth read (`GET /api/v1/admin/admin-auth`) — which modules guard the ADMIN surface
+/// (distinct from the ingress `auth` chain). `modules` is the live `admin_auth` chain (the SAME
+/// resource `PUT /api/v1/admin/admin-auth` writes), so a read-after-write is coherent. An empty chain is
+/// the open (anonymous, full-authority) dev posture — `configured: false`. Never a secret.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AdminAuthView {
+    /// Whether an admin credential chain is configured. `false` = the empty chain = open dev posture.
+    pub(crate) configured: bool,
+    /// The active admin-plane guard module names — the `admin_auth` chain verbatim (e.g.
+    /// `["admin-tokens"]`), reported in order. Empty when the admin plane is open.
+    pub(crate) modules: Vec<String>,
+}
+
+/// The result of `POST /api/v1/admin/config/validate` — a DRY-RUN: does a proposed config resolve +
+/// validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
+/// failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid
+/// request that describes an INVALID config is `ok: false`, not an HTTP error); only a MALFORMED request
+/// body is an `invalid_request`. Env-var interpolation is out of scope — this checks structure and
+/// cross-reference resolution, not runtime secret presence.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ConfigValidateView {
+    pub(crate) ok: bool,
+    pub(crate) errors: Vec<String>,
+}
+
+#[cfg(test)]
+#[path = "tests/tests.rs"]
+mod tests;

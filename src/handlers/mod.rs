@@ -52,41 +52,8 @@ pub(crate) fn request_handler(protocol: &str) -> Option<&'static dyn RequestHand
 }
 
 #[cfg(test)]
-mod registry_tests {
-    use super::*;
-    use crate::operation::Operation;
-
-    #[test]
-    fn registry_resolves_openai_and_its_moderation_handler() {
-        let h = request_handler("openai").expect("openai handler registered");
-        assert_eq!(h.protocol_name(), "openai");
-        assert!(h.operation_handler(Operation::Moderation).is_some());
-        assert!(
-            request_handler("zzz-unknown").is_none(),
-            "unknown protocol → None"
-        );
-    }
-
-    #[test]
-    fn every_protocol_serves_chat_via_its_request_handler() {
-        // Chat is operation #1, reached through the SAME registry as every other op. All six
-        // protocols resolve a handler and a chat OperationHandler — the unified dispatch, no special path.
-        for proto in [
-            "openai",
-            "anthropic",
-            "gemini",
-            "bedrock",
-            "cohere",
-            "responses",
-        ] {
-            let h = request_handler(proto).expect("protocol registered");
-            assert!(
-                h.operation_handler(Operation::Chat).is_some(),
-                "{proto} must serve chat via operation_handler(Chat)"
-            );
-        }
-    }
-}
+#[path = "tests/registry_tests.rs"]
+mod registry_tests;
 
 use crate::ir::variant::{IrReq, IrResp};
 use crate::ir::IrUsage;
@@ -274,76 +241,8 @@ pub(crate) trait RequestHandler: Send + Sync {
 }
 
 #[cfg(test)]
-mod contract_tests {
-    use super::*;
-
-    // A trivial OperationHandler + RequestHandler prove the trait objects are object-safe and the no-OperationHandler lookup works.
-    struct NoopModeration;
-    impl OperationHandler for NoopModeration {
-        fn read_request(&self, _body: &[u8], _content_type: &str) -> Result<IrReq, IngressReject> {
-            Err(IngressReject::BadRequest("noop".into()))
-        }
-        fn write_request(&self, _ir: &IrReq) -> Bytes {
-            Bytes::new()
-        }
-        fn read_response(&self, _w: &[u8]) -> Result<IrResp, CodecError> {
-            Err(CodecError::Malformed("noop".into()))
-        }
-        fn write_response(&self, _ir: &IrResp) -> WireBody {
-            WireBody::json(Bytes::new())
-        }
-    }
-
-    struct OpenAiLike;
-    impl RequestHandler for OpenAiLike {
-        fn protocol_name(&self) -> &'static str {
-            "openai"
-        }
-        fn operation_handler(&self, op: Operation) -> Option<&dyn OperationHandler> {
-            // openai serves moderation; not, say, chat-on-a-moderation-only stub → None = no-handler 404.
-            match op {
-                Operation::Moderation => Some(&NoopModeration),
-                _ => None,
-            }
-        }
-        fn upstream_path(&self, ctx: &EgressCtx) -> String {
-            match ctx.operation {
-                Operation::Moderation => "/v1/moderations".into(),
-                _ => String::new(),
-            }
-        }
-        fn resolve_operation(&self, path: &str, _body: &[u8]) -> Option<Operation> {
-            path.ends_with("/v1/moderations")
-                .then_some(Operation::Moderation)
-        }
-    }
-
-    #[test]
-    fn no_handler_lookup_returns_none_for_unsupported_op() {
-        let h = OpenAiLike;
-        assert!(h.operation_handler(Operation::Moderation).is_some());
-        assert!(
-            h.operation_handler(Operation::Chat).is_none(),
-            "an absent OperationHandler IS the no-handler 404"
-        );
-        assert_eq!(h.protocol_name(), "openai");
-    }
-
-    #[test]
-    fn sub_op_reject_carries_op_and_model() {
-        let r = IngressReject::UnsupportedSubOp {
-            op: Operation::Image,
-            model: "gpt-image-1".into(),
-        };
-        assert!(matches!(
-            r,
-            IngressReject::UnsupportedSubOp {
-                op: Operation::Image,
-                ..
-            }
-        ));
-    }
-}
+#[path = "tests/contract_tests.rs"]
+mod contract_tests;
 
 use crate::state::Lane;
 
@@ -425,58 +324,5 @@ pub(crate) fn chat(protocol: &str) -> Op {
 }
 
 #[cfg(test)]
-mod dispatch_tests {
-    use super::*;
-
-    #[test]
-    fn chat_declares_its_capabilities() {
-        let chat = CHAT;
-        assert_eq!(chat.name(), "chat");
-        assert!(chat.streaming(), "chat streams");
-        assert!(
-            chat.taps_nonstream_usage(),
-            "chat bills tokens from the body"
-        );
-        assert!(
-            chat.wants_stream(&serde_json::json!({"stream": true})),
-            "chat reads the stream boolean"
-        );
-        assert!(!chat.wants_stream(&serde_json::json!({})));
-        assert_eq!(
-            chat.body_affinity_key(&serde_json::json!({"system": "you are helpful"})),
-            Some("you are helpful")
-        );
-        assert_eq!(
-            chat.body_affinity_key(&serde_json::json!({"system": ""})),
-            None
-        );
-    }
-
-    /// The load-bearing invariant of the operations axis: the forward engine branches on the
-    /// *capabilities* an OperationHandler declares, never on an operation's *identity*. If someone adds
-    /// `if op.name() == "embeddings"` or `match op.name() { ... }` to the engine, chat stops being
-    /// just operation #1 and the "add an operation without touching the engine" property is lost.
-    /// (`op.name()` used as a value — a tracing span field — is fine; only comparisons/matches are
-    /// forbidden.)
-    #[test]
-    fn engine_never_branches_on_operation_identity() {
-        // Scan EVERY file of the forward engine (the module split must not open a blind spot).
-        let engine_files = [("src/proxy/mod.rs", include_str!("../proxy/mod.rs"))];
-        let forbidden = [
-            "op.name() ==",
-            "op.name()==",
-            "== op.name()",
-            "==op.name()",
-            "match op.name()",
-        ];
-        for (file, engine) in engine_files {
-            for pat in forbidden {
-                assert!(
-                    !engine.contains(pat),
-                    "{file} contains a forbidden operation-identity branch (`{pat}`). The \
-                     engine must read capabilities off the OperationHandler, never branch on op.name()."
-                );
-            }
-        }
-    }
-}
+#[path = "tests/dispatch_tests.rs"]
+mod dispatch_tests;
