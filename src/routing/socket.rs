@@ -36,10 +36,6 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
-/// Reply-line cap — a ranking is a short list of indices; a runaway/hostile hook must not drive
-/// unbounded allocation (mirrors the webhook's 64 KiB response cap).
-const MAX_REPLY_BYTES: u64 = 64 * 1024;
-
 /// One kept-alive connection to the hook binary: buffered read half + write half.
 type Conn = (BufReader<OwnedReadHalf>, OwnedWriteHalf);
 
@@ -141,7 +137,7 @@ impl SocketPolicy {
         let mut reply = Vec::with_capacity(128);
         // Cap the reply read: `take` bounds how many bytes `read_until` may pull. If the cap is hit
         // without a newline, treat it as a protocol error (peer is flooding or not speaking NDJSON).
-        let mut limited = (&mut conn.0).take(MAX_REPLY_BYTES);
+        let mut limited = (&mut conn.0).take(super::wire::MAX_HOOK_REPLY_BYTES as u64);
         let n = limited.read_until(b'\n', &mut reply).await?;
         if n == 0 {
             return Err(std::io::Error::new(

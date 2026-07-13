@@ -77,6 +77,8 @@ const ERR_DEGRADED_NON2XX: &str = "degraded-non2xx";
 /// Metric-label values for the `disposition` dimension on `UPSTREAM_FAILURES_TOTAL` and the
 /// `reason` dimension on `FAILOVERS_TOTAL`.
 const DISPOSITION_TRANSIENT: &str = "transient_upstream";
+/// A single attempt's budget-clamped transport timeout fired (retryable within the request).
+const DISPOSITION_ATTEMPT_TIMEOUT: &str = "attempt_timeout";
 const DISPOSITION_HARD_DOWN: &str = "hard_down";
 const DISPOSITION_CONTEXT_LENGTH: &str = "context_length";
 
@@ -413,7 +415,7 @@ fn translate_request_cross_protocol(
                     ingress_protocol,
                     StatusCode::NOT_FOUND,
                     KIND_NOT_FOUND,
-                    "This model does not support that operation.",
+                    DETAIL_MODEL_UNSUPPORTED_OPERATION,
                 )));
             };
             let mut ir_req = match ih.read_request(hop_bytes, req_content_type) {
@@ -465,7 +467,7 @@ fn translate_request_cross_protocol(
                 ingress_protocol,
                 StatusCode::BAD_REQUEST,
                 KIND_INVALID_REQUEST,
-                "We received an unexpected internal error. Please try again.",
+                DETAIL_INTERNAL_ERROR,
             )));
         };
         // OPERATION-BLIND translate: the INGRESS operation handler parses its dialect into the
@@ -485,7 +487,7 @@ fn translate_request_cross_protocol(
                 ingress_protocol,
                 StatusCode::NOT_FOUND,
                 KIND_NOT_FOUND,
-                "This endpoint does not support that operation.",
+                DETAIL_ENDPOINT_UNSUPPORTED_OPERATION,
             )));
         };
         match ingress_handler.read_request_value(&body) {
@@ -508,7 +510,7 @@ fn translate_request_cross_protocol(
                         ingress_protocol,
                         StatusCode::NOT_FOUND,
                         KIND_NOT_FOUND,
-                        "This model does not support that operation.",
+                        DETAIL_MODEL_UNSUPPORTED_OPERATION,
                     )));
                 };
                 match eh.write_request_value(&ir_req) {
@@ -574,7 +576,7 @@ fn translate_request_cross_protocol(
             ingress_protocol,
             StatusCode::INTERNAL_SERVER_ERROR,
             KIND_API_ERROR,
-            "We received an unexpected internal error. Please try again.",
+            DETAIL_INTERNAL_ERROR,
         ))),
     }
 }
@@ -732,6 +734,15 @@ const MID_STREAM_GENERIC_DETAIL: &str = crate::proto::STREAM_ABORT_DETAIL;
 /// read like copy a real single-vendor API would emit — NOT reverse-proxy vocabulary like "upstream".
 /// The real status/cause is logged server-side; only this generic string reaches the client.
 const GENERIC_REJECTED_DETAIL: &str = "The request could not be processed.";
+
+/// Client-visible fallback `detail` strings each repeated across several ingress-error sites —
+/// hoisted so the copy cannot drift between them. Same vendor-neutral rules as
+/// `GENERIC_REJECTED_DETAIL`: generic service phrasing, no proxy/translation vocabulary.
+const DETAIL_INTERNAL_ERROR: &str = "We received an unexpected internal error. Please try again.";
+const DETAIL_MODEL_UNSUPPORTED_OPERATION: &str = "This model does not support that operation.";
+const DETAIL_ENDPOINT_UNSUPPORTED_OPERATION: &str =
+    "This endpoint does not support that operation.";
+const DETAIL_REQUEST_TIMEOUT: &str = "The request timed out. Please retry shortly.";
 
 /// Vendor-neutral fallback detail for a cross-protocol response that could not be relayed (a body
 /// transfer failure mid-read, an over-cap body, or an untranslatable shape). Rendered into the
@@ -2969,11 +2980,7 @@ fn map_decision(
         // defense in depth: no policy, present or future, can mint a success/redirect/5xx or a
         // log/client-injecting message through this path.
         RoutingDecision::Reject { status, message } => PolicyOutcome::RejectRequest {
-            status: if (400..=499).contains(&status) {
-                status
-            } else {
-                403
-            },
+            status: crate::routing::wire::clamp_reject_status(status),
             message: crate::routing::wire::sanitize_reject_message(&message),
             name: policy_name,
         },
@@ -3337,7 +3344,7 @@ async fn forward_with_pool_parsed_inner(
                 ingress_protocol,
                 StatusCode::NOT_FOUND,
                 KIND_NOT_FOUND,
-                "This model does not support that operation.",
+                DETAIL_MODEL_UNSUPPORTED_OPERATION,
             );
         }
         kept
@@ -3994,7 +4001,7 @@ async fn forward_with_pool_parsed_inner(
                 ingress_protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 KIND_OVERLOADED,
-                "The request timed out. Please retry shortly.",
+                DETAIL_REQUEST_TIMEOUT,
             );
         }
 
@@ -4113,7 +4120,7 @@ async fn forward_with_pool_parsed_inner(
                             ingress_protocol,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             KIND_API_ERROR,
-                            "We received an unexpected internal error. Please try again.",
+                            DETAIL_INTERNAL_ERROR,
                         );
                     }
                 },
@@ -4177,7 +4184,7 @@ async fn forward_with_pool_parsed_inner(
                     ingress_protocol,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     KIND_API_ERROR,
-                    "We received an unexpected internal error. Please try again.",
+                    DETAIL_INTERNAL_ERROR,
                 );
             }
         };
@@ -4276,13 +4283,13 @@ async fn forward_with_pool_parsed_inner(
                             crate::metrics::UPSTREAM_FAILURES_TOTAL,
                             "pool" => metric_pool.to_owned(),
                             "lane" => app.lanes[i].model.clone(),
-                            "disposition" => "attempt_timeout"
+                            "disposition" => DISPOSITION_ATTEMPT_TIMEOUT
                         )
                         .increment(1);
                         metrics::counter!(
                             crate::metrics::FAILOVERS_TOTAL,
                             "pool" => metric_pool.to_owned(),
-                            "reason" => "attempt_timeout"
+                            "reason" => DISPOSITION_ATTEMPT_TIMEOUT
                         )
                         .increment(1);
                         tracing::warn!(
@@ -4291,7 +4298,7 @@ async fn forward_with_pool_parsed_inner(
                             attempt_timeout_ms = ms,
                             "no response headers within the attempt cap; failing over"
                         );
-                        last_failure = Some("attempt_timeout");
+                        last_failure = Some(DISPOSITION_ATTEMPT_TIMEOUT);
                         drop(permit);
                         continue;
                     }
@@ -4989,7 +4996,7 @@ async fn forward_with_pool_parsed_inner(
                                         ingress_protocol,
                                         StatusCode::NOT_FOUND,
                                         KIND_NOT_FOUND,
-                                        "This endpoint does not support that operation.",
+                                        DETAIL_ENDPOINT_UNSUPPORTED_OPERATION,
                                     );
                                 };
                                 let mut translated = match ingress_op.write_response_value(&ir) {
@@ -5375,7 +5382,7 @@ async fn forward_once(
     // path; only a JSON-Content-Type body that FAILS to parse is the caller's 400.
     let v: Option<Value> = match crate::json::parse(body) {
         Ok(v) => Some(v),
-        Err(_) if !req_content_type.starts_with("application/json") => None,
+        Err(_) if !req_content_type.starts_with(APPLICATION_JSON) => None,
         Err(_) => {
             // See the main forward path: log a sanitized note for operators; never the parser's raw
             // error (with sonic-rs it embeds a fragment of the input body — secrets/PII) nor leak it
@@ -5486,7 +5493,7 @@ async fn forward_once(
                 ingress_protocol,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 KIND_API_ERROR,
-                "We received an unexpected internal error. Please try again.",
+                DETAIL_INTERNAL_ERROR,
             ));
         }
     };
@@ -5572,7 +5579,7 @@ async fn forward_once(
                         crate::metrics::UPSTREAM_FAILURES_TOTAL,
                         "pool" => pool.to_string(),
                         "lane" => app.lanes[i].model.clone(),
-                        "disposition" => "attempt_timeout"
+                        "disposition" => DISPOSITION_ATTEMPT_TIMEOUT
                     )
                     .increment(1);
                     // Parity with the organic path: a degraded-path attempt-timeout is a failover
@@ -5580,7 +5587,7 @@ async fn forward_once(
                     metrics::counter!(
                         crate::metrics::FAILOVERS_TOTAL,
                         "pool" => pool.to_string(),
-                        "reason" => "attempt_timeout"
+                        "reason" => DISPOSITION_ATTEMPT_TIMEOUT
                     )
                     .increment(1);
                     return Err(());
@@ -5910,7 +5917,7 @@ async fn forward_once(
                                     ingress_protocol,
                                     StatusCode::NOT_FOUND,
                                     KIND_NOT_FOUND,
-                                    "This endpoint does not support that operation.",
+                                    DETAIL_ENDPOINT_UNSUPPORTED_OPERATION,
                                 ));
                             };
                             let mut translated = match ingress_op.write_response_value(&ir) {
@@ -6107,7 +6114,7 @@ async fn handle_fallback_pool(
             ingress_protocol,
             StatusCode::SERVICE_UNAVAILABLE,
             KIND_OVERLOADED,
-            "The request timed out. Please retry shortly.",
+            DETAIL_REQUEST_TIMEOUT,
         );
     }
 
@@ -6153,7 +6160,7 @@ async fn handle_fallback_pool(
                 ingress_protocol,
                 StatusCode::SERVICE_UNAVAILABLE,
                 KIND_OVERLOADED,
-                "The request timed out. Please retry shortly.",
+                DETAIL_REQUEST_TIMEOUT,
             );
         }
 

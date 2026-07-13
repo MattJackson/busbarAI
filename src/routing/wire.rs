@@ -453,10 +453,12 @@ pub(crate) fn parse_rewrite(value: &serde_json::Value) -> Option<RewriteReply> {
 /// capped. ONE extraction for both the decide path (`normalize`) and the transform path (a `rw`
 /// gate's reject) so the two can never diverge.
 pub(crate) fn parse_reject_detail(reject: &serde_json::Value) -> (u16, String) {
-    let status = match reject.get("status").and_then(|s| s.as_i64()) {
-        Some(s) if (400..=499).contains(&s) => s as u16,
-        _ => REJECT_STATUS_DEFAULT,
-    };
+    let status = reject
+        .get("status")
+        .and_then(|s| s.as_i64())
+        .and_then(|s| u16::try_from(s).ok())
+        .map(clamp_reject_status)
+        .unwrap_or(REJECT_STATUS_DEFAULT);
     let message =
         sanitize_reject_message(reject.get("message").and_then(|m| m.as_str()).unwrap_or(""));
     (status, message)
@@ -481,6 +483,23 @@ pub(crate) fn transform_outcome(parsed: HookResponse) -> busbar_api::TransformOu
 
 /// Reject-status clamp range + fallback: any status outside 400..=499 becomes 403.
 const REJECT_STATUS_DEFAULT: u16 = 403;
+
+/// Shared cap on a routing-hook reply body — one bound for BOTH transports (the socket's
+/// NDJSON reply line and the webhook's response body), so a runaway/hostile hook can never drive
+/// unbounded allocation and the two transports cannot drift on the limit.
+pub(crate) const MAX_HOOK_REPLY_BYTES: usize = 64 * 1024;
+
+/// Clamp a hook-supplied reject status to the client-error range: anything outside 400..=499
+/// becomes `REJECT_STATUS_DEFAULT` (403). Shared by `parse_reject_detail` (the transports' reply
+/// seam) and forward's policy-outcome seam (defense in depth for a `RoutingDecision::Reject`
+/// constructed directly by a policy impl), so no producer can mint a success/redirect/5xx.
+pub(crate) fn clamp_reject_status(status: u16) -> u16 {
+    if (400..=499).contains(&status) {
+        status
+    } else {
+        REJECT_STATUS_DEFAULT
+    }
+}
 /// Reject-message length cap (chars). Long enough for a real reason, short enough for an error body.
 const REJECT_MESSAGE_MAX_CHARS: usize = 300;
 /// Reject-message fallback when the hook sends none (or nothing survives sanitizing).

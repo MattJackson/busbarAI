@@ -32,21 +32,18 @@
 use super::{Candidate, PolicyResult, RoutingContext, RoutingPolicy, RoutingRequest};
 use std::time::Duration;
 
-/// A hostile or buggy sidecar must never drive unbounded allocation on the busbar server: EVERY
-/// webhook response body — decide, configure, describe — is read through this 64 KiB cap. Mirrors
-/// the socket transport's `MAX_REPLY_BYTES`.
-const MAX_WEBHOOK_RESP_BYTES: usize = 64 * 1024;
-
 /// Read a webhook response body with the 64 KiB cap, aborting (rather than allocating) past it.
 async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, super::PolicyError> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = resp.chunk().await.map_err(|e| -> super::PolicyError {
         format!("webhook response read failed: {e}").into()
     })? {
-        if buf.len() + chunk.len() > MAX_WEBHOOK_RESP_BYTES {
-            return Err(
-                format!("webhook response exceeded {MAX_WEBHOOK_RESP_BYTES} byte cap").into(),
-            );
+        if buf.len() + chunk.len() > super::wire::MAX_HOOK_REPLY_BYTES {
+            return Err(format!(
+                "webhook response exceeded {} byte cap",
+                super::wire::MAX_HOOK_REPLY_BYTES
+            )
+            .into());
         }
         buf.extend_from_slice(&chunk);
     }
@@ -645,7 +642,7 @@ mod tests {
         assert_eq!(arr[1]["budget_remaining"], 1000);
     }
 
-    /// A 2xx sidecar response whose body exceeds MAX_WEBHOOK_RESP_BYTES (64 KiB) must yield `Err`
+    /// A 2xx sidecar response whose body exceeds MAX_HOOK_REPLY_BYTES (64 KiB) must yield `Err`
     /// (→ coerced to `on_error` fallback by the seam). This guards against a hostile/buggy sidecar
     /// driving unbounded allocation by streaming a huge body.
     #[tokio::test]
@@ -667,7 +664,7 @@ mod tests {
             .await;
         assert!(
             res.is_err(),
-            "a sidecar body exceeding MAX_WEBHOOK_RESP_BYTES must surface as Err (→ on_error fallback)"
+            "a sidecar body exceeding MAX_HOOK_REPLY_BYTES must surface as Err (→ on_error fallback)"
         );
     }
 

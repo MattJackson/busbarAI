@@ -107,7 +107,7 @@ impl WireBody {
     pub(crate) fn json(bytes: Bytes) -> Self {
         Self {
             bytes,
-            content_type: axum::http::HeaderValue::from_static("application/json"),
+            content_type: axum::http::HeaderValue::from_static(crate::forward::APPLICATION_JSON),
         }
     }
     /// A body with an explicit content-type (e.g. audio speech). Falls back to octet-stream if the
@@ -200,7 +200,7 @@ pub(crate) trait OperationHandler: Send + Sync {
     /// The Content-Type of THIS operation's egress request wire (what `write_request` emits).
     /// JSON for every JSON-bodied operation; a multipart operation overrides with its boundary.
     fn egress_request_content_type(&self) -> &'static str {
-        "application/json"
+        crate::forward::APPLICATION_JSON
     }
 
     /// The egress `Accept` header for the upstream request. Default: the writer's stream-aware choice
@@ -216,7 +216,7 @@ pub(crate) trait OperationHandler: Send + Sync {
     /// these seams.
     fn read_request_value(&self, v: &Value) -> Result<IrReq, IngressReject> {
         let bytes = serde_json::to_vec(v).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
-        self.read_request(&bytes, "application/json")
+        self.read_request(&bytes, crate::forward::APPLICATION_JSON)
     }
     fn write_request_value(&self, ir: &IrReq) -> Option<Value> {
         serde_json::from_slice(&self.write_request(ir)).ok()
