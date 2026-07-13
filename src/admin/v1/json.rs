@@ -930,7 +930,7 @@ async fn rollback_config(
 /// Body:
 /// `{"admin_auth": ["module", ...]}`. Guarded three ways:
 /// - every name must be a compiled-in admin module (a typo can never silently drop auth);
-/// - optimistic concurrency via `If-Match` (409 `conflict` when stale);
+/// - optimistic concurrency via `If-Match` (409 `version_conflict` when stale — re-read and retry);
 /// - **the D4 DRY-RUN GUARD**: the CALLING request's own credentials are re-evaluated against the
 ///   CANDIDATE chain, and unless they would still hold FULL scope under it the change is rejected
 ///   with 409 — you cannot lock yourself out with this endpoint. (A chain broken some other way
@@ -1444,11 +1444,20 @@ async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
                     crate::routing::wire::parse_status_metrics(m)
                         .into_iter()
                         .map(|(name, metric)| {
-                            (
-                                name,
-                                json!({"type": metric.kind, "value": metric.value,
-                                       "help": metric.help}),
-                            )
+                            let mut entry = json!({"type": metric.kind, "value": metric.value});
+                            // Optional members appear only when the hook sent them (absent ≠ null).
+                            for (k, v) in [
+                                ("help", metric.help.map(serde_json::Value::from)),
+                                ("label", metric.label.map(serde_json::Value::from)),
+                                ("unit", metric.unit.map(serde_json::Value::from)),
+                                ("viz", metric.viz.map(serde_json::Value::from)),
+                                ("max", metric.max.map(serde_json::Value::from)),
+                            ] {
+                                if let Some(v) = v {
+                                    entry[k] = v;
+                                }
+                            }
+                            (name, entry)
                         })
                         .collect::<serde_json::Map<_, _>>()
                 })
@@ -1558,7 +1567,7 @@ fn openapi_doc() -> serde_json::Value {
                     "200": {"description": "Replaced — the name existed (same-grant re-register; body is the hook definition)"},
                     "400": {"description": "Malformed body or invalid definition (`invalid_request`)"},
                     "403": {"description": "hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)"},
-                    "409": {"description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `If-Match` (`conflict`, §6.4)"}
+                    "409": {"description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `If-Match` (`version_conflict`, §6.4)"}
                 }
             }),
         );
@@ -1591,7 +1600,7 @@ fn openapi_doc() -> serde_json::Value {
                     "400": {"description": "Invalid definition (error code `invalid_request`)"},
                     "403": {"description": "A `hooks-register` principal may not replace a hook into a content-seeing (`prompt`/`user`) or `global` form (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
-                    "409": {"description": "Base-defined hook, grant change, or stale `If-Match` (error code `conflict`)"}
+                    "409": {"description": "Base-defined hook, grant change (`conflict`), or stale `If-Match` (`version_conflict`)"}
                 }
             },
             "delete": {
@@ -1695,7 +1704,7 @@ fn openapi_doc() -> serde_json::Value {
                     "400": {"description": "Hook did not acknowledge (error code `invalid_request`); nothing committed"},
                     "403": {"description": "A `hooks-register` principal may not push settings to a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
-                    "409": {"description": "Base-defined hook or stale `If-Match` (error code `conflict`)"}
+                    "409": {"description": "Base-defined hook (`conflict`) or stale `If-Match` (`version_conflict`)"}
                 }
             }
         }),
@@ -1743,7 +1752,7 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "`{applied, config_version, note}`"},
                     "400": {"description": "Invalid config (error code `invalid_request`); nothing changed"},
-                    "409": {"description": "stale `If-Match` (error code `conflict`)"}
+                    "409": {"description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"}
                 }
             }
         }),
@@ -1768,7 +1777,7 @@ fn openapi_doc() -> serde_json::Value {
             "responses": {
                 "200": {"description": "`{applied, admin_auth, config_version, note}`"},
                 "400": {"description": "Unknown module / malformed body (error code `invalid_request`)"},
-                "409": {"description": "Stale `If-Match`, or the new chain would lock the caller out (error code `conflict`)"}
+                "409": {"description": "Stale `If-Match` (`version_conflict`), or the new chain would lock the caller out (error code `conflict`)"}
             }
         });
     }
@@ -1794,7 +1803,7 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "`{restored_version, new_version}`"},
                     "404": {"description": "Target version not retained (error code `not_found`)"},
-                    "409": {"description": "stale `If-Match` (error code `conflict`)"},
+                    "409": {"description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"},
                     "400": {"description": "Snapshot fails re-validation (error code `invalid_request`)"}
                 }
             }
@@ -1859,7 +1868,7 @@ fn openapi_doc() -> serde_json::Value {
                     "200": {"description": "Updated metadata"},
                     "400": {"description": "Invalid budget/rate (error code `invalid_request`)"},
                     "404": {"description": "Unknown key (error code `not_found`)"},
-                    "409": {"description": "Stale `If-Match` ETag (error code `conflict`)"}
+                    "409": {"description": "Stale `If-Match` ETag (error code `version_conflict` — re-read and retry)"}
                 }
             },
             "delete": {
@@ -2071,7 +2080,8 @@ fn openapi_doc() -> serde_json::Value {
                 "schema": {"type": "string"},
                 "description": "Optimistic concurrency: the resource's ETag from a prior read \
                                 (or the ETag returned by the previous mutation). Stale = 409 \
-                                `conflict`, nothing changes; absent or `*` = unconditional."
+                                `version_conflict` (re-read and retry), nothing changes; absent \
+                                or `*` = unconditional."
             });
             match op.get_mut("parameters").and_then(|p| p.as_array_mut()) {
                 Some(params) => params.push(param),

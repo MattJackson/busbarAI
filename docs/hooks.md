@@ -52,6 +52,19 @@ Each hook declares **exactly one transport** — `socket` (an absolute Unix-sock
 | `attempt` | every dispatch attempt | `attempt_number`, `model` (the dispatched member), `remaining_candidates`, `previous_failure` |
 | `completion` | the outcome | `outcome` + `status` — including the **synthetic rejected completion**, so an audit tap sees denials, not just served traffic |
 
+Stage payloads ride a top-level `stage` object on the (shape-only) per-request projection, with
+only the stage's own fields present:
+
+```jsonc
+{"op": "notify", "request": {...}, "candidates": [], "context": {},
+ "stage": {"at": "attempt",                 // "route" | "attempt" | "completion"
+           "model": "claude-opus",          // the dispatched member (attempt)
+           "attempt_number": 2,             // (attempt)
+           "remaining_candidates": 3,       // (route, attempt)
+           "previous_failure": "...",       // (attempt ≥ 2)
+           "outcome": "ok", "status": 200}} // (completion)
+```
+
 The completion `outcome` vocabulary is `ok | failed | rejected_by_gate | rejected_by_auth` and is
 **append-only** — treat unknown outcomes as "not ok", never crash on one. In 1.3 the `user:` grant
 projects identity on **gate decision payloads only**; tap and transform payloads omit identity
@@ -140,26 +153,45 @@ changes. The rules a hook author must know:
   `{"ack": {"settings_version": <the exact version sent>}}` (5s deadline). On the PATCH, no exact
   ack = nothing commits (the operator gets a 400); on the connection preamble, no exact ack =
   the connection is not used.
-- **`describe`** (`{"describe": true}`) — reply with your settings **JSON Schema, bare** (the reply
-  IS the schema — no wrapper); Busbar serves it verbatim at `GET /api/v1/admin/hooks/{name}/schema`.
-  Optional: don't answer (or `{}`) and the API reports `schema: null`.
+- **`describe`** (`{"describe": true}`) — reply with your self-description ENVELOPE:
+  `{"schema": <settings JSON Schema>, "dashboard"?: {"widgets": [...]}}`. Busbar extracts `schema`
+  and serves it at `GET /api/v1/admin/hooks/{name}/schema`; `dashboard` is your DECLARED widget
+  layout (`{"metric", "label", "viz", "unit"?, "max"?}` per widget — values come from
+  `status.metrics`), so one declaration drives both the config form and the plugin dashboard.
+  Both members optional; don't answer (or `{}`) and the API reports `schema: null`.
 - **`status`** (`{"status": true}`) — the control-plane read: reply your **observed** state —
   `{"status": {"settings_version": N, "settings": {...}, "metrics": {...}}}` — and Busbar surfaces
   it at `GET /api/v1/admin/hooks/{name}/status` with a desired-vs-reported **drift** verdict. The
   `metrics` map is how your hook feeds its own operational data to the control plane (a Headroom
   compressor reports `chars_saved_total`; a dashboard built on Busbar sees what each plug is doing)
   instead of running its own dashboard. Entry shape:
-  `"<name>": {"type": "counter"|"gauge", "value": <number>, "help": "..."}` — names match
-  `^[a-z][a-z0-9_]{0,63}$` (counters SHOULD end `_total`), values are finite numbers, `help` ≤ 200
-  chars. Busbar validates and BOUNDS entries (64 per reply); malformed entries are dropped
-  individually, never the reply. Optional: reply `{}` and Busbar treats status as unsupported.
+  `"<name>": {"type": "counter"|"gauge", "value": <number>, "help"?, "label"?, "unit"?, "viz"?,
+  "max"?}` — names match `^[a-z][a-z0-9_]{0,63}$` (counters SHOULD end `_total`), values are
+  finite numbers, `help` ≤ 200 chars. The optional DISPLAY HINTS make a dashboard render your
+  metric correctly without per-plugin code: `label` (≤ 64 chars), `unit` (a short token like
+  `"ms"`/`"$"`/`"%"`, ≤ 16 chars), `viz` (`number` | `gauge` | `counter` | `sparkline`), `max`
+  (gauge ceiling). Busbar validates and BOUNDS everything (64 entries per reply; hints sanitized
+  like `help`); malformed entries/hints are dropped individually, never the reply. Time series are
+  the CONSUMER's job in 1.3 (a dashboard samples `status` and accumulates); an engine-side
+  `series` member on the entry is the reserved additive path. Optional: reply `{}` and Busbar
+  treats status as unsupported.
 - **Reserved:** the reply field name **`report`** is reserved on per-request replies for per-request
   hook data (attached to the completion-stage tap payload in a future release) — do not use it for
   anything else.
 
-All three are as fail-safe as everything else on the wire: a hook that ignores them keeps working;
-none of them can delay or fail request traffic (management calls ride fresh connections, never the
-request-path connection).
+Fail-safety, precisely (don't over-generalize): `describe` and `status` are fully optional — a
+hook that ignores them keeps working. **The socket `configure` preamble is NOT optional**: a
+socket hook that never acks it has every connection rejected (each delivery then lands on the
+gate's `on_error`), because a hook running settings it never acknowledged is running blind. The
+exact-echo ack RULE is one; the DEADLINE is the delivery's own budget — the admin PATCH/management
+calls allow 5s, but a request-path (re)connect acks within the gate's `timeout_ms` (default 1 ms —
+ack `configure` immediately and apply settings asynchronously if application is slow). Webhooks
+have no connection preamble (each PATCH push is its own POST). None of the management messages can
+delay or fail request traffic: they ride fresh connections, never the request-path connection.
+
+On a connection where you only ever receive `notify` (a tap), **never write anything** — Busbar
+does not read tap replies, so even the polite `{}`-for-unknown-ops rule is scoped to
+reply-expected connections; Busbar will never send a reply-expected op on a tap connection.
 
 ## Managing hooks over the API
 

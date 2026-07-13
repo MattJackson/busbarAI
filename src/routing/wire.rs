@@ -203,11 +203,25 @@ pub(crate) struct ConfigureAckBody {
     pub(crate) settings_version: u64,
 }
 
-/// The DESCRIBE request (D2): `{"describe": true}` — the hook replies its settings JSON Schema
-/// (any JSON value; busbar proxies it verbatim on `GET /api/v1/admin/hooks/{name}/schema`).
+/// The DESCRIBE request (D2): `{"describe": true}` — the hook replies its self-description
+/// ENVELOPE: `{"schema": <settings JSON Schema>, "dashboard"?: {"widgets": [...]}}`. ONE
+/// declaration drives both the config form (`schema` — served at
+/// `GET /api/v1/admin/hooks/{name}/schema`) and the plugin dashboard layout (`dashboard`,
+/// reserved for the dashboard read; values come from `status.metrics` — busbar-ui suggestion #2).
+/// Both members optional; unknown members ignored (append-only).
 #[derive(Serialize)]
 pub(crate) struct DescribeMsg {
     pub(crate) describe: bool,
+}
+
+/// The describe reply envelope, parsed liberally.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DescribeReply {
+    #[serde(default)]
+    pub(crate) schema: Option<serde_json::Value>,
+    #[serde(default)]
+    #[allow(dead_code)] // reserved: consumed by the plugin-dashboard read (post-1.3 additive)
+    pub(crate) dashboard: Option<serde_json::Value>,
 }
 
 /// The STATUS management message: `{"status": true}` — mirrors `describe`'s key-discriminated
@@ -225,7 +239,12 @@ pub(crate) struct StatusMsg {
 }
 
 /// One hook-reported metric entry (parsed liberally; malformed ENTRIES are dropped, never the
-/// whole reply). `type` is `counter` (monotonic over the hook's lifetime) or `gauge`.
+/// whole reply). `type` is `counter` (monotonic over the hook's lifetime) or `gauge`. The optional
+/// DISPLAY HINTS (`label`/`unit`/`viz`/`max` — busbar-ui suggestion #1) let a dashboard render the
+/// metric correctly without per-plugin code; all are sanitized/bounded like `help` (the same
+/// anti-exfiltration rule: hints are presentation, never content). Time SERIES are the CONSUMER's
+/// job in 1.3 (a dashboard samples `status` and accumulates client-side); a future engine-side
+/// `series` field on this entry is reserved as the additive path.
 #[derive(Debug, Deserialize)]
 pub(crate) struct HookMetric {
     #[serde(rename = "type")]
@@ -233,6 +252,18 @@ pub(crate) struct HookMetric {
     pub(crate) value: f64,
     #[serde(default)]
     pub(crate) help: Option<String>,
+    /// Human display name (a UI falls back to the metric name).
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    /// Display unit token (`"ms"`, `"$"`, `"%"`, `"req/s"`, …) — max 16 chars, sanitized.
+    #[serde(default)]
+    pub(crate) unit: Option<String>,
+    /// Rendering hint: `number` | `gauge` | `counter` | `sparkline` (anything else is dropped).
+    #[serde(default)]
+    pub(crate) viz: Option<String>,
+    /// Gauge normalization ceiling (finite number, else dropped).
+    #[serde(default)]
+    pub(crate) max: Option<f64>,
 }
 
 /// The hook's `status` reply body (liberal: every field optional, unknown fields ignored),
@@ -269,6 +300,9 @@ pub(crate) struct StatusEnvelope {
 pub(crate) const MAX_HOOK_METRICS: usize = 64;
 /// Metric-help length cap (chars), sanitized through `sanitize_reject_message` before exposure.
 pub(crate) const MAX_METRIC_HELP_CHARS: usize = 200;
+/// Display-hint caps (same sanitize rule as help).
+pub(crate) const MAX_METRIC_LABEL_CHARS: usize = 64;
+pub(crate) const MAX_METRIC_UNIT_CHARS: usize = 16;
 
 /// Validate a hook-reported metric NAME: `^[a-z][a-z0-9_]{0,63}$`. Anything else is dropped —
 /// names become Prometheus label values, so the charset is enforced structurally (a hook granted
@@ -300,11 +334,24 @@ pub(crate) fn parse_status_metrics(
         if !m.value.is_finite() || !matches!(m.kind.as_str(), "counter" | "gauge") {
             continue;
         }
-        m.help = m.help.map(|h| {
-            let mut s = sanitize_reject_message(&h);
-            s.truncate(MAX_METRIC_HELP_CHARS);
-            s
-        });
+        // CHAR-boundary-safe caps (re-audit F1): `String::truncate` takes BYTES and panics off a
+        // char boundary — a hook replying multi-byte help (100 × '€') could panic the admin
+        // handler. `.chars().take(n)` caps in CHARS, panic-free, matching the documented "≤ N
+        // chars" rule. Hints are sanitized + bounded exactly like help; out-of-vocabulary /
+        // oversize values are dropped INDIVIDUALLY (the metric itself survives).
+        let cap = |raw: &str, n: usize| -> String {
+            sanitize_reject_message(raw).chars().take(n).collect()
+        };
+        m.help = m.help.map(|h| cap(&h, MAX_METRIC_HELP_CHARS));
+        m.label = m.label.map(|l| cap(&l, MAX_METRIC_LABEL_CHARS));
+        m.unit = m
+            .unit
+            .map(|u| cap(&u, MAX_METRIC_UNIT_CHARS))
+            .filter(|s| !s.is_empty());
+        m.viz = m
+            .viz
+            .filter(|v| matches!(v.as_str(), "number" | "gauge" | "counter" | "sparkline"));
+        m.max = m.max.filter(|v| v.is_finite());
         out.push((name.clone(), m));
     }
     out
@@ -570,6 +617,45 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
 
 #[cfg(test)]
 mod tests {
+    /// Re-audit F1 REGRESSION: a hook-supplied multi-byte help/label/unit must cap at a CHAR
+    /// boundary, never panic (String::truncate takes bytes — 100 × '€' panicked the admin handler).
+    #[test]
+    fn status_metric_hints_cap_char_safe() {
+        let long_euro = "€".repeat(400);
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "ok_total".to_string(),
+            serde_json::json!({"type": "counter", "value": 1.0,
+                               "help": long_euro, "label": long_euro, "unit": long_euro}),
+        );
+        let parsed = super::parse_status_metrics(&m);
+        assert_eq!(parsed.len(), 1);
+        let (_, metric) = &parsed[0];
+        assert_eq!(
+            metric.help.as_ref().unwrap().chars().count(),
+            super::MAX_METRIC_HELP_CHARS
+        );
+        assert_eq!(
+            metric.label.as_ref().unwrap().chars().count(),
+            super::MAX_METRIC_LABEL_CHARS
+        );
+        assert_eq!(
+            metric.unit.as_ref().unwrap().chars().count(),
+            super::MAX_METRIC_UNIT_CHARS
+        );
+        // Out-of-vocabulary viz + non-finite max drop individually; the metric survives.
+        let mut m2 = std::collections::BTreeMap::new();
+        m2.insert(
+            "g".to_string(),
+            serde_json::json!({"type": "gauge", "value": 0.5, "viz": "hologram",
+                               "max": f64::NAN}),
+        );
+        let parsed2 = super::parse_status_metrics(&m2);
+        assert_eq!(parsed2.len(), 1);
+        assert!(parsed2[0].1.viz.is_none());
+        assert!(parsed2[0].1.max.is_none());
+    }
+
     use super::*;
     use crate::routing::{CallerIdentity, PromptProjection};
 

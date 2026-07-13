@@ -1872,9 +1872,11 @@ mod tests {
                 .json()
                 .await
                 .unwrap();
+        // The describe reply is the {schema, dashboard?} envelope; the engine EXTRACTS the schema
+        // member, so the endpoint serves a SINGLE nest (the old double-wrap was audit W-H3).
         assert_eq!(
-            schema["schema"]["schema"]["properties"]["ratio"]["type"], "number",
-            "describe proxied: {schema}"
+            schema["schema"]["properties"]["ratio"]["type"], "number",
+            "describe schema extracted, single nest: {schema}"
         );
 
         serve.abort();

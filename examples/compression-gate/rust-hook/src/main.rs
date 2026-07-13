@@ -89,9 +89,11 @@ fn handle_line(line: &str) -> String {
             }
             "{}\n".into()
         }
-        // A tap notify is fire-and-forget (busbar never reads a reply); a decide from this rw gate
-        // is unreachable (rw gates fire on the transform pass) — abstain on both, and on any
-        // future op we don't recognize.
+        // A tap NOTIFY is fire-and-forget: busbar never reads a reply on a tap connection, so
+        // answering one queues bytes forever — write NOTHING (re-audit F5). A decide from this rw
+        // gate is unreachable (rw gates fire on the transform pass); unknown future ops get the
+        // safe `{}`.
+        Some("notify") => String::new(),
         _ => "{}\n".into(),
     }
 }
@@ -109,14 +111,17 @@ fn configure(cfg: &serde_json::Value) -> String {
     format!("{{\"ack\":{{\"settings_version\":{version}}}}}\n")
 }
 
-/// Answer `describe` with the BARE settings JSON Schema — busbar proxies the reply VERBATIM at
-/// `GET /api/v1/admin/hooks/{name}/schema`, so wrapping it (the old `{"schema": {...}}` form)
-/// double-nests on the admin API.
+/// Answer `describe` with the self-description ENVELOPE: `schema` (the settings JSON Schema —
+/// busbar extracts it for `GET /api/v1/admin/hooks/{name}/schema`) and `dashboard` (the plugin's
+/// declared widget layout — values come from `status.metrics`, so ONE declaration drives both the
+/// config form and the dashboard).
 fn describe() -> String {
     concat!(
-        r#"{"type":"object","properties":{"min_savings_pct":"#,
+        r#"{"schema":{"type":"object","properties":{"min_savings_pct":"#,
         r#"{"type":"integer","minimum":0,"maximum":100,"#,
-        r#""description":"rewrite only when the body shrinks by at least this percent"}}}"#,
+        r#""description":"rewrite only when the body shrinks by at least this percent"}}},"#,
+        r#""dashboard":{"widgets":[{"metric":"chars_saved_total","label":"Characters saved","#,
+        r#""viz":"counter"}]}}"#,
         "\n"
     )
     .into()
@@ -132,6 +137,7 @@ fn status() -> String {
         concat!(
             r#"{{"status":{{"settings":{{"min_savings_pct":{pct}}},"#,
             r#""metrics":{{"chars_saved_total":{{"type":"counter","value":{saved},"#,
+            r#""label":"Characters saved","viz":"counter","#,
             r#""help":"characters removed by whitespace compression"}}}}}}}}"#,
             "\n"
         ),
@@ -219,14 +225,14 @@ mod tests {
     /// hook), and cargo runs `#[test]`s in parallel — separate tests mutating it would race.
     #[test]
     fn five_message_wire_lifecycle() {
-        // describe → the BARE settings schema (busbar proxies it verbatim — no wrapper).
+        // describe → the self-description envelope: settings schema + declared dashboard.
         let r = handle_line(r#"{"describe":true}"#);
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
-        assert_eq!(v["properties"]["min_savings_pct"]["type"], "integer");
-        assert!(
-            v.get("schema").is_none(),
-            "no wrapper: the reply IS the schema"
+        assert_eq!(
+            v["schema"]["properties"]["min_savings_pct"]["type"],
+            "integer"
         );
+        assert_eq!(v["dashboard"]["widgets"][0]["metric"], "chars_saved_total");
 
         // transform (per-request messages carry the `op` discriminator) → rewrite when the collapse
         // clears the (default 10%) threshold; body form out.
@@ -258,11 +264,9 @@ mod tests {
             handle_line(r#"{"op":"transform","request":{"pool":"p"}}"#).trim(),
             "{}"
         );
-        // a NOTIFY (tap) or an unknown future op → the safe `{}` (append-only evolvability).
-        assert_eq!(
-            handle_line(r#"{"op":"notify","request":{"pool":"p"}}"#).trim(),
-            "{}"
-        );
+        // a NOTIFY (tap) → NOTHING is written (busbar never reads a tap reply — an answered
+        // notify queues bytes forever); unknown future ops → the safe `{}` (append-only rule).
+        assert_eq!(handle_line(r#"{"op":"notify","request":{"pool":"p"}}"#), "");
         assert_eq!(
             handle_line(r#"{"op":"someday-new","request":{}}"#).trim(),
             "{}"

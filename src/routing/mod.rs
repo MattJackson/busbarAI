@@ -341,9 +341,16 @@ pub(crate) async fn fetch_schema(
     client: &reqwest::Client,
 ) -> Option<serde_json::Value> {
     let transport = gate_transport_named(name, hook, client, settings_version)?;
-    transport
+    let reply = transport
         .describe(std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS))
-        .await
+        .await?;
+    // The describe reply is the self-description ENVELOPE `{schema, dashboard?}` — extract the
+    // schema member for the /schema read (the endpoint adds its own {name, schema} wrapper, so
+    // extracting here is what prevents a double nest). No `schema` member (incl. the `{}`
+    // unsupported reply) = no schema (the endpoint reports null).
+    serde_json::from_value::<crate::routing::wire::DescribeReply>(reply)
+        .ok()?
+        .schema
 }
 
 /// Resolve a hook's `on_error` NAME into its runtime fallback chain + terminal, following the
