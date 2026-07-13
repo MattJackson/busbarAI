@@ -36,40 +36,40 @@ proceeds with its original body untouched. A broken compressor can never corrupt
 
 ## What it costs, and what it saves
 
-I measured it two ways, both reproducible. First the hook alone, driven directly over its socket
-with no Busbar in the loop: a compression call runs about 150 microseconds (µs) on a 2KB history and 720µs on a
-16KB one. Then the honest end-to-end test: the same request stream through two identical Busbar
-configs that differ only by the hook, with a recording mock upstream so I could confirm the
-smaller prompt actually reached the provider.
+I measured it the way Busbar measures itself: from Busbar's own clock. Busbar reports its internal
+processing time — everything it did, minus the upstream round-trip — in a standard
+`Server-Timing: busbar;dur` header, and the Headroom gate runs synchronously inside that window, so
+that number captures exactly what the hook adds. On an 11KB noisy tool-log history, one request at
+a time (`busbar;dur`, µs):
 
-On an 11KB noisy tool-log history, the hook cut input tokens from **2,832 to 1,422 per request, a
-50% reduction**, and the mock confirmed the compressed body is what shipped upstream. It held
-across cross-protocol (anthropic in, openai out) and same-protocol paths alike. Measured one
-request at a time, the hook adds about **620 microseconds (µs)** to a request — the with-hook minus
-without-hook delta, so the benchmark harness's own round-trip floor cancels out and what's left is
-the compression plus its socket round trip. That rides on top of Busbar's own overhead, which its
-[benchmark](https://getbusbar.com/docs/benchmark/) clocks in the tens of µs. Total added latency:
-well under a millisecond. Short conversational chats, where there's nothing worth trimming, pass
-through byte-identical — the hook abstained 100% of the time on them.
+| | p50 | p90 | p99 |
+|---|--:|--:|--:|
+| Busbar alone | 22 | 25 | 30 |
+| Busbar + Headroom | 569 | 601 | 634 |
+| **Headroom's added cost** | **547** | 576 | 604 |
+
+Two things I like about that. **Busbar itself is 22 microseconds (µs)** — the gateway isn't where
+your latency goes. And **Headroom adds ~550 µs** to compress the history, with a tail that barely
+moves: p99 is only about 1.1× p50, because Busbar and the hook are both single Rust binaries with
+no garbage collector to pause the path. The compression is real, too — the mock upstream tallied
+the tokens it actually received, confirming **2,832 → 1,422 input tokens, a 50% cut**, shipped to
+the provider. Short conversational chats, where there's nothing worth trimming, pass through
+byte-identical: the hook abstained 100% of the time on them.
 
 That trade is decisive, and it's almost free. On a request whose model call takes two seconds,
-620µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
+550 µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
 half the input tokens.
 
-And here's the number that matters for anyone deciding *where* to run compression. Headroom ships
-as an HTTP proxy today and reports a **52ms median overhead** in production, which they rightly
-note is negligible against inference. Run that exact same compression core as a co-located socket
-gate on Busbar's path and the added latency is **sub-millisecond**: no separate proxy service, no
-network hop between the gateway and the compressor.
-
-| running Headroom as… | added latency | reach |
-|---|---|---|
-| its own HTTP proxy | 52ms median | the traffic you point at it |
-| a gate on Busbar | ~620µs median | all six protocols, with failover underneath |
+For scale, Headroom ships as an HTTP proxy today and reports a **52ms median overhead** in
+production, which they rightly note is negligible against inference. The same compression core, run
+as a gate on Busbar, measures in the hundreds of microseconds on Busbar's clock. Both are small
+next to the model call, and I won't pretend to know how their proxy is deployed — the point isn't
+a race.
 
 That's the division of labor I think is right: **Headroom does the compression, Busbar does the
-placement.** Same core, same savings, one fewer moving part to run, and it now covers every
-protocol and provider Busbar speaks. Build the best compressor; let the gateway be the gateway.
+placement.** Same core, same savings, and it now covers every protocol and provider Busbar speaks,
+with failover and circuit breaking underneath it. Build the best compressor; let the gateway be the
+gateway.
 
 ## Try it
 

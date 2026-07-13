@@ -166,25 +166,36 @@ const ICONS: Record<string, string> = {
     .page-doc .hook-bench {
       width: 100%;
       border-collapse: collapse;
-      margin: 1.1rem 0;
-      font-size: 0.9rem;
+      margin: 1.3rem 0;
+      font-size: 0.92rem;
+      font-variant-numeric: tabular-nums;
     }
     .page-doc .hook-bench th,
     .page-doc .hook-bench td {
-      padding: 0.5rem 0.7rem;
+      padding: 0.55rem 0.4rem;
       text-align: left;
       border-bottom: 1px solid var(--border, #1e293b);
+    }
+    /* Label column takes the slack; the three number columns get even, fixed width. */
+    .page-doc .hook-bench th:first-child,
+    .page-doc .hook-bench td:first-child { width: 99%; padding-left: 0; }
+    .page-doc .hook-bench th:not(:first-child),
+    .page-doc .hook-bench td:not(:first-child) {
+      text-align: right;
+      white-space: nowrap;
+      width: 4.5rem;
+      padding-left: 1.4rem;
     }
     .page-doc .hook-bench thead th {
       font-weight: 600;
       color: var(--muted);
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       text-transform: uppercase;
-      letter-spacing: 0.03em;
+      letter-spacing: 0.04em;
+      border-bottom-width: 2px;
     }
-    .page-doc .hook-bench td:not(:first-child),
-    .page-doc .hook-bench th:not(:first-child) { text-align: right; white-space: nowrap; }
-    .page-doc .hook-bench .bench-note { color: var(--muted); font-weight: 400; }
+    .page-doc .hook-bench tbody tr:last-child td { border-bottom: none; }
+    .page-doc .hook-bench .bench-note { color: var(--muted); font-weight: 400; font-size: 0.85em; }
 
     /* The tagline + status badge sit on one line under the H1, inside .intro. */
     .page-doc .intro {
