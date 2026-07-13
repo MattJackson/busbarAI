@@ -66,31 +66,30 @@ claude
 Nova itself wants two small tweaks — an output-token cap and prompt caching off (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`,
 `DISABLE_PROMPT_CACHING`) — but those are about Nova's limits, not about Claude Code, which runs unchanged.
 
-Then I launched the real Claude Code window and asked it to *build* something — a small Python web app
-that serves an interactive Sudoku game — the kind of task that loops through writing a file, a compile
-check, and several turns. Every one of those turns was answered by Nova:
+Then I launched the real Claude Code window and gave it an agentic coding task — write two small Python
+files (a FizzBuzz and a prime printer), then list the folder and report back. The kind of thing that
+loops through several tool calls, each one answered by Nova:
 
-![The real Claude Code window building a Python Sudoku web app, every turn answered by Amazon Nova Pro on Bedrock through Busbar](/demo/claude-nova.gif)
+![The real Claude Code window writing Python code, every turn answered by Amazon Nova Pro on Bedrock through Busbar](/demo/claude-nova.gif)
 
-That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It writes `app.py` (an
-`http.server` that serves a 9×9 Sudoku grid), runs `python3 -m py_compile` to check it, and reports
-back. The model behind every step is Amazon Nova; the `<thinking>` blocks are Nova's, not Claude's.
-Busbar translated each Anthropic request into a Bedrock Converse call and the response back again — the
-agent never knew.
+That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It writes `fizzbuzz.py`
+and `primes.py`, runs `ls -la`, and reports `DONE`. The model behind every step is Amazon Nova; the
+`<thinking>` blocks are Nova's, not Claude's. Busbar translated each Anthropic request into a Bedrock
+Converse call and the response back again — the agent never knew.
 
 The receipt, because "trust me" isn't a demo. I read AWS Bedrock's own CloudWatch usage for Nova Pro —
 wholly independent of anything Busbar reports — right before the run and right after it:
 
 ```console
 # before
-nova-pro   invocations=23   input_tokens=41,726
+nova-pro   invocations=42   input_tokens=81,636
 # after
 nova-pro   invocations=46   input_tokens=86,535
 ```
 
-Twenty-three invocations and ~45,000 input tokens, all from one Claude Code session that believed it
-was talking to Anthropic. AWS's own console says it was Nova. To swap in Gemini, or to put Claude behind
-two keys with failover, or to add a compression hook — you edit the pool, not the agent.
+Every turn ticked the counters up on AWS's own console — one Claude Code session that believed it was
+talking to Anthropic, served entirely by Nova. To swap in Gemini, or to put Claude behind two keys with
+failover, or to add a compression hook — you edit the pool, not the agent.
 
 ## The simple version
 
