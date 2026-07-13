@@ -437,7 +437,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// supply a native envelope, or a client on that protocol gets this generic — non-native — shape).
     ///
     /// This method IS on the live request path: it is dispatched via the writer vtable from the
-    /// router/auth/forward error sites (`route::ingress_error`, `auth`, `forward::ingress_error`).
+    /// router/auth/forward error sites (`ingress::ingress_error`, `auth`, `proxy::ingress_error`).
     /// Only the default *body* is unreachable in release (every concrete writer overrides it), so no
     /// dead-code suppression is needed here.
     fn write_error(&self, _status: u16, kind: &str, message: &str) -> serde_json::Value {
@@ -463,7 +463,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// response, given the already-built error `envelope` and canonical `kind`. Default no-op (most
     /// protocols carry the error entirely in the body). Bedrock attaches `x-amzn-RequestId` +
     /// `x-amzn-errortype`; Anthropic mirrors the body `request_id` into the `request-id` header. The
-    /// agnostic error path (`forward::ingress_error`) calls this through the writer vtable instead of
+    /// agnostic error path (`proxy::ingress_error`) calls this through the writer vtable instead of
     /// branching on the protocol name, so the main/degraded/auth/route error paths cannot drift.
     fn attach_error_response_headers(
         &self,
@@ -517,7 +517,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// overrides to `"application/vnd.amazon.eventstream"`. The agnostic forward path calls this
     /// through the writer vtable so `ingress_stream_content_type` carries no `"bedrock"` branch.
     fn streaming_content_type(&self) -> &'static str {
-        crate::forward::TEXT_EVENT_STREAM
+        crate::proxy::TEXT_EVENT_STREAM
     }
 
     /// Plausible native-SDK `User-Agent` for THIS EGRESS protocol. reqwest sends NO default
@@ -532,7 +532,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// (better than none). Each registered writer overrides with its own pinned SDK UA string (see
     /// `EGRESS_UA_*` in forward.rs for the per-protocol UA strings that must be kept current).
     fn egress_user_agent(&self) -> &'static str {
-        crate::forward::EGRESS_UA_DEFAULT
+        crate::proxy::EGRESS_UA_DEFAULT
     }
 
     /// Native-SDK `Accept` header for THIS EGRESS protocol, given the caller's stream intent.
@@ -546,9 +546,9 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// streaming, `application/json` otherwise.
     fn egress_accept(&self, wants_stream: bool) -> &'static str {
         if wants_stream {
-            crate::forward::TEXT_EVENT_STREAM
+            crate::proxy::TEXT_EVENT_STREAM
         } else {
-            crate::forward::APPLICATION_JSON
+            crate::proxy::APPLICATION_JSON
         }
     }
 
@@ -590,10 +590,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// Default: `(StatusCode::UNAUTHORIZED, "authentication_error")` (openai/responses/anthropic/
     /// cohere/unknown).
     fn auth_failure_status_and_kind(&self) -> (StatusCode, &'static str) {
-        (
-            StatusCode::UNAUTHORIZED,
-            crate::forward::KIND_AUTHENTICATION,
-        )
+        (StatusCode::UNAUTHORIZED, crate::proxy::KIND_AUTHENTICATION)
     }
 
     /// When a Bedrock-ingress client requested a STREAMING response (`wants_stream`) but the upstream
@@ -1055,7 +1052,7 @@ pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
 /// Sweeps `KNOWN_PROTOCOLS`, reading each writer's `streaming_content_type()` from the vtable (this is
 /// the registry layer aggregating the writers — it names no MIME literal of its own), then sorts and
 /// dedups into a stable `&'static [&'static str]`. The one-time `OnceLock` init pays the
-/// `protocol_for` Box allocations; callers (e.g. `forward::is_streaming_content_type`) then read the
+/// `protocol_for` Box allocations; callers (e.g. `proxy::is_streaming_content_type`) then read the
 /// cached slice with zero per-request allocation. The aggregated set is IDENTICAL to what the
 /// per-request sweep produced — the cache only memoizes it.
 pub(crate) fn streaming_content_types() -> &'static [&'static str] {
@@ -1078,7 +1075,7 @@ pub(crate) fn streaming_content_types() -> &'static [&'static str] {
 /// Sweeps `KNOWN_PROTOCOLS`, reading each writer's `array_stream_shim_key()` (most return `None`;
 /// only Gemini overrides → `GEMINI_JSON_ARRAY_SHIM_KEY`). Like `streaming_content_types`, the
 /// `OnceLock` init pays the one-time `protocol_for` allocations so callers (e.g.
-/// `forward::strip_router_shim_keys`) iterate the cached slice with zero per-request allocation, and
+/// `proxy::strip_router_shim_keys`) iterate the cached slice with zero per-request allocation, and
 /// the collected slice is sorted + deduped (mirroring `streaming_content_types`) so the set is stable
 /// and unique regardless of registry order even if a second protocol ever overrides this key. The
 /// collected set is IDENTICAL to the per-request sweep — the cache only memoizes it.
@@ -1099,7 +1096,7 @@ pub(crate) fn array_stream_shim_keys() -> &'static [&'static str] {
 
 /// The array-stream shim key for the NAMED protocol's writer, or `None` if that protocol has no
 /// shim key (most don't) or is not registered. Routes through the writer vtable so the INJECTION
-/// site (`route::ingress_path_model`, which sets the marker on a non-`alt=sse` Gemini request body)
+/// site (`ingress::ingress_path_model`, which sets the marker on a non-`alt=sse` Gemini request body)
 /// names no protocol submodule — preserving "delete proto/X → app is X-free": if `proto/gemini.rs`
 /// were removed, this returns `None` and the marker is simply never injected, with no compile-time
 /// dependency on the submodule. Dispatch by protocol NAME string is the sanctioned registry boundary.
@@ -1410,7 +1407,7 @@ impl StreamTranslate {
     /// full reader→IR pipeline per frame for usage extraction but re-emits the ORIGINAL frame bytes
     /// verbatim (see the `same_proto` field) — a byte-exact passthrough with an IR side-channel. The
     /// caller gates this behind the reversible universal-same-proto flag
-    /// (`forward::ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE`); when the flag is off the caller passes
+    /// (`proxy::ENABLE_UNIVERSAL_SAME_PROTO_TRANSLATE`); when the flag is off the caller passes
     /// `None` and falls back to the legacy raw-chunk passthrough.
     pub(crate) fn new_same_proto(proto: &str) -> Option<Self> {
         Self::build(proto, proto, true)
@@ -2032,7 +2029,7 @@ impl StreamTranslate {
             // a bare close here leaves the SSE client with a SILENTLY-TRUNCATED stream and NO terminal /
             // error frame — indistinguishable from a successful short completion, so a native SDK
             // believes it received the whole answer. Emit the ingress protocol's NATIVE streaming error
-            // frame so the truncation is signaled in-band, mirroring `forward::mid_stream_error_bytes`'s
+            // frame so the truncation is signaled in-band, mirroring `proxy::mid_stream_error_bytes`'s
             // SSE branch (the same `write_response_event(&IrStreamEvent::Error(..))` path, framed by
             // `emit_ir_event` exactly as every other event on this stream). `emit_ir_event` takes the
             // non-eventstream branch here (`ingress_eventstream` is false), so this stays SSE text.
@@ -2145,6 +2142,8 @@ fn reframe_sse(event_type: &str, data: &serde_json::Value) -> String {
 pub(crate) mod anthropic;
 pub(crate) mod bedrock;
 pub(crate) mod cohere;
+/// Wire-dialect detection: `protocol_id(path, headers)` sniffs which protocol a request speaks.
+pub(crate) mod detect;
 pub(crate) mod gemini;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_family;
@@ -7195,7 +7194,7 @@ mod stream_translate_tests {
     /// end with a silently-truncated body. Before this fix `finish()` returned an empty tail for SSE
     /// ingress (only bedrock ingress emitted a terminal frame), so an SSE/native SDK client saw a
     /// short stream indistinguishable from a successful completion. `finish()` must now emit the
-    /// ingress protocol's NATIVE streaming error frame (mirroring `forward::mid_stream_error_bytes`),
+    /// ingress protocol's NATIVE streaming error frame (mirroring `proxy::mid_stream_error_bytes`),
     /// and OpenAI ingress must still append `data: [DONE]`.
     #[test]
     fn test_sse_ingress_overflow_abort_emits_native_error_frame() {

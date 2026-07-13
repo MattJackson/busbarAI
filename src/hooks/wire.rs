@@ -782,7 +782,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::routing::{CallerIdentity, PromptProjection};
+    use crate::hooks::{CallerIdentity, PromptProjection};
 
     fn cand(idx: usize, tags: &'static [String]) -> Candidate<'static> {
         Candidate {

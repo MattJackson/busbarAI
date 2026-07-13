@@ -46,10 +46,11 @@ mod config;
 mod config_validate;
 mod endpoints;
 mod eventstream;
-mod forward;
 mod governance;
 mod handlers;
 mod health;
+mod hooks;
+mod ingress;
 mod ir;
 mod json;
 mod limits;
@@ -60,9 +61,7 @@ mod net_guard;
 mod observability;
 mod operation;
 mod proto;
-mod route;
-mod router;
-mod routing;
+mod proxy;
 mod sigv4;
 mod state;
 mod state_persist;
@@ -596,14 +595,14 @@ pub(crate) fn fallback_error_response(
         status,
         [(
             axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static(crate::forward::APPLICATION_JSON),
+            axum::http::HeaderValue::from_static(crate::proxy::APPLICATION_JSON),
         )],
         body.to_string(),
     )
         .into_response();
     // Provider-specific error RESPONSE HEADERS (Bedrock `x-amzn-RequestId`/`x-amzn-errortype`;
     // Anthropic `request-id` mirrored from the body) — dispatched via the writer vtable so this
-    // fallback handler matches the shape produced by `forward::ingress_error` on the hot path,
+    // fallback handler matches the shape produced by `proxy::ingress_error` on the hot path,
     // with no provider name-branch here.
     if let Some(p) = &protocol {
         p.writer()
@@ -612,7 +611,7 @@ pub(crate) fn fallback_error_response(
     resp
 }
 
-// NOTE: the 404 fallback handler is superseded by `route::protocol_dispatch`, which owns the
+// NOTE: the 404 fallback handler is superseded by `ingress::protocol_dispatch`, which owns the
 // catch-all and reproduces the same native-envelope 404 shaping for non-protocol paths.
 
 /// 405 fallback: a valid ingress path hit with the wrong method (e.g. GET on a POST-only ingress).
@@ -671,7 +670,7 @@ fn server_timing_dur_ms(total_us: u64, upstream_us: u64) -> f64 {
 /// reporting the latency Busbar itself added — total request wall-clock MINUS the upstream
 /// round-trip — so operators (and browser DevTools / APM tools) can see the gateway's own cost
 /// in-band on every response, without scraping `/metrics` or wiring traces. The upstream RTT is
-/// recorded by the forward path into the [`forward::UPSTREAM_RTT_US`] task-local for the duration
+/// recorded by the forward path into the [`proxy::UPSTREAM_RTT_US`] task-local for the duration
 /// of this scope; a request that never dispatched upstream (admin / health / early error) reports
 /// its full processing time. W3C `Server-Timing` `dur` is milliseconds; emitted at µs precision.
 async fn server_timing(
@@ -682,7 +681,7 @@ async fn server_timing(
     use std::sync::atomic::Ordering;
     let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_UPSTREAM_RTT));
     let start = std::time::Instant::now();
-    let mut resp = forward::UPSTREAM_RTT_US
+    let mut resp = proxy::UPSTREAM_RTT_US
         .scope(slot.clone(), next.run(req))
         .await;
     // Gated by `observability.emit_server_timing` (default false). When disabled, NO Server-Timing
@@ -721,7 +720,7 @@ async fn reshape_oversized_413(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
-        .is_some_and(|ct| ct.starts_with(crate::forward::APPLICATION_JSON));
+        .is_some_and(|ct| ct.starts_with(crate::proxy::APPLICATION_JSON));
     if is_json {
         return resp;
     }
@@ -745,7 +744,7 @@ async fn reshape_oversized_413(
         path,
         axum::http::StatusCode::PAYLOAD_TOO_LARGE,
         // CANONICAL kind for an oversized payload across the protocol writers.
-        crate::forward::KIND_REQUEST_TOO_LARGE,
+        crate::proxy::KIND_REQUEST_TOO_LARGE,
         "request body exceeds the maximum allowed size",
     )
 }
@@ -1105,7 +1104,7 @@ pub(crate) fn build_app_from_config(
 
     // The `default:` hook (if any) — the base ordering that pools which named none inherit, replacing
     // the compiled-in weighted backstop (everything-is-a-hook model). At most one (validated).
-    let default_hook = routing::default_hook_name(&cfg.hooks).map(str::to_string);
+    let default_hook = hooks::default_hook_name(&cfg.hooks).map(str::to_string);
 
     // Per-pool runtime config (failover/exclusions), keyed by pool name.
     let mut pool_runtime = std::collections::HashMap::new();
@@ -1138,7 +1137,7 @@ pub(crate) fn build_app_from_config(
                 // Resolve the routing policy ONCE here. `weighted` (default) ⇒ `None` ⇒ the zero-cost
                 // inline SWRR path; a `default:` hook replaces that base for pools that named none; the
                 // webhook transport reuses the shared upstream client.
-                policy: routing::resolve_pool_ordering(
+                policy: hooks::resolve_pool_ordering(
                     pool_cfg,
                     &cfg.hooks,
                     &upstream_client,
@@ -1147,13 +1146,13 @@ pub(crate) fn build_app_from_config(
                 ),
                 // This pool's decision gates, resolved once here (priority carried for the phase-2
                 // chain merge). NOT re-resolved on config apply yet — same scope caveat as `policy`.
-                gates: routing::resolve_pool_gates(
+                gates: hooks::resolve_pool_gates(
                     pool_cfg,
                     &cfg.hooks,
                     &upstream_client,
                     app_config_version,
                 ),
-                rewrite_hooks: routing::resolve_pool_rewrites(
+                rewrite_hooks: hooks::resolve_pool_rewrites(
                     pool_cfg,
                     &cfg.hooks,
                     &upstream_client,
@@ -1216,35 +1215,35 @@ pub(crate) fn build_app_from_config(
 
     // Resolve the global rewrite hooks (prompt: rw gates in global_hooks) into priority-ordered
     // transports ONCE. Empty unless the operator configured a rewrite hook — zero cost by default.
-    let rewrite_hooks = routing::resolve_rewrite_hooks(
+    let rewrite_hooks = hooks::resolve_rewrite_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
         app_config_version,
     );
     // Resolve the global request-stage tap hooks the same way. Empty unless configured.
-    let tap_hooks = routing::resolve_tap_hooks(
+    let tap_hooks = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
         app_config_version,
         config::HookStage::Request,
     );
-    let tap_hooks_route = routing::resolve_tap_hooks(
+    let tap_hooks_route = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
         app_config_version,
         config::HookStage::Route,
     );
-    let tap_hooks_attempt = routing::resolve_tap_hooks(
+    let tap_hooks_attempt = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
         app_config_version,
         config::HookStage::Attempt,
     );
-    let tap_hooks_completion = routing::resolve_tap_hooks(
+    let tap_hooks_completion = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
@@ -1253,7 +1252,7 @@ pub(crate) fn build_app_from_config(
     );
     // Resolve the global DECISION gates (non-rewrite gates in global_hooks) — fired for a verdict on
     // every request. Empty unless configured.
-    let global_gates = routing::resolve_gate_hooks(
+    let global_gates = hooks::resolve_gate_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
@@ -1376,14 +1375,14 @@ fn base_data_router() -> Router<std::sync::Arc<state::AppHandle>> {
         // Governance-scoped like /stats (restricted keys see only their reachable names).
         .route("/v1/models", get(endpoints::list_models))
         .route("/v1beta/models", get(endpoints::list_models_v1beta))
-        .route("/{name}/v1/messages", post(route::named))
-        .route("/{provider}/{model}/v1/messages", post(route::adhoc))
+        .route("/{name}/v1/messages", post(ingress::named))
+        .route("/{provider}/{model}/v1/messages", post(ingress::adhoc))
         // EVERY protocol endpoint — chat and the 1.2 operations, all six dialects — flows through the
         // catch-all: Router (dumb protocol ID from path+headers) → that protocol's RequestHandler
         // (reads path+body, decides the operation) → its OperationHandler cell. Adding a protocol or
         // an operation never touches this file. Unknown paths / wrong methods keep the pre-collapse
         // native-envelope 404/405 shaping (no bare-proxy tells).
-        .fallback(route::protocol_dispatch)
+        .fallback(ingress::protocol_dispatch)
         // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
         // treatment as the 404 fallback above.
         .method_not_allowed_fallback(method_not_allowed_handler)
@@ -1995,7 +1994,7 @@ mod tests {
             axum::http::StatusCode::PAYLOAD_TOO_LARGE,
             [(
                 axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static(crate::forward::APPLICATION_JSON),
+                axum::http::HeaderValue::from_static(crate::proxy::APPLICATION_JSON),
             )],
             r#"{"error":{"type":"request_too_large","message":"native"}}"#,
         )

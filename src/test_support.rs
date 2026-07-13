@@ -838,13 +838,13 @@ mod tests {
     use super::*;
     use crate::auth::AuthMiddleware;
     use crate::config::AuthCfg;
-    use crate::forward::forward_with_pool;
+    use crate::proxy::forward_with_pool;
     use crate::state::now;
 
     use reqwest::Client;
     use serde_json::json;
 
-    /// Test-only anthropic-ingress convenience wrapper (the former `forward::forward`, kept here so
+    /// Test-only anthropic-ingress convenience wrapper (the former `proxy::forward`, kept here so
     /// the production entry point is a single `forward_with_pool`). Binds anthropic ingress, the
     /// lane-default breaker cell (empty pool name), and no affinity.
     async fn forward(
@@ -852,7 +852,7 @@ mod tests {
         cands: Vec<crate::state::WeightedLane>,
         body: bytes::Bytes,
         caller_token: Option<&str>,
-        usage_sink: Option<crate::forward::UsageSink>,
+        usage_sink: Option<crate::proxy::UsageSink>,
     ) -> axum::response::Response {
         forward_with_pool(
             app,
@@ -5328,7 +5328,7 @@ mod tests {
     /// OpenAI ingress same-protocol passthrough test.
     #[tokio::test]
     async fn test_openai_ingress_same_protocol_passthrough() {
-        use crate::route;
+        use crate::ingress;
         use axum::http::HeaderMap;
 
         // Create a custom mock server that listens at /v1/chat/completions (OpenAI endpoint)
@@ -5385,7 +5385,7 @@ mod tests {
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
         // Call openai_ingress handler directly
-        let response = route::operation_ingress(
+        let response = ingress::operation_ingress(
             &app,
             &crate::governance::GovCtx::default(),
             &crate::auth::CallerToken::default(),
@@ -5439,7 +5439,7 @@ mod tests {
     /// OpenAI ingress missing model → 400.
     #[tokio::test]
     async fn test_openai_ingress_missing_model() {
-        use crate::route;
+        use crate::ingress;
         use axum::http::HeaderMap;
 
         // Build a minimal App (no lanes needed for this test)
@@ -5451,7 +5451,7 @@ mod tests {
         });
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
-        let response = route::operation_ingress(
+        let response = ingress::operation_ingress(
             &app,
             &crate::governance::GovCtx::default(),
             &crate::auth::CallerToken::default(),
@@ -5472,7 +5472,7 @@ mod tests {
     /// emitted, so caller path segments can't inflate `/metrics` cardinality).
     #[tokio::test]
     async fn test_adhoc_rejects_unconfigured_provider_model() {
-        use crate::route;
+        use crate::ingress;
 
         let app = TestApp::new()
             .lane(
@@ -5489,7 +5489,7 @@ mod tests {
         let body = Bytes::from_static(b"{\"messages\":[]}");
 
         // Attacker-chosen provider/model that isn't configured → 404, no upstream reached.
-        let resp = route::adhoc(
+        let resp = ingress::adhoc(
             crate::state::CurrentApp(app.clone()),
             axum::extract::Path(("evil.example.com".to_string(), "../secret".to_string())),
             axum::extract::Extension(crate::governance::GovCtx::default()),
@@ -5504,7 +5504,7 @@ mod tests {
         );
 
         // Configured model but WRONG provider → 400 (must match the lane's provider).
-        let resp2 = route::adhoc(
+        let resp2 = ingress::adhoc(
             crate::state::CurrentApp(app),
             axum::extract::Path(("wrong-provider".to_string(), "test-model".to_string())),
             axum::extract::Extension(crate::governance::GovCtx::default()),
@@ -5522,7 +5522,7 @@ mod tests {
     /// OpenAI ingress unknown model → 404.
     #[tokio::test]
     async fn test_openai_ingress_unknown_model() {
-        use crate::route;
+        use crate::ingress;
         use axum::http::HeaderMap;
 
         // Build a minimal App with no "nope" model
@@ -5535,7 +5535,7 @@ mod tests {
         });
         let body_bytes = Bytes::from(serde_json::to_vec(&req_body).unwrap());
 
-        let response = route::operation_ingress(
+        let response = ingress::operation_ingress(
             &app,
             &crate::governance::GovCtx::default(),
             &crate::auth::CallerToken::default(),
@@ -5648,7 +5648,7 @@ mod tests {
     /// `forward` wrapper (Anthropic ingress) and returned the raw Anthropic body.
     #[tokio::test]
     async fn test_openai_ingress_single_model_anthropic_response_translated() {
-        use crate::route;
+        use crate::ingress;
 
         let state = Arc::new(MockServerState::new());
         // Backend returns a native Anthropic message response.
@@ -5678,7 +5678,7 @@ mod tests {
             .build();
 
         let body = json!({"model": "glm-4.5", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 15});
-        let resp = route::operation_ingress(
+        let resp = ingress::operation_ingress(
             &app,
             &crate::governance::GovCtx::default(),
             &crate::auth::CallerToken::default(),
@@ -5712,7 +5712,7 @@ mod tests {
         lane_default: Option<u32>,
         request_body: serde_json::Value,
     ) -> serde_json::Value {
-        use crate::route;
+        use crate::ingress;
 
         let state = Arc::new(MockServerState::new());
         state.push(MockResponse::Ok {
@@ -5739,7 +5739,7 @@ mod tests {
         }
         let app = TestApp::new().lane(spec).build();
 
-        let resp = route::operation_ingress(
+        let resp = ingress::operation_ingress(
             &app,
             &crate::governance::GovCtx::default(),
             &crate::auth::CallerToken::default(),

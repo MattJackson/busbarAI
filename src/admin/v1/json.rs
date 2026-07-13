@@ -162,7 +162,7 @@ static CONFIG_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 fn ok_json<T: Serialize>(status: StatusCode, view: &T) -> Response {
     (
         status,
-        [(CONTENT_TYPE, crate::forward::APPLICATION_JSON)],
+        [(CONTENT_TYPE, crate::proxy::APPLICATION_JSON)],
         serde_json::to_string(view).unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
@@ -175,7 +175,7 @@ pub(crate) fn err_json(e: &AdminError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
         status,
-        [(CONTENT_TYPE, crate::forward::APPLICATION_JSON)],
+        [(CONTENT_TYPE, crate::proxy::APPLICATION_JSON)],
         json!({"error": {"code": e.code(), "message": e.message()}}).to_string(),
     )
         .into_response()
@@ -1366,8 +1366,7 @@ async fn patch_hook_settings(
     // hold (§6.5: no partial config ever goes live). The client is captured here; the load() that
     // feeds the actual swap is re-taken AFTER the await, under the mutation lock.
     let client = current.client.clone();
-    if let Err(e) = crate::routing::push_configure(&updated, &name, settings_version, &client).await
-    {
+    if let Err(e) = crate::hooks::push_configure(&updated, &name, settings_version, &client).await {
         audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::Validation(format!(
             "hook did not acknowledge the settings push: {e}"
@@ -1426,7 +1425,7 @@ async fn hook_schema(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
     let schema =
-        crate::routing::fetch_schema(&name, hook, current.config_version, &current.client).await;
+        crate::hooks::fetch_schema(&name, hook, current.config_version, &current.client).await;
     ok_json(StatusCode::OK, &json!({ "name": name, "schema": schema }))
 }
 
@@ -1442,8 +1441,7 @@ async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
     let desired_version = current.config_version;
-    let reported =
-        crate::routing::fetch_status(&name, hook, desired_version, &current.client).await;
+    let reported = crate::hooks::fetch_status(&name, hook, desired_version, &current.client).await;
     let as_of = crate::store::now();
     let body = match reported {
         Some(r) => {
@@ -1458,7 +1456,7 @@ async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
                 .metrics
                 .as_ref()
                 .map(|m| {
-                    crate::routing::wire::parse_status_metrics(m)
+                    crate::hooks::wire::parse_status_metrics(m)
                         .into_iter()
                         .map(|metric| {
                             let mut entry =
@@ -2228,7 +2226,7 @@ mod tests {
     async fn err_json_uses_stable_envelope() {
         let (status, ct, body) = parts(err_json(&AdminError::NotFound("hook".into()))).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
-        assert_eq!(ct, crate::forward::APPLICATION_JSON);
+        assert_eq!(ct, crate::proxy::APPLICATION_JSON);
         assert_eq!(body["error"]["code"], "not_found");
         assert!(
             body["error"]["message"]
@@ -2254,7 +2252,7 @@ mod tests {
         let (status, ct, body) =
             parts(ok_json(StatusCode::CREATED, &View { name: "x", n: 7 })).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(ct, crate::forward::APPLICATION_JSON);
+        assert_eq!(ct, crate::proxy::APPLICATION_JSON);
         assert_eq!(body, json!({"name": "x", "n": 7}));
     }
 

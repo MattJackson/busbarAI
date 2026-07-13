@@ -32,10 +32,10 @@ pub(crate) const OPENAI_FAMILY_DEFAULT_MODEL: &str = "gpt-4o";
 /// Responses cannot drift.
 pub(crate) const OPENAI_FAMILY_MAX_OPEN_TOOLS: usize = 128;
 
-// CANONICAL error-kind vocabulary home. The forward-layer KIND_* bank (`forward::KIND_*`), the
+// CANONICAL error-kind vocabulary home. The forward-layer KIND_* bank (`proxy::KIND_*`), the
 // admin API's ERR_TYPE_NOT_FOUND/ERR_TYPE_INVALID_REQUEST, and the anthropic writer's private
 // ERR_TYPE_* bank all alias these consts, so the shared string values are single-sourced here and
-// cannot drift. (`forward::KIND_OVERLOADED` = "overloaded" and anthropic's "timeout_error" are
+// cannot drift. (`proxy::KIND_OVERLOADED` = "overloaded" and anthropic's "timeout_error" are
 // DELIBERATELY different values and stay defined at their own sites.)
 /// OpenAI error `type` for a malformed / bad-argument request.
 pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
@@ -55,7 +55,7 @@ pub(crate) const ERR_TYPE_INSUFFICIENT_QUOTA: &str = "insufficient_quota";
 /// OpenAI wire (OpenAI has no `overloaded_error` type).
 pub(crate) const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
 /// Anthropic-vocabulary error `type` for a generic upstream/API failure; also the agnostic
-/// forward-layer kind (`forward::KIND_API_ERROR` aliases this).
+/// forward-layer kind (`proxy::KIND_API_ERROR` aliases this).
 pub(crate) const ERR_TYPE_API_ERROR: &str = "api_error";
 /// Error `type` for an oversized request (HTTP 413); shared by the forward KIND bank and the
 /// anthropic writer.
@@ -87,7 +87,7 @@ pub(crate) fn openai_context_length_prose_scan(text: &str) -> bool {
 /// explicitly and emits `null`, the correct native value for those types.
 pub(crate) fn bearer_error_code(error_type: &str) -> serde_json::Value {
     match error_type {
-        crate::forward::KIND_AUTHENTICATION => {
+        crate::proxy::KIND_AUTHENTICATION => {
             serde_json::Value::String(CODE_INVALID_API_KEY.to_string())
         }
         // Real OpenAI quota-exhaustion errors carry BOTH `type` and `code` set to
@@ -95,15 +95,15 @@ pub(crate) fn bearer_error_code(error_type: &str) -> serde_json::Value {
         // (route.rs `ingress_error(..., KIND_INSUFFICIENT_QUOTA, ...)`) reaches these writers with that
         // type; emitting `code: null` for it is an SDK-visible mismatch (the official client surfaces
         // `error.code == "insufficient_quota"`) and a proxy tell, so we mirror the native pairing.
-        crate::forward::KIND_INSUFFICIENT_QUOTA => {
-            serde_json::Value::String(crate::forward::KIND_INSUFFICIENT_QUOTA.to_string())
+        crate::proxy::KIND_INSUFFICIENT_QUOTA => {
+            serde_json::Value::String(crate::proxy::KIND_INSUFFICIENT_QUOTA.to_string())
         }
-        crate::forward::KIND_INVALID_REQUEST
-        | crate::forward::KIND_PERMISSION
-        | crate::forward::KIND_NOT_FOUND
-        | crate::forward::KIND_RATE_LIMIT
-        | crate::forward::KIND_SERVER_ERROR
-        | crate::forward::KIND_API_ERROR => serde_json::Value::Null,
+        crate::proxy::KIND_INVALID_REQUEST
+        | crate::proxy::KIND_PERMISSION
+        | crate::proxy::KIND_NOT_FOUND
+        | crate::proxy::KIND_RATE_LIMIT
+        | crate::proxy::KIND_SERVER_ERROR
+        | crate::proxy::KIND_API_ERROR => serde_json::Value::Null,
         other => {
             // A caller-supplied passthrough type we model no code for: OpenAI carries no
             // machine-readable code for these, so `null` matches the native shape. Named binding
@@ -132,7 +132,7 @@ pub(crate) fn openai_classify(status: StatusCode, body: &[u8]) -> crate::breaker
                 .map(|s| s.to_string())
         })
         .as_deref()
-        == Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH);
+        == Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH);
     // Mirror production `extract_error`: the prose message scan is GATED to the HTTP statuses an
     // oversized request actually uses (400 invalid_request_error; 413 payload-too-large). Without the
     // gate a 401/429/5xx whose prose happens to contain "maximum context length" would reclassify as
@@ -258,21 +258,21 @@ mod tests {
     fn bearer_error_code_mirrors_native_type_code_pairing() {
         use super::bearer_error_code as code;
         assert_eq!(
-            code(crate::forward::KIND_AUTHENTICATION),
+            code(crate::proxy::KIND_AUTHENTICATION),
             serde_json::Value::String("invalid_api_key".to_string())
         );
         assert_eq!(
-            code(crate::forward::KIND_INSUFFICIENT_QUOTA),
+            code(crate::proxy::KIND_INSUFFICIENT_QUOTA),
             serde_json::Value::String("insufficient_quota".to_string())
         );
         // Every modeled non-auth/non-quota type carries no code.
         for t in [
-            crate::forward::KIND_INVALID_REQUEST,
-            crate::forward::KIND_PERMISSION,
-            crate::forward::KIND_NOT_FOUND,
-            crate::forward::KIND_RATE_LIMIT,
-            crate::forward::KIND_SERVER_ERROR,
-            crate::forward::KIND_API_ERROR,
+            crate::proxy::KIND_INVALID_REQUEST,
+            crate::proxy::KIND_PERMISSION,
+            crate::proxy::KIND_NOT_FOUND,
+            crate::proxy::KIND_RATE_LIMIT,
+            crate::proxy::KIND_SERVER_ERROR,
+            crate::proxy::KIND_API_ERROR,
         ] {
             assert_eq!(code(t), serde_json::Value::Null, "{t} must emit code:null");
         }

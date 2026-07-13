@@ -3,7 +3,7 @@
 
 //! The **Unix-socket** routing hook (`route: socket`) — an operator-run BINARY that ranks pool
 //! members over a local Unix domain socket. The fast rung of the hook ladder: same wire contract as
-//! the HTTP webhook (`routing::wire`, newline-delimited here instead of HTTP-framed), same hard
+//! the HTTP webhook (`hooks::wire`, newline-delimited here instead of HTTP-framed), same hard
 //! deadline, same `on_error` fail-safe — but no HTTP stack and no TCP, so a co-located compiled hook
 //! answers in single-digit microseconds instead of the webhook's fraction of a millisecond.
 //!
@@ -345,7 +345,7 @@ impl RoutingPolicy for SocketPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::RoutingDecision;
+    use crate::hooks::RoutingDecision;
     use tokio::io::AsyncReadExt;
     use tokio::net::UnixListener;
 
@@ -914,13 +914,13 @@ mod tests {
 
         // Opt-in request: prompt + identity populated (as `forward` does behind the flags).
         let mut r = req();
-        r.prompt = Some(crate::routing::PromptProjection {
+        r.prompt = Some(crate::hooks::PromptProjection {
             system: Some("be brief".into()),
             // A literal newline in the text: the NDJSON framing must survive it end-to-end
             // (serde_json escapes it inside the string value, so the line stays ONE line).
             messages: vec![("user".into(), "hello\nsecond line".into())],
         });
-        r.identity = Some(crate::routing::CallerIdentity {
+        r.identity = Some(crate::hooks::CallerIdentity {
             key_id: Some("k-1".into()),
             key_name: Some("sales-team".into()),
             user: None,

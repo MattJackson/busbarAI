@@ -867,7 +867,7 @@ pub(crate) struct HookCfg {
     /// `auth: [sso]` means the built-in `tokens` is not loaded. AT MOST ONE hook may set `default:
     /// true` (boot AND every admin apply → error naming both); 0 ⇒ the compiled-in backstop. Only an
     /// ordering hook (one that returns `order`) is a meaningful default. Default false. Resolution:
-    /// `routing::resolve_pool_ordering` gives this hook to every pool whose base is unnamed.
+    /// `hooks::resolve_pool_ordering` gives this hook to every pool whose base is unnamed.
     #[serde(default)]
     pub(crate) default: bool,
 }

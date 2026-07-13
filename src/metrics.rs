@@ -346,7 +346,7 @@ fn refresh_scrape_gauges(app: &App) {
 
     // Direct-model lanes (reachable via `by_model` routing, no pool required) get a lane-state
     // gauge too, labeled with the model name as `pool` — the same convention the counters use
-    // for model-routed traffic (`forward::metric_pool_label`: empty pool name → model string),
+    // for model-routed traffic (`proxy::metric_pool_label`: empty pool name → model string),
     // so gauge and counters PromQL-join. Cardinality: bounded by |configured models|, a startup
     // constant. Without this, a pool-less config (the docs' minimal getting-started config)
     // exposes NO lane gauges at all — a fresh boot rendered an empty /metrics (harness finding,

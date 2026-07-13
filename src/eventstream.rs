@@ -327,11 +327,7 @@ pub(crate) fn encode_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
     // Drop the frame if any header is oversized rather than emit a corrupt/truncated header (see
     // push_string_header). `:event-type` is the only caller-supplied value; the others are literals.
     if !push_string_header(&mut frame, HDR_EVENT_TYPE, event_type)
-        || !push_string_header(
-            &mut frame,
-            HDR_CONTENT_TYPE,
-            crate::forward::APPLICATION_JSON,
-        )
+        || !push_string_header(&mut frame, HDR_CONTENT_TYPE, crate::proxy::APPLICATION_JSON)
         || !push_string_header(&mut frame, HDR_MESSAGE_TYPE, MSG_TYPE_EVENT)
     {
         // An oversized header dropped the frame. This is unreachable for any real Bedrock event name
@@ -364,11 +360,7 @@ pub(crate) fn encode_exception_frame(exception_type: &str, message: &str) -> Vec
     // Build headers straight into the single frame buffer (see `encode_frame`) — one allocation.
     let mut frame = frame_open();
     if !push_string_header(&mut frame, HDR_EXCEPTION_TYPE, exception_type)
-        || !push_string_header(
-            &mut frame,
-            HDR_CONTENT_TYPE,
-            crate::forward::APPLICATION_JSON,
-        )
+        || !push_string_header(&mut frame, HDR_CONTENT_TYPE, crate::proxy::APPLICATION_JSON)
         || !push_string_header(&mut frame, HDR_MESSAGE_TYPE, MSG_TYPE_EXCEPTION)
     {
         // `:exception-type` is the caller-supplied value; an oversized one drops the frame. Log so a
@@ -668,7 +660,7 @@ mod tests {
         let mut h = string_header(HDR_EXCEPTION_TYPE, "InternalServerException");
         h.extend_from_slice(&string_header(
             HDR_CONTENT_TYPE,
-            crate::forward::APPLICATION_JSON,
+            crate::proxy::APPLICATION_JSON,
         ));
         h.extend_from_slice(&string_header(HDR_MESSAGE_TYPE, MSG_TYPE_EXCEPTION));
         assert_eq!(event_type_for_frame(&h), "internalServerException");
@@ -780,7 +772,7 @@ mod tests {
         let mut h2 = string_header(HDR_MESSAGE_TYPE, MSG_TYPE_EXCEPTION);
         h2.extend_from_slice(&string_header(
             HDR_CONTENT_TYPE,
-            crate::forward::APPLICATION_JSON,
+            crate::proxy::APPLICATION_JSON,
         ));
         assert_eq!(
             event_type_for_frame(&h2),

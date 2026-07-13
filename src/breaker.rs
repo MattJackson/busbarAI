@@ -169,7 +169,7 @@ pub(crate) fn normalize_raw_error(
         // The previous `!(500..600)` guard let any non-5xx (e.g. a 200/3xx/auth) carrying a
         // `context_length_exceeded` code masquerade as ContextLength; restrict to the precise
         // request-size set so it can never mask a non-request-size status.
-        if code == crate::forward::PROVIDER_CODE_CONTEXT_LENGTH
+        if code == crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH
             && (raw.http_status == 400 || raw.http_status == 413)
         {
             return CanonicalSignal {
@@ -298,7 +298,7 @@ mod tests {
         // healthy, fail over without penalizing the breaker.
         let raw = RawUpstreamError {
             http_status: 400,
-            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+            provider_code: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
@@ -317,7 +317,7 @@ mod tests {
         // TransientUpstream) so the breaker is penalized — NOT ContextLength.
         let raw = RawUpstreamError {
             http_status: 503,
-            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+            provider_code: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
@@ -331,11 +331,11 @@ mod tests {
         // built-in context-length recognition even for the canonical code on a 400.
         let raw = RawUpstreamError {
             http_status: 400,
-            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+            provider_code: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
-        let map = err_map(&[(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH, "client_error")]);
+        let map = err_map(&[(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH, "client_error")]);
         let sig = normalize_raw_error(&raw, &map);
         assert_eq!(sig.class, StatusClass::ClientError);
     }
@@ -400,7 +400,7 @@ mod tests {
         // (Fails against pre-R27 code, whose `!(500..600)` guard accepted any non-5xx.)
         let raw = RawUpstreamError {
             http_status: 403,
-            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+            provider_code: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };
@@ -414,7 +414,7 @@ mod tests {
         // accepts for the built-in context_length code.
         let raw = RawUpstreamError {
             http_status: 413,
-            provider_code: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+            provider_code: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
             structured_type: None,
             retry_after_secs: None,
         };

@@ -13,7 +13,7 @@ use super::*;
 /// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
 /// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims. Single
 /// source of truth shared by the route injection (`route.rs`), the forward-layer strip
-/// (`forward::strip_router_shim_keys`), and the Gemini reader's `modeled_keys` exclusion so it never
+/// (`proxy::strip_router_shim_keys`), and the Gemini reader's `modeled_keys` exclusion so it never
 /// reaches a backend on any path. A leading `__busbar` makes a collision with a real provider field
 /// impossible. Defined here and referenced at this owning path, so the route/forward sites reach it
 /// via `crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY`.
@@ -220,7 +220,7 @@ impl ProtocolReader for GeminiReader {
                     || (lower.contains("exceeds the maximum")
                         && (lower.contains("token") || lower.contains("context")))
                 {
-                    Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
+                    Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
                 } else {
                     provider_code
                 }
@@ -310,7 +310,7 @@ impl ProtocolReader for GeminiReader {
         {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
-                provider_signal: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+                provider_signal: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
                 retry_after: None,
             };
         }
@@ -709,7 +709,7 @@ impl ProtocolReader for GeminiReader {
         // (the `test_gemini_roundtrip_identity` invariant). `IrRequest.stream` (captured above) is the
         // source of truth for path selection (`upstream_path_for_stream`); the `extra` copy is purely
         // for round-trip fidelity. The router-injected `stream`/shim NEVER reach a real backend
-        // because `forward::strip_router_shim_keys` now runs UNCONDITIONALLY (same- AND cross-protocol)
+        // because `proxy::strip_router_shim_keys` now runs UNCONDITIONALLY (same- AND cross-protocol)
         // before the upstream call.
         //
         // The router-internal `__busbar_gemini_json_array` shim IS in `modeled_keys`, so it never
@@ -2597,7 +2597,7 @@ impl ProtocolWriter for GeminiWriter {
         // the SOURCE request carried one and it was preserved verbatim through `extra` (the reader
         // does NOT model `stream`, mirroring how it round-trips `model` for byte-identity). For a
         // NATIVE Gemini request `extra` carries no `stream`, so the egress body carries none either.
-        // On same-protocol passthrough `forward::strip_router_shim_keys` removes any router-injected
+        // On same-protocol passthrough `proxy::strip_router_shim_keys` removes any router-injected
         // `stream` before the upstream call. (An earlier version of this comment wrongly claimed the
         // reader excludes `stream` via `modeled_keys`; it does not — the accurate behavior is here.)
 
@@ -2667,11 +2667,11 @@ impl ProtocolWriter for GeminiWriter {
                 ERR_TYPE_RATE_LIMIT | "resource_exhausted" | "rate_limit" => {
                     Some(GRPC_RESOURCE_EXHAUSTED)
                 }
-                ERR_TYPE_OVERLOADED | crate::forward::KIND_OVERLOADED | "unavailable" => {
+                ERR_TYPE_OVERLOADED | crate::proxy::KIND_OVERLOADED | "unavailable" => {
                     Some(GRPC_UNAVAILABLE)
                 }
-                "deadline_exceeded" | crate::forward::KIND_TIMEOUT => Some(GRPC_DEADLINE_EXCEEDED),
-                crate::forward::KIND_API_ERROR | "internal" | crate::forward::KIND_SERVER_ERROR => {
+                "deadline_exceeded" | crate::proxy::KIND_TIMEOUT => Some(GRPC_DEADLINE_EXCEEDED),
+                crate::proxy::KIND_API_ERROR | "internal" | crate::proxy::KIND_SERVER_ERROR => {
                     Some(GRPC_INTERNAL)
                 }
                 "unimplemented" | "not_implemented" => Some(GRPC_UNIMPLEMENTED),
@@ -3291,7 +3291,7 @@ impl ProtocolWriter for GeminiWriter {
 
     fn egress_user_agent(&self) -> &'static str {
         // Google GenAI SDK UA shape — pinned, see `EGRESS_UA_GEMINI` in forward.rs.
-        crate::forward::EGRESS_UA_GEMINI
+        crate::proxy::EGRESS_UA_GEMINI
     }
 
     fn has_model_in_url(&self) -> bool {

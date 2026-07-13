@@ -107,7 +107,7 @@ impl WireBody {
     pub(crate) fn json(bytes: Bytes) -> Self {
         Self {
             bytes,
-            content_type: axum::http::HeaderValue::from_static(crate::forward::APPLICATION_JSON),
+            content_type: axum::http::HeaderValue::from_static(crate::proxy::APPLICATION_JSON),
         }
     }
     /// A body with an explicit content-type (e.g. audio speech). Falls back to octet-stream if the
@@ -123,7 +123,7 @@ impl WireBody {
 }
 
 /// A request that could not be parsed into this operation's IR — rendered as a caller-dialect 4xx
-/// (via the existing `forward::ingress_error`). `UnsupportedSubOp` is the m3 second 404 site
+/// (via the existing `proxy::ingress_error`). `UnsupportedSubOp` is the m3 second 404 site
 /// (`ImageIr.op` unsupported for the model) — distinct from handler-absence (§3), same terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IngressReject {
@@ -200,7 +200,7 @@ pub(crate) trait OperationHandler: Send + Sync {
     /// The Content-Type of THIS operation's egress request wire (what `write_request` emits).
     /// JSON for every JSON-bodied operation; a multipart operation overrides with its boundary.
     fn egress_request_content_type(&self) -> &'static str {
-        crate::forward::APPLICATION_JSON
+        crate::proxy::APPLICATION_JSON
     }
 
     /// The egress `Accept` header for the upstream request. Default: the writer's stream-aware choice
@@ -216,7 +216,7 @@ pub(crate) trait OperationHandler: Send + Sync {
     /// these seams.
     fn read_request_value(&self, v: &Value) -> Result<IrReq, IngressReject> {
         let bytes = serde_json::to_vec(v).map_err(|e| IngressReject::BadRequest(e.to_string()))?;
-        self.read_request(&bytes, crate::forward::APPLICATION_JSON)
+        self.read_request(&bytes, crate::proxy::APPLICATION_JSON)
     }
     fn write_request_value(&self, ir: &IrReq) -> Option<Value> {
         serde_json::from_slice(&self.write_request(ir)).ok()
@@ -461,7 +461,7 @@ mod dispatch_tests {
     #[test]
     fn engine_never_branches_on_operation_identity() {
         // Scan EVERY file of the forward engine (the module split must not open a blind spot).
-        let engine_files = [("src/forward/mod.rs", include_str!("../forward/mod.rs"))];
+        let engine_files = [("src/proxy/mod.rs", include_str!("../proxy/mod.rs"))];
         let forbidden = [
             "op.name() ==",
             "op.name()==",

@@ -121,7 +121,7 @@ const MAX_KEY_ID_LEN: usize = 64;
 fn json_response(status: StatusCode, body: Value) -> Response {
     (
         status,
-        [(CONTENT_TYPE, crate::forward::APPLICATION_JSON)],
+        [(CONTENT_TYPE, crate::proxy::APPLICATION_JSON)],
         body.to_string(),
     )
         .into_response()
@@ -4895,7 +4895,7 @@ providers: {}
             };
             let resp = req
                 .header("x-admin-token", "admintok")
-                .header("content-type", crate::forward::APPLICATION_JSON)
+                .header("content-type", crate::proxy::APPLICATION_JSON)
                 .body(malformed.clone())
                 .send()
                 .await

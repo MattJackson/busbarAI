@@ -408,10 +408,7 @@ fn vendor_auth_failure_message(proto: &str) -> &'static str {
 pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static str) {
     crate::proto::protocol_for(proto)
         .map(|p| p.writer().auth_failure_status_and_kind())
-        .unwrap_or((
-            StatusCode::UNAUTHORIZED,
-            crate::forward::KIND_AUTHENTICATION,
-        ))
+        .unwrap_or((StatusCode::UNAUTHORIZED, crate::proxy::KIND_AUTHENTICATION))
 }
 
 /// Build an auth-failure response carrying the inferred ingress protocol's NATIVE error envelope.
@@ -437,7 +434,7 @@ pub(crate) fn auth_failure_status_and_kind(proto: &str) -> (StatusCode, &'static
 /// No unwrap / expect / panic on this request path: `ingress_error` degrades a serialization failure
 /// to a generic JSON object internally.
 ///
-/// The envelope is built by `crate::forward::ingress_error`, the single source of truth for native
+/// The envelope is built by `crate::proxy::ingress_error`, the single source of truth for native
 /// error shaping: it selects the protocol writer, sets `application/json`, and attaches the Bedrock
 /// `x-amzn-RequestId` / `x-amzn-errortype` headers via the
 /// `ProtocolWriter::attach_error_response_headers` vtable method. Using the shared builder means the
@@ -449,7 +446,7 @@ fn unauthorized_response(path: &str) -> Response {
     let proto = proto_for_path(path);
     let message = vendor_auth_failure_message(proto);
     let (status, kind) = auth_failure_status_and_kind(proto);
-    crate::forward::ingress_error(proto, status, kind, message)
+    crate::proxy::ingress_error(proto, status, kind, message)
 }
 
 /// Extract the operator admin token from the `x-admin-token` header, treating a present-but-blank
@@ -778,12 +775,12 @@ fn rate_limited_response() -> Response {
 fn unauthorized_with_completion_taps(app: &crate::state::App, path: &str) -> Response {
     let proto = proto_for_path(path);
     if !app.tap_hooks_completion.is_empty() {
-        let shape = crate::forward::capture_stage_shape(None, "", proto, false);
+        let shape = crate::proxy::capture_stage_shape(None, "", proto, false);
         let status = auth_failure_status_and_kind(proto).0.as_u16();
-        crate::forward::fire_stage_taps(
+        crate::proxy::fire_stage_taps(
             &app.tap_hooks_completion,
             &shape,
-            crate::routing::wire::HookStageProjection {
+            crate::hooks::wire::HookStageProjection {
                 at: "completion",
                 model: None,
                 attempt_number: None,
@@ -1435,7 +1432,7 @@ mod tests {
     fn test_synth_amzn_request_id_is_uuid_v4() {
         // Regression for the flat-32-hex-no-dashes format: a Bedrock x-amzn-RequestId must be a
         // CSPRNG UUID-v4, matching real AWS. The auth path now mints this id through the CANONICAL
-        // `crate::proto::bedrock::synth_amzn_request_id` (via `forward::ingress_error` →
+        // `crate::proto::bedrock::synth_amzn_request_id` (via `proxy::ingress_error` →
         // `attach_bedrock_error_headers`), not a private copy — assert the canonical fn's shape so the
         // bedrock auth-failure header contract stays covered. Two consecutive ids must differ
         // (entropy-sourced, not a predictable timestamp||counter).

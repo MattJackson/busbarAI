@@ -5,7 +5,7 @@
 //!
 //! A pool may declare a routing **policy** that, given a cheap projection of the request, returns an
 //! ordered **preference** of members — not a single pick. The ordered list feeds the failover loop
-//! Busbar already has (`forward::pick_among`): if the policy's #1 is tripped / excluded / at
+//! Busbar already has (`proxy::pick_among`): if the policy's #1 is tripped / excluded / at
 //! capacity, Busbar walks to #2 using the existing breaker machinery. One transport-agnostic trait
 //! (`RoutingPolicy`); webhook / socket are the out-of-process implementations, and the built-in
 //! ranking hooks (the `hooks/ranking/` workspace crate) are the in-process ones.
@@ -14,9 +14,9 @@
 //! at config load and NEVER constructs any of the projection types or enters this module's async
 //! path. The hot path stays today's inline SWRR.
 //!
-//! This surface is PRODUCTION-WIRED: `forward::decide_policy_order` builds the `RoutingRequest` +
+//! This surface is PRODUCTION-WIRED: `proxy::decide_policy_order` builds the `RoutingRequest` +
 //! `Candidate` projections from the live store signals and invokes the resolved policy on every
-//! non-default request; `forward::pick_among` walks the ranked order through the existing failover
+//! non-default request; `proxy::pick_among` walks the ranked order through the existing failover
 //! loop. `resolve_policy` (below) constructs the ranking-hook / webhook / socket transports once
 //! at config load.
 
@@ -103,7 +103,7 @@ pub(crate) struct FallbackHook {
 /// This resolves the BASE only. A pool's GATES are resolved separately (`resolve_pool_gates`) and
 /// fire in the phase-2 decision reconcile — a gate's `order` overrides the base; its abstain falls
 /// through to the base. The resolved base is stored on `PoolRuntime::policy` and consumed
-/// per-request by `forward::decide_policy_order`.
+/// per-request by `proxy::decide_policy_order`.
 pub(crate) fn resolve_policy(cfg: &crate::config::PoolCfg) -> Option<ResolvedPolicy> {
     // `weighted` ⇒ the zero-cost default path (no policy object, inline SWRR) — byte-identical to
     // 1.2.1's `route: weighted` — so `native_name()` returns `None` here and we take the `?`
@@ -348,7 +348,7 @@ pub(crate) async fn fetch_schema(
     // schema member for the /schema read (the endpoint adds its own {name, schema} wrapper, so
     // extracting here is what prevents a double nest). No `schema` member (incl. the `{}`
     // unsupported reply) = no schema (the endpoint reports null).
-    serde_json::from_value::<crate::routing::wire::DescribeReply>(reply)
+    serde_json::from_value::<crate::hooks::wire::DescribeReply>(reply)
         .ok()?
         .schema
 }

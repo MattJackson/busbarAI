@@ -26,7 +26,7 @@
 //! internal target at runtime.
 //!
 //! This transport is live: `resolve_policy`'s webhook arm constructs a `WebhookPolicy` over the
-//! validated sidecar URL + the shared client at config load, and `forward::decide_policy_order`
+//! validated sidecar URL + the shared client at config load, and `proxy::decide_policy_order`
 //! invokes it per request through the same failover loop the natives feed.
 
 use super::{Candidate, PolicyResult, RoutingContext, RoutingPolicy, RoutingRequest};
@@ -87,7 +87,7 @@ impl WebhookPolicy {
             .post(&self.url)
             .header(
                 reqwest::header::CONTENT_TYPE,
-                crate::forward::APPLICATION_JSON,
+                crate::proxy::APPLICATION_JSON,
             )
             .body(payload)
             .timeout(budget)
@@ -238,7 +238,7 @@ impl RoutingPolicy for WebhookPolicy {
             .post(&self.url)
             .header(
                 reqwest::header::CONTENT_TYPE,
-                crate::forward::APPLICATION_JSON,
+                crate::proxy::APPLICATION_JSON,
             )
             .body(projection.to_vec())
             .timeout(budget)
@@ -250,7 +250,7 @@ impl RoutingPolicy for WebhookPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::RoutingDecision;
+    use crate::hooks::RoutingDecision;
     use axum::{routing::post, Router};
     use std::time::Duration as StdDuration;
 
@@ -266,7 +266,7 @@ mod tests {
                 axum::http::StatusCode::from_u16(status).unwrap(),
                 [(
                     axum::http::header::CONTENT_TYPE,
-                    crate::forward::APPLICATION_JSON,
+                    crate::proxy::APPLICATION_JSON,
                 )],
                 body,
             )
@@ -536,7 +536,7 @@ mod tests {
                     .status(status)
                     .header(
                         axum::http::header::CONTENT_TYPE,
-                        crate::forward::APPLICATION_JSON,
+                        crate::proxy::APPLICATION_JSON,
                     )
                     .body(Body::from(body))
                     .unwrap()
@@ -567,7 +567,7 @@ mod tests {
                     axum::http::StatusCode::OK,
                     [(
                         axum::http::header::CONTENT_TYPE,
-                        crate::forward::APPLICATION_JSON,
+                        crate::proxy::APPLICATION_JSON,
                     )],
                     r#"{"order":[0]}"#,
                 )
@@ -686,7 +686,7 @@ mod tests {
                         axum::http::StatusCode::OK,
                         [(
                             axum::http::header::CONTENT_TYPE,
-                            crate::forward::APPLICATION_JSON,
+                            crate::proxy::APPLICATION_JSON,
                         )],
                         r#"{"order":[0]}"#,
                     )
@@ -708,11 +708,11 @@ mod tests {
             .unwrap();
         // Opt-in request: prompt + identity present.
         let mut r = req();
-        r.prompt = Some(crate::routing::PromptProjection {
+        r.prompt = Some(crate::hooks::PromptProjection {
             system: Some("be brief".into()),
             messages: vec![("user".into(), "hello".into())],
         });
-        r.identity = Some(crate::routing::CallerIdentity {
+        r.identity = Some(crate::hooks::CallerIdentity {
             key_id: None,
             key_name: Some("sales-team".into()),
             user: Some("alice".into()),

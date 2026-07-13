@@ -289,7 +289,7 @@ impl ProtocolReader for AnthropicReader {
                 || (lower.contains("exceeds the maximum")
                     && (lower.contains("token") || lower.contains("context")))
             {
-                Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
+                Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
             } else {
                 None
             }
@@ -1933,11 +1933,9 @@ impl ProtocolWriter for AnthropicWriter {
             "not_found" => ERR_TYPE_NOT_FOUND,
             ERR_TYPE_REQUEST_TOO_LARGE | "payload_too_large" => ERR_TYPE_REQUEST_TOO_LARGE,
             "rate_limit" | "too_many_requests" => ERR_TYPE_RATE_LIMIT,
-            crate::forward::KIND_OVERLOADED => ERR_TYPE_OVERLOADED,
-            crate::forward::KIND_TIMEOUT => ERR_TYPE_TIMEOUT,
-            ERR_TYPE_API_ERROR | crate::forward::KIND_SERVER_ERROR | "internal" => {
-                ERR_TYPE_API_ERROR
-            }
+            crate::proxy::KIND_OVERLOADED => ERR_TYPE_OVERLOADED,
+            crate::proxy::KIND_TIMEOUT => ERR_TYPE_TIMEOUT,
+            ERR_TYPE_API_ERROR | crate::proxy::KIND_SERVER_ERROR | "internal" => ERR_TYPE_API_ERROR,
             // Already an Anthropic-native type (e.g. "invalid_request_error") or an unmapped value:
             // emit it unchanged rather than collapsing every unknown into one bucket.
             ERR_TYPE_INVALID_REQUEST
@@ -1993,7 +1991,7 @@ impl ProtocolWriter for AnthropicWriter {
 
     fn egress_user_agent(&self) -> &'static str {
         // Anthropic Python SDK UA shape — pinned, see `EGRESS_UA_ANTHROPIC` in forward.rs.
-        crate::forward::EGRESS_UA_ANTHROPIC
+        crate::proxy::EGRESS_UA_ANTHROPIC
     }
 
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {

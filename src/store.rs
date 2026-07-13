@@ -254,7 +254,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// only ORDERS; the unchanged `acquire_for_dispatch_in` (called once on the chosen lane) still
     /// owns the HalfOpen probe race. Using `usable_in` here instead would steal recovery probes for
     /// every ranked lane the walk merely peeks at.
-    // ROUTING-POLICY SIGNAL ACCESSORS: read per-request by `forward::decide_policy_order` (and
+    // ROUTING-POLICY SIGNAL ACCESSORS: read per-request by `proxy::decide_policy_order` (and
     // `pick_among` for `ready_in`) to build the `Candidate` projection the resolved policy ranks on.
     fn ready_in(&self, pool: &str, lane: usize, now: u64) -> bool;
     /// Available (free) concurrency permits on a lane's semaphore right now — a routing-policy signal
@@ -1810,7 +1810,7 @@ impl InMemoryStore {
 
     /// Side-effect-FREE readiness check (lane-global gates + a non-mutating breaker peek). Shared
     /// body for both `is_ready` (test-gated) and `ready_in` (the non-test `StateStore` trait method,
-    /// production-wired via `forward::decide_policy_order`/`pick_among`), so it is production-live.
+    /// production-wired via `proxy::decide_policy_order`/`pick_among`), so it is production-live.
     fn ready_for(&self, pool: &str, lane: usize, now: u64) -> bool {
         if !self.lane_admissible(lane) {
             return false;

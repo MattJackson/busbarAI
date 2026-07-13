@@ -28,7 +28,7 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str, proto: &str) -> 
             return Some(ingress_error(
                 proto,
                 StatusCode::FORBIDDEN,
-                crate::forward::KIND_PERMISSION,
+                crate::proxy::KIND_PERMISSION,
                 "Your API key does not have permission to access this resource.",
             ));
         }
@@ -40,7 +40,7 @@ fn pool_authorized(gov: &crate::governance::GovCtx, pool: &str, proto: &str) -> 
 /// reach if the requested pool exhausts (`OnExhausted::FallbackPool`). The initial `pool_authorized`
 /// check only gates the FIRST pool; without this, a key restricted to pool A could be served by a
 /// fallback pool B (configured via A's `on_exhausted = fallback_pool:B`) it is not allowed to touch,
-/// because the fallback dispatch in `forward::handle_fallback_pool` never re-checks the key (the
+/// because the fallback dispatch in `proxy::handle_fallback_pool` never re-checks the key (the
 /// `gov` context is not threaded that deep — the ACL is an INGRESS concern, enforced here).
 ///
 /// The fallback chain is multi-level (A→B→C: B's own `on_exhausted` may name C) and may cycle
@@ -94,9 +94,9 @@ fn usage_sink(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     charged_at: u64,
-) -> Option<crate::forward::UsageSink> {
+) -> Option<crate::proxy::UsageSink> {
     match (&app.governance, &gov.key) {
-        (Some(g), Some(key)) => Some(crate::forward::UsageSink {
+        (Some(g), Some(key)) => Some(crate::proxy::UsageSink {
             gov: g.clone(),
             key_id: key.id.clone(),
             period: key.budget_period.clone(),
@@ -179,7 +179,7 @@ async fn budget_check(
                 Err(ingress_error(
                     proto,
                     status,
-                    crate::forward::KIND_INSUFFICIENT_QUOTA,
+                    crate::proxy::KIND_INSUFFICIENT_QUOTA,
                     "You have exceeded your current quota. Please check your plan and billing details.",
                 ))
             }
@@ -204,7 +204,7 @@ async fn budget_check(
                         Err(ingress_error(
                             proto,
                             status,
-                            crate::forward::KIND_INSUFFICIENT_QUOTA,
+                            crate::proxy::KIND_INSUFFICIENT_QUOTA,
                             "You have exceeded your current quota. Please check your plan and billing details.",
                         ))
                     }
@@ -250,7 +250,7 @@ async fn governance_guard(
     // FALLBACK pool on exhaustion (`OnExhausted::FallbackPool`). Re-enforce the key's `allowed_pools`
     // against every fallback pool reachable from here, so a key restricted to pool A can never be
     // served by a fallback pool B it is not allowed to use (the fallback dispatch in
-    // `forward::handle_fallback_pool` does not — and cannot — re-check the key; the ACL is enforced
+    // `proxy::handle_fallback_pool` does not — and cannot — re-check the key; the ACL is enforced
     // at this ingress boundary). A denial is the SAME protocol-native 403 the initial check emits.
     if let Some(resp) = fallback_pools_authorized(app, gov, pool, proto) {
         return Err(finish_rejected(
@@ -300,7 +300,7 @@ fn rate_check(
             let mut resp = ingress_error(
                 proto,
                 StatusCode::TOO_MANY_REQUESTS,
-                crate::forward::KIND_RATE_LIMIT,
+                crate::proxy::KIND_RATE_LIMIT,
                 "Rate limit exceeded. Please retry after the indicated time.",
             );
             if let Ok(hv) = axum::http::HeaderValue::from_str(&retry.to_string()) {
@@ -329,7 +329,7 @@ fn pool_label<'a>(app: &Arc<App>, model: &'a str) -> &'a str {
     if app.pools.contains_key(model) || app.by_model.contains_key(model) {
         model
     } else {
-        crate::forward::POOL_LABEL_UNRESOLVED
+        crate::proxy::POOL_LABEL_UNRESOLVED
     }
 }
 
@@ -491,14 +491,14 @@ fn finish_inner(
 /// names the ingress protocol of the route that failed; `status` is the HTTP status; `kind` is a
 /// protocol-appropriate error category; `message` is the human-readable detail.
 ///
-/// Thin delegation to the CANONICAL `crate::forward::ingress_error` (the single
+/// Thin delegation to the CANONICAL `crate::proxy::ingress_error` (the single
 /// source of truth for native error shaping + per-protocol headers — Bedrock
 /// `x-amzn-RequestId`/`x-amzn-errortype` via the `ProtocolWriter::attach_error_response_headers` vtable method (BedrockWriter delegates to its private helper), the generic
 /// fallback envelope, etc.). Keeping route.rs on this one function rather than a private copy means
 /// route/forward error shaping cannot drift. The route call sites (and the in-module tests) keep
 /// the short `proto`/`message` parameter names; the canonical fn names them `ingress`/`msg`.
 fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> Response {
-    crate::forward::ingress_error(proto, status, kind, message)
+    crate::proxy::ingress_error(proto, status, kind, message)
 }
 
 /// Shared ingress core for the PATH-MODEL protocols (`gemini`, `bedrock`): the model lives in the
@@ -545,13 +545,13 @@ async fn ingress_path_model(
                 app,
                 gov,
                 proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
+                crate::proxy::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
+                    crate::proxy::KIND_INVALID_REQUEST,
                     "We could not parse the JSON body of your request.",
                 ),
             );
@@ -569,7 +569,7 @@ async fn ingress_path_model(
             // rather than SSE (only Gemini's writer carries such a key today). The marker key is
             // resolved through the writer vtable by protocol NAME — route.rs names no protocol
             // submodule, so "delete proto/gemini → app is gemini-free" holds. The shim is stripped
-            // before the upstream call (`forward::strip_router_shim_keys`); cross-protocol egress
+            // before the upstream call (`proxy::strip_router_shim_keys`); cross-protocol egress
             // drops it via the IR.
             if gemini_json_array {
                 if let Some(shim_key) = crate::proto::array_stream_shim_key_for(proto) {
@@ -585,13 +585,13 @@ async fn ingress_path_model(
                 app,
                 gov,
                 proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
+                crate::proxy::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
+                    crate::proxy::KIND_INVALID_REQUEST,
                     "Request body must be a JSON object.",
                 ),
             );
@@ -620,13 +620,13 @@ async fn ingress_path_model(
                 app,
                 gov,
                 proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
+                crate::proxy::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
+                    crate::proxy::KIND_INVALID_REQUEST,
                     "The request body could not be processed.",
                 ),
             );
@@ -643,13 +643,13 @@ async fn ingress_path_model(
             app,
             gov,
             proto,
-            crate::forward::POOL_LABEL_UNRESOLVED,
+            crate::proxy::POOL_LABEL_UNRESOLVED,
             started,
             charged_at,
             ingress_error(
                 proto,
                 StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
+                crate::proxy::KIND_NOT_FOUND,
                 "This endpoint does not support that operation.",
             ),
         );
@@ -747,13 +747,13 @@ pub(crate) async fn gemini_ingress(
                     &app,
                     &gov,
                     envelope_proto,
-                    crate::forward::POOL_LABEL_UNRESOLVED,
+                    crate::proxy::POOL_LABEL_UNRESOLVED,
                     started,
                     charged_at,
                     ingress_error(
                         envelope_proto,
                         StatusCode::NOT_FOUND,
-                        crate::forward::KIND_NOT_FOUND,
+                        crate::proxy::KIND_NOT_FOUND,
                         &format!(
                 "Invalid resource path: models/{rest} is not found for API version {api_version}."
             ),
@@ -768,13 +768,13 @@ pub(crate) async fn gemini_ingress(
                 &app,
                 &gov,
                 envelope_proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
+                crate::proxy::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     envelope_proto,
                     StatusCode::NOT_FOUND,
-                    crate::forward::KIND_NOT_FOUND,
+                    crate::proxy::KIND_NOT_FOUND,
                     "the requested resource was not found",
                 ),
             );
@@ -817,13 +817,13 @@ pub(crate) async fn gemini_ingress(
                     &app,
                     &gov,
                     envelope_proto,
-                    crate::forward::POOL_LABEL_UNRESOLVED,
+                    crate::proxy::POOL_LABEL_UNRESOLVED,
                     started,
                     charged_at,
                     ingress_error(
                         envelope_proto,
                         StatusCode::NOT_FOUND,
-                        crate::forward::KIND_NOT_FOUND,
+                        crate::proxy::KIND_NOT_FOUND,
                         &format!(
                             "models/{model} is not found for API version {api_version}, \
                              or is not supported for {other}."
@@ -835,13 +835,13 @@ pub(crate) async fn gemini_ingress(
                 &app,
                 &gov,
                 envelope_proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
+                crate::proxy::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     envelope_proto,
                     StatusCode::NOT_FOUND,
-                    crate::forward::KIND_NOT_FOUND,
+                    crate::proxy::KIND_NOT_FOUND,
                     "the requested resource was not found",
                 ),
             );
@@ -863,13 +863,13 @@ pub(crate) async fn gemini_ingress(
             &app,
             &gov,
             PROTO_GEMINI,
-            crate::forward::POOL_LABEL_UNRESOLVED,
+            crate::proxy::POOL_LABEL_UNRESOLVED,
             started,
             charged_at,
             ingress_error(
                 PROTO_GEMINI,
                 StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
+                crate::proxy::KIND_NOT_FOUND,
                 "This endpoint does not support that operation.",
             ),
         );
@@ -958,7 +958,7 @@ pub(crate) async fn bedrock_converse(
         return ingress_error(
             PROTO_BEDROCK,
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
         );
     };
@@ -985,7 +985,7 @@ pub(crate) async fn bedrock_converse_stream(
         return ingress_error(
             PROTO_BEDROCK,
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
         );
     };
@@ -1077,10 +1077,10 @@ pub(crate) async fn named(
         .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
         .is_none()
     {
-        return crate::forward::ingress_error(
+        return crate::proxy::ingress_error(
             PROTO_ANTHROPIC,
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
         );
     }
@@ -1105,7 +1105,7 @@ pub(crate) async fn named(
         let affinity_key = headers
             .get(affinity_header_for(&app, &name))
             .and_then(|v| v.to_str().ok());
-        let resp = crate::forward::forward_with_pool_keyed(
+        let resp = crate::proxy::forward_with_pool_keyed(
             app.clone(),
             cands.clone(),
             body,
@@ -1134,7 +1134,7 @@ pub(crate) async fn named(
     if let Some(&i) = app.by_model.get(&name) {
         // Model-based routing: anthropic ingress, lane-default breaker OperationHandler (empty pool name → the
         // op_handler shared by all direct/ad-hoc routes, surfaced by /stats and /healthz), no affinity.
-        let resp = crate::forward::forward_with_pool_keyed(
+        let resp = crate::proxy::forward_with_pool_keyed(
             app.clone(),
             vec![WeightedLane {
                 reasoning: None,
@@ -1180,7 +1180,7 @@ pub(crate) async fn named(
         ingress_error(
             PROTO_ANTHROPIC,
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             // Anthropic ingress: canonical (non-gemini) model-not-found copy.
             &not_found_message(&name, None),
         ),
@@ -1202,10 +1202,10 @@ pub(crate) async fn adhoc(
         .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
         .is_none()
     {
-        return crate::forward::ingress_error(
+        return crate::proxy::ingress_error(
             PROTO_ANTHROPIC,
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
         );
     }
@@ -1227,7 +1227,7 @@ pub(crate) async fn adhoc(
         Some(&i) if app.lanes[i].provider == provider => {
             // Single lane with weight=1 (default for ad-hoc routing): anthropic ingress, lane-default
             // breaker OperationHandler (empty pool name), no affinity.
-            let resp = crate::forward::forward_with_pool_keyed(
+            let resp = crate::proxy::forward_with_pool_keyed(
                 app.clone(),
                 vec![WeightedLane {
                     reasoning: None,
@@ -1280,7 +1280,7 @@ pub(crate) async fn adhoc(
                 ingress_error(
                     PROTO_ANTHROPIC,
                     StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
+                    crate::proxy::KIND_INVALID_REQUEST,
                     // Anthropic ingress: canonical (non-gemini) model-not-found copy.
                     &not_found_message(&model, None),
                 ),
@@ -1299,7 +1299,7 @@ pub(crate) async fn adhoc(
             ingress_error(
                 PROTO_ANTHROPIC,
                 StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
+                crate::proxy::KIND_NOT_FOUND,
                 // Anthropic ingress: canonical (non-gemini) model-not-found copy.
                 &not_found_message(&model, None),
             ),
@@ -1644,7 +1644,7 @@ mod tests {
     // the `finish` REFUND must use the window implied by the pinned `charged_at` (header-arrival)
     // epoch, NOT a fresh `store::now()`. With a `daily` key and a `charged_at` on a past day, the
     // charge lands in that day; a non-2xx finish refunds in that SAME day (net 0 there), and nothing
-    // ever leaks into today's window. (Token-fee side: `forward::usage_tap_tests::
+    // ever leaks into today's window. (Token-fee side: `proxy::usage_tap_tests::
     // test_nonstream_token_fee_uses_charged_at_window_not_clock`.)
     // No-runtime `#[test]`: the offloaded refund in `finish` runs INLINE and is observable. The
     // admission charge is seeded via the SYNC store path into the charged_at window.
@@ -2577,7 +2577,7 @@ mod tests {
         let upstream = axum::Router::new().fallback(axum::routing::any(|| async {
             axum::response::Response::builder()
                 .status(StatusCode::OK)
-                .header("content-type", crate::forward::APPLICATION_JSON)
+                .header("content-type", crate::proxy::APPLICATION_JSON)
                 .header("x-amzn-requestid", UPSTREAM_REQ_ID)
                 .body(axum::body::Body::from(
                     json!({
@@ -4735,7 +4735,7 @@ mod tests {
         let resp = ingress_error(
             "bedrock",
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             "The model 'x' does not exist or you do not have access to it.",
         );
         let req_id = resp
@@ -4775,22 +4775,22 @@ mod tests {
     fn test_bedrock_errortype_header_matches_body_and_others_omit() {
         for (kind, status, expected) in [
             (
-                crate::forward::KIND_INVALID_REQUEST,
+                crate::proxy::KIND_INVALID_REQUEST,
                 StatusCode::BAD_REQUEST,
                 "ValidationException",
             ),
             (
-                crate::forward::KIND_RATE_LIMIT,
+                crate::proxy::KIND_RATE_LIMIT,
                 StatusCode::TOO_MANY_REQUESTS,
                 "ThrottlingException",
             ),
             (
-                crate::forward::KIND_PERMISSION,
+                crate::proxy::KIND_PERMISSION,
                 StatusCode::FORBIDDEN,
                 "AccessDeniedException",
             ),
             (
-                crate::forward::KIND_INSUFFICIENT_QUOTA,
+                crate::proxy::KIND_INSUFFICIENT_QUOTA,
                 StatusCode::BAD_REQUEST,
                 "ServiceQuotaExceededException",
             ),
@@ -4812,7 +4812,7 @@ mod tests {
         let openai = ingress_error(
             "openai",
             StatusCode::NOT_FOUND,
-            crate::forward::KIND_NOT_FOUND,
+            crate::proxy::KIND_NOT_FOUND,
             "m",
         );
         assert!(
@@ -6151,7 +6151,7 @@ mod tests {
     //
     // A virtual key's `allowed_pools` was enforced only on the INITIAL pool. A pool configured with
     // `on_exhausted = fallback_pool:B` would, on exhaustion, route the request to pool B inside
-    // `forward::handle_fallback_pool` — which never re-checks the key (the `gov` context is not
+    // `proxy::handle_fallback_pool` — which never re-checks the key (the `gov` context is not
     // threaded that deep). So a key allowed ONLY on pool A could be served by pool B it was never
     // permitted to use. The fix (`fallback_pools_authorized`, wired into `governance_guard`) walks
     // the fallback chain reachable from the requested pool and re-runs the SAME `pool_authorized`
@@ -6914,7 +6914,7 @@ mod tests {
     // back to `app.by_model` (the by_model arm). The pool path is covered by
     // `test_adhoc_success_round_trip_via_router` and the governance pool-ACL set; the by_model
     // fallback — where `name` is a configured single-model lane with NO pool entry, routed via
-    // `crate::forward::forward_with_pool` — had no test. A refactor that dropped the fallback, or fed the
+    // `crate::proxy::forward_with_pool` — had no test. A refactor that dropped the fallback, or fed the
     // wrong model string, would go undetected. This wires ONLY a by_model lane (no `.pool(...)`),
     // POSTs an Anthropic body to `/<model>/v1/messages`, and asserts the 2xx plus that the upstream
     // received the (translated) forwarded request.
@@ -6975,7 +6975,7 @@ mod tests {
     //      `by_model` arm, which calls `forward_with_pool` directly with the ingress protocol so a
     //      cross-protocol backend is translated both ways; and
     //   2. the Anthropic `/<model>/v1/messages` (`named`) / `/<provider>/<model>/v1/messages`
-    //      (`adhoc`) routes → `crate::forward::forward_with_pool`, which passes `""` (the lane-default breaker
+    //      (`adhoc`) routes → `crate::proxy::forward_with_pool`, which passes `""` (the lane-default breaker
     //      CELL shared by every direct/single-model route — forward.rs design intent).
     //
     // forward.rs records every breaker outcome against the CELL keyed by the `pool_name` argument

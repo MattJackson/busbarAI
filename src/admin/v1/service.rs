@@ -233,41 +233,41 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
         next.global_hooks.retain(|n| n != name);
     }
     // Re-resolve the FIRED transports from the new registry so a global hook is live after the swap.
-    next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
+    next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
     );
-    next.tap_hooks = crate::routing::resolve_tap_hooks(
+    next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Request,
     );
-    next.tap_hooks_route = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Route,
     );
-    next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Attempt,
     );
-    next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Completion,
     );
-    next.global_gates = crate::routing::resolve_gate_hooks(
+    next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
@@ -290,41 +290,41 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
     next.config_version = current.config_version.wrapping_add(1);
     next.hook_registry.remove(name);
     next.global_hooks.retain(|n| n != name);
-    next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
+    next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
     );
-    next.tap_hooks = crate::routing::resolve_tap_hooks(
+    next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Request,
     );
-    next.tap_hooks_route = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Route,
     );
-    next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Attempt,
     );
-    next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Completion,
     );
-    next.global_gates = crate::routing::resolve_gate_hooks(
+    next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
@@ -379,41 +379,41 @@ pub(crate) fn build_with_registry(
     next.config_version = current.config_version.wrapping_add(1);
     next.hook_registry = registry;
     next.global_hooks = global_hooks;
-    next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
+    next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
     );
-    next.tap_hooks = crate::routing::resolve_tap_hooks(
+    next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Request,
     );
-    next.tap_hooks_route = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Route,
     );
-    next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Attempt,
     );
-    next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
+    next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
         next.config_version,
         crate::config::HookStage::Completion,
     );
-    next.global_gates = crate::routing::resolve_gate_hooks(
+    next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,

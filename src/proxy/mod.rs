@@ -846,7 +846,7 @@ pub(crate) struct UsageSink {
     pub(crate) key_id: String,
     pub(crate) period: String,
     /// Wall-clock epoch (seconds) captured ONCE at header-arrival time for this request. Both the
-    /// flat per-request fee (`route::budget_check` → `try_charge_request_within_budget`) and the token fee (`record_tokens`,
+    /// flat per-request fee (`ingress::budget_check` → `try_charge_request_within_budget`) and the token fee (`record_tokens`,
     /// fired at stream end / on the buffered path) are attributed to the window this epoch implies,
     /// so a single streaming request whose stream completes in a later rate-limit/budget window than
     /// its headers arrived cannot split its two charges across two windows (#29). Without it, the two
@@ -1315,7 +1315,7 @@ where
                     // mid-flight (`translate_aborted`) delivered a partial/aborted response the caller
                     // cannot use, and billing it contradicts the flat-fee-only-on-success policy (the
                     // per-request fee is charged at admission by
-                    // `route::budget_check`→`try_charge_request_within_budget`, and `route::finish`
+                    // `ingress::budget_check`→`try_charge_request_within_budget`, and `ingress::finish`
                     // REFUNDS it on a non-2xx, so the net flat fee lands only on a 2xx). Mirror that
                     // here with the SAME `failed` predicate the breaker gate above uses: a failed
                     // stream is not token-billed, covering BOTH the SSE-ingress and json-array close
@@ -2068,7 +2068,7 @@ fn record_ir_usage(
 /// direct/ad-hoc (single-model) route — that empty string is the correct CELL key and must NOT be
 /// repointed (the cell identity drives breaker state, /stats, /healthz). But emitting it verbatim
 /// as the `pool` metric LABEL mislabels all model-routed upstream traffic under an empty-string
-/// series, whereas `REQUESTS_TOTAL` (via `route::pool_label`) labels the SAME request stream with
+/// series, whereas `REQUESTS_TOTAL` (via `ingress::pool_label`) labels the SAME request stream with
 /// the MODEL name. That split makes upstream metrics impossible to correlate with the request
 /// counter for non-pool traffic. Resolve the metric label to the routed lane's model name when the
 /// cell key is empty, leaving named-pool traffic labeled by its pool name. This decouples the metric
@@ -2187,7 +2187,7 @@ enum PolicyOutcome {
 ///   content is accepted); a string `input` is replaced by the list.
 fn apply_rewrite_to_body(
     v: &mut Value,
-    rewrite: &crate::routing::wire::RewriteReply,
+    rewrite: &crate::hooks::wire::RewriteReply,
     ingress_protocol: &str,
 ) -> bool {
     if rewrite.messages.is_empty() {
@@ -2297,9 +2297,9 @@ fn build_rewrite_request<'a>(
     ingress_protocol: &'a str,
     wants_stream: bool,
     with_prompt: bool,
-) -> crate::routing::RoutingRequest<'a> {
+) -> crate::hooks::RoutingRequest<'a> {
     let system_chars = system_text_chars(v, ingress_protocol);
-    crate::routing::RoutingRequest {
+    crate::hooks::RoutingRequest {
         pool: pool_name,
         ingress_protocol,
         requested_model: v.get("model").and_then(|m| m.as_str()),
@@ -2340,7 +2340,7 @@ fn build_rewrite_request<'a>(
 async fn apply_global_rewrites(
     rewrite_hooks: &[(
         std::time::Duration,
-        std::sync::Arc<dyn crate::routing::RoutingPolicy>,
+        std::sync::Arc<dyn crate::hooks::RoutingPolicy>,
     )],
     v: &mut Value,
     pool_name: &str,
@@ -2547,7 +2547,7 @@ fn body_end_user(v: &Value) -> Option<String> {
 fn build_prompt_projection<'a>(
     v: &'a Value,
     ingress_protocol: &str,
-) -> crate::routing::PromptProjection<'a> {
+) -> crate::hooks::PromptProjection<'a> {
     use std::borrow::Cow;
     // A content value is a bare string (borrowed as-is) or an array of blocks (text blocks joined
     // by newline into an owned string).
@@ -2647,7 +2647,7 @@ fn build_prompt_projection<'a>(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    crate::routing::PromptProjection { system, messages }
+    crate::hooks::PromptProjection { system, messages }
 }
 
 /// Build the routing projection (request + candidates + context) and run the resolved policy ONCE,
@@ -2662,7 +2662,7 @@ fn build_prompt_projection<'a>(
 #[allow(clippy::too_many_arguments)]
 async fn decide_policy_order(
     app: &Arc<App>,
-    resolved: &crate::routing::ResolvedPolicy,
+    resolved: &crate::hooks::ResolvedPolicy,
     cands: &[WeightedLane],
     request_ctx: &RequestCtx,
     v: &Value,
@@ -2672,7 +2672,7 @@ async fn decide_policy_order(
     caller_token: Option<&str>,
     resolved_gov_key: Option<&crate::governance::VirtualKey>,
 ) -> PolicyOutcome {
-    use crate::routing::{
+    use crate::hooks::{
         Candidate, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingRequest,
     };
 
@@ -2733,7 +2733,7 @@ async fn decide_policy_order(
     // the OpenAI dialect, `metadata.user_id` in the Anthropic dialect).
     let identity = if send_user {
         let body_user = body_end_user(v);
-        Some(crate::routing::CallerIdentity {
+        Some(crate::hooks::CallerIdentity {
             key_id: gov_key.as_ref().map(|k| k.id.clone()),
             key_name: gov_key.as_ref().map(|k| k.name.clone()),
             user: body_user,
@@ -2876,11 +2876,11 @@ async fn decide_policy_order(
 /// Every link failing lands on the chain's reserved TERMINAL (weighted/reject/first). The common
 /// case — `on_error: weighted` etc. — has an EMPTY chain and goes straight to the terminal.
 async fn run_on_error_chain(
-    chain: &[crate::routing::FallbackHook],
+    chain: &[crate::hooks::FallbackHook],
     terminal: &crate::config::PolicyOnError,
-    req: &crate::routing::RoutingRequest<'_>,
-    candidates: &[crate::routing::Candidate<'_>],
-    ctx: &crate::routing::RoutingContext<'_>,
+    req: &crate::hooks::RoutingRequest<'_>,
+    candidates: &[crate::hooks::Candidate<'_>],
+    ctx: &crate::hooks::RoutingContext<'_>,
     failed_policy_name: &'static str,
     pool_name: &str,
 ) -> PolicyOutcome {
@@ -2888,7 +2888,7 @@ async fn run_on_error_chain(
         // Re-project per the FALLBACK's grants: it may see at most what the primary projection
         // built AND its own grants allow (never over-shares; a fallback with a grant the primary
         // lacked gets shape-only — the projection was never built).
-        let fb_req = crate::routing::RoutingRequest {
+        let fb_req = crate::hooks::RoutingRequest {
             prompt: if fb.send_prompt {
                 req.prompt.clone()
             } else {
@@ -2943,12 +2943,12 @@ async fn run_on_error_chain(
 /// and every on_error fallback, so a fallback's reject/restrict/order carries the same clamping,
 /// sanitizing, and normalization guarantees as a primary's.
 fn map_decision(
-    decision: crate::routing::RoutingDecision,
+    decision: crate::hooks::RoutingDecision,
     policy_name: &'static str,
-    candidates: &[crate::routing::Candidate<'_>],
+    candidates: &[crate::hooks::Candidate<'_>],
     on_empty: &crate::config::PolicyOnError,
 ) -> PolicyOutcome {
-    use crate::routing::RoutingDecision;
+    use crate::hooks::RoutingDecision;
 
     match decision {
         RoutingDecision::Prefer(order) => {
@@ -2980,8 +2980,8 @@ fn map_decision(
         // defense in depth: no policy, present or future, can mint a success/redirect/5xx or a
         // log/client-injecting message through this path.
         RoutingDecision::Reject { status, message } => PolicyOutcome::RejectRequest {
-            status: crate::routing::wire::clamp_reject_status(status),
-            message: crate::routing::wire::sanitize_reject_message(&message),
+            status: crate::hooks::wire::clamp_reject_status(status),
+            message: crate::hooks::wire::sanitize_reject_message(&message),
             name: policy_name,
         },
         // The hook's RESTRICT verb: keep only candidates carrying one of `tags_any` (a compliance
@@ -3001,7 +3001,7 @@ fn map_decision(
 /// ⇒ a 503. `first` advertises the policy name so the degraded pick is still observable.
 fn coerce_on_error(
     on_error: &crate::config::PolicyOnError,
-    candidates: &[crate::routing::Candidate<'_>],
+    candidates: &[crate::hooks::Candidate<'_>],
     policy_name: &'static str,
 ) -> PolicyOutcome {
     use crate::config::PolicyOnError;
@@ -3071,17 +3071,17 @@ pub(crate) fn fire_stage_taps(
     taps: &[(
         std::time::Duration,
         bool,
-        Arc<dyn crate::routing::RoutingPolicy>,
+        Arc<dyn crate::hooks::RoutingPolicy>,
     )],
     shape: &StageShape<'_>,
-    stage: crate::routing::wire::HookStageProjection<'_>,
+    stage: crate::hooks::wire::HookStageProjection<'_>,
 ) {
     if taps.is_empty() {
         return;
     }
-    let hook_req = crate::routing::wire::HookRequest {
-        op: crate::routing::wire::OP_NOTIFY,
-        request: crate::routing::wire::HookReqProjection {
+    let hook_req = crate::hooks::wire::HookRequest {
+        op: crate::hooks::wire::OP_NOTIFY,
+        request: crate::hooks::wire::HookReqProjection {
             pool: shape.pool,
             ingress_protocol: shape.ingress_protocol,
             message_count: shape.message_count,
@@ -3094,7 +3094,7 @@ pub(crate) fn fire_stage_taps(
             user: None,
         },
         candidates: Vec::new(),
-        context: crate::routing::wire::HookContext {
+        context: crate::hooks::wire::HookContext {
             budget_remaining: None,
         },
         stage: Some(stage),
@@ -3125,7 +3125,7 @@ fn gate_rejected(mut resp: Response) -> Response {
 
 /// Forward with pool name context for on_exhausted config lookup.
 /// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
-/// delegate. The ingress hot path (`route::forward_resolved`) instead calls
+/// delegate. The ingress hot path (`ingress::forward_resolved`) instead calls
 /// [`forward_with_pool_parsed`] directly with the `Value` it ALREADY parsed to resolve the model —
 /// so a normal request parses the body once across the route+forward layers, not twice.
 ///
@@ -3283,7 +3283,7 @@ pub(crate) async fn forward_with_pool_parsed(
         fire_stage_taps(
             &completion_app.tap_hooks_completion,
             &shape,
-            crate::routing::wire::HookStageProjection {
+            crate::hooks::wire::HookStageProjection {
                 at: "completion",
                 model: None,
                 attempt_number: None,
@@ -3371,7 +3371,7 @@ async fn forward_with_pool_parsed_inner(
     // each chain internally priority-ordered, globals always first.
     let pool_rewrites: &[(
         std::time::Duration,
-        std::sync::Arc<dyn crate::routing::RoutingPolicy>,
+        std::sync::Arc<dyn crate::hooks::RoutingPolicy>,
     )] = app
         .pool_runtime
         .get(pool_name)
@@ -3449,7 +3449,7 @@ async fn forward_with_pool_parsed_inner(
     // tap count. ZERO COST when no tap is configured (empty-list branch).
     if !app.tap_hooks.is_empty() {
         if let Some(body) = v.as_ref() {
-            let ctx = crate::routing::RoutingContext {
+            let ctx = crate::hooks::RoutingContext {
                 pool: pool_name,
                 budget_remaining: None,
             };
@@ -3461,8 +3461,8 @@ async fn forward_with_pool_parsed_inner(
                     wants_stream,
                     with_prompt,
                 );
-                serde_json::to_vec(&crate::routing::wire::build(
-                    crate::routing::wire::OP_NOTIFY,
+                serde_json::to_vec(&crate::hooks::wire::build(
+                    crate::hooks::wire::OP_NOTIFY,
                     &req,
                     &[],
                     &ctx,
@@ -3603,7 +3603,7 @@ async fn forward_with_pool_parsed_inner(
     //      below applies).
     // The restriction persists across failover (hops select from the shrunk `cands`). ZERO COST
     // when no gate is configured (both sources empty ⇒ the pass is skipped).
-    let pool_gates: &[(u16, crate::routing::ResolvedPolicy)] = app
+    let pool_gates: &[(u16, crate::hooks::ResolvedPolicy)] = app
         .pool_runtime
         .get(pool_name)
         .map(|r| r.gates.as_slice())
@@ -3612,7 +3612,7 @@ async fn forward_with_pool_parsed_inner(
     if !app.global_gates.is_empty() || !pool_gates.is_empty() {
         // The chain: globals (pre-sorted ascending by priority) then pool gates (config order),
         // stable-sorted by priority — ties keep globals-first, then config order.
-        let mut chain: Vec<&(u16, crate::routing::ResolvedPolicy)> =
+        let mut chain: Vec<&(u16, crate::hooks::ResolvedPolicy)> =
             app.global_gates.iter().chain(pool_gates.iter()).collect();
         chain.sort_by_key(|(p, _)| *p);
         // Every concurrently-firing gate borrows the same parsed body; the shared Null stands in
@@ -3979,7 +3979,7 @@ async fn forward_with_pool_parsed_inner(
         fire_stage_taps(
             &app.tap_hooks_route,
             shape,
-            crate::routing::wire::HookStageProjection {
+            crate::hooks::wire::HookStageProjection {
                 at: "route",
                 model: None,
                 attempt_number: None,
@@ -4060,7 +4060,7 @@ async fn forward_with_pool_parsed_inner(
             fire_stage_taps(
                 &app.tap_hooks_attempt,
                 shape,
-                crate::routing::wire::HookStageProjection {
+                crate::hooks::wire::HookStageProjection {
                     at: "attempt",
                     model: Some(&app.lanes[i].model),
                     attempt_number: Some(
@@ -6296,7 +6296,7 @@ mod usage_tap_tests {
     /// returns false, so the request proceeds with the original body.
     #[test]
     fn apply_rewrite_to_body_swaps_messages_and_is_fail_safe() {
-        use crate::routing::wire::RewriteReply;
+        use crate::hooks::wire::RewriteReply;
 
         // Chat-shaped body → messages replaced, tool injected (appended to existing tools).
         let mut v = serde_json::json!({
@@ -6342,7 +6342,7 @@ mod usage_tap_tests {
     /// responses into the input list; a non-text rewrite message aborts untouched.
     #[test]
     fn apply_rewrite_renders_per_dialect() {
-        use crate::routing::wire::RewriteReply;
+        use crate::hooks::wire::RewriteReply;
         let rw = RewriteReply {
             messages: vec![
                 serde_json::json!({"role": "user", "content": "compressed"}),
@@ -6387,7 +6387,7 @@ mod usage_tap_tests {
     /// user turns.
     #[test]
     fn gemini_rewrite_role_round_trips_model_and_assistant() {
-        use crate::routing::wire::RewriteReply;
+        use crate::hooks::wire::RewriteReply;
 
         // Projection canonicalizes the gemini-native `model` role to `assistant`.
         let g_body = serde_json::json!({
@@ -6436,8 +6436,8 @@ mod usage_tap_tests {
     /// whatever it sees →"B" ends at "B", proving B ran on A's output.
     #[tokio::test]
     async fn apply_global_rewrites_chains_in_order() {
-        use crate::routing::wire::RewriteReply;
-        use crate::routing::{
+        use crate::hooks::wire::RewriteReply;
+        use crate::hooks::{
             Candidate, PolicyResult, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
         };
 
@@ -6492,7 +6492,7 @@ mod usage_tap_tests {
     // epoch), NOT a fresh `store::now()` read at completion time. With a `daily` budget period, a
     // request that arrives on day N but whose (buffered or streamed) response is accounted "now" on
     // day N+1 would, under the old `now()`-based code, charge the token fee into day N+1's window —
-    // splitting it from the flat per-request fee (charged into day N by `route::budget_check`→`try_charge_request_within_budget`). The fix
+    // splitting it from the flat per-request fee (charged into day N by `ingress::budget_check`→`try_charge_request_within_budget`). The fix
     // threads `charged_at` so both land in day N. We pin `charged_at` to a fixed past day and assert
     // the spend lands in THAT day's window regardless of the real wall clock (which is always later).
     #[test]
@@ -7547,7 +7547,7 @@ mod request_short_circuit_tests {
             proto_name,
             crate::handlers::chat(proto_name),
             Some(body),
-            crate::forward::APPLICATION_JSON,
+            crate::proxy::APPLICATION_JSON,
             true,
             &hop_bytes,
         )
@@ -7615,7 +7615,7 @@ mod request_short_circuit_tests {
             "openai",
             crate::handlers::chat("openai"),
             Some(body),
-            crate::forward::APPLICATION_JSON,
+            crate::proxy::APPLICATION_JSON,
             true,
             &hop_bytes,
         )
@@ -12068,7 +12068,7 @@ mod hook_seam_tests {
     //! the `RoutingDecision::Reject` → `PolicyOutcome::RejectRequest` mapping — plus the reject
     //! status → error-kind mapping and its dialect-native envelope.
     use super::*;
-    use crate::routing::{
+    use crate::hooks::{
         Candidate, PolicyResult, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingPolicy,
         RoutingRequest,
     };
@@ -12623,7 +12623,7 @@ mod hook_seam_tests {
         (
             std::time::Duration,
             bool,
-            Arc<dyn crate::routing::RoutingPolicy>,
+            Arc<dyn crate::hooks::RoutingPolicy>,
         ),
     ) {
         let state = Arc::new(crate::test_support::MockServerState::new());
@@ -12639,8 +12639,8 @@ mod hook_seam_tests {
             server.base_url()
         )))
         .expect("loopback tap url");
-        let policy: Arc<dyn crate::routing::RoutingPolicy> = Arc::new(
-            crate::routing::webhook::WebhookPolicy::new(url, reqwest::Client::new()),
+        let policy: Arc<dyn crate::hooks::RoutingPolicy> = Arc::new(
+            crate::hooks::webhook::WebhookPolicy::new(url, reqwest::Client::new()),
         );
         (
             server,
@@ -12872,7 +12872,7 @@ mod hook_seam_tests {
             _ctx: &RoutingContext<'_>,
             _budget: std::time::Duration,
         ) -> PolicyResult {
-            Ok(crate::routing::RoutingDecision::Abstain)
+            Ok(crate::hooks::RoutingDecision::Abstain)
         }
         fn name(&self) -> &'static str {
             "rewriter"
@@ -12882,7 +12882,7 @@ mod hook_seam_tests {
             _req: &RoutingRequest<'_>,
             _budget: std::time::Duration,
         ) -> busbar_api::TransformOutcome {
-            busbar_api::TransformOutcome::Rewrite(crate::routing::wire::RewriteReply {
+            busbar_api::TransformOutcome::Rewrite(crate::hooks::wire::RewriteReply {
                 messages: vec![serde_json::json!({"role": "user", "content": self.0})],
                 tools: vec![],
             })
@@ -13011,7 +13011,7 @@ mod hook_seam_tests {
         let gate = ResolvedPolicy::Policy {
             policy: Arc::new(ErroringPolicy),
             on_error: crate::config::PolicyOnError::Weighted,
-            on_error_chain: vec![crate::routing::FallbackHook {
+            on_error_chain: vec![crate::hooks::FallbackHook {
                 policy: Arc::new(CannedGate {
                     canned: Canned::Reject(451, "fallback says no"),
                     name: "backup",
@@ -13050,7 +13050,7 @@ mod hook_seam_tests {
         let gate = ResolvedPolicy::Policy {
             policy: Arc::new(ErroringPolicy),
             on_error: crate::config::PolicyOnError::Reject,
-            on_error_chain: vec![crate::routing::FallbackHook {
+            on_error_chain: vec![crate::hooks::FallbackHook {
                 policy: Arc::new(ErroringPolicy), // the fallback fails too
                 timeout: std::time::Duration::from_millis(50),
                 send_prompt: false,

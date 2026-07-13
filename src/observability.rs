@@ -486,7 +486,7 @@ pub(crate) fn fire_request_log(payload: Value) {
             .post(url.as_str())
             .header(
                 reqwest::header::CONTENT_TYPE,
-                crate::forward::APPLICATION_JSON,
+                crate::proxy::APPLICATION_JSON,
             )
             .body(body)
             .timeout(webhook_delivery_timeout())

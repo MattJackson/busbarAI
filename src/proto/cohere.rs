@@ -489,7 +489,7 @@ impl ProtocolReader for CohereReader {
             || status == StatusCode::PAYLOAD_TOO_LARGE)
             && Self::body_signals_context_length(body)
         {
-            Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
+            Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
         } else {
             provider_code
         };
@@ -541,7 +541,7 @@ impl ProtocolReader for CohereReader {
         {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
-                provider_signal: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+                provider_signal: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
                 retry_after: None,
             };
         }
@@ -2178,7 +2178,7 @@ impl ProtocolWriter for CohereWriter {
 
     fn egress_user_agent(&self) -> &'static str {
         // Cohere Python SDK UA shape — pinned, see `EGRESS_UA_COHERE` in forward.rs.
-        crate::forward::EGRESS_UA_COHERE
+        crate::proxy::EGRESS_UA_COHERE
     }
 
     fn auth_failure_message(&self) -> &'static str {

@@ -349,7 +349,7 @@ fn class_for_response_failed(signal: &str) -> StatusClass {
     match signal {
         CODE_INVALID_API_KEY | ERR_TYPE_AUTHENTICATION => StatusClass::Auth,
         ERR_CODE_RATE_LIMIT | ERR_TYPE_INSUFFICIENT_QUOTA => StatusClass::RateLimit,
-        crate::forward::PROVIDER_CODE_CONTEXT_LENGTH | ERR_CODE_STRING_ABOVE_MAX => {
+        crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH | ERR_CODE_STRING_ABOVE_MAX => {
             StatusClass::ContextLength
         }
         ERR_TYPE_SERVER_ERROR | ERR_TYPE_OVERLOADED => StatusClass::ServerError,
@@ -479,7 +479,7 @@ impl ProtocolReader for ResponsesReader {
             }
             let lower = String::from_utf8_lossy(body).to_lowercase();
             if super::openai_family::openai_context_length_prose_scan(&lower) {
-                Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
+                Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
             } else {
                 None
             }
@@ -3717,7 +3717,7 @@ impl ProtocolWriter for ResponsesWriter {
             // exhaustion/timeout, a non-native type and a deterministic cross-protocol tell. Map the
             // overloaded/unavailable family onto the native `server_error`. Same class as the OpenAI
             // writer's 5xx bucket.
-            crate::forward::KIND_OVERLOADED
+            crate::proxy::KIND_OVERLOADED
             | ERR_TYPE_OVERLOADED
             | "service_unavailable"
             | "unavailable" => ERR_TYPE_SERVER_ERROR,
@@ -3729,18 +3729,16 @@ impl ProtocolWriter for ResponsesWriter {
             // non-native `type` such as `{"error":{"type":"timeout"}}` or `{"error":{"type":"5xx"}}`
             // to a Responses-API client: a deterministic cross-protocol tell that breaks SDK
             // consumers switching on `error.type`. Mirrors openai_chat.rs's `server_error` bucket.
-            crate::forward::KIND_TIMEOUT
+            crate::proxy::KIND_TIMEOUT
             | "network"
             | "connect"
             | "5xx"
             | "transient"
-            | crate::forward::KIND_API_ERROR => ERR_TYPE_SERVER_ERROR,
+            | crate::proxy::KIND_API_ERROR => ERR_TYPE_SERVER_ERROR,
             // A context-length overflow is surfaced by forward.rs as `context_length_exceeded`; the
             // Responses vocabulary has no dedicated type for it (as openai_chat.rs also maps it), so it
             // folds into `invalid_request_error`. `bad_request` is the same client-error class.
-            crate::forward::PROVIDER_CODE_CONTEXT_LENGTH | "bad_request" => {
-                ERR_TYPE_INVALID_REQUEST
-            }
+            crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH | "bad_request" => ERR_TYPE_INVALID_REQUEST,
             "billing" | ERR_TYPE_INSUFFICIENT_QUOTA => ERR_TYPE_INSUFFICIENT_QUOTA,
             other => other,
         };
@@ -3758,7 +3756,7 @@ impl ProtocolWriter for ResponsesWriter {
     fn egress_user_agent(&self) -> &'static str {
         // Responses API is served by the same OpenAI SDK/UA as the Chat Completions surface.
         // Pinned — see `EGRESS_UA_OPENAI` in forward.rs.
-        crate::forward::EGRESS_UA_OPENAI
+        crate::proxy::EGRESS_UA_OPENAI
     }
 
     fn auth_failure_message(&self) -> &'static str {
@@ -5545,7 +5543,7 @@ mod tests {
             StatusClass::RateLimit
         );
         assert_eq!(
-            class_for_response_failed(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH),
+            class_for_response_failed(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH),
             StatusClass::ContextLength
         );
         assert_eq!(
@@ -5579,7 +5577,7 @@ mod tests {
             .read_response(&serde_json::json!({
                 "status": STATUS_FAILED,
                 "output": [],
-                "error": {"code": crate::forward::PROVIDER_CODE_CONTEXT_LENGTH, "type": ERR_TYPE_INVALID_REQUEST}
+                "error": {"code": crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH, "type": ERR_TYPE_INVALID_REQUEST}
             }))
             .expect_err("failed body must surface an IrError");
         assert_eq!(
@@ -8175,7 +8173,7 @@ mod tests {
             );
             assert!(v["error"]["code"].is_null(), "server_error code is null");
         }
-        for kind in [crate::forward::PROVIDER_CODE_CONTEXT_LENGTH, "bad_request"] {
+        for kind in [crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH, "bad_request"] {
             let v = writer.write_error(400, kind, "bad request");
             assert_eq!(
                 v["error"]["type"].as_str(),

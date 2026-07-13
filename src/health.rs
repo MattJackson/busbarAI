@@ -137,9 +137,9 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
     // reserved `:` that signs as `%3A` but a raw send transmits `:`). Encode the path ONCE via the
     // shared `sign_and_wire_path` helper — the identical primitive the organic forward path uses —
     // and reuse it for both the signed canonical URI and the wire URL so signed == sent.
-    let wire_path = crate::forward::sign_and_wire_path(&url_path);
+    let wire_path = crate::proxy::sign_and_wire_path(&url_path);
     let signing_ctx = crate::proto::SigningContext {
-        host: crate::forward::host_from_base(&lane.base_url),
+        host: crate::proxy::host_from_base(&lane.base_url),
         canonical_uri: wire_path
             .split('?')
             .next()
@@ -151,7 +151,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         // token), so the native API-key shape (Token mode) is correct here.
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
-    let auth = crate::forward::lane_auth_headers(lane, &lane.api_key, &signing_ctx);
+    let auth = crate::proxy::lane_auth_headers(lane, &lane.api_key, &signing_ctx);
 
     // Send the SAME native-SDK fingerprint headers the organic forward path sends, so a probe is
     // indistinguishable from real traffic to the backend: reqwest emits no default User-Agent (its
@@ -163,9 +163,9 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         .client
         .post(format!("{}{}", lane.base_url, wire_path))
         .headers(convert_headers(auth))
-        .header(CONTENT_TYPE, crate::forward::APPLICATION_JSON)
-        .header(USER_AGENT, crate::forward::egress_user_agent(egress_name))
-        .header(ACCEPT, crate::forward::egress_accept(egress_name, false))
+        .header(CONTENT_TYPE, crate::proxy::APPLICATION_JSON)
+        .header(USER_AGENT, crate::proxy::egress_user_agent(egress_name))
+        .header(ACCEPT, crate::proxy::egress_accept(egress_name, false))
         .timeout(timeout)
         .body(body)
         .send()
@@ -353,12 +353,12 @@ mod tests {
         // as the organic forward path does (egress_user_agent / egress_accept).
         assert_eq!(
             state.get_last_request_header("user-agent").as_deref(),
-            Some(crate::forward::egress_user_agent("anthropic")),
+            Some(crate::proxy::egress_user_agent("anthropic")),
             "probe must send the native User-Agent organic traffic sends"
         );
         assert_eq!(
             state.get_last_request_header("accept").as_deref(),
-            Some(crate::forward::egress_accept("anthropic", false)),
+            Some(crate::proxy::egress_accept("anthropic", false)),
             "probe must send the native Accept organic traffic sends"
         );
         server.shutdown().await;
@@ -631,7 +631,7 @@ mod tests {
 
     /// REGRESSION (R16 HIGH, SigV4 signed==sent): the active probe MUST sign the canonical URI from
     /// the SAME path encoding it transmits on the wire. `probe_lane` derives both the SigV4
-    /// `canonical_uri` and the wire URL from `crate::forward::sign_and_wire_path(&url_path)` (the
+    /// `canonical_uri` and the wire URL from `crate::proxy::sign_and_wire_path(&url_path)` (the
     /// identical primitive the organic forward path uses), so for a Bedrock-style path whose modelId
     /// carries a reserved `:` the signed/sent path is byte-identical and `%3A`-encoded — eliminating
     /// the `SignatureDoesNotMatch` 403 that would otherwise park every Bedrock lane dead. This guards
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn test_probe_signs_and_sends_same_encoded_path_for_reserved_chars() {
         let url_path = "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/converse";
-        let wire_path = crate::forward::sign_and_wire_path(url_path);
+        let wire_path = crate::proxy::sign_and_wire_path(url_path);
         let canonical_uri = wire_path
             .split('?')
             .next()

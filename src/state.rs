@@ -106,20 +106,20 @@ pub(crate) struct PoolRuntime {
     /// Per-pool routing policy, resolved ONCE at config load. `None` is the ZERO-COST default
     /// (`route: weighted` / absent / explicit-native-weighted): no policy object, no projection, the
     /// unchanged inline SWRR hot path. `Some(_)` is a non-default policy whose ranked order feeds the
-    /// failover loop: `forward::decide_policy_order` invokes it per request and `pick_among` walks the
+    /// failover loop: `proxy::decide_policy_order` invokes it per request and `pick_among` walks the
     /// resulting order.
-    pub(crate) policy: Option<crate::routing::ResolvedPolicy>,
+    pub(crate) policy: Option<crate::hooks::ResolvedPolicy>,
     /// This pool's DECISION GATES (`hook:` / the non-strategy names in `hooks: [...]`), resolved once
     /// at config load, each with its `priority`, in config order. Fired in the phase-2 decision
     /// reconcile alongside the global gates (one priority-sorted chain; stable sort keeps
     /// globals-before-pool on ties, then config order). Empty (the default) = no pool gates — the
     /// phase-2 pass is skipped entirely when this and `global_gates` are both empty.
-    pub(crate) gates: Vec<(u16, crate::routing::ResolvedPolicy)>,
+    pub(crate) gates: Vec<(u16, crate::hooks::ResolvedPolicy)>,
     /// This pool's REWRITE chain — the `prompt: rw` gates in its `hooks: [...]` list, resolved once
     /// at config load, ascending-priority order. Fired in the phase-1 transform pass AFTER the
     /// global rewrite chain, only for requests routed to this pool. Empty (the default) = no pool
     /// rewrites, zero cost.
-    pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
+    pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::hooks::RoutingPolicy>)>,
 }
 
 /// `Clone` is the config-apply enabler: cloning an `App` shares the live-state `Arc`s (store, auth,
@@ -142,7 +142,7 @@ pub(crate) struct App {
     /// pass, zero cost. Only `rw` gates land here — the grant is enforced at RESOLUTION, so a
     /// `ro`/`no` hook can never rewrite (the bidirectional grant holds by construction). Each entry is
     /// `(per-hook transform deadline, transport)`.
-    pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::routing::RoutingPolicy>)>,
+    pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::hooks::RoutingPolicy>)>,
     /// GLOBAL request-stage TAP hooks — the `kind: tap` hooks in `global_hooks` observing at the
     /// `request` stage, resolved to their transports. Fired FIRE-AND-FORGET (spawned off the request
     /// path) before dispatch — a tap can never delay or fail the request. Empty (the default) = no
@@ -153,21 +153,21 @@ pub(crate) struct App {
     pub(crate) tap_hooks: Vec<(
         std::time::Duration,
         bool,
-        Arc<dyn crate::routing::RoutingPolicy>,
+        Arc<dyn crate::hooks::RoutingPolicy>,
     )>,
     /// GLOBAL taps observing at the ROUTE stage (`at: route`) — fired once per request when the
     /// decision reconcile has produced the final candidate set. Same triple shape as `tap_hooks`.
     pub(crate) tap_hooks_route: Vec<(
         std::time::Duration,
         bool,
-        Arc<dyn crate::routing::RoutingPolicy>,
+        Arc<dyn crate::hooks::RoutingPolicy>,
     )>,
     /// GLOBAL taps observing at the ATTEMPT stage (`at: attempt`) — fired per failover attempt with
     /// the attempt number / dispatched target / remaining candidates / previous failure.
     pub(crate) tap_hooks_attempt: Vec<(
         std::time::Duration,
         bool,
-        Arc<dyn crate::routing::RoutingPolicy>,
+        Arc<dyn crate::hooks::RoutingPolicy>,
     )>,
     /// GLOBAL taps observing at the COMPLETION stage (`at: completion`) — fired once per request
     /// with the outcome (`ok`/`failed`/`rejected_by_gate` — the SYNTHETIC completion, so audit taps
@@ -175,7 +175,7 @@ pub(crate) struct App {
     pub(crate) tap_hooks_completion: Vec<(
         std::time::Duration,
         bool,
-        Arc<dyn crate::routing::RoutingPolicy>,
+        Arc<dyn crate::hooks::RoutingPolicy>,
     )>,
     /// GLOBAL DECISION gates — the non-rewrite `kind: gate` hooks in `global_hooks`, resolved to
     /// their full `ResolvedPolicy` (transport + on_error/on_empty/grants), each with its `priority`.
@@ -183,7 +183,7 @@ pub(crate) struct App {
     /// own gates into one priority-sorted chain (reject wins / restricts intersect / order
     /// last-wins). Empty (the default) = no global gates, zero cost. Pre-sorted ascending by
     /// priority so the merge's stable sort keeps globals-first on ties.
-    pub(crate) global_gates: Vec<(u16, crate::routing::ResolvedPolicy)>,
+    pub(crate) global_gates: Vec<(u16, crate::hooks::ResolvedPolicy)>,
     /// The raw `hooks:` registry (name → definition) as configured, for the Admin API v1 hooks READ
     /// surface (`GET /api/v1/admin/hooks`). This is the DEFINITION set, distinct
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty

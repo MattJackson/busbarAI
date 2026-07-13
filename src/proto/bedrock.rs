@@ -34,7 +34,7 @@ const APPLICATION_VND_AMAZON_EVENTSTREAM: &str = "application/vnd.amazon.eventst
 
 /// The Bedrock-side spelling of the "overloaded" error type that AWS's own error responses carry
 /// in their `__type` field (`ServiceUnavailableException` maps back to this on a round-trip).
-/// Distinguished from `crate::forward::KIND_OVERLOADED` ("overloaded"), which is busbar's own
+/// Distinguished from `crate::proxy::KIND_OVERLOADED` ("overloaded"), which is busbar's own
 /// internal kind vocabulary. Both map to `ServiceUnavailableException` via
 /// `error_kind_to_bedrock_type`; named here so the match arm is a const pattern rather than a
 /// bare literal.
@@ -59,15 +59,15 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
             "AccessDeniedException"
         }
         "not_found" | ERR_TYPE_NOT_FOUND | "model_not_found" => "ResourceNotFoundException",
-        crate::forward::KIND_TIMEOUT | "model_timeout" => "ModelTimeoutException",
-        crate::forward::KIND_OVERLOADED
+        crate::proxy::KIND_TIMEOUT | "model_timeout" => "ModelTimeoutException",
+        crate::proxy::KIND_OVERLOADED
         | ERR_TYPE_OVERLOADED
         | "service_unavailable"
         | "unavailable" => EXC_SERVICE_UNAVAILABLE,
         "quota_exceeded" | "service_quota_exceeded" | ERR_TYPE_INSUFFICIENT_QUOTA => {
             "ServiceQuotaExceededException"
         }
-        crate::forward::KIND_API_ERROR | "internal_error" | crate::forward::KIND_SERVER_ERROR => {
+        crate::proxy::KIND_API_ERROR | "internal_error" | crate::proxy::KIND_SERVER_ERROR => {
             EXC_INTERNAL_SERVER
         }
         // No native Bedrock counterpart: fall back to the generic client-error exception so the
@@ -83,7 +83,7 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
 /// CSPRNG; returns `None` (so the caller simply OMITS the header) if entropy is unavailable — this is
 /// on the request path and must never panic. Single source of truth: every path — success
 /// (`proto/mod.rs` via `wrap_buffered_as_stream` / `forward.rs` via `maybe_attach_response_request_id`)
-/// and error (`forward::ingress_error` and the `main.rs` fallback, both via
+/// and error (`proxy::ingress_error` and the `main.rs` fallback, both via
 /// `attach_bedrock_error_headers`) — reaches this through the writer vtable, so there are no private
 /// copies.
 pub(crate) fn synth_amzn_request_id() -> Option<String> {
@@ -816,7 +816,7 @@ impl ProtocolReader for BedrockReader {
                 || (lower.contains("exceeds the maximum")
                     && (lower.contains("token") || lower.contains("context")))
             {
-                Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
+                Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string())
             } else {
                 provider_code
             }
@@ -853,7 +853,7 @@ impl ProtocolReader for BedrockReader {
         {
             return CanonicalSignal {
                 class: StatusClass::ContextLength,
-                provider_signal: Some(crate::forward::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
+                provider_signal: Some(crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH.to_string()),
                 retry_after: None,
             };
         }
@@ -2157,7 +2157,7 @@ impl ProtocolWriter for BedrockWriter {
         let mut signed = vec![
             (
                 "content-type".to_string(),
-                crate::forward::APPLICATION_JSON.to_string(),
+                crate::proxy::APPLICATION_JSON.to_string(),
             ),
             ("host".to_string(), ctx.host.clone()),
             (
@@ -3125,7 +3125,7 @@ impl ProtocolWriter for BedrockWriter {
     fn egress_user_agent(&self) -> &'static str {
         // AWS Bedrock is reached via boto3/botocore; the SDK's UA is the backend-facing fingerprint
         // guard. Pinned — see `EGRESS_UA_BEDROCK` in forward.rs.
-        crate::forward::EGRESS_UA_BEDROCK
+        crate::proxy::EGRESS_UA_BEDROCK
     }
 
     fn egress_accept(&self, wants_stream: bool) -> &'static str {
@@ -3134,7 +3134,7 @@ impl ProtocolWriter for BedrockWriter {
         if wants_stream {
             APPLICATION_VND_AMAZON_EVENTSTREAM
         } else {
-            crate::forward::APPLICATION_JSON
+            crate::proxy::APPLICATION_JSON
         }
     }
 
@@ -4323,7 +4323,7 @@ mod tests {
         // would pair an HTTP 503 with a 400-class `__type` AWS never produces, making an AWS SDK
         // raise a non-retryable client fault instead of a retryable ServiceUnavailableException.
         assert_eq!(
-            error_kind_to_bedrock_type(crate::forward::KIND_OVERLOADED),
+            error_kind_to_bedrock_type(crate::proxy::KIND_OVERLOADED),
             "ServiceUnavailableException"
         );
         assert_eq!(

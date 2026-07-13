@@ -30,7 +30,7 @@ fn multipart_model(body: &[u8]) -> Option<String> {
 
 /// Ingress for the NEW operations (embeddings/moderations/images/audio, 1.2), for EVERY dialect that
 /// speaks the op. Resolves the (protocol, operation) OperationHandler — absent ⇒ no-handler 404 in the CALLER's
-/// dialect (design §3) — then forwards through `forward::forward_with_pool_parsed` (same-proto
+/// dialect (design §3) — then forwards through `proxy::forward_with_pool_parsed` (same-proto
 /// passthrough or the cross-protocol IR bridge). Model resolution: `model_hint` for path-model dialects (gemini/bedrock —
 /// their route handler parsed it from the URL), else the JSON body `model` (openai/cohere) or the
 /// multipart form (openai transcription).
@@ -57,13 +57,13 @@ pub(crate) async fn operation_ingress(
             app,
             gov,
             proto,
-            crate::forward::POOL_LABEL_UNRESOLVED,
+            crate::proxy::POOL_LABEL_UNRESOLVED,
             started,
             charged_at,
             ingress_error(
                 proto,
                 StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
+                crate::proxy::KIND_NOT_FOUND,
                 "This protocol does not support that operation.",
             ),
         );
@@ -73,13 +73,13 @@ pub(crate) async fn operation_ingress(
             app,
             gov,
             proto,
-            crate::forward::POOL_LABEL_UNRESOLVED,
+            crate::proxy::POOL_LABEL_UNRESOLVED,
             started,
             charged_at,
             ingress_error(
                 proto,
                 StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
+                crate::proxy::KIND_NOT_FOUND,
                 "This endpoint does not support that operation.",
             ),
         );
@@ -101,13 +101,13 @@ pub(crate) async fn operation_ingress(
                     app,
                     gov,
                     proto,
-                    crate::forward::POOL_LABEL_UNRESOLVED,
+                    crate::proxy::POOL_LABEL_UNRESOLVED,
                     started,
                     charged_at,
                     ingress_error(
                         proto,
                         StatusCode::BAD_REQUEST,
-                        crate::forward::KIND_INVALID_REQUEST,
+                        crate::proxy::KIND_INVALID_REQUEST,
                         "We could not parse the JSON body of your request.",
                     ),
                 );
@@ -132,13 +132,13 @@ pub(crate) async fn operation_ingress(
                 app,
                 gov,
                 proto,
-                crate::forward::POOL_LABEL_UNRESOLVED,
+                crate::proxy::POOL_LABEL_UNRESOLVED,
                 started,
                 charged_at,
                 ingress_error(
                     proto,
                     StatusCode::BAD_REQUEST,
-                    crate::forward::KIND_INVALID_REQUEST,
+                    crate::proxy::KIND_INVALID_REQUEST,
                     "Missing required parameter: 'model'.",
                 ),
             );
@@ -214,7 +214,7 @@ pub(crate) async fn operation_resolved(
             ingress_error(
                 proto,
                 StatusCode::NOT_FOUND,
-                crate::forward::KIND_NOT_FOUND,
+                crate::proxy::KIND_NOT_FOUND,
                 &not_found_message(model, gemini_api_version),
             ),
             charged,
@@ -232,13 +232,13 @@ pub(crate) async fn operation_resolved(
         .and_then(|h| h.to_str().ok())
         .map(str::to_string);
     let req_ct_owned = ct.to_string();
-    let resp = crate::forward::forward_with_pool_parsed(
+    let resp = crate::proxy::forward_with_pool_parsed(
         app.clone(),
         cands,
         body,
         v,
         if req_ct_owned.is_empty() {
-            crate::forward::APPLICATION_JSON
+            crate::proxy::APPLICATION_JSON
         } else {
             &req_ct_owned
         },
@@ -284,7 +284,7 @@ pub(crate) async fn protocol_dispatch(
     body: Bytes,
 ) -> Response {
     let path = uri.path().to_string();
-    let Some(proto) = crate::router::protocol_id(&path, &headers) else {
+    let Some(proto) = crate::proto::detect::protocol_id(&path, &headers) else {
         // Not a protocol endpoint: the pre-collapse 404 fallback shape (native envelope by path).
         return crate::fallback_error_response(
             &path,
@@ -311,10 +311,10 @@ pub(crate) async fn protocol_dispatch(
     if let Some(rh) = crate::handlers::request_handler(proto) {
         if let Some(op) = rh.resolve_operation(&path, &body) {
             if rh.operation_handler(op).is_none() {
-                return crate::forward::ingress_error(
+                return crate::proxy::ingress_error(
                     proto,
                     StatusCode::NOT_FOUND,
-                    crate::forward::KIND_NOT_FOUND,
+                    crate::proxy::KIND_NOT_FOUND,
                     "This endpoint does not support that operation.",
                 );
             }
@@ -426,7 +426,7 @@ pub(crate) async fn bedrock_invoke(
         return ingress_error(
             PROTO_BEDROCK,
             StatusCode::BAD_REQUEST,
-            crate::forward::KIND_INVALID_REQUEST,
+            crate::proxy::KIND_INVALID_REQUEST,
             "InvokeModel body is not a supported operation (expected inputText or textToImageParams).",
         );
     };
