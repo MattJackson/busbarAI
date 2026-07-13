@@ -273,6 +273,19 @@ async fn register_hook(
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{}", req.name);
+    // A base-config-defined hook may NOT be shadowed/redirected via the API — the same guard PUT
+    // and PATCH enforce (put_hook / patch_hook_settings). Without it a narrow hooks-register token
+    // could POST a same-shape definition over a base hook's name and silently redirect its
+    // transport (e.g. point a base `pii-guard` gate at a hostile socket). Edit config.yaml for base
+    // hooks. (found: audit c1r5 — register was the one mutation verb missing this check.)
+    if current.base_hook_names.contains(&req.name) {
+        audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "hook `{}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)",
+            req.name
+        )));
+    }
     if let Some(expected) = req.expected_version {
         if expected != current.config_version {
             audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_REJECTED, &actor);
@@ -395,9 +408,11 @@ async fn put_hook(
     }
 }
 
-/// `DELETE /admin/v1/hooks/{name}` — remove a hook at RUNTIME (live). Builds the next snapshot without
-/// the hook (dropped from the registry + global wiring, transports re-resolved) and swaps it in.
-/// `404 not_found` if the hook is unregistered. `204 No Content` on success.
+/// `DELETE /admin/v1/hooks/{name}` — remove an API-registered hook at RUNTIME (live). Builds the next
+/// snapshot without the hook (dropped from the registry + global wiring, transports re-resolved) and
+/// swaps it in. `404 not_found` if the hook is unregistered; `409 conflict` if the hook is
+/// base-config-defined (base hooks are file-owned and read-only via the API — the same posture as
+/// PUT/PATCH; edit config.yaml to remove one). `204 No Content` on success.
 async fn delete_hook(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
@@ -407,6 +422,17 @@ async fn delete_hook(
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");
+    // A base-config hook is read-only via the API (consistent with put_hook / patch_hook_settings).
+    // Without this a narrow hooks-register token could DELETE an operator's base-defined security
+    // gate (e.g. `pii-guard`) — an escalation beyond "register" — and the additive overlay can't
+    // durably subtract a base hook anyway. Edit config.yaml. (found: audit c1r5.)
+    if current.base_hook_names.contains(&name) {
+        audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "hook `{name}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)"
+        )));
+    }
     match build_without_hook(&current, &name) {
         Ok(next) => {
             let installed = Arc::new(next);
@@ -1195,7 +1221,7 @@ fn openapi_doc() -> serde_json::Value {
                     "201": {"description": "Registered (body is the hook definition)"},
                     "400": {"description": "Malformed body or invalid definition (`invalid_request`)"},
                     "403": {"description": "hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)"},
-                    "409": {"description": "Grant change on an existing hook, or stale `expected_version` (`conflict`, §6.4)"}
+                    "409": {"description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `expected_version` (`conflict`, §6.4)"}
                 }
             }),
         );
@@ -1239,7 +1265,8 @@ fn openapi_doc() -> serde_json::Value {
                 }],
                 "responses": {
                     "204": {"description": "Removed"},
-                    "404": {"description": "Unknown hook (error code `not_found`)"}
+                    "404": {"description": "Unknown hook (error code `not_found`)"},
+                    "409": {"description": "Base-defined hook — read-only via the API; edit config.yaml (error code `conflict`)"}
                 }
             }
         }),

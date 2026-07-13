@@ -45,6 +45,13 @@ pub(crate) fn persist(
         if let Some(name) = deleted_remove {
             deleted.retain(|n| n != name);
         }
+        // INVARIANT: a hook present in the registry being persisted can never ALSO be tombstoned —
+        // the boot-merge would insert it then subtract it, silently dropping a live hook. The
+        // explicit `deleted_remove` above covers the register-a-name case; this reconciliation also
+        // covers the WHOLESALE-registry writes (config ROLLBACK, which passes both args `None`):
+        // rollback restores a registry that may contain a name still tombstoned from an earlier
+        // API delete, and without this the rollback would not survive a restart (found: audit c1r5).
+        deleted.retain(|name| !hooks.contains_key(name));
         let doc = OverlayDoc {
             hooks: hooks.clone(),
             global_hooks: global_hooks.to_vec(),
@@ -215,5 +222,48 @@ mod tests {
             "a tombstoned base hook is removed from the effective config"
         );
         assert!(!deploy.global_hooks.iter().any(|g| g == "base_hook"));
+    }
+
+    /// REGRESSION (audit c1r5): a WHOLESALE registry write (config rollback passes both tombstone
+    /// args `None`) must reconcile away any tombstone for a name that the restored registry
+    /// contains — otherwise the boot-merge inserts the hook then subtracts it, and the rollback
+    /// silently vanishes on the next restart. `persist` retains only tombstones whose name is
+    /// ABSENT from the persisted registry.
+    #[test]
+    fn persist_reconciles_tombstone_against_present_hook() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busbar-overlay-recon-{}.json", std::process::id()));
+        // Seed a prior overlay that tombstoned "x" (an earlier API delete).
+        write(
+            &path,
+            &OverlayDoc {
+                hooks: HashMap::new(),
+                global_hooks: Vec::new(),
+                deleted: vec!["x".to_string()],
+            },
+        )
+        .unwrap();
+        // Rollback restores a registry that CONTAINS "x", persisting with both tombstone args None.
+        persist(
+            Some(&path),
+            &HashMap::from([("x".to_string(), gate())]),
+            &["x".to_string()],
+            None,
+            None,
+        );
+        let doc = read(&path).expect("read back");
+        assert!(
+            !doc.deleted.iter().any(|n| n == "x"),
+            "a restored hook must not remain tombstoned, or it vanishes on restart"
+        );
+        // And it survives the boot merge (inserted, not subtracted).
+        let mut deploy: DeployCfg =
+            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
+        merge_into(&mut deploy, doc);
+        assert!(
+            deploy.hooks.contains_key("x"),
+            "rollback is durable across restart"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

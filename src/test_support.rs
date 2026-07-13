@@ -647,6 +647,7 @@ pub(crate) struct TestApp {
     on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     hook_registry: std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: Vec<String>,
+    base_hook_names: std::collections::HashSet<String>,
     overlay_path: Option<std::path::PathBuf>,
 }
 
@@ -664,6 +665,7 @@ impl TestApp {
             on_exhausted_cfgs: std::collections::HashMap::new(),
             hook_registry: std::collections::HashMap::new(),
             global_hooks: Vec::new(),
+            base_hook_names: std::collections::HashSet::new(),
             overlay_path: None,
         }
     }
@@ -676,6 +678,13 @@ impl TestApp {
     /// Register a hook definition in the `hooks:` registry (for the Admin API v1 hooks read surface).
     pub(crate) fn hook(mut self, name: &str, cfg: crate::config::HookCfg) -> Self {
         self.hook_registry.insert(name.into(), cfg);
+        self
+    }
+    /// Register a BASE-config-defined hook (registry AND `base_hook_names`) so the API's base-hook
+    /// read-only guards (register/put/patch/delete return 409) can be exercised.
+    pub(crate) fn base_hook(mut self, name: &str, cfg: crate::config::HookCfg) -> Self {
+        self.hook_registry.insert(name.into(), cfg);
+        self.base_hook_names.insert(name.into());
         self
     }
     /// Add a name to the `global_hooks:` list (globally-wired hooks).
@@ -764,7 +773,7 @@ impl TestApp {
             idempotency_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            base_hook_names: std::collections::HashSet::new(),
+            base_hook_names: self.base_hook_names,
             admin_chain: vec!["admin-tokens".to_string()],
             credential_cache: std::sync::Arc::new(crate::auth_cache::CredentialCache::new()),
             auth_modules: std::collections::HashMap::new(),

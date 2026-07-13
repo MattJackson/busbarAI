@@ -3225,6 +3225,79 @@ providers: {}
         handle.abort();
     }
 
+    /// REGRESSION (audit c1r5): base-config hooks are READ-ONLY across every mutation verb — a
+    /// narrow hooks-register token must not be able to shadow/redirect (POST) or remove (DELETE) an
+    /// operator's file-defined hook (e.g. a `pii-guard` gate). PUT/PATCH already guarded; this pins
+    /// POST + DELETE to the same 409, matching the guard other verbs enforce.
+    #[tokio::test]
+    async fn test_admin_v1_base_hook_is_read_only_via_api() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let base: crate::config::HookCfg = serde_json::from_value(serde_json::json!({
+            "kind": "gate", "webhook": "http://127.0.0.1:9990/", "prompt": "no", "global": true
+        }))
+        .unwrap();
+        let app = TestApp::new()
+            .governance(gov)
+            .base_hook("pii-guard", base)
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // POST a same-shape definition over the base hook's name → 409 (no silent transport redirect).
+        let shadow = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "pii-guard",
+                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:6666/", "prompt": "no", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            shadow.status().as_u16(),
+            409,
+            "POST cannot shadow a base hook"
+        );
+
+        // DELETE the base hook → 409 (cannot remove an operator's base security gate via the API).
+        let del = client
+            .delete(format!("http://{addr}/admin/v1/hooks/pii-guard"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            del.status().as_u16(),
+            409,
+            "DELETE cannot remove a base hook"
+        );
+
+        // It is still present and unchanged.
+        let got: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/hooks/pii-guard"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            got["transport"].to_string().contains("9990"),
+            "base hook untouched: {got}"
+        );
+    }
+
     /// `DELETE /admin/v1/hooks/{name}` removes a hook at runtime (live): register → delete (204) →
     /// GET /hooks/{name} 404. Deleting an unregistered hook is 404.
     #[tokio::test]
