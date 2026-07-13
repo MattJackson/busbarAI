@@ -1022,6 +1022,7 @@ struct PatchSettingsReq {
 async fn patch_hook_settings(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     Path(name): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -1060,6 +1061,15 @@ async fn patch_hook_settings(
     let Some(existing) = current.hook_registry.get(&name) else {
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
+    // §6.3 escalation guard, keyed on the EXISTING hook's grants (PATCH changes settings, not
+    // grants). A non-Full (hooks-register) principal may not push settings to a content-seeing
+    // (`prompt`/`user`) or `global: true` hook — the same ceiling register_hook/put_hook enforce.
+    // Without it a narrow token could retune a `prompt: rw` global gate it can neither create nor
+    // replace, reaching a content-seeing hook by the back door. (found: audit c1r6.)
+    if let Some(e) = hooks_register_escalation(scope, existing) {
+        audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
     if current.base_hook_names.contains(&name) {
         audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::Conflict(format!(

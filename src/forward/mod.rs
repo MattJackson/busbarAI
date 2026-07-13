@@ -12106,6 +12106,52 @@ mod hook_seam_tests {
         server.shutdown().await;
     }
 
+    /// REGRESSION (audit c1r6): the completion-tap `status` must be the PROTOCOL-NATIVE auth-failure
+    /// status the client actually receives — not a hardcoded 401. A Gemini ingress bad-key denial is
+    /// HTTP 400 (INVALID_ARGUMENT), so a tap watching it must see 400, matching the served response.
+    /// Gated on the tokens module (featureless builds have no data-plane auth to reject with).
+    #[cfg(feature = "auth-tokens")]
+    #[tokio::test]
+    async fn completion_tap_status_is_protocol_native_gemini_400() {
+        crate::metrics::init();
+        let (server, state, tap) = webhook_tap().await;
+        let mut app = TestApp::new()
+            .auth(Arc::new(crate::auth::AuthMiddleware::new(
+                &serde_yaml::from_str::<crate::config::AuthCfg>(
+                    "chain: [tokens]\nclient_tokens: [good-token]\n",
+                )
+                .unwrap(),
+            )))
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_completion = vec![tap];
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        // Gemini ingress path + bad key → the served response is HTTP 400 (not 401).
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/gemini-x:generateContent"
+            ))
+            .header("x-goog-api-key", "wrong-key")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "gemini bad-key is native 400");
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["outcome"], "rejected_by_auth");
+        assert_eq!(
+            payload["stage"]["status"], 400,
+            "the tap status must match the client-visible native status, not a hardcoded 401"
+        );
+        serve.abort();
+        server.shutdown().await;
+    }
+
     /// STAGE TAPS: a completion tap fires with the SYNTHETIC `rejected_by_gate` outcome when a
     /// decision gate rejects — audit taps see denials, not just served requests.
     #[tokio::test]

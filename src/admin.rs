@@ -712,7 +712,17 @@ pub(crate) async fn rotate_key(
     };
     let gov = gov.clone();
     let gid = id.clone();
-    let res = tokio::task::spawn_blocking(move || gov.rotate_key(&gid)).await;
+    // rotate is a check-then-act (get_key → mint → put_key over the UPSERT primitive), so it must
+    // hold EXISTENCE_GATE for the same reason update_key/delete_key do: without it a concurrent
+    // delete that lands between rotate's read and write is clobbered by rotate's put — RESURRECTING
+    // a revoked key with a fresh secret. Gate acquired INSIDE the closure for cancellation safety
+    // (a scheduled spawn_blocking runs to completion even if the handler future is dropped).
+    // (found: audit c1r6 — rotate was the one key-mutator missing the gate.)
+    let res = tokio::task::spawn_blocking(move || {
+        let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        gov.rotate_key(&gid)
+    })
+    .await;
     let resource = format!("key:{id}");
     match res {
         Ok(Ok(Some((key, secret)))) => {
@@ -2017,6 +2027,27 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(r.status().as_u16(), 201, "full scope registers anything");
+
+        // REGRESSION (audit c1r6): a hooks-register token may not RETUNE (PATCH settings) a
+        // content-seeing / global hook it can neither create nor replace — PATCH must enforce the
+        // same §6.3 ceiling, keyed on the EXISTING hook's grants.
+        let patch = client
+            .patch(format!("http://{addr}/admin/v1/hooks/op-hook/settings"))
+            .header("x-admin-token", "grp:registrars")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"settings": {"k": "v"}}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patch.status().as_u16(),
+            403,
+            "hooks-register must not PATCH settings on a prompt:rw global hook"
+        );
+        assert_eq!(
+            patch.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "forbidden"
+        );
 
         handle.abort();
     }
@@ -5046,6 +5077,95 @@ providers: {}
             listed["keys"].as_array().unwrap().len(),
             0,
             "a PATCH must never resurrect a key a concurrent DELETE revoked: {listed}"
+        );
+        handle.abort();
+    }
+
+    /// REGRESSION (audit c1r6, SECURITY): `rotate_key` is a check-then-act (get_key → mint →
+    /// put_key over the UPSERT), so — exactly like update_key/delete_key — it must hold
+    /// EXISTENCE_GATE across lookup→write. Without it a DELETE that revokes the key between rotate's
+    /// read and its `put_key` is clobbered by the put, RESURRECTING the revoked key with a fresh
+    /// (attacker-usable) secret. Same deterministic `BarrierStore` interleaving as the PATCH test.
+    #[tokio::test]
+    async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
+        crate::metrics::init();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(BarrierStore {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let gov =
+            Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        let (addr, handle) = serve_with_gov(gov).await;
+
+        // Arm the barrier so rotate's put_key (the next put) pauses between its check and its write.
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let rotate_url = format!("http://{addr}/admin/v1/keys/{}/rotate", key.id);
+        let rotate_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&rotate_url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        // Wait until rotate is parked inside put_key.
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .expect("ROTATE must reach the instrumented put_key");
+
+        let delete_url = format!("http://{addr}/admin/keys/{}", key.id);
+        let delete_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .delete(&delete_url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release_tx.send(()).unwrap();
+        let _ = rotate_task.await.unwrap();
+        let _ = delete_task.await.unwrap();
+
+        // DECISIVE: the revoked key must be GONE. A resurrecting rotate (ungated) leaves it PRESENT.
+        let listed: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["keys"].as_array().unwrap().len(),
+            0,
+            "rotate must never resurrect a key a concurrent DELETE revoked: {listed}"
         );
         handle.abort();
     }

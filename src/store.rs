@@ -31,6 +31,23 @@ const ST_CLOSED: u64 = 0;
 const ST_OPEN: u64 = 1;
 const ST_HALF_OPEN: u64 = 2;
 
+/// Normalize a breaker state being RESTORED from a snapshot (or inherited by a sibling cell):
+/// `ST_HALF_OPEN` becomes `ST_OPEN`. A restored HalfOpen cell has `probe_in_flight == false` (the
+/// snapshot never carries it, and the restore path never sets it), and both `cell_ready_breaker` and
+/// `cell_acquire_breaker` reject HalfOpen unconditionally — so the cell WEDGES: no dispatch can acquire
+/// it and no probe outcome (`cell_open`/`cell_closed`) ever runs against it, benching that (pool, lane)
+/// until an out-of-band `recover_lane` touches it (indefinitely when health probing is disabled).
+/// Restoring `ST_OPEN` instead lets the restored (already-expired) cooldown drive a fresh probe
+/// acquisition on the cell's first request. (found: audit c1r6 — restore lacked the sibling-create
+/// path's existing normalization.)
+fn restored_breaker_state(state: u64) -> u64 {
+    if state == ST_HALF_OPEN {
+        ST_OPEN
+    } else {
+        state
+    }
+}
+
 // Bounded capacity of each cell's sliding outcome window (recent request outcomes for the
 // error-rate trip computation).
 const OUTCOME_WINDOW_CAPACITY: usize = 1024;
@@ -544,8 +561,10 @@ impl InMemoryStore {
                 continue;
             };
             lane.budget.store(snap.budget, Ordering::Relaxed);
-            lane.breaker_state
-                .store(snap.breaker_state, Ordering::Relaxed);
+            lane.breaker_state.store(
+                restored_breaker_state(snap.breaker_state),
+                Ordering::Relaxed,
+            );
             lane.cooldown_until
                 .store(snap.cooldown_until, Ordering::Relaxed);
             lane.streak.store(snap.streak, Ordering::Relaxed);
@@ -563,7 +582,7 @@ impl InMemoryStore {
                 // In-place restore may find the cell already lazily created — restore INTO it.
                 if let Some((_, cell)) = cells.iter().find(|(p, _)| p.as_ref() == cs.pool) {
                     cell.breaker_state
-                        .store(cs.breaker_state, Ordering::Relaxed);
+                        .store(restored_breaker_state(cs.breaker_state), Ordering::Relaxed);
                     cell.cooldown_until
                         .store(cs.cooldown_until, Ordering::Relaxed);
                     cell.streak.store(cs.streak, Ordering::Relaxed);
@@ -571,7 +590,7 @@ impl InMemoryStore {
                 } else {
                     let cell = Arc::new(BreakerCell::new());
                     cell.breaker_state
-                        .store(cs.breaker_state, Ordering::Relaxed);
+                        .store(restored_breaker_state(cs.breaker_state), Ordering::Relaxed);
                     cell.cooldown_until
                         .store(cs.cooldown_until, Ordering::Relaxed);
                     cell.streak.store(cs.streak, Ordering::Relaxed);
@@ -2703,6 +2722,36 @@ mod tests {
         // Hard-down is recoverable-by-design (sticky Open + cooldown, NOT the dead latch); the
         // reason string + the default-cell Open state are what carry.
         assert_eq!(restored.dead_reason, "auth rejected (HTTP 401)");
+    }
+
+    /// REGRESSION (audit c1r6): a snapshot captured while a lane's single-flight probe was in flight
+    /// carries `ST_HALF_OPEN`. Restoring it verbatim WEDGES the cell (HalfOpen is rejected by both
+    /// `cell_ready_breaker`/`cell_acquire_breaker` and no probe outcome ever runs against a restored
+    /// cell whose `probe_in_flight` is false), benching the lane forever when health probing is off.
+    /// Restore must normalize HalfOpen → Open (the sibling-create path already did).
+    #[test]
+    fn restored_halfopen_state_normalizes_to_open() {
+        // The pure helper both restore sites share.
+        assert_eq!(restored_breaker_state(ST_HALF_OPEN), ST_OPEN);
+        assert_eq!(restored_breaker_state(ST_OPEN), ST_OPEN);
+        assert_eq!(restored_breaker_state(ST_CLOSED), ST_CLOSED);
+
+        // End to end: a snapshot with a HalfOpen lane-global state restores as Open, not wedged.
+        set_now_for_test(9000);
+        let a = InMemoryStore::new(vec![make_lane_data(3, 4)]);
+        let mut snaps = a.export_health();
+        snaps[0].breaker_state = ST_HALF_OPEN; // as if captured mid-probe
+        let b = InMemoryStore::new_with_limits_restored(
+            vec![make_lane_data(3, 4)],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        assert_eq!(
+            b.get_lane(0).breaker_state.load(Ordering::Relaxed),
+            ST_OPEN,
+            "a restored HalfOpen must become Open, or the lane wedges and never self-recovers"
+        );
     }
 
     #[test]

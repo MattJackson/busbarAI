@@ -744,13 +744,18 @@ fn rate_limited_response() -> Response {
         .expect("static rate-limited response")
 }
 
-/// Fire the synthetic `rejected_by_auth` completion taps (fire-and-forget) and return the native
-/// 401 — so audit taps see auth denials, not just served traffic (design-hooks-v2 §3.2). The
+/// Fire the synthetic `rejected_by_auth` completion taps (fire-and-forget) and return the auth
+/// denial — so audit taps see auth denials, not just served traffic (design-hooks-v2 §3.2). The
 /// request body is unparsed at the auth stage, so the shape is the zeroed default bucket with the
-/// path-inferred protocol.
+/// path-inferred protocol. The tap's `status` MUST be the client-visible HTTP status, which is
+/// PROTOCOL-NATIVE for an auth failure — 401 for anthropic/openai/responses/cohere, 403 for Bedrock
+/// (SigV4 → AccessDenied), 400 for Gemini (INVALID_ARGUMENT). Hardcoding 401 made a tap watching a
+/// gemini/bedrock ingress denial contradict the response the client actually got (found: audit c1r6).
 fn unauthorized_with_completion_taps(app: &crate::state::App, path: &str) -> Response {
+    let proto = proto_for_path(path);
     if !app.tap_hooks_completion.is_empty() {
-        let shape = crate::forward::capture_stage_shape(None, "", proto_for_path(path), false);
+        let shape = crate::forward::capture_stage_shape(None, "", proto, false);
+        let status = auth_failure_status_and_kind(proto).0.as_u16();
         crate::forward::fire_stage_taps(
             &app.tap_hooks_completion,
             &shape,
@@ -761,7 +766,7 @@ fn unauthorized_with_completion_taps(app: &crate::state::App, path: &str) -> Res
                 remaining_candidates: None,
                 previous_failure: None,
                 outcome: Some("rejected_by_auth"),
-                status: Some(401),
+                status: Some(status),
             },
         );
     }
