@@ -3276,6 +3276,102 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// THE GOVERNANCE RE-KEY end-to-end (§2.3): with governance ON and an external data-plane
+    /// module in the chain, a group-mapped principal gets a SYNTHESIZED key — its group's pool ACL
+    /// admits/denies (403), its rpm cap 429s with Retry-After, and an unmapped group is rejected
+    /// outright (fail closed) — all keyed by the principal id through the same machinery a virtual
+    /// key uses.
+    #[tokio::test]
+    async fn test_group_mapped_principal_governed_like_a_virtual_key() {
+        use crate::governance::{GovState, SqliteStore};
+        crate::metrics::init();
+        let state = StdArc::new(MockServerState::new());
+        for _ in 0..3 {
+            state.push(MockResponse::Ok {
+                status: axum::http::StatusCode::OK,
+                body: openai_ok_body(),
+            });
+        }
+        let server = MockServer::new(state.clone()).await;
+        let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
+        let auth_cfg = crate::config::AuthCfg {
+            chain: vec!["test-groups-module".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
+            client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
+        };
+        let mut app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "rekey-model",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("gpool-a", &[(0, 1)])
+            .pool("gpool-b", &[(0, 1)])
+            .auth(StdArc::new(crate::auth::AuthMiddleware::new(&auth_cfg)))
+            .governance(gov)
+            .build();
+        {
+            let inner = StdArc::get_mut(&mut app).expect("sole owner");
+            inner.group_map.insert(
+                "llm-users".to_string(),
+                crate::config::GroupMapEntry {
+                    allowed_pools: Some(vec!["gpool-a".to_string()]),
+                    ..Default::default()
+                },
+            );
+            inner.group_map.insert(
+                "batch".to_string(),
+                crate::config::GroupMapEntry {
+                    allowed_pools: Some(vec!["gpool-a".to_string()]),
+                    rpm_limit: Some(1),
+                    ..Default::default()
+                },
+            );
+        }
+        let (addr, handle) = serve(app).await;
+        let client = reqwest::Client::new();
+        let send = |tok: &'static str, model: &'static str| {
+            client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .bearer_auth(tok)
+                .header("content-type", "application/json")
+                .body(
+                    json!({"model": model, "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                )
+                .send()
+        };
+
+        // Pool ACL from the group grant: gpool-a serves, gpool-b is denied.
+        let r = send("grp:llm-users", "gpool-a").await.unwrap();
+        assert_eq!(r.status().as_u16(), 200, "granted pool serves");
+        let r = send("grp:llm-users", "gpool-b").await.unwrap();
+        assert_eq!(r.status().as_u16(), 403, "ungranted pool is denied");
+
+        // The rpm cap rides the synthesized key: second request in the window is a 429 with
+        // Retry-After, exactly like a capped virtual key.
+        let r = send("grp:batch", "gpool-a").await.unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let r = send("grp:batch", "gpool-a").await.unwrap();
+        assert_eq!(r.status().as_u16(), 429, "the group rpm cap enforces");
+        assert!(
+            r.headers().get("retry-after").is_some(),
+            "429 carries Retry-After"
+        );
+
+        // Fail closed: an identified principal whose groups earn no grant is rejected.
+        let r = send("grp:strangers", "gpool-a").await.unwrap();
+        assert_eq!(r.status().as_u16(), 401, "unmapped groups grant nothing");
+
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// CI TIMING GATE (ignored by default; CI runs it explicitly in release mode). Serves warm-up
     /// plus a measured batch through the REAL router against an instant in-process mock upstream
     /// and gates the measured p50/p99 full-request latency under DELIBERATELY GENEROUS bounds —

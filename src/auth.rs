@@ -157,6 +157,12 @@ impl AuthMiddleware {
                     // safe.
                     #[cfg(feature = "auth-tokens")]
                     "tokens" => Some(Box::new(TokensModule::new(&tokens))),
+                    // TEST-ONLY external-module stand-in for the DATA-PLANE chain (the admin
+                    // chain has its own): `grp:<group>` identifies as a principal carrying that
+                    // group, so the governance re-key is e2e-testable. Compiled out of release
+                    // binaries entirely.
+                    #[cfg(test)]
+                    "test-groups-module" => Some(Box::new(TestGroupsModule)),
                     other => {
                         tracing::error!(
                             module = other,
@@ -474,6 +480,28 @@ impl AuthPrincipal {
             .as_ref()
             .map(|p| p.id.as_str())
             .unwrap_or("anonymous")
+    }
+}
+
+/// TEST-ONLY data-plane module (see the `test-groups-module` chain arm): credential `grp:<g>`
+/// identifies as `test:<g>` carrying exactly that group; anything else defers (`Pass`).
+#[cfg(test)]
+struct TestGroupsModule;
+
+#[cfg(test)]
+impl AuthModule for TestGroupsModule {
+    fn name(&self) -> &'static str {
+        "test-groups-module"
+    }
+    fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome {
+        match candidate.and_then(|t| t.strip_prefix("grp:")) {
+            Some(group) => {
+                let mut p = Principal::from_id(format!("test:{group}"));
+                p.groups = vec![group.to_string()];
+                AuthOutcome::Identify(p)
+            }
+            None => AuthOutcome::Pass,
+        }
     }
 }
 
@@ -1014,9 +1042,27 @@ pub(crate) async fn auth_middleware(
                 req.extensions_mut()
                     .insert(crate::governance::GovCtx { key: Some(key) });
             }
-            // A resolved-but-disabled key and a no-such-key both reject. Spelled out (no `_ =>`
-            // catch-all) so a future `GovKey` field or lookup outcome can't silently fall through.
-            Some(_) | None => return Err(unauthorized_with_completion_taps(&app, &path)),
+            // Not a virtual key (or disabled). THE GOVERNANCE RE-KEY (§2.3): if the auth chain
+            // identified a GROUP-carrying principal whose groups earn a data-plane grant in
+            // `group_map:`, admit it with a SYNTHESIZED key — governance enforcement (pool ACL,
+            // RPM/TPM, budget, usage) keyed by the principal id, identical to a virtual key.
+            // Groups that map to nothing grant nothing (fail closed): reject as before.
+            Some(_) | None => {
+                let synth = match &chain_verdict {
+                    ChainVerdict::Identified(p) if !p.groups.is_empty() => {
+                        crate::governance::synthesize_principal_key(p, &app.group_map)
+                    }
+                    _ => None,
+                };
+                match (synth, chain_verdict) {
+                    (Some(key), ChainVerdict::Identified(p)) => {
+                        req.extensions_mut().insert(AuthPrincipal(Some(p)));
+                        req.extensions_mut()
+                            .insert(crate::governance::GovCtx { key: Some(key) });
+                    }
+                    _ => return Err(unauthorized_with_completion_taps(&app, &path)),
+                }
+            }
         }
     } else {
         // Governance disabled: enforce the static-allowlist token check on every non-admin path.
@@ -1024,14 +1070,21 @@ pub(crate) async fn auth_middleware(
             return Err(unauthorized_with_completion_taps(&app, &path));
         }
         // Attach WHO was identified: the chain's principal, or `None` for the empty-chain
-        // anonymous front door.
+        // anonymous front door. A GROUP principal additionally carries its `group_map:` grants as
+        // a synthesized key even with governance off — the pool ACL still applies; the rate/budget
+        // axes need the governance store and stay off with it. A group principal whose groups earn
+        // no grant keeps `key: None` (the chain admitted it; group_map only ADDS enforcement here).
+        let principal = match chain_verdict {
+            ChainVerdict::Identified(p) => Some(p),
+            ChainVerdict::Open | ChainVerdict::Denied => None,
+        };
+        let synth = principal
+            .as_ref()
+            .filter(|p| !p.groups.is_empty())
+            .and_then(|p| crate::governance::synthesize_principal_key(p, &app.group_map));
+        req.extensions_mut().insert(AuthPrincipal(principal));
         req.extensions_mut()
-            .insert(AuthPrincipal(match chain_verdict {
-                ChainVerdict::Identified(p) => Some(p),
-                ChainVerdict::Open | ChainVerdict::Denied => None,
-            }));
-        req.extensions_mut()
-            .insert(crate::governance::GovCtx::default());
+            .insert(crate::governance::GovCtx { key: synth });
     }
 
     Ok(next.run(req).await)
@@ -1246,17 +1299,22 @@ mod tests {
             "viewers".to_string(),
             crate::config::GroupMapEntry {
                 admin_scope: Some("read-only".to_string()),
+                ..Default::default()
             },
         );
         gm.insert(
             "admins".to_string(),
             crate::config::GroupMapEntry {
                 admin_scope: Some("full".to_string()),
+                ..Default::default()
             },
         );
         gm.insert(
             "no-admin".to_string(),
-            crate::config::GroupMapEntry { admin_scope: None },
+            crate::config::GroupMapEntry {
+                admin_scope: None,
+                ..Default::default()
+            },
         );
 
         // Open posture: full.

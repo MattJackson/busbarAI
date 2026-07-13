@@ -934,6 +934,80 @@ impl GovState {
     }
 }
 
+/// THE GOVERNANCE RE-KEY (design-hooks-v2 §2.3): synthesize the governance grants for a
+/// GROUP-CARRYING principal from the UNION of its `group_map:` entries — the same `VirtualKey`
+/// shape every enforcement site already speaks, keyed by the PRINCIPAL id, so an SSO user and a
+/// virtual key get identical enforcement (pool ACL, RPM/TPM windows, budget, usage attribution,
+/// the hook `send_user` projection) through identical code.
+///
+/// Fail-closed: `None` unless at least one mapped group SETS `allowed_pools` (the data-plane
+/// grant; an admin-only group confers no inference access). Union is most-permissive: pool lists
+/// union (an explicit `[]` = every pool); a granting group without an rpm/tpm/budget cap makes the
+/// principal uncapped on that axis, otherwise the max wins.
+pub(crate) fn synthesize_principal_key(
+    principal: &crate::auth::Principal,
+    group_map: &std::collections::HashMap<String, crate::config::GroupMapEntry>,
+) -> Option<VirtualKey> {
+    let granting: Vec<&crate::config::GroupMapEntry> = principal
+        .groups
+        .iter()
+        .filter_map(|g| group_map.get(g))
+        .filter(|e| e.allowed_pools.is_some())
+        .collect();
+    if granting.is_empty() {
+        return None;
+    }
+    // Pool union. An explicit `[]` on any granting group = unrestricted (empty Vec is the
+    // VirtualKey encoding for "all pools").
+    let mut pools: Vec<String> = Vec::new();
+    let mut all_pools = false;
+    for e in &granting {
+        match e.allowed_pools.as_deref() {
+            Some([]) => all_pools = true,
+            Some(list) => {
+                for p in list {
+                    if !pools.contains(p) {
+                        pools.push(p.clone());
+                    }
+                }
+            }
+            None => unreachable!("filtered on is_some"),
+        }
+    }
+    if all_pools {
+        pools.clear();
+    }
+    // Most-permissive cap union: any granting group WITHOUT the cap lifts it entirely.
+    let cap_union = |get: fn(&crate::config::GroupMapEntry) -> Option<i64>| -> Option<i64> {
+        let mut max: Option<i64> = None;
+        for e in &granting {
+            let v = get(e)?; // a capless granting group lifts the cap entirely
+            max = Some(max.map_or(v, |m: i64| m.max(v)));
+        }
+        max
+    };
+    let rpm = cap_union(|e| e.rpm_limit.map(i64::from)).map(|v| v as u32);
+    let tpm = cap_union(|e| e.tpm_limit.map(i64::from)).map(|v| v as u32);
+    let budget = cap_union(|e| e.max_budget_cents);
+    Some(VirtualKey {
+        id: principal.id.clone(),
+        // NOT a credential hash — a marker. The synthetic key never authenticates anything (the
+        // auth module already did); it exists purely to carry grants through enforcement.
+        key_hash: format!("principal:{}", principal.id),
+        name: principal
+            .name
+            .clone()
+            .unwrap_or_else(|| principal.id.clone()),
+        allowed_pools: pools,
+        max_budget_cents: budget,
+        budget_period: BUDGET_PERIOD_TOTAL.to_string(),
+        rpm_limit: rpm,
+        tpm_limit: tpm,
+        enabled: true,
+        created_at: 0,
+    })
+}
+
 /// Resolved governance context attached to each request by the auth middleware. `key` is `None`
 /// when governance is disabled (so downstream enforcement is a no-op).
 #[derive(Clone, Debug, Default)]
@@ -1889,6 +1963,79 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The re-key union semantics: pools union (`[]` = every pool), caps are most-permissive
+    /// (a granting group without a cap lifts it; otherwise max wins), and a principal whose
+    /// groups never set `allowed_pools` gets NO synthetic key (admin-only groups confer no
+    /// data-plane access).
+    #[test]
+    fn synthesize_principal_key_union_semantics() {
+        use crate::config::GroupMapEntry;
+        let mut gm = std::collections::HashMap::new();
+        gm.insert(
+            "a".to_string(),
+            GroupMapEntry {
+                allowed_pools: Some(vec!["p1".to_string()]),
+                rpm_limit: Some(10),
+                tpm_limit: Some(1000),
+                max_budget_cents: Some(500),
+                ..Default::default()
+            },
+        );
+        gm.insert(
+            "b".to_string(),
+            GroupMapEntry {
+                allowed_pools: Some(vec!["p2".to_string()]),
+                rpm_limit: Some(60),
+                // no tpm cap: lifts the axis entirely (most permissive)
+                ..Default::default()
+            },
+        );
+        gm.insert(
+            "admin-only".to_string(),
+            GroupMapEntry {
+                admin_scope: Some("full".to_string()),
+                ..Default::default()
+            },
+        );
+        gm.insert(
+            "all-pools".to_string(),
+            GroupMapEntry {
+                allowed_pools: Some(vec![]),
+                ..Default::default()
+            },
+        );
+
+        let mut p = crate::auth::Principal::from_id("test:u");
+        p.groups = vec!["a".to_string(), "b".to_string()];
+        let k = synthesize_principal_key(&p, &gm).expect("granting groups synthesize");
+        assert_eq!(k.id, "test:u", "keyed by the principal id");
+        let mut pools = k.allowed_pools.clone();
+        pools.sort();
+        assert_eq!(
+            pools,
+            vec!["p1".to_string(), "p2".to_string()],
+            "pools union"
+        );
+        assert_eq!(k.rpm_limit, Some(60), "max rpm wins");
+        assert_eq!(k.tpm_limit, None, "a capless granting group lifts the cap");
+        assert_eq!(k.max_budget_cents, None, "same for budget");
+        assert!(k.enabled);
+
+        // An explicit [] on any granting group = every pool.
+        p.groups = vec!["a".to_string(), "all-pools".to_string()];
+        let k = synthesize_principal_key(&p, &gm).expect("granting");
+        assert!(k.allowed_pools.is_empty(), "explicit [] grants every pool");
+
+        // Admin-only groups (and unmapped ones) confer no data-plane key.
+        p.groups = vec!["admin-only".to_string(), "unmapped".to_string()];
+        assert!(
+            synthesize_principal_key(&p, &gm).is_none(),
+            "no allowed_pools grant = no synthetic key (fail closed)"
+        );
+        p.groups = vec![];
+        assert!(synthesize_principal_key(&p, &gm).is_none());
+    }
     use super::*;
 
     fn sample_key(id: &str, hash: &str) -> VirtualKey {

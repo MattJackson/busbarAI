@@ -708,10 +708,12 @@ fn default_admin_auth() -> Vec<String> {
     vec!["admin-tokens".to_string()]
 }
 
-/// One `group_map:` entry — the operator-owned policy granted to a principal GROUP. Additive
-/// surface: governance fields (allowed_pools, budgets, rate limits) land here next; today it
-/// carries the admin authorization scope.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// One `group_map:` entry — the operator-owned policy granted to a principal GROUP (design-hooks-v2
+/// §2.3): the admin authorization scope AND the data-plane governance grants. A group-carrying
+/// principal (an external auth module's verdict) gets governance enforcement synthesized from the
+/// UNION of its mapped groups — identical machinery, keyed by the principal id, so an SSO user and
+/// a virtual key get identical enforcement. Unmapped groups grant nothing (fail closed).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupMapEntry {
     /// The ADMIN scope this group grants: `read-only` | `hooks-register` | `full`. Absent = no
@@ -719,6 +721,22 @@ pub(crate) struct GroupMapEntry {
     /// mapped groups wins.
     #[serde(default)]
     pub(crate) admin_scope: Option<String>,
+    /// DATA-PLANE grant: pools this group may target. Setting this (even `[]`) is what grants the
+    /// group data-plane access at all; a group that only maps `admin_scope` confers none. Across a
+    /// principal's groups the pool lists UNION; an explicit `[]` grants access to EVERY pool
+    /// (mirroring a virtual key with no pool restriction).
+    #[serde(default)]
+    pub(crate) allowed_pools: Option<Vec<String>>,
+    /// Requests-per-minute cap for principals granted through this group. Most-permissive union:
+    /// a granting group WITHOUT a cap makes the principal uncapped; otherwise the max wins.
+    #[serde(default)]
+    pub(crate) rpm_limit: Option<u32>,
+    /// Tokens-per-minute cap; same most-permissive union as `rpm_limit`.
+    #[serde(default)]
+    pub(crate) tpm_limit: Option<u32>,
+    /// Spend cap in cents (an all-time "total" window); same most-permissive union.
+    #[serde(default)]
+    pub(crate) max_budget_cents: Option<i64>,
 }
 
 /// A named entry in the top-level `hooks:` registry — a single hook (tap or gate) and its transport.

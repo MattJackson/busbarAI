@@ -1676,12 +1676,14 @@ providers: {}
                 "viewers".to_string(),
                 crate::config::GroupMapEntry {
                     admin_scope: Some("read-only".to_string()),
+                    ..Default::default()
                 },
             );
             inner.group_map.insert(
                 "registrars".to_string(),
                 crate::config::GroupMapEntry {
                     admin_scope: Some("hooks-register".to_string()),
+                    ..Default::default()
                 },
             );
             // For the CAP proofs below: a group MAPPED full — the module ceiling must cut it
@@ -1690,12 +1692,14 @@ providers: {}
                 "admins-capped".to_string(),
                 crate::config::GroupMapEntry {
                     admin_scope: Some("full".to_string()),
+                    ..Default::default()
                 },
             );
             inner.group_map.insert(
                 "sneaky".to_string(),
                 crate::config::GroupMapEntry {
                     admin_scope: Some("full".to_string()),
+                    ..Default::default()
                 },
             );
             // §2.4 trust-boundary caps on the external module: it may only assert these groups
@@ -1870,6 +1874,7 @@ providers: {}
                 "viewers".to_string(),
                 crate::config::GroupMapEntry {
                     admin_scope: Some("read-only".to_string()),
+                    ..Default::default()
                 },
             );
         }
@@ -1968,6 +1973,7 @@ providers: {}
                 "admins".to_string(),
                 crate::config::GroupMapEntry {
                     admin_scope: Some("full".to_string()),
+                    ..Default::default()
                 },
             );
             inner.auth_modules.insert(

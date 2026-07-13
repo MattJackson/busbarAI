@@ -2927,6 +2927,7 @@ mod tests {
             "viewers".to_string(),
             config::GroupMapEntry {
                 admin_scope: Some("readonly".to_string()), // typo (it's read-only)
+                ..Default::default()
             },
         );
         let errs = validate(&cfg).expect_err("typo'd scope tokens must fail validation");
