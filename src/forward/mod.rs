@@ -2055,31 +2055,115 @@ enum PolicyOutcome {
 /// `false` and leaves `v` UNTOUCHED — the request proceeds with the ORIGINAL body, never a corrupted
 /// one. (Full canonical re-render across ALL six dialects via the IR — `IrReq` — is the follow-up;
 /// see docs/1.3-everything-is-a-hook.md "Rewrite forward-integration crux".)
-fn apply_rewrite_to_body(v: &mut Value, rewrite: &crate::routing::wire::RewriteReply) -> bool {
+/// Apply a hook's `rewrite` reply to the INGRESS body, rendered PER DIALECT (the reply carries
+/// `{role, content}` messages in body form; each ingress protocol frames conversation content
+/// differently). Fail-safe throughout: a body without the dialect's conversation container, or a
+/// rewrite message whose content isn't plain text where the dialect needs re-framing, leaves the
+/// body untouched and returns `false` — never a corrupted request.
+///
+/// Dialect rendering:
+/// - openai / anthropic / cohere: `messages: [{role, content}]` — inserted verbatim (all three
+///   accept string content). Abstract `tools` injection applies here only (their tool shapes are
+///   compatible enough to append; the other dialects' tool framings differ — deferred, fail-safe).
+/// - bedrock (Converse): `messages: [{role, content: [{text}]}]` — each rewrite message is
+///   RE-FRAMED into a one-block text content list (a verbatim insert would corrupt the block
+///   shape — bedrock also has a `messages` key, so this arm is load-bearing, not cosmetic).
+/// - gemini: `contents: [{role, parts: [{text}]}]` — re-framed, with the role mapping gemini
+///   requires (`assistant` → `model`; everything else → `user`).
+/// - responses: `input: [{role, content}]` — re-framed into the EasyInputMessage list (string
+///   content is accepted); a string `input` is replaced by the list.
+fn apply_rewrite_to_body(
+    v: &mut Value,
+    rewrite: &crate::routing::wire::RewriteReply,
+    ingress_protocol: &str,
+) -> bool {
     if rewrite.messages.is_empty() {
         return false;
     }
     let Some(obj) = v.as_object_mut() else {
         return false;
     };
-    // Only rewrite a body that already carries a `messages` ARRAY (openai/anthropic family). Any other
-    // shape is left untouched — fail-safe, never a corrupted body.
-    if !obj.get("messages").is_some_and(Value::is_array) {
-        return false;
-    }
-    obj.insert(
-        "messages".to_string(),
-        Value::Array(rewrite.messages.clone()),
-    );
-    if !rewrite.tools.is_empty() {
-        match obj.get_mut("tools").and_then(Value::as_array_mut) {
-            Some(existing) => existing.extend(rewrite.tools.iter().cloned()),
-            None => {
-                obj.insert("tools".to_string(), Value::Array(rewrite.tools.clone()));
+    // Extract (role, text) pairs when a dialect needs re-framing. `None` = a message without
+    // plain-string content — abort untouched (fail-safe).
+    let as_text_pairs = || -> Option<Vec<(String, String)>> {
+        rewrite
+            .messages
+            .iter()
+            .map(|m| {
+                let role = m.get("role").and_then(Value::as_str)?.to_string();
+                let text = m.get("content").and_then(Value::as_str)?.to_string();
+                Some((role, text))
+            })
+            .collect()
+    };
+    match ingress_protocol {
+        "bedrock" => {
+            if !obj.get("messages").is_some_and(Value::is_array) {
+                return false;
             }
+            let Some(pairs) = as_text_pairs() else {
+                return false;
+            };
+            let framed: Vec<Value> = pairs
+                .into_iter()
+                .map(|(role, text)| {
+                    serde_json::json!({ "role": role, "content": [{ "text": text }] })
+                })
+                .collect();
+            obj.insert("messages".to_string(), Value::Array(framed));
+            true
+        }
+        "gemini" => {
+            if !obj.get("contents").is_some_and(Value::is_array) {
+                return false;
+            }
+            let Some(pairs) = as_text_pairs() else {
+                return false;
+            };
+            let framed: Vec<Value> = pairs
+                .into_iter()
+                .map(|(role, text)| {
+                    let g_role = if role == "assistant" { "model" } else { "user" };
+                    serde_json::json!({ "role": g_role, "parts": [{ "text": text }] })
+                })
+                .collect();
+            obj.insert("contents".to_string(), Value::Array(framed));
+            true
+        }
+        "responses" => {
+            if obj.get("input").is_none() {
+                return false;
+            }
+            let Some(pairs) = as_text_pairs() else {
+                return false;
+            };
+            let framed: Vec<Value> = pairs
+                .into_iter()
+                .map(|(role, text)| serde_json::json!({ "role": role, "content": text }))
+                .collect();
+            obj.insert("input".to_string(), Value::Array(framed));
+            true
+        }
+        // openai / anthropic / cohere: the reply IS the dialect's message shape.
+        _ => {
+            if !obj.get("messages").is_some_and(Value::is_array) {
+                return false;
+            }
+            obj.insert(
+                "messages".to_string(),
+                Value::Array(rewrite.messages.clone()),
+            );
+            if !rewrite.tools.is_empty() {
+                match obj.get_mut("tools").and_then(Value::as_array_mut) {
+                    Some(existing) => existing.extend(rewrite.tools.iter().cloned()),
+                    None => {
+                        obj.insert("tools".to_string(), Value::Array(rewrite.tools.clone()));
+                    }
+                }
+            }
+            true
         }
     }
-    true
 }
 
 /// Build the request projection a rewrite (`prompt: rw`) gate receives. The prompt is ALWAYS sent (a
@@ -2152,7 +2236,7 @@ async fn apply_global_rewrites(
         let rewritten = hook.transform(&req, *timeout).await;
         drop(req); // end the immutable borrow of `v` before mutating it
         if let Some(rw) = rewritten {
-            applied |= apply_rewrite_to_body(v, &rw);
+            applied |= apply_rewrite_to_body(v, &rw, ingress_protocol);
         }
     }
     applied
@@ -5800,7 +5884,7 @@ mod usage_tap_tests {
             messages: vec![serde_json::json!({"role": "user", "content": "compressed"})],
             tools: vec![serde_json::json!({"name": "headroom_retrieve"})],
         };
-        assert!(super::apply_rewrite_to_body(&mut v, &rw));
+        assert!(super::apply_rewrite_to_body(&mut v, &rw, "openai"));
         assert_eq!(
             v["messages"],
             serde_json::json!([{"role":"user","content":"compressed"}])
@@ -5815,7 +5899,7 @@ mod usage_tap_tests {
         // No `messages` array (e.g. gemini `contents`) → untouched, returns false.
         let mut g = serde_json::json!({"contents": [{"parts": []}]});
         let before = g.clone();
-        assert!(!super::apply_rewrite_to_body(&mut g, &rw));
+        assert!(!super::apply_rewrite_to_body(&mut g, &rw, "openai"));
         assert_eq!(g, before, "non-chat body left untouched (fail-safe)");
 
         // Empty rewrite → untouched, false.
@@ -5825,8 +5909,51 @@ mod usage_tap_tests {
             messages: vec![],
             tools: vec![],
         };
-        assert!(!super::apply_rewrite_to_body(&mut v2, &empty));
+        assert!(!super::apply_rewrite_to_body(&mut v2, &empty, "openai"));
         assert_eq!(v2, before2);
+    }
+
+    /// Per-dialect rewrite rendering: bedrock re-frames into content BLOCKS (the load-bearing arm
+    /// — a verbatim insert corrupts its shape), gemini into contents/parts with the role mapping,
+    /// responses into the input list; a non-text rewrite message aborts untouched.
+    #[test]
+    fn apply_rewrite_renders_per_dialect() {
+        use crate::routing::wire::RewriteReply;
+        let rw = RewriteReply {
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "compressed"}),
+                serde_json::json!({"role": "assistant", "content": "prior"}),
+            ],
+            tools: vec![],
+        };
+
+        // bedrock: {role, content:[{text}]} blocks.
+        let mut b = serde_json::json!({"messages": [{"role":"user","content":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(&mut b, &rw, "bedrock"));
+        assert_eq!(b["messages"][0]["content"][0]["text"], "compressed");
+        assert_eq!(b["messages"][1]["content"][0]["text"], "prior");
+
+        // gemini: contents/parts + assistant→model.
+        let mut g = serde_json::json!({"contents": [{"role":"user","parts":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(&mut g, &rw, "gemini"));
+        assert_eq!(g["contents"][0]["parts"][0]["text"], "compressed");
+        assert_eq!(g["contents"][1]["role"], "model");
+
+        // responses: input list (string input replaced).
+        let mut r = serde_json::json!({"input": "orig"});
+        assert!(super::apply_rewrite_to_body(&mut r, &rw, "responses"));
+        assert_eq!(r["input"][0]["content"], "compressed");
+
+        // Fail-safe: a rewrite message with NON-string content aborts a re-framing dialect
+        // untouched.
+        let blocky = RewriteReply {
+            messages: vec![serde_json::json!({"role":"user","content":[{"type":"text"}]})],
+            tools: vec![],
+        };
+        let mut b2 = serde_json::json!({"messages": [{"role":"user","content":[{"text":"orig"}]}]});
+        let before = b2.clone();
+        assert!(!super::apply_rewrite_to_body(&mut b2, &blocky, "bedrock"));
+        assert_eq!(b2, before, "non-text rewrite leaves bedrock untouched");
     }
 
     /// `apply_global_rewrites` fires the hooks in order and each sees the prior's output (a true
