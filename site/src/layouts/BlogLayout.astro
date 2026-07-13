@@ -190,9 +190,11 @@ const ARTICLE = datePublished
       .post-body em { color: var(--muted); }
       .post-body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.88em; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
       .post-body pre { background: var(--slate); color: #e2e8f0; border-radius: 10px; padding: 18px 20px; overflow-x: auto; margin: 0 0 20px; }
+      .post-body img { display: block; max-width: 100%; height: auto; margin: 8px auto 22px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 30px rgba(15,23,42,0.10); }
       .post-body pre code { background: none; border: none; padding: 0; color: inherit; font-size: 13.5px; }
       .post-body blockquote { margin: 0 0 22px; padding: 4px 0 4px 20px; border-left: 3px solid var(--lime); color: #475569; font-size: 17px; }
-      .post-body img { display: block; max-width: 100%; height: auto; margin: 10px auto 24px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 1px 3px rgba(15,23,42,0.06); }
+      .post-body img { display: block; max-width: min(100%, 620px); height: auto; margin: 10px auto 24px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 1px 3px rgba(15,23,42,0.06); }
+      .post-body img + em { display: block; text-align: center; font-size: 13.5px; color: var(--muted); margin: -14px 0 26px; }
 
       /* COMMENTS (giscus) */
       .post-comments { max-width: 720px; margin: 64px auto 0; padding-top: 36px; border-top: 1px solid var(--line); }

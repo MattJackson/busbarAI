@@ -63,38 +63,28 @@ export ANTHROPIC_API_KEY="vk_…"                                 # already set 
 claude
 ```
 
-Then I launched the real Claude Code TUI and gave it a small agentic task — create a file, read it
-back, list the directory — the kind of thing that makes it loop through a few tool calls. Every one of
-those turns was answered by Nova:
+Then I launched the real Claude Code window and gave it a small agentic task — run a few shell
+commands, one at a time, then report back. That's the kind of thing that makes it loop through several
+tool calls, and every one of those turns was answered by Nova:
 
-![The real Claude Code TUI running an agentic task, every turn answered by Amazon Nova on Bedrock through Busbar](/demo/claude-nova.gif)
+![The real Claude Code window running an agentic task, every turn answered by Amazon Nova on Bedrock through Busbar](/demo/claude-nova.gif)
 
-That's the actual Claude Code window — same welcome screen, same tool-call rendering. It plans, writes
-`notes.txt` with the words "busbar demo", reads it back, runs `ls`, and reports done. The model behind
-every step is Amazon Nova, and Busbar translated each Anthropic request into a Bedrock Converse call and
-the response back again — the agent never knew.
+That's the actual Claude Code TUI — same welcome screen, same tool-call cards. It plans, runs each
+`Bash` command in turn, and reports `DONE`. The model behind every step is Amazon Nova; the `<thinking>`
+blocks are Nova's, not Claude's. Busbar translated each Anthropic request into a Bedrock Converse call
+and the response back again — the agent never knew.
 
-Two sets of receipts, because "trust me" isn't a demo. Busbar counts every call it routes to the
-Bedrock backend:
-
-```console
-$ curl -s localhost:8080/metrics -H "authorization: Bearer vk_…" | grep claude-code
-busbar_requests_total{ingress_protocol="anthropic",pool="claude-code",outcome="ok"} 28
-```
-
-And AWS Bedrock's own CloudWatch usage for `nova-lite` — independent of anything Busbar reports:
+The receipt, because "trust me" isn't a demo. AWS Bedrock's own CloudWatch usage for `nova-lite`, wholly
+independent of anything Busbar reports, climbed with every turn:
 
 ```console
 $ aws cloudwatch get-metric-statistics --namespace AWS/Bedrock \
-    --metric-name Invocations   --dimensions Name=ModelId,Value=amazon.nova-lite-v1:0 ...
-32.0
-$ ... --metric-name InputTokenCount ...
-66157.0
+    --metric-name Invocations --dimensions Name=ModelId,Value=amazon.nova-lite-v1:0 ...
+72.0
 ```
 
-The agent thinks it talked to Anthropic. Busbar's metrics and AWS's own console agree it was Nova. To
-swap in Gemini, or to put Claude behind two keys with failover, or to add a compression hook — you edit
-the pool, not the agent.
+The agent thinks it talked to Anthropic. AWS's own console says it was Nova. To swap in Gemini, or to put
+Claude behind two keys with failover, or to add a compression hook — you edit the pool, not the agent.
 
 ## The simple version
 
