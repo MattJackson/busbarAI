@@ -23,6 +23,27 @@ clear startup error telling you exactly what to write instead.
 
 ### Added
 
+- **FinOps metering, built for third parties.** `GET /api/v1/admin/usage` reports per-model and
+  per-key consumption as the RAW token split (input / output / cache-read / cache-creation —
+  each prices differently) in fixed UTC-day buckets, with `spend_micros` (micro-USD, integer
+  math) derived at read time from your configured prices. The principle: Busbar exposes the
+  inputs of cost, not just its own number — a consumer with negotiated per-model pricing
+  reconstructs cost exactly from the split. `?window=` selects past buckets; over-cap key lists
+  carry an `others` remainder so every unit stays attributable; `window`/`as_of`/`currency`
+  label the numbers.
+- **Hooks are control-plane citizens.** A hook self-reports its OBSERVED settings and its own
+  operational metrics over the new `status` wire message (a Headroom compressor reports what it
+  compressed), and `GET /api/v1/admin/hooks/{name}/status` surfaces it with a desired-vs-reported
+  drift verdict. A dashboard built on Busbar sees what every plug is doing — hooks don't need
+  their own dashboards.
+- **One professional wire contract, audited to zero.** Three independent contract-audit rounds
+  on the Admin API and two on the hook wire, all findings fixed pre-freeze: one error envelope
+  everywhere with a frozen code taxonomy (including `unauthorized`, `method_not_allowed`, and
+  retryable `version_conflict` split from terminal `conflict`), one `{items, next_cursor}` list
+  envelope with opaque cursors, one optimistic-concurrency mechanism (RFC-7232 `If-Match`/ETag
+  on every mutable resource), `Idempotency-Key` on both secret-minting POSTs, `Retry-After` on
+  429s, machine-readable query params + scope annotations in `openapi.json`, and explicit
+  per-request `op` discrimination + append-only evolvability rules on the hook wire.
 - **The Admin API is now a full config plane.** Anything the config file can express, the API
   can do: read the running config, apply a validated change atomically, roll back to any
   previous version, register hooks, adjust pools, budgets, and rate limits. Drive Busbar from
