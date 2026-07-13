@@ -1582,7 +1582,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
 
 #[test]
 fn test_validate_passthrough_warns_on_nonempty_configured_key() {
-    // Regression (LOW #10): in passthrough mode forward.rs selects the upstream key as
+    // Regression (LOW #10): in passthrough mode proxy engine selects the upstream key as
     // `caller_token.unwrap_or(lane.api_key)`, so an UNAUTHENTICATED caller (no token) gets
     // busbar's OWN configured lane key (resolved from `api_key_env`) substituted upstream — a
     // credential leak. A passthrough deployment should forward the CALLER credential, never a

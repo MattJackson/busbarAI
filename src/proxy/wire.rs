@@ -92,7 +92,7 @@ pub(crate) fn maybe_attach_route_policy(
 /// `pub(crate)` and the single source of truth for native error shaping: it attaches the
 /// protocol-appropriate headers (Bedrock `x-amzn-RequestId` / `x-amzn-errortype` via the
 /// `ProtocolWriter::attach_error_response_headers` vtable method (BedrockWriter delegates to its
-/// private helper); Gemini code/status ride the body envelope the writer builds). `route.rs::ingress_error` and `auth.rs::unauthorized_response` now both DELEGATE to THIS
+/// private helper); Gemini code/status ride the body envelope the writer builds). `ingress::ingress_error` and `auth.rs::unauthorized_response` now both DELEGATE to THIS
 /// function (the migration is complete — they hold no private copies), so the degraded path, the main
 /// path, and the auth/route paths cannot diverge on error shape or headers.
 pub(crate) fn ingress_error(ingress: &str, status: StatusCode, kind: &str, msg: &str) -> Response {
@@ -687,7 +687,7 @@ pub(crate) fn mid_stream_error_bytes(
     if ingress_eventstream {
         // Binary eventstream client (a native AWS SDK): a mid-stream failure is a MODELED-EXCEPTION
         // frame, not an SSE event. The exception NAME comes from the ingress writer's vtable
-        // (`write_response_exception`) — so forward.rs names no protocol's wire shape;
+        // (`write_response_exception`) — so proxy engine names no protocol's wire shape;
         // `encode_exception_frame` is the generic binary framer. A protocol that reports
         // `ingress_is_eventstream` but declines an exception mapping (a contradiction) falls through.
         if let Some((exc_name, msg)) = proto.writer().write_response_exception(&err) {

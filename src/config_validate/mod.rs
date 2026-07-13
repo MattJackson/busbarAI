@@ -313,7 +313,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
 
         // The `path` override is appended to `base_url` VERBATIM at request time
-        // (`format!("{base}{wire_path}")` in forward.rs), and the composed string is then parsed by
+        // (`format!("{base}{wire_path}")` in proxy engine), and the composed string is then parsed by
         // reqwest's `url` crate to choose the connect host. base_url validation alone is therefore
         // NOT sufficient: a `path` that does not begin with `/` FUSES into the authority — e.g.
         // base_url `https://api.openai.com` + path `.evil.com/v1` yields
@@ -552,7 +552,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
 
         // Rule 7: A well-formed `on_exhausted: fallback_pool:<name>` whose `<name>` is not a
-        // configured pool parses fine but silently misses at runtime (forward.rs's
+        // configured pool parses fine but silently misses at runtime (proxy engine's
         // `fallback_pools.get(name)` returns None) and cascades to a generic 503 — the configured
         // degraded-routing policy never engages, with no boot diagnostic. Mirror the member-target
         // resolution check and fail loud. (A malformed action string already `die`s in main.rs at
@@ -568,7 +568,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     ));
                 } else if target == *pool_name {
                     // Self-referential fallback (pool A -> fallback A): the runtime loop guard
-                    // (forward.rs `RequestCtx::visited_pools`) silently terminates the chain on the
+                    // (proxy engine `RequestCtx::visited_pools`) silently terminates the chain on the
                     // re-entry, so the configured degraded-routing policy never actually engages — A
                     // exhausts, "falls back" to itself, is recognised as already-visited, and 503s.
                     // A fallback pointing at its own owner is never meaningful; reject it at boot
@@ -622,7 +622,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
 
     // Rule 7b: Multi-hop fallback cycle (A -> B -> A, or any longer ring). The per-pool self-ref
     // check above (Rule 7) only catches the length-1 case; a chain that exits the originating pool
-    // and loops back through one or more intermediaries is just as defeated at runtime — forward.rs's
+    // and loops back through one or more intermediaries is just as defeated at runtime — proxy engine's
     // `RequestCtx::visited_pools` guard terminates the walk the moment it re-enters an already-visited
     // pool, so the configured degraded-routing policy still collapses into a 503 with no boot
     // diagnostic. Detect it at startup by following each pool's resolved fallback edge until the chain
@@ -968,7 +968,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
 
         // `upstream_credentials: passthrough` with a NON-EMPTY configured api_key on a provider is a
-        // credential-leak risk: forward.rs selects the upstream key as `caller_token.unwrap_or("")`,
+        // credential-leak risk: proxy engine selects the upstream key as `caller_token.unwrap_or("")`,
         // so an UNAUTHENTICATED caller forwards an EMPTY credential (the provider 401/403s the
         // caller), NOT busbar's configured lane key — but a non-empty configured key means busbar's
         // OWN secret gets substituted upstream on the caller's behalf. WARN (not hard-reject): a

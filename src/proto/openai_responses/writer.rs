@@ -1153,7 +1153,7 @@ impl ProtocolWriter for ResponsesWriter {
             "not_found" | ERR_TYPE_NOT_FOUND => ERR_TYPE_NOT_FOUND,
             "rate_limit" | ERR_TYPE_RATE_LIMIT => ERR_TYPE_RATE_LIMIT,
             ERR_TYPE_SERVER_ERROR | "internal" | "internal_error" => ERR_TYPE_SERVER_ERROR,
-            // A 503 exhaustion/timeout is reported by forward.rs as kind `"overloaded"` (an
+            // A 503 exhaustion/timeout is reported by proxy engine as kind `"overloaded"` (an
             // Anthropic-vocabulary token). The OpenAI/Responses error vocabulary has no
             // `overloaded` type — a 5xx is `server_error` — so without this arm `other => other`
             // would leak `{"error":{"type":"overloaded",...}}` to an OpenAI-family client on every
@@ -1164,7 +1164,7 @@ impl ProtocolWriter for ResponsesWriter {
             | ERR_TYPE_OVERLOADED
             | "service_unavailable"
             | "unavailable" => ERR_TYPE_SERVER_ERROR,
-            // forward.rs emits these transient/upstream-failure kinds directly to every ingress
+            // proxy engine emits these transient/upstream-failure kinds directly to every ingress
             // writer (`timeout`/`network`/`connect` from the request-error path, `5xx`/`transient`
             // from the canonical-signal mapping, `api_error` from the generic upstream-error path).
             // None is an OpenAI/Responses error type — real OpenAI reports a transient upstream
@@ -1178,7 +1178,7 @@ impl ProtocolWriter for ResponsesWriter {
             | "5xx"
             | "transient"
             | crate::proxy::KIND_API_ERROR => ERR_TYPE_SERVER_ERROR,
-            // A context-length overflow is surfaced by forward.rs as `context_length_exceeded`; the
+            // A context-length overflow is surfaced by proxy engine as `context_length_exceeded`; the
             // Responses vocabulary has no dedicated type for it (as openai_chat.rs also maps it), so it
             // folds into `invalid_request_error`. `bad_request` is the same client-error class.
             crate::proxy::PROVIDER_CODE_CONTEXT_LENGTH | "bad_request" => ERR_TYPE_INVALID_REQUEST,
@@ -1198,7 +1198,7 @@ impl ProtocolWriter for ResponsesWriter {
 
     fn egress_user_agent(&self) -> &'static str {
         // Responses API is served by the same OpenAI SDK/UA as the Chat Completions surface.
-        // Pinned — see `EGRESS_UA_OPENAI` in forward.rs.
+        // Pinned — see `EGRESS_UA_OPENAI` in proxy engine.
         crate::proxy::EGRESS_UA_OPENAI
     }
 

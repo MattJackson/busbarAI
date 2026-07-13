@@ -335,7 +335,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
 /// virtual key, so TPM limits enforce on streams too. The streaming path records tokens through
 /// a completely separate code path from the non-stream test above: `FirstByteBody`'s stream-end
 /// handler reads IR-derived usage via `translate.usage()` and calls `gov.record_tokens` via the
-/// `UsageSink` on clean 2xx completion (forward.rs), NOT the buffered `record_nonstream_usage`.
+/// `UsageSink` on clean 2xx completion (proxy engine), NOT the buffered `record_nonstream_usage`.
 /// A regression that broke the
 /// stream-end charge (the drop/poll handler not firing, the sink not wired into the streaming
 /// branch) would leave streaming token usage uncharged and TPM would silently stop enforcing for
@@ -3615,7 +3615,7 @@ async fn test_forward_once_records_success_and_spends_budget() {
     server.shutdown().await;
 }
 
-/// REGRESSION (R7 MEDIUM, forward.rs gemini-json-array gating): a BODY-MODEL client (openai) that
+/// REGRESSION (R7 MEDIUM, proxy engine gemini-json-array gating): a BODY-MODEL client (openai) that
 /// sends `__busbar_gemini_json_array:true` in its own fully-controlled body must NOT have its SSE
 /// stream reframed as a JSON array under `Content-Type: application/json`. The framing is gated on
 /// `ingress_protocol == "gemini"`, so an openai-ingress streaming response stays `text/event-stream`
@@ -4132,7 +4132,7 @@ async fn test_sticky_session_while_healthy() {
 /// `cands[pos].idx` as the sticky member. With `cands = [lane0, lane1]`,
 /// `cands.len() == 2`, so the sticky member is lane 0 iff `stable_hash(key)`
 /// is even. `stable_hash("session-abc") % 2 == 0` (verified against the FNV-1a
-/// constants in forward.rs), so the sticky member here is the TRIPPED lane 0 —
+/// constants in proxy engine), so the sticky member here is the TRIPPED lane 0 —
 /// NOT the healthy lane 1. (The previous revision used `"session-to-lane-0"`,
 /// whose hash is ODD → sticky member was lane 1, the *healthy* lane, so the
 /// affinity fast path simply succeeded and the tripped-member yield branch was

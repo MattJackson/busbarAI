@@ -92,7 +92,7 @@ pub(crate) fn bearer_error_code(error_type: &str) -> serde_json::Value {
         }
         // Real OpenAI quota-exhaustion errors carry BOTH `type` and `code` set to
         // `insufficient_quota` (HTTP 429). The over-budget governance path
-        // (route.rs `ingress_error(..., KIND_INSUFFICIENT_QUOTA, ...)`) reaches these writers with that
+        // (ingress `ingress_error(..., KIND_INSUFFICIENT_QUOTA, ...)`) reaches these writers with that
         // type; emitting `code: null` for it is an SDK-visible mismatch (the official client surfaces
         // `error.code == "insufficient_quota"`) and a proxy tell, so we mirror the native pairing.
         crate::proxy::KIND_INSUFFICIENT_QUOTA => {

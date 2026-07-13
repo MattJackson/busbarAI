@@ -181,12 +181,12 @@ impl StreamTranslate {
             // protocol boundary. Clear the foreign-format `MessageStart` `id`/`created` so the INGRESS
             // writer synthesizes NATIVE-format stream identity rather than leaking the backend's
             // `chatcmpl-…`/`msg_…` id to a different-protocol client — mirrors the non-stream strip in
-            // forward.rs (`ir.id = None`). `model` is DELIBERATELY LEFT INTACT: it is the lane's model
+            // proxy engine (`ir.id = None`). `model` is DELIBERATELY LEFT INTACT: it is the lane's model
             // name (format-neutral, like `created`), and ingress writers use a populated `model` as
             // the anchor for synthesizing the full native stream-start skeleton — clearing it
             // suppressed that synthesis (the Anthropic writer emitted a degenerate `message_start`
             // missing `id`/`type`/`content`/`stop_reason`/`stop_sequence`; the Gemini writer omitted
-            // `modelVersion`). The non-stream path in forward.rs also does NOT clear `model`. Same-
+            // `modelVersion`). The non-stream path in proxy engine also does NOT clear `model`. Same-
             // protocol byte-exact round-trips never reach here, so they are untouched.
             if let crate::ir::IrStreamEvent::MessageStart {
                 id, created, usage, ..
@@ -664,7 +664,7 @@ impl StreamTranslate {
     /// accessor lets that close path observe the translate-side abort and emit the framer error-close
     /// instead, mirroring the SSE-ingress terminal-error behavior in `finish()`.
     ///
-    /// Production wiring lives in `forward.rs`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
+    /// Production wiring lives in `proxy engine`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
     /// close arm reads `translate.aborted()` and passes it to
     /// `framer.finish_for_translate(translate_aborted)` so an aborted gemini-json-array stream
     /// surfaces a native error element instead of a bare close.
@@ -715,11 +715,11 @@ impl StreamTranslate {
         // frame) — a protocol-indistinguishability tell, and it leaves an AWS SDK keying on the final
         // exception/metadata event in an ambiguous state. Emit a modeled `InternalServerException`
         // frame so the close is well-formed for the native decoder, mirroring the inner-stream
-        // transport-error path in forward.rs (`mid_stream_error_bytes`, also keyed off
+        // transport-error path in proxy engine (`mid_stream_error_bytes`, also keyed off
         // `ingress_eventstream`). This is the only terminator on an aborted stream, so return early.
         if self.aborted {
             // The shared abort detail (see `STREAM_ABORT_DETAIL`) so the text a client sees is
-            // identical across this Bedrock-eventstream path and forward.rs's SSE/forward abort path.
+            // identical across this Bedrock-eventstream path and proxy engine's SSE/forward abort path.
             const ABORT_DETAIL: &str = STREAM_ABORT_DETAIL;
             if let Some(exc_type) = self.framing.abort_exception_type() {
                 // The ingress framing owns the wire exception TYPE name (Bedrock →

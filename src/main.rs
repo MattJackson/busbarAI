@@ -953,7 +953,7 @@ pub(crate) fn build_app_from_config(
     // names it, so its context_max must be single-valued. Previously the last pool to iterate (in
     // nondeterministic HashMap order) silently won, so a model carrying `context_max: Some(128000)`
     // in one pool and `None` (or a different limit) in another could end up with whichever value the
-    // iteration happened to land on — defeating the context-length failover exclusion in forward.rs
+    // iteration happened to land on — defeating the context-length failover exclusion in proxy engine
     // and losing pool-specific limits without a diagnostic. Resolve it deterministically and fail
     // loud on a genuine conflict instead.
     let model_context_max = resolve_model_context_max(&cfg.pools)?;

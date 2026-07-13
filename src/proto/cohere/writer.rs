@@ -698,8 +698,8 @@ impl ProtocolWriter for CohereWriter {
     /// `application/json` per the trait contract.
     ///
     /// This is a LIVE production code path, not test-only scaffolding: it is reached at runtime via
-    /// the `ProtocolWriter` trait object on every Cohere-ingress error response (e.g. route.rs,
-    /// forward.rs, and auth.rs all dispatch `p.writer().write_error(...)`). It carries no
+    /// the `ProtocolWriter` trait object on every Cohere-ingress error response (e.g. ingress,
+    /// proxy engine, and auth.rs all dispatch `p.writer().write_error(...)`). It carries no
     /// `allow(dead_code)` suppression — matching every other protocol writer — because the
     /// dead-code lint never fires on vtable-dispatched trait method implementations.
     fn write_error(&self, _status: u16, _kind: &str, message: &str) -> serde_json::Value {
@@ -709,7 +709,7 @@ impl ProtocolWriter for CohereWriter {
     }
 
     fn egress_user_agent(&self) -> &'static str {
-        // Cohere Python SDK UA shape — pinned, see `EGRESS_UA_COHERE` in forward.rs.
+        // Cohere Python SDK UA shape — pinned, see `EGRESS_UA_COHERE` in proxy engine.
         crate::proxy::EGRESS_UA_COHERE
     }
 

@@ -162,9 +162,9 @@ async fn test_shape_cross_protocol_error_auth_kinds() {
     }
 }
 
-/// REGRESSION (R7 HIGH, forward.rs ingress_error): a Bedrock-ingress forward-layer error must
+/// REGRESSION (R7 HIGH, proxy engine ingress_error): a Bedrock-ingress forward-layer error must
 /// carry BOTH `x-amzn-RequestId` and `x-amzn-errortype` (mirroring the body `__type`), exactly
-/// like a real AWS Bedrock runtime error and like route.rs/auth.rs. Non-bedrock ingress must NOT
+/// like a real AWS Bedrock runtime error and like ingress/auth.rs. Non-bedrock ingress must NOT
 /// carry them.
 #[test]
 fn test_ingress_error_bedrock_amzn_headers() {
@@ -261,7 +261,7 @@ async fn test_ingress_error_emits_native_envelope_with_status() {
     );
 }
 
-/// MEDIUM/conformance (forward.rs): the anthropic-ingress error `request-id` HEADER equals
+/// MEDIUM/conformance (proxy engine): the anthropic-ingress error `request-id` HEADER equals
 /// the body `request_id`, and non-anthropic ingress carries no such header.
 #[tokio::test]
 async fn test_anthropic_ingress_error_request_id_header_matches_body() {
@@ -507,7 +507,7 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
     server.shutdown().await;
 }
 
-/// REGRESSION (MED #1, forward.rs `FirstByteBody`): a SAME-PROTOCOL NON-STREAM 2xx
+/// REGRESSION (MED #1, proxy engine `FirstByteBody`): a SAME-PROTOCOL NON-STREAM 2xx
 /// `application/json` body whose top-level object splits across transport frames BEFORE its
 /// trailing `usage` must STILL be token-counted. The streaming per-poll `tap.feed` scanner keeps
 /// no cross-chunk state — it only parses complete JSON objects within a single chunk — so the old
@@ -629,7 +629,7 @@ async fn test_same_protocol_nonstream_multichunk_counts_usage() {
         );
 }
 
-/// REGRESSION (LOW #15 SECURITY, forward.rs key selection): in `Passthrough` mode, a caller that
+/// REGRESSION (LOW #15 SECURITY, proxy engine key selection): in `Passthrough` mode, a caller that
 /// presents NO credential must fall back to an EMPTY credential, NOT the lane operator's
 /// `api_key`. Borrowing the operator key would let an unauthenticated caller silently spend on the
 /// operator's upstream account. With the empty-credential fallback the upstream returns its own
@@ -727,7 +727,7 @@ async fn test_passthrough_no_caller_token_selects_empty_not_lane_key() {
     server.shutdown().await;
 }
 
-/// CLASS regression (forward.rs cross-protocol seam): a Bedrock backend returns an
+/// CLASS regression (proxy engine cross-protocol seam): a Bedrock backend returns an
 /// identity-EMPTY non-stream IR (`read_response` yields `id`/`created`/`model` all `None`, since
 /// a Converse body carries no body-level identity). On a Bedrock→Gemini hop the Gemini writer
 /// gates `usageMetadata.totalTokenCount` and a synthesized `responseId` on the cross-protocol
@@ -896,7 +896,7 @@ async fn test_bedrock_ingress_success_carries_amzn_request_id() {
     server.shutdown().await;
 }
 
-/// MEDIUM/conformance (forward.rs, relay paths): an anthropic-INGRESS 2xx must carry a
+/// MEDIUM/conformance (proxy engine, relay paths): an anthropic-INGRESS 2xx must carry a
 /// `request-id` RESPONSE HEADER — a real Anthropic response always does (the SDK reads it into
 /// `Message._request_id`). On this CROSS-protocol hop (OpenAI backend → Anthropic client) there is
 /// no upstream anthropic id to forward, so busbar must SYNTHESIZE a shape-correct `req_…` one.
@@ -968,7 +968,7 @@ async fn test_anthropic_ingress_success_carries_request_id_header() {
     server.shutdown().await;
 }
 
-/// MEDIUM/test-coverage (forward.rs, STREAMING branch at forward.rs): an anthropic-
+/// MEDIUM/test-coverage (proxy engine, STREAMING branch at proxy engine): an anthropic-
 /// INGRESS STREAMING 2xx must ALSO carry the `request-id` response header. The non-streaming test
 /// above exercises only the buffered builder; the streaming builder is a separate code path, so a
 /// regression on the stream branch alone would otherwise pass CI. The official SDK reads
@@ -1036,12 +1036,12 @@ data: {"type":"message_stop"}"#
     assert!(
         rid.starts_with("req_"),
         "anthropic-ingress STREAMING 2xx MUST carry a `request-id` header in the native req_ \
-             shape (forward.rs maybe_attach_response_request_id path); got {rid:?}"
+             shape (proxy engine maybe_attach_response_request_id path); got {rid:?}"
     );
     server.shutdown().await;
 }
 
-/// HIGH (forward.rs): a cross-protocol CLIENT-fault 4xx must be RESHAPED into the ingress
+/// HIGH (proxy engine): a cross-protocol CLIENT-fault 4xx must be RESHAPED into the ingress
 /// protocol's native error envelope, not relayed with the EGRESS protocol's foreign error body.
 /// An OpenAI backend returning a 400 with an OpenAI-shaped error must reach an Anthropic client as
 /// the Anthropic error shape (`{"type":"error","error":{...}}`), with no OpenAI fields leaking.
@@ -1609,7 +1609,7 @@ async fn test_anthropic_same_proto_passthrough_401_relays_request_id_verbatim_on
     server.shutdown().await;
 }
 
-/// HIGH/conformance (R9, forward.rs error sites): no forward-layer error body returned to a client
+/// HIGH/conformance (R9, proxy engine error sites): no forward-layer error body returned to a client
 /// may begin with the wire-visible internal `router:` prefix — a deterministic proxy tell no native
 /// endpoint emits. The route-layer regression test never reaches the forward layer; this drives the
 /// most-exercised forward-layer error surfaces (overload 503 via empty-pool exhaustion, and the
@@ -1654,7 +1654,7 @@ async fn test_forward_layer_errors_carry_no_router_prefix() {
     }
 }
 
-/// HIGH/test-coverage (R9, forward.rs area): a native AWS SDK ConverseStream request answered
+/// HIGH/test-coverage (R9, proxy engine area): a native AWS SDK ConverseStream request answered
 /// by a buffered (non-SSE) `application/json` 2xx from a CROSS-protocol OpenAI lane must be emitted
 /// at the HTTP boundary as `application/vnd.amazon.eventstream`, decode into the native frame
 /// sequence, AND carry a UUID `x-amzn-RequestId`. The existing coverage tests only the synthesis
@@ -1742,7 +1742,7 @@ async fn test_bedrock_converse_stream_buffered_cross_protocol_emits_binary_event
     server.shutdown().await;
 }
 
-/// HIGH/test-coverage (forward.rs gemini JSON-array buffered-synthesis branch in
+/// HIGH/test-coverage (proxy engine gemini JSON-array buffered-synthesis branch in
 /// `forward_with_pool`): a native Gemini `:streamGenerateContent` WITHOUT `?alt=sse` routed
 /// cross-protocol to an OpenAI lane that answers with a BUFFERED (non-SSE) 2xx must emit a
 /// one-element JSON ARRAY (`[{...}]`) of native `GenerateContentResponse` under
@@ -1831,7 +1831,7 @@ async fn test_gemini_json_array_buffered_cross_protocol_emits_one_element_array(
     server.shutdown().await;
 }
 
-/// MEDIUM/test-coverage (forward.rs gemini JSON-array buffered-synthesis branch in `forward_once`,
+/// MEDIUM/test-coverage (proxy engine gemini JSON-array buffered-synthesis branch in `forward_once`,
 /// the FallbackPool/exhaustion path): the SECOND copy of the branch must match the primary path.
 /// Drive a gemini `:streamGenerateContent` (no alt=sse) through the degraded `forward_once` route
 /// (lane parked in long cooldown + LeastBad on_exhausted, as in
@@ -1923,7 +1923,7 @@ async fn test_gemini_json_array_buffered_via_forward_once_matches_primary() {
     server.shutdown().await;
 }
 
-/// MEDIUM/correctness (forward.rs `record_nonstream_usage` vs `ReadEnd::Truncated` guard):
+/// MEDIUM/correctness (proxy engine `record_nonstream_usage` vs `ReadEnd::Truncated` guard):
 /// CHOSEN SEMANTICS — a cross-protocol non-stream success body that exceeds OUR translation cap
 /// (`MAX_TRANSLATED_BODY_BYTES`, 32 MiB) is UNTRANSLATABLE: the client receives HTTP 500 with NO
 /// completion, so token usage is NOT charged (the `record_nonstream_usage` call now lives AFTER

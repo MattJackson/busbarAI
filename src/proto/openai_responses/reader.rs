@@ -1255,7 +1255,7 @@ impl ProtocolReader for ResponsesReader {
         // mirroring all five sibling readers (openai_chat.rs, gemini, cohere, etc.). A missing
         // `usage` on an otherwise valid 200 is an upstream response-format quirk (a mock/staging/
         // proxy backend that omits it), NOT a client mistake: a `ClientError` here would make
-        // forward.rs discard a valid body and emit a spurious 500.
+        // proxy engine discard a valid body and emit a spurious 500.
         let usage_val = obj.get("usage");
 
         let cached = usage_val.and_then(read_cached_tokens);

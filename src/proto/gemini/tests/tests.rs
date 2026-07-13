@@ -1862,7 +1862,7 @@ fn test_write_request_tool_result_json_passthrough() {
 }
 
 /// Regression: a cross-protocol response with NO foreign id but a populated `created` (the
-/// boundary signal `forward.rs` leaves intact after stripping `id`) must SYNTHESIZE a
+/// boundary signal `proxy engine` leaves intact after stripping `id`) must SYNTHESIZE a
 /// Gemini-shaped `responseId` so a native SDK always sees a value. Previously omitted entirely.
 #[test]
 fn test_response_identity_cross_protocol_synthesizes_id_when_created_set() {
@@ -2116,7 +2116,7 @@ fn test_read_response_functioncall_gets_nonempty_id() {
 
 /// Regression (MEDIUM/correctness): a SAFETY-filtered Gemini candidate carries only
 /// `finishReason` + `safetyRatings` and NO `content` field. `read_response` must decode it as an
-/// empty-content response with the mapped stop reason, NOT hard-fail (which forward.rs turned into
+/// empty-content response with the mapped stop reason, NOT hard-fail (which proxy engine turned into
 /// a spurious 500). Mirrors the streaming reader's `if let Some(content)` tolerance.
 #[test]
 fn test_read_response_safety_filtered_candidate_no_content_is_ok() {

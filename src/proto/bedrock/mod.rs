@@ -82,7 +82,7 @@ pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
 /// `None`, which is impossible with a real endpoint and a deterministic proxy tell). Uses the OS
 /// CSPRNG; returns `None` (so the caller simply OMITS the header) if entropy is unavailable — this is
 /// on the request path and must never panic. Single source of truth: every path — success
-/// (`proto/mod.rs` via `wrap_buffered_as_stream` / `forward.rs` via `maybe_attach_response_request_id`)
+/// (`proto/mod.rs` via `wrap_buffered_as_stream` / `proxy engine` via `maybe_attach_response_request_id`)
 /// and error (`proxy::ingress_error` and the `main.rs` fallback, both via
 /// `attach_bedrock_error_headers`) — reaches this through the writer vtable, so there are no private
 /// copies.
@@ -109,8 +109,8 @@ pub(crate) fn synth_amzn_request_id() -> Option<String> {
 /// `error_kind_to_bedrock_type`, the single source of truth) so header and body agree; the request
 /// id is the only request-id surface the AWS SDK exposes via `*Output::request_id()`. This module-
 /// private helper is the single source of those headers, dispatched through the
-/// `BedrockWriter::attach_error_response_headers` vtable method — the only caller; `forward.rs::
-/// ingress_error`, `route.rs`, and `auth.rs` reach it through that vtable (not by name), so they
+/// `BedrockWriter::attach_error_response_headers` vtable method — the only caller; `proxy engine::
+/// ingress_error`, `ingress`, and `auth.rs` reach it through that vtable (not by name), so they
 /// cannot drift on which headers a Bedrock error must carry. Best-effort: if entropy or header
 /// encoding fails we skip that header rather than panic — this runs on the request path.
 fn attach_bedrock_error_headers(headers: &mut axum::http::HeaderMap, kind: &str) {

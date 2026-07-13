@@ -59,7 +59,7 @@ fn buffered_response_wraps_into_converse_stream_frames() {
     );
 }
 
-/// MEDIUM (R9, forward.rs): the `IrBlock::ToolUse` arm of `bedrock_response_to_eventstream`
+/// MEDIUM (R9, proxy engine): the `IrBlock::ToolUse` arm of `bedrock_response_to_eventstream`
 /// must synthesize native ConverseStream tool-use framing — a `contentBlockStart` carrying
 /// `start.toolUse.{toolUseId,name}` and a `contentBlockDelta` carrying `delta.toolUse.input` — so a
 /// native AWS SDK ConverseStream client receiving a buffered cross-protocol tool-call completion can

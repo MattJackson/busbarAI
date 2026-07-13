@@ -494,7 +494,7 @@ fn finish_inner(
 /// Thin delegation to the CANONICAL `crate::proxy::ingress_error` (the single
 /// source of truth for native error shaping + per-protocol headers — Bedrock
 /// `x-amzn-RequestId`/`x-amzn-errortype` via the `ProtocolWriter::attach_error_response_headers` vtable method (BedrockWriter delegates to its private helper), the generic
-/// fallback envelope, etc.). Keeping route.rs on this one function rather than a private copy means
+/// fallback envelope, etc.). Keeping ingress on this one function rather than a private copy means
 /// route/forward error shaping cannot drift. The route call sites (and the in-module tests) keep
 /// the short `proto`/`message` parameter names; the canonical fn names them `ingress`/`msg`.
 fn ingress_error(proto: &str, status: StatusCode, kind: &str, message: &str) -> Response {
@@ -567,7 +567,7 @@ async fn ingress_path_model(
             obj.insert("stream".to_string(), Value::Bool(stream));
             // Signal a non-`alt=sse` streaming request so the response is framed as a JSON array
             // rather than SSE (only Gemini's writer carries such a key today). The marker key is
-            // resolved through the writer vtable by protocol NAME — route.rs names no protocol
+            // resolved through the writer vtable by protocol NAME — ingress names no protocol
             // submodule, so "delete proto/gemini → app is gemini-free" holds. The shim is stripped
             // before the upstream call (`proxy::strip_router_shim_keys`); cross-protocol egress
             // drops it via the IR.

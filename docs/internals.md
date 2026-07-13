@@ -13,7 +13,7 @@ Cross-references: [ADRs](adr/) · [development.md](development.md) ·
 
 ## 1. The IR fidelity contract (ADR-0005)
 
-The IR (`src/ir.rs`) is a **superset** of what the six protocols can represent,
+The IR (`src/ir/mod.rs`) is a **superset** of what the six protocols can represent,
 not an intersection. Its job is to make a cross-protocol hop lossless for
 everything it models, and to make a same-protocol hop lossless for *everything*.
 
@@ -57,7 +57,7 @@ for the live wiring (frame reassembly, Bedrock binary `eventstream` decode
 
 ### Why a seam
 
-`StateStore` (`src/store.rs`) is a trait of **operations, not fields**: `usable`,
+`StateStore` (`src/store/mod.rs`) is a trait of **operations, not fields**: `usable`,
 `record_transient`, `record_hard_down`, `recover_lane`, `select_weighted`,
 `try_acquire`, `spend_budget`, `snapshot`, etc. The production impl is
 `InMemoryStore`. The seam keeps the hot lane-health path swappable and, crucially,
@@ -118,7 +118,7 @@ InMemoryStore {
   the *shared upstream*, so a recovery clears the default cell **and** every
   per-pool cell for that lane, and "should we probe?" is "tripped in any cell."
 
-### The FSM, precisely (`src/store.rs`)
+### The FSM, precisely (`src/store/mod.rs`)
 
 - **`cell_usable_breaker(now)`**: Closed → usable iff `now >= cooldown_until`
   (a sub-trip failure can still arm a short cooldown that briefly skips the lane).
@@ -155,7 +155,7 @@ InMemoryStore {
 ## 3. The two-stage disposition pipeline (ADR-0002)
 
 The classification chain (see [breaker.rs](../src/breaker.rs) and the disposition
-`match` in `forward.rs`):
+`match` in `proxy/engine/mod.rs`):
 
 ```
 Stage 1a  proto.reader().extract_error(status, body) -> RawUpstreamError
@@ -171,7 +171,7 @@ classification (401/403→Auth, 429→RateLimit, 408→Timeout, 529→Overloaded
 billing/quota with an idiosyncratic code can be canonicalized purely with YAML
 (`error_map`), no code.
 
-**Stage 2 outcome rules** (applied in the `forward.rs` disposition match: each arm
+**Stage 2 outcome rules** (applied in the `proxy/engine/mod.rs` disposition match: each arm
 exhaustively re-matches `StatusClass`, using `unreachable!()` for classes that
 cannot reach that arm, so the compiler keeps the taxonomy honest):
 
@@ -217,7 +217,7 @@ approximate, but eligibility filtering and long-run proportionality hold. See
 
 ## 5. Governance internals (ADR-0009)
 
-`src/governance.rs` is a **separate** durable store from the hot in-memory
+`src/governance/mod.rs` is a **separate** durable store from the hot in-memory
 `StateStore`; it holds only bounded enforcement state.
 
 - **Key storage / hashing.** A virtual key's secret is generated from 16 bytes of
@@ -243,12 +243,12 @@ approximate, but eligibility filtering and long-run proportionality hold. See
   and usage accumulation. It is embedded + statically linked, preserving the
   single-binary story; the `Store` trait leaves room for a `PostgresStore` for
   multi-node later.
-- **Enforcement order** (in `src/route.rs`, before forwarding): allowed-pools
+- **Enforcement order** (in `src/ingress/mod.rs`, before forwarding): allowed-pools
   (`pool_allowed` → 403) → budget (`is_over_budget` → 429, or 400 for Bedrock
   ingress) → rate (`check_rate` → 429 + `Retry-After`). Over-budget never returns
   402 (no vendor does); the body `error.type` is `insufficient_quota`. The auth
   middleware resolves the virtual
-  key first (`src/auth.rs`); `/admin/*` is guarded by the separate admin token,
+  key first (`src/auth/mod.rs`); `/admin/*` is guarded by the separate admin token,
   not a virtual key.
 
 See [operations.md](operations.md) for the operator-facing governance/admin view.

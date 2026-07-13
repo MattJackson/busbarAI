@@ -8,7 +8,7 @@
 //! lives in ONE place instead of being scattered as `sonic_rs::`/`serde_json::` across the request
 //! path. Swapping the parser/serializer — or, later, eliminating the `serde_json::Value` intermediate
 //! in favour of parsing straight into the IR — becomes a change to this module, not a hunt across
-//! `route.rs` and `forward.rs`. ALL body JSON — hot translate path AND the cold error-body /
+//! `ingress/` and `proxy/`. ALL body JSON — hot translate path AND the cold error-body /
 //! error-envelope / SSE-event paths — goes through here; only config (YAML) and tests use a JSON
 //! library directly. The in-memory document type is `serde_json::Value` (sonic-rs parses/serializes
 //! it directly); replacing it with a native value, or swapping the engine, is a change to THIS module.

@@ -241,7 +241,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
             // config (trip thresholds + cooldown backoff): resolve the per-pool `BreakerCfg` from
             // `app.pool_runtime` by pool name, falling back to the ADR-0002 default for the bare `""`
             // default cell and any pool without its own breaker block — matching the per-pool cfg the
-            // organic forward path resolves (forward.rs `breaker_cfg`). This replaces the prior
+            // organic forward path resolves (proxy engine `breaker_cfg`). This replaces the prior
             // one-size `BreakerCfg::default()` that ignored per-pool thresholds/cooldowns (#24/#25).
             let resolve_cfg = |pool: &str| -> BreakerCfg {
                 app.pool_runtime
@@ -635,7 +635,7 @@ mod tests {
     /// identical primitive the organic forward path uses), so for a Bedrock-style path whose modelId
     /// carries a reserved `:` the signed/sent path is byte-identical and `%3A`-encoded — eliminating
     /// the `SignatureDoesNotMatch` 403 that would otherwise park every Bedrock lane dead. This guards
-    /// the contract at the health layer (the helper itself is covered by the forward.rs reserved-char
+    /// the contract at the health layer (the helper itself is covered by the proxy engine reserved-char
     /// test) so a future refactor of the probe can't reintroduce a raw-send divergence.
     #[test]
     fn test_probe_signs_and_sends_same_encoded_path_for_reserved_chars() {

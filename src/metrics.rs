@@ -21,7 +21,7 @@
 //!   budget window. Useful for token-cost dashboards.
 //! * **`busbar_lane_state`** — per-(pool, lane) health gauge: 0 = healthy/closed, 1 =
 //!   half-open (cooling but at least one cell admits), 2 = tripped (all cells Open or hard-down).
-//!   Labels use ONLY configured pool names and lane MODEL strings (matching the forward.rs counter
+//!   Labels use ONLY configured pool names and lane MODEL strings (matching the proxy engine counter
 //!   sites so gauge and counters PromQL-join on `lane`) — both bounded by operator config, never
 //!   client-supplied values.
 //!
@@ -117,7 +117,7 @@ pub(crate) const BILLING_TRUNCATED_TOTAL: &str = "busbar_billing_truncated_total
 //
 // * `busbar_lane_state`: labels `pool` (configured pool name set — bounded by Cargo at startup) and
 //   `lane` (the lane's configured MODEL string — bounded by N = number of configured lanes, a
-//   startup constant; identical to the `lane` label on the forward.rs counters so the gauge and
+//   startup constant; identical to the `lane` label on the proxy engine counters so the gauge and
 //   counters PromQL-join). Neither label can be influenced by a client request.
 
 /// Per-virtual-key spend in cents for the current budget window. Scrape-time gauge.
@@ -137,7 +137,7 @@ const KEY_TOKENS_TOTAL: &str = "busbar_key_tokens_total";
 /// Values: 0 = healthy (Closed), 1 = half-open (cooling but probe admitted), 2 = tripped (Open /
 /// hard-down). Scrape-time gauge; side-effect-free (does not trigger Open→HalfOpen transitions).
 /// Labels: `pool` (configured pool name, bounded) and `lane` (the lane's MODEL string, bounded —
-/// matches the forward.rs counter sites so the gauge and counters can be PromQL-joined on `lane`).
+/// matches the proxy engine counter sites so the gauge and counters can be PromQL-joined on `lane`).
 const LANE_STATE: &str = "busbar_lane_state";
 
 /// Prometheus text exposition format content-type (version 0.0.4), returned by the `/metrics`
@@ -309,7 +309,7 @@ fn refresh_scrape_gauges(app: &App) {
     // For each configured pool, iterate the pool's lane members. The lane state is derived from
     // the lane snapshot (dead flag, aggregate usability, aggregate cooldown remaining), which are
     // pure atomic reads — no FSM transitions are triggered. The `lane` label value is the lane's
-    // MODEL string (matching the forward.rs counters; bounded one-per-configured-lane, a startup
+    // MODEL string (matching the proxy engine counters; bounded one-per-configured-lane, a startup
     // constant), not a numeric index.
     //
     // State derivation (3-state: 0=healthy, 1=half-open, 2=tripped):
@@ -332,7 +332,7 @@ fn refresh_scrape_gauges(app: &App) {
                 0.0 // Closed / healthy
             };
             // The `lane` label is the lane's MODEL string (NOT a numeric index), matching the
-            // counter sites in forward.rs so the gauge and counters can be PromQL-joined on `lane`.
+            // counter sites in proxy engine so the gauge and counters can be PromQL-joined on `lane`.
             // It is bounded one-per-configured-lane (a startup constant), so cardinality stays safe.
             let lane_label = app.lanes[lane_idx].model.clone();
             metrics::gauge!(
@@ -609,7 +609,7 @@ mod tests {
             "healthy lane must have state 0; got:\n{line}"
         );
         // The `lane` label is the lane's MODEL string (NOT a numeric index), consistent with the
-        // forward.rs counter sites so the gauge and counters can be PromQL-joined on `lane`.
+        // proxy engine counter sites so the gauge and counters can be PromQL-joined on `lane`.
         assert!(
             line.contains("lane=\"model-h\""),
             "lane label must be the model string, not a numeric index; got:\n{line}"

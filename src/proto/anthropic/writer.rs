@@ -25,7 +25,7 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn sign_request(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
-        // Wire path: the upstream-credential mode (set by forward.rs into the SigningContext) resolves
+        // Wire path: the upstream-credential mode (set by proxy engine into the SigningContext) resolves
         // an Ambiguous Anthropic credential to the SINGLE native header it implies — Passthrough
         // forwards the caller's token as `authorization: Bearer`; Own presents the configured key as
         // `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
@@ -122,7 +122,7 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn egress_user_agent(&self) -> &'static str {
-        // Anthropic Python SDK UA shape — pinned, see `EGRESS_UA_ANTHROPIC` in forward.rs.
+        // Anthropic Python SDK UA shape — pinned, see `EGRESS_UA_ANTHROPIC` in proxy engine.
         crate::proxy::EGRESS_UA_ANTHROPIC
     }
 
@@ -697,7 +697,7 @@ impl ProtocolWriter for AnthropicWriter {
         // stop_sequence: a native non-streaming Anthropic `Message` ALWAYS carries this key — the
         // matched stop string when a stop sequence fired, JSON `null` otherwise (the SDK types
         // `Message.stop_sequence` as `Optional[str]` and always populates it). `write_response` runs
-        // ONLY on the cross-protocol translate path (forward.rs: same-protocol non-stream relays the
+        // ONLY on the cross-protocol translate path (proxy engine: same-protocol non-stream relays the
         // raw upstream body and never reaches here), where the egress is Anthropic and must byte-match
         // the native shape — so emit an explicit `null` when absent rather than omitting the key. A
         // read→write→read round-trip stays IR-idempotent (`read_response` maps a `null`

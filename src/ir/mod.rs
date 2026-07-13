@@ -278,7 +278,7 @@ pub(crate) struct IrResponse {
     /// SDK-valid (see the synthesized-ID contract below).
     ///
     /// Synthesized-ID contract: on a CROSS-PROTOCOL non-stream response the foreign-format `id` is
-    /// stripped (`forward.rs` sets `ir.id = None`) and the ingress writer mints a NATIVE-format id
+    /// stripped (`proxy engine` sets `ir.id = None`) and the ingress writer mints a NATIVE-format id
     /// when `created` is `Some` (the cross-boundary signal) — so e.g. an OpenAI backend's
     /// `chatcmpl-…` id never reaches an Anthropic client. A same-protocol response preserves the
     /// native id verbatim.

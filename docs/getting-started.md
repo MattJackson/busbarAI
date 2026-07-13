@@ -364,7 +364,7 @@ Busbar signs each outbound request with SigV4 (region parsed from the host); you
 **Bedrock ingress** (acting as a Bedrock endpoint for native AWS SDK clients) has two tracks:
 
 - **Without governance** (`auth.mode: passthrough` or `none`): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (none).
-- **With governance** (`auth.mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **With governance** (`auth.mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 ### Injecting `max_tokens` for cross-protocol calls
 

@@ -1058,7 +1058,7 @@ async fn test_bedrock_converse_stream_returns_binary_eventstream() {
         "streaming bedrock ingress is binary eventstream; got {ct}"
     );
 
-    // HIGH/test-coverage (forward.rs streaming-success header emission): a real AWS Bedrock
+    // HIGH/test-coverage (proxy engine streaming-success header emission): a real AWS Bedrock
     // ConverseStream response ALWAYS carries `x-amzn-RequestId` (the only request-id surface the
     // AWS SDK exposes via `*Output::request_id()`); an absent header makes that return None,
     // which a native endpoint never does, and is a proxy tell on the most security-sensitive new
@@ -1118,7 +1118,7 @@ async fn test_bedrock_converse_stream_returns_binary_eventstream() {
 /// upstream IS a Bedrock backend, so the binary `application/vnd.amazon.eventstream` body must be
 /// relayed VERBATIM (no SSE→binary re-encode, no buffering) and the upstream's REAL
 /// `x-amzn-RequestId` forwarded as-is — never re-synthesized. The cross-protocol stream tests
-/// (OpenAI backend) only exercise the re-encode path; this one drives forward.rs's same-protocol
+/// (OpenAI backend) only exercise the re-encode path; this one drives proxy engine's same-protocol
 /// branch (`is_streaming_content_type` on the eventstream CT, verbatim FirstByteBody relay with
 /// `translate=None`, upstream-CT preservation, and `upstream_amzn_id.or_else(synth)` taking the
 /// upstream value). Asserts: (a) CT is `application/vnd.amazon.eventstream`, (b) the body decodes
@@ -1237,7 +1237,7 @@ async fn test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request
 /// COMPLETELY DIFFERENT code branch from the streaming case asserted by
 /// `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`: a non-stream
 /// `/converse` flows through the buffered/verbatim same-protocol relay (`is_sse == false`,
-/// `cross_protocol == false`) where forward.rs forwards the upstream `x-amzn-RequestId` verbatim
+/// `cross_protocol == false`) where proxy engine forwards the upstream `x-amzn-RequestId` verbatim
 /// (`upstream_amzn_id.or_else(synth)`). A real `Converse` body carries NO body-level identity
 /// (`id`/`created`/`model` are all absent — only `output`/`stopReason`/`usage`), so the ONLY
 /// request-id surface the AWS SDK exposes (`*Output::request_id()`) is the `x-amzn-RequestId`
@@ -1451,7 +1451,7 @@ async fn test_bedrock_same_protocol_stream_mid_stream_transport_error_appends_bi
     server.shutdown().await;
 }
 
-/// HIGH/test-coverage (forward.rs): a TRUE mid-stream transport failure on a
+/// HIGH/test-coverage (proxy engine): a TRUE mid-stream transport failure on a
 /// bedrock-ingress cross-protocol stream must terminate the body with a CRC-valid BINARY
 /// `:message-type: exception` frame appended AFTER the real frames — never SSE `event:`/`data:`
 /// ASCII (which yields an undecodable prelude/CRC for the AWS SDK). `SseTransportError` drops the
@@ -1514,7 +1514,7 @@ async fn test_bedrock_ingress_mid_stream_transport_error_appends_binary_exceptio
     server.shutdown().await;
 }
 
-/// HIGH/test-coverage twin (forward.rs): the SSE-ingress (openai) mid-stream transport-failure
+/// HIGH/test-coverage twin (proxy engine): the SSE-ingress (openai) mid-stream transport-failure
 /// path must append a BARE `data:` error frame (NO `event:` line — openai native streams never
 /// emit one mid-stream) whose `data:` is the native OpenAI error envelope.
 #[tokio::test]
@@ -2538,7 +2538,7 @@ async fn test_gemini_json_array_mid_stream_error_closes_array_no_sse() {
 /// key (the bug: the gemini reader swept it into IR `extra` and the egress writer re-emitted the
 /// router fingerprint onto the foreign backend).
 ///
-/// R9 HIGH (forward.rs) correction: the egress `stream` field is NOT a router fingerprint
+/// R9 HIGH (proxy engine) correction: the egress `stream` field is NOT a router fingerprint
 /// for a BODY-MODEL backend — the OpenAI writer AUTHORS `"stream": ir.stream` and the backend
 /// reads it to decide whether to stream. The client called `:streamGenerateContent`, so it
 /// genuinely wants streaming; `stream: true` MUST reach the OpenAI backend, otherwise the backend
@@ -2585,7 +2585,7 @@ async fn test_gemini_json_array_shim_not_leaked_cross_protocol() {
         upstream_v.get("__busbar_gemini_json_array").is_none(),
         "router shim key must not leak to a foreign backend; got {upstream_v}"
     );
-    // R9 HIGH (forward.rs): the writer-authored `stream` MUST reach a body-model (OpenAI)
+    // R9 HIGH (proxy engine): the writer-authored `stream` MUST reach a body-model (OpenAI)
     // backend so it actually streams — the client called `:streamGenerateContent`. Stripping it
     // here was the bug that made the backend answer non-streaming.
     assert_eq!(
@@ -4320,7 +4320,7 @@ async fn test_bedrock_percent_encoded_model_id_converse_stream() {
 
 // ---- HIGH/test-coverage: mid-stream transport-error E2E for Cohere and Responses ingress ----
 //
-// `test_sse_ingress_mid_stream_error_uses_native_framing` (forward.rs) tests the byte shape of
+// `test_sse_ingress_mid_stream_error_uses_native_framing` (proxy engine) tests the byte shape of
 // `mid_stream_error_bytes` in isolation; these two drive a TRUE `SseTransportError` through the
 // REAL router on the two ingress routes that previously lacked an E2E mid-stream error test
 // (bedrock/openai/gemini-json-array already have theirs above). Each routes cross-protocol to an
@@ -5397,7 +5397,7 @@ async fn test_gemini_v1_stable_stream_generate_content_no_alt_sse() {
 
 // ---- MEDIUM/test-coverage: governance 429 (rate) and over-budget paths on the new ingress ----
 //
-// The route.rs governance suite above (`test_governance_pool_acl_403_*`) only exercises the
+// The ingress governance suite above (`test_governance_pool_acl_403_*`) only exercises the
 // pool-ACL 403 guard end-to-end. The OTHER two `governance_guard` rejections — `rate_check`
 // (429 + Retry-After) and `budget_check` (over-quota) — share the same `forward_resolved`
 // dispatch but map to DIFFERENT per-protocol `kind`s (`rate_limit_error` / `insufficient_quota`)
@@ -5525,7 +5525,7 @@ async fn test_governance_rate_limit_429_native_envelope_all_ingress() {
 /// Each first-class ingress route: an over-budget virtual key is rejected with the protocol's
 /// native quota shape before resolution. The over-quota `kind` is `insufficient_quota`; the
 /// status is 429 for every protocol EXCEPT bedrock (whose native `ServiceQuotaExceededException`
-/// is a 400-class error — see `budget_check`). Closes the route.rs gap the 403-only set left on
+/// is a 400-class error — see `budget_check`). Closes the ingress gap the 403-only set left on
 /// the `budget_check` guard.
 #[tokio::test]
 async fn test_governance_over_budget_native_envelope_all_ingress() {
@@ -5642,9 +5642,9 @@ async fn test_named_by_model_fallback_round_trip_via_router() {
 //      cross-protocol backend is translated both ways; and
 //   2. the Anthropic `/<model>/v1/messages` (`named`) / `/<provider>/<model>/v1/messages`
 //      (`adhoc`) routes → `crate::proxy::forward_with_pool`, which passes `""` (the lane-default breaker
-//      CELL shared by every direct/single-model route — forward.rs design intent).
+//      CELL shared by every direct/single-model route — proxy engine design intent).
 //
-// forward.rs records every breaker outcome against the CELL keyed by the `pool_name` argument
+// proxy engine records every breaker outcome against the CELL keyed by the `pool_name` argument
 // (`record_transient_in(pool_name, …)`). If `forward_resolved`'s by_model arm passes the MODEL
 // name as `pool_name` (the pre-fix bug) while the named/adhoc paths pass `""`, the SAME lane's
 // breaker state is split across two cells purely by route shape: failures driven through the

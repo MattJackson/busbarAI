@@ -6,7 +6,7 @@ use crate::proto::gemini::GEMINI_JSON_ARRAY_SHIM_KEY;
 use crate::proto::StatusClass;
 use serde_json::{json, Value};
 
-/// HIGH (forward.rs gemini JSON-array path, + the SSE/eventstream + pre-first-byte twins):
+/// HIGH (proxy engine gemini JSON-array path, + the SSE/eventstream + pre-first-byte twins):
 /// the client-facing mid-stream transport-error detail MUST be a static, vendor-neutral string —
 /// NEVER the raw `reqwest::Error` Display, which embeds hyper/reqwest internals and the egress
 /// backend URL (a protocol tell + infrastructure leak). All three call sites pass the single
@@ -88,7 +88,7 @@ fn test_mid_stream_generic_detail_has_no_leak_markers() {
     );
 }
 
-/// HIGH (forward.rs / 372-380): a mid-stream upstream failure on a BEDROCK-ingress stream
+/// HIGH (proxy engine / 372-380): a mid-stream upstream failure on a BEDROCK-ingress stream
 /// (the client decodes binary `application/vnd.amazon.eventstream`) MUST be emitted as a valid
 /// binary exception frame — never an SSE `event: error` text frame, which would inject ASCII into
 /// a binary body and produce an undecodable prelude/CRC for the AWS SDK's eventstream decoder.
@@ -133,7 +133,7 @@ fn test_bedrock_ingress_mid_stream_error_is_binary_exception_frame() {
     assert_eq!(v["message"], "connection reset by peer");
 }
 
-/// HIGH/conformance (forward.rs): the SSE mid-stream error frame must be the ingress
+/// HIGH/conformance (proxy engine): the SSE mid-stream error frame must be the ingress
 /// writer's OWN STREAMING error event (`write_response_event(&Error)`), framed exactly as the
 /// happy path — NOT the non-stream `write_error()` HTTP envelope. Bare-`data:` protocols
 /// (openai/cohere/gemini, whose native streams emit `data:`-only frames) get NO `event:` line;
@@ -328,7 +328,7 @@ fn test_strip_same_protocol_model_shim() {
     assert_eq!(v["model"], "gpt-4o", "openai model never stripped");
 }
 
-/// REGRESSION (R7 CRITICAL, forward.rs shim-strip ordering): a PATH-MODEL ingress (gemini/bedrock)
+/// REGRESSION (R7 CRITICAL, proxy engine shim-strip ordering): a PATH-MODEL ingress (gemini/bedrock)
 /// crossing to a BODY-MODEL egress (openai/anthropic/cohere/responses) must reach the backend WITH
 /// the authoritative egress `model`. The bug: `rewrite_model` ran, then an UNCONDITIONAL strip
 /// removed `model`, so the cross-protocol body hit the backend with no `model` (a guaranteed 400).

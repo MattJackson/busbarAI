@@ -140,8 +140,8 @@ pub(crate) const BASE62_REJECT_THRESHOLD: u8 = 248;
 
 /// Client-visible detail string for a mid-stream abort (the upstream connection dropped or a
 /// translate step failed after first byte). Lives in the proto layer — the lowest common ancestor —
-/// because BOTH `forward.rs` (SSE/forward abort path) and the Bedrock-eventstream reassembler in this
-/// module emit it, and `forward.rs → proto` is the only legal dependency direction. Single source of
+/// because BOTH `proxy engine` (SSE/forward abort path) and the Bedrock-eventstream reassembler in this
+/// module emit it, and `proxy engine → proto` is the only legal dependency direction. Single source of
 /// truth so the abort text a client sees is identical on every framing.
 pub(crate) const STREAM_ABORT_DETAIL: &str = "The response stream was interrupted.";
 
@@ -528,9 +528,9 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// writer vtable instead of the name-match in `egress_user_agent`, so adding a 7th protocol
     /// only requires an override here, not a new branch in the core.
     ///
-    /// Default: `EGRESS_UA_DEFAULT` from forward.rs — a generic-but-present UA for unknown egress
+    /// Default: `EGRESS_UA_DEFAULT` from proxy engine — a generic-but-present UA for unknown egress
     /// (better than none). Each registered writer overrides with its own pinned SDK UA string (see
-    /// `EGRESS_UA_*` in forward.rs for the per-protocol UA strings that must be kept current).
+    /// `EGRESS_UA_*` in proxy engine for the per-protocol UA strings that must be kept current).
     fn egress_user_agent(&self) -> &'static str {
         crate::proxy::EGRESS_UA_DEFAULT
     }
@@ -633,7 +633,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// always sends these headers; their absence is a detectable proxy tell and leaves the AWS SDK's
     /// `request_id()` returning `None`.
     ///
-    /// Used as the predicate at the four category-3 sites in `forward.rs` (header capture before body
+    /// Used as the predicate at the four category-3 sites in `proxy engine` (header capture before body
     /// consumption, 2xx buffered attach, streaming 2xx attach, degraded error attach). The header-attach
     /// bodies remain inline; only the name-branch `if ingress_protocol == "bedrock"` is replaced with
     /// `if writer.ingress_relays_amzn_headers()`, removing the provider-name string from the
@@ -709,7 +709,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// protocols. Gemini native NOT_FOUND responses carry a structured message naming the resource
     /// path and API version; for all other protocols the generic envelope is correct.
     ///
-    /// Used at two sites in `route.rs` (no-colon path and unsupported-action path) to gate the
+    /// Used at two sites in `ingress` (no-colon path and unsupported-action path) to gate the
     /// Gemini-native NOT_FOUND envelope without branching on the name string `"gemini"`.
     ///
     /// Default: `false` (all non-Gemini protocols use the canonical OpenAI-shape NOT_FOUND).

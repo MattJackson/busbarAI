@@ -1533,7 +1533,7 @@ pub(crate) const DEFAULT_MAX_INBOUND_CONCURRENT: usize = 0;
 pub(crate) const DEFAULT_HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
 /// Default ceiling on a honored upstream `Retry-After` (seconds). Mirrors `store.rs` (24h).
 pub(crate) const DEFAULT_MAX_HONORED_RETRY_AFTER_SECS: u64 = 86_400;
-/// Default cap on a buffered upstream ERROR / verbatim-relay body (bytes). Mirrors `forward.rs`.
+/// Default cap on a buffered upstream ERROR / verbatim-relay body (bytes). Mirrors `proxy engine`.
 pub(crate) const DEFAULT_UPSTREAM_ERROR_BODY_MAX_BYTES: usize = 256 * 1024;
 /// Default TLS handshake wall-clock bound (seconds). Mirrors `tls.rs`.
 pub(crate) const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;

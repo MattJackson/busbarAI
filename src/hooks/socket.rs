@@ -248,7 +248,7 @@ impl RoutingPolicy for SocketPolicy {
     /// — ANY error (timeout, I/O, malformed reply, no/empty rewrite) yields `None`, so the caller
     /// proceeds with the ORIGINAL body. A rewrite hook reads the `request` projection (its `prompt`),
     /// not the candidate set, so an empty candidate list is sent.
-    #[allow(dead_code)] // wired into the forward global-hooks transform seam next (slice-4 step)
+    #[allow(dead_code)] // wired into the proxy global-hooks transform seam next (slice-4 step)
     async fn transform(
         &self,
         req: &RoutingRequest<'_>,

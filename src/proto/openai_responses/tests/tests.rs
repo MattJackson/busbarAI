@@ -457,7 +457,7 @@ fn test_read_response_decode() {
 /// Fix #9 (lenience): a Responses `read_response` body with NO `usage` object must parse to a
 /// zero IrUsage rather than hard-erroring with a ClientError — mirroring all five sibling readers
 /// (openai_chat.rs, etc.). A missing `usage` on an otherwise valid 200 is an upstream format quirk,
-/// not a client mistake; erroring here would make forward.rs discard a valid body and 500.
+/// not a client mistake; erroring here would make proxy engine discard a valid body and 500.
 #[test]
 fn read_response_without_usage_zero_defaults_no_error() {
     let json = serde_json::json!({
@@ -4020,7 +4020,7 @@ fn test_terminal_completed_unchanged_for_end_turn() {
 }
 
 /// Regression (HIGH/conformance, Round 11): write_error must NOT leak the Anthropic-vocabulary
-/// `overloaded` type to an OpenAI-family client. A 503 exhaustion/timeout (forward.rs passes
+/// `overloaded` type to an OpenAI-family client. A 503 exhaustion/timeout (proxy engine passes
 /// kind `"overloaded"`) maps onto the native `server_error`.
 #[test]
 fn test_write_error_maps_overloaded_to_server_error() {
@@ -4369,7 +4369,7 @@ fn test_failed_event_replays_created_at() {
     );
 }
 
-/// Regression (MEDIUM/conformance, Round 12): the forward.rs transient/upstream error kinds
+/// Regression (MEDIUM/conformance, Round 12): the proxy engine transient/upstream error kinds
 /// (`timeout`/`network`/`connect`/`5xx`/`transient`/`api_error`) must map to the native
 /// `server_error` type, and `context_length_exceeded`/`bad_request` to `invalid_request_error`,
 /// never leaking a non-native `error.type` to a Responses client.

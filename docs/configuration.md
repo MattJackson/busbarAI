@@ -9,7 +9,7 @@ Busbar reads **two YAML files** at startup:
 
 Both files support `${VAR}` environment interpolation before YAML is parsed. A missing or malformed env var reference is a fatal startup error, Busbar refuses to boot rather than run with an incomplete config.
 
-> All defaults below are sourced from `src/config.rs`, `src/breaker.rs`, `src/health.rs`, and `src/proto/mod.rs`. Where a serde field default differs from a runtime constant, both are noted.
+> All defaults below are sourced from `src/config/mod.rs`, `src/breaker.rs`, `src/health.rs`, and `src/proto/mod.rs`. Where a serde field default differs from a runtime constant, both are noted.
 
 ---
 
@@ -229,7 +229,7 @@ auth:
 **Bedrock ingress.** Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization: AWS4-HMAC-SHA256 …`). There are two tracks:
 
 - **Without governance** (`chain: []`, with or without `upstream_credentials: passthrough`): Busbar does not verify the inbound SigV4 signature. The header is forwarded upstream (passthrough) or ignored entirely. Use this for transparent Bedrock proxying without per-key controls.
-- **With governance** (`chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **With governance** (`chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth/mod.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 All other five ingress protocols use bearer-style auth and work with every chain configuration.
 

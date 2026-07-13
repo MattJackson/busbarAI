@@ -276,7 +276,7 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
     );
 }
 
-/// REGRESSION (LOW #18, forward.rs token-sum): the buffered token-fee sum must use
+/// REGRESSION (LOW #18, proxy engine token-sum): the buffered token-fee sum must use
 /// `saturating_add` over the UPSTREAM-CONTROLLED `input_tokens`/`output_tokens`. A hostile/buggy
 /// upstream that reports counts summing past `u64::MAX` would, under the old unchecked `+`, PANIC
 /// on the request path in debug (and silently WRAP in release). With `saturating_add` the sum

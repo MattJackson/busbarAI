@@ -76,7 +76,7 @@ pipeline**.
 
 ### 1. Ingress & protocol detection
 
-The route table (`src/main.rs` `build_router`, `src/route.rs`) determines the
+The route table (`src/main.rs` `build_router`, `src/ingress/mod.rs`) determines the
 **ingress protocol** by path, not by sniffing the body. All six protocols are
 first-class ingress, one handler per protocol (Gemini's handler is reachable via
 two path prefixes, `v1` and `v1beta`):
@@ -107,7 +107,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 
 ### 2. Authentication
 
-`auth_middleware` (`src/auth.rs`) runs before routing:
+`auth_middleware` (`src/auth/mod.rs`) runs before routing:
 
 - `/healthz` is always open (liveness probes must not require a token).
 - `/metrics` is **not** exempted, Prometheus telemetry (lane/pool topology,
@@ -125,7 +125,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
   passthrough forwarding.
 - **Bedrock ingress** has two modes depending on governance:
   - *Without governance* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
-  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth.rs`.
+  - *With governance* (`token` mode + `governance.enabled: true`): `src/auth/mod.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with `"issue_aws_credential": true`. Note: `src/sigv4.rs` provides signing primitives; the inbound verifier lives in `src/auth/mod.rs`.
 
 ### 3. Governance checks
 
@@ -142,13 +142,13 @@ accounting). See [operations.md](operations.md).
 
 ### 4. Pool / lane selection
 
-For a pool target, `forward_with_pool` (`src/forward.rs`) selects a member:
+For a pool target, `forward_with_pool` (`src/proxy/engine/mod.rs`) selects a member:
 
 1. **Affinity preference**: if a session header is present and the sticky member is
    usable, use it; otherwise fall through.
 2. **Exclusions**: configured `failover.exclusions` and already-tried lanes (across
    failover hops) are removed from the candidate set.
-3. **SWRR**: `select_weighted` (`src/store.rs`) runs Nginx-style smooth weighted
+3. **SWRR**: `select_weighted` (`src/store/mod.rs`) runs Nginx-style smooth weighted
    round-robin over the *usable* candidates, using per-pool `current_weight` state.
    A lane is usable only if it isn't dead, isn't out of lifetime budget, and its
    breaker cell admits it.
@@ -167,7 +167,7 @@ translates the **request** through the superset IR:
 ingress.reader().read_request(body)  →  IrRequest  →  lane.writer().write_request(ir)
 ```
 
-The IR (`src/ir.rs`) is a superset of all six protocols' representable content:
+The IR (`src/ir/mod.rs`) is a superset of all six protocols' representable content:
 system blocks, messages with text / thinking (+signature) / tool-use / tool-result
 / image blocks, tools (name + description + JSON schema), `max_tokens`,
 `temperature` (held as `f64` so a caller's value never silently mutates), a `stream`
@@ -204,7 +204,7 @@ field is rewritten to the selected lane's model.
 ### 7. Two-stage failure disposition
 
 Every non-2xx upstream response is run through a pipeline that decides **who is at
-fault** and therefore what to do (`src/forward.rs`, `src/breaker.rs`):
+fault** and therefore what to do (`src/proxy/engine/mod.rs`, `src/breaker.rs`):
 
 ```
 Stage 1a  proto.reader().extract_error(status, body)  → RawUpstreamError
@@ -251,7 +251,7 @@ Bedrock-ingress (AWS eventstream) clients.
 
 ## Circuit-breaker state
 
-Breaker state is **per-(pool, lane)**, stored in `src/store.rs`. The FSM is Closed →
+Breaker state is **per-(pool, lane)**, stored in `src/store/mod.rs`. The FSM is Closed →
 Open → HalfOpen → Closed, with exponential cooldown backoff and single-flight
 half-open probing. See [operations.md](operations.md) for the full state machine,
 trip modes, and recovery behavior.
@@ -260,5 +260,5 @@ trip modes, and recovery behavior.
 
 Metrics are emitted at the ingress boundary (`busbar_requests_total`, the duration
 histogram) and at each upstream attempt/failure/trip/failover/translation
-(`src/metrics.rs`, `src/forward.rs`). Optional OTLP spans and a request-log webhook
+(`src/metrics.rs`, `src/proxy/engine/mod.rs`). Optional OTLP spans and a request-log webhook
 are configured via the `observability` section.

@@ -1391,7 +1391,7 @@ fn test_write_request_tool_result_preserves_non_text_content() {
 /// Regression (writer): a stream Error event names a REAL Converse exception (mapped from the IR
 /// error class) as its event-type token instead of the non-native literal `"error"`. (The
 /// `:message-type: exception` framing itself is the encoder's job — see the production
-/// mid-stream-error path in forward.rs — and is out of this unit's scope.)
+/// mid-stream-error path in proxy engine — and is out of this unit's scope.)
 #[test]
 fn test_write_response_event_error_names_real_exception() {
     let writer = BedrockWriter;

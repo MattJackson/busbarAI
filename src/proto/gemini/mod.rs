@@ -12,7 +12,7 @@ use super::*;
 /// Router-internal shim key the gemini ingress route injects into the request body when the client
 /// sent a streaming `:streamGenerateContent` request WITHOUT `?alt=sse` (so the response must be the
 /// JSON-array streaming format, not SSE). It rides alongside the `model`/`stream` shims. Single
-/// source of truth shared by the route injection (`route.rs`), the forward-layer strip
+/// source of truth shared by the route injection (`ingress`), the forward-layer strip
 /// (`proxy::strip_router_shim_keys`), and the Gemini reader's `modeled_keys` exclusion so it never
 /// reaches a backend on any path. A leading `__busbar` makes a collision with a real provider field
 /// impossible. Defined here and referenced at this owning path, so the route/forward sites reach it
@@ -133,7 +133,7 @@ fn modeled_request_keys() -> &'static std::collections::HashSet<&'static str> {
         // Keeping the raw `generationConfig` object in `extra` lets the writer OVERLAY the 5 typed
         // fields onto the original object (the same pattern `BedrockWriter` uses for
         // `inferenceConfig`), preserving unknown sub-fields. Same-protocol Gemini→Gemini is
-        // unaffected (byte-identical), and the cross-protocol seam (`forward.rs ir.extra.clear()`)
+        // unaffected (byte-identical), and the cross-protocol seam (`proxy engine ir.extra.clear()`)
         // still prevents foreign Gemini sub-fields from leaking onto a non-Gemini backend.
         [
             "contents",
@@ -1003,7 +1003,7 @@ impl GeminiJsonArrayFramer {
     ///
     /// [`finish`]: Self::finish
     ///
-    /// Production wiring lives in `forward.rs`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
+    /// Production wiring lives in `proxy engine`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
     /// close arm calls this with `translate.aborted()` (captured before draining the translate's SSE
     /// terminator) instead of discarding `translate.finish()` then calling plain `framer.finish()`.
     pub(crate) fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
@@ -1062,7 +1062,7 @@ impl crate::proto::JsonArrayFramer for GeminiJsonArrayFramer {
 
     fn finish_with_server_error(&mut self, message: &str) -> Vec<u8> {
         // The implementor owns the wire shape: a native Gemini server error is HTTP 500 / gRPC
-        // `INTERNAL`. The agnostic caller passes only the message, so forward.rs names no Gemini value.
+        // `INTERNAL`. The agnostic caller passes only the message, so proxy engine names no Gemini value.
         GeminiJsonArrayFramer::finish_with_error(self, 500, GRPC_INTERNAL, message)
     }
 }

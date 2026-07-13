@@ -254,7 +254,7 @@ fn test_trip_on_error_rate() {
 }
 
 /// REGRESSION (#29): `cell_record_failure` (via `record_transient`/`record_rate_limit`) must
-/// RETURN `true` exactly on a logical Closed→Open trip, so the forward.rs call sites emit
+/// RETURN `true` exactly on a logical Closed→Open trip, so the proxy engine call sites emit
 /// `BREAKER_TRIPS_TOTAL` once per trip. Sub-threshold failures return `false`; the failure that
 /// breaches the threshold returns `true`; further failures on the already-Open cell return `false`
 /// (no multi-count); and a HalfOpen→Open reopen (failed recovery probe) is NOT a fresh trip.
@@ -1761,7 +1761,7 @@ fn test_default_cell_recovery_does_not_zero_lane_err() {
     );
 }
 
-/// HIGH (forward.rs pick_among): a single-flight recovery probe WON via
+/// HIGH (proxy engine pick_among): a single-flight recovery probe WON via
 /// `acquire_for_dispatch_in` but then NOT dispatched (permit-wait timeout / shutdown) must be
 /// RELEASED via `release_probe_in`, otherwise the cell stays HalfOpen with `probe_in_flight ==
 /// true` and `usable_in` benches the lane forever. After release the lane must be re-probeable.
@@ -1800,7 +1800,7 @@ fn test_release_probe_reverts_undispatched_probe_winner() {
     );
 }
 
-/// HIGH (forward.rs pick_among SESSION-AFFINITY fast path): `usable_in` is the sticky-path
+/// HIGH (proxy engine pick_among SESSION-AFFINITY fast path): `usable_in` is the sticky-path
 /// admission call, and — like `acquire_for_dispatch_in` — it WINS the single-flight probe as a
 /// SIDE EFFECT (Open→HalfOpen + probe CAS) for an expired-Open lane. If the sticky path then fails
 /// to get a concurrency permit and falls through WITHOUT `release_probe_in`, the cell is wedged
@@ -1841,7 +1841,7 @@ fn test_usable_in_wins_probe_and_must_be_released_on_sticky_path() {
     );
 }
 
-/// MEDIUM/correctness (forward.rs ClientFault arm probe leak): a HalfOpen lane that wins the
+/// MEDIUM/correctness (proxy engine ClientFault arm probe leak): a HalfOpen lane that wins the
 /// single-flight recovery probe and then serves a request the upstream answers with a 4xx
 /// (`Disposition::ClientFault`) must NOT be left wedged. The forward path's ClientFault arm calls
 /// `record_client_fault` — which by design bumps ONLY an observability counter and does NOT clear
@@ -1886,7 +1886,7 @@ fn test_client_fault_on_halfopen_lane_releases_probe() {
     );
 }
 
-/// MEDIUM/correctness (forward.rs ContextLength arm probe leak): a HalfOpen lane that wins the
+/// MEDIUM/correctness (proxy engine ContextLength arm probe leak): a HalfOpen lane that wins the
 /// recovery probe and then serves a request the upstream rejects as too large for its context
 /// window (`Disposition::ContextLength`) must NOT be left wedged. ContextLength is a client-fault
 /// variant — no breaker penalty — so the arm `continue`s to failover without recording any outcome
@@ -2196,7 +2196,7 @@ fn test_budget_is_lane_global_across_pools() {
     );
 }
 
-/// MEDIUM/correctness (forward.rs): a body transfer that fails AFTER the 2xx headers
+/// MEDIUM/correctness (proxy engine): a body transfer that fails AFTER the 2xx headers
 /// (which optimistically spent one budget unit) must REFUND that unit — no usable response was
 /// delivered, so a failed transfer must not permanently drain the lane's lifetime `max_requests`
 /// budget. `refund_budget` is the inverse of one `spend_budget`.
@@ -2238,7 +2238,7 @@ fn test_refund_budget_unlimited_is_noop() {
     );
 }
 
-/// HIGH/correctness (forward.rs): a hard-down trips the lane in EVERY cell — the default
+/// HIGH/correctness (proxy engine): a hard-down trips the lane in EVERY cell — the default
 /// ("") cell AND every existing per-pool cell — mirroring `recover_lane`'s all-cells reach. The
 /// organic forward path previously tripped only the routing pool's cell, leaving the same dead
 /// upstream Closed in the default cell (read by `named`/`adhoc`/direct routes) and other pools.

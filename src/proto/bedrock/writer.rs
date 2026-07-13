@@ -1062,7 +1062,7 @@ impl ProtocolWriter for BedrockWriter {
 
     fn egress_user_agent(&self) -> &'static str {
         // AWS Bedrock is reached via boto3/botocore; the SDK's UA is the backend-facing fingerprint
-        // guard. Pinned — see `EGRESS_UA_BEDROCK` in forward.rs.
+        // guard. Pinned — see `EGRESS_UA_BEDROCK` in proxy engine.
         crate::proxy::EGRESS_UA_BEDROCK
     }
 

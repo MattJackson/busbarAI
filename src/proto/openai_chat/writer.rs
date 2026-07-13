@@ -673,7 +673,7 @@ impl ProtocolWriter for OpenAiWriter {
     }
 
     fn egress_user_agent(&self) -> &'static str {
-        // OpenAI Python SDK UA shape — pinned, see `EGRESS_UA_OPENAI` in forward.rs.
+        // OpenAI Python SDK UA shape — pinned, see `EGRESS_UA_OPENAI` in proxy engine.
         crate::proxy::EGRESS_UA_OPENAI
     }
 

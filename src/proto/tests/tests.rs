@@ -605,7 +605,7 @@ fn test_extra_passthrough() {
 // Finding 2 (native control fields dropped on cross-protocol hops). The universally-modeled
 // sampling controls (top_p, top_k, stop) are now first-class IR fields, so they survive the
 // cross-protocol seam (which CLEARS `ir.extra` to stop source-only key leakage). Each test reads
-// a native request, CLEARS `extra` to simulate the seam (forward.rs `ir.extra.clear()`), then
+// a native request, CLEARS `extra` to simulate the seam (proxy engine `ir.extra.clear()`), then
 // writes through a DIFFERENT protocol and asserts the control reappears in that protocol's native
 // shape. Were these still extra-only, the clear would drop them.
 

@@ -598,7 +598,7 @@ pub(crate) trait Store: Send + Sync + 'static {
     /// requests for the same key can NO LONGER each read "under budget" and all charge — the cap is a
     /// HARD cap for the flat fee. (Token cost is still reconciled post-response, so a single in-flight
     /// request's own tokens can push spend marginally over — bounded to ONE request, not N. See the
-    /// call site in `route.rs`.)
+    /// call site in `ingress`.)
     fn charge_within_budget(
         &self,
         key_id: &str,

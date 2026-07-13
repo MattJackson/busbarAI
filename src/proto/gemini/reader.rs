@@ -91,7 +91,7 @@ impl ProtocolReader for GeminiReader {
         // `breaker::normalize_raw_error` (operator-error-map-INDEPENDENT, unlike a `provider_code`
         // that would only map via a configured entry the shipped Gemini error_map lacks); overriding
         // `http_status` is safe because the forwarder relays the INGRESS-native auth status to the
-        // client (forward.rs `auth_failure_status_and_kind`), never this raw value — it is consumed
+        // client (proxy engine `auth_failure_status_and_kind`), never this raw value — it is consumed
         // ONLY for breaker classification. `provider_code` is also set to the canonical `"auth"`
         // string (`breaker::status_class_from_str`) so an operator who DOES map it is reinforced.
         //
@@ -637,7 +637,7 @@ impl ProtocolReader for GeminiReader {
         // NO `candidates`, so without this arm the reader would emit a bare `MessageStart` and then
         // EOF — no `IrStreamEvent::Error`, no terminal MessageDelta/MessageStop — silently swallowing
         // the failure and leaving the downstream client (or cross-protocol ingress writer) on a
-        // hung/non-terminated stream while the breaker/observability never see it. forward.rs only
+        // hung/non-terminated stream while the breaker/observability never see it. proxy engine only
         // converts HTTP-status-level errors, so an inline 200-status error object bypasses that path
         // entirely. Mirror the Bedrock reader's inline `*Exception` surfacing (bedrock.rs)
         // and the Cohere terminal `ERROR` mapping (cohere.rs): map `error.status`/`error.code`

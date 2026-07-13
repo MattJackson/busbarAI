@@ -1,7 +1,7 @@
 # ADR-0005 — Superset IR & translation fidelity
 
 > Status: accepted (reconstructed from code). `ADR-0005` is referenced in
-> `src/ir.rs` (including the explicit f64-not-f32 note). The prose is
+> `src/ir/mod.rs` (including the explicit f64-not-f32 note). The prose is
 > reconstructed from the implementation.
 
 ## Context
@@ -21,7 +21,7 @@ caller's intent, the gateway has failed at its one job. Two specific hazards:
 
 ## Decision
 
-Define a **superset IR** (`src/ir.rs`) that is the union of what the six
+Define a **superset IR** (`src/ir/mod.rs`) that is the union of what the six
 protocols can represent, not the intersection:
 
 - `IrRequest` holds `system`, `messages`, `tools`, `max_tokens`,

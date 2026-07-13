@@ -331,7 +331,7 @@ impl ProtocolReader for OpenAiReader {
         // first-class IR fields (read above) and excluded here, so they no longer linger in `extra` —
         // otherwise the writer would double-emit them (once from the typed field, once from the extra
         // sweep). Cross-protocol mapping of these to Gemini/Anthropic/Bedrock analogs is handled by the
-        // translate seam (`forward.rs`).
+        // translate seam (`proxy engine`).
         //
         // The set is a compile-time constant, so it is built ONCE into a process-global `OnceLock`
         // and shared by every `read_request` call instead of being re-allocated and re-hashed per
@@ -881,7 +881,7 @@ impl ProtocolReader for OpenAiReader {
         // than hard-erroring. A missing `usage` is an upstream response-format quirk (a
         // mock/staging/proxy OpenAI-compatible backend that omits it on an otherwise valid 200
         // completion), NOT a client mistake: returning a `ClientError` here mislabels the cause and
-        // makes forward.rs discard a valid 200 body and emit a spurious 500. The sibling Gemini and
+        // makes proxy engine discard a valid 200 body and emit a spurious 500. The sibling Gemini and
         // Cohere readers tolerate the same condition with a zero-usage fallback. `usage_val` is an
         // `Option`, so each token lookup below already defaults to 0.
         let usage_val = obj.get("usage");

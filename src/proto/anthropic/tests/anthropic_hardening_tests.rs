@@ -2533,7 +2533,7 @@ fn tool_choice_absent_emits_nothing() {
 
 /// Cross-protocol: an OpenAI forced-function `tool_choice` reaches an Anthropic backend as
 /// the native `{type:"tool", name}` directive — NOT silently degraded to auto. Simulates the
-/// cross-protocol seam by clearing `extra` between read and write (forward.rs `ir.extra.clear()`).
+/// cross-protocol seam by clearing `extra` between read and write (proxy engine `ir.extra.clear()`).
 #[test]
 fn tool_choice_openai_specific_to_anthropic_targeted() {
     let openai_body = serde_json::json!({

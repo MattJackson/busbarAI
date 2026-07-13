@@ -91,7 +91,7 @@ fn test_gemini_read_write_response_roundtrip() {
 }
 
 // CLASS regression companion to the cross-protocol seam fix
-// (forward.rs::test_cross_protocol_bedrock_to_gemini_carries_total_tokens_and_response_id):
+// (proxy engine::test_cross_protocol_bedrock_to_gemini_carries_total_tokens_and_response_id):
 // the SAME-protocol minimal roundtrip must stay LOSSLESS. A native Gemini body that legitimately
 // omits `responseId` and any timestamp reads into an IR with `id`/`created`/`model` all `None`
 // (the cross-protocol boundary signal is NOT set, because this path never crosses the seam — the

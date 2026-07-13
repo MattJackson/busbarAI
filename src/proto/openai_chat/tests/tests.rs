@@ -3123,7 +3123,7 @@ fn trailing_usage_only_chunk_emits_message_delta_with_real_tokens() {
 }
 
 // Regression: a 200 completion body that omits `usage` entirely must still read back
-// successfully with a zero-usage fallback — never a hard `IrError` (which forward.rs would
+// successfully with a zero-usage fallback — never a hard `IrError` (which proxy engine would
 // swallow into a spurious 500, discarding the valid 200 body). Mirrors the Gemini/Cohere
 // readers. Against the old hard-fail code this `.expect` panics; after the fix it passes.
 #[test]

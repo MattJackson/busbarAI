@@ -515,7 +515,7 @@ impl ProtocolWriter for GeminiWriter {
 
         // Map busbar/router `kind` categories onto google.rpc.Code names where one exists. An
         // unknown `kind` yields `None` so the HTTP-status mapping (always defined) is authoritative.
-        // `overloaded` (no `_error` suffix) is the bare alias `forward.rs::cross_protocol_error_kind`
+        // `overloaded` (no `_error` suffix) is the bare alias `proxy engine::cross_protocol_error_kind`
         // emits for a relayed upstream 503 — it MUST map to UNAVAILABLE alongside `overloaded_error`,
         // otherwise a cross-protocol 503 fell through to `None` and (when the status arm below was
         // bypassed) could surface the wrong code/status pairing.
@@ -1048,7 +1048,7 @@ impl ProtocolWriter for GeminiWriter {
         // closes the gap for those two as well. Bedrock's Converse body carries no body-level model
         // or timestamp, so its IR was identity-field-empty here — the residual that this gate alone
         // could not distinguish from a minimal native body. That residual is now closed UPSTREAM at
-        // the cross-protocol seam (`forward.rs`), which stamps a synthesized `created` on any
+        // the cross-protocol seam (`proxy engine`), which stamps a synthesized `created` on any
         // identity-empty egress IR before this writer runs, so a Bedrock→Gemini hop arrives with
         // `created.is_some()` and emits `totalTokenCount` here just like the other backends. The OR
         // on `model` stays as defense-in-depth for any caller of this writer that bypasses the seam.
@@ -1130,13 +1130,13 @@ impl ProtocolWriter for GeminiWriter {
         //     that protocol's response id (OpenAI `chatcmpl-…`, Anthropic `msg_…`); the id is opaque
         //     to the Gemini SDK (Gemini ids carry no documented prefix it could reject), so we
         //     surface it verbatim — `(Some(id), _)`.
-        //   * Cross-protocol with NO foreign id: `forward.rs` strips `id` to `None` on every
+        //   * Cross-protocol with NO foreign id: `proxy engine` strips `id` to `None` on every
         //     cross-protocol response but LEAVES `created` populated as the boundary signal, so
         //     `(None, Some(_))` — synthesize a Gemini-shaped `responseId` so a native `google-genai`
         //     client reading `GenerateContentResponse.response_id` always sees a value (real Gemini
         //     responses carry one). Previously this case omitted `responseId` on EVERY
         //     cross-protocol response, a distinguishability signal; the old comment wrongly claimed a
-        //     value was "always present", contradicting `forward.rs` which sets `ir.id = None`.
+        //     value was "always present", contradicting `proxy engine` which sets `ir.id = None`.
         //   * Minimal same-protocol IR with neither id nor created: a native body that legitimately
         //     omitted `responseId` yields `(None, None)` — omit it rather than fabricate, since
         //     `responseId` is `Optional` in the Gemini schema / SDK and fabricating one would make a
@@ -1155,7 +1155,7 @@ impl ProtocolWriter for GeminiWriter {
     }
 
     fn egress_user_agent(&self) -> &'static str {
-        // Google GenAI SDK UA shape — pinned, see `EGRESS_UA_GEMINI` in forward.rs.
+        // Google GenAI SDK UA shape — pinned, see `EGRESS_UA_GEMINI` in proxy engine.
         crate::proxy::EGRESS_UA_GEMINI
     }
 

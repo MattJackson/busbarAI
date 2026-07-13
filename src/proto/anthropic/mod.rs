@@ -23,7 +23,7 @@ const ANTHROPIC_NATIVE_ALPHABET: &[u8; 62] =
 /// `APIError.request_id` / `Message._request_id`). Defined here (the Anthropic dialect's home) and
 /// used within this module; surfaced externally only via the writer vtable
 /// (`AnthropicWriter::ingress_response_request_id` / `ingress_relayed_response_header_names`), so
-/// the sites that attach it (forward.rs success path) and capture it from upstream cannot drift on
+/// the sites that attach it (proxy engine success path) and capture it from upstream cannot drift on
 /// spelling.
 const HDR_REQUEST_ID: &str = "request-id";
 
@@ -166,7 +166,7 @@ fn synth_id_with_prefix(prefix: &str) -> String {
 /// a native Anthropic response always carries. The official SDK reads this header into
 /// `APIError.request_id` / `Message._request_id` (NOT the body), so a busbar anthropic response that
 /// omitted it left `request_id == None` — impossible against the real API and a deterministic proxy
-/// tell. Used by `forward.rs` on anthropic-ingress success/relay 2xx responses that have NO upstream
+/// tell. Used by `proxy engine` on anthropic-ingress success/relay 2xx responses that have NO upstream
 /// `request-id` to forward (the error path mirrors the writer's own body `request_id` into the header
 /// instead; the same-protocol passthrough forwards the UPSTREAM `request-id` verbatim and never calls
 /// this). The shape mirrors a native id EXACTLY: the `req_` prefix, the `01` version marker, then a
@@ -1048,7 +1048,7 @@ enum AnthropicCredScheme {
     OAuth,
     /// Shape not recognizable as either Anthropic credential family. busbar cannot tell from the
     /// credential alone whether this is a static API key or a passthrough Bearer token (the mode
-    /// is known to forward.rs but not plumbed into this trait method), so it conservatively emits
+    /// is known to proxy engine but not plumbed into this trait method), so it conservatively emits
     /// BOTH headers — preserving the passthrough Bearer round-trip for an opaque caller token
     /// while still presenting `x-api-key` for a non-canonical static key. Real Anthropic
     /// credentials always match `ApiKey`/`OAuth`, so the dual-header fallback never fires for

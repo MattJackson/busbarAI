@@ -1082,7 +1082,7 @@ impl InMemoryStore {
         let _tx = lock_recover(c.transition_lock());
         // Reset the consecutive-failure streak on a success — but NOT while the cell is Open. A bare
         // `record_success(lane)` can land on an Open cell via the degraded-forward path
-        // (forward.rs `record_success` on a lane whose cell is still Open): the HalfOpen→Closed CAS
+        // (proxy engine `record_success` on a lane whose cell is still Open): the HalfOpen→Closed CAS
         // below then fails (Open ≠ HalfOpen) so no recovery occurs, yet an unconditional reset would
         // already have wiped the streak. In Consecutive mode the streak drives the escalating
         // backoff cooldown (`compute_cooldown_with_retry_after`); zeroing it on a still-Open cell
@@ -1427,7 +1427,7 @@ impl InMemoryStore {
     }
 
     /// Returns `true` iff this failure drove a Closed→Open trip on the (pool, lane) cell — threaded
-    /// out so the forward.rs call site can emit `BREAKER_TRIPS_TOTAL` exactly once per logical trip.
+    /// out so the proxy engine call site can emit `BREAKER_TRIPS_TOTAL` exactly once per logical trip.
     pub(crate) fn record_failure_for(
         &self,
         pool: &str,

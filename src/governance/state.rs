@@ -38,7 +38,7 @@ impl GovState {
         self
     }
 
-    /// The configured budget store-error fail-mode. Consulted by the route.rs admission site.
+    /// The configured budget store-error fail-mode. Consulted by the ingress admission site.
     pub(crate) fn budget_on_store_error(&self) -> crate::config::BudgetOnStoreError {
         self.budget_on_store_error
     }
@@ -178,7 +178,7 @@ impl GovState {
 
     /// Acquire the `rate` map for reading (poison-recovering, same rationale as `rate_write`).
     /// Read by `rate_headroom`, which is wired into production routing: `decide_policy_order` in
-    /// `forward.rs` calls `lookup` + `rate_headroom` (one key lookup shared with the `send_user`
+    /// `proxy engine` calls `lookup` + `rate_headroom` (one key lookup shared with the `send_user`
     /// identity projection) to compute the per-lane `usage` routing signal.
     fn rate_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, RateState>> {
         self.rate.read().unwrap_or_else(|p| p.into_inner())
@@ -194,7 +194,7 @@ impl GovState {
     /// window) reads as fully-available for the current window, which is correct: its counters do not
     /// carry forward. When both RPM and TPM are set, the headroom is the MINIMUM of the two (the
     /// tighter constraint governs how close the key is to a 429).
-    // Wired into production routing: `forward.rs::decide_policy_order` calls this on the key it
+    // Wired into production routing: `proxy engine::decide_policy_order` calls this on the key it
     // looked up (one lookup shared with the `send_user` identity projection) to produce the
     // per-lane `usage` signal; the in-crate tests also exercise it directly.
     pub(crate) fn rate_headroom(&self, key: &VirtualKey, now: u64) -> Option<f64> {

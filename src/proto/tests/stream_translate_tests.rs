@@ -673,7 +673,7 @@ fn test_gemini_json_array_framer_empty_and_done() {
     assert_eq!(out, b"[]", "empty stream → empty JSON array");
 }
 
-/// The agnostic `finish_with_server_error` seam (forward.rs:`poll_next`) reaches the framer through
+/// The agnostic `finish_with_server_error` seam (proxy engine:`poll_next`) reaches the framer through
 /// a `Box<dyn JsonArrayFramer>` — exercise THAT dispatch path: the trait method must produce the
 /// native Gemini server-error element (HTTP 500 / gRPC `INTERNAL`) carrying the supplied message,
 /// closed into a valid JSON array. The core passes only the message; the impl owns 500/`INTERNAL`.
