@@ -162,6 +162,29 @@ const ICONS: Record<string, string> = {
       white-space: pre;
     }
     .page-doc .install-foot { font-size: 13.5px; color: var(--muted); margin: 0; }
+    /* Benchmark table embedded in a detail paragraph. */
+    .page-doc .hook-bench {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1.1rem 0;
+      font-size: 0.9rem;
+    }
+    .page-doc .hook-bench th,
+    .page-doc .hook-bench td {
+      padding: 0.5rem 0.7rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border, #1e293b);
+    }
+    .page-doc .hook-bench thead th {
+      font-weight: 600;
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .page-doc .hook-bench td:not(:first-child),
+    .page-doc .hook-bench th:not(:first-child) { text-align: right; white-space: nowrap; }
+    .page-doc .hook-bench .bench-note { color: var(--muted); font-weight: 400; }
 
     /* The tagline + status badge sit on one line under the H1, inside .intro. */
     .page-doc .intro {
