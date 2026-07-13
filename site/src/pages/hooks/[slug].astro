@@ -145,6 +145,7 @@ const ICONS: Record<string, string> = {
     }
     .page-doc .install p { margin: 0 0 14px; }
     .page-doc .install-code {
+      position: relative;
       background: var(--slate);
       color: #cbd5e1;
       border-radius: 10px;
@@ -152,6 +153,25 @@ const ICONS: Record<string, string> = {
       overflow-x: auto;
       margin: 0 0 14px;
     }
+    .page-doc .install-copy {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      font: inherit;
+      font-size: 12px;
+      line-height: 1;
+      color: #cbd5e1;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px;
+      padding: 5px 9px;
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.12s ease, background 0.12s ease;
+    }
+    .page-doc .install-code:hover .install-copy,
+    .page-doc .install-copy:focus-visible { opacity: 1; }
+    .page-doc .install-copy:hover { background: rgba(255, 255, 255, 0.16); }
     .page-doc .install-code code {
       background: none;
       border: 0;
@@ -162,6 +182,32 @@ const ICONS: Record<string, string> = {
       white-space: pre;
     }
     .page-doc .install-foot { font-size: 13.5px; color: var(--muted); margin: 0; }
+    /* CSS-only platform tabs on the install curl block. */
+    .page-doc .os-tabs { margin: 8px 0 14px; }
+    .page-doc .os-tabs > input { position: absolute; opacity: 0; pointer-events: none; }
+    .page-doc .os-tab-labels { display: flex; gap: 4px; }
+    .page-doc .os-tab-labels label {
+      cursor: pointer;
+      padding: 6px 13px;
+      font-size: 13px;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border, #e2e8f0);
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      user-select: none;
+    }
+    .page-doc .os-panel { display: none; border-top-left-radius: 0; }
+    .page-doc #os-lx:checked ~ .os-tab-labels label[for="os-lx"],
+    .page-doc #os-la:checked ~ .os-tab-labels label[for="os-la"],
+    .page-doc #os-mac:checked ~ .os-tab-labels label[for="os-mac"] {
+      color: #cbd5e1;
+      background: var(--slate);
+      border-color: var(--slate);
+    }
+    .page-doc #os-lx:checked ~ .os-panel.p-lx,
+    .page-doc #os-la:checked ~ .os-panel.p-la,
+    .page-doc #os-mac:checked ~ .os-panel.p-mac { display: block; }
     /* Benchmark table embedded in a detail paragraph. */
     .page-doc .hook-bench {
       width: 100%;
@@ -285,4 +331,23 @@ const ICONS: Record<string, string> = {
       margin: 18px 0 0;
     }
   </style>
+
+  <script>
+    // Copy button on install code blocks — mirrors the /download page's .dl-copy behavior.
+    document.querySelectorAll('pre.install-code').forEach(function (pre) {
+      var code = pre.querySelector('code');
+      if (!code) return;
+      var btn = document.createElement('button');
+      btn.className = 'install-copy';
+      btn.type = 'button';
+      btn.textContent = 'Copy';
+      btn.setAttribute('aria-label', 'Copy command');
+      btn.addEventListener('click', function () {
+        navigator.clipboard && navigator.clipboard.writeText(code.textContent);
+        btn.textContent = 'Copied';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 1400);
+      });
+      pre.appendChild(btn);
+    });
+  </script>
 </PageLayout>

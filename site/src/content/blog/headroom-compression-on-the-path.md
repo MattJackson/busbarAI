@@ -6,9 +6,14 @@ author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---
 
-When I said 1.3's rewrite gate would have a first real user very soon, this is it. **Headroom**
+When I said 1.3's rewrite gate would have a first real user very soon, this is it. Headroom
 is a context-compression hook for Busbar, and it's the cleanest demonstration I have of why hooks
 belong on the normalized request path.
+
+A couple of days ago I wrote up [running Claude Code through Busbar](/blog/run-claude-code-through-busbar/)
+— one env var, and the coding agent you already use runs on the gateway. Headroom is the payoff:
+along with running Claude Code through Busbar, you can now compress the tokens it sends, on the path,
+without touching the agent.
 
 ## The problem it solves
 
@@ -46,11 +51,11 @@ a time (`busbar;dur`, µs):
 |---|--:|--:|--:|
 | Busbar alone | 22 | 25 | 30 |
 | Busbar + Headroom | 569 | 601 | 634 |
-| **Headroom's added cost** | **547** | 576 | 604 |
+| Headroom's added cost | 547 | 576 | 604 |
 
-Two things I like about that. **Busbar itself is 22 microseconds (µs)** — as our own
-[benchmark](/docs/benchmark/) has shown, the gateway isn't where your latency goes. And **Headroom
-adds 547 µs** to compress the history, with a tail that barely
+Two things I like about that. Busbar itself is 22 microseconds (µs) — as our own
+[benchmark](/docs/benchmark/) has shown, the gateway isn't where your latency goes. And Headroom
+adds 547 µs to compress the history, with a tail that barely
 moves: p99 is only about 1.1× p50, because Busbar and the hook are both single Rust binaries with
 no garbage collector to pause the path.
 
@@ -68,14 +73,14 @@ That trade is decisive, and it's almost free. On a request whose model call take
 547 µs of compression is 0.03% of the request, and it buys a prompt half the size that bills for
 half the input tokens.
 
-For scale, Headroom ships as an HTTP proxy today and reports a **52ms median overhead** in
+For scale, Headroom ships as an HTTP proxy today and reports a 52ms median overhead in
 production, which they rightly note is negligible against inference. The same compression core, run
 as a gate on Busbar, measures in the hundreds of microseconds on Busbar's clock. Both are small
 next to the model call, and I won't pretend to know how their proxy is deployed — the point isn't
 a race.
 
-That's the division of labor I think is right: **Headroom does the compression, Busbar does the
-placement.** Same core, same savings, and it now covers every protocol and provider Busbar speaks,
+That's the division of labor I think is right: Headroom does the compression, Busbar does the
+placement. Same core, same savings, and it now covers every protocol and provider Busbar speaks,
 with failover and circuit breaking underneath it. Build the best compressor; let the gateway be the
 gateway.
 
@@ -97,4 +102,4 @@ hooks:
 Full credit to Tejas and the [Headroom](https://headroomlabs-ai.github.io/headroom/) project for
 the compression core. Busbar just puts it in front of every model you call.
 
-Get Busbar at **[getbusbar.com](https://getbusbar.com)**.
+Get Busbar at [getbusbar.com](https://getbusbar.com).
