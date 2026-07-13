@@ -363,6 +363,45 @@ fn class_for_response_failed(signal: &str) -> StatusClass {
     }
 }
 
+/// True when `signal` looks like an `error.code` ENUM TOKEN (a single snake/kebab identifier an SDK
+/// switch-cases on) rather than a HUMAN sentence. The discriminator is prose: a real code carries no
+/// whitespace and stays short, while a transport/cross-protocol signal like `STREAM_ABORT_DETAIL`
+/// ("The response stream was interrupted.") or "connection reset by peer" has spaces. This preserves
+/// arbitrary code-like upstream signals (`overloaded`, `rate_limit_exceeded`, …) on a round-trip
+/// while never leaking prose as the `code` enum.
+fn is_code_like_signal(signal: &str) -> bool {
+    !signal.is_empty()
+        && signal.len() <= 64
+        && signal
+            .bytes()
+            .all(|b| b == b'_' || b == b'-' || b == b'.' || b.is_ascii_alphanumeric())
+}
+
+/// The Responses `error.code` enum for a stream failure. A code-like `provider_signal` (a
+/// same-protocol / code-bearing round-trip) is preserved verbatim; otherwise — including the
+/// cross-protocol and transport-abort paths where `provider_signal` is a HUMAN sentence, not an enum
+/// — the code is DERIVED from the error class so the wire ALWAYS carries a valid enum an SDK can
+/// switch on, never a free-form string. Exhaustive over `StatusClass` (no `_`) per the no-catch-all
+/// rule. (found: audit c2r2.)
+fn responses_error_code(err: &crate::proto::IrError) -> String {
+    if let Some(s) = err.provider_signal.as_deref() {
+        if is_code_like_signal(s) {
+            return s.to_string();
+        }
+    }
+    match err.class {
+        StatusClass::RateLimit => ERR_TYPE_RATE_LIMIT,
+        StatusClass::Auth => ERR_TYPE_AUTHENTICATION,
+        StatusClass::Billing => ERR_TYPE_INSUFFICIENT_QUOTA,
+        StatusClass::ContextLength | StatusClass::ClientError => ERR_TYPE_INVALID_REQUEST,
+        StatusClass::Overloaded
+        | StatusClass::ServerError
+        | StatusClass::Timeout
+        | StatusClass::Network => ERR_TYPE_SERVER_ERROR,
+    }
+    .to_string()
+}
+
 /// The set of top-level Responses API request keys that `ResponsesReader::read_request` MODELS
 /// into `IrRequest` fields. Keys in this set are EXCLUDED from `extra` (the pass-through map) so
 /// they are not double-emitted by the writer's extra-forwarding loop. Built once per process via
@@ -3407,13 +3446,11 @@ impl ProtocolWriter for ResponsesWriter {
                     .provider_signal
                     .clone()
                     .unwrap_or_else(|| "error".to_string());
-                // Use the carried provider signal as the error code enum when present (so a
-                // same-protocol round-trip preserves the upstream `code`), defaulting to the
-                // canonical `"server_error"` enum — never null.
-                let code = err
-                    .provider_signal
-                    .clone()
-                    .unwrap_or_else(|| ERR_TYPE_SERVER_ERROR.to_string());
+                // `code` MUST be a valid Responses enum, never the free-form human `provider_signal`
+                // (a cross-protocol / transport-abort path carries a sentence like "The response
+                // stream was interrupted." there). A recognized code round-trips; otherwise it is
+                // derived from the error class. `message` keeps the human text. (found: audit c2r2.)
+                let code = responses_error_code(err);
                 // Replay the stream's captured `response.id` so `response.failed` correlates with
                 // the opening `response.created` (the SDK reads `event.response.id` on the failure
                 // event); fall back to a fresh id only if the cell is empty (failure before any
@@ -6980,6 +7017,52 @@ mod tests {
             code,
             Some("server_error"), // golden wire-contract literal (kept bare on purpose)
             "error.code must default to server_error, never null"
+        );
+    }
+
+    /// REGRESSION (audit c2r2): on a cross-protocol / transport-abort path `provider_signal` carries
+    /// a HUMAN sentence (e.g. `STREAM_ABORT_DETAIL`), NOT a Responses code enum. `error.code` must be
+    /// DERIVED from the class (a valid enum an SDK can switch on), while `error.message` keeps the
+    /// human text — the old code forwarded the sentence as the `code` enum, breaking typed SDKs.
+    #[test]
+    fn test_response_failed_code_is_enum_even_for_human_provider_signal() {
+        let writer = ResponsesWriter;
+        let (_, payload) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::ServerError,
+                provider_signal: Some(crate::proto::STREAM_ABORT_DETAIL.to_string()),
+                retry_after: None,
+            }))
+            .expect("emit");
+        let error = payload
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(|e| e.as_object())
+            .expect("error object");
+        assert_eq!(
+            error.get("code").and_then(|c| c.as_str()),
+            Some("server_error"),
+            "a human provider_signal must NOT leak as the code enum — derive it from the class"
+        );
+        assert_eq!(
+            error.get("message").and_then(|m| m.as_str()),
+            Some(crate::proto::STREAM_ABORT_DETAIL),
+            "the human text stays in `message`"
+        );
+
+        // An auth-class transport error derives the auth code enum, not the human string.
+        let (_, payload) = writer
+            .write_response_event(&IrStreamEvent::Error(IrError {
+                class: StatusClass::Auth,
+                provider_signal: Some("connection reset by peer".to_string()),
+                retry_after: None,
+            }))
+            .expect("emit");
+        assert_eq!(
+            payload
+                .pointer("/response/error/code")
+                .and_then(|c| c.as_str()),
+            Some(ERR_TYPE_AUTHENTICATION)
         );
     }
 

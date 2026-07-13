@@ -3313,16 +3313,59 @@ pub(crate) fn bedrock_response_to_eventstream(
                 );
                 push(&IrStreamEvent::BlockStop { index }, &mut out);
             }
-            // Thinking/ToolResult/Image blocks have no native ConverseStream content-delta frame on
-            // this synthesized path (the Bedrock writer maps their start/delta to None); skip them
-            // rather than emit an orphaned/empty frame. These are enumerated EXPLICITLY (no `_`
-            // catch-all) so that adding a future `IrBlock` variant (e.g. a document or
-            // redacted-thinking block) is a COMPILE error here rather than silent data loss in the
-            // synthesized ConverseStream output — this is the newest, least-tested encoder path.
-            IrBlock::Thinking { .. }
-            | IrBlock::ToolResult { .. }
-            | IrBlock::Image { .. }
-            | IrBlock::Json(_) => {}
+            // A Thinking (reasoningContent) block DOES have native ConverseStream frames — the
+            // Bedrock writer emits `contentBlockStart{reasoningContent:{}}` for the
+            // `IrBlockMeta::Thinking` start and `contentBlockDelta{reasoningContent:{…}}` for the
+            // ThinkingDelta / SignatureDelta / RedactedReasoningDelta deltas. The old comment claimed
+            // the writer maps them to None and skipped the block, silently dropping upstream
+            // reasoning on a cross-protocol→Bedrock streaming client. Synthesize the same
+            // start/delta(s)/stop the live streaming path produces. (found: audit c2r2.)
+            IrBlock::Thinking {
+                text,
+                signature,
+                redacted,
+                ..
+            } => {
+                push(
+                    &IrStreamEvent::BlockStart {
+                        index,
+                        block: IrBlockMeta::Thinking,
+                    },
+                    &mut out,
+                );
+                if *redacted {
+                    // Opaque encrypted reasoning — `text` holds the bytes, ONE delta carries them.
+                    push(
+                        &IrStreamEvent::BlockDelta {
+                            index,
+                            delta: IrDelta::RedactedReasoningDelta(text.clone()),
+                        },
+                        &mut out,
+                    );
+                } else {
+                    push(
+                        &IrStreamEvent::BlockDelta {
+                            index,
+                            delta: IrDelta::ThinkingDelta(text.clone()),
+                        },
+                        &mut out,
+                    );
+                    if let Some(sig) = signature {
+                        push(
+                            &IrStreamEvent::BlockDelta {
+                                index,
+                                delta: IrDelta::SignatureDelta(sig.clone()),
+                            },
+                            &mut out,
+                        );
+                    }
+                }
+                push(&IrStreamEvent::BlockStop { index }, &mut out);
+            }
+            // ToolResult/Image/Json blocks have no native ConverseStream content-delta frame on this
+            // synthesized path; skip them. Enumerated EXPLICITLY (no `_` catch-all) so a future
+            // `IrBlock` variant is a COMPILE error here rather than silent data loss.
+            IrBlock::ToolResult { .. } | IrBlock::Image { .. } | IrBlock::Json(_) => {}
         }
     }
 
@@ -5302,6 +5345,57 @@ mod tests {
                 .pointer("/usage/outputTokens")
                 .and_then(|v| v.as_u64()),
             Some(1)
+        );
+    }
+
+    /// REGRESSION (audit c2r2): `bedrock_response_to_eventstream` (buffered 2xx → synthesized
+    /// ConverseStream, used when a Bedrock-streaming client gets a non-streaming cross-protocol 2xx)
+    /// must NOT drop a `Thinking` (reasoningContent) block. The old arm skipped it, silently losing
+    /// upstream reasoning; it now synthesizes the `reasoningContent` start/delta/stop frames.
+    #[test]
+    fn eventstream_emits_reasoning_content_for_thinking_block() {
+        let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Thinking {
+                    text: "let me think".to_string(),
+                    signature: Some("sigblob".to_string()),
+                    redacted: false,
+                    cache_control: None,
+                },
+                crate::ir::IrBlock::Text {
+                    text: "answer".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+            ],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let bytes = bedrock_response_to_eventstream(&resp, Some(5));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("reasoningContent"),
+            "a Thinking block must synthesize a reasoningContent frame, not be dropped"
+        );
+        assert!(
+            text.contains("let me think"),
+            "the thinking text must ride a reasoningContent delta"
+        );
+        assert!(
+            text.contains("sigblob"),
+            "the reasoning signature must ride a signature delta"
         );
     }
 

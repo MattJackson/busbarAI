@@ -163,17 +163,18 @@ impl RoutingPolicy for WebhookPolicy {
         };
         let body = serde_json::to_vec(&msg)
             .map_err(|e| -> super::PolicyError { format!("serialize configure: {e}").into() })?;
-        let resp = tokio::time::timeout(
-            budget,
-            self.client
-                .post(self.url.clone())
-                .header("content-type", "application/json")
-                .body(body)
-                .send(),
-        )
-        .await
-        .map_err(|_| -> super::PolicyError { "configure deadline exceeded".into() })?
-        .map_err(|e| -> super::PolicyError { format!("configure POST failed: {e}").into() })?;
+        // `.timeout(budget)` on the builder (not an outer `tokio::time::timeout` around only
+        // `send()`) so the deadline also covers the BODY-read phase — a slow/dribbling ack body must
+        // not stall `configure` for the client-level total timeout (default 300s). (found: audit c2r2.)
+        let resp = self
+            .client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(budget)
+            .send()
+            .await
+            .map_err(|e| -> super::PolicyError { format!("configure POST failed: {e}").into() })?;
         if !resp.status().is_success() {
             return Err(format!("configure rejected: HTTP {}", resp.status()).into());
         }
@@ -190,17 +191,17 @@ impl RoutingPolicy for WebhookPolicy {
 
     async fn describe(&self, budget: Duration) -> Option<serde_json::Value> {
         let body = serde_json::to_vec(&super::wire::DescribeMsg { describe: true }).ok()?;
-        let resp = tokio::time::timeout(
-            budget,
-            self.client
-                .post(self.url.clone())
-                .header("content-type", "application/json")
-                .body(body)
-                .send(),
-        )
-        .await
-        .ok()?
-        .ok()?;
+        // `.timeout(budget)` on the builder so the deadline covers the body-read too (see
+        // `configure`) — not just the header exchange. (found: audit c2r2.)
+        let resp = self
+            .client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(budget)
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }

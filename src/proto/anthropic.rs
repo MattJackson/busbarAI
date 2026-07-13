@@ -784,7 +784,38 @@ impl ProtocolReader for AnthropicReader {
         data: &serde_json::Value,
         _state: &mut crate::ir::StreamDecodeState,
     ) -> Vec<IrStreamEvent> {
-        // Anthropic events are already block-structured (1:1): wrap the singular, ignore state.
+        // A streamed `redacted_thinking` block carries its full opaque encrypted `data` INLINE on the
+        // `content_block_start` event (Anthropic sends NO deltas for redacted blocks), so the 1:1
+        // single-event reader dropped it entirely (`_ => return None`). Emit the pair the IR models
+        // for redacted reasoning — a `Thinking` BlockStart plus a `RedactedReasoningDelta` carrying
+        // the opaque bytes — from this one start event (the natural `content_block_stop` that follows
+        // produces the BlockStop). Mirrors the Bedrock streaming reader + the non-stream `read_block`.
+        // (found: audit c2r2.)
+        if event_type == EVT_CONTENT_BLOCK_START {
+            if let Some(block) = data.get("content_block") {
+                if block.get("type").and_then(|t| t.as_str()) == Some(BLOCK_TYPE_REDACTED_THINKING)
+                {
+                    if let Some(index) = read_clamped_block_index(data) {
+                        let bytes = block
+                            .get("data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return vec![
+                            IrStreamEvent::BlockStart {
+                                index,
+                                block: IrBlockMeta::Thinking,
+                            },
+                            IrStreamEvent::BlockDelta {
+                                index,
+                                delta: IrDelta::RedactedReasoningDelta(bytes),
+                            },
+                        ];
+                    }
+                }
+            }
+        }
+        // Anthropic events are otherwise already block-structured (1:1): wrap the singular.
         match self.read_response_event(event_type, data) {
             Some(ev) => vec![ev],
             None => vec![],
@@ -3990,6 +4021,56 @@ mod anthropic_hardening_tests {
             }
             other => panic!("expected Thinking carrier for redacted_thinking, got {other:?}"),
         }
+    }
+
+    /// REGRESSION (audit c2r2): the STREAMING reader must not drop a `redacted_thinking` block. The
+    /// opaque `data` rides inline on `content_block_start` (no deltas follow), so the reader emits a
+    /// `Thinking` BlockStart + a `RedactedReasoningDelta` carrying the bytes; the later
+    /// `content_block_stop` yields the BlockStop. Before the fix the block hit `_ => None` and the
+    /// encrypted reasoning was silently lost on an any→Anthropic streaming passthrough.
+    #[test]
+    fn streaming_redacted_thinking_is_not_dropped() {
+        let reader = AnthropicReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let start = serde_json::json!({
+            "type": EVT_CONTENT_BLOCK_START,
+            "index": 0,
+            "content_block": { "type": BLOCK_TYPE_REDACTED_THINKING, "data": "ENCRYPTED_BYTES" }
+        });
+        let evs = reader.read_response_events(EVT_CONTENT_BLOCK_START, &start, &mut state);
+        assert_eq!(
+            evs.len(),
+            2,
+            "redacted_thinking start emits BlockStart + delta, got {evs:?}"
+        );
+        assert!(
+            matches!(
+                &evs[0],
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Thinking
+                }
+            ),
+            "first event is a Thinking BlockStart: {:?}",
+            evs[0]
+        );
+        match &evs[1] {
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::RedactedReasoningDelta(bytes),
+            } => assert_eq!(
+                bytes, "ENCRYPTED_BYTES",
+                "opaque bytes preserved, not dropped"
+            ),
+            other => panic!("expected RedactedReasoningDelta carrying the bytes, got {other:?}"),
+        }
+        // The following content_block_stop still yields a BlockStop.
+        let stop = serde_json::json!({"type": EVT_CONTENT_BLOCK_STOP, "index": 0});
+        let stop_evs = reader.read_response_events(EVT_CONTENT_BLOCK_STOP, &stop, &mut state);
+        assert!(
+            matches!(stop_evs.as_slice(), [IrStreamEvent::BlockStop { index: 0 }]),
+            "content_block_stop closes the redacted block: {stop_evs:?}"
+        );
     }
 
     /// Round-trip: an Anthropic `redacted_thinking` block read on the RESPONSE path must
