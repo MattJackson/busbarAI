@@ -2045,16 +2045,6 @@ enum PolicyOutcome {
     },
 }
 
-/// Apply a rewrite gate's reply to the ingress request body IN PLACE (the transform pass). MVP:
-/// replace the `messages` array (the openai/anthropic-family chat shape) with the rewritten messages,
-/// and inject any returned `tools` (append to an existing `tools` array, else set it). Returns whether
-/// a rewrite was applied.
-///
-/// FAIL-SAFE by construction: if the body is not an object, or has no `messages` ARRAY (a dialect the
-/// MVP does not cover — e.g. gemini `contents`), or the rewrite carries no messages, it returns
-/// `false` and leaves `v` UNTOUCHED — the request proceeds with the ORIGINAL body, never a corrupted
-/// one. (Full canonical re-render across ALL six dialects via the IR — `IrReq` — is the follow-up;
-/// see docs/1.3-everything-is-a-hook.md "Rewrite forward-integration crux".)
 /// Apply a hook's `rewrite` reply to the INGRESS body, rendered PER DIALECT (the reply carries
 /// `{role, content}` messages in body form; each ingress protocol frames conversation content
 /// differently). Fail-safe throughout: a body without the dialect's conversation container, or a

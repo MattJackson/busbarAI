@@ -608,6 +608,15 @@ async fn put_auth(
     let current = handle.load();
     if let Some(expected) = req.expected_version {
         if expected != current.config_version {
+            // Audit the rejected attempt (§6.7: every mutation attempt leaves a trail — uniform
+            // with every other stale-expected_version rejection in this file, and with put_auth's
+            // own dry-run-guard rejection below).
+            audit::AUDIT.record_by(
+                "auth.admin_chain_put",
+                "auth:admin_auth",
+                audit::OUTCOME_REJECTED,
+                principal.actor_id(),
+            );
             return err_json(&AdminError::Conflict(format!(
                 "expected_version {expected} != current {}",
                 current.config_version
@@ -926,6 +935,27 @@ async fn patch_hook_settings(
             )))
         }
     };
+    // BOUND the settings map. It is persisted verbatim into the state file AND re-sent to the hook
+    // as the configure preamble on EVERY (re)connection, so an unbounded map amplifies both the
+    // snapshot size and per-reconnect wire traffic. Cap the serialized size and the key count as
+    // defense-in-depth (admin-gated, but a compromised hooks-register token should not be able to
+    // bloat the durable state / reconnect path). The caps are far past any real hook's settings.
+    const MAX_SETTINGS_BYTES: usize = 64 * 1024;
+    const MAX_SETTINGS_KEYS: usize = 256;
+    if req.settings.len() > MAX_SETTINGS_KEYS {
+        return err_json(&AdminError::Validation(format!(
+            "settings has too many keys ({}, max {MAX_SETTINGS_KEYS})",
+            req.settings.len()
+        )));
+    }
+    if let Ok(bytes) = serde_json::to_vec(&req.settings) {
+        if bytes.len() > MAX_SETTINGS_BYTES {
+            return err_json(&AdminError::Validation(format!(
+                "settings too large ({} bytes, max {MAX_SETTINGS_BYTES})",
+                bytes.len()
+            )));
+        }
+    }
     let current = handle.load();
     let resource = format!("hook:{name}");
     let Some(existing) = current.hook_registry.get(&name) else {
