@@ -370,13 +370,63 @@ pub(crate) struct Page<T> {
 }
 
 impl<T> Page<T> {
-    /// A single-page result (no further pages). The topology reads are small and unpaginated today;
-    /// keys/audit/versions get real cursoring as they land.
+    /// A single-page result (no further pages). The topology reads are small and unpaginated today.
     pub(crate) fn single(items: Vec<T>) -> Self {
         Self {
             items,
             next_cursor: None,
         }
+    }
+}
+
+/// The pagination cursor is OPAQUE by contract — clients must round-trip it verbatim, never parse it.
+/// Under the hood it is just the hex of a tagged byte offset (`o:<n>`); the encoding is an
+/// implementation detail that can change to a keyset cursor later without a wire break. Dependency-free
+/// (no base64 crate) — hex keeps it URL-safe.
+pub(crate) fn encode_offset_cursor(offset: usize) -> String {
+    use std::fmt::Write;
+    format!("o:{offset}")
+        .bytes()
+        .fold(String::new(), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Decode an opaque `?cursor=` back to its byte offset. Returns `None` for any malformed/foreign
+/// cursor so the transport can answer `invalid_request` rather than silently ignoring it.
+pub(crate) fn decode_offset_cursor(cursor: &str) -> Option<usize> {
+    if cursor.is_empty() || !cursor.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..cursor.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(cursor.get(i..i + 2)?, 16).ok())
+        .collect();
+    let s = String::from_utf8(bytes?).ok()?;
+    s.strip_prefix("o:")?.parse::<usize>().ok()
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::{decode_offset_cursor, encode_offset_cursor};
+
+    #[test]
+    fn offset_cursor_round_trips_and_is_opaque() {
+        for n in [0usize, 1, 42, 1000, usize::MAX] {
+            let c = encode_offset_cursor(n);
+            assert!(
+                c.bytes().all(|b| b.is_ascii_hexdigit()),
+                "cursor is URL-safe hex: {c}"
+            );
+            assert_ne!(c, n.to_string(), "cursor is opaque, not the bare integer");
+            assert_eq!(decode_offset_cursor(&c), Some(n));
+        }
+        // Foreign / malformed cursors decode to None (transport -> invalid_request, not silent skip).
+        assert_eq!(decode_offset_cursor(""), None);
+        assert_eq!(decode_offset_cursor("zz"), None);
+        assert_eq!(decode_offset_cursor("abc"), None); // odd length
+        assert_eq!(decode_offset_cursor("6f"), None); // "o" alone — no ":<n>" tail
     }
 }
 

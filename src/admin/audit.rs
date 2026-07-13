@@ -157,10 +157,12 @@ impl AuditLog {
         true
     }
 
-    /// The most-recent `limit` entries, newest first, optionally filtered by exact `action` and/or
-    /// `resource` (design-admin-api-v1 §2.5). `None` filters match everything.
+    /// A page of entries newest-first, optionally filtered by exact `action` and/or `resource`
+    /// (design-admin-api-v1 §2.5): skip `offset`, then take `limit`. `None` filters match everything.
+    /// The transport fetches `limit + 1` to detect whether a further page exists (the cursor envelope).
     pub(crate) fn list_filtered(
         &self,
+        offset: usize,
         limit: usize,
         action: Option<&str>,
         resource: Option<&str>,
@@ -170,6 +172,7 @@ impl AuditLog {
             .rev()
             .filter(|e| action.is_none_or(|a| e.action == a))
             .filter(|e| resource.is_none_or(|r| e.resource == r))
+            .skip(offset)
             .take(limit)
             .cloned()
             .collect()
@@ -178,7 +181,7 @@ impl AuditLog {
     /// The most-recent `limit` entries, newest first (unfiltered).
     #[cfg(test)]
     pub(crate) fn list(&self, limit: usize) -> Vec<AuditEntry> {
-        self.list_filtered(limit, None, None)
+        self.list_filtered(0, limit, None, None)
     }
 }
 

@@ -78,10 +78,12 @@ impl VersionLog {
         });
     }
 
-    /// Version metadata, most-recent-first (the LIST projection — snapshots omitted).
-    pub(crate) fn list(&self, limit: usize) -> Vec<ConfigVersion> {
+    /// A page of version metadata, most-recent-first (the LIST projection — snapshots omitted): skip
+    /// `offset`, then take `limit`. The transport fetches `limit + 1` to detect a further page for the
+    /// cursor envelope (design-admin-api-v1 §0.4).
+    pub(crate) fn list(&self, offset: usize, limit: usize) -> Vec<ConfigVersion> {
         let q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        q.iter().rev().take(limit).cloned().collect()
+        q.iter().rev().skip(offset).take(limit).cloned().collect()
     }
 
     /// One full version (with its snapshot), if retained.
@@ -162,7 +164,7 @@ mod tests {
         let log = VersionLog::new();
         log.record(1, "admin", "hook.register hook:a", &reg(&["a"]), &[]);
         log.record(2, "admin", "hook.register hook:b", &reg(&["a", "b"]), &[]);
-        let listed = log.list(10);
+        let listed = log.list(0, 10);
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].version, 2, "newest first");
         assert_eq!(listed[0].principal, "admin");
@@ -172,14 +174,14 @@ mod tests {
 
         // Re-record replaces (no duplicate versions).
         log.record(2, "admin", "hook.register hook:b2", &reg(&["b"]), &[]);
-        assert_eq!(log.list(10).len(), 2);
+        assert_eq!(log.list(0, 10).len(), 2);
         assert_eq!(log.get(2).unwrap().summary, "hook.register hook:b2");
 
         // Bounded: MAX_VERSIONS + overflow prunes the oldest.
         for v in 3..(MAX_VERSIONS as u64 + 5) {
             log.record(v, "admin", "s", &reg(&[]), &[]);
         }
-        let all = log.list(usize::MAX);
+        let all = log.list(0, usize::MAX);
         assert_eq!(all.len(), MAX_VERSIONS);
         assert!(log.get(1).is_none(), "oldest pruned");
     }

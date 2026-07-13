@@ -2293,8 +2293,8 @@ mod tests {
             .await
             .unwrap();
         let listed: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
-        assert!(listed["keys"][0].get("key_hash").is_none());
+        assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+        assert!(listed["items"][0].get("key_hash").is_none());
 
         // Usage endpoint works.
         let r = client
@@ -2335,7 +2335,7 @@ mod tests {
             .await
             .unwrap();
         let listed: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(listed["keys"].as_array().unwrap().len(), 0, "deleted");
+        assert_eq!(listed["items"].as_array().unwrap().len(), 0, "deleted");
 
         handle.abort();
     }

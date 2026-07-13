@@ -152,6 +152,36 @@ fn respond<T: Serialize>(status: StatusCode, result: Result<T, AdminError>) -> R
     }
 }
 
+/// Decode the opaque `?cursor=` into a start offset (0 when absent). A malformed/foreign cursor is a
+/// 400 `invalid_request` — never a silent skip — so every cursor-paginated handler rejects it the same.
+// The Err variant is an axum `Response` (the ready-to-return 400) — intentionally, so callers just
+// `return` it; that makes the Result "large", which is fine for a per-request handler helper.
+#[allow(clippy::result_large_err)]
+fn cursor_offset(q: &std::collections::HashMap<String, String>) -> Result<usize, Response> {
+    match q.get("cursor") {
+        None => Ok(0),
+        Some(c) => crate::admin::v1::contract::decode_offset_cursor(c).ok_or_else(|| {
+            err_json(&AdminError::Validation(
+                "invalid or foreign pagination cursor".into(),
+            ))
+        }),
+    }
+}
+
+/// Given a slice fetched with `limit + 1` starting at `start`, trim it IN PLACE to `limit` and return
+/// the next opaque cursor iff the probe row existed (i.e. a further page remains). The one seam that
+/// gives keys/audit/versions an identical `{items, next_cursor}` continuation.
+fn page_cursor<T>(items: &mut Vec<T>, start: usize, limit: usize) -> Option<String> {
+    if items.len() > limit {
+        items.truncate(limit);
+        Some(crate::admin::v1::contract::encode_offset_cursor(
+            start.saturating_add(limit),
+        ))
+    } else {
+        None
+    }
+}
+
 // ── route handlers (thin: call the service, project onto the wire) ───────────────────────────────
 
 /// `GET /admin/v1/info` — version, compiled-in plugin proof, uptime, topology.
@@ -481,20 +511,31 @@ async fn delete_hook(
 }
 
 /// `GET /admin/v1/audit` — the admin audit log (most-recent-first), every mutation with its outcome.
-/// Optional filters: `?action=hook.register`, `?resource=hook:x`, `?limit=N` (capped at 1000).
+/// Filters: `?action=hook.register`, `?resource=hook:x`. Paginated by the shared cursor envelope:
+/// `?limit=N` (cap 1000) + opaque `?cursor=`, response `{items, next_cursor}` (next_cursor iff more).
 async fn get_audit(Query(q): Query<std::collections::HashMap<String, String>>) -> Response {
     let limit = q
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(200)
         .min(1000);
+    let start = match cursor_offset(&q) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
     let action = q.get("action").map(String::as_str);
     let resource = q.get("resource").map(String::as_str);
-    let entries = audit::AUDIT.list_filtered(limit, action, resource);
-    ok_json(StatusCode::OK, &json!({ "entries": entries }))
+    // Fetch one past the page to learn whether a further page exists, then trim to `limit`.
+    let mut entries = audit::AUDIT.list_filtered(start, limit + 1, action, resource);
+    let next_cursor = page_cursor(&mut entries, start, limit);
+    ok_json(
+        StatusCode::OK,
+        &json!({ "items": entries, "next_cursor": next_cursor }),
+    )
 }
 
-/// `GET /admin/v1/config/versions` — version history metadata, newest first (`?limit=N`, cap 1000).
+/// `GET /admin/v1/config/versions` — version history metadata, newest first. Paginated by the shared
+/// cursor envelope: `?limit=N` (cap 1000) + opaque `?cursor=`, response `{items, next_cursor}`.
 async fn list_config_versions(
     State(handle): State<Arc<AppHandle>>,
     Query(q): Query<std::collections::HashMap<String, String>>,
@@ -504,9 +545,15 @@ async fn list_config_versions(
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100)
         .min(1000);
+    let start = match cursor_offset(&q) {
+        Ok(n) => n,
+        Err(resp) => return resp,
+    };
+    let mut versions = handle.load().versions.list(start, limit + 1);
+    let next_cursor = page_cursor(&mut versions, start, limit);
     ok_json(
         StatusCode::OK,
-        &json!({ "versions": handle.load().versions.list(limit) }),
+        &json!({ "items": versions, "next_cursor": next_cursor }),
     )
 }
 
@@ -1200,11 +1247,11 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     ),
     (
         "/admin/v1/audit",
-        "Admin audit log — every mutation with its outcome (newest first)",
+        "Admin audit log — every mutation with its outcome (newest first). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
     ),
     (
         "/admin/v1/config/versions",
-        "Config version history (newest first; id/ts/principal/summary)",
+        "Config version history (newest first; id/ts/principal/summary). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
     ),
     ("/admin/v1/openapi.json", "This OpenAPI 3.1 document"),
 ];
@@ -1489,10 +1536,11 @@ fn openapi_doc() -> serde_json::Value {
         "/admin/v1/keys".to_string(),
         json!({
             "get": {
-                "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=",
+                "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=. Paginate: ?limit=, ?cursor= (opaque)",
                 "security": [{"adminToken": []}],
                 "responses": {
-                    "200": {"description": "Key metadata list + total"},
+                    "200": {"description": "`{items, next_cursor}` — the cursor page envelope (next_cursor null at end)"},
+                    "400": {"description": "Malformed/foreign pagination cursor (error code `invalid_request`)"},
                     "401": {"description": "Missing/invalid admin credential"}
                 }
             },

@@ -680,14 +680,24 @@ pub(crate) async fn list_keys(
     let gov = gov.clone();
     let enabled = q.get("enabled").and_then(|s| s.parse::<bool>().ok());
     let prefix = q.get("prefix").cloned();
-    // PAGINATION (design-admin-api-v1 §2.1): `?limit=&offset=` over the filtered, id-sorted set.
-    // Absent params = the full list (unchanged legacy shape); `total` counts the filtered set so a
-    // pager can compute pages without a second call.
+    // PAGINATION (design-admin-api-v1 §0.4): the ONE cursor envelope shared by every admin list —
+    // `?limit=` bounds the page, `?cursor=` (opaque) resumes after the prior one, and the response is
+    // `{items, next_cursor}` (next_cursor present iff more rows remain). No `total`, no `?offset=` —
+    // one pagination grammar across keys/audit/versions/topology.
     let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok());
-    let offset = q
-        .get("offset")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    let start = match q.get("cursor") {
+        Some(c) => match crate::admin::v1::contract::decode_offset_cursor(c) {
+            Some(n) => n,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    ERR_TYPE_INVALID_REQUEST,
+                    "invalid or foreign pagination cursor",
+                )
+            }
+        },
+        None => 0,
+    };
     let res = tokio::task::spawn_blocking(move || gov.all_keys()).await;
     match res {
         Ok(Ok(keys)) => {
@@ -702,11 +712,18 @@ pub(crate) async fn list_keys(
             let total = filtered.len();
             let page: Vec<_> = filtered
                 .into_iter()
-                .skip(offset)
+                .skip(start)
                 .take(limit.unwrap_or(usize::MAX))
                 .map(key_meta)
                 .collect();
-            json_response(StatusCode::OK, json!({ "keys": page, "total": total }))
+            // More rows past this page → hand back the next opaque cursor; else None (end of list).
+            let end = start.saturating_add(page.len());
+            let next_cursor =
+                (end < total).then(|| crate::admin::v1::contract::encode_offset_cursor(end));
+            json_response(
+                StatusCode::OK,
+                json!({ "items": page, "next_cursor": next_cursor }),
+            )
         }
         Ok(Err(e)) => internal_error("list_keys", &e),
         Err(e) => join_error("list_keys", &e),
@@ -2454,7 +2471,11 @@ providers: {}
         .json()
         .await
         .unwrap();
-        assert_eq!(listed["total"], 1, "no double-create: {listed}");
+        assert_eq!(
+            listed["items"].as_array().unwrap().len(),
+            1,
+            "no double-create: {listed}"
+        );
 
         // If-Match: stale = 409 untouched; current etag = applied.
         let id = a["id"].as_str().unwrap();
@@ -2566,36 +2587,59 @@ providers: {}
             ));
         }
 
-        // Pagination: limit 2 offset 0 then offset 2 covers all three exactly once, total stable.
+        // Pagination (cursor envelope): page 1 with ?limit=2 yields 2 items + a next_cursor; feeding
+        // that opaque cursor back yields the final item with next_cursor=null. Covers all three once.
         let p1: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2&offset=0")))
+            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2")))
                 .send()
                 .await
                 .unwrap()
                 .json()
                 .await
                 .unwrap();
-        let p2: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2&offset=2")))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
-        assert_eq!(p1["total"], 3);
-        assert_eq!(p1["keys"].as_array().unwrap().len(), 2);
-        assert_eq!(p2["keys"].as_array().unwrap().len(), 1);
-        let mut seen: Vec<String> = p1["keys"]
+        assert_eq!(p1["items"].as_array().unwrap().len(), 2);
+        let cursor = p1["next_cursor"]
+            .as_str()
+            .expect("more rows remain -> a next_cursor is present");
+        let p2: serde_json::Value = admin(client.get(format!(
+            "http://{addr}/admin/v1/keys?limit=2&cursor={cursor}"
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(p2["items"].as_array().unwrap().len(), 1);
+        assert!(
+            p2["next_cursor"].is_null(),
+            "last page has no next_cursor: {p2}"
+        );
+        let mut seen: Vec<String> = p1["items"]
             .as_array()
             .unwrap()
             .iter()
-            .chain(p2["keys"].as_array().unwrap())
+            .chain(p2["items"].as_array().unwrap())
             .map(|k| k["id"].as_str().unwrap().to_string())
             .collect();
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), 3, "pages cover every key exactly once");
+
+        // A malformed/foreign cursor is a 400 invalid_request (never a silent skip).
+        let bad = admin(client.get(format!("http://{addr}/admin/v1/keys?cursor=notacursor")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            bad.status().as_u16(),
+            400,
+            "foreign cursor is invalid_request"
+        );
+        assert_eq!(
+            bad.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "invalid_request"
+        );
 
         // Rotate the first key: same id, new secret; old secret dead, new secret resolves.
         let (id, old_secret) = ids[0].clone();
@@ -2761,7 +2805,7 @@ providers: {}
                 .json()
                 .await
                 .unwrap();
-        let list = versions["versions"].as_array().unwrap();
+        let list = versions["items"].as_array().unwrap();
         assert_eq!(list.len(), 3, "boot + register + delete: {versions}");
         assert_eq!(list[0]["version"], 2);
         assert!(list[0]["summary"]
@@ -3002,7 +3046,7 @@ providers: {}
             .json()
             .await
             .unwrap();
-        let entries = audit["entries"].as_array().unwrap();
+        let entries = audit["items"].as_array().unwrap();
         let mine = entries
             .iter()
             .find(|e| e["resource"] == format!("hook:{name}"))
@@ -3021,7 +3065,7 @@ providers: {}
             .json()
             .await
             .unwrap();
-        let f = filtered["entries"].as_array().unwrap();
+        let f = filtered["items"].as_array().unwrap();
         assert!(!f.is_empty());
         assert!(
             f.iter().all(|e| e["resource"] == format!("hook:{name}")),
@@ -3040,7 +3084,7 @@ providers: {}
             .json()
             .await
             .unwrap();
-        assert_eq!(none["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(none["items"].as_array().unwrap().len(), 0);
 
         handle.abort();
     }
@@ -3104,7 +3148,7 @@ providers: {}
                 .json()
                 .await
                 .unwrap();
-            let entry = filtered["entries"]
+            let entry = filtered["items"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -3165,17 +3209,17 @@ providers: {}
 
         // Prefix = the full id → exactly this key.
         let by_prefix = get(format!("?prefix={}", minted.id)).await;
-        let keys = by_prefix["keys"].as_array().unwrap();
+        let keys = by_prefix["items"].as_array().unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0]["id"], minted.id);
 
         // Non-matching prefix → none.
         let none = get("?prefix=vk_does_not_exist".into()).await;
-        assert_eq!(none["keys"].as_array().unwrap().len(), 0);
+        assert_eq!(none["items"].as_array().unwrap().len(), 0);
 
         // enabled=true includes the fresh (enabled) key.
         let enabled = get("?enabled=true".into()).await;
-        assert!(enabled["keys"]
+        assert!(enabled["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -3264,7 +3308,7 @@ providers: {}
             .contains_key(name));
         // Audit records it.
         assert!(
-            get(format!("/admin/v1/audit?resource=hook:{name}")).await["entries"]
+            get(format!("/admin/v1/audit?resource=hook:{name}")).await["items"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -3394,7 +3438,7 @@ providers: {}
             .json()
             .await
             .unwrap();
-        let mine = audit["entries"]
+        let mine = audit["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -4142,7 +4186,7 @@ providers: {}
             !listed_str.contains(&aws_secret),
             "the AWS secret access key must NEVER appear in a read response: {listed_str}"
         );
-        for k in listed["keys"].as_array().unwrap() {
+        for k in listed["items"].as_array().unwrap() {
             assert!(
                 k["aws_secret_access_key"].is_null(),
                 "list must not leak the AWS secret"
@@ -4187,9 +4231,9 @@ providers: {}
             .unwrap();
         assert_eq!(listed.status().as_u16(), 200);
         let lb: serde_json::Value = listed.json().await.unwrap();
-        assert_eq!(lb["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(lb["items"].as_array().unwrap().len(), 1);
         assert!(
-            lb["keys"][0]["secret"].is_null(),
+            lb["items"][0]["secret"].is_null(),
             "list must not leak secrets"
         );
 
@@ -5038,7 +5082,7 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(
-            listed["keys"].as_array().unwrap().len(),
+            listed["items"].as_array().unwrap().len(),
             0,
             "PATCH must not have re-inserted the deleted key: {listed}"
         );
@@ -5228,7 +5272,7 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(
-            listed["keys"].as_array().unwrap().len(),
+            listed["items"].as_array().unwrap().len(),
             0,
             "a PATCH must never resurrect a key a concurrent DELETE revoked: {listed}"
         );
@@ -5317,7 +5361,7 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(
-            listed["keys"].as_array().unwrap().len(),
+            listed["items"].as_array().unwrap().len(),
             0,
             "rotate must never resurrect a key a concurrent DELETE revoked: {listed}"
         );
