@@ -1,65 +1,81 @@
 ---
 title: "Run Claude Code through Busbar"
-description: "Point Claude Code at Busbar with one environment variable and get observability, failover, budgets, and on-path middleware for the coding agent you already use — without changing anything about how it works."
+description: "Point Claude Code at Busbar with one environment variable — get observability, failover, and budgets for the agent you already use. Then the twist: because Busbar translates between protocols, you can point Claude Code at a Gemini or Bedrock model instead."
 date: 2026-07-12
 author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---
 
-Claude Code talks to the Anthropic API. Busbar speaks the Anthropic protocol natively — a client
-using the Anthropic SDK can't tell it isn't talking to Anthropic. Put those two facts together and
-you get something useful: you can run Claude Code *through* Busbar by setting one environment
-variable, and Claude Code never knows the difference.
+Claude Code is the best coding agent I've used, and on its own it's a black box pointed straight at
+one provider. You can't see what it spends, you can't fail it over when a key rate-limits mid-session,
+and you can't put anything on its path. I wanted it to stay exactly as good as it is — and become
+something I can see, steer, and rely on. That's the whole reason to run it through a gateway.
 
-## How
+Busbar speaks the Anthropic protocol natively, so a client using the Anthropic SDK can't tell it
+isn't talking to Anthropic. Claude Code is such a client. Put Busbar in the middle with one
+environment variable and Claude Code never knows the difference — but now:
 
-Claude Code honors `ANTHROPIC_BASE_URL`. Point it at a Busbar pool that has a Claude model in it:
+- **You can see what it's doing.** Every request and every token, per key and per pool, in Busbar's
+  `/metrics` and OTLP traces. The agent's token bill stops being a surprise on your invoice.
+- **It doesn't go down mid-session.** Give the pool a second key or a fallback lane; when one trips a
+  529 or its breaker, Busbar fails over in-flight without dropping your session.
+- **You can put things on its path.** Redaction, audit, and context compression run as hooks inside
+  Busbar's request path — transparently, with no change to the agent.
+
+## And here's the part that gets me
+
+"Point it at a provider" doesn't have to mean Anthropic anymore.
+
+Busbar's whole job is lossless translation between the six wire protocols it speaks. Claude Code
+sends the Anthropic Messages format; Busbar can translate that, on the fly, into Gemini's
+`generateContent` or a Bedrock Converse call — and translate the response back into exactly the shape
+Claude Code expects. So you can **run Claude Code against Gemini, or against Bedrock**, without Claude
+Code knowing it's not talking to Anthropic at all.
+
+Same agent you know. Different brain behind it. You change one line of Busbar config, not one line of
+Claude Code.
+
+## The demo
+
+A Busbar pool named `claude-code`, pointed at a **Gemini** model:
+
+```yaml
+# config.yaml
+pools:
+  claude-code:
+    members:
+      - target: gemini-2.5-pro     # the model actually answering
+        weight: 1
+```
+
+Point Claude Code at that pool:
 
 ```sh
-export ANTHROPIC_BASE_URL="https://your-busbar:8080/my-pool"
-export ANTHROPIC_API_KEY="vk_…"   # a Busbar-issued key, not your raw Anthropic key
+export ANTHROPIC_BASE_URL="http://localhost:8080/claude-code"
+export ANTHROPIC_API_KEY="vk_…"   # a Busbar-issued key, not a raw provider key
 claude
 ```
 
-That's the whole integration. Claude Code sends `POST /v1/messages`; Busbar's Anthropic ingress
-answers it, translating to whatever the pool's backend actually speaks and streaming the response
-back in the exact shape Claude Code expects. Your real provider keys live in Busbar's config, on
-your network — not in the agent's environment on every laptop.
+Now run it. Claude Code sends Anthropic; Gemini answers:
 
-## Why
+```console
+$ claude "explain what src/forward/mod.rs does in two sentences"
+● Busbar translated the Anthropic request to Gemini and streamed it back —
+  Claude Code rendered it like any other response.
 
-The point isn't to add a hop for its own sake. It's that Claude Code, on its own, is a black box
-pointed straight at a provider. Putting Busbar in the middle makes it something you can see and
-steer:
+$ curl -s localhost:8080/metrics | grep claude-code
+busbar_requests_total{pool="claude-code",backend="gemini",status="200"} 1
+busbar_tokens_total{pool="claude-code",backend="gemini",kind="input"} 812
+```
 
-- **See what it's doing.** Every request and every token Claude Code spends shows up in Busbar's
-  `/metrics` and OTLP traces, per key and per pool. The agent's token bill stops being a surprise
-  on your invoice.
-- **Don't go down mid-session.** Give the pool more than one way to reach Claude — a second
-  Anthropic key, or a Bedrock/Vertex Claude lane as fallback. When one returns a 529 or trips its
-  breaker, Busbar fails over in-flight to the next without dropping your session.
-- **Budgets and rate limits.** Cap spend per key or per team, throttle requests, and revoke a key
-  the moment you need to — all without touching the agent.
-- **Middleware on the path.** Redaction, audit, and context compression run as hooks *inside*
-  Busbar's request path, so they apply to Claude Code transparently. (More on the compression one
-  in a couple of days.)
-
-## Pros and cons, honestly
-
-**Pros:** one environment variable, no code change; Claude Code stays exactly Claude Code; your
-provider keys move off every developer's machine into one governed place; and you can front
-multiple Claude providers behind a single endpoint.
-
-**Cons:** it's one more hop — a sub-millisecond one, measured from Busbar's own clock (tens of
-microseconds of gateway time; see the [benchmark](/docs/benchmark/)), but a hop you now operate.
-Busbar is a single static binary with no dependencies, so "operate" is light, but it's yours to
-run. And you have to trust it with your traffic — which is exactly why it's self-hosted and your
-keys never leave your network.
+The agent thinks it talked to Anthropic. The metrics show Gemini served it. To swap in Bedrock, or to
+put Claude behind two keys with failover, or to add a compression hook — you edit the pool, not the
+agent.
 
 ## The simple version
 
-If you already run Busbar, this is one variable away. If you don't, it's a single binary and a
+If you already run Busbar, this is one variable away. If you don't, it's a single static binary and a
 few lines of config to front the model Claude Code is already using — and once it's in the path,
-everything else Busbar does (failover, budgets, observability, hooks) comes along for free.
+everything else Busbar does comes along for free.
 
 Get it at **[getbusbar.com](https://getbusbar.com)**.
