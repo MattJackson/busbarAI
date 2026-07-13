@@ -1076,10 +1076,6 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
         "/admin/v1/config/versions",
         "Config version history (newest first; id/ts/principal/summary)",
     ),
-    (
-        "/admin/v1/config/diff",
-        "Structured hook-surface diff between two versions (?from=&to=)",
-    ),
     ("/admin/v1/openapi.json", "This OpenAPI 3.1 document"),
 ];
 
@@ -1196,6 +1192,25 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "OK (`reachable` may be null for webhook/non-unix)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/config/diff".to_string(),
+        json!({
+            "get": {
+                "summary": "Structured hook-surface diff between two retained versions",
+                "security": [{"adminToken": []}],
+                "parameters": [
+                    {"name": "from", "in": "query", "required": true, "schema": {"type": "integer"}},
+                    {"name": "to", "in": "query", "required": true, "schema": {"type": "integer"}}
+                ],
+                "responses": {
+                    "200": {"description": "The diff (hooks added/removed/changed + global-wiring delta)"},
+                    "400": {"description": "Missing/non-numeric `from` or `to` (error code `invalid_request`)"},
+                    "404": {"description": "Either version pruned or never recorded (error code `not_found`)"},
+                    "401": {"description": "Missing/invalid admin credential"}
                 }
             }
         }),

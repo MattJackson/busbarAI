@@ -32,6 +32,27 @@
 use super::{Candidate, PolicyResult, RoutingContext, RoutingPolicy, RoutingRequest};
 use std::time::Duration;
 
+/// A hostile or buggy sidecar must never drive unbounded allocation on the busbar server: EVERY
+/// webhook response body — decide, configure, describe — is read through this 64 KiB cap. Mirrors
+/// the socket transport's `MAX_REPLY_BYTES`.
+const MAX_WEBHOOK_RESP_BYTES: usize = 64 * 1024;
+
+/// Read a webhook response body with the 64 KiB cap, aborting (rather than allocating) past it.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, super::PolicyError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| -> super::PolicyError {
+        format!("webhook response read failed: {e}").into()
+    })? {
+        if buf.len() + chunk.len() > MAX_WEBHOOK_RESP_BYTES {
+            return Err(
+                format!("webhook response exceeded {MAX_WEBHOOK_RESP_BYTES} byte cap").into(),
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// A `WebhookPolicy` POSTs the request projection to an operator sidecar and returns the ranked
 /// order. Holds a clone of the SHARED upstream `reqwest::Client` (reused, not freshly built) so the
 /// connection pool and the `redirect::none` SSRF posture are inherited. The URL is validated at
@@ -74,17 +95,8 @@ impl WebhookPolicy {
             .timeout(budget)
             .send()
             .await?;
-        let mut resp = resp.error_for_status()?;
-        const MAX_WEBHOOK_RESP_BYTES: usize = 64 * 1024;
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
-            if buf.len() + chunk.len() > MAX_WEBHOOK_RESP_BYTES {
-                return Err(
-                    format!("webhook response exceeded {MAX_WEBHOOK_RESP_BYTES} byte cap").into(),
-                );
-            }
-            buf.extend_from_slice(&chunk);
-        }
+        let resp = resp.error_for_status()?;
+        let buf = read_capped(resp).await?;
         crate::json::parse(&buf)
             .map_err(|_| -> super::PolicyError { crate::json::parse_err_log(buf.len()).into() })
     }
@@ -165,9 +177,7 @@ impl RoutingPolicy for WebhookPolicy {
         if !resp.status().is_success() {
             return Err(format!("configure rejected: HTTP {}", resp.status()).into());
         }
-        let bytes = resp.bytes().await.map_err(|e| -> super::PolicyError {
-            format!("configure reply read failed: {e}").into()
-        })?;
+        let bytes = read_capped(resp).await?;
         let ack: super::wire::ConfigureAck =
             serde_json::from_slice(&bytes).map_err(|e| -> super::PolicyError {
                 format!("configure reply unparsable: {e}").into()
@@ -194,7 +204,7 @@ impl RoutingPolicy for WebhookPolicy {
         if !resp.status().is_success() {
             return None;
         }
-        let bytes = resp.bytes().await.ok()?;
+        let bytes = read_capped(resp).await.ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
