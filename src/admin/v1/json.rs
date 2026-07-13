@@ -235,17 +235,18 @@ async fn register_hook(
     }
     match build_with_hook(&current, &req.name, req.config) {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by("hook.register", &resource, audit::OUTCOME_APPLIED, &actor);
             // Persist the new hook state to the overlay (best-effort; no-op when persistence disabled).
             // Clear any tombstone for this name — a re-register un-deletes it.
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 &format!("hook.register {resource}"),
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
@@ -306,15 +307,16 @@ async fn put_hook(
     }
     match build_with_hook(&current, &name, req.config) {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by("hook.replace", &resource, audit::OUTCOME_APPLIED, &actor);
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 &format!("hook.replace {resource}"),
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
@@ -345,16 +347,17 @@ async fn delete_hook(
     let resource = format!("hook:{name}");
     match build_without_hook(&current, &name) {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_APPLIED, &actor);
             // Tombstone this name so the deletion survives a restart even if the hook was base-defined.
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 &format!("hook.delete {resource}"),
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
@@ -539,15 +542,16 @@ async fn rollback_config(
     };
     match build_with_registry(&current, target.hook_registry, target.global_hooks) {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by("config.rollback", &resource, audit::OUTCOME_APPLIED, &actor);
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 &format!("config.rollback to v{}", req.version),
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             // Best-effort overlay persistence of the restored surface (no-op when disabled).
             crate::config::overlay::persist(
@@ -668,7 +672,8 @@ async fn put_auth(
                 .into(),
         ));
     }
-    handle.swap(Arc::new(next));
+    let installed = Arc::new(next);
+    handle.swap(installed.clone());
     audit::AUDIT.record_by(
         "auth.admin_chain_put",
         "auth:admin_auth",
@@ -676,12 +681,12 @@ async fn put_auth(
         principal.actor_id(),
     );
     let cur = handle.load();
-    cur.versions.record(
-        cur.config_version,
+    installed.versions.record(
+        installed.config_version,
         principal.actor_id(),
         "auth.admin_chain_put",
-        &cur.hook_registry,
-        &cur.global_hooks,
+        &installed.hook_registry,
+        &installed.global_hooks,
     );
     ok_json(
         StatusCode::OK,
@@ -771,7 +776,8 @@ async fn reload_config(
         });
     match outcome {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by(
                 "config.reload",
                 "config:disk",
@@ -779,12 +785,12 @@ async fn reload_config(
                 &actor,
             );
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 "config.reload (from disk)",
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             ok_json(
                 StatusCode::OK,
@@ -868,7 +874,8 @@ async fn apply_config(
         });
     match outcome {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by(
                 "config.apply",
                 "config:body",
@@ -876,12 +883,12 @@ async fn apply_config(
                 &actor,
             );
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 "config.apply (request body)",
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             ok_json(
                 StatusCode::OK,
@@ -991,15 +998,16 @@ async fn patch_hook_settings(
     }
     match build_with_hook(&current, &name, updated) {
         Ok(next) => {
-            handle.swap(Arc::new(next));
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
             audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_APPLIED, &actor);
             let cur = handle.load();
-            cur.versions.record(
-                cur.config_version,
+            installed.versions.record(
+                installed.config_version,
                 &actor,
                 &format!("hook.settings {resource}"),
-                &cur.hook_registry,
-                &cur.global_hooks,
+                &installed.hook_registry,
+                &installed.global_hooks,
             );
             crate::config::overlay::persist(
                 cur.overlay_path.as_deref(),
