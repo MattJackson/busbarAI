@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{extract::Path, extract::Query, Router};
 use serde::Serialize;
 use serde_json::json;
@@ -51,6 +51,11 @@ impl AdminTransport for JsonV1 {
                 get(get_hook).put(put_hook).delete(delete_hook),
             )
             .route("/admin/v1/hooks/{name}/health", get(hook_health))
+            .route(
+                "/admin/v1/hooks/{name}/settings",
+                patch(patch_hook_settings),
+            )
+            .route("/admin/v1/hooks/{name}/schema", get(hook_schema))
             .route("/admin/v1/plugins", get(list_plugins))
             .route("/admin/v1/auth", get(get_auth))
             .route("/admin/v1/admin-auth", get(get_admin_auth))
@@ -742,6 +747,108 @@ async fn apply_config(
     }
 }
 
+/// The `PATCH /admin/v1/hooks/{name}/settings` body.
+#[derive(serde::Deserialize)]
+struct PatchSettingsReq {
+    settings: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    expected_version: Option<u64>,
+}
+
+/// `PATCH /admin/v1/hooks/{name}/settings` — push an opaque settings map to the RUNNING hook and
+/// COMMIT ON ACK (D2): busbar sends the `configure` message over the hook's transport, waits for
+/// the versioned ack (5s deadline), and only then swaps in the registry update (grants untouched —
+/// immutability holds by construction) + persists + audits + versions. A nack/timeout/error
+/// commits NOTHING (`invalid_request` names the reason). Base-defined hooks are 409 (edit the
+/// file). Socket hooks ALSO receive the committed settings as the configure preamble on every
+/// future (re)connection, so a restarted hook never runs blind.
+async fn patch_hook_settings(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let req: PatchSettingsReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed settings body: {e}"
+            )))
+        }
+    };
+    let current = handle.load();
+    let resource = format!("hook:{name}");
+    let Some(existing) = current.hook_registry.get(&name) else {
+        return err_json(&AdminError::NotFound(format!("hook `{name}`")));
+    };
+    if current.base_hook_names.contains(&name) {
+        audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "hook `{name}` is defined in the base config file; edit config.yaml"
+        )));
+    }
+    if let Some(expected) = req.expected_version {
+        if expected != current.config_version {
+            audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+            return err_json(&AdminError::Conflict(format!(
+                "expected_version {expected} is stale (current is {})",
+                current.config_version
+            )));
+        }
+    }
+    let mut updated = existing.clone();
+    updated.settings = req.settings;
+    let settings_version = current.config_version.wrapping_add(1);
+    // PUSH first, COMMIT on ack — a hook that never acked never sees committed state it doesn't
+    // hold (§6.5: no partial config ever goes live).
+    if let Err(e) =
+        crate::routing::push_configure(&updated, &name, settings_version, &current.client).await
+    {
+        audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Validation(format!(
+            "hook did not acknowledge the settings push: {e}"
+        )));
+    }
+    match build_with_hook(&current, &name, updated) {
+        Ok(next) => {
+            handle.swap(Arc::new(next));
+            audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            cur.versions.record(
+                cur.config_version,
+                &actor,
+                &format!("hook.settings {resource}"),
+                &cur.hook_registry,
+                &cur.global_hooks,
+            );
+            crate::config::overlay::persist(
+                cur.overlay_path.as_deref(),
+                &cur.hook_registry,
+                &cur.global_hooks,
+                None,
+                Some(&name),
+            );
+            respond(StatusCode::OK, service(&handle).get_hook(&name).await)
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
+/// `GET /admin/v1/hooks/{name}/schema` — proxy the hook's self-described settings JSON Schema
+/// (the `describe` wire message). `{"schema": null}` when the hook/transport doesn't answer.
+async fn hook_schema(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+    let current = handle.load();
+    let Some(hook) = current.hook_registry.get(&name) else {
+        return err_json(&AdminError::NotFound(format!("hook `{name}`")));
+    };
+    let schema = crate::routing::fetch_schema(hook, &current.client).await;
+    ok_json(StatusCode::OK, &json!({ "name": name, "schema": schema }))
+}
+
 /// The stable v1 GET endpoints (path, summary), the single source for both the router-mount drift
 /// test and the OpenAPI `paths`. Templated/POST routes are documented separately in `openapi_doc`.
 /// Adding a GET endpoint means adding it here so the doc + the drift guard both see it.
@@ -919,6 +1026,42 @@ fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "The version (metadata + hooks + global_hooks)"},
                     "404": {"description": "Pruned or never recorded (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/hooks/{name}/settings".to_string(),
+        json!({
+            "patch": {
+                "summary": "Push an opaque settings map to the running hook; COMMIT ON ACK",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "Acked + committed (the updated hook)"},
+                    "400": {"description": "Hook did not acknowledge (error code `invalid_request`); nothing committed"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"},
+                    "409": {"description": "Base-defined hook or stale expected_version (error code `conflict`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        "/admin/v1/hooks/{name}/schema".to_string(),
+        json!({
+            "get": {
+                "summary": "The hook's self-described settings JSON Schema (describe proxy)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "`{name, schema}` (`schema` null when the hook doesn't answer describe)"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"}
                 }
             }
         }),

@@ -1145,6 +1145,141 @@ mod tests {
     /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
     /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// D2 e2e (unix): PATCH settings pushes `configure` to the running hook and commits ON ACK
+    /// (the registry shows the new settings); a NACKing hook commits nothing; GET schema proxies
+    /// the hook's describe reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
+        crate::metrics::init();
+        // A fake hook binary: acks configure (echoing the pushed version), answers describe.
+        let dir = std::env::temp_dir().join(format!("busbar-d2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hook.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let ack_mode = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_ack = ack_mode.clone();
+        let hook_task = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let ack = hook_ack.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+                        let reply = if let Some(c) = v.get("configure") {
+                            if ack.load(std::sync::atomic::Ordering::Relaxed) {
+                                serde_json::json!({"ack": {"settings_version": c["settings_version"]}})
+                            } else {
+                                serde_json::json!({"error": "refused"})
+                            }
+                        } else if v.get("describe").is_some() {
+                            serde_json::json!({"schema": {"type": "object", "properties": {"ratio": {"type": "number"}}}})
+                        } else {
+                            serde_json::json!({})
+                        };
+                        if w.write_all(format!("{reply}\n").as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let serve = tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // Register the hook (overlay), then PATCH its settings — ack mode on: commits.
+        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+            .body(
+                serde_json::json!({
+                    "name": "cfg-hook",
+                    "config": {"kind": "gate", "socket": sock.to_str().unwrap()}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let patched =
+            admin(client.patch(format!("http://{addr}/admin/v1/hooks/cfg-hook/settings")))
+                .body(serde_json::json!({"settings": {"ratio": 0.4}}).to_string())
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(patched.status().as_u16(), 200, "{:?}", patched.text().await);
+        let got: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            got["settings"]["ratio"], 0.4,
+            "committed settings visible: {got}"
+        );
+
+        // NACK mode: the push is refused — nothing commits.
+        ack_mode.store(false, std::sync::atomic::Ordering::Relaxed);
+        let refused =
+            admin(client.patch(format!("http://{addr}/admin/v1/hooks/cfg-hook/settings")))
+                .body(serde_json::json!({"settings": {"ratio": 0.9}}).to_string())
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(refused.status().as_u16(), 400, "nack = not committed");
+        let still: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            still["settings"]["ratio"], 0.4,
+            "old settings intact: {still}"
+        );
+
+        // Schema proxy (ack mode back on — the committed settings ride the configure preamble on
+        // the fresh describe connection, and a nacking hook refuses connections by design).
+        ack_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+        let schema: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook/schema")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            schema["schema"]["schema"]["properties"]["ratio"]["type"], "number",
+            "describe proxied: {schema}"
+        );
+
+        serve.abort();
+        hook_task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `POST /admin/v1/config/apply`: a body-carried full config swaps in atomically — the new
     /// topology is live, the surviving identity keeps its tripped health, and a stale
     /// expected_version is a 409 that changes nothing.
@@ -2321,6 +2456,7 @@ providers: {}
             user: crate::config::UserAccess::Ro,
             priority: 7,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: false,
             default: false,
@@ -2403,6 +2539,7 @@ providers: {}
             user: crate::config::UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: false,
             default: false,
@@ -2475,6 +2612,7 @@ providers: {}
             user: crate::config::UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: false,
             default: false,
@@ -2654,6 +2792,7 @@ providers: {}
             user: crate::config::UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: false,
             default: false,

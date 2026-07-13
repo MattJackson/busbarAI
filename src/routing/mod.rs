@@ -256,6 +256,26 @@ pub(crate) trait RoutingPolicy: Send + Sync + 'static {
         None
     }
 
+    /// PUSH a settings map to the hook (D2, `PATCH /admin/v1/hooks/{name}/settings`): send the
+    /// `configure` message and wait for the ack, bounded by `budget`. `Ok(())` = the hook
+    /// acknowledged (the caller commits); any error/nack/timeout = NOT committed. Default: this
+    /// transport cannot be configured (in-process natives have no settings).
+    async fn configure(
+        &self,
+        _hook_name: &str,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+        _settings_version: u64,
+        _budget: std::time::Duration,
+    ) -> Result<(), PolicyError> {
+        Err("this hook transport does not support configure".into())
+    }
+
+    /// Ask the hook to DESCRIBE its settings schema (D2, `GET /admin/v1/hooks/{name}/schema`).
+    /// `None` = the transport/hook doesn't answer describe. Proxied verbatim.
+    async fn describe(&self, _budget: std::time::Duration) -> Option<serde_json::Value> {
+        None
+    }
+
     /// TAP (fire-and-forget): WRITE the pre-serialized request projection (JSON bytes, no trailing
     /// newline — the transport frames it) to the hook and return. A tap is write-only in steady
     /// state, so NO reply is read. Best-effort and bounded by `budget`; ANY error is swallowed,
@@ -477,14 +497,66 @@ fn gate_transport_only(
     gate_socket_transport(hook)
 }
 
-/// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`].
+/// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`], carrying the configure
+/// preamble (D2) when the hook declares settings — sent first on every fresh connection so a
+/// restarted hook always holds current settings.
 #[cfg(unix)]
 fn gate_socket_transport(hook: &crate::config::HookCfg) -> Option<Arc<dyn RoutingPolicy>> {
     let path = hook.socket.as_deref()?;
     if path.is_empty() {
         return None;
     }
-    Some(Arc::new(socket::SocketPolicy::new(path.to_string())))
+    if hook.settings.is_empty() {
+        Some(Arc::new(socket::SocketPolicy::new(path.to_string())))
+    } else {
+        Some(Arc::new(socket::SocketPolicy::with_configure(
+            path.to_string(),
+            // The registry NAME isn't threaded to this seam; the hook's own name is echoed in the
+            // configure context for multi-hook binaries. Absent a name here, the socket path is
+            // the stable identity the hook can key on.
+            path,
+            &hook.settings,
+            0,
+        )))
+    }
+}
+
+/// The configure-push deadline (spec `configure_timeout_ms` default): distinct from the
+/// per-request gate deadline — configure may do real work (reload a model, open files).
+const CONFIGURE_TIMEOUT_MS: u64 = 5000;
+
+/// PUSH a settings map to a hook over its transport and wait for the ack (D2, the
+/// `PATCH /admin/v1/hooks/{name}/settings` core). `Ok` = acked (commit); `Err` = NOT committed.
+pub(crate) async fn push_configure(
+    hook: &crate::config::HookCfg,
+    name: &str,
+    settings_version: u64,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let Some(transport) = gate_transport_only(hook, client) else {
+        return Err("hook transport unresolvable".to_string());
+    };
+    transport
+        .configure(
+            name,
+            &hook.settings,
+            settings_version,
+            std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS),
+        )
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Fetch a hook's self-described settings schema over its transport (D2,
+/// `GET /admin/v1/hooks/{name}/schema`). `None` = the hook/transport doesn't answer describe.
+pub(crate) async fn fetch_schema(
+    hook: &crate::config::HookCfg,
+    client: &reqwest::Client,
+) -> Option<serde_json::Value> {
+    let transport = gate_transport_only(hook, client)?;
+    transport
+        .describe(std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS))
+        .await
 }
 
 /// Resolve a hook's `on_error` NAME into its runtime fallback chain + terminal, following the
@@ -743,6 +815,7 @@ mod tests {
             user: UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: false,
             default: false,
@@ -1073,6 +1146,7 @@ mod tests {
             user: UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: true,
             default: false,
@@ -1114,6 +1188,7 @@ mod tests {
             user: UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: true,
             default: false,
@@ -1154,6 +1229,7 @@ mod tests {
             user: UserAccess::No,
             priority: 0,
             at,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: true,
             default: false,
@@ -1219,6 +1295,7 @@ mod tests {
             user: UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: true,
             default: false,

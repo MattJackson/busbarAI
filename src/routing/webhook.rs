@@ -131,6 +131,73 @@ impl RoutingPolicy for WebhookPolicy {
 
     /// TAP: fire-and-forget POST of the pre-serialized projection. The response is NOT read (a tap is
     /// write-only). Bounded by `budget`; any error is swallowed — a tap never affects the request.
+    async fn configure(
+        &self,
+        hook_name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+        settings_version: u64,
+        budget: Duration,
+    ) -> Result<(), super::PolicyError> {
+        // HTTP is stateless — configure is a plain POST of the same body the socket wire frames;
+        // 2xx with an ack body = committed. (No per-connection preamble exists for webhooks; the
+        // PATCH push is the delivery, documented.)
+        let msg = super::wire::ConfigureMsg {
+            configure: super::wire::ConfigureBody {
+                hook: hook_name,
+                settings,
+                settings_version,
+                busbar_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let body = serde_json::to_vec(&msg)
+            .map_err(|e| -> super::PolicyError { format!("serialize configure: {e}").into() })?;
+        let resp = tokio::time::timeout(
+            budget,
+            self.client
+                .post(self.url.clone())
+                .header("content-type", "application/json")
+                .body(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| -> super::PolicyError { "configure deadline exceeded".into() })?
+        .map_err(|e| -> super::PolicyError { format!("configure POST failed: {e}").into() })?;
+        if !resp.status().is_success() {
+            return Err(format!("configure rejected: HTTP {}", resp.status()).into());
+        }
+        let bytes = resp.bytes().await.map_err(|e| -> super::PolicyError {
+            format!("configure reply read failed: {e}").into()
+        })?;
+        let ack: super::wire::ConfigureAck =
+            serde_json::from_slice(&bytes).map_err(|e| -> super::PolicyError {
+                format!("configure reply unparsable: {e}").into()
+            })?;
+        match ack.ack {
+            Some(body) if body.settings_version == settings_version => Ok(()),
+            _ => Err("hook did not ack the configure push".into()),
+        }
+    }
+
+    async fn describe(&self, budget: Duration) -> Option<serde_json::Value> {
+        let body = serde_json::to_vec(&super::wire::DescribeMsg { describe: true }).ok()?;
+        let resp = tokio::time::timeout(
+            budget,
+            self.client
+                .post(self.url.clone())
+                .header("content-type", "application/json")
+                .body(body)
+                .send(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     async fn notify(&self, projection: &[u8], budget: Duration) {
         let _ = self
             .client

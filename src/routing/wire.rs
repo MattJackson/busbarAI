@@ -144,6 +144,46 @@ pub(crate) struct HookContext<'a> {
     pub(crate) budget_remaining: Option<i64>,
 }
 
+/// The CONFIGURE message (D2) — the FIRST line busbar sends on every socket connection (and the
+/// push a settings PATCH makes before committing): the hook's current desired-state settings.
+/// Top-level `configure` key discriminates it from decide/transform payloads (which carry
+/// `request`/`candidates`/`context`), so a hook branches on the first key. Idempotent
+/// desired-state: re-sending the same settings must be a no-op for the hook.
+#[derive(Serialize)]
+pub(crate) struct ConfigureMsg<'a> {
+    pub(crate) configure: ConfigureBody<'a>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ConfigureBody<'a> {
+    /// The hook's own registry name (context echo).
+    pub(crate) hook: &'a str,
+    /// The opaque settings map from the hook's registry entry (operator/API-owned).
+    pub(crate) settings: &'a serde_json::Map<String, serde_json::Value>,
+    /// Monotonic settings version (the config_version that committed them) — the ack echoes it.
+    pub(crate) settings_version: u64,
+    pub(crate) busbar_version: &'static str,
+}
+
+/// The hook's configure ACK: `{"ack": {"settings_version": N}}`. Anything else (error, wrong
+/// version, garbage, timeout) is a FAILED configure — a settings PATCH does not commit.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigureAck {
+    pub(crate) ack: Option<ConfigureAckBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigureAckBody {
+    pub(crate) settings_version: u64,
+}
+
+/// The DESCRIBE request (D2): `{"describe": true}` — the hook replies its settings JSON Schema
+/// (any JSON value; busbar proxies it verbatim on `GET /admin/v1/hooks/{name}/schema`).
+#[derive(Serialize)]
+pub(crate) struct DescribeMsg {
+    pub(crate) describe: bool,
+}
+
 /// The hook's reply. `order` is the ranked preference (candidate `idx` values, most-preferred
 /// first); an explicit `abstain: true` (or an absent/empty `order`) means "no opinion". Both fields
 /// are optional so an empty `{}` deserializes to Abstain. Unknown JSON fields are ignored, so a hook

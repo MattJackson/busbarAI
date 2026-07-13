@@ -4242,6 +4242,7 @@ models:
             user: config::UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global: false,
             default: false,

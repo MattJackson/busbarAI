@@ -713,6 +713,7 @@ impl AdminService {
             }),
             on_error: cfg.on_error.clone(),
             timeout_ms: cfg.timeout_ms,
+            settings: cfg.settings.clone(),
             global: cfg.global || self.app.global_hooks.iter().any(|n| n == name),
         }
     }
@@ -735,6 +736,7 @@ mod tests {
             user: UserAccess::No,
             priority: 0,
             at: None,
+            settings: serde_json::Map::new(),
             on_empty: None,
             global,
             default: false,

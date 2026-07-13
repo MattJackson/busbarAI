@@ -296,6 +296,9 @@ pub(crate) struct HookView {
     pub(crate) on_error: String,
     /// Gate decision deadline in milliseconds.
     pub(crate) timeout_ms: u64,
+    /// The hook's opaque settings map (operator/API-owned; pushed via the configure wire). Never
+    /// interpreted by busbar; never a secret by contract (hook settings are operator config).
+    pub(crate) settings: serde_json::Map<String, serde_json::Value>,
     /// Whether this hook fires on every request (globally wired).
     pub(crate) global: bool,
 }

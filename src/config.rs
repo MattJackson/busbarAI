@@ -754,6 +754,11 @@ pub(crate) struct HookCfg {
     /// reconcile.
     #[serde(default)]
     pub(crate) on_empty: Option<PolicyOnError>,
+    /// OPAQUE settings map pushed to the hook via the `configure` wire message (D2): sent as the
+    /// first line on every socket connection and re-pushed (commit-on-ack) by
+    /// `PATCH /admin/v1/hooks/{name}/settings`. Busbar never interprets the contents.
+    #[serde(default)]
+    pub(crate) settings: serde_json::Map<String, serde_json::Value>,
     /// Fire on EVERY request — inline sugar for adding this name to `global_hooks:`. Default false.
     #[serde(default)]
     pub(crate) global: bool,

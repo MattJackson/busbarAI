@@ -52,6 +52,10 @@ pub(crate) struct SocketPolicy {
     /// appear after boot — the hook binary can start later, connection is lazy).
     path: String,
     conn: Mutex<Option<Conn>>,
+    /// The pre-serialized `configure` line (D2), sent FIRST on every fresh connection so a
+    /// (re)started hook always holds its current settings before its first request. `None` = the
+    /// legacy 3-message wire (no settings configured) — old binaries keep working untouched.
+    configure_line: Option<Vec<u8>>,
 }
 
 impl SocketPolicy {
@@ -59,7 +63,53 @@ impl SocketPolicy {
         Self {
             path,
             conn: Mutex::new(None),
+            configure_line: None,
         }
+    }
+
+    /// Construct with a configure preamble (D2): `settings` are serialized ONCE into the line sent
+    /// first on every fresh connection. The connect-time ack read shares the request's own budget.
+    pub(crate) fn with_configure(
+        path: String,
+        hook_name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+        settings_version: u64,
+    ) -> Self {
+        let msg = super::wire::ConfigureMsg {
+            configure: super::wire::ConfigureBody {
+                hook: hook_name,
+                settings,
+                settings_version,
+                busbar_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let mut line = serde_json::to_vec(&msg).unwrap_or_default();
+        line.push(b'\n');
+        Self {
+            path,
+            conn: Mutex::new(None),
+            configure_line: (!settings.is_empty()).then_some(line),
+        }
+    }
+
+    /// Establish a fresh connection, sending the configure preamble (when configured) and reading
+    /// its ack line before the connection is considered usable — a hook that answers requests
+    /// without acking its settings is running blind, so the ack is REQUIRED once a preamble exists.
+    async fn connect(&self) -> Result<Conn, std::io::Error> {
+        let stream = UnixStream::connect(&self.path).await?;
+        let (r, w) = stream.into_split();
+        let mut conn: Conn = (BufReader::new(r), w);
+        if let Some(ref line) = self.configure_line {
+            let ack = Self::round_trip(&mut conn, line).await?;
+            let parsed: Result<super::wire::ConfigureAck, _> = serde_json::from_slice(&ack);
+            if !matches!(parsed, Ok(super::wire::ConfigureAck { ack: Some(_) })) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hook did not ack its configure preamble",
+                ));
+            }
+        }
+        Ok(conn)
     }
 
     /// One request/reply round trip on an established connection. Any I/O error bubbles as `Err`;
@@ -106,9 +156,7 @@ impl SocketPolicy {
                     }
                 }
             }
-            let stream = UnixStream::connect(&self.path).await?;
-            let (r, w) = stream.into_split();
-            let mut conn: Conn = (BufReader::new(r), w);
+            let mut conn = self.connect().await?;
             let reply = Self::round_trip(&mut conn, line).await?;
             *guard = Some(conn);
             Ok(reply)
@@ -133,9 +181,7 @@ impl SocketPolicy {
             }
             // Stale after a tap-binary restart — fall through to a fresh connect.
         }
-        let stream = UnixStream::connect(&self.path).await?;
-        let (r, w) = stream.into_split();
-        let mut conn: Conn = (BufReader::new(r), w);
+        let mut conn = self.connect().await?;
         conn.1.write_all(line).await?;
         conn.1.flush().await?;
         *guard = Some(conn);
@@ -203,6 +249,47 @@ impl RoutingPolicy for SocketPolicy {
 
     /// TAP: write-only fire-and-forget send of the pre-serialized projection. No reply is read.
     /// Bounded by `budget`; any error is swallowed — a tap never affects the served request.
+    async fn configure(
+        &self,
+        hook_name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+        settings_version: u64,
+        budget: Duration,
+    ) -> Result<(), super::PolicyError> {
+        let msg = super::wire::ConfigureMsg {
+            configure: super::wire::ConfigureBody {
+                hook: hook_name,
+                settings,
+                settings_version,
+                busbar_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let mut line = serde_json::to_vec(&msg)
+            .map_err(|e| -> super::PolicyError { format!("serialize configure: {e}").into() })?;
+        line.push(b'\n');
+        let reply = self.exchange(&line, budget).await?;
+        let parsed: super::wire::ConfigureAck =
+            serde_json::from_slice(&reply).map_err(|e| -> super::PolicyError {
+                format!("configure reply unparsable: {e}").into()
+            })?;
+        match parsed.ack {
+            Some(body) if body.settings_version == settings_version => Ok(()),
+            Some(body) => Err(format!(
+                "hook acked the wrong settings_version ({} != {settings_version})",
+                body.settings_version
+            )
+            .into()),
+            None => Err("hook did not ack the configure push".into()),
+        }
+    }
+
+    async fn describe(&self, budget: Duration) -> Option<serde_json::Value> {
+        let mut line = serde_json::to_vec(&super::wire::DescribeMsg { describe: true }).ok()?;
+        line.push(b'\n');
+        let reply = self.exchange(&line, budget).await.ok()?;
+        serde_json::from_slice(&reply).ok()
+    }
+
     async fn notify(&self, projection: &[u8], budget: Duration) {
         let mut line = Vec::with_capacity(projection.len() + 1);
         line.extend_from_slice(projection);
