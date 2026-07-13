@@ -178,7 +178,7 @@ pub(crate) struct ConfigureAckBody {
 }
 
 /// The DESCRIBE request (D2): `{"describe": true}` — the hook replies its settings JSON Schema
-/// (any JSON value; busbar proxies it verbatim on `GET /admin/v1/hooks/{name}/schema`).
+/// (any JSON value; busbar proxies it verbatim on `GET /api/v1/admin/hooks/{name}/schema`).
 #[derive(Serialize)]
 pub(crate) struct DescribeMsg {
     pub(crate) describe: bool,

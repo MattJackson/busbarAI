@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The JSON-REST adapter for Admin API **v1** — mounts `/admin/v1/*`.
+//! The JSON-REST adapter for Admin API **v1** — mounts `/api/v1/admin/*`.
 //!
 //! The version-specific WIRE layer for the JSON transport: it declares the v1 routes, owns the v1 JSON
 //! envelope helpers, and maps each route to a shared `AdminService` call. It holds NO operation logic
@@ -25,7 +25,7 @@ use crate::admin::audit;
 use crate::admin::transport::AdminTransport;
 use crate::state::AppHandle;
 
-/// The JSON-REST adapter for v1: the `/admin/v1/*` resource API with the stable
+/// The JSON-REST adapter for v1: the `/api/v1/admin/*` resource API with the stable
 /// `{"error":{"code","message"}}` envelope (design-admin-api-v1 §0.3). Zero-sized — each request
 /// builds an `AdminService` over the CURRENT snapshot from the router's `Arc<AppHandle>` state (so a
 /// read after a config apply reflects the new config), and the mutation path swaps through the handle.
@@ -36,41 +36,64 @@ impl AdminTransport for JsonV1 {
         "json/v1"
     }
 
+    fn version(&self) -> &'static str {
+        "v1"
+    }
+
+    fn area(&self) -> &'static str {
+        "admin"
+    }
+
     fn router(&self) -> Router<Arc<AppHandle>> {
-        // Routes stay declarative; each handler pulls the `Arc<AppHandle>` state, loads the current
-        // snapshot into a per-request `AdminService`, and maps the typed result onto the JSON wire.
+        // Routes are RELATIVE — `admin::transport::mount` nests this router under the computed
+        // `/api/<version>/<area>` prefix (the algorithmic mount grammar), so no path here can drift
+        // from `contract::ADMIN_PREFIX`. Each handler pulls the `Arc<AppHandle>` state, loads the
+        // current snapshot into a per-request `AdminService`, and maps the typed result onto the
+        // JSON wire.
         Router::new()
-            .route("/admin/v1/info", get(info))
-            .route("/admin/v1/pools", get(list_pools))
-            .route("/admin/v1/pools/{name}", get(get_pool))
-            .route("/admin/v1/models", get(list_models))
-            .route("/admin/v1/providers", get(list_providers))
-            .route("/admin/v1/hooks", get(list_hooks).post(register_hook))
+            .route("/info", get(info))
+            .route("/pools", get(list_pools))
+            .route("/pools/{name}", get(get_pool))
+            .route("/models", get(list_models))
+            .route("/providers", get(list_providers))
+            .route("/hooks", get(list_hooks).post(register_hook))
             .route(
-                "/admin/v1/hooks/{name}",
+                "/hooks/{name}",
                 get(get_hook).put(put_hook).delete(delete_hook),
             )
-            .route("/admin/v1/hooks/{name}/health", get(hook_health))
+            .route("/hooks/{name}/health", get(hook_health))
+            .route("/hooks/{name}/settings", patch(patch_hook_settings))
+            .route("/hooks/{name}/schema", get(hook_schema))
+            .route("/plugins", get(list_plugins))
+            .route("/auth", get(get_auth))
+            .route("/admin-auth", get(get_admin_auth).put(put_auth))
+            .route("/usage", get(get_usage))
+            .route("/config", get(get_config))
+            .route("/audit", get(get_audit))
+            .route("/config/validate", post(validate_config))
+            .route("/config/versions", get(list_config_versions))
+            .route("/config/versions/{v}", get(get_config_version))
+            .route("/config/diff", get(config_diff))
+            .route("/config/rollback", post(rollback_config))
+            .route("/config/reload", post(reload_config))
+            .route("/auth/cache/flush", post(flush_credential_cache))
+            .route("/config/apply", post(apply_config))
+            .route("/openapi.json", get(openapi))
+            // Virtual-key management — the keys resource of the SAME v1 admin surface. Handlers
+            // live in `crate::admin` while they migrate into the layered service; mounting them
+            // here (not in main.rs) keeps the whole admin surface one router under one prefix.
             .route(
-                "/admin/v1/hooks/{name}/settings",
-                patch(patch_hook_settings),
+                "/keys",
+                post(crate::admin::create_key).get(crate::admin::list_keys),
             )
-            .route("/admin/v1/hooks/{name}/schema", get(hook_schema))
-            .route("/admin/v1/plugins", get(list_plugins))
-            .route("/admin/v1/auth", get(get_auth))
-            .route("/admin/v1/admin-auth", get(get_admin_auth).put(put_auth))
-            .route("/admin/v1/usage", get(get_usage))
-            .route("/admin/v1/config", get(get_config))
-            .route("/admin/v1/audit", get(get_audit))
-            .route("/admin/v1/config/validate", post(validate_config))
-            .route("/admin/v1/config/versions", get(list_config_versions))
-            .route("/admin/v1/config/versions/{v}", get(get_config_version))
-            .route("/admin/v1/config/diff", get(config_diff))
-            .route("/admin/v1/config/rollback", post(rollback_config))
-            .route("/admin/v1/config/reload", post(reload_config))
-            .route("/admin/v1/auth/cache/flush", post(flush_credential_cache))
-            .route("/admin/v1/config/apply", post(apply_config))
-            .route("/admin/v1/openapi.json", get(openapi))
+            .route(
+                "/keys/{id}",
+                get(crate::admin::get_key)
+                    .delete(crate::admin::delete_key)
+                    .patch(crate::admin::update_key),
+            )
+            .route("/keys/{id}/usage", get(crate::admin::key_usage))
+            .route("/keys/{id}/rotate", post(crate::admin::rotate_key))
     }
 }
 
@@ -80,7 +103,7 @@ fn service(handle: &Arc<AppHandle>) -> AdminService {
 }
 
 /// §6.3 BODY-DERIVED AUTHORIZATION REFINEMENT for hook registration. The route matrix admits a
-/// `hooks-register` principal to POST/PUT `/admin/v1/hooks*`, but that scope is "define a hook,
+/// `hooks-register` principal to POST/PUT `/api/v1/admin/hooks*`, but that scope is "define a hook,
 /// don't wire it into a security-critical path". A non-`Full` caller therefore may NOT register a
 /// hook that (a) sees or rewrites caller content/identity (`prompt`/`user` above `no`) or (b) sets
 /// inline `global: true` — attaching to every request is chain WIRING, which is full-only. `Full`
@@ -233,32 +256,32 @@ fn with_config_etag(mut resp: Response, version: u64) -> Response {
 
 // ── route handlers (thin: call the service, project onto the wire) ───────────────────────────────
 
-/// `GET /admin/v1/info` — version, compiled-in plugin proof, uptime, topology.
+/// `GET /api/v1/admin/info` — version, compiled-in plugin proof, uptime, topology.
 async fn info(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).info().await)
 }
 
-/// `GET /admin/v1/pools` — pool topology read.
+/// `GET /api/v1/admin/pools` — pool topology read.
 async fn list_pools(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).list_pools().await)
 }
 
-/// `GET /admin/v1/pools/{name}` — live per-member status of one pool (404 if unknown).
+/// `GET /api/v1/admin/pools/{name}` — live per-member status of one pool (404 if unknown).
 async fn get_pool(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
     respond(StatusCode::OK, service(&handle).get_pool(&name).await)
 }
 
-/// `GET /admin/v1/models` — model lanes + providers.
+/// `GET /api/v1/admin/models` — model lanes + providers.
 async fn list_models(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).list_models().await)
 }
 
-/// `GET /admin/v1/providers` — distinct providers + lane counts.
+/// `GET /api/v1/admin/providers` — distinct providers + lane counts.
 async fn list_providers(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).list_providers().await)
 }
 
-/// `GET /admin/v1/hooks` — the hook registry read (+ config-plane `ETag` for `If-Match` chaining).
+/// `GET /api/v1/admin/hooks` — the hook registry read (+ config-plane `ETag` for `If-Match` chaining).
 async fn list_hooks(State(handle): State<Arc<AppHandle>>) -> Response {
     let version = handle.load().config_version;
     with_config_etag(
@@ -267,7 +290,7 @@ async fn list_hooks(State(handle): State<Arc<AppHandle>>) -> Response {
     )
 }
 
-/// `GET /admin/v1/hooks/{name}` — one hook definition (404 if unregistered; + config-plane `ETag`).
+/// `GET /api/v1/admin/hooks/{name}` — one hook definition (404 if unregistered; + config-plane `ETag`).
 async fn get_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
     let version = handle.load().config_version;
     with_config_etag(
@@ -276,12 +299,12 @@ async fn get_hook(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>
     )
 }
 
-/// `GET /admin/v1/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
+/// `GET /api/v1/admin/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
 async fn hook_health(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
     respond(StatusCode::OK, service(&handle).hook_health(&name).await)
 }
 
-/// `GET /admin/v1/plugins?type=auth|hooks` — the plugin catalog for one type. A missing/unknown
+/// `GET /api/v1/admin/plugins?type=auth|hooks` — the plugin catalog for one type. A missing/unknown
 /// `type` is an `invalid_request` (the two types are distinct engine contracts).
 async fn list_plugins(
     State(handle): State<Arc<AppHandle>>,
@@ -291,13 +314,13 @@ async fn list_plugins(
     respond(StatusCode::OK, service(&handle).list_plugins(ptype).await)
 }
 
-/// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode (no secrets).
+/// `GET /api/v1/admin/auth` — the ingress auth chain + upstream-credential mode (no secrets).
 async fn get_auth(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).get_auth().await)
 }
 
-/// `GET /admin/v1/admin-auth` — the admin-plane auth config (the admin surface guard;
-/// + config-plane `ETag` so a `PUT /admin/v1/admin-auth` can chain `If-Match` off this read).
+/// `GET /api/v1/admin/admin-auth` — the admin-plane auth config (the admin surface guard;
+/// + config-plane `ETag` so a `PUT /api/v1/admin/admin-auth` can chain `If-Match` off this read).
 async fn get_admin_auth(State(handle): State<Arc<AppHandle>>) -> Response {
     let version = handle.load().config_version;
     with_config_etag(
@@ -306,12 +329,12 @@ async fn get_admin_auth(State(handle): State<Arc<AppHandle>>) -> Response {
     )
 }
 
-/// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests, per-key).
+/// `GET /api/v1/admin/usage` — fleet usage aggregation (spend/tokens/requests, per-key).
 async fn get_usage(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).get_usage().await)
 }
 
-/// `GET /admin/v1/config` — the effective running config snapshot (redacted; no secrets;
+/// `GET /api/v1/admin/config` — the effective running config snapshot (redacted; no secrets;
 /// + config-plane `ETag` so apply/rollback callers chain `If-Match` off this read).
 async fn get_config(State(handle): State<Arc<AppHandle>>) -> Response {
     let version = handle.load().config_version;
@@ -321,7 +344,7 @@ async fn get_config(State(handle): State<Arc<AppHandle>>) -> Response {
     )
 }
 
-/// The `POST /admin/v1/hooks` request body: the hook name + its definition. Optimistic concurrency
+/// The `POST /api/v1/admin/hooks` request body: the hook name + its definition. Optimistic concurrency
 /// rides the `If-Match` header (H3) — never a body field.
 #[derive(serde::Deserialize)]
 struct RegisterHookReq {
@@ -329,14 +352,14 @@ struct RegisterHookReq {
     config: crate::config::HookCfg,
 }
 
-/// The `PUT /admin/v1/hooks/{name}` body: the replacement definition (the name rides the path;
+/// The `PUT /api/v1/admin/hooks/{name}` body: the replacement definition (the name rides the path;
 /// optimistic concurrency rides `If-Match`).
 #[derive(serde::Deserialize)]
 struct PutHookReq {
     config: crate::config::HookCfg,
 }
 
-/// `POST /admin/v1/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
+/// `POST /api/v1/admin/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
 /// the next `App` snapshot with the hook wired + transports re-resolved, atomically `swap`s it in, and
 /// returns `201` with the registered hook. A `global` hook is LIVE immediately (new requests see it);
 /// in-flight requests finish on the old snapshot. Lanes/store are untouched — live breaker state is
@@ -426,7 +449,7 @@ async fn register_hook(
     }
 }
 
-/// `PUT /admin/v1/hooks/{name}` — REPLACE an existing hook definition at runtime (live, atomic
+/// `PUT /api/v1/admin/hooks/{name}` — REPLACE an existing hook definition at runtime (live, atomic
 /// swap). `404 not_found` for an unregistered name (PUT replaces; POST creates). `409 conflict`
 /// for a BASE-defined hook (operator file config is edited in the file, never silently shadowed
 /// via the API) and for a grant change (`kind`/`prompt`/`user` are immutable — §6.4, enforced in
@@ -510,7 +533,7 @@ async fn put_hook(
     }
 }
 
-/// `DELETE /admin/v1/hooks/{name}` — remove an API-registered hook at RUNTIME (live). Builds the next
+/// `DELETE /api/v1/admin/hooks/{name}` — remove an API-registered hook at RUNTIME (live). Builds the next
 /// snapshot without the hook (dropped from the registry + global wiring, transports re-resolved) and
 /// swaps it in. `404 not_found` if the hook is unregistered; `409 conflict` if the hook is
 /// base-config-defined (base hooks are file-owned and read-only via the API — the same posture as
@@ -594,7 +617,7 @@ async fn delete_hook(
     }
 }
 
-/// `GET /admin/v1/audit` — the admin audit log (most-recent-first), every mutation with its outcome.
+/// `GET /api/v1/admin/audit` — the admin audit log (most-recent-first), every mutation with its outcome.
 /// Filters: `?action=hook.register`, `?resource=hook:x`. Paginated by the shared cursor envelope:
 /// `?limit=N` (cap 1000) + opaque `?cursor=`, response `{items, next_cursor}` (next_cursor iff more).
 async fn get_audit(Query(q): Query<std::collections::HashMap<String, String>>) -> Response {
@@ -618,7 +641,7 @@ async fn get_audit(Query(q): Query<std::collections::HashMap<String, String>>) -
     )
 }
 
-/// `GET /admin/v1/config/versions` — version history metadata, newest first. Paginated by the shared
+/// `GET /api/v1/admin/config/versions` — version history metadata, newest first. Paginated by the shared
 /// cursor envelope: `?limit=N` (cap 1000) + opaque `?cursor=`, response `{items, next_cursor}`.
 async fn list_config_versions(
     State(handle): State<Arc<AppHandle>>,
@@ -641,7 +664,7 @@ async fn list_config_versions(
     )
 }
 
-/// `GET /admin/v1/config/versions/{v}` — one retained version WITH its hook-surface snapshot.
+/// `GET /api/v1/admin/config/versions/{v}` — one retained version WITH its hook-surface snapshot.
 async fn get_config_version(State(handle): State<Arc<AppHandle>>, Path(v): Path<u64>) -> Response {
     match handle.load().versions.get(v) {
         Some(cv) => ok_json(
@@ -661,7 +684,7 @@ async fn get_config_version(State(handle): State<Arc<AppHandle>>, Path(v): Path<
     }
 }
 
-/// `GET /admin/v1/config/diff?from=&to=` — structured hook-surface diff between two retained
+/// `GET /api/v1/admin/config/diff?from=&to=` — structured hook-surface diff between two retained
 /// versions: hook names added / removed / changed (definition differs), plus the global wiring of
 /// each side when it changed.
 async fn config_diff(
@@ -718,14 +741,14 @@ async fn config_diff(
     ok_json(StatusCode::OK, &body)
 }
 
-/// The `POST /admin/v1/config/rollback` request body. Optimistic concurrency rides `If-Match` (H3).
+/// The `POST /api/v1/admin/config/rollback` request body. Optimistic concurrency rides `If-Match` (H3).
 #[derive(serde::Deserialize)]
 struct RollbackReq {
     /// The retained version to restore.
     version: u64,
 }
 
-/// `POST /admin/v1/config/rollback` — restore a retained version's hook surface. The target is
+/// `POST /api/v1/admin/config/rollback` — restore a retained version's hook surface. The target is
 /// RE-VALIDATED against current reality before the swap (a rollback that no longer resolves is
 /// rejected, never blindly applied); the result is a NEW version (history is append-only — rolling
 /// back never rewrites it), audited and overlay-persisted.
@@ -816,8 +839,8 @@ async fn rollback_config(
     }
 }
 
-/// `PUT /admin/v1/admin-auth` — replace the ADMIN auth chain (`admin_auth:`) at runtime. Pairs with
-/// `GET /admin/v1/admin-auth`, which reports the same `admin_auth` chain (read-after-write coherent).
+/// `PUT /api/v1/admin/admin-auth` — replace the ADMIN auth chain (`admin_auth:`) at runtime. Pairs with
+/// `GET /api/v1/admin/admin-auth`, which reports the same `admin_auth` chain (read-after-write coherent).
 /// Body:
 /// `{"admin_auth": ["module", ...]}`. Guarded three ways:
 /// - every name must be a compiled-in admin module (a typo can never silently drop auth);
@@ -875,7 +898,7 @@ async fn put_auth(
     }
     if req.admin_auth.is_empty() {
         tracing::warn!(
-            "PUT /admin/v1/admin-auth applied an EMPTY admin_auth chain — the admin API is now the \
+            "PUT /api/v1/admin/admin-auth applied an EMPTY admin_auth chain — the admin API is now the \
              open (anonymous, full-authority) dev posture"
         );
     }
@@ -941,7 +964,7 @@ async fn put_auth(
     )
 }
 
-/// `POST /admin/v1/auth/cache/flush` — INSTANT REVOCATION of the credential cache's
+/// `POST /api/v1/admin/auth/cache/flush` — INSTANT REVOCATION of the credential cache's
 /// cached-allow window (design-hooks-v2 §2.5). Body `{"module": "<name>"}` flushes one module's
 /// partition; no/empty body flushes everything. The deny path never needed this (`Reject` is
 /// never cached); this closes the Identify window when a directory changes NOW.
@@ -981,7 +1004,7 @@ async fn flush_credential_cache(
     ok_json(StatusCode::OK, &json!({ "flushed": flushed }))
 }
 
-/// `POST /admin/v1/config/reload` — re-run the BOOT disk-load pipeline (config.yaml +
+/// `POST /api/v1/admin/config/reload` — re-run the BOOT disk-load pipeline (config.yaml +
 /// providers.yaml + env interpolation from the boot-time environment + overlay merge), validate,
 /// build a complete new `App` reusing process-lifetime state (client pool, governance DB, version
 /// history, rate windows) with every surviving lane's health RESTORED BY STABLE IDENTITY, and
@@ -1055,7 +1078,7 @@ async fn reload_config(
     }
 }
 
-/// The `POST /admin/v1/config/apply` body: a full proposed config (validate's exact shape).
+/// The `POST /api/v1/admin/config/apply` body: a full proposed config (validate's exact shape).
 /// Optimistic concurrency rides `If-Match` (H3).
 #[derive(serde::Deserialize)]
 struct ApplyConfigReq {
@@ -1067,7 +1090,7 @@ struct ApplyConfigReq {
     providers: std::collections::HashMap<String, crate::config::ProviderDef>,
 }
 
-/// `POST /admin/v1/config/apply` — apply a FULL config carried in the request body, atomically:
+/// `POST /api/v1/admin/config/apply` — apply a FULL config carried in the request body, atomically:
 /// resolve + validate (an invalid config is a 400 that changes nothing), build a complete new
 /// `App` reusing process-lifetime state, carry every surviving lane's health BY STABLE IDENTITY
 /// (D1), swap. The body-carried twin of `config/reload` (disk) — Terraform/CI push the config they
@@ -1160,13 +1183,13 @@ async fn apply_config(
     }
 }
 
-/// The `PATCH /admin/v1/hooks/{name}/settings` body. Optimistic concurrency rides `If-Match` (H3).
+/// The `PATCH /api/v1/admin/hooks/{name}/settings` body. Optimistic concurrency rides `If-Match` (H3).
 #[derive(serde::Deserialize)]
 struct PatchSettingsReq {
     settings: serde_json::Map<String, serde_json::Value>,
 }
 
-/// `PATCH /admin/v1/hooks/{name}/settings` — push an opaque settings map to the RUNNING hook and
+/// `PATCH /api/v1/admin/hooks/{name}/settings` — push an opaque settings map to the RUNNING hook and
 /// COMMIT ON ACK (D2): busbar sends the `configure` message over the hook's transport, waits for
 /// the versioned ack (5s deadline), and only then swaps in the registry update (grants untouched —
 /// immutability holds by construction) + persists + audits + versions. A nack/timeout/error
@@ -1289,7 +1312,7 @@ async fn patch_hook_settings(
     }
 }
 
-/// `GET /admin/v1/hooks/{name}/schema` — proxy the hook's self-described settings JSON Schema
+/// `GET /api/v1/admin/hooks/{name}/schema` — proxy the hook's self-described settings JSON Schema
 /// (the `describe` wire message). `{"schema": null}` when the hook/transport doesn't answer.
 async fn hook_schema(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
     let current = handle.load();
@@ -1305,42 +1328,42 @@ async fn hook_schema(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
 /// Adding a GET endpoint means adding it here so the doc + the drift guard both see it.
 pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
-        "/admin/v1/info",
+        "/api/v1/admin/info",
         "Version, compiled-in plugin proof, uptime, topology",
     ),
-    ("/admin/v1/pools", "Pool topology (members + weights)"),
-    ("/admin/v1/models", "Model lanes + upstream providers"),
-    ("/admin/v1/providers", "Distinct providers + lane counts"),
-    ("/admin/v1/hooks", "Hook registry (definitions)"),
+    ("/api/v1/admin/pools", "Pool topology (members + weights)"),
+    ("/api/v1/admin/models", "Model lanes + upstream providers"),
+    ("/api/v1/admin/providers", "Distinct providers + lane counts"),
+    ("/api/v1/admin/hooks", "Hook registry (definitions)"),
     (
-        "/admin/v1/plugins",
+        "/api/v1/admin/plugins",
         "Plugin catalog by type (compiled-in + external)",
     ),
     (
-        "/admin/v1/auth",
+        "/api/v1/admin/auth",
         "Ingress auth chain + upstream-credential mode",
     ),
     (
-        "/admin/v1/admin-auth",
+        "/api/v1/admin/admin-auth",
         "Admin-plane auth config (the admin surface guard)",
     ),
     (
-        "/admin/v1/usage",
+        "/api/v1/admin/usage",
         "Fleet usage aggregation (spend/tokens/requests, per-key)",
     ),
     (
-        "/admin/v1/config",
+        "/api/v1/admin/config",
         "Effective running config snapshot (redacted)",
     ),
     (
-        "/admin/v1/audit",
+        "/api/v1/admin/audit",
         "Admin audit log — every mutation with its outcome (newest first). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
     ),
     (
-        "/admin/v1/config/versions",
+        "/api/v1/admin/config/versions",
         "Config version history (newest first; id/ts/principal/summary). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
     ),
-    ("/admin/v1/openapi.json", "This OpenAPI 3.1 document"),
+    ("/api/v1/admin/openapi.json", "This OpenAPI 3.1 document"),
 ];
 
 /// Build the OpenAPI 3.1 document describing the v1 JSON-REST surface. Paths + methods + the stable
@@ -1366,7 +1389,7 @@ fn openapi_doc() -> serde_json::Value {
     }
     // Runtime hook registration: POST on the /hooks collection (merged onto its GET entry above).
     if let Some(obj) = paths
-        .get_mut("/admin/v1/hooks")
+        .get_mut("/api/v1/admin/hooks")
         .and_then(|p| p.as_object_mut())
     {
         obj.insert(
@@ -1385,7 +1408,7 @@ fn openapi_doc() -> serde_json::Value {
     }
     // Templated + non-GET routes.
     paths.insert(
-        "/admin/v1/hooks/{name}".to_string(),
+        "/api/v1/admin/hooks/{name}".to_string(),
         json!({
             "get": {
                 "summary": "One hook definition",
@@ -1431,7 +1454,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/pools/{name}".to_string(),
+        "/api/v1/admin/pools/{name}".to_string(),
         json!({
             "get": {
                 "summary": "Live per-member status of one pool (breaker/concurrency/latency)",
@@ -1448,7 +1471,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/hooks/{name}/health".to_string(),
+        "/api/v1/admin/hooks/{name}/health".to_string(),
         json!({
             "get": {
                 "summary": "Best-effort hook transport reachability",
@@ -1465,7 +1488,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/config/diff".to_string(),
+        "/api/v1/admin/config/diff".to_string(),
         json!({
             "get": {
                 "summary": "Structured hook-surface diff between two retained versions",
@@ -1484,7 +1507,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/config/versions/{v}".to_string(),
+        "/api/v1/admin/config/versions/{v}".to_string(),
         json!({
             "get": {
                 "summary": "One retained config version, with its hook-surface snapshot",
@@ -1501,7 +1524,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/hooks/{name}/settings".to_string(),
+        "/api/v1/admin/hooks/{name}/settings".to_string(),
         json!({
             "patch": {
                 "summary": "Push an opaque settings map to the running hook; COMMIT ON ACK",
@@ -1521,7 +1544,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/hooks/{name}/schema".to_string(),
+        "/api/v1/admin/hooks/{name}/schema".to_string(),
         json!({
             "get": {
                 "summary": "The hook's self-described settings JSON Schema (describe proxy)",
@@ -1538,7 +1561,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/config/apply".to_string(),
+        "/api/v1/admin/config/apply".to_string(),
         json!({
             "post": {
                 "summary": "Apply a full config from the request body, atomically (live until next reload/restart; health preserved by lane identity)",
@@ -1552,7 +1575,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/config/reload".to_string(),
+        "/api/v1/admin/config/reload".to_string(),
         json!({
             "post": {
                 "summary": "Re-read config.yaml/providers.yaml from disk and apply atomically (health state preserved by lane identity)",
@@ -1564,7 +1587,7 @@ fn openapi_doc() -> serde_json::Value {
             }
         }),
     );
-    if let Some(auth_path) = paths.get_mut("/admin/v1/admin-auth") {
+    if let Some(auth_path) = paths.get_mut("/api/v1/admin/admin-auth") {
         auth_path["put"] = json!({
             "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
             "security": [{"adminToken": []}],
@@ -1576,7 +1599,7 @@ fn openapi_doc() -> serde_json::Value {
         });
     }
     paths.insert(
-        "/admin/v1/auth/cache/flush".to_string(),
+        "/api/v1/admin/auth/cache/flush".to_string(),
         json!({
             "post": {
                 "summary": "Flush the credential cache — one module's partition (`{module}`) or everything (empty body). Instant revocation of the cached-allow window",
@@ -1589,7 +1612,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/config/rollback".to_string(),
+        "/api/v1/admin/config/rollback".to_string(),
         json!({
             "post": {
                 "summary": "Restore a retained version's hook surface (re-validated; a NEW version)",
@@ -1604,7 +1627,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/config/validate".to_string(),
+        "/api/v1/admin/config/validate".to_string(),
         json!({
             "post": {
                 "summary": "Dry-run validate a proposed config",
@@ -1620,7 +1643,7 @@ fn openapi_doc() -> serde_json::Value {
     // Virtual-key management (mounted in main.rs, not the v1 router, but part of the frozen v1
     // surface — must be discoverable). The secret is shown ONCE at create/rotate and never read back.
     paths.insert(
-        "/admin/v1/keys".to_string(),
+        "/api/v1/admin/keys".to_string(),
         json!({
             "get": {
                 "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=. Paginate: ?limit=, ?cursor= (opaque)",
@@ -1643,7 +1666,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/keys/{id}".to_string(),
+        "/api/v1/admin/keys/{id}".to_string(),
         json!({
             "get": {
                 "summary": "One key's metadata + `ETag` (never the secret/hash)",
@@ -1677,7 +1700,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/keys/{id}/usage".to_string(),
+        "/api/v1/admin/keys/{id}/usage".to_string(),
         json!({
             "get": {
                 "summary": "Current-window usage for one key (spend / tokens / requests)",
@@ -1691,7 +1714,7 @@ fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
-        "/admin/v1/keys/{id}/rotate".to_string(),
+        "/api/v1/admin/keys/{id}/rotate".to_string(),
         json!({
             "post": {
                 "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving",
@@ -1738,15 +1761,15 @@ fn openapi_doc() -> serde_json::Value {
     // advertise a guard they don't enforce. Keys PATCH/DELETE guard on the KEY's own ETag; the
     // config-plane ops guard on the config-version ETag their reads emit.
     const IF_MATCH_GUARDED: &[(&str, &str)] = &[
-        ("/admin/v1/hooks", "post"),
-        ("/admin/v1/hooks/{name}", "put"),
-        ("/admin/v1/hooks/{name}", "delete"),
-        ("/admin/v1/hooks/{name}/settings", "patch"),
-        ("/admin/v1/admin-auth", "put"),
-        ("/admin/v1/config/apply", "post"),
-        ("/admin/v1/config/rollback", "post"),
-        ("/admin/v1/keys/{id}", "patch"),
-        ("/admin/v1/keys/{id}", "delete"),
+        ("/api/v1/admin/hooks", "post"),
+        ("/api/v1/admin/hooks/{name}", "put"),
+        ("/api/v1/admin/hooks/{name}", "delete"),
+        ("/api/v1/admin/hooks/{name}/settings", "patch"),
+        ("/api/v1/admin/admin-auth", "put"),
+        ("/api/v1/admin/config/apply", "post"),
+        ("/api/v1/admin/config/rollback", "post"),
+        ("/api/v1/admin/keys/{id}", "patch"),
+        ("/api/v1/admin/keys/{id}", "delete"),
     ];
     for (path, method) in IF_MATCH_GUARDED {
         if let Some(op) = paths
@@ -1775,7 +1798,7 @@ fn openapi_doc() -> serde_json::Value {
         "info": {
             "title": "Busbar Admin API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "The frozen, additive-only /admin/v1 surface. Errors use the stable \
+            "description": "The frozen, additive-only /api/v1/admin surface. Errors use the stable \
                             envelope {\"error\":{\"code\",\"message\"}}; tooling branches on `code`."
         },
         "components": {
@@ -1805,12 +1828,12 @@ fn openapi_doc() -> serde_json::Value {
     })
 }
 
-/// `GET /admin/v1/openapi.json` — the OpenAPI 3.1 schema of the v1 surface (the discovery contract).
+/// `GET /api/v1/admin/openapi.json` — the OpenAPI 3.1 schema of the v1 surface (the discovery contract).
 async fn openapi() -> Response {
     ok_json(StatusCode::OK, &openapi_doc())
 }
 
-/// The `POST /admin/v1/config/validate` request body: a full proposed config — the `config.yaml`
+/// The `POST /api/v1/admin/config/validate` request body: a full proposed config — the `config.yaml`
 /// deploy block + the `providers.yaml` definitions — mirroring the two files busbar loads at boot.
 #[derive(serde::Deserialize)]
 struct ValidateConfigReq {
@@ -1823,7 +1846,7 @@ struct ValidateConfigReq {
     providers: std::collections::HashMap<String, crate::config::ProviderDef>,
 }
 
-/// `POST /admin/v1/config/validate` — dry-run validate a proposed config. A malformed body is an
+/// `POST /api/v1/admin/config/validate` — dry-run validate a proposed config. A malformed body is an
 /// `invalid_request`; a well-formed body always returns 200 with the `{ok, errors}` verdict.
 async fn validate_config(
     State(handle): State<Arc<AppHandle>>,
@@ -1917,7 +1940,7 @@ mod tests {
     }
 
     /// Structural lock on the discovery doc: OpenAPI 3.1, an info.version that matches the crate,
-    /// and every path under the frozen `/admin/v1/` prefix (the deprecated aliases are documented
+    /// and every path under the frozen `/api/v1/admin/` prefix (the deprecated aliases are documented
     /// elsewhere; v1's own doc never mixes prefixes).
     #[test]
     fn openapi_doc_is_31_and_v1_prefixed() {
@@ -1929,8 +1952,8 @@ mod tests {
         assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
         for path in doc["paths"].as_object().unwrap().keys() {
             assert!(
-                path.starts_with("/admin/v1/"),
-                "{path} escaped the frozen /admin/v1/ prefix"
+                path.starts_with("/api/v1/admin/"),
+                "{path} escaped the frozen /api/v1/admin/ prefix"
             );
         }
     }
@@ -2006,10 +2029,10 @@ mod tests {
     fn openapi_hook_escalation_endpoints_document_403() {
         let doc = openapi_doc();
         let cases = [
-            ("/admin/v1/hooks", "post"),
-            ("/admin/v1/hooks/{name}", "put"),
-            ("/admin/v1/hooks/{name}", "delete"),
-            ("/admin/v1/hooks/{name}/settings", "patch"),
+            ("/api/v1/admin/hooks", "post"),
+            ("/api/v1/admin/hooks/{name}", "put"),
+            ("/api/v1/admin/hooks/{name}", "delete"),
+            ("/api/v1/admin/hooks/{name}/settings", "patch"),
         ];
         for (path, method) in cases {
             assert!(

@@ -104,7 +104,7 @@ pub(crate) struct RootCfg {
     /// gate by name via `hook:`, and `global_hooks` names those firing on every request. Empty when
     /// no `hooks:` block is present.
     pub(crate) hooks: HashMap<String, HookCfg>,
-    /// The ADMIN auth chain (`admin_auth:`) — ordered module names gating `/admin/v1/*` (the
+    /// The ADMIN auth chain (`admin_auth:`) — ordered module names gating `/api/v1/admin/*` (the
     /// parallel of `auth.chain` for the operator surface). Default `[admin-tokens]` (the single
     /// operator admin token, exactly 1.2.1 behavior). `[]` = OPEN admin (dev only; loud boot
     /// warning). Each name must resolve to a compiled-in admin auth module.
@@ -811,7 +811,7 @@ pub(crate) struct HookCfg {
     pub(crate) on_empty: Option<PolicyOnError>,
     /// OPAQUE settings map pushed to the hook via the `configure` wire message (D2): sent as the
     /// first line on every socket connection and re-pushed (commit-on-ack) by
-    /// `PATCH /admin/v1/hooks/{name}/settings`. Busbar never interprets the contents.
+    /// `PATCH /api/v1/admin/hooks/{name}/settings`. Busbar never interprets the contents.
     #[serde(default)]
     pub(crate) settings: serde_json::Map<String, serde_json::Value>,
     /// Fire on EVERY request — inline sugar for adding this name to `global_hooks:`. Default false.

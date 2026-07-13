@@ -289,7 +289,7 @@ fn gate_socket_transport(hook: &crate::config::HookCfg) -> Option<Arc<dyn Routin
 const CONFIGURE_TIMEOUT_MS: u64 = 5000;
 
 /// PUSH a settings map to a hook over its transport and wait for the ack (D2, the
-/// `PATCH /admin/v1/hooks/{name}/settings` core). `Ok` = acked (commit); `Err` = NOT committed.
+/// `PATCH /api/v1/admin/hooks/{name}/settings` core). `Ok` = acked (commit); `Err` = NOT committed.
 pub(crate) async fn push_configure(
     hook: &crate::config::HookCfg,
     name: &str,
@@ -311,7 +311,7 @@ pub(crate) async fn push_configure(
 }
 
 /// Fetch a hook's self-described settings schema over its transport (D2,
-/// `GET /admin/v1/hooks/{name}/schema`). `None` = the hook/transport doesn't answer describe.
+/// `GET /api/v1/admin/hooks/{name}/schema`). `None` = the hook/transport doesn't answer describe.
 pub(crate) async fn fetch_schema(
     hook: &crate::config::HookCfg,
     client: &reqwest::Client,

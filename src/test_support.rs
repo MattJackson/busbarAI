@@ -2263,7 +2263,7 @@ mod tests {
 
         // Missing admin token → 401.
         let r = client
-            .post(format!("{base}/admin/keys"))
+            .post(format!("{base}/api/v1/admin/keys"))
             .json(&serde_json::json!({"name": "x"}))
             .send()
             .await
@@ -2272,7 +2272,7 @@ mod tests {
 
         // Create a key with the admin token.
         let r = client
-            .post(format!("{base}/admin/keys"))
+            .post(format!("{base}/api/v1/admin/keys"))
             .bearer_auth("admintok")
             .json(&serde_json::json!({"name": "team-a", "allowed_pools": ["allowedpool"], "rpm_limit": 5}))
             .send()
@@ -2287,7 +2287,7 @@ mod tests {
 
         // List shows it (no hash).
         let r = client
-            .get(format!("{base}/admin/keys"))
+            .get(format!("{base}/api/v1/admin/keys"))
             .bearer_auth("admintok")
             .send()
             .await
@@ -2298,7 +2298,7 @@ mod tests {
 
         // Usage endpoint works.
         let r = client
-            .get(format!("{base}/admin/keys/{id}/usage"))
+            .get(format!("{base}/api/v1/admin/keys/{id}/usage"))
             .bearer_auth("admintok")
             .send()
             .await
@@ -2322,14 +2322,14 @@ mod tests {
 
         // Delete, then it's gone from the list.
         let r = client
-            .delete(format!("{base}/admin/keys/{id}"))
+            .delete(format!("{base}/api/v1/admin/keys/{id}"))
             .bearer_auth("admintok")
             .send()
             .await
             .unwrap();
         assert_eq!(r.status().as_u16(), 204);
         let r = client
-            .get(format!("{base}/admin/keys"))
+            .get(format!("{base}/api/v1/admin/keys"))
             .bearer_auth("admintok")
             .send()
             .await

@@ -185,7 +185,7 @@ pub(crate) struct App {
     /// priority so the merge's stable sort keeps globals-first on ties.
     pub(crate) global_gates: Vec<(u16, crate::routing::ResolvedPolicy)>,
     /// The raw `hooks:` registry (name → definition) as configured, for the Admin API v1 hooks READ
-    /// surface (`GET /admin/v1/hooks`). This is the DEFINITION set, distinct
+    /// surface (`GET /api/v1/admin/hooks`). This is the DEFINITION set, distinct
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty
     /// when no hooks are configured. Read-only after construction; the config-plane mutation surface
     /// swaps a new `App` snapshot rather than mutating this in place.
@@ -194,7 +194,7 @@ pub(crate) struct App {
     /// true`). Carried for the hooks read surface so a definition can report whether it is globally
     /// wired. Read-only after construction.
     pub(crate) global_hooks: Vec<String>,
-    /// Hook names defined in the BASE config file (pre-overlay). `PUT /admin/v1/hooks/{name}` on a
+    /// Hook names defined in the BASE config file (pre-overlay). `PUT /api/v1/admin/hooks/{name}` on a
     /// base hook is a 409 (edit the file, don't shadow it); API-registered (overlay) hooks replace
     /// freely. Immutable after boot.
     pub(crate) base_hook_names: std::collections::HashSet<String>,
@@ -227,7 +227,7 @@ pub(crate) struct App {
     /// `group_map:` — principal groups → operator policy (admin scope today). Read by the admin
     /// authorization resolution; unmapped groups grant nothing (fail closed).
     pub(crate) group_map: HashMap<String, crate::config::GroupMapEntry>,
-    /// The config.yaml path busbar booted from — `POST /admin/v1/config/reload` re-runs the boot
+    /// The config.yaml path busbar booted from — `POST /api/v1/admin/config/reload` re-runs the boot
     /// disk-load pipeline against it. `None` (tests / ephemeral) ⇒ reload is `invalid_request`.
     pub(crate) config_path: Option<std::path::PathBuf>,
     /// The providers.yaml path (same role as `config_path`).
@@ -238,7 +238,7 @@ pub(crate) struct App {
     /// a global) so it is testable + survives config swaps (`App::clone` copies it).
     pub(crate) overlay_path: Option<std::path::PathBuf>,
     /// Monotonic config version — `0` at boot, incremented by each API config apply (the swap builds
-    /// the next snapshot with `config_version + 1`). Exposed on `GET /admin/v1/info` so drift-detection
+    /// the next snapshot with `config_version + 1`). Exposed on `GET /api/v1/admin/info` so drift-detection
     /// tooling can tell whether the running config changed since a prior read. Process-local (resets on
     /// restart); durable version history + rollback is a follow-up.
     pub(crate) config_version: u64,

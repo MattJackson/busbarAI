@@ -121,10 +121,10 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 
 /// Admin error envelope — the FROZEN v1 shape `{"error":{"code":...,"message":...}}` with the
 /// canonical `code` enum (`not_found`/`invalid_request`/`conflict`/`internal`/…), IDENTICAL to every
-/// other `/admin/v1` resource (see `admin::v1::contract::AdminError::code`). These legacy key
+/// other `/api/v1/admin` resource (see `admin::v1::contract::AdminError::code`). These legacy key
 /// handlers previously spoke a DIFFERENT envelope (`{message,type}` with `*_error` values); that
 /// split forced a client/Terraform provider to branch on `error.code` for config/hooks/auth but on
-/// `error.type` for keys, with different values. Since `/admin/v1` freezes at 1.3, keys must speak
+/// `error.type` for keys, with different values. Since `/api/v1/admin` freezes at 1.3, keys must speak
 /// the one contract (audit: admin contract H1). `message` carries only caller-safe text — store/DB
 /// details are logged server-side (see `internal_error`) and never reach this body.
 fn error_response(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
@@ -159,7 +159,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
     )
 }
 
-// ── Admin API (the FROZEN surface — /admin/v1/*) ─────────────────────────────────────────────────
+// ── Admin API (the FROZEN surface — /api/v1/admin/*) ─────────────────────────────────────────────────
 //
 // Built engine + swappable layers (Matthew 7/11), VERSION-FIRST: each API version (`v1`, later `v2`)
 // is a self-contained unit under its own directory holding that version's CONTRACT (typed views +
@@ -167,7 +167,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 // adapters (`json`, later `graphql`). The transport PORT (`AdminTransport` in `transport`) is shared
 // across versions and transports. Releasing v2 is a LAYER copy of `v1/`, not a rewrite; v1 never
 // breaks. The `/admin/keys` handlers below are mounted under BOTH the deprecated `/admin/keys`
-// alias and the canonical `/admin/v1/keys` prefix (main.rs), so they speak the ONE frozen v1
+// alias and the canonical `/api/v1/admin/keys` prefix (main.rs), so they speak the ONE frozen v1
 // contract: the `{error:{code,message}}` envelope with the stable code enum (contract H1) — not a
 // bespoke `{type}` envelope. Keys are a first-class v1 resource served by these handlers until they
 // migrate into the versioned service module.
@@ -745,7 +745,7 @@ pub(crate) async fn list_keys(
     }
 }
 
-/// POST /admin/v1/keys/{id}/rotate — mint a FRESH bearer secret for an existing key, in place: the
+/// POST /api/v1/admin/keys/{id}/rotate — mint a FRESH bearer secret for an existing key, in place: the
 /// id (and with it budgets, rate windows, usage, audit attribution) is unchanged; the old secret
 /// stops resolving immediately; the new secret is returned exactly once, exactly like mint. 404
 /// for an unknown id. An attached AWS SigV4 credential is not touched (separate lifecycle).
@@ -929,7 +929,7 @@ pub(crate) async fn delete_key(
     match res {
         Ok(Ok(DeleteOutcome::Deleted)) => {
             audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_APPLIED, &actor);
-            // 204 No Content — the SAME success shape as `DELETE /admin/v1/hooks/{name}` (was a
+            // 204 No Content — the SAME success shape as `DELETE /api/v1/admin/hooks/{name}` (was a
             // bespoke `200 {"deleted": id}` found nowhere else on the surface). (contract H4.)
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1028,7 +1028,7 @@ mod tests {
         (addr, handle)
     }
 
-    /// `GET /admin/v1/info` flows end-to-end through the ports-and-adapters stack (JSON-REST
+    /// `GET /api/v1/admin/info` flows end-to-end through the ports-and-adapters stack (JSON-REST
     /// transport → service → contract view): admin-token guarded, returns the version, the
     /// compiled-in plugin proof (with the default build's `tokens`/`ranking` present + the always-on
     /// `weighted_floor`), and the topology counts. Proves the transport is mounted and the frozen
@@ -1043,7 +1043,7 @@ mod tests {
 
         // Wrong token → 401 (the v1 surface is admin-guarded like the rest of /admin).
         let unauth = client
-            .get(format!("http://{addr}/admin/v1/info"))
+            .get(format!("http://{addr}/api/v1/admin/info"))
             .send()
             .await
             .unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
         );
 
         let resp = client
-            .get(format!("http://{addr}/admin/v1/info"))
+            .get(format!("http://{addr}/api/v1/admin/info"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1092,7 +1092,7 @@ mod tests {
         handle.abort();
     }
 
-    /// The topology read surface (`/admin/v1/pools`, `/models`, `/providers`) flows through the
+    /// The topology read surface (`/api/v1/admin/pools`, `/models`, `/providers`) flows through the
     /// service and projects the pool/model/provider views. Built on a two-lane, two-provider fixture
     /// so the provider aggregation + pool membership are observable.
     #[tokio::test]
@@ -1144,7 +1144,7 @@ mod tests {
             }
         };
 
-        let pools = get("/admin/v1/pools".into()).await;
+        let pools = get("/api/v1/admin/pools".into()).await;
         let items = pools["items"].as_array().unwrap();
         let mypool = items
             .iter()
@@ -1155,7 +1155,7 @@ mod tests {
         let weight_a = members.iter().find(|m| m["model"] == "model-a").unwrap()["weight"].as_u64();
         assert_eq!(weight_a, Some(3), "model-a weight projected");
 
-        let models = get("/admin/v1/models".into()).await;
+        let models = get("/api/v1/admin/models".into()).await;
         let m_items = models["items"].as_array().unwrap();
         assert!(m_items
             .iter()
@@ -1164,7 +1164,7 @@ mod tests {
             .iter()
             .any(|m| m["model"] == "model-b" && m["provider"] == "prov-y"));
 
-        let providers = get("/admin/v1/providers".into()).await;
+        let providers = get("/api/v1/admin/providers".into()).await;
         let p_items = providers["items"].as_array().unwrap();
         let px = p_items.iter().find(|p| p["provider"] == "prov-x").unwrap();
         assert_eq!(px["model_count"].as_u64(), Some(1));
@@ -1173,7 +1173,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `GET /admin/v1/pools/{name}` projects each member's LIVE status (usable/cooldown/concurrency/
+    /// `GET /api/v1/admin/pools/{name}` projects each member's LIVE status (usable/cooldown/concurrency/
     /// inflight/tallies) from the store; 404s an unknown pool.
     #[tokio::test]
     async fn test_admin_v1_pool_detail_live_status() {
@@ -1200,7 +1200,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         let ok: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/pools/mypool"))
+            .get(format!("http://{addr}/api/v1/admin/pools/mypool"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1224,7 +1224,7 @@ mod tests {
 
         // Unknown pool → 404 not_found.
         let missing = client
-            .get(format!("http://{addr}/admin/v1/pools/nope"))
+            .get(format!("http://{addr}/api/v1/admin/pools/nope"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1238,7 +1238,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `GET /admin/v1/admin-auth` reports the admin-plane guard: with governance + an admin token it
+    /// `GET /api/v1/admin/admin-auth` reports the admin-plane guard: with governance + an admin token it
     /// is `configured: true` with the `admin-token` module. Never a secret.
     #[tokio::test]
     async fn test_admin_v1_admin_auth_read() {
@@ -1253,7 +1253,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         let body: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/admin-auth"))
+            .get(format!("http://{addr}/api/v1/admin/admin-auth"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1272,7 +1272,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `GET /admin/v1/keys/{id}` returns one key's metadata (never the secret/hash); 404 for an
+    /// `GET /api/v1/admin/keys/{id}` returns one key's metadata (never the secret/hash); 404 for an
     /// unknown id. Fills the single-key read gap on the legacy key surface.
     #[tokio::test]
     async fn test_admin_v1_get_single_key() {
@@ -1302,7 +1302,7 @@ mod tests {
 
         // Found → 200 with metadata, no secret/hash.
         let resp = client
-            .get(format!("http://{addr}/admin/v1/keys/{}", minted.id))
+            .get(format!("http://{addr}/api/v1/admin/keys/{}", minted.id))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1320,7 +1320,7 @@ mod tests {
 
         // Unknown id → 404.
         let missing = client
-            .get(format!("http://{addr}/admin/v1/keys/vk_doesnotexist"))
+            .get(format!("http://{addr}/api/v1/admin/keys/vk_doesnotexist"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1330,7 +1330,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `GET /admin/v1/usage` aggregates governance's per-key counters into fleet totals + a per-key
+    /// `GET /api/v1/admin/usage` aggregates governance's per-key counters into fleet totals + a per-key
     /// breakdown. A freshly minted key appears with zero usage; totals reflect it. Never leaks the
     /// secret (id/name only).
     #[tokio::test]
@@ -1361,7 +1361,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         let body: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/usage"))
+            .get(format!("http://{addr}/api/v1/admin/usage"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -1389,8 +1389,8 @@ mod tests {
         handle.abort();
     }
 
-    /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
-    /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
+    /// END-TO-END config apply: `POST /api/v1/admin/hooks` registers a hook at runtime (201), and a
+    /// subsequent `GET /api/v1/admin/hooks` SEES it — proving the AppHandle swap took effect AND the
     /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
     /// D2 e2e (unix): PATCH settings pushes `configure` to the running hook and commits ON ACK
     /// (the registry shows the new settings); a NACKing hook commits nothing; GET schema proxies
@@ -1452,7 +1452,7 @@ mod tests {
         };
 
         // Register the hook (overlay), then PATCH its settings — ack mode on: commits.
-        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+        let created = admin(client.post(format!("http://{addr}/api/v1/admin/hooks")))
             .body(
                 serde_json::json!({
                     "name": "cfg-hook",
@@ -1464,15 +1464,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.status().as_u16(), 201);
-        let patched =
-            admin(client.patch(format!("http://{addr}/admin/v1/hooks/cfg-hook/settings")))
-                .body(serde_json::json!({"settings": {"ratio": 0.4}}).to_string())
-                .send()
-                .await
-                .unwrap();
+        let patched = admin(client.patch(format!(
+            "http://{addr}/api/v1/admin/hooks/cfg-hook/settings"
+        )))
+        .body(serde_json::json!({"settings": {"ratio": 0.4}}).to_string())
+        .send()
+        .await
+        .unwrap();
         assert_eq!(patched.status().as_u16(), 200, "{:?}", patched.text().await);
         let got: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/hooks/cfg-hook")))
                 .send()
                 .await
                 .unwrap()
@@ -1486,15 +1487,16 @@ mod tests {
 
         // NACK mode: the push is refused — nothing commits.
         ack_mode.store(false, std::sync::atomic::Ordering::Relaxed);
-        let refused =
-            admin(client.patch(format!("http://{addr}/admin/v1/hooks/cfg-hook/settings")))
-                .body(serde_json::json!({"settings": {"ratio": 0.9}}).to_string())
-                .send()
-                .await
-                .unwrap();
+        let refused = admin(client.patch(format!(
+            "http://{addr}/api/v1/admin/hooks/cfg-hook/settings"
+        )))
+        .body(serde_json::json!({"settings": {"ratio": 0.9}}).to_string())
+        .send()
+        .await
+        .unwrap();
         assert_eq!(refused.status().as_u16(), 400, "nack = not committed");
         let still: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/hooks/cfg-hook")))
                 .send()
                 .await
                 .unwrap()
@@ -1510,7 +1512,7 @@ mod tests {
         // the fresh describe connection, and a nacking hook refuses connections by design).
         ack_mode.store(true, std::sync::atomic::Ordering::Relaxed);
         let schema: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook/schema")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/hooks/cfg-hook/schema")))
                 .send()
                 .await
                 .unwrap()
@@ -1527,7 +1529,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `POST /admin/v1/config/apply`: a body-carried full config swaps in atomically — the new
+    /// `POST /api/v1/admin/config/apply`: a body-carried full config swaps in atomically — the new
     /// topology is live, the surviving identity keeps its tripped health, and a stale
     /// If-Match is a 409 that changes nothing.
     #[tokio::test]
@@ -1572,7 +1574,7 @@ mod tests {
                 "pools": {"apply-pool": {"members": [{"target": "m0"}, {"target": "m-applied"}]}}
             }
         });
-        let resp = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+        let resp = admin(client.post(format!("http://{addr}/api/v1/admin/config/apply")))
             .body(body.to_string())
             .send()
             .await
@@ -1580,7 +1582,7 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
 
         let pool: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/pools/apply-pool")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/pools/apply-pool")))
                 .send()
                 .await
                 .unwrap()
@@ -1594,7 +1596,7 @@ mod tests {
         assert_eq!(ma["usable"], true, "fresh lane: {ma}");
 
         // Stale If-Match: 409, nothing applied (H3: concurrency rides the header, never the body).
-        let stale = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+        let stale = admin(client.post(format!("http://{addr}/api/v1/admin/config/apply")))
             .header("if-match", "\"0\"")
             .body(
                 serde_json::json!({
@@ -1607,7 +1609,7 @@ mod tests {
             .unwrap();
         assert_eq!(stale.status().as_u16(), 409);
         // A malformed If-Match is a 400 invalid_request, never a silent unguarded write.
-        let malformed = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+        let malformed = admin(client.post(format!("http://{addr}/api/v1/admin/config/apply")))
             .header("if-match", "\"not-a-version\"")
             .body(
                 serde_json::json!({
@@ -1623,7 +1625,7 @@ mod tests {
         handle.abort();
     }
 
-    /// `POST /admin/v1/config/reload`: re-reads disk truth and swaps it in atomically — the new
+    /// `POST /api/v1/admin/config/reload`: re-reads disk truth and swaps it in atomically — the new
     /// topology is live, surviving lanes keep their learned health BY IDENTITY (a breaker tripped
     /// before the reload is still tripped after it), and an invalid disk config rejects with 400
     /// changing nothing.
@@ -1692,18 +1694,19 @@ pools:
         let admin = |req: reqwest::RequestBuilder| req.header("x-admin-token", "admintok");
 
         // Reload: disk truth replaces the synthetic topology.
-        let resp = admin(client.post(format!("http://{addr}/admin/v1/config/reload")))
+        let resp = admin(client.post(format!("http://{addr}/api/v1/admin/config/reload")))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
-        let models: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/models")))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let models: serde_json::Value =
+            admin(client.get(format!("http://{addr}/api/v1/admin/models")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
         let names: Vec<&str> = models["items"]
             .as_array()
             .unwrap()
@@ -1717,7 +1720,7 @@ pools:
 
         // The surviving identity (m0 @ test-provider) carried its tripped health state.
         let pool: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/pools/reload-pool")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/pools/reload-pool")))
                 .send()
                 .await
                 .unwrap()
@@ -1754,25 +1757,27 @@ providers: {}
 ",
         )
         .unwrap();
-        let before: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/info")))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let bad = admin(client.post(format!("http://{addr}/admin/v1/config/reload")))
+        let before: serde_json::Value =
+            admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let bad = admin(client.post(format!("http://{addr}/api/v1/admin/config/reload")))
             .send()
             .await
             .unwrap();
         assert_eq!(bad.status().as_u16(), 400, "invalid disk config rejects");
-        let after: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/info")))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let after: serde_json::Value =
+            admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
         assert_eq!(
             before["config_version"], after["config_version"],
             "a rejected reload changes nothing"
@@ -1803,7 +1808,7 @@ providers: {}
         let mut limited_at = None;
         for i in 1..=22 {
             let resp = client
-                .post(format!("http://{addr}/admin/v1/config/rollback"))
+                .post(format!("http://{addr}/api/v1/admin/config/rollback"))
                 .header("x-admin-token", "admintok")
                 .header("content-type", "application/json")
                 .body(serde_json::json!({"version": 424242}).to_string())
@@ -1908,7 +1913,7 @@ providers: {}
         // read-only: GET 200, mutations 403 with the frozen envelope.
         let r = with(
             "grp:viewers",
-            client.get(format!("http://{addr}/admin/v1/info")),
+            client.get(format!("http://{addr}/api/v1/admin/info")),
         )
         .send()
         .await
@@ -1916,7 +1921,7 @@ providers: {}
         assert_eq!(r.status().as_u16(), 200, "read-only can read");
         let r = with(
             "grp:viewers",
-            client.post(format!("http://{addr}/admin/v1/keys")),
+            client.post(format!("http://{addr}/api/v1/admin/keys")),
         )
         .body(key_body.clone())
         .send()
@@ -1927,7 +1932,7 @@ providers: {}
         assert_eq!(body["error"]["code"], "forbidden");
         let r = with(
             "grp:viewers",
-            client.post(format!("http://{addr}/admin/v1/hooks")),
+            client.post(format!("http://{addr}/api/v1/admin/hooks")),
         )
         .body(hook_body.clone())
         .send()
@@ -1938,7 +1943,7 @@ providers: {}
         // hooks-register: hook lifecycle yes, keys no (the escalation guard).
         let r = with(
             "grp:registrars",
-            client.post(format!("http://{addr}/admin/v1/hooks")),
+            client.post(format!("http://{addr}/api/v1/admin/hooks")),
         )
         .body(hook_body.clone())
         .send()
@@ -1947,7 +1952,7 @@ providers: {}
         assert_eq!(r.status().as_u16(), 201, "hooks-register registers hooks");
         let r = with(
             "grp:registrars",
-            client.post(format!("http://{addr}/admin/v1/keys")),
+            client.post(format!("http://{addr}/api/v1/admin/keys")),
         )
         .body(key_body.clone())
         .send()
@@ -1958,7 +1963,7 @@ providers: {}
         // Unmapped group: authenticated but zero grants — 403 even on reads.
         let r = with(
             "grp:strangers",
-            client.get(format!("http://{addr}/admin/v1/info")),
+            client.get(format!("http://{addr}/api/v1/admin/info")),
         )
         .send()
         .await
@@ -1974,7 +1979,7 @@ providers: {}
         .to_string();
         let r = with(
             "grp:admins-capped",
-            client.post(format!("http://{addr}/admin/v1/hooks")),
+            client.post(format!("http://{addr}/api/v1/admin/hooks")),
         )
         .body(capped_hook)
         .send()
@@ -1987,7 +1992,7 @@ providers: {}
         );
         let r = with(
             "grp:admins-capped",
-            client.post(format!("http://{addr}/admin/v1/keys")),
+            client.post(format!("http://{addr}/api/v1/admin/keys")),
         )
         .body(key_body.clone())
         .send()
@@ -2003,7 +2008,7 @@ providers: {}
         // authorized to assert it — the group is dropped BEFORE mapping, leaving zero grants.
         let r = with(
             "grp:sneaky",
-            client.get(format!("http://{addr}/admin/v1/info")),
+            client.get(format!("http://{addr}/api/v1/admin/info")),
         )
         .send()
         .await
@@ -2017,7 +2022,7 @@ providers: {}
         // The operator token is still full (admin-tokens is exempt from module ceilings).
         let r = with(
             "admintok",
-            client.post(format!("http://{addr}/admin/v1/keys")),
+            client.post(format!("http://{addr}/api/v1/admin/keys")),
         )
         .body(key_body)
         .send()
@@ -2065,7 +2070,7 @@ providers: {}
         let client = reqwest::Client::new();
         let post = |tok: &'static str, cfg: serde_json::Value| {
             client
-                .post(format!("http://{addr}/admin/v1/hooks"))
+                .post(format!("http://{addr}/api/v1/admin/hooks"))
                 .header("x-admin-token", tok)
                 .header("content-type", "application/json")
                 .body(serde_json::json!({"name": "h", "config": cfg}).to_string())
@@ -2108,7 +2113,7 @@ providers: {}
 
         // The operator (full) can register a prompt: rw global gate (unique name — `h` is taken).
         let r = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -2127,7 +2132,7 @@ providers: {}
         // content-seeing / global hook it can neither create nor replace — PATCH must enforce the
         // same §6.3 ceiling, keyed on the EXISTING hook's grants.
         let patch = client
-            .patch(format!("http://{addr}/admin/v1/hooks/op-hook/settings"))
+            .patch(format!("http://{addr}/api/v1/admin/hooks/op-hook/settings"))
             .header("x-admin-token", "grp:registrars")
             .header("content-type", "application/json")
             .body(serde_json::json!({"settings": {"k": "v"}}).to_string())
@@ -2148,7 +2153,7 @@ providers: {}
         // gate a full admin installed — tearing down that security gate is the same §6.3 escalation
         // register/put/patch forbid.
         let del = client
-            .delete(format!("http://{addr}/admin/v1/hooks/op-hook"))
+            .delete(format!("http://{addr}/api/v1/admin/hooks/op-hook"))
             .header("x-admin-token", "grp:registrars")
             .send()
             .await
@@ -2164,7 +2169,7 @@ providers: {}
         );
         // And the operator's gate is still there — the rejected delete did not remove it.
         let still = client
-            .get(format!("http://{addr}/admin/v1/hooks/op-hook"))
+            .get(format!("http://{addr}/api/v1/admin/hooks/op-hook"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -2213,7 +2218,7 @@ providers: {}
         let client = reqwest::Client::new();
         let mint = |tok: &'static str| {
             client
-                .post(format!("http://{addr}/admin/v1/keys"))
+                .post(format!("http://{addr}/api/v1/admin/keys"))
                 .header("x-admin-token", tok)
                 .header("content-type", "application/json")
                 .header("idempotency-key", "shared-value")
@@ -2244,7 +2249,7 @@ providers: {}
 
     /// The credential cache end-to-end (§2.5): an external-module identify is CACHED (the second
     /// request is served from the cache — observable via the flush count), `POST
-    /// /admin/v1/auth/cache/flush` drops it (full scope; read-only principals get 403), and the
+    /// /api/v1/admin/auth/cache/flush` drops it (full scope; read-only principals get 403), and the
     /// built-in operator token is NEVER cached (flush finds nothing after operator calls).
     #[tokio::test]
     async fn test_admin_v1_credential_cache_and_flush_endpoint() {
@@ -2272,7 +2277,7 @@ providers: {}
         // Two reads as a group-mapped principal: the module's Identify lands in the cache.
         for _ in 0..2 {
             let r = client
-                .get(format!("http://{addr}/admin/v1/info"))
+                .get(format!("http://{addr}/api/v1/admin/info"))
                 .header("x-admin-token", "grp:viewers")
                 .send()
                 .await
@@ -2282,7 +2287,7 @@ providers: {}
 
         // A read-only principal cannot flush (full-scope mutation).
         let r = client
-            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .post(format!("http://{addr}/api/v1/admin/auth/cache/flush"))
             .header("x-admin-token", "grp:viewers")
             .send()
             .await
@@ -2292,7 +2297,7 @@ providers: {}
         // Operator flushes the module partition: exactly ONE entry (the cached viewers identify;
         // operator-token authentications are never cached).
         let r = client
-            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .post(format!("http://{addr}/api/v1/admin/auth/cache/flush"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(serde_json::json!({"module": "test-scope-module"}).to_string())
@@ -2312,7 +2317,7 @@ providers: {}
 
         // Flush-all with an empty body: nothing left.
         let r = client
-            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .post(format!("http://{addr}/api/v1/admin/auth/cache/flush"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -2327,7 +2332,7 @@ providers: {}
 
         // Malformed body: invalid_request.
         let r = client
-            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .post(format!("http://{addr}/api/v1/admin/auth/cache/flush"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body("{\"module\": 7}")
@@ -2339,7 +2344,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `PUT /admin/v1/admin-auth` end-to-end with the D4 dry-run guard: a chain that would lock the
+    /// `PUT /api/v1/admin/admin-auth` end-to-end with the D4 dry-run guard: a chain that would lock the
     /// CALLER out is a 409 and nothing changes; a chain the caller survives applies atomically
     /// (the old credential stops working on the very next request, the surviving one carries on);
     /// unknown modules and a stale If-Match reject.
@@ -2376,7 +2381,7 @@ providers: {}
         let client = reqwest::Client::new();
         let put = |tok: &'static str, body: serde_json::Value| {
             client
-                .put(format!("http://{addr}/admin/v1/admin-auth"))
+                .put(format!("http://{addr}/api/v1/admin/admin-auth"))
                 .header("x-admin-token", tok)
                 .header("content-type", "application/json")
                 .body(body.to_string())
@@ -2396,7 +2401,7 @@ providers: {}
         // Stale If-Match: 409 (H3: concurrency rides the header; a body-level twin no longer parses
         // — deny_unknown_fields makes a leftover `expected_version` field a loud 400, not a no-op).
         let r = client
-            .put(format!("http://{addr}/admin/v1/admin-auth"))
+            .put(format!("http://{addr}/api/v1/admin/admin-auth"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .header("if-match", "\"999\"")
@@ -2422,7 +2427,7 @@ providers: {}
         let body: serde_json::Value = r.json().await.unwrap();
         assert_eq!(body["error"]["code"], "conflict");
         let r = client
-            .get(format!("http://{addr}/admin/v1/info"))
+            .get(format!("http://{addr}/api/v1/admin/info"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -2447,7 +2452,7 @@ providers: {}
 
         // …after which the operator token no longer authenticates (it is not in the chain)…
         let r = client
-            .get(format!("http://{addr}/admin/v1/info"))
+            .get(format!("http://{addr}/api/v1/admin/info"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -2460,18 +2465,18 @@ providers: {}
 
         // …and the surviving credential carries on.
         let r = client
-            .get(format!("http://{addr}/admin/v1/info"))
+            .get(format!("http://{addr}/api/v1/admin/info"))
             .header("x-admin-token", "grp:admins")
             .send()
             .await
             .unwrap();
         assert_eq!(r.status().as_u16(), 200);
 
-        // READ-AFTER-WRITE (L3): GET /admin/v1/admin-auth reflects exactly what the PUT installed —
+        // READ-AFTER-WRITE (L3): GET /api/v1/admin/admin-auth reflects exactly what the PUT installed —
         // the write and read now name the SAME resource (previously PUT lived on /auth and GET
         // admin-auth reported a hard-coded module, so they could never agree).
         let body: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/admin-auth"))
+            .get(format!("http://{addr}/api/v1/admin/admin-auth"))
             .header("x-admin-token", "grp:admins")
             .send()
             .await
@@ -2510,7 +2515,7 @@ providers: {}
 
         // Same Idempotency-Key twice → identical response, ONE key.
         let mint = |k: &'static str| {
-            admin(client.post(format!("http://{addr}/admin/v1/keys")))
+            admin(client.post(format!("http://{addr}/api/v1/admin/keys")))
                 .header("idempotency-key", k)
                 .body(serde_json::json!({"name": "idem"}).to_string())
                 .send()
@@ -2523,7 +2528,7 @@ providers: {}
             "replay returns the FIRST response verbatim"
         );
         let listed: serde_json::Value = admin(client.get(format!(
-            "http://{addr}/admin/v1/keys?prefix={}",
+            "http://{addr}/api/v1/admin/keys?prefix={}",
             a["id"].as_str().unwrap()
         )))
         .send()
@@ -2540,7 +2545,7 @@ providers: {}
 
         // If-Match: stale = 409 untouched; current etag = applied.
         let id = a["id"].as_str().unwrap();
-        let got = admin(client.get(format!("http://{addr}/admin/v1/keys/{id}")))
+        let got = admin(client.get(format!("http://{addr}/api/v1/admin/keys/{id}")))
             .send()
             .await
             .unwrap();
@@ -2552,14 +2557,14 @@ providers: {}
             .unwrap()
             .trim_matches('"')
             .to_string();
-        let stale = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
+        let stale = admin(client.patch(format!("http://{addr}/api/v1/admin/keys/{id}")))
             .header("if-match", "\"deadbeefdeadbeef\"")
             .body(serde_json::json!({"rpm_limit": 5}).to_string())
             .send()
             .await
             .unwrap();
         assert_eq!(stale.status().as_u16(), 409, "stale If-Match conflicts");
-        let fresh = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
+        let fresh = admin(client.patch(format!("http://{addr}/api/v1/admin/keys/{id}")))
             .header("if-match", format!("\"{etag}\""))
             .body(serde_json::json!({"rpm_limit": 5}).to_string())
             .send()
@@ -2586,7 +2591,7 @@ providers: {}
         let client = reqwest::Client::new();
         let post = |body: &'static str| {
             client
-                .post(format!("http://{addr}/admin/v1/keys"))
+                .post(format!("http://{addr}/api/v1/admin/keys"))
                 .header("x-admin-token", "admintok")
                 .header("content-type", "application/json")
                 .header("idempotency-key", "reuse-key")
@@ -2634,7 +2639,7 @@ providers: {}
         let mut ids = Vec::new();
         for n in ["ka", "kb", "kc"] {
             let created: serde_json::Value =
-                admin(client.post(format!("http://{addr}/admin/v1/keys")))
+                admin(client.post(format!("http://{addr}/api/v1/admin/keys")))
                     .body(serde_json::json!({"name": n}).to_string())
                     .send()
                     .await
@@ -2651,7 +2656,7 @@ providers: {}
         // Pagination (cursor envelope): page 1 with ?limit=2 yields 2 items + a next_cursor; feeding
         // that opaque cursor back yields the final item with next_cursor=null. Covers all three once.
         let p1: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/keys?limit=2")))
                 .send()
                 .await
                 .unwrap()
@@ -2663,7 +2668,7 @@ providers: {}
             .as_str()
             .expect("more rows remain -> a next_cursor is present");
         let p2: serde_json::Value = admin(client.get(format!(
-            "http://{addr}/admin/v1/keys?limit=2&cursor={cursor}"
+            "http://{addr}/api/v1/admin/keys?limit=2&cursor={cursor}"
         )))
         .send()
         .await
@@ -2688,7 +2693,7 @@ providers: {}
         assert_eq!(seen.len(), 3, "pages cover every key exactly once");
 
         // A malformed/foreign cursor is a 400 invalid_request (never a silent skip).
-        let bad = admin(client.get(format!("http://{addr}/admin/v1/keys?cursor=notacursor")))
+        let bad = admin(client.get(format!("http://{addr}/api/v1/admin/keys?cursor=notacursor")))
             .send()
             .await
             .unwrap();
@@ -2705,7 +2710,7 @@ providers: {}
         // Rotate the first key: same id, new secret; old secret dead, new secret resolves.
         let (id, old_secret) = ids[0].clone();
         let rotated: serde_json::Value =
-            admin(client.post(format!("http://{addr}/admin/v1/keys/{id}/rotate")))
+            admin(client.post(format!("http://{addr}/api/v1/admin/keys/{id}/rotate")))
                 .send()
                 .await
                 .unwrap()
@@ -2722,7 +2727,7 @@ providers: {}
         );
 
         // Unknown id → 404.
-        let missing = admin(client.post(format!("http://{addr}/admin/v1/keys/vk_nope/rotate")))
+        let missing = admin(client.post(format!("http://{addr}/api/v1/admin/keys/vk_nope/rotate")))
             .send()
             .await
             .unwrap();
@@ -2731,7 +2736,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `PUT /admin/v1/hooks/{name}`: replaces an overlay hook live; 404 for an unknown name;
+    /// `PUT /api/v1/admin/hooks/{name}`: replaces an overlay hook live; 404 for an unknown name;
     /// 409 for a grant change (immutability) and for a stale If-Match.
     #[tokio::test]
     async fn test_admin_v1_put_hook_replaces_live_with_guards() {
@@ -2750,7 +2755,7 @@ providers: {}
         };
 
         // PUT on an unknown name is 404 (PUT replaces; POST creates).
-        let missing = admin(client.put(format!("http://{addr}/admin/v1/hooks/nope")))
+        let missing = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/nope")))
             .body(
                 serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:1/"}})
                     .to_string(),
@@ -2761,7 +2766,7 @@ providers: {}
         assert_eq!(missing.status().as_u16(), 404);
 
         // Create, then replace with a new transport target (same grants) — 200, live.
-        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+        let created = admin(client.post(format!("http://{addr}/api/v1/admin/hooks")))
             .body(
                 serde_json::json!({
                     "name": "rep",
@@ -2773,7 +2778,7 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(created.status().as_u16(), 201);
-        let replaced = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+        let replaced = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/rep")))
             .body(
                 serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9972/"}})
                     .to_string(),
@@ -2782,20 +2787,21 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(replaced.status().as_u16(), 200);
-        let got: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/hooks/rep")))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let got: serde_json::Value =
+            admin(client.get(format!("http://{addr}/api/v1/admin/hooks/rep")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
         assert!(
             got["transport"].to_string().contains("9972"),
             "the replacement is live: {got}"
         );
 
         // Grant change via PUT is a 409 (immutability holds on the replace path too).
-        let escalate = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+        let escalate = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/rep")))
             .body(serde_json::json!({"config": {"kind": "gate", "webhook": "http://127.0.0.1:9972/", "prompt": "rw"}}).to_string())
             .send()
             .await
@@ -2803,7 +2809,7 @@ providers: {}
         assert_eq!(escalate.status().as_u16(), 409, "grants are immutable");
 
         // Stale If-Match is a 409 conflict (H3: concurrency rides the header).
-        let stale = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+        let stale = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/rep")))
             .header("if-match", "\"0\"")
             .body(
                 serde_json::json!({
@@ -2817,7 +2823,7 @@ providers: {}
         assert_eq!(stale.status().as_u16(), 409, "stale If-Match conflicts");
 
         // The current ETag (from the GET above / the PUT response) applies cleanly: read it live.
-        let live = admin(client.get(format!("http://{addr}/admin/v1/hooks/rep")))
+        let live = admin(client.get(format!("http://{addr}/api/v1/admin/hooks/rep")))
             .send()
             .await
             .unwrap();
@@ -2827,7 +2833,7 @@ providers: {}
             .and_then(|v| v.to_str().ok())
             .expect("config-plane reads emit the ETag")
             .to_string();
-        let fresh = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+        let fresh = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/rep")))
             .header("if-match", etag)
             .body(
                 serde_json::json!({
@@ -2868,14 +2874,14 @@ providers: {}
             "name": "rbk",
             "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/"}
         });
-        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+        let created = admin(client.post(format!("http://{addr}/api/v1/admin/hooks")))
             .header("content-type", "application/json")
             .body(body.to_string())
             .send()
             .await
             .unwrap();
         assert_eq!(created.status().as_u16(), 201);
-        let deleted = admin(client.delete(format!("http://{addr}/admin/v1/hooks/rbk")))
+        let deleted = admin(client.delete(format!("http://{addr}/api/v1/admin/hooks/rbk")))
             .send()
             .await
             .unwrap();
@@ -2883,7 +2889,7 @@ providers: {}
 
         // The history lists boot + register + delete, newest first, attributed.
         let versions: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/config/versions")))
+            admin(client.get(format!("http://{addr}/api/v1/admin/config/versions")))
                 .send()
                 .await
                 .unwrap()
@@ -2900,18 +2906,19 @@ providers: {}
         assert_eq!(list[0]["principal"], "admin");
 
         // Diff v1 -> v2: the hook was removed.
-        let diff: serde_json::Value =
-            admin(client.get(format!("http://{addr}/admin/v1/config/diff?from=1&to=2")))
-                .send()
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let diff: serde_json::Value = admin(client.get(format!(
+            "http://{addr}/api/v1/admin/config/diff?from=1&to=2"
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
         assert_eq!(diff["hooks"]["removed"][0], "rbk", "{diff}");
 
         // Rollback to v1 restores the hook, LIVE, as a NEW version (append-only history).
-        let rb = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+        let rb = admin(client.post(format!("http://{addr}/api/v1/admin/config/rollback")))
             .header("content-type", "application/json")
             .body(serde_json::json!({"version": 1}).to_string())
             .send()
@@ -2921,7 +2928,7 @@ providers: {}
         let rb_body: serde_json::Value = rb.json().await.unwrap();
         assert_eq!(rb_body["restored_version"], 1);
         assert_eq!(rb_body["new_version"], 3);
-        let restored = admin(client.get(format!("http://{addr}/admin/v1/hooks/rbk")))
+        let restored = admin(client.get(format!("http://{addr}/api/v1/admin/hooks/rbk")))
             .send()
             .await
             .unwrap();
@@ -2932,14 +2939,14 @@ providers: {}
         );
 
         // Guard rails: unknown target = 404; stale If-Match = 409 (H3).
-        let missing = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+        let missing = admin(client.post(format!("http://{addr}/api/v1/admin/config/rollback")))
             .header("content-type", "application/json")
             .body(serde_json::json!({"version": 999}).to_string())
             .send()
             .await
             .unwrap();
         assert_eq!(missing.status().as_u16(), 404);
-        let stale = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+        let stale = admin(client.post(format!("http://{addr}/api/v1/admin/config/rollback")))
             .header("content-type", "application/json")
             .header("if-match", "\"0\"")
             .body(serde_json::json!({"version": 1}).to_string())
@@ -2965,7 +2972,7 @@ providers: {}
 
         // Before: no hooks.
         let before: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/hooks"))
+            .get(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -2986,7 +2993,7 @@ providers: {}
             }
         });
         let created = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -3001,7 +3008,7 @@ providers: {}
 
         // After: the hook is LIVE — a fresh read sees it (swap took effect + reads-current).
         let after: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/hooks"))
+            .get(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3019,7 +3026,7 @@ providers: {}
 
         // The config version bumped from 0 → 1 on the apply (drift-detection primitive).
         let info: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/info"))
+            .get(format!("http://{addr}/api/v1/admin/info"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3034,7 +3041,7 @@ providers: {}
 
         // GET one by name also sees it.
         let one = client
-            .get(format!("http://{addr}/admin/v1/hooks/compress"))
+            .get(format!("http://{addr}/api/v1/admin/hooks/compress"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3043,7 +3050,7 @@ providers: {}
 
         // Invalid definition (prompt:rw on a tap) → 400 invalid_request, no mutation.
         let bad = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -3065,7 +3072,7 @@ providers: {}
         // Grant immutability over the wire (§6.4): re-registering "compress" (a prompt:rw gate) with a
         // DIFFERENT grant (prompt:ro) → 409 conflict, no mutation. Same grants would be idempotent.
         let escalate = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -3091,7 +3098,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `GET /admin/v1/audit` records admin mutations: registering a hook appears in the audit log as
+    /// `GET /api/v1/admin/audit` records admin mutations: registering a hook appears in the audit log as
     /// `hook.register` / `applied`, with the resource named. (The audit ring is process-global, so
     /// other concurrent tests may add entries — assert the specific action appears, not an exact count.)
     #[tokio::test]
@@ -3109,7 +3116,7 @@ providers: {}
         // A uniquely-named hook so the audit assertion can't collide with a concurrent test.
         let name = "audit_probe_hook_x7";
         client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -3124,7 +3131,7 @@ providers: {}
             .unwrap();
 
         let audit: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/audit"))
+            .get(format!("http://{addr}/api/v1/admin/audit"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3143,7 +3150,9 @@ providers: {}
 
         // Filter by resource (§2.5): only this hook's entries come back.
         let filtered: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/audit?resource=hook:{name}"))
+            .get(format!(
+                "http://{addr}/api/v1/admin/audit?resource=hook:{name}"
+            ))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3161,7 +3170,7 @@ providers: {}
         // Filter by a non-matching action → empty.
         let none: serde_json::Value = client
             .get(format!(
-                "http://{addr}/admin/v1/audit?resource=hook:{name}&action=key.create"
+                "http://{addr}/api/v1/admin/audit?resource=hook:{name}&action=key.create"
             ))
             .header("x-admin-token", "admintok")
             .send()
@@ -3195,7 +3204,7 @@ providers: {}
         let patch_name = "ghost_patch_hook_q3";
 
         let put_resp = client
-            .put(format!("http://{addr}/admin/v1/hooks/{put_name}"))
+            .put(format!("http://{addr}/api/v1/admin/hooks/{put_name}"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -3209,7 +3218,7 @@ providers: {}
 
         let patch_resp = client
             .patch(format!(
-                "http://{addr}/admin/v1/hooks/{patch_name}/settings"
+                "http://{addr}/api/v1/admin/hooks/{patch_name}/settings"
             ))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
@@ -3226,7 +3235,9 @@ providers: {}
         // Both 404s must appear in the audit log as REJECTED, resource-named.
         for (name, action) in [(put_name, "hook.replace"), (patch_name, "hook.settings")] {
             let filtered: serde_json::Value = client
-                .get(format!("http://{addr}/admin/v1/audit?resource=hook:{name}"))
+                .get(format!(
+                    "http://{addr}/api/v1/admin/audit?resource=hook:{name}"
+                ))
                 .header("x-admin-token", "admintok")
                 .send()
                 .await
@@ -3250,7 +3261,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `GET /admin/v1/keys` supports `?prefix=` and `?enabled=` filters (§2.1): a full-id prefix
+    /// `GET /api/v1/admin/keys` supports `?prefix=` and `?enabled=` filters (§2.1): a full-id prefix
     /// returns just that key; a non-matching prefix returns none; `?enabled=true` includes a fresh key.
     #[tokio::test]
     async fn test_admin_v1_list_keys_filters() {
@@ -3278,7 +3289,7 @@ providers: {}
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
         let get = |query: String| {
-            let url = format!("http://{addr}/admin/v1/keys{query}");
+            let url = format!("http://{addr}/api/v1/admin/keys{query}");
             let client = client.clone();
             async move {
                 client
@@ -3355,19 +3366,19 @@ providers: {}
 
         // Baseline: no hooks, version 0, persistence on.
         assert_eq!(
-            get("/admin/v1/hooks".into()).await["items"]
+            get("/api/v1/admin/hooks".into()).await["items"]
                 .as_array()
                 .unwrap()
                 .len(),
             0
         );
-        let info0 = get("/admin/v1/info".into()).await;
+        let info0 = get("/api/v1/admin/info".into()).await;
         assert_eq!(info0["config_version"], 0);
         assert_eq!(info0["config_persistence"], true);
 
         // Register.
         let created = c
-            .post(format!("{base}/admin/v1/hooks"))
+            .post(format!("{base}/api/v1/admin/hooks"))
             .header("x-admin-token", "t")
             .header("content-type", "application/json")
             .body(
@@ -3381,20 +3392,20 @@ providers: {}
         assert_eq!(created.status().as_u16(), 201);
 
         // Live (read sees it), version bumped, persisted to disk.
-        assert!(get("/admin/v1/hooks".into()).await["items"]
+        assert!(get("/api/v1/admin/hooks".into()).await["items"]
             .as_array()
             .unwrap()
             .iter()
             .any(|h| h["name"] == name));
-        assert_eq!(get("/admin/v1/info".into()).await["config_version"], 1);
-        assert_eq!(get("/admin/v1/config".into()).await["version"], 1);
+        assert_eq!(get("/api/v1/admin/info".into()).await["config_version"], 1);
+        assert_eq!(get("/api/v1/admin/config".into()).await["version"], 1);
         assert!(crate::config::overlay::read(&overlay)
             .unwrap()
             .hooks
             .contains_key(name));
         // Audit records it.
         assert!(
-            get(format!("/admin/v1/audit?resource=hook:{name}")).await["items"]
+            get(format!("/api/v1/admin/audit?resource=hook:{name}")).await["items"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -3403,7 +3414,7 @@ providers: {}
 
         // Delete.
         let deleted = c
-            .delete(format!("{base}/admin/v1/hooks/{name}"))
+            .delete(format!("{base}/api/v1/admin/hooks/{name}"))
             .header("x-admin-token", "t")
             .send()
             .await
@@ -3412,13 +3423,13 @@ providers: {}
 
         // Gone, version bumped again, persisted removal.
         assert_eq!(
-            get("/admin/v1/hooks".into()).await["items"]
+            get("/api/v1/admin/hooks".into()).await["items"]
                 .as_array()
                 .unwrap()
                 .len(),
             0
         );
-        assert_eq!(get("/admin/v1/info".into()).await["config_version"], 2);
+        assert_eq!(get("/api/v1/admin/info".into()).await["config_version"], 2);
         assert!(!crate::config::overlay::read(&overlay)
             .unwrap()
             .hooks
@@ -3454,7 +3465,7 @@ providers: {}
 
         // Register a global gate — the handler persists it to the overlay file.
         let created = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -3503,7 +3514,7 @@ providers: {}
 
         // Mint a uniquely-named key.
         let minted: serde_json::Value = client
-            .post(format!("http://{addr}/admin/v1/keys"))
+            .post(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(serde_json::json!({"name": "audit_key_probe_z3"}).to_string())
@@ -3516,7 +3527,7 @@ providers: {}
         let id = minted["id"].as_str().unwrap().to_string();
 
         let audit: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/audit"))
+            .get(format!("http://{addr}/api/v1/admin/audit"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3561,7 +3572,7 @@ providers: {}
 
         // POST a same-shape definition over the base hook's name → 409 (no silent transport redirect).
         let shadow = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .header("content-type", "application/json")
             .body(
@@ -3582,7 +3593,7 @@ providers: {}
 
         // DELETE the base hook → 409 (cannot remove an operator's base security gate via the API).
         let del = client
-            .delete(format!("http://{addr}/admin/v1/hooks/pii-guard"))
+            .delete(format!("http://{addr}/api/v1/admin/hooks/pii-guard"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3595,7 +3606,7 @@ providers: {}
 
         // It is still present and unchanged.
         let got: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/hooks/pii-guard"))
+            .get(format!("http://{addr}/api/v1/admin/hooks/pii-guard"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3609,7 +3620,7 @@ providers: {}
         );
     }
 
-    /// `DELETE /admin/v1/hooks/{name}` removes a hook at runtime (live): register → delete (204) →
+    /// `DELETE /api/v1/admin/hooks/{name}` removes a hook at runtime (live): register → delete (204) →
     /// GET /hooks/{name} 404. Deleting an unregistered hook is 404.
     #[tokio::test]
     async fn test_admin_v1_delete_hook_takes_effect_live() {
@@ -3626,7 +3637,7 @@ providers: {}
 
         // Register a global tap.
         let created = client
-            .post(format!("http://{addr}/admin/v1/hooks"))
+            .post(format!("http://{addr}/api/v1/admin/hooks"))
             .header(tok.0, tok.1)
             .header("content-type", "application/json")
             .body(
@@ -3643,7 +3654,7 @@ providers: {}
 
         // Delete an absent hook → 404.
         let absent = client
-            .delete(format!("http://{addr}/admin/v1/hooks/nope"))
+            .delete(format!("http://{addr}/api/v1/admin/hooks/nope"))
             .header(tok.0, tok.1)
             .send()
             .await
@@ -3652,7 +3663,7 @@ providers: {}
 
         // Delete the registered hook → 204, and it's gone live.
         let deleted = client
-            .delete(format!("http://{addr}/admin/v1/hooks/logger"))
+            .delete(format!("http://{addr}/api/v1/admin/hooks/logger"))
             .header(tok.0, tok.1)
             .send()
             .await
@@ -3660,7 +3671,7 @@ providers: {}
         assert_eq!(deleted.status().as_u16(), 204);
 
         let after = client
-            .get(format!("http://{addr}/admin/v1/hooks/logger"))
+            .get(format!("http://{addr}/api/v1/admin/hooks/logger"))
             .header(tok.0, tok.1)
             .send()
             .await
@@ -3674,7 +3685,7 @@ providers: {}
         handle.abort();
     }
 
-    /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
+    /// The hooks read surface (`GET /api/v1/admin/hooks`, `GET /api/v1/admin/hooks/{name}`) projects the
     /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
     /// secret. Built on a fixture with one global gate.
     #[tokio::test]
@@ -3711,7 +3722,7 @@ providers: {}
 
         // List: the one hook, projected.
         let list = client
-            .get(format!("http://{addr}/admin/v1/hooks"))
+            .get(format!("http://{addr}/api/v1/admin/hooks"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3737,7 +3748,7 @@ providers: {}
 
         // Get one by name.
         let one = client
-            .get(format!("http://{addr}/admin/v1/hooks/compress"))
+            .get(format!("http://{addr}/api/v1/admin/hooks/compress"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3746,7 +3757,7 @@ providers: {}
 
         // Unknown name → 404 with the stable v1 `not_found` code.
         let missing = client
-            .get(format!("http://{addr}/admin/v1/hooks/nope"))
+            .get(format!("http://{addr}/api/v1/admin/hooks/nope"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3758,7 +3769,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `GET /admin/v1/hooks/{name}/health` best-effort probes a hook's transport: 404 for an unknown
+    /// `GET /api/v1/admin/hooks/{name}/health` best-effort probes a hook's transport: 404 for an unknown
     /// name; a webhook hook reports `reachable: null` (probed on demand); a socket hook pointing at a
     /// nonexistent path reports `reachable: false`. Never fires the hook.
     #[tokio::test]
@@ -3792,7 +3803,7 @@ providers: {}
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
         let get = |name: &str| {
-            let url = format!("http://{addr}/admin/v1/hooks/{name}/health");
+            let url = format!("http://{addr}/api/v1/admin/hooks/{name}/health");
             let client = client.clone();
             async move {
                 client
@@ -3831,7 +3842,7 @@ providers: {}
         handle.abort();
     }
 
-    /// The plugin catalog (`GET /admin/v1/plugins?type=`) lists compiled-in plugins per type (the
+    /// The plugin catalog (`GET /api/v1/admin/plugins?type=`) lists compiled-in plugins per type (the
     /// same feature-gated source as `info`) plus external hooks from the registry, and rejects an
     /// unknown/absent type with the stable `invalid_request` code.
     #[tokio::test]
@@ -3862,7 +3873,7 @@ providers: {}
         let client = reqwest::Client::new();
 
         let get = |q: &str| {
-            let url = format!("http://{addr}/admin/v1/plugins?type={q}");
+            let url = format!("http://{addr}/api/v1/admin/plugins?type={q}");
             let client = client.clone();
             async move {
                 client
@@ -3917,7 +3928,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `GET /admin/v1/auth` reports the ingress chain + upstream-credential mode, never a secret. A
+    /// `GET /api/v1/admin/auth` reports the ingress chain + upstream-credential mode, never a secret. A
     /// governance-only fixture (no explicit auth chain) is the open front door.
     #[tokio::test]
     async fn test_admin_v1_auth_read() {
@@ -3932,7 +3943,7 @@ providers: {}
         let client = reqwest::Client::new();
 
         let body: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/auth"))
+            .get(format!("http://{addr}/api/v1/admin/auth"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -3949,7 +3960,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `POST /admin/v1/config/validate` dry-runs a proposed config: a malformed body is a 400
+    /// `POST /api/v1/admin/config/validate` dry-runs a proposed config: a malformed body is a 400
     /// `invalid_request`; a well-formed body describing an INVALID config (here a provider reference
     /// absent from the defs) returns 200 with `ok:false` and the resolution errors — never mutating.
     #[tokio::test]
@@ -3963,7 +3974,7 @@ providers: {}
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/v1/config/validate");
+        let url = format!("http://{addr}/api/v1/admin/config/validate");
 
         // Malformed body → 400 invalid_request (the REQUEST is broken, not the config).
         let bad = client
@@ -4010,7 +4021,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `GET /admin/v1/config` composes the effective-config snapshot (auth + pools/models/providers +
+    /// `GET /api/v1/admin/config` composes the effective-config snapshot (auth + pools/models/providers +
     /// hooks + global_hooks) from the redacted reads. Asserts the shape and that no secret-bearing
     /// field (client tokens, provider keys) appears anywhere in the serialized body.
     #[tokio::test]
@@ -4055,7 +4066,7 @@ providers: {}
         let client = reqwest::Client::new();
 
         let resp = client
-            .get(format!("http://{addr}/admin/v1/config"))
+            .get(format!("http://{addr}/api/v1/admin/config"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -4102,7 +4113,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `GET /admin/v1/openapi.json` returns a valid OpenAPI 3.1 doc, and — the DRIFT GUARD — every GET
+    /// `GET /api/v1/admin/openapi.json` returns a valid OpenAPI 3.1 doc, and — the DRIFT GUARD — every GET
     /// path it documents (from V1_GET_PATHS) actually resolves on the live router (never a phantom
     /// endpoint in the discovery contract). Also asserts the stable error `code` enum is present.
     #[tokio::test]
@@ -4118,7 +4129,7 @@ providers: {}
         let client = reqwest::Client::new();
 
         let doc: serde_json::Value = client
-            .get(format!("http://{addr}/admin/v1/openapi.json"))
+            .get(format!("http://{addr}/api/v1/admin/openapi.json"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -4137,12 +4148,12 @@ providers: {}
 
         // The runtime hook mutation methods are documented in the discovery contract.
         assert!(
-            doc["paths"]["/admin/v1/hooks"]["post"].is_object(),
-            "POST /admin/v1/hooks (register) must be in the openapi doc"
+            doc["paths"]["/api/v1/admin/hooks"]["post"].is_object(),
+            "POST /api/v1/admin/hooks (register) must be in the openapi doc"
         );
         assert!(
-            doc["paths"]["/admin/v1/hooks/{name}"]["delete"].is_object(),
-            "DELETE /admin/v1/hooks/{{name}} (remove) must be in the openapi doc"
+            doc["paths"]["/api/v1/admin/hooks/{name}"]["delete"].is_object(),
+            "DELETE /api/v1/admin/hooks/{{name}} (remove) must be in the openapi doc"
         );
 
         // DRIFT GUARD: every documented GET path is both listed in the doc AND actually mounted.
@@ -4168,7 +4179,7 @@ providers: {}
         handle.abort();
     }
 
-    /// SECURITY CONTRACT: every documented `/admin/v1` GET endpoint rejects a MISSING token and a
+    /// SECURITY CONTRACT: every documented `/api/v1/admin` GET endpoint rejects a MISSING token and a
     /// WRONG token with 401 — the whole surface is admin-guarded, no read leaks without the credential.
     /// Iterates the same V1_GET_PATHS the openapi doc + drift guard use, so a newly-added endpoint is
     /// automatically covered.
@@ -4224,7 +4235,7 @@ providers: {}
         let client = reqwest::Client::new();
 
         let created = client
-            .post(format!("http://{addr}/admin/keys"))
+            .post(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .json(&serde_json::json!({"name": "bedrock-key", "issue_aws_credential": true}))
             .send()
@@ -4243,7 +4254,7 @@ providers: {}
 
         // A plain mint (no flag) carries NO AWS fields.
         let plain: serde_json::Value = client
-            .post(format!("http://{addr}/admin/keys"))
+            .post(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .json(&serde_json::json!({"name": "plain"}))
             .send()
@@ -4259,7 +4270,7 @@ providers: {}
 
         // The list endpoint must NEVER expose the AWS secret (nor key_hash).
         let listed: serde_json::Value = client
-            .get(format!("http://{addr}/admin/keys"))
+            .get(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -4296,7 +4307,7 @@ providers: {}
 
         // create
         let created = client
-            .post(format!("http://{addr}/admin/keys"))
+            .post(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .json(&serde_json::json!({"name": "k1"}))
             .send()
@@ -4310,7 +4321,7 @@ providers: {}
 
         // list
         let listed = client
-            .get(format!("http://{addr}/admin/keys"))
+            .get(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -4325,7 +4336,7 @@ providers: {}
 
         // usage
         let usage = client
-            .get(format!("http://{addr}/admin/keys/{id}/usage"))
+            .get(format!("http://{addr}/api/v1/admin/keys/{id}/usage"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -4346,7 +4357,7 @@ providers: {}
         let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys");
+        let url = format!("http://{addr}/api/v1/admin/keys");
 
         // Typo'd period → 400, no key minted.
         for bad in ["weekly", "monthlly", "", "TOTAL"] {
@@ -4433,8 +4444,8 @@ providers: {}
         let secret_fragment = "SUPER_SECRET_AWS_KEY_abc123";
         let malformed = format!(r#"{{"name": "k", "secret_access_key": "{secret_fragment}" "#);
 
-        for path in ["/admin/keys", "/admin/keys/some-id"] {
-            let req = if path == "/admin/keys" {
+        for path in ["/api/v1/admin/keys", "/api/v1/admin/keys/some-id"] {
+            let req = if path == "/api/v1/admin/keys" {
                 client.post(format!("http://{addr}{path}"))
             } else {
                 client.patch(format!("http://{addr}{path}"))
@@ -4491,7 +4502,7 @@ providers: {}
         let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys");
+        let url = format!("http://{addr}/api/v1/admin/keys");
 
         for bad in [-1_i64, -100, i64::MIN] {
             let resp = client
@@ -4568,7 +4579,7 @@ providers: {}
         let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let base = format!("http://{addr}/admin/keys");
+        let base = format!("http://{addr}/api/v1/admin/keys");
 
         // Create a key to operate on.
         let created: serde_json::Value = client
@@ -4646,7 +4657,7 @@ providers: {}
         let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys");
+        let url = format!("http://{addr}/api/v1/admin/keys");
 
         for field in ["rpm_limit", "tpm_limit"] {
             let resp = client
@@ -4721,7 +4732,7 @@ providers: {}
         let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let base = format!("http://{addr}/admin/keys");
+        let base = format!("http://{addr}/api/v1/admin/keys");
 
         // Create a key that HAS all three caps set.
         let created: serde_json::Value = client
@@ -4957,7 +4968,7 @@ providers: {}
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
         let resp = client
-            .delete(format!("http://{addr}/admin/keys/{}", key.id))
+            .delete(format!("http://{addr}/api/v1/admin/keys/{}", key.id))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -4979,7 +4990,7 @@ providers: {}
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
         let resp = client
-            .delete(format!("http://{addr}/admin/keys/vk_does_not_exist"))
+            .delete(format!("http://{addr}/api/v1/admin/keys/vk_does_not_exist"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -5017,7 +5028,7 @@ providers: {}
             .unwrap();
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys/{}", key.id);
+        let url = format!("http://{addr}/api/v1/admin/keys/{}", key.id);
         let first = client
             .delete(&url)
             .header("x-admin-token", "admintok")
@@ -5058,7 +5069,7 @@ providers: {}
             )
             .unwrap();
         let (addr, handle) = serve_with_gov(gov).await;
-        let url = format!("http://{addr}/admin/keys/{}", key.id);
+        let url = format!("http://{addr}/api/v1/admin/keys/{}", key.id);
 
         // Launch several DELETEs concurrently against the single freshly-created key.
         let mut tasks = Vec::new();
@@ -5121,7 +5132,7 @@ providers: {}
             .unwrap();
         let (addr, handle) = serve_with_gov(gov).await;
         let client = reqwest::Client::new();
-        let key_url = format!("http://{addr}/admin/keys/{}", key.id);
+        let key_url = format!("http://{addr}/api/v1/admin/keys/{}", key.id);
 
         // Revoke the key.
         let del = client
@@ -5159,7 +5170,7 @@ providers: {}
             "the revoked key must remain absent after the PATCH"
         );
         let listed: serde_json::Value = client
-            .get(format!("http://{addr}/admin/keys"))
+            .get(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -5301,7 +5312,7 @@ providers: {}
             )
             .unwrap();
         let (addr, handle) = serve_with_gov(gov).await;
-        let key_url = format!("http://{addr}/admin/keys/{}", key.id);
+        let key_url = format!("http://{addr}/api/v1/admin/keys/{}", key.id);
 
         // Arm the barrier so the PATCH's put_key (the next put) pauses mid-update.
         store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -5349,7 +5360,7 @@ providers: {}
         // DECISIVE: regardless of the order the two requests reported, the revoked key must be GONE.
         // A resurrecting PATCH (old code) leaves it PRESENT here.
         let listed: serde_json::Value = reqwest::Client::new()
-            .get(format!("http://{addr}/admin/keys"))
+            .get(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -5401,7 +5412,7 @@ providers: {}
         // Arm the barrier so rotate's put_key (the next put) pauses between its check and its write.
         store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let rotate_url = format!("http://{addr}/admin/v1/keys/{}/rotate", key.id);
+        let rotate_url = format!("http://{addr}/api/v1/admin/keys/{}/rotate", key.id);
         let rotate_task = tokio::spawn(async move {
             reqwest::Client::new()
                 .post(&rotate_url)
@@ -5419,7 +5430,7 @@ providers: {}
             .unwrap()
             .expect("ROTATE must reach the instrumented put_key");
 
-        let delete_url = format!("http://{addr}/admin/keys/{}", key.id);
+        let delete_url = format!("http://{addr}/api/v1/admin/keys/{}", key.id);
         let delete_task = tokio::spawn(async move {
             reqwest::Client::new()
                 .delete(&delete_url)
@@ -5438,7 +5449,7 @@ providers: {}
 
         // DECISIVE: the revoked key must be GONE. A resurrecting rotate (ungated) leaves it PRESENT.
         let listed: serde_json::Value = reqwest::Client::new()
-            .get(format!("http://{addr}/admin/keys"))
+            .get(format!("http://{addr}/api/v1/admin/keys"))
             .header("x-admin-token", "admintok")
             .send()
             .await
@@ -5516,7 +5527,7 @@ providers: {}
             )
             .unwrap();
         let (addr, handle) = serve_with_gov(gov).await;
-        let key_url = format!("http://{addr}/admin/keys/{}", key.id);
+        let key_url = format!("http://{addr}/api/v1/admin/keys/{}", key.id);
 
         // Arm the barrier so the PATCH's put_key (the next put) pauses mid-update.
         store.armed.store(true, std::sync::atomic::Ordering::SeqCst);

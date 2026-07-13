@@ -11,7 +11,7 @@
 //! - [`service`] — the v1 application service: typed operations returning `contract` views/errors,
 //!   over the shared engine (`App`). Version-agnostic engine logic will factor to a shared core when
 //!   v2 lands (extract-on-second-use); today the ops are simple reads.
-//! - [`json`] — the JSON-REST wire adapter (`JsonV1`) mounting `/admin/v1/*`. A `graphql` sibling
+//! - [`json`] — the JSON-REST wire adapter (`JsonV1`) mounting `/api/v1/admin/*`. A `graphql` sibling
 //!   would speak the same service over a different wire.
 //!
 //! The transport PORT (`super::transport::AdminTransport`) is shared across versions and transports.

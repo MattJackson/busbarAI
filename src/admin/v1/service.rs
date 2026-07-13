@@ -96,7 +96,7 @@ async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
 }
 
 /// Build the next `App` snapshot with `name` registered/updated to `cfg` in the hook registry — the
-/// PURE core of `POST /admin/v1/hooks` (runtime hook registration). Validates the definition, clones
+/// PURE core of `POST /api/v1/admin/hooks` (runtime hook registration). Validates the definition, clones
 /// the current snapshot (sharing the live-state `Arc`s), inserts the hook, updates the global-hook
 /// wiring, and RE-RESOLVES the rewrite/tap transports so a `global` hook takes effect immediately on
 /// swap. Lanes/store/pools/auth are UNTOUCHED, so the store's per-lane breaker state is preserved (no
@@ -230,7 +230,7 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
 }
 
 /// Build the next `App` snapshot with `name` REMOVED from the hook registry — the pure core of
-/// `DELETE /admin/v1/hooks/{name}`. `not_found` if the name is unregistered. Clones the current
+/// `DELETE /api/v1/admin/hooks/{name}`. `not_found` if the name is unregistered. Clones the current
 /// snapshot (sharing live state), drops the hook from the registry + global wiring, and re-resolves
 /// the rewrite/tap transports. Lanes/store untouched (breaker state preserved). Same GLOBAL scope as
 /// `build_with_hook`: pool-`hook:` references are resolved into `pool_runtime` at startup and are NOT
@@ -278,7 +278,7 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
 }
 
 /// Build the next `App` snapshot with the whole HOOK SURFACE replaced by a version snapshot — the
-/// pure core of `POST /admin/v1/config/rollback`. RE-VALIDATES the snapshot against CURRENT reality
+/// pure core of `POST /api/v1/admin/config/rollback`. RE-VALIDATES the snapshot against CURRENT reality
 /// before any mutation (a snapshot that was valid when recorded may violate an invariant now):
 /// per-hook transport XOR + rw-on-tap, at-most-one-default, and no dangling global refs. Clones the
 /// current snapshot (sharing live state — lanes/store untouched, breaker state preserved) and
@@ -368,7 +368,7 @@ impl AdminService {
         Self { app }
     }
 
-    /// `GET /admin/v1/info` — version, the COMPILED-IN plugin sets (compliance-by-compilation proof),
+    /// `GET /api/v1/admin/info` — version, the COMPILED-IN plugin sets (compliance-by-compilation proof),
     /// uptime, and pool/model/provider topology. Read scope. Infallible today, but returns `Result`
     /// for a uniform transport contract (every op is `Result<View, AdminError>`).
     pub(crate) async fn info(&self) -> Result<InfoView, AdminError> {
@@ -399,7 +399,7 @@ impl AdminService {
         })
     }
 
-    /// `GET /admin/v1/pools` — the pool topology (name + member models/weights). Read scope. Sorted
+    /// `GET /api/v1/admin/pools` — the pool topology (name + member models/weights). Read scope. Sorted
     /// by name for a stable, diff-friendly listing. Live per-member
     /// status is an additive follow-up (§6.9).
     pub(crate) async fn list_pools(&self) -> Result<Page<PoolView>, AdminError> {
@@ -423,7 +423,7 @@ impl AdminService {
         Ok(Page::single(pools))
     }
 
-    /// `GET /admin/v1/pools/{name}` — the LIVE per-member status of one pool (breaker/concurrency/
+    /// `GET /api/v1/admin/pools/{name}` — the LIVE per-member status of one pool (breaker/concurrency/
     /// latency/tallies), from the same store signals the routing seam ranks on. Read scope.
     /// `not_found` if the pool is unknown.
     pub(crate) async fn get_pool(&self, name: &str) -> Result<PoolDetailView, AdminError> {
@@ -459,7 +459,7 @@ impl AdminService {
         })
     }
 
-    /// `GET /admin/v1/models` — every model lane + its upstream provider. Read scope. Sorted by
+    /// `GET /api/v1/admin/models` — every model lane + its upstream provider. Read scope. Sorted by
     /// model name. No credentials.
     pub(crate) async fn list_models(&self) -> Result<Page<ModelView>, AdminError> {
         let mut models: Vec<ModelView> = self
@@ -475,7 +475,7 @@ impl AdminService {
         Ok(Page::single(models))
     }
 
-    /// `GET /admin/v1/providers` — distinct upstream providers + the count of model lanes routing
+    /// `GET /api/v1/admin/providers` — distinct upstream providers + the count of model lanes routing
     /// through each. Read scope. Sorted by provider name.
     pub(crate) async fn list_providers(&self) -> Result<Page<ProviderView>, AdminError> {
         let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -492,7 +492,7 @@ impl AdminService {
         Ok(Page::single(providers))
     }
 
-    /// `GET /admin/v1/hooks` — the hook registry read. Read scope. Each entry
+    /// `GET /api/v1/admin/hooks` — the hook registry read. Read scope. Each entry
     /// is the DEFINITION (kind/transport/grants/ordering/stage), never a secret. Sorted by name.
     pub(crate) async fn list_hooks(&self) -> Result<Page<HookView>, AdminError> {
         let mut hooks: Vec<HookView> = self
@@ -505,7 +505,7 @@ impl AdminService {
         Ok(Page::single(hooks))
     }
 
-    /// `GET /admin/v1/hooks/{name}` — one hook definition, or `not_found` if the name is unregistered.
+    /// `GET /api/v1/admin/hooks/{name}` — one hook definition, or `not_found` if the name is unregistered.
     pub(crate) async fn get_hook(&self, name: &str) -> Result<HookView, AdminError> {
         self.app
             .hook_registry
@@ -514,7 +514,7 @@ impl AdminService {
             .ok_or_else(|| AdminError::NotFound(format!("hook `{name}`")))
     }
 
-    /// `GET /admin/v1/plugins?type=auth|hooks` — the plugin catalog for one TYPE. Read
+    /// `GET /api/v1/admin/plugins?type=auth|hooks` — the plugin catalog for one TYPE. Read
     /// scope. Lists COMPILED-IN plugins (feature-gated, from the binary — the same source as `info`'s
     /// build proof) and EXTERNAL plugins (registered over socket/webhook). An unknown/absent `type` is
     /// an `invalid_request` (the two types are distinct engine contracts; a caller must pick one).
@@ -584,7 +584,7 @@ impl AdminService {
         Ok(Page::single(plugins))
     }
 
-    /// `GET /admin/v1/config` — the EFFECTIVE running config, composed from the same redacted reads as
+    /// `GET /api/v1/admin/config` — the EFFECTIVE running config, composed from the same redacted reads as
     /// the individual endpoints (auth/pools/models/providers/hooks/global-hooks). Read scope. Carries
     /// no secret. For drift detection + one-shot inspection; the base-vs-overlay source annotation
     /// lands with the overlay substrate.
@@ -600,7 +600,7 @@ impl AdminService {
         })
     }
 
-    /// `POST /admin/v1/config/validate` — DRY-RUN a proposed config: resolve (`config.yaml` deploy +
+    /// `POST /api/v1/admin/config/validate` — DRY-RUN a proposed config: resolve (`config.yaml` deploy +
     /// `providers.yaml` defs) then run the full boot-time `config_validate`, collecting every error at
     /// once, WITHOUT applying anything. Always succeeds as an operation (`Result::Ok`) — the verdict is
     /// in the view's `ok`/`errors`; a valid request describing an invalid config is `ok: false`, not an
@@ -624,8 +624,8 @@ impl AdminService {
         }
     }
 
-    /// `GET /admin/v1/admin-auth` — the ADMIN-plane auth config (distinct from the ingress chain).
-    /// Read scope. Reports the live `admin_auth` chain — the SAME resource `PUT /admin/v1/admin-auth`
+    /// `GET /api/v1/admin/admin-auth` — the ADMIN-plane auth config (distinct from the ingress chain).
+    /// Read scope. Reports the live `admin_auth` chain — the SAME resource `PUT /api/v1/admin/admin-auth`
     /// writes, so a read-after-write is coherent (previously this hard-coded `["admin-token"]` and
     /// never reflected a PUT). Never a secret.
     pub(crate) async fn get_admin_auth(&self) -> Result<AdminAuthView, AdminError> {
@@ -637,7 +637,7 @@ impl AdminService {
         })
     }
 
-    /// `GET /admin/v1/usage` — fleet usage aggregation (spend/tokens/requests totals + per-key
+    /// `GET /api/v1/admin/usage` — fleet usage aggregation (spend/tokens/requests totals + per-key
     /// breakdown) from governance's counters. Read scope. Empty when governance is disabled. The
     /// per-key store reads run on a blocking thread (the SQLite store is synchronous), so the async
     /// runtime is never blocked. Never returns a secret — ids/names only.
@@ -687,10 +687,10 @@ impl AdminService {
         }
     }
 
-    /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode. Read scope. Never a
+    /// `GET /api/v1/admin/auth` — the ingress auth chain + upstream-credential mode. Read scope. Never a
     /// secret: only module names and the mode. This is READ-ONLY at runtime — the ingress chain is
-    /// mutated through the config-plane write path (`PUT/POST /admin/v1/config`), not a dedicated PUT.
-    /// (The ADMIN-plane chain, by contrast, has `PUT /admin/v1/admin-auth`.)
+    /// mutated through the config-plane write path (`PUT/POST /api/v1/admin/config`), not a dedicated PUT.
+    /// (The ADMIN-plane chain, by contrast, has `PUT /api/v1/admin/admin-auth`.)
     pub(crate) async fn get_auth(&self) -> Result<AuthView, AdminError> {
         Ok(AuthView {
             chain: self.app.auth.chain_names(),
@@ -702,7 +702,7 @@ impl AdminService {
         })
     }
 
-    /// `GET /admin/v1/hooks/{name}/health` — best-effort transport reachability for one hook. Read
+    /// `GET /api/v1/admin/hooks/{name}/health` — best-effort transport reachability for one hook. Read
     /// scope. `not_found` if the name is unregistered. NEVER fires the hook: for a socket it does a
     /// short-timeout connect probe (`reachable = Some(_)`); for a webhook (or on non-unix) it reports
     /// `reachable = None` with a note (webhooks are probed on demand at request time, not here).

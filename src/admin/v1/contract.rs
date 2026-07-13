@@ -16,6 +16,16 @@
 
 use serde::Serialize;
 
+/// The root every busbar-NATIVE API surface mounts under (`/api/<version>/<area>/…`). The data
+/// plane (the six mimicked SDK wire protocols) is deliberately OUTSIDE this root — its paths are
+/// dictated by the upstream SDKs, not by busbar.
+pub(crate) const API_ROOT: &str = "/api";
+
+/// The frozen Admin API v1 path prefix — `API_ROOT` + version + area. Every admin endpoint hangs
+/// off this; the router nest, the scope matrix, and the OpenAPI doc all derive from it (one source
+/// of truth, drift-proof by construction — see `admin::transport::mount`).
+pub(crate) const ADMIN_PREFIX: &str = "/api/v1/admin";
+
 /// The three built-in authorization scopes, totally ordered `ReadOnly ⊂ HooksRegister ⊂ Full`
 /// (design-admin-api-v1 §1). Authorization is checked on the PRINCIPAL per endpoint and is NEVER
 /// derived from the request body, so a crafted request cannot escalate. `Ord` derives from
@@ -68,7 +78,7 @@ impl Scope {
 
 /// The AUTHORIZATION MATRIX (design-admin-api-v1 §1, §6.3): the scope an admin endpoint requires,
 /// derived from METHOD + PATH — never from the body (a crafted request cannot escalate). The
-/// ladder: every read is `read-only`; the hook-DEFINITION lifecycle (`/admin/v1/hooks*` mutations)
+/// ladder: every read is `read-only`; the hook-DEFINITION lifecycle (`/api/v1/admin/hooks*` mutations)
 /// is `hooks-register` (deliberately narrow — automation can register itself but cannot mint keys
 /// or change auth); every other mutation — keys, config apply/rollback, auth chains, group_map,
 /// cache — is `full`. Unknown methods fail closed to `full`. Body-derived refinements (§6.3: a
@@ -85,7 +95,10 @@ pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
         || method == Method::PUT
         || method == Method::PATCH
         || method == Method::DELETE;
-    if is_mutation && (path == "/admin/v1/hooks" || path.starts_with("/admin/v1/hooks/")) {
+    // Match RELATIVE to the one true prefix so the matrix can never drift from the mount grammar.
+    // A path outside the prefix (impossible for a mounted admin route) fails closed to `full`.
+    let rel = path.strip_prefix(ADMIN_PREFIX).unwrap_or(path);
+    if is_mutation && (rel == "/hooks" || rel.starts_with("/hooks/")) {
         return Scope::HooksRegister;
     }
     Scope::Full
@@ -165,7 +178,7 @@ impl AdminError {
     }
 }
 
-/// The compiled-in plugin catalog + topology + uptime returned by `GET /admin/v1/info`. Powers
+/// The compiled-in plugin catalog + topology + uptime returned by `GET /api/v1/admin/info`. Powers
 /// version negotiation for tooling AND the compliance-by-compilation proof: `auth_modules`/`hook_plugins` reflect
 /// the ACTUAL binary (feature-gated at compile time), not config, so `--no-default-features` shows a
 /// provably smaller surface. No LLM content, ever.
@@ -205,7 +218,7 @@ pub(crate) struct TopologyInfo {
     pub(crate) providers: usize,
 }
 
-/// A pool in the topology read (`GET /admin/v1/pools`). Summary shape today: name + the member
+/// A pool in the topology read (`GET /api/v1/admin/pools`). Summary shape today: name + the member
 /// models and their weights. LIVE per-member status (breaker state, available concurrency, latency
 /// EWMA, budget/rate headroom — design-admin-api-v1 §6.9) is an additive follow-up; the field set
 /// only grows.
@@ -222,7 +235,7 @@ pub(crate) struct PoolMemberView {
     pub(crate) weight: u32,
 }
 
-/// The LIVE per-pool detail read (`GET /admin/v1/pools/{name}`) — the reliability/capacity dashboard
+/// The LIVE per-pool detail read (`GET /api/v1/admin/pools/{name}`) — the reliability/capacity dashboard
 /// data (design-admin-api-v1 §6.9): each member's breaker state, concurrency headroom, in-flight
 /// count, latency EWMA, and success/error tallies, read from the SAME store signals the routing seam
 /// ranks on. No LLM content, no credentials.
@@ -257,7 +270,7 @@ pub(crate) struct PoolMemberStatusView {
     pub(crate) dead: bool,
 }
 
-/// A model lane in the topology read (`GET /admin/v1/models`): the config key + its upstream
+/// A model lane in the topology read (`GET /api/v1/admin/models`): the config key + its upstream
 /// provider. No credentials, ever.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ModelView {
@@ -265,7 +278,7 @@ pub(crate) struct ModelView {
     pub(crate) provider: String,
 }
 
-/// A provider in the topology read (`GET /admin/v1/providers`): the provider name + how many model
+/// A provider in the topology read (`GET /api/v1/admin/providers`): the provider name + how many model
 /// lanes route through it.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ProviderView {
@@ -273,7 +286,7 @@ pub(crate) struct ProviderView {
     pub(crate) model_count: usize,
 }
 
-/// A hook definition in the registry read (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) — the
+/// A hook definition in the registry read (`GET /api/v1/admin/hooks`, `GET /api/v1/admin/hooks/{name}`) — the
 /// plugin catalog read. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a
 /// secret. `global` reports whether the hook fires on every request (named in `global_hooks:` or
 /// declared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.
@@ -313,7 +326,7 @@ pub(crate) struct HookTransportView {
     pub(crate) target: Option<String>,
 }
 
-/// The live health of one hook's transport (`GET /admin/v1/hooks/{name}/health`). BEST-EFFORT: for a
+/// The live health of one hook's transport (`GET /api/v1/admin/hooks/{name}/health`). BEST-EFFORT: for a
 /// socket transport `reachable` is `Some(true/false)` from a short-timeout connect probe; for a webhook
 /// (or on a non-unix host) it is `None` (probed on demand, not here) with a `detail` note. Never fires
 /// the hook — just checks whether the endpoint accepts a connection. Additive-only.
@@ -328,7 +341,7 @@ pub(crate) struct HookHealthView {
     pub(crate) detail: Option<String>,
 }
 
-/// One plugin in the plugin catalog (`GET /admin/v1/plugins?type=`). A plugin is either
+/// One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either
 /// COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)
 /// or EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where
 /// activation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`
@@ -347,7 +360,7 @@ pub(crate) struct PluginView {
     pub(crate) target: Option<String>,
 }
 
-/// The ingress auth chain read (`GET /admin/v1/auth`): the ordered module names that authenticate
+/// The ingress auth chain read (`GET /api/v1/admin/auth`): the ordered module names that authenticate
 /// callers + the upstream-credential mode. Never a secret — module names and the mode are config
 /// identifiers, not credentials. An empty `chain` is the open front door (admits every request).
 #[derive(Debug, Clone, Serialize)]
@@ -430,7 +443,7 @@ mod cursor_tests {
     }
 }
 
-/// The EFFECTIVE config snapshot (`GET /admin/v1/config`) — the running configuration as busbar
+/// The EFFECTIVE config snapshot (`GET /api/v1/admin/config`) — the running configuration as busbar
 /// resolved it, for drift detection (compare against your desired config) and one-shot inspection.
 /// Composed from the same REDACTED reads as the individual endpoints (auth chain names, pool/model/
 /// provider topology, hook definitions, global-hook wiring) — so it carries NO secret: no client
@@ -450,7 +463,7 @@ pub(crate) struct EffectiveConfigView {
     pub(crate) global_hooks: Vec<String>,
 }
 
-/// Fleet usage aggregation (`GET /admin/v1/usage`) — spend/tokens/requests totals plus a per-key
+/// Fleet usage aggregation (`GET /api/v1/admin/usage`) — spend/tokens/requests totals plus a per-key
 /// breakdown, read from governance's per-key counters. The data-plane half of metering. Empty (zero
 /// totals, no keys) when governance is disabled. No secrets — key ids/names only, never a token.
 #[derive(Debug, Clone, Serialize)]
@@ -477,9 +490,9 @@ pub(crate) struct KeyUsageView {
     pub(crate) requests: u64,
 }
 
-/// The admin-plane auth read (`GET /admin/v1/admin-auth`) — which modules guard the ADMIN surface
+/// The admin-plane auth read (`GET /api/v1/admin/admin-auth`) — which modules guard the ADMIN surface
 /// (distinct from the ingress `auth` chain). `modules` is the live `admin_auth` chain (the SAME
-/// resource `PUT /admin/v1/admin-auth` writes), so a read-after-write is coherent. An empty chain is
+/// resource `PUT /api/v1/admin/admin-auth` writes), so a read-after-write is coherent. An empty chain is
 /// the open (anonymous, full-authority) dev posture — `configured: false`. Never a secret.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AdminAuthView {
@@ -490,7 +503,7 @@ pub(crate) struct AdminAuthView {
     pub(crate) modules: Vec<String>,
 }
 
-/// The result of `POST /admin/v1/config/validate` — a DRY-RUN: does a proposed config resolve +
+/// The result of `POST /api/v1/admin/config/validate` — a DRY-RUN: does a proposed config resolve +
 /// validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
 /// failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid
 /// request that describes an INVALID config is `ok: false`, not an HTTP error); only a MALFORMED request
@@ -513,11 +526,11 @@ mod tests {
     #[test]
     fn required_scope_matrix() {
         for path in [
-            "/admin/v1/info",
-            "/admin/v1/hooks",
-            "/admin/v1/keys",
-            "/admin/v1/config",
-            "/admin/v1/audit",
+            "/api/v1/admin/info",
+            "/api/v1/admin/hooks",
+            "/api/v1/admin/keys",
+            "/api/v1/admin/config",
+            "/api/v1/admin/audit",
         ] {
             assert_eq!(
                 required_scope(&Method::GET, path),
@@ -526,29 +539,32 @@ mod tests {
             );
         }
         assert_eq!(
-            required_scope(&Method::POST, "/admin/v1/hooks"),
+            required_scope(&Method::POST, "/api/v1/admin/hooks"),
             Scope::HooksRegister
         );
         assert_eq!(
-            required_scope(&Method::DELETE, "/admin/v1/hooks/my-hook"),
+            required_scope(&Method::DELETE, "/api/v1/admin/hooks/my-hook"),
             Scope::HooksRegister
         );
         assert_eq!(
-            required_scope(&Method::PATCH, "/admin/v1/hooks/my-hook/settings"),
+            required_scope(&Method::PATCH, "/api/v1/admin/hooks/my-hook/settings"),
             Scope::HooksRegister
         );
         // A sibling path must not inherit the hooks scope (boundary-safe prefix).
         assert_eq!(
-            required_scope(&Method::POST, "/admin/v1/hooksx"),
-            Scope::Full
-        );
-        assert_eq!(required_scope(&Method::POST, "/admin/v1/keys"), Scope::Full);
-        assert_eq!(
-            required_scope(&Method::POST, "/admin/v1/config/apply"),
+            required_scope(&Method::POST, "/api/v1/admin/hooksx"),
             Scope::Full
         );
         assert_eq!(
-            required_scope(&Method::OPTIONS, "/admin/v1/hooks"),
+            required_scope(&Method::POST, "/api/v1/admin/keys"),
+            Scope::Full
+        );
+        assert_eq!(
+            required_scope(&Method::POST, "/api/v1/admin/config/apply"),
+            Scope::Full
+        );
+        assert_eq!(
+            required_scope(&Method::OPTIONS, "/api/v1/admin/hooks"),
             Scope::Full,
             "unknown methods fail closed"
         );

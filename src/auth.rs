@@ -27,12 +27,15 @@ const X_ADMIN_TOKEN: &str = "x-admin-token";
 const AUTH_SCHEME_BEARER: &str = "bearer";
 /// The liveness-probe path that bypasses auth entirely.
 const HEALTHZ_PATH: &str = "/healthz";
-/// The exact `/admin` path (the admin surface root, e.g. GET /admin/keys redirects).
-const ADMIN_PATH: &str = "/admin";
-/// The `/admin/` prefix that all registered admin sub-routes share. A path must match
-/// ADMIN_PATH exactly OR start with ADMIN_PATH_PREFIX to be treated as an admin request —
-/// preventing sibling paths like `/adminx/…` from being mis-classified.
-const ADMIN_PATH_PREFIX: &str = "/admin/";
+/// The exact `/api` path (the native-API root — every busbar-own surface mounts under it;
+/// see `admin::v1::contract::API_ROOT`).
+const ADMIN_PATH: &str = "/api";
+/// The `/api/` prefix that all native-API sub-routes share. A path must match ADMIN_PATH exactly
+/// OR start with ADMIN_PATH_PREFIX to be treated as an admin-plane request — preventing sibling
+/// paths like `/apix/…` from being mis-classified. The WHOLE `/api/` root is admin-classified
+/// (fail-closed): a future area (`events`, `metrics`) mounted under `/api/` is admin-guarded by
+/// default and must explicitly carve out a weaker class if it ever wants one.
+const ADMIN_PATH_PREFIX: &str = "/api/";
 /// Fixed dummy secret used when an inbound SigV4 AccessKeyId is unknown: we still run the
 /// full HMAC verification so the timing is indistinguishable from a bad-signature rejection
 /// (no AccessKeyId-enumeration oracle). The `crate::sigv4` test module references this via
@@ -653,7 +656,7 @@ fn module_admin_scope_cap(
 
 /// D4 DRY-RUN: evaluate what EFFECTIVE admin scope the presented carriers would earn under
 /// `app`'s admin chain (chain verdict → group_map resolution → module ceiling), without serving
-/// anything. `None` = denied / no grant. `PUT /admin/v1/auth` runs the CALLER through the
+/// anything. `None` = denied / no grant. `PUT /api/v1/admin/auth` runs the CALLER through the
 /// CANDIDATE chain with this before committing — a chain that would lock the caller out is
 /// rejected instead of applied (Matthew's D4 ruling; restart remains the backstop).
 pub(crate) fn dry_run_admin_scope(
@@ -793,13 +796,12 @@ pub(crate) async fn auth_middleware(
     // Derive owned values up front so no immutable borrow of `req` is live when we mutate its
     // extensions below.
     //
-    // Admin detection must be path-boundary-safe: a bare `starts_with("/admin")` also captures
-    // sibling paths like `/adminx/v1/messages` or `/admin_portal`, which are NOT registered admin
-    // routes. Such a path would be sent down the admin auth branch and (with a valid admin token)
-    // early-return WITHOUT the `CallerToken` extension a non-admin handler requires — yielding a
-    // 500 MissingExtension and leaking that the path was treated as admin-protected. Require either
-    // the exact `/admin` segment or a `/admin/` delimiter so only the four registered admin routes
-    // (`/admin/keys`, `/admin/keys/:id`, `/admin/keys/:id/usage`) match.
+    // Admin detection must be path-boundary-safe: a bare `starts_with("/api")` also captures
+    // sibling paths like `/apix/v1/messages`, which are NOT native-API routes. Such a path would be
+    // sent down the admin auth branch and (with a valid admin token) early-return WITHOUT the
+    // `CallerToken` extension a non-admin handler requires — yielding a 500 MissingExtension and
+    // leaking that the path was treated as admin-protected. Require either the exact `/api` segment
+    // or an `/api/` delimiter so only the native-API root (`/api/<version>/<area>/…`) matches.
     let is_admin = path == ADMIN_PATH || path.starts_with(ADMIN_PATH_PREFIX);
     let admin_header_token = extract_admin_header_token(&req);
     // The busbar client token, taken from whichever carrier the SDK used (Authorization: Bearer,
@@ -880,9 +882,14 @@ pub(crate) async fn auth_middleware(
             || method == axum::http::Method::DELETE;
         if is_mutation {
             // The CONFIG class (10/min) is the blast-radius set: whole-config mutations AND the
-            // admin auth chain itself. Everything else that mutates (hooks, keys, cache flush)
-            // is the CRUD class (60/min).
-            let class = if path.starts_with("/admin/v1/config/") || path == "/admin/v1/auth" {
+            // admin auth chain itself (`PUT /admin-auth` — the L3 remount moved it off `/auth`).
+            // Everything else that mutates (hooks, keys, cache flush) is the CRUD class (60/min).
+            // Matched RELATIVE to the one contract prefix so this gate can never drift from the
+            // mount grammar.
+            let rel = path
+                .strip_prefix(crate::admin::v1::contract::ADMIN_PREFIX)
+                .unwrap_or(&path);
+            let class = if rel.starts_with("/config/") || rel == "/admin-auth" {
                 crate::admin::rate::MutationClass::Config
             } else {
                 crate::admin::rate::MutationClass::Crud
@@ -2000,7 +2007,7 @@ mod tests {
             "/v1/responses",                    // responses
             "/v2/chat",                         // cohere
             "/model/anthropic.claude/converse", // bedrock
-            "/admin/keys",                      // admin path → inferred-proto fallback (openai)
+            "/api/v1/admin/keys",               // admin path → inferred-proto fallback (openai)
             "/totally/unknown/path",            // unknown → openai fallback
         ];
         for path in paths {
@@ -2515,11 +2522,11 @@ mod tests {
     }
 
     /// Regression for the over-broad admin-prefix detection: a path that merely STARTS WITH the
-    /// bytes `/admin` but is not a registered `/admin/...` route (e.g. `/adminx/...`) must NOT be
+    /// bytes `/api` but is not a registered `/api/...` route (e.g. `/apix/...`) must NOT be
     /// classified as admin. Under TOKEN mode with a wrong token it should be rejected by the normal
     /// auth branch with the inferred-protocol native 401 envelope — never routed down the admin
     /// branch (which would early-return without the `CallerToken` extension and 500 in a non-admin
-    /// handler). `/adminx/v1/messages` infers the anthropic protocol via the `/v1/messages` suffix.
+    /// handler). `/apix/v1/messages` infers the anthropic protocol via the `/v1/messages` suffix.
     #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_admin_prefix_is_boundary_safe() {
@@ -2547,7 +2554,7 @@ mod tests {
                 )
                 .api_key("busbar-upstream-key"),
             )
-            .pool("adminx", &[(0, 1)])
+            .pool("apix", &[(0, 1)])
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
             .build();
 
@@ -2556,14 +2563,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
-        let body = json!({"model": "adminx", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+        let body = json!({"model": "apix", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
             .to_string();
 
-        // Wrong token to `/adminx/v1/messages`: rejected by the NORMAL auth branch, not the admin
+        // Wrong token to `/apix/v1/messages`: rejected by the NORMAL auth branch, not the admin
         // branch — a normal-protocol native 401 (anthropic), NOT the admin "admin unauthorized"
         // path and NOT a 500 from a missing CallerToken extension.
         let r = client
-            .post(format!("http://{addr}/adminx/v1/messages"))
+            .post(format!("http://{addr}/apix/v1/messages"))
             .header("x-api-key", "wrong-token")
             .body(body)
             .send()
@@ -2572,7 +2579,7 @@ mod tests {
         assert_eq!(
             r.status().as_u16(),
             401,
-            "an /adminx path with a wrong token must be a normal 401, not 500/admin-500 (got {})",
+            "an /apix path with a wrong token must be a normal 401, not 500/admin-500 (got {})",
             r.status()
         );
         assert_eq!(
@@ -3120,7 +3127,7 @@ mod tests {
 
         // Absent header → None (unchanged).
         let absent = Request::builder()
-            .uri("/admin/keys")
+            .uri("/api/v1/admin/keys")
             .body(Body::empty())
             .expect("test request must build");
         assert_eq!(extract_admin_header_token(&absent), None);
@@ -3148,7 +3155,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys");
+        let url = format!("http://{addr}/api/v1/admin/keys");
 
         // Blank x-admin-token (and no Bearer) → 401: a blank header is treated as absent.
         let r_blank = client
@@ -3208,7 +3215,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys");
+        let url = format!("http://{addr}/api/v1/admin/keys");
 
         // Correct Bearer + WRONG x-admin-token → authorized (the header compare must not veto a
         // matching Bearer; the fold is OR, not AND).
@@ -3287,7 +3294,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/admin/keys");
+        let url = format!("http://{addr}/api/v1/admin/keys");
 
         // The admin secret presented via the vendor-SDK carriers MUST be rejected: these carriers are
         // the client-token surface, NOT the operator surface. Exercise BOTH carriers, on BOTH the

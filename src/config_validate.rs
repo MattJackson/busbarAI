@@ -121,7 +121,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             }
         }
         // Reserved-name check (same rule as the pool and provider loops below): a model named `admin`
-        // is reached at `POST /admin/v1/messages`, which the auth middleware classifies as the
+        // is reached at `POST /api/v1/admin/messages`, which the auth middleware classifies as the
         // operator admin surface (guarded by admin_token, not a client/virtual-key token). So the
         // model is unreachable to normal clients AND, in governance mode, the admin branch inserts
         // `GovCtx::default()` (key: None) which skips per-model `allowed_pools` enforcement — a
@@ -159,7 +159,7 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         // Reserved-name check: the auth middleware classifies any request path that is exactly
         // `/admin` or starts with `/admin/` as the operator admin surface (guarded by the governance
         // admin_token, NOT a client/virtual-key token). A pool named `admin` is reached at
-        // `POST /admin/v1/messages`, which the middleware intercepts as an admin request — so a
+        // `POST /api/v1/admin/messages`, which the middleware intercepts as an admin request — so a
         // normal client_token / virtual-key holder gets a 401 and the pool is permanently
         // unreachable; worse, in governance mode the admin branch inserts `GovCtx::default()`
         // (key: None), so an admin-token holder reaching the pool this way bypasses per-pool
@@ -1180,7 +1180,7 @@ pub(crate) fn validate_governance(
             .is_none_or(|t| t.trim().is_empty())
     {
         errors.push(
-            "governance.enabled is true but no governance.admin_token is configured; the /admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
+            "governance.enabled is true but no governance.admin_token is configured; the /api/v1/admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
         );
     }
     // WARN (not a hard error): with `price_per_request_cents == 0`, a request that consumes no
@@ -2617,7 +2617,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_pool_named_admin() {
-        // A pool named `admin` is reached at `/admin/v1/messages`, which the auth middleware
+        // A pool named `admin` is reached at `/api/v1/admin/messages`, which the auth middleware
         // intercepts as the operator admin surface — making the pool unreachable to clients and
         // (in governance mode) bypassing per-pool enforcement. Must fail loud at boot.
         let (providers, models, _) = valid_maps();
@@ -2652,7 +2652,7 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_model_named_admin() {
-        // Regression: a MODEL named `admin` is reached at `/admin/v1/messages`,
+        // Regression: a MODEL named `admin` is reached at `/api/v1/admin/messages`,
         // which the auth middleware intercepts as the operator admin surface — unreachable to clients
         // and (in governance mode) a per-model `allowed_pools` bypass via the GovCtx::default() admin
         // branch. The model loop previously skipped the reserved-name check the pool/provider loops
