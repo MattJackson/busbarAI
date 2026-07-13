@@ -3,6 +3,10 @@
 
 //! Gemini protocol reader/writer implementation.
 
+use super::openai_family::{
+    ERR_TYPE_AUTHENTICATION, ERR_TYPE_INVALID_REQUEST, ERR_TYPE_NOT_FOUND, ERR_TYPE_PERMISSION,
+    ERR_TYPE_RATE_LIMIT,
+};
 use super::*;
 
 /// Router-internal shim key the gemini ingress route injects into the request body when the client
@@ -92,7 +96,7 @@ const GRPC_NOT_FOUND: &str = "NOT_FOUND";
 /// google.rpc.Code name for an unimplemented / not-supported operation.
 const GRPC_UNIMPLEMENTED: &str = "UNIMPLEMENTED";
 /// Busbar/Anthropic internal error kind for an overloaded upstream (maps to GRPC_UNAVAILABLE).
-const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
+const ERR_TYPE_OVERLOADED: &str = super::openai_family::ERR_TYPE_OVERLOADED;
 
 // ── ErrorInfo tokens ──────────────────────────────────────────────────────────
 /// The machine-readable `reason` value carried in `google.rpc.ErrorInfo` for an invalid API key.
@@ -2652,15 +2656,15 @@ impl ProtocolWriter for GeminiWriter {
         // bypassed) could surface the wrong code/status pairing.
         fn status_name_for_kind(kind: &str) -> Option<&'static str> {
             match kind {
-                "invalid_request_error" | "invalid_argument" | "bad_request" => {
+                ERR_TYPE_INVALID_REQUEST | "invalid_argument" | "bad_request" => {
                     Some(GRPC_INVALID_ARGUMENT)
                 }
-                "authentication_error" | "unauthenticated" | "auth" => Some(GRPC_UNAUTHENTICATED),
-                "permission_error" | "permission_denied" | "forbidden" => {
+                ERR_TYPE_AUTHENTICATION | "unauthenticated" | "auth" => Some(GRPC_UNAUTHENTICATED),
+                ERR_TYPE_PERMISSION | "permission_denied" | "forbidden" => {
                     Some(GRPC_PERMISSION_DENIED)
                 }
-                "not_found_error" | "not_found" => Some(GRPC_NOT_FOUND),
-                "rate_limit_error" | "resource_exhausted" | "rate_limit" => {
+                ERR_TYPE_NOT_FOUND | "not_found" => Some(GRPC_NOT_FOUND),
+                ERR_TYPE_RATE_LIMIT | "resource_exhausted" | "rate_limit" => {
                     Some(GRPC_RESOURCE_EXHAUSTED)
                 }
                 ERR_TYPE_OVERLOADED | crate::forward::KIND_OVERLOADED | "unavailable" => {
@@ -3302,7 +3306,10 @@ impl ProtocolWriter for GeminiWriter {
         // it returns HTTP 400 with `error.status: "INVALID_ARGUMENT"`. The gemini writer maps
         // `invalid_request_error` → INVALID_ARGUMENT and echoes `code: 400`, so a 401 body
         // would be a tell the google-genai SDK never sees from real Google on the bad-key path.
-        (axum::http::StatusCode::BAD_REQUEST, "invalid_request_error")
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            ERR_TYPE_INVALID_REQUEST,
+        )
     }
 
     fn uses_array_stream_shim(&self) -> bool {

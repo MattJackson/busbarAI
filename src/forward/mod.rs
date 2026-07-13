@@ -19,7 +19,9 @@ use serde_json::Value;
 
 use crate::breaker::{classify as classify_disposition, normalize_raw_error, Disposition};
 use crate::config::OnExhausted;
-use crate::proto::{convert_headers, StatusClass, PROTO_BEDROCK, PROTO_GEMINI, PROTO_RESPONSES};
+use crate::proto::{
+    convert_headers, openai_family, StatusClass, PROTO_BEDROCK, PROTO_GEMINI, PROTO_RESPONSES,
+};
 use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
@@ -44,18 +46,24 @@ pub(crate) const TEXT_EVENT_STREAM: &str = "text/event-stream";
 /// Canonical error-KIND tokens: produced by `cross_protocol_error_kind` / passed to
 /// `ingress_error` as the `kind` argument. Each string is the protocol-agnostic discriminant that
 /// the per-protocol writer maps to its native error category (e.g. Bedrock `__type`, Gemini
-/// `error.status`).
-pub(crate) const KIND_AUTHENTICATION: &str = "authentication_error";
-pub(crate) const KIND_PERMISSION: &str = "permission_error";
-pub(crate) const KIND_RATE_LIMIT: &str = "rate_limit_error";
-pub(crate) const KIND_API_ERROR: &str = "api_error";
-pub(crate) const KIND_INVALID_REQUEST: &str = "invalid_request_error";
-pub(crate) const KIND_NOT_FOUND: &str = "not_found_error";
+/// `error.status`). Values shared with the OpenAI-family/anthropic/admin vocabularies alias their
+/// canonical home in `proto::openai_family`; only the two forward-specific tokens (`overloaded`,
+/// `timeout`) are defined here.
+pub(crate) const KIND_AUTHENTICATION: &str = openai_family::ERR_TYPE_AUTHENTICATION;
+pub(crate) const KIND_PERMISSION: &str = openai_family::ERR_TYPE_PERMISSION;
+pub(crate) const KIND_RATE_LIMIT: &str = openai_family::ERR_TYPE_RATE_LIMIT;
+pub(crate) const KIND_INVALID_REQUEST: &str = openai_family::ERR_TYPE_INVALID_REQUEST;
+pub(crate) const KIND_NOT_FOUND: &str = openai_family::ERR_TYPE_NOT_FOUND;
+pub(crate) const KIND_API_ERROR: &str = openai_family::ERR_TYPE_API_ERROR;
+/// Bare `overloaded` — DELIBERATELY distinct from `openai_family::ERR_TYPE_OVERLOADED`
+/// ("overloaded_error", the Anthropic wire spelling): this is busbar's own agnostic kind for a
+/// relayed upstream 503.
 pub(crate) const KIND_OVERLOADED: &str = "overloaded";
+/// Bare `timeout` — distinct from the Anthropic wire's `timeout_error` spelling.
 pub(crate) const KIND_TIMEOUT: &str = "timeout";
-pub(crate) const KIND_INSUFFICIENT_QUOTA: &str = "insufficient_quota";
-pub(crate) const KIND_SERVER_ERROR: &str = "server_error";
-pub(crate) const KIND_REQUEST_TOO_LARGE: &str = "request_too_large";
+pub(crate) const KIND_INSUFFICIENT_QUOTA: &str = openai_family::ERR_TYPE_INSUFFICIENT_QUOTA;
+pub(crate) const KIND_SERVER_ERROR: &str = openai_family::ERR_TYPE_SERVER_ERROR;
+pub(crate) const KIND_REQUEST_TOO_LARGE: &str = openai_family::ERR_TYPE_REQUEST_TOO_LARGE;
 
 /// Network-transient `err_type` values passed to `record_transient_in`.  These are distinct from
 /// the error-KIND tokens above: they label the *category* of network failure recorded in the

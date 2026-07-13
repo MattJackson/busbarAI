@@ -97,10 +97,11 @@ struct CreateKeyReq {
 const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
 
 /// Error-type taxonomy strings used by the admin API and by `main.rs` (which references them via
-/// `crate::admin::ERR_TYPE_*`). `forward.rs` defines parallel `KIND_NOT_FOUND`/`KIND_INVALID_REQUEST`
-/// consts with the same string values independently, rather than importing from here.
-pub(crate) const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
-pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
+/// `crate::admin::ERR_TYPE_*`). The two values shared with the forward/OpenAI-family vocabulary
+/// alias their canonical home in `proto::openai_family` so the banks cannot drift.
+pub(crate) const ERR_TYPE_NOT_FOUND: &str = crate::proto::openai_family::ERR_TYPE_NOT_FOUND;
+pub(crate) const ERR_TYPE_INVALID_REQUEST: &str =
+    crate::proto::openai_family::ERR_TYPE_INVALID_REQUEST;
 const ERR_TYPE_INTERNAL: &str = "internal_error";
 const ERR_TYPE_CONFLICT: &str = "conflict_error";
 /// RETRYABLE optimistic-concurrency staleness — maps to the frozen `version_conflict` code

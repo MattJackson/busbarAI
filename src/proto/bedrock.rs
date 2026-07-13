@@ -3,6 +3,10 @@
 
 //! Bedrock Converse protocol reader/writer implementation.
 
+use super::openai_family::{
+    ERR_TYPE_AUTHENTICATION, ERR_TYPE_INSUFFICIENT_QUOTA, ERR_TYPE_INVALID_REQUEST,
+    ERR_TYPE_NOT_FOUND, ERR_TYPE_PERMISSION, ERR_TYPE_RATE_LIMIT,
+};
 use super::*;
 
 /// The two response headers a native AWS Bedrock endpoint ALWAYS emits (lowercase on the wire):
@@ -34,7 +38,7 @@ const APPLICATION_VND_AMAZON_EVENTSTREAM: &str = "application/vnd.amazon.eventst
 /// internal kind vocabulary. Both map to `ServiceUnavailableException` via
 /// `error_kind_to_bedrock_type`; named here so the match arm is a const pattern rather than a
 /// bare literal.
-const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
+const ERR_TYPE_OVERLOADED: &str = super::openai_family::ERR_TYPE_OVERLOADED;
 
 /// Map busbar's generic error `kind` vocabulary to the AWS Bedrock Converse exception name carried
 /// in `__type`. AWS's Converse error model is a fixed, closed set of exception shapes
@@ -47,20 +51,20 @@ const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
 /// same-protocol error round-trips its structured type.
 pub(crate) fn error_kind_to_bedrock_type(kind: &str) -> &'static str {
     match kind {
-        "invalid_request_error" | "invalid_request" | "validation" | "bad_request" => {
+        ERR_TYPE_INVALID_REQUEST | "invalid_request" | "validation" | "bad_request" => {
             EXC_VALIDATION
         }
-        "rate_limit_error" | "rate_limit" | "too_many_requests" | "throttling" => EXC_THROTTLING,
-        "authentication_error" | "permission_error" | "auth" | "forbidden" | "unauthorized" => {
+        ERR_TYPE_RATE_LIMIT | "rate_limit" | "too_many_requests" | "throttling" => EXC_THROTTLING,
+        ERR_TYPE_AUTHENTICATION | ERR_TYPE_PERMISSION | "auth" | "forbidden" | "unauthorized" => {
             "AccessDeniedException"
         }
-        "not_found" | "not_found_error" | "model_not_found" => "ResourceNotFoundException",
+        "not_found" | ERR_TYPE_NOT_FOUND | "model_not_found" => "ResourceNotFoundException",
         crate::forward::KIND_TIMEOUT | "model_timeout" => "ModelTimeoutException",
         crate::forward::KIND_OVERLOADED
         | ERR_TYPE_OVERLOADED
         | "service_unavailable"
         | "unavailable" => EXC_SERVICE_UNAVAILABLE,
-        "quota_exceeded" | "service_quota_exceeded" | "insufficient_quota" => {
+        "quota_exceeded" | "service_quota_exceeded" | ERR_TYPE_INSUFFICIENT_QUOTA => {
             "ServiceQuotaExceededException"
         }
         crate::forward::KIND_API_ERROR | "internal_error" | crate::forward::KIND_SERVER_ERROR => {

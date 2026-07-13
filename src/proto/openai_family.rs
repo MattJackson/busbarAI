@@ -10,8 +10,9 @@ use axum::http::StatusCode;
 
 /// Machine-readable `code` field emitted in a bad-key 401 OpenAI-family error envelope.
 /// Used in `bearer_error_code` to mirror the native `authentication_error` → `invalid_api_key`
-/// pairing that official SDKs surface as `error.code`.
-const CODE_INVALID_API_KEY: &str = "invalid_api_key";
+/// pairing that official SDKs surface as `error.code`. Also matched by the Responses stream
+/// classifier (`class_for_response_failed`) when the provider signal echoes this code back.
+pub(crate) const CODE_INVALID_API_KEY: &str = "invalid_api_key";
 
 /// Busbar-internal `provider_signal` label for a context-length result (the LANE label, not the
 /// OpenAI wire code). Distinct from `PROVIDER_CODE_CONTEXT_LENGTH` ("context_length_exceeded"),
@@ -31,6 +32,11 @@ pub(crate) const OPENAI_FAMILY_DEFAULT_MODEL: &str = "gpt-4o";
 /// Responses cannot drift.
 pub(crate) const OPENAI_FAMILY_MAX_OPEN_TOOLS: usize = 128;
 
+// CANONICAL error-kind vocabulary home. The forward-layer KIND_* bank (`forward::KIND_*`), the
+// admin API's ERR_TYPE_NOT_FOUND/ERR_TYPE_INVALID_REQUEST, and the anthropic writer's private
+// ERR_TYPE_* bank all alias these consts, so the shared string values are single-sourced here and
+// cannot drift. (`forward::KIND_OVERLOADED` = "overloaded" and anthropic's "timeout_error" are
+// DELIBERATELY different values and stay defined at their own sites.)
 /// OpenAI error `type` for a malformed / bad-argument request.
 pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
 /// OpenAI error `type` for a missing or invalid API key.
@@ -48,6 +54,12 @@ pub(crate) const ERR_TYPE_INSUFFICIENT_QUOTA: &str = "insufficient_quota";
 /// Anthropic/busbar internal kind for an overloaded upstream; mapped to `server_error` on the
 /// OpenAI wire (OpenAI has no `overloaded_error` type).
 pub(crate) const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
+/// Anthropic-vocabulary error `type` for a generic upstream/API failure; also the agnostic
+/// forward-layer kind (`forward::KIND_API_ERROR` aliases this).
+pub(crate) const ERR_TYPE_API_ERROR: &str = "api_error";
+/// Error `type` for an oversized request (HTTP 413); shared by the forward KIND bank and the
+/// anthropic writer.
+pub(crate) const ERR_TYPE_REQUEST_TOO_LARGE: &str = "request_too_large";
 
 /// Precise context-length prose scan shared by `OpenAiReader::extract_error` and
 /// `ResponsesReader::extract_error` — the message scan was duplicated. The scan must be PRECISE:

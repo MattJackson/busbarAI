@@ -59,16 +59,19 @@ const STOP_REFUSAL: &str = "refusal";
 /// Anthropic content block `type` values not covered by the delta sub-type constants above.
 const BLOCK_TYPE_REDACTED_THINKING: &str = "redacted_thinking";
 
-/// Anthropic error `type` strings used in error envelopes and in-stream error events.
-const ERR_TYPE_OVERLOADED: &str = "overloaded_error";
-const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
-const ERR_TYPE_AUTHENTICATION: &str = "authentication_error";
-const ERR_TYPE_RATE_LIMIT: &str = "rate_limit_error";
-const ERR_TYPE_API_ERROR: &str = "api_error";
+/// Anthropic error `type` strings used in error envelopes and in-stream error events. Values
+/// shared with the forward/OpenAI-family vocabulary alias their canonical home in
+/// `openai_family.rs`; only `timeout_error` is an Anthropic-specific spelling (the forward layer's
+/// agnostic kind is the bare `timeout`).
+const ERR_TYPE_OVERLOADED: &str = super::openai_family::ERR_TYPE_OVERLOADED;
+const ERR_TYPE_INVALID_REQUEST: &str = super::openai_family::ERR_TYPE_INVALID_REQUEST;
+const ERR_TYPE_AUTHENTICATION: &str = super::openai_family::ERR_TYPE_AUTHENTICATION;
+const ERR_TYPE_RATE_LIMIT: &str = super::openai_family::ERR_TYPE_RATE_LIMIT;
+const ERR_TYPE_API_ERROR: &str = super::openai_family::ERR_TYPE_API_ERROR;
 const ERR_TYPE_TIMEOUT: &str = "timeout_error";
-const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
-const ERR_TYPE_PERMISSION: &str = "permission_error";
-const ERR_TYPE_REQUEST_TOO_LARGE: &str = "request_too_large";
+const ERR_TYPE_NOT_FOUND: &str = super::openai_family::ERR_TYPE_NOT_FOUND;
+const ERR_TYPE_PERMISSION: &str = super::openai_family::ERR_TYPE_PERMISSION;
+const ERR_TYPE_REQUEST_TOO_LARGE: &str = super::openai_family::ERR_TYPE_REQUEST_TOO_LARGE;
 
 /// Anthropic citation `type` tag values (the `type` field on each citation object).
 const CITATION_TYPE_CHAR: &str = "char_location";

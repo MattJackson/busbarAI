@@ -4,7 +4,7 @@
 //! OpenAI Responses API protocol reader/writer implementation.
 
 use super::openai_family::{
-    bearer_error_code, ERR_TYPE_AUTHENTICATION, ERR_TYPE_INSUFFICIENT_QUOTA,
+    bearer_error_code, CODE_INVALID_API_KEY, ERR_TYPE_AUTHENTICATION, ERR_TYPE_INSUFFICIENT_QUOTA,
     ERR_TYPE_INVALID_REQUEST, ERR_TYPE_NOT_FOUND, ERR_TYPE_OVERLOADED, ERR_TYPE_PERMISSION,
     ERR_TYPE_RATE_LIMIT, ERR_TYPE_SERVER_ERROR,
 };
@@ -347,7 +347,7 @@ fn write_responses_tool_choice(tc: &crate::ir::IrToolChoice) -> serde_json::Valu
 /// HardDown) per the no-`_`-catch-all rule.
 fn class_for_response_failed(signal: &str) -> StatusClass {
     match signal {
-        "invalid_api_key" | ERR_TYPE_AUTHENTICATION => StatusClass::Auth,
+        CODE_INVALID_API_KEY | ERR_TYPE_AUTHENTICATION => StatusClass::Auth,
         ERR_CODE_RATE_LIMIT | ERR_TYPE_INSUFFICIENT_QUOTA => StatusClass::RateLimit,
         crate::forward::PROVIDER_CODE_CONTEXT_LENGTH | ERR_CODE_STRING_ABOVE_MAX => {
             StatusClass::ContextLength
