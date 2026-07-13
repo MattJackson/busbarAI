@@ -1193,6 +1193,11 @@ pub(crate) fn build_app_from_config(
         ),
         base_hook_names,
         admin_chain: cfg.admin_auth.clone(),
+        auth_modules: cfg
+            .auth
+            .as_ref()
+            .map(|a| a.modules.clone())
+            .unwrap_or_default(),
         group_map: cfg.group_map.clone(),
         config_path: config_paths.0,
         providers_path: config_paths.1,

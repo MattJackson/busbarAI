@@ -1684,6 +1684,35 @@ providers: {}
                     admin_scope: Some("hooks-register".to_string()),
                 },
             );
+            // For the CAP proofs below: a group MAPPED full — the module ceiling must cut it
+            // down — and a group mapped full that the allowlist doesn't authorize at all.
+            inner.group_map.insert(
+                "admins-capped".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                },
+            );
+            inner.group_map.insert(
+                "sneaky".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                },
+            );
+            // §2.4 trust-boundary caps on the external module: it may only assert these groups
+            // (`sneaky` is deliberately NOT pre-authorized), and nothing through it can exceed
+            // hooks-register regardless of group_map.
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: Some(vec![
+                        "viewers".to_string(),
+                        "registrars".to_string(),
+                        "admins-capped".to_string(),
+                        "strangers".to_string(),
+                    ]),
+                    max_admin_scope: Some("hooks-register".to_string()),
+                },
+            );
         }
         let router = crate::build_router(app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1761,7 +1790,56 @@ providers: {}
         .unwrap();
         assert_eq!(r.status().as_u16(), 403, "unmapped groups grant nothing");
 
-        // The operator token is still full.
+        // max_admin_scope CEILING: a group MAPPED full through the capped module lands at
+        // hooks-register — it registers hooks but still cannot mint keys.
+        let capped_hook = serde_json::json!({
+            "name": "capped-hook",
+            "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        })
+        .to_string();
+        let r = with(
+            "grp:admins-capped",
+            client.post(format!("http://{addr}/admin/v1/hooks")),
+        )
+        .body(capped_hook)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            201,
+            "the ceiling still allows what it grants (hooks-register)"
+        );
+        let r = with(
+            "grp:admins-capped",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            403,
+            "group_map said full, the module ceiling says hooks-register — the ceiling wins"
+        );
+
+        // allowed_groups INTERSECTION: `sneaky` is mapped full in group_map but the module is not
+        // authorized to assert it — the group is dropped BEFORE mapping, leaving zero grants.
+        let r = with(
+            "grp:sneaky",
+            client.get(format!("http://{addr}/admin/v1/info")),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            403,
+            "a group outside allowed_groups never reaches group_map"
+        );
+
+        // The operator token is still full (admin-tokens is exempt from module ceilings).
         let r = with(
             "admintok",
             client.post(format!("http://{addr}/admin/v1/keys")),

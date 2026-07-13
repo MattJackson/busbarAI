@@ -764,6 +764,7 @@ impl TestApp {
             )),
             base_hook_names: std::collections::HashSet::new(),
             admin_chain: vec!["admin-tokens".to_string()],
+            auth_modules: std::collections::HashMap::new(),
             group_map: std::collections::HashMap::new(),
             config_path: None,
             providers_path: None,
@@ -1538,6 +1539,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![token.to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
@@ -2738,6 +2740,7 @@ mod tests {
             chain: vec![],
             upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         };
         let app_passthrough = TestApp::new()
             .lane(
@@ -2800,6 +2803,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["caller-token-123".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app_token = TestApp::new()
             .lane(
@@ -2911,6 +2915,7 @@ mod tests {
             chain: vec![],
             upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(

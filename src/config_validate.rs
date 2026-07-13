@@ -869,6 +869,26 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
+    // Rule (auth.modules/max-scope): every `auth.modules.<name>.max_admin_scope` must be a known
+    // scope token (typos fail at boot), and `full` — lifting the default read-only ceiling on an
+    // external chain — is a LOUD boot warning: it is the explicit opt-in §2.4 requires.
+    if let Some(auth) = cfg.auth.as_ref() {
+        for (module, mc) in &auth.modules {
+            if let Some(scope) = mc.max_admin_scope.as_deref() {
+                match crate::admin::v1::contract::Scope::parse(scope) {
+                    None => errors.push(format!(
+                        "auth.modules '{module}' has unknown max_admin_scope '{scope}': expected                          read-only, hooks-register, or full"
+                    )),
+                    Some(crate::admin::v1::contract::Scope::Full) => tracing::warn!(
+                        module,
+                        "auth.modules grants max_admin_scope: full — principals identified by                          this module can hold FULL admin authority (the default ceiling is                          read-only); make sure this chain is trusted end to end"
+                    ),
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
     // Rule (hooks/global-ref): every name in `global_hooks:` must reference a registry entry.
     for name in &cfg.global_hooks {
         if !cfg.hooks.contains_key(name) {
@@ -2257,6 +2277,7 @@ mod tests {
             chain,
             upstream_credentials: upstream,
             client_tokens: client_tokens.into_iter().map(|s| s.to_string()).collect(),
+            modules: std::collections::HashMap::new(),
         }
     }
 
@@ -2888,6 +2909,40 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_bad_module_scope_and_group_map_scope() {
+        // Both scope-token rules: a typo'd `auth.modules.<m>.max_admin_scope` and a typo'd
+        // `group_map.<g>.admin_scope` each fail loud at boot, naming the offender.
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        let mut auth = config::AuthCfg::default_none();
+        auth.modules.insert(
+            "corp-ad".to_string(),
+            config::AuthModuleCfg {
+                allowed_groups: Some(vec!["llm-users".to_string()]),
+                max_admin_scope: Some("superuser".to_string()), // typo
+            },
+        );
+        cfg.auth = Some(auth);
+        cfg.group_map.insert(
+            "viewers".to_string(),
+            config::GroupMapEntry {
+                admin_scope: Some("readonly".to_string()), // typo (it's read-only)
+            },
+        );
+        let errs = validate(&cfg).expect_err("typo'd scope tokens must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("auth.modules 'corp-ad'") && e.contains("superuser")),
+            "expected the max_admin_scope error; got: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("group_map 'viewers'") && e.contains("readonly")),
+            "expected the group_map scope error; got: {errs:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_accepts_known_failover_exclusion() {
         // An exclusion that names a real member of the pool is the supported case and must validate.
         let (mut providers, mut models, _) = valid_maps();
@@ -3076,6 +3131,7 @@ mod tests {
             chain,
             upstream_credentials: upstream,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         }
     }
 

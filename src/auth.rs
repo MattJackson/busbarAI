@@ -104,6 +104,10 @@ pub(crate) struct AuthMiddleware {
     /// busbar's key (`Own`) or forwards the caller's (`Passthrough`). Read by the egress signing path.
     pub(crate) upstream_creds: UpstreamCreds,
     pub(crate) client_tokens: Vec<String>,
+    /// Per-module `allowed_groups:` caps (`auth.modules:`), applied to a module's Identify verdict
+    /// before anything downstream reads the groups. (The admin chain applies the same caps from
+    /// `App.auth_modules`; this copy serves the data-plane chain, which runs before `App` routing.)
+    module_caps: std::collections::HashMap<String, crate::config::AuthModuleCfg>,
     /// The AUTH CHAIN — the ordered `auth.chain` modules. `validate_token` runs it: the first module
     /// to `Identify` admits, a `Reject` denies, and if every module `Pass`es (no usable credential
     /// matched) a NON-EMPTY chain denies (fail-closed). An EMPTY chain admits unconditionally — the
@@ -187,6 +191,7 @@ impl AuthMiddleware {
             upstream_creds: cfg.upstream_credentials,
             client_tokens: tokens,
             chain,
+            module_caps: cfg.modules.clone(),
         }
     }
 
@@ -214,7 +219,20 @@ impl AuthMiddleware {
         }
         for module in &self.chain {
             match module.authenticate(candidate) {
-                AuthOutcome::Identify(principal) => return ChainVerdict::Identified(principal),
+                AuthOutcome::Identify(mut principal) => {
+                    // `allowed_groups:` intersection (design-hooks-v2 §2.4), BEFORE group_map — a
+                    // module cannot assert a group the operator did not pre-authorize for it.
+                    if !principal.groups.is_empty() {
+                        if let Some(allowed) = self
+                            .module_caps
+                            .get(module.name())
+                            .and_then(|c| c.allowed_groups.as_ref())
+                        {
+                            principal.groups.retain(|g| allowed.contains(g));
+                        }
+                    }
+                    return ChainVerdict::Identified(principal);
+                }
                 AuthOutcome::Reject => return ChainVerdict::Denied,
                 AuthOutcome::Pass => {}
             }
@@ -445,9 +463,9 @@ fn run_admin_chain(
     app: &crate::state::App,
     bearer: Option<&str>,
     header: Option<&str>,
-) -> ChainVerdict {
+) -> (ChainVerdict, Option<crate::admin::v1::contract::Scope>) {
     if app.admin_chain.is_empty() {
-        return ChainVerdict::Open;
+        return (ChainVerdict::Open, None);
     }
     for name in &app.admin_chain {
         let outcome = match name.as_str() {
@@ -481,12 +499,67 @@ fn run_admin_chain(
             }
         };
         match outcome {
-            AuthOutcome::Identify(principal) => return ChainVerdict::Identified(principal),
-            AuthOutcome::Reject => return ChainVerdict::Denied,
+            AuthOutcome::Identify(mut principal) => {
+                // TRUST-BOUNDARY CAPS (design-hooks-v2 §2.4), applied at the moment of identity:
+                // intersect the module's asserted groups with its operator-owned `allowed_groups:`
+                // allowlist BEFORE group_map resolution — a module cannot claim a group the
+                // operator did not pre-authorize for it — and carry the module's admin-scope
+                // ceiling out for the authorization step.
+                intersect_allowed_groups(app, name, &mut principal);
+                let cap = module_admin_scope_cap(app, name);
+                return (ChainVerdict::Identified(principal), cap);
+            }
+            AuthOutcome::Reject => return (ChainVerdict::Denied, None),
             AuthOutcome::Pass => {}
         }
     }
-    ChainVerdict::Denied
+    (ChainVerdict::Denied, None)
+}
+
+/// Intersect an identifying module's asserted `groups` with its configured `allowed_groups:`
+/// allowlist (no cap configured = every group passes). Runs BEFORE `group_map:` — the ORDER is the
+/// security property: a filtered-out group never reaches governance/scope resolution at all.
+fn intersect_allowed_groups(app: &crate::state::App, module: &str, principal: &mut Principal) {
+    if principal.groups.is_empty() {
+        return;
+    }
+    if let Some(allowed) = app
+        .auth_modules
+        .get(module)
+        .and_then(|c| c.allowed_groups.as_ref())
+    {
+        let before = principal.groups.len();
+        principal.groups.retain(|g| allowed.contains(g));
+        if principal.groups.len() < before {
+            tracing::warn!(
+                module,
+                principal = %principal.id,
+                dropped = before - principal.groups.len(),
+                "auth module asserted groups outside its allowed_groups cap; dropped"
+            );
+        }
+    }
+}
+
+/// The ADMIN-SCOPE CEILING for an identifying module (`max_admin_scope:`): the built-in
+/// `admin-tokens` operator credential is exempt (full by definition — the root credential); every
+/// other module is capped at its configured ceiling, DEFAULT `read-only` — `full` through an
+/// external chain is an explicit opt-in (boot-warned in config_validate).
+fn module_admin_scope_cap(
+    app: &crate::state::App,
+    module: &str,
+) -> Option<crate::admin::v1::contract::Scope> {
+    use crate::admin::v1::contract::Scope;
+    if module == "admin-tokens" {
+        return None;
+    }
+    Some(
+        app.auth_modules
+            .get(module)
+            .and_then(|c| c.max_admin_scope.as_deref())
+            .and_then(Scope::parse)
+            .unwrap_or(Scope::ReadOnly),
+    )
 }
 
 /// Resolve a principal's ADMIN SCOPE — the authorization half, operator-owned by construction:
@@ -641,19 +714,25 @@ pub(crate) async fn auth_middleware(
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(AuthMiddleware::extract_bearer_token);
-        let principal =
-            match run_admin_chain(&app, admin_bearer.as_deref(), admin_header_token.as_deref()) {
-                ChainVerdict::Identified(p) => Some(p),
-                // The explicit `admin_auth: []` OPEN posture (dev): anonymous, full authority —
-                // symmetric with the data plane's empty chain. The default config never lands here.
-                ChainVerdict::Open => None,
-                ChainVerdict::Denied => return Err(unauthorized_response(&path)),
-            };
+        let (verdict, scope_cap) =
+            run_admin_chain(&app, admin_bearer.as_deref(), admin_header_token.as_deref());
+        let principal = match verdict {
+            ChainVerdict::Identified(p) => Some(p),
+            // The explicit `admin_auth: []` OPEN posture (dev): anonymous, full authority —
+            // symmetric with the data plane's empty chain. The default config never lands here.
+            ChainVerdict::Open => None,
+            ChainVerdict::Denied => return Err(unauthorized_response(&path)),
+        };
         // AUTHORIZATION: resolve the principal's admin scope (module-intrinsic for the operator
         // token; `group_map:` for group-carrying principals — most permissive wins, unmapped
-        // groups grant nothing) and check it against the endpoint's required scope. An identified
-        // principal with NO grant is 403, never 401 — authenticated but not authorized.
+        // groups grant nothing), CAPPED by the identifying module's `max_admin_scope:` ceiling,
+        // and check it against the endpoint's required scope. An identified principal with NO
+        // grant is 403, never 401 — authenticated but not authorized.
         let scope = admin_scope_for(principal.as_ref(), &app.group_map);
+        let scope = match (scope, scope_cap) {
+            (Some(s), Some(cap)) => Some(std::cmp::min(s, cap)),
+            (s, _) => s,
+        };
         let required = crate::admin::v1::contract::required_scope(req.method(), &path);
         match scope {
             Some(s) if s.allows(required) => {}
@@ -1223,6 +1302,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["tok1".to_string(), "tok2".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -1247,6 +1327,7 @@ mod tests {
                 "middle-token".to_string(),
                 "last-token".to_string(),
             ],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
         assert!(mw.validate_token(Some("first-token")), "match at index 0");
@@ -1266,6 +1347,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -1306,6 +1388,7 @@ mod tests {
             chain: vec![],
             upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -1320,6 +1403,7 @@ mod tests {
             chain: vec![],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
 
@@ -1339,6 +1423,7 @@ mod tests {
             chain: vec![],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["listed-but-ignored".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
         assert_eq!(mw.client_tokens, vec!["listed-but-ignored".to_string()]);
@@ -1376,6 +1461,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![raw.to_string()],
+            modules: std::collections::HashMap::new(),
         };
         // Must not panic even though NOT_A_REAL_ENV_VAR is unset.
         let mw = AuthMiddleware::new(&cfg);
@@ -1880,6 +1966,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![token.to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(
@@ -2013,6 +2100,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(
@@ -2118,6 +2206,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(
@@ -2206,6 +2295,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(
@@ -2289,6 +2379,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["the-real-token".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(
@@ -2787,6 +2878,7 @@ mod tests {
                 let auth_cfg = crate::config::AuthCfg {
                     chain: vec!["tokens".to_string()], upstream_credentials: crate::auth::UpstreamCreds::Own,
                     client_tokens: vec!["static-allowlisted-but-inert".to_string()],
+                    modules: std::collections::HashMap::new(),
                 };
 
                 let app = TestApp::new()
@@ -3331,6 +3423,7 @@ mod tests {
             chain: vec!["tokens".to_string()],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![secret_a.to_string(), secret_b.to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let mw = AuthMiddleware::new(&cfg);
         let dbg = format!("{mw:?}");

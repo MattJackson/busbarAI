@@ -210,6 +210,9 @@ pub(crate) struct App {
     /// The ADMIN auth chain (`admin_auth:` module names, default `[admin-tokens]`) — executed by
     /// the auth middleware for `/admin` paths. Empty = the explicit OPEN admin posture (dev).
     pub(crate) admin_chain: Vec<String>,
+    /// Per-module trust-boundary caps (`auth.modules:`) — consulted by BOTH chains at Identify
+    /// time (allowed_groups intersection) and at admin scope resolution (max_admin_scope ceiling).
+    pub(crate) auth_modules: std::collections::HashMap<String, crate::config::AuthModuleCfg>,
     /// `group_map:` — principal groups → operator policy (admin scope today). Read by the admin
     /// authorization resolution; unmapped groups grant nothing (fail closed).
     pub(crate) group_map: HashMap<String, crate::config::GroupMapEntry>,

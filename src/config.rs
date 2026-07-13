@@ -158,6 +158,26 @@ pub(crate) struct TlsCfg {
     pub(crate) client_ca_file: Option<String>,
 }
 
+/// Per-module TRUST-BOUNDARY CAPS (`auth.modules.<name>:`) — design-hooks-v2 §2.4. An auth module
+/// is a fully trusted endpoint (a module returning `groups: ["busbar-admins"]` IS asserting an
+/// admin); these two operator-owned caps bound its blast radius. They apply to BOTH chains (the
+/// data-plane `auth.chain` and the admin `admin_auth:`) — the module namespace is shared.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthModuleCfg {
+    /// Groups this module may assert: busbar INTERSECTS the module's returned `groups` with this
+    /// allowlist BEFORE `group_map:` resolution, so a module cannot claim a group the operator did
+    /// not pre-authorize for it. Absent = no cap (every returned group passes through).
+    #[serde(default)]
+    pub(crate) allowed_groups: Option<Vec<String>>,
+    /// Ceiling on the ADMIN scope obtainable through this module, regardless of what `group_map:`
+    /// grants: `read-only` | `hooks-register` | `full`. Absent = `read-only` for every module
+    /// except the built-in `admin-tokens` operator credential (which is full by definition and
+    /// exempt) — `full` from an external chain is an explicit, boot-warned opt-in.
+    #[serde(default)]
+    pub(crate) max_admin_scope: Option<String>,
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthCfg {
@@ -173,6 +193,10 @@ pub(crate) struct AuthCfg {
     /// The `tokens` module's allowlist. Inert unless `tokens` is in `chain`.
     #[serde(default)]
     pub(crate) client_tokens: Vec<String>,
+    /// Per-module trust-boundary caps, keyed by module name (see [`AuthModuleCfg`]). Applies to
+    /// the module wherever it appears — data-plane chain or `admin_auth:`.
+    #[serde(default)]
+    pub(crate) modules: std::collections::HashMap<String, AuthModuleCfg>,
 }
 
 // MANUAL Debug that REDACTS every credential field. A derived `Debug` would print every entry of
@@ -200,6 +224,7 @@ impl AuthCfg {
             chain: vec![],
             upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         }
     }
 }
@@ -2974,6 +2999,7 @@ models: {}
                 "SECRET-client-token-aaa".to_string(),
                 "SECRET-client-token-bbb".to_string(),
             ],
+            modules: std::collections::HashMap::new(),
         };
         let dbg = format!("{auth:?}");
         assert!(
@@ -3067,6 +3093,7 @@ models: {}
                 chain: vec!["tokens".to_string()],
                 upstream_credentials: crate::auth::UpstreamCreds::Own,
                 client_tokens: vec!["SECRET-embedded-client-token".to_string()],
+                modules: std::collections::HashMap::new(),
             }),
             providers,
             models: HashMap::new(),
