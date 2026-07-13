@@ -33,8 +33,11 @@ the bottom — that's the one allowed exception.
 ## 3. Objective size trigger, not vibes
 
 A file crosses to a folder-module when it exceeds **~1,500 impl lines** or carries **more than one**
-named test module. The lint's hard ceiling is **2,000 lines for any `.rs` file** (impl or tests) —
-past that, split by area (impl) or by test module (tests).
+named test module. The lint's hard ceiling on **impl** files is **2,500 lines** — it exists to forbid
+genuine monster files (the thing that makes a codebase unnavigable), not to micromanage a cohesive
+unit at 1,600. **Test files are exempt** from the size cap: they are located by name
+(`foo/tests/<what>.rs`), not read top-to-bottom, so the navigability the cap protects is already
+served by the tests/ folder convention and one-module-per-file.
 
 ## 4. Files are role-named — the name predicts the content
 

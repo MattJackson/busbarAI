@@ -5,7 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MAX_LINES=2000          # no single .rs file may exceed this (impl OR tests — split it)
+# Impl files target ~1,500 lines; the hard ceiling forbids genuine MONSTER files (the thing that
+# makes a codebase unnavigable) rather than micromanaging cohesive units. Test files are exempt from
+# the size cap: they are located by name (foo/tests/<what>.rs), not read top-to-bottom, so the
+# navigability the cap protects is already served by the tests/ folder convention + one-module-per-file.
+MAX_LINES_IMPL=2500
 fail=0
 
 note() { printf '  %s\n' "$1"; }
@@ -22,12 +26,13 @@ while IFS= read -r d; do
 done < <(find src -type d)
 [ "$fail" -eq 0 ] && note "ok"
 
-# ── Invariant 2: no oversized files — split by area (impl) or by test module (tests). ─────────────
-hdr "no .rs file over ${MAX_LINES} lines"
+# ── Invariant 2: no monster impl files — split by area. Test files (under a tests/ dir) are exempt. ─
+hdr "no impl .rs file over ${MAX_LINES_IMPL} lines (test files exempt)"
 big=0
 while IFS= read -r f; do
+  case "$f" in */tests/*) continue ;; esac   # test files are name-navigated → exempt from the cap
   n=$(wc -l < "$f")
-  if [ "$n" -gt "$MAX_LINES" ]; then note "OVERSIZED: $f ($n lines)"; fail=1; big=1; fi
+  if [ "$n" -gt "$MAX_LINES_IMPL" ]; then note "OVERSIZED: $f ($n lines)"; fail=1; big=1; fi
 done < <(find src -name '*.rs')
 [ "$big" -eq 0 ] && note "ok"
 

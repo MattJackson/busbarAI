@@ -32,8 +32,28 @@ fn chat_declares_its_capabilities() {
 /// forbidden.)
 #[test]
 fn engine_never_branches_on_operation_identity() {
-    // Scan EVERY file of the forward engine (the module split must not open a blind spot).
-    let engine_files = [("src/proxy/mod.rs", include_str!("../../proxy/mod.rs"))];
+    // Scan EVERY file of the forward engine (the module split must not open a blind spot): the proxy
+    // hub, each area-module, and the engine core + failover walk.
+    let engine_files = [
+        ("src/proxy/mod.rs", include_str!("../../proxy/mod.rs")),
+        ("src/proxy/wire.rs", include_str!("../../proxy/wire.rs")),
+        ("src/proxy/hooks.rs", include_str!("../../proxy/hooks.rs")),
+        ("src/proxy/select.rs", include_str!("../../proxy/select.rs")),
+        ("src/proxy/usage.rs", include_str!("../../proxy/usage.rs")),
+        ("src/proxy/egress.rs", include_str!("../../proxy/egress.rs")),
+        (
+            "src/proxy/response_body.rs",
+            include_str!("../../proxy/response_body.rs"),
+        ),
+        (
+            "src/proxy/engine/mod.rs",
+            include_str!("../../proxy/engine/mod.rs"),
+        ),
+        (
+            "src/proxy/engine/walk.rs",
+            include_str!("../../proxy/engine/walk.rs"),
+        ),
+    ];
     let forbidden = [
         "op.name() ==",
         "op.name()==",

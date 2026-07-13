@@ -27,6 +27,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Structure lint
+        run: scripts/structure-lint.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
