@@ -1400,6 +1400,17 @@ impl<S, P> FirstByteBody<S, P> {
     }
 }
 
+/// A compliance restrict captured on the PRIMARY pool that must persist across every failover hop —
+/// including a `fallback_pool` spill to an independent pool. `tags_any` is the eligible tag set,
+/// `on_empty` decides what happens when a hop's candidates carry none of them (fail-closed reject vs
+/// advisory weighted-escape), and `name` is the gate name for logs/metrics.
+#[derive(Debug, Clone)]
+struct RestrictConstraint {
+    tags_any: Vec<String>,
+    on_empty: crate::config::PolicyOnError,
+    name: &'static str,
+}
+
 /// Context for request lifecycle: deadline, accumulated exclusions, and visited pools.
 #[derive(Debug, Clone)]
 struct RequestCtx {
@@ -1409,6 +1420,10 @@ struct RequestCtx {
     excluded: std::collections::HashSet<usize>,
     /// Visited pool names for loop prevention in fallback chains (e.g., A→B→A).
     visited_pools: std::collections::HashSet<String>,
+    /// Compliance restricts in force for this request (captured at the primary pool's gate
+    /// reconcile). Re-applied on every downstream hop so a `Restrict` gate's "only these lanes,
+    /// ever" guarantee holds across a `fallback_pool` spill — see [`RequestCtx::enforce_restricts`].
+    active_restricts: Vec<RestrictConstraint>,
 }
 
 impl RequestCtx {
@@ -1418,7 +1433,45 @@ impl RequestCtx {
             deadline: start.saturating_add(deadline_secs),
             excluded: std::collections::HashSet::new(),
             visited_pools: std::collections::HashSet::new(),
+            active_restricts: Vec::new(),
         }
+    }
+
+    /// Re-apply the captured compliance restricts against a DOWNSTREAM pool's candidate set, keyed by
+    /// THAT pool's own member tags (lane `idx` are global; `pool_runtime.members` is idx-keyed). The
+    /// primary-pool gate reconcile shrinks `cands` in place, which keeps the restriction across
+    /// in-pool failover — but a `fallback_pool` hop rebuilds candidates from an INDEPENDENT pool's
+    /// full membership, so without re-applying here a compliance (e.g. BAA-only) restrict would be
+    /// silently dropped at the pool boundary. Mirrors Reconcile-2 exactly: a `Weighted` on_empty is an
+    /// advisory escape (skip this restrict on this hop); the fail-closed default returns `Err(name)`
+    /// so the caller REJECTS rather than spilling to an ineligible lane. (found: audit c1r13.)
+    fn enforce_restricts(
+        &self,
+        app: &App,
+        pool_name: &str,
+        cands: Vec<WeightedLane>,
+    ) -> Result<Vec<WeightedLane>, &'static str> {
+        let mut cands = cands;
+        for r in &self.active_restricts {
+            let members = app.pool_runtime.get(pool_name).map(|rt| &rt.members);
+            let restricted: Vec<WeightedLane> = cands
+                .iter()
+                .filter(|wl| {
+                    members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                        meta.tags.iter().any(|t| r.tags_any.iter().any(|w| w == t))
+                    })
+                })
+                .cloned()
+                .collect();
+            if restricted.is_empty() {
+                if matches!(r.on_empty, crate::config::PolicyOnError::Weighted) {
+                    continue; // advisory escape — skip this restrict on this hop
+                }
+                return Err(r.name); // fail closed — no eligible lane satisfies a required restrict
+            }
+            cands = restricted;
+        }
+        Ok(cands)
     }
 
     /// Check if deadline has been exceeded.
@@ -3524,6 +3577,15 @@ async fn forward_with_pool_parsed_inner(
                 on_empty,
             } = outcome
             {
+                // Capture this restrict so it PERSISTS across a `fallback_pool` hop (which rebuilds
+                // candidates from an independent pool). Recorded for every restrict regardless of
+                // whether it narrows here — the fail-closed reject case returns below before any
+                // fallback, so a stray record is harmless. (found: audit c1r13.)
+                request_ctx.active_restricts.push(RestrictConstraint {
+                    tags_any: tags_any.clone(),
+                    on_empty: on_empty.clone(),
+                    name,
+                });
                 let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
                 let restricted: Vec<WeightedLane> = cands
                     .iter()
@@ -5917,6 +5979,28 @@ async fn handle_fallback_pool(
     let Some(fallback_cands) = app.fallback_pools.get(pool_name).cloned() else {
         // Fallback pool not configured — cascade to Status503.
         return handle_status_503(&app, &[], now(), pool_name, ingress_protocol);
+    };
+
+    // Re-apply any compliance restrict from the primary pool against THIS fallback pool's own member
+    // tags — the fallback pool is an independent membership, so without this the "restrictions hold
+    // across failover" guarantee would break at the pool boundary. Fail closed (503) if a required
+    // restrict leaves no eligible fallback lane. (found: audit c1r13.)
+    let fallback_cands = match request_ctx.enforce_restricts(&app, pool_name, fallback_cands) {
+        Ok(c) => c,
+        Err(name) => {
+            tracing::info!(
+                policy = name,
+                pool = pool_name,
+                "compliance restrict left no eligible lane in the fallback pool; fail closed \
+                 rather than spill to an ineligible upstream"
+            );
+            return gate_rejected(ingress_error(
+                ingress_protocol,
+                StatusCode::SERVICE_UNAVAILABLE,
+                KIND_OVERLOADED,
+                "No upstream satisfies a required gate's restriction. Please retry shortly.",
+            ));
+        }
     };
 
     // Mark before re-entering so a cycle back to this pool is detected.
@@ -12095,6 +12179,98 @@ mod hook_seam_tests {
             gates,
             rewrite_hooks: Vec::new(),
         }
+    }
+
+    /// REGRESSION (audit c1r13, compliance): a `Restrict` gate on the primary pool must persist onto
+    /// a `fallback_pool` hop, re-applied against the FALLBACK pool's own member tags. A required
+    /// (`on_empty: reject`) restrict fails CLOSED when no fallback lane carries the tag; a `weighted`
+    /// restrict is an advisory escape (skip).
+    #[test]
+    fn enforce_restricts_reapplies_compliance_tags_across_pools() {
+        // Fallback pool "fb": lane 0 carries `baa`, lane 1 carries nothing.
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .lane(LaneSpec::new(
+                "m1",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("fb", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "fb",
+                pool_runtime_with(&[(0, &["baa"]), (1, &[])], Vec::new()),
+            )
+            .build();
+        let cands = vec![
+            WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                reasoning: None,
+                idx: 1,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+        ];
+
+        // A required `baa` restrict narrows the fallback pool to ONLY the tagged lane — the untagged
+        // lane 1 is dropped, so the compliance constraint holds across the pool hop.
+        let mut rc = RequestCtx::new(60);
+        rc.active_restricts.push(RestrictConstraint {
+            tags_any: vec!["baa".to_string()],
+            on_empty: crate::config::PolicyOnError::Reject,
+            name: "baa-gate",
+        });
+        let out = rc.enforce_restricts(&app, "fb", cands.clone()).unwrap();
+        assert_eq!(
+            out.iter().map(|w| w.idx).collect::<Vec<_>>(),
+            vec![0],
+            "only the baa-tagged fallback lane may survive a required restrict"
+        );
+
+        // A required restrict with NO matching fallback lane fails CLOSED (Err), never spills.
+        let mut rc_reject = RequestCtx::new(60);
+        rc_reject.active_restricts.push(RestrictConstraint {
+            tags_any: vec!["hipaa".to_string()],
+            on_empty: crate::config::PolicyOnError::Reject,
+            name: "hipaa-gate",
+        });
+        assert!(
+            rc_reject
+                .enforce_restricts(&app, "fb", cands.clone())
+                .is_err(),
+            "a required restrict with no eligible fallback lane must fail closed, not spill"
+        );
+
+        // A `weighted` restrict with no match is an advisory escape — candidates pass unchanged.
+        let mut rc_weighted = RequestCtx::new(60);
+        rc_weighted.active_restricts.push(RestrictConstraint {
+            tags_any: vec!["hipaa".to_string()],
+            on_empty: crate::config::PolicyOnError::Weighted,
+            name: "hipaa-advisory",
+        });
+        let out = rc_weighted
+            .enforce_restricts(&app, "fb", cands.clone())
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "a weighted restrict with no eligible lane escapes (candidates unchanged)"
+        );
+
+        // No active restrict → identity.
+        let rc_none = RequestCtx::new(60);
+        assert_eq!(
+            rc_none.enforce_restricts(&app, "fb", cands).unwrap().len(),
+            2
+        );
     }
 
     fn chat_body() -> Vec<u8> {

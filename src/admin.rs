@@ -2049,6 +2049,37 @@ providers: {}
             "forbidden"
         );
 
+        // REGRESSION (audit c1r13): a hooks-register token may not DELETE a content-seeing / global
+        // gate a full admin installed — tearing down that security gate is the same §6.3 escalation
+        // register/put/patch forbid.
+        let del = client
+            .delete(format!("http://{addr}/admin/v1/hooks/op-hook"))
+            .header("x-admin-token", "grp:registrars")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            del.status().as_u16(),
+            403,
+            "hooks-register must not DELETE a prompt:rw global hook"
+        );
+        assert_eq!(
+            del.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "forbidden"
+        );
+        // And the operator's gate is still there — the rejected delete did not remove it.
+        let still = client
+            .get(format!("http://{addr}/admin/v1/hooks/op-hook"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            still.status().as_u16(),
+            200,
+            "the gate survives the rejected delete"
+        );
+
         handle.abort();
     }
 

@@ -419,12 +419,26 @@ async fn put_hook(
 async fn delete_hook(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     Path(name): Path<String>,
 ) -> Response {
     let actor = principal.actor_id().to_string();
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");
+    // §6.3 escalation guard, keyed on the EXISTING hook's grants — a non-Full (hooks-register)
+    // principal may not DELETE a content-seeing (`prompt`/`user`) or `global: true` gate. Such a
+    // hook can only have been created by a Full admin (register/put block a narrow token from wiring
+    // one), and DELETING it TEARS DOWN that admin's security gate — the same escalation register /
+    // put / patch already forbid. Without this a hooks-register token could remove an operator's
+    // global `pii-guard` gate and reach content by the back door. (found: audit c1r13; the sibling
+    // c1r6 fix closed the PATCH path — DELETE was the remaining verb missing the guard.)
+    if let Some(existing) = current.hook_registry.get(&name) {
+        if let Some(e) = hooks_register_escalation(scope, existing) {
+            audit::AUDIT.record_by("hook.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+            return err_json(&e);
+        }
+    }
     // A base-config hook is read-only via the API (consistent with put_hook / patch_hook_settings).
     // Without this a narrow hooks-register token could DELETE an operator's base-defined security
     // gate (e.g. `pii-guard`) — an escalation beyond "register" — and the additive overlay can't
@@ -1269,6 +1283,7 @@ fn openapi_doc() -> serde_json::Value {
                 }],
                 "responses": {
                     "204": {"description": "Removed"},
+                    "403": {"description": "A `hooks-register` principal may not delete a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
                     "409": {"description": "Base-defined hook — read-only via the API; edit config.yaml (error code `conflict`)"}
                 }
@@ -1825,6 +1840,7 @@ mod tests {
         let cases = [
             ("/admin/v1/hooks", "post"),
             ("/admin/v1/hooks/{name}", "put"),
+            ("/admin/v1/hooks/{name}", "delete"),
             ("/admin/v1/hooks/{name}/settings", "patch"),
         ];
         for (path, method) in cases {
