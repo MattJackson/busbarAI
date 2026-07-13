@@ -2166,16 +2166,12 @@ fn build_rewrite_request<'a>(
     wants_stream: bool,
     with_prompt: bool,
 ) -> crate::routing::RoutingRequest<'a> {
-    let system_chars = system_text_chars(v);
+    let system_chars = system_text_chars(v, ingress_protocol);
     crate::routing::RoutingRequest {
         pool: pool_name,
         ingress_protocol,
         requested_model: v.get("model").and_then(|m| m.as_str()),
-        message_count: v
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0),
+        message_count: turn_count(v, ingress_protocol),
         tool_count: v
             .get("tools")
             .and_then(|t| t.as_array())
@@ -2185,7 +2181,7 @@ fn build_rewrite_request<'a>(
             .get("tools")
             .and_then(|t| t.as_array())
             .is_some_and(|a| !a.is_empty()),
-        total_chars: total_text_chars(v, system_chars),
+        total_chars: total_text_chars(v, ingress_protocol, system_chars),
         system_chars,
         max_tokens: v
             .get("max_tokens")
@@ -2195,7 +2191,7 @@ fn build_rewrite_request<'a>(
         // A `prompt: rw` rewrite gate needs the prompt content (`with_prompt`). A TAP gets the
         // shape-only default bucket (`with_prompt == false`) — a per-grant prompt projection for
         // `prompt: ro` taps is a follow-up; shape-only never OVER-shares, so the grant holds.
-        prompt: with_prompt.then(|| build_prompt_projection(v)),
+        prompt: with_prompt.then(|| build_prompt_projection(v, ingress_protocol)),
         identity: None,
     }
 }
@@ -2232,30 +2228,90 @@ async fn apply_global_rewrites(
     applied
 }
 
-/// Chars of the request's system prompt: a bare string, or — when the system value is a block
-/// array (Anthropic allows both) — the sum of every block's `text` string (keyed on the `text`
-/// field's presence, not on `type`). The SAME shapes
-/// `build_prompt_projection` flattens, so the SIZE signal and the opt-in content projection never
-/// diverge on a block-array system prompt. Cheap v1 SIZE signal (NOT a token count).
-fn system_text_chars(v: &Value) -> usize {
-    match v.get("system") {
-        Some(Value::String(s)) => s.chars().count(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .map(|t| t.chars().count())
-            .sum(),
-        _ => 0,
+/// The ingress body's conversation-turn array, DIALECT-AWARE — the READ-side mirror of
+/// `apply_rewrite_to_body`'s write dialects: gemini carries turns in `contents`
+/// (`{role, parts: [{text}]}`), the Responses API in a list `input` (`{role, content}`), and
+/// every other protocol in `messages`. Reading only `messages` here made every projection
+/// (rewrite request, `send_prompt`, stage-tap shape) EMPTY on gemini/responses ingress — a
+/// rewrite gate saw `message_count: 0` and no prompt, so it abstained and silently no-oped.
+fn conversation_turns<'a>(v: &'a Value, ingress_protocol: &str) -> Option<&'a Vec<Value>> {
+    let key = match ingress_protocol {
+        "gemini" => "contents",
+        "responses" => "input",
+        _ => "messages",
+    };
+    v.get(key).and_then(|m| m.as_array())
+}
+
+/// Dialect-aware conversation-turn count. The Responses API also allows a bare-string `input`
+/// (one implicit user turn) — counted as 1 so the SIZE signal matches what the hook projection
+/// yields for the same body.
+fn turn_count(v: &Value, ingress_protocol: &str) -> usize {
+    match conversation_turns(v, ingress_protocol) {
+        Some(turns) => turns.len(),
+        None => usize::from(
+            ingress_protocol == "responses" && v.get("input").and_then(Value::as_str).is_some(),
+        ),
     }
 }
 
-/// Total chars across the system prompt + every message's text content. Anthropic's `content` is
-/// either a bare string or an array of blocks (`{type:"text", text:"…"}`); both shapes are summed.
-/// A best-effort projection over the pristine ingress body — never fails, never allocates per char.
-fn total_text_chars(v: &Value, system_chars: usize) -> usize {
+/// Sum the chars of every `parts[].text` string in a gemini Content object (`systemInstruction`
+/// or a `contents[]` turn). Non-text parts (inlineData, functionCall, …) contribute 0.
+fn gemini_parts_chars(content: &Value) -> usize {
+    content
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Chars of the request's system prompt, DIALECT-AWARE: `system` as a bare string or a block
+/// array (Anthropic allows both; blocks keyed on the `text` field's presence, not on `type`),
+/// gemini's `systemInstruction` (`{parts: [{text}]}`), or the Responses API's bare-string
+/// `instructions`. The SAME shapes `build_prompt_projection` flattens, so the SIZE signal and
+/// the opt-in content projection never diverge. Cheap v1 SIZE signal (NOT a token count).
+fn system_text_chars(v: &Value, ingress_protocol: &str) -> usize {
+    match ingress_protocol {
+        "gemini" => v
+            .get("systemInstruction")
+            .map(gemini_parts_chars)
+            .unwrap_or(0),
+        "responses" => v
+            .get("instructions")
+            .and_then(|i| i.as_str())
+            .map(|s| s.chars().count())
+            .unwrap_or(0),
+        _ => match v.get("system") {
+            Some(Value::String(s)) => s.chars().count(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum(),
+            _ => 0,
+        },
+    }
+}
+
+/// Total chars across the system prompt + every conversation turn's text content, DIALECT-AWARE.
+/// `content` is a bare string or an array of blocks carrying `text` (Anthropic text blocks,
+/// Bedrock `[{text}]`, Responses `input_text` items all match on the `text` key); gemini turns
+/// carry `parts[].text` instead. A best-effort projection over the pristine ingress body —
+/// never fails, never allocates per char.
+fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> usize {
     let mut total = system_chars;
-    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
-        for m in msgs {
+    if let Some(turns) = conversation_turns(v, ingress_protocol) {
+        for m in turns {
+            if ingress_protocol == "gemini" {
+                total += gemini_parts_chars(m);
+                continue;
+            }
             match m.get("content") {
                 Some(Value::String(s)) => total += s.chars().count(),
                 Some(Value::Array(blocks)) => {
@@ -2267,6 +2323,11 @@ fn total_text_chars(v: &Value, system_chars: usize) -> usize {
                 }
                 _ => {}
             }
+        }
+    } else if ingress_protocol == "responses" {
+        // Bare-string `input` = one implicit user turn.
+        if let Some(s) = v.get("input").and_then(Value::as_str) {
+            total += s.chars().count();
         }
     }
     total
@@ -2317,7 +2378,10 @@ fn body_end_user(v: &Value) -> Option<String> {
 /// `{role, text: ""}`, never silently vanishes. Bare-string content BORROWS from the parsed body
 /// (`Cow::Borrowed`, the common case); only block arrays allocate a joined string. Runs ONLY
 /// behind the per-pool opt-in, so even that cost never touches a default pool.
-fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection<'_> {
+fn build_prompt_projection<'a>(
+    v: &'a Value,
+    ingress_protocol: &str,
+) -> crate::routing::PromptProjection<'a> {
     use std::borrow::Cow;
     // A content value is a bare string (borrowed as-is) or an array of blocks (text blocks joined
     // by newline into an owned string).
@@ -2339,23 +2403,62 @@ fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection<'_> {
             _ => Cow::Borrowed(""),
         }
     }
-    let system = v
-        .get("system")
-        .map(|s| flatten_content(Some(s)))
-        .filter(|s| !s.is_empty());
-    let messages = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|msgs| {
-            msgs.iter()
-                .map(|m| {
-                    let role: Cow<'_, str> =
-                        Cow::Borrowed(m.get("role").and_then(|r| r.as_str()).unwrap_or(""));
-                    (role, flatten_content(m.get("content")))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // A gemini Content object: join `parts[].text` with newlines (mirrors `gemini_parts_chars`,
+    // which counts what this flattens). Borrows a lone text part (the common case).
+    fn flatten_gemini_parts(c: &Value) -> Cow<'_, str> {
+        match c.get("parts").and_then(|p| p.as_array()) {
+            Some(parts) => {
+                let mut texts = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .peekable();
+                match texts.next() {
+                    Some(first) if texts.peek().is_none() => Cow::Borrowed(first),
+                    Some(first) => {
+                        let mut out = String::from(first);
+                        for t in texts {
+                            out.push('\n');
+                            out.push_str(t);
+                        }
+                        Cow::Owned(out)
+                    }
+                    None => Cow::Borrowed(""),
+                }
+            }
+            None => Cow::Borrowed(""),
+        }
+    }
+    let system = match ingress_protocol {
+        "gemini" => v.get("systemInstruction").map(flatten_gemini_parts),
+        "responses" => v
+            .get("instructions")
+            .and_then(|i| i.as_str())
+            .map(Cow::Borrowed),
+        _ => v.get("system").map(|s| flatten_content(Some(s))),
+    }
+    .filter(|s| !s.is_empty());
+    let messages = match conversation_turns(v, ingress_protocol) {
+        Some(turns) => turns
+            .iter()
+            .map(|m| {
+                let role: Cow<'_, str> =
+                    Cow::Borrowed(m.get("role").and_then(|r| r.as_str()).unwrap_or(""));
+                let text = if ingress_protocol == "gemini" {
+                    flatten_gemini_parts(m)
+                } else {
+                    flatten_content(m.get("content"))
+                };
+                (role, text)
+            })
+            .collect(),
+        // The Responses API's bare-string `input` = one implicit user turn.
+        None if ingress_protocol == "responses" => v
+            .get("input")
+            .and_then(Value::as_str)
+            .map(|s| vec![(Cow::Borrowed("user"), Cow::Borrowed(s))])
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     crate::routing::PromptProjection { system, messages }
 }
 
@@ -2448,7 +2551,7 @@ async fn decide_policy_order(
     // `policy.send_prompt` opt-in (default off): flatten the prompt content for the hook. The
     // allocation cost lives entirely behind the flag — a shape-only pool never runs this.
     let prompt = if send_prompt {
-        Some(build_prompt_projection(v))
+        Some(build_prompt_projection(v, ingress_protocol))
     } else {
         None
     };
@@ -2458,17 +2561,13 @@ async fn decide_policy_order(
     // Count the system prompt's chars ONCE: it feeds both `total_chars` (via `total_text_chars`) and
     // `system_chars`, so computing it inline twice would run the O(n) UTF-8 scan over the system block
     // twice. Off the zero-cost default path (only non-default route policies reach here).
-    let system_chars = system_text_chars(v);
+    let system_chars = system_text_chars(v, ingress_protocol);
 
     let req = RoutingRequest {
         pool: pool_name,
         ingress_protocol,
         requested_model: v.get("model").and_then(|m| m.as_str()),
-        message_count: v
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0),
+        message_count: turn_count(v, ingress_protocol),
         tool_count: v
             .get("tools")
             .and_then(|t| t.as_array())
@@ -2478,7 +2577,7 @@ async fn decide_policy_order(
             .get("tools")
             .and_then(|t| t.as_array())
             .is_some_and(|a| !a.is_empty()),
-        total_chars: total_text_chars(v, system_chars),
+        total_chars: total_text_chars(v, ingress_protocol, system_chars),
         system_chars,
         // Saturating narrow: an absurd caller cap (> u32::MAX) still signals "huge ask" to the
         // policy instead of wrapping to a small number. A SIZE signal, not a limit.
@@ -2754,16 +2853,13 @@ pub(crate) fn capture_stage_shape<'a>(
 ) -> StageShape<'a> {
     let (message_count, has_tools, total_chars, max_tokens) = match v {
         Some(v) => {
-            let system_chars = system_text_chars(v);
+            let system_chars = system_text_chars(v, ingress_protocol);
             (
-                v.get("messages")
-                    .and_then(|m| m.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0),
+                turn_count(v, ingress_protocol),
                 v.get("tools")
                     .and_then(|t| t.as_array())
                     .is_some_and(|a| !a.is_empty()),
-                total_text_chars(v, system_chars),
+                total_text_chars(v, ingress_protocol, system_chars),
                 v.get("max_tokens")
                     .and_then(|m| m.as_u64())
                     .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
@@ -11322,7 +11418,7 @@ mod hook_opt_in_projection_tests {
                 ]}
             ]
         });
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.system.as_deref(), Some("be brief"));
         assert_eq!(
             p.messages,
@@ -11345,15 +11441,15 @@ mod hook_opt_in_projection_tests {
             "system": [{"type": "text", "text": "sys a"}, {"type": "text", "text": "sys b"}],
             "messages": []
         });
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.system.as_deref(), Some("sys a\nsys b"));
 
         let v: Value = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.system, None);
 
         // A non-JSON / bodyless request (v == Null) projects empty, never panics.
-        let p = build_prompt_projection(&Value::Null);
+        let p = build_prompt_projection(&Value::Null, "anthropic");
         assert_eq!(p.system, None);
         assert!(p.messages.is_empty());
     }
@@ -11370,7 +11466,7 @@ mod hook_opt_in_projection_tests {
                 {"content": "no role on this one"}
             ]
         });
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.messages.len(), 2, "media-only entries must not vanish");
         assert_eq!(p.messages[0].0, "user");
         assert_eq!(p.messages[0].1, "", "media-only turn reads as empty text");
@@ -11387,14 +11483,107 @@ mod hook_opt_in_projection_tests {
             "system": [{"type": "text", "text": "abcde"}, {"type": "text", "text": "fgh"}],
             "messages": []
         });
-        assert_eq!(system_text_chars(&v), 8);
-        let p = build_prompt_projection(&v);
+        assert_eq!(system_text_chars(&v, "anthropic"), 8);
+        let p = build_prompt_projection(&v, "anthropic");
         // The flattened projection joins with a newline; the SIZE signal counts text only.
         assert_eq!(p.system.as_deref(), Some("abcde\nfgh"));
 
         let v: Value = serde_json::json!({"system": "plain", "messages": []});
-        assert_eq!(system_text_chars(&v), 5);
-        assert_eq!(system_text_chars(&Value::Null), 0);
+        assert_eq!(system_text_chars(&v, "anthropic"), 5);
+        assert_eq!(system_text_chars(&Value::Null, "anthropic"), 0);
+    }
+
+    /// REGRESSION (audit c1r4): the projection read-path was blind to GEMINI ingress — it read
+    /// only `messages`/`system`, so a gemini body (`contents`/`systemInstruction`/`parts`)
+    /// projected EMPTY: a rewrite gate saw `message_count: 0` with no prompt and silently
+    /// no-oped. The read side must mirror the dialects `apply_rewrite_to_body` writes.
+    #[test]
+    fn prompt_projection_reads_gemini_contents() {
+        let v: Value = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "be brief"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "hello"}]},
+                {"role": "model", "parts": [
+                    {"text": "part one"},
+                    {"inlineData": {"mimeType": "image/png", "data": "AAAA"}},
+                    {"text": "part two"}
+                ]}
+            ]
+        });
+        let p = build_prompt_projection(&v, "gemini");
+        assert_eq!(p.system.as_deref(), Some("be brief"));
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".into(), "hello".into()),
+                ("model".into(), "part one\npart two".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
+        );
+        // SIZE signals agree with the projection (minus join separators).
+        assert_eq!(system_text_chars(&v, "gemini"), 8);
+        assert_eq!(turn_count(&v, "gemini"), 2);
+        assert_eq!(total_text_chars(&v, "gemini", 8), 8 + 5 + 16);
+        // And the rewrite-request projection (the gate's view) is POPULATED, not blind.
+        let req = build_rewrite_request(&v, "p", "gemini", false, true);
+        assert_eq!(req.message_count, 2);
+        assert!(req.total_chars > 0);
+        assert_eq!(req.prompt.as_ref().unwrap().messages.len(), 2);
+    }
+
+    /// REGRESSION (audit c1r4), Responses-API half: `input` (list OR bare string) and
+    /// `instructions` must project — the old read-path saw neither.
+    #[test]
+    fn prompt_projection_reads_responses_input() {
+        let v: Value = serde_json::json!({
+            "instructions": "be brief",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "hi there"}]}
+            ]
+        });
+        let p = build_prompt_projection(&v, "responses");
+        assert_eq!(p.system.as_deref(), Some("be brief"));
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".into(), "hello".into()),
+                ("assistant".into(), "hi there".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
+        );
+        assert_eq!(system_text_chars(&v, "responses"), 8);
+        assert_eq!(turn_count(&v, "responses"), 2);
+
+        // A bare-string `input` is ONE implicit user turn — in the projection AND the count.
+        let v: Value = serde_json::json!({"input": "just a question"});
+        let p = build_prompt_projection(&v, "responses");
+        assert_eq!(
+            p.messages,
+            vec![("user".into(), "just a question".into())]
+                as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
+        );
+        assert_eq!(turn_count(&v, "responses"), 1);
+        assert_eq!(total_text_chars(&v, "responses", 0), 15);
+
+        let req = build_rewrite_request(&v, "p", "responses", false, true);
+        assert_eq!(req.message_count, 1);
+        assert_eq!(req.total_chars, 15);
+    }
+
+    /// Bedrock ingress rides the `messages` default: its `content: [{text}]` blocks (no `type`
+    /// key) flatten via the same text-keyed match as Anthropic blocks.
+    #[test]
+    fn prompt_projection_reads_bedrock_messages() {
+        let v: Value = serde_json::json!({
+            "system": [{"text": "sys"}],
+            "messages": [
+                {"role": "user", "content": [{"text": "hello"}, {"text": "again"}]}
+            ]
+        });
+        let p = build_prompt_projection(&v, "bedrock");
+        assert_eq!(p.system.as_deref(), Some("sys"));
+        assert_eq!(p.messages[0].1, "hello\nagain");
+        assert_eq!(turn_count(&v, "bedrock"), 1);
+        assert_eq!(total_text_chars(&v, "bedrock", 3), 3 + 10);
     }
 
     /// `body_end_user` is dialect-aware: OpenAI `user` first, Anthropic `metadata.user_id` second,
