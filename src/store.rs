@@ -561,16 +561,21 @@ impl InMemoryStore {
                 continue;
             };
             // Carry over the remaining request budget ONLY when BOTH the snapshot and the new lane
-            // are limited. `export_health` writes the sentinel -1 for an unlimited lane; if the new
-            // config just ADDED `max_requests` to a lane that was unlimited at snapshot time,
-            // storing that -1 over the freshly-set cap would make `lane_admissible`
-            // (`limited && budget <= 0`) reject every dispatch with NO self-recovery path (the
-            // budget only rises on a successful dispatch, which is itself gated on admissibility).
-            // Guard on both flags: preserve the remaining budget when limited→limited, keep the
-            // constructor's cap when unlimited→limited, and ignore the value when the new lane is
-            // unlimited (`budget` is not consulted there anyway).
+            // are limited, and never above the NEW cap. `export_health` writes the sentinel -1 for
+            // an unlimited lane; if the new config just ADDED `max_requests` to a lane that was
+            // unlimited at snapshot time, storing that -1 over the freshly-set cap would make
+            // `lane_admissible` (`limited && budget <= 0`) reject every dispatch with NO
+            // self-recovery path (the budget only rises on a successful dispatch, which is itself
+            // gated on admissibility). And if the operator LOWERED `max_requests`, the prior
+            // (larger) remaining budget must be clamped to the freshly-set cap the constructor
+            // already stored — otherwise the lane over-serves by up to (old_remaining - new_cap),
+            // silently blowing past the operator's newly-lowered hard ceiling. `min` with the
+            // current atomic (which holds the new cap at this point) handles same-cap and
+            // cap-increase carry-over unchanged while capping a reduction.
             if lane.limited && snap.budget >= 0 {
-                lane.budget.store(snap.budget, Ordering::Relaxed);
+                let new_cap = lane.budget.load(Ordering::Relaxed);
+                lane.budget
+                    .store(snap.budget.min(new_cap), Ordering::Relaxed);
             }
             lane.breaker_state.store(
                 restored_breaker_state(snap.breaker_state),
@@ -2820,6 +2825,27 @@ mod tests {
             carried.get_lane(0).budget.load(Ordering::Relaxed),
             40,
             "limited→limited must carry the remaining budget, not reset to the full cap"
+        );
+
+        // REGRESSION (audit c1r8): a LOWERED cap must CLAMP the carried remaining budget — carrying a
+        // larger old remaining over a smaller new cap would over-serve past the operator's new hard
+        // ceiling. old cap 500, 100 served → snap remaining 400; new cap 300 → must clamp to 300.
+        let mut over = snaps.clone();
+        over[0].budget = 400;
+        let clamped = InMemoryStore::new_with_limits_restored(
+            vec![LaneData {
+                limited: true,
+                budget: 300, // operator LOWERED max_requests
+                ..make_lane_data(3, 4)
+            }],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &over,
+        );
+        assert_eq!(
+            clamped.get_lane(0).budget.load(Ordering::Relaxed),
+            300,
+            "a carried remaining above the NEW cap must clamp to the cap, not over-serve"
         );
     }
 

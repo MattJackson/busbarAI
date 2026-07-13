@@ -138,8 +138,16 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     next.config_version = current.config_version.wrapping_add(1);
     let is_global = cfg.global;
     next.hook_registry.insert(name.to_string(), cfg);
-    if is_global && !next.global_hooks.iter().any(|n| n == name) {
-        next.global_hooks.push(name.to_string());
+    if is_global {
+        if !next.global_hooks.iter().any(|n| n == name) {
+            next.global_hooks.push(name.to_string());
+        }
+    } else {
+        // A PUT that REPLACES a prior `global: true` hook with `global: false` must DE-WIRE it from
+        // the global fan-out — otherwise the stale membership keeps it firing on every request and
+        // `hook_view` keeps reporting `global: true`, so the operator's 200 OK silently no-ops the
+        // demotion. Mirrors `build_without_hook`'s DELETE cleanup.
+        next.global_hooks.retain(|n| n != name);
     }
     // Re-resolve the FIRED transports from the new registry so a global hook is live after the swap.
     next.rewrite_hooks = crate::routing::resolve_rewrite_hooks(
@@ -766,6 +774,37 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&app.store, &next.store),
             "the store (live breaker state) is preserved across the apply, not re-indexed"
+        );
+    }
+
+    /// REGRESSION (audit c1r8): a PUT that REPLACES a `global: true` hook with `global: false` must
+    /// DE-WIRE it from the global fan-out — remove it from `global_hooks` AND drop it from the fired
+    /// transports — so the demotion actually takes effect. The prior code only ever APPENDED on
+    /// `global: true` and never removed, so a demoted hook kept firing on every request and still
+    /// reported `global: true`.
+    #[test]
+    fn build_with_hook_demotes_global_false_removes_wiring() {
+        let app = TestApp::new().build();
+        // Register a GLOBAL tap, then PUT the same name with global: false.
+        let promoted = build_with_hook(&app, "logger", hook(HookKind::Tap, true))
+            .expect("global tap registers");
+        assert!(promoted.global_hooks.iter().any(|n| n == "logger"));
+        assert_eq!(promoted.tap_hooks.len(), 1, "global tap is live");
+
+        let demoted = build_with_hook(&promoted, "logger", hook(HookKind::Tap, false))
+            .expect("demotion to global: false is a valid same-grant replace");
+        assert!(
+            !demoted.global_hooks.iter().any(|n| n == "logger"),
+            "a global: false PUT must REMOVE the hook from global_hooks, not leave it firing"
+        );
+        assert_eq!(
+            demoted.tap_hooks.len(),
+            0,
+            "the demoted hook must drop out of the fired global tap transports"
+        );
+        assert!(
+            demoted.hook_registry.contains_key("logger"),
+            "the hook definition itself survives — only its global membership is dropped"
         );
     }
 
