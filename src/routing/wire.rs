@@ -226,48 +226,83 @@ pub(crate) struct DescribeReply {
 
 /// The STATUS management message: `{"status": true}` — mirrors `describe`'s key-discriminated
 /// idiom. The hook replies its OBSERVED state: `{"status": {"settings_version"?: N,
-/// "settings"?: {...}, "metrics"?: {"<name>": {"type": "counter"|"gauge", "value": <number>,
-/// "help"?: "..."}}}}`. Every reply key is optional; unknown keys are ignored; a hook that does
-/// not implement `status` replies `{}` (busbar treats empty/absent as "unsupported" and fails
-/// open). This is the control-plane read that lets busbar surface a hook's own settings and
-/// operational data ("Your AI Control Plane" — a dashboard on busbar sees what each plug is
-/// doing). Metric names: `^[a-z][a-z0-9_]{0,63}$`, counters SHOULD end `_total`; per-reply and
-/// per-hook-lifetime name counts are bounded by busbar (a hostile hook cannot flood the registry).
+/// "settings"?: {...}, "metrics"?: [<entry>, ...]}}`. `metrics` is an ARRAY of Prometheus-shaped
+/// entries (see [`HookMetric`]) — the shape that carries per-dimension `labels` and `histogram`
+/// distributions a flat map cannot. Every reply key is optional; unknown keys are ignored; a hook
+/// that does not implement `status` replies `{}` (busbar treats empty/absent as "unsupported" and
+/// fails open). This is the control-plane read that lets busbar surface a hook's own settings and
+/// operational data ("Your AI Control Plane" — a dashboard on busbar sees what each plug is doing).
+/// Entries are validated + bounded by busbar (a hostile hook cannot flood or exfiltrate).
 #[derive(Serialize)]
 pub(crate) struct StatusMsg {
     pub(crate) status: bool,
 }
 
-/// One hook-reported metric entry (parsed liberally; malformed ENTRIES are dropped, never the
-/// whole reply). `type` is `counter` (monotonic over the hook's lifetime) or `gauge`. The optional
-/// DISPLAY HINTS (`label`/`unit`/`viz`/`max` — busbar-ui suggestion #1) let a dashboard render the
-/// metric correctly without per-plugin code; all are sanitized/bounded like `help` (the same
-/// anti-exfiltration rule: hints are presentation, never content). Time SERIES are the CONSUMER's
-/// job in 1.3 (a dashboard samples `status` and accumulates client-side); a future engine-side
-/// `series` field on this entry is reserved as the additive path.
+/// One hook-reported metric entry — a Prometheus/OpenMetrics-shaped observation (parsed liberally;
+/// a malformed ENTRY is dropped whole, never the reply). This is the FROZEN metrics shape: a hook
+/// reports its operational data (a Headroom compressor's tokens-saved, a router's decision latency)
+/// and busbar surfaces it on the admin API + Prometheus for any dashboard. Beyond `name`+`type`
+/// everything is optional, so the simplest hook sends `{name, type, value}` and a rich one uses the
+/// rest. Modeled as an ARRAY (not a name→value map) precisely so several entries can share a `name`
+/// and differ by `labels` — the per-dimension breakdown (per-strategy, per-model) a flat map cannot
+/// carry and a real plugin dashboard needs first.
+///
+/// Anti-exfiltration holds structurally: `name`/label KEYS are charset-enforced, every string
+/// (label values, `help`, `label`, `unit`) is sanitized + length-bounded, and every number must be
+/// finite — a `prompt: ro` hook cannot smuggle content into a scrape.
 #[derive(Debug, Deserialize)]
 pub(crate) struct HookMetric {
+    /// The series name: `^[a-z][a-z0-9_]{0,63}$` (counters SHOULD end `_total`).
+    pub(crate) name: String,
+    /// `counter` (monotonic over the hook's lifetime), `gauge` (a point-in-time level), or
+    /// `histogram` (a distribution reported via `quantiles`).
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    /// The scalar value. Required for counter/gauge; for a histogram it is the observation COUNT
+    /// (the distribution rides `quantiles`). Defaults to 0 when absent so a pure-histogram entry
+    /// need not send it.
+    #[serde(default)]
     pub(crate) value: f64,
+    /// PROMETHEUS-STYLE DIMENSIONS (the per-strategy / per-model breakdown a dashboard drills into).
+    /// Several entries may share `name` and differ here. Keys `^[a-z][a-z0-9_]{0,63}$`, values
+    /// sanitized ≤ 64 chars; ≤ [`MAX_METRIC_LABELS`] pairs (excess/invalid pairs dropped).
+    #[serde(default)]
+    pub(crate) labels: Option<std::collections::BTreeMap<String, String>>,
+    /// A DISTRIBUTION for `type: histogram` (p50/p95/p99 latency — what a mean hides). Keys are
+    /// quantiles in `[0,1]` as strings (`"0.95"`), values finite. Empty/invalid → dropped.
+    #[serde(default)]
+    pub(crate) quantiles: Option<std::collections::BTreeMap<String, f64>>,
+    /// PROVENANCE: `true` marks this value an ESTIMATE (e.g. Headroom's holdout-control savings)
+    /// rather than a directly measured fact — a dashboard renders it distinctly.
+    #[serde(default)]
+    pub(crate) estimated: Option<bool>,
+    /// Confidence interval for an estimated value (finite; `ci_low ≤ ci_high` or both dropped).
+    #[serde(default)]
+    pub(crate) ci_low: Option<f64>,
+    #[serde(default)]
+    pub(crate) ci_high: Option<f64>,
+    /// Human display name (a UI falls back to `name`).
     #[serde(default)]
     pub(crate) help: Option<String>,
-    /// Human display name (a UI falls back to the metric name).
     #[serde(default)]
     pub(crate) label: Option<String>,
     /// Display unit token (`"ms"`, `"$"`, `"%"`, `"req/s"`, …) — max 16 chars, sanitized.
     #[serde(default)]
     pub(crate) unit: Option<String>,
-    /// Rendering hint: `number` | `gauge` | `counter` | `sparkline` (anything else is dropped).
+    /// Rendering hint: `number` | `gauge` | `counter` | `sparkline` | `histogram` (else dropped).
     #[serde(default)]
     pub(crate) viz: Option<String>,
     /// Gauge normalization ceiling (finite number, else dropped).
     #[serde(default)]
     pub(crate) max: Option<f64>,
+    // Time SERIES are the CONSUMER's job in 1.3 (a dashboard samples `status` and accumulates); an
+    // engine-retained `series` member is the reserved append-only path (a future release). A hook
+    // may send unknown members today — they are ignored, not an error.
 }
 
 /// The hook's `status` reply body (liberal: every field optional, unknown fields ignored),
-/// deserialized into the shared `busbar_api::HookStatus` shape.
+/// deserialized into the shared `busbar_api::HookStatus` shape. `metrics` is the raw array of entry
+/// objects (validated downstream by [`parse_status_metrics`]).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct StatusReply {
     #[serde(default)]
@@ -275,7 +310,7 @@ pub(crate) struct StatusReply {
     #[serde(default)]
     pub(crate) settings: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
-    pub(crate) metrics: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    pub(crate) metrics: Option<Vec<serde_json::Value>>,
 }
 
 impl From<StatusReply> for busbar_api::HookStatus {
@@ -296,17 +331,19 @@ pub(crate) struct StatusEnvelope {
     pub(crate) status: Option<StatusReply>,
 }
 
-/// Per-reply cap on hook-reported metric entries (excess dropped with a warn — bounded registry).
+/// Per-reply cap on hook-reported metric entries (excess dropped — bounded registry).
 pub(crate) const MAX_HOOK_METRICS: usize = 64;
+/// Per-entry cap on label pairs (a labeled series stays small — cardinality guard).
+pub(crate) const MAX_METRIC_LABELS: usize = 8;
 /// Metric-help length cap (chars), sanitized through `sanitize_reject_message` before exposure.
 pub(crate) const MAX_METRIC_HELP_CHARS: usize = 200;
-/// Display-hint caps (same sanitize rule as help).
+/// Display-hint + label-value caps (same sanitize rule as help).
 pub(crate) const MAX_METRIC_LABEL_CHARS: usize = 64;
 pub(crate) const MAX_METRIC_UNIT_CHARS: usize = 16;
 
-/// Validate a hook-reported metric NAME: `^[a-z][a-z0-9_]{0,63}$`. Anything else is dropped —
-/// names become Prometheus label values, so the charset is enforced structurally (a hook granted
-/// `prompt: ro` physically cannot smuggle content into a scrape).
+/// Validate a hook-reported metric NAME or LABEL KEY: `^[a-z][a-z0-9_]{0,63}$`. Anything else is
+/// dropped — names/keys become Prometheus identifiers, so the charset is enforced structurally (a
+/// hook granted `prompt: ro` physically cannot smuggle content into a scrape).
 pub(crate) fn valid_metric_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     matches!(bytes.next(), Some(b'a'..=b'z'))
@@ -314,45 +351,76 @@ pub(crate) fn valid_metric_name(name: &str) -> bool {
         && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
 }
 
-/// Parse + validate the metrics map of a `status` reply fail-open: malformed entries (bad name,
-/// unknown type, non-finite value) are DROPPED individually, valid ones kept, capped at
-/// [`MAX_HOOK_METRICS`]. Help strings are sanitized + length-capped.
-pub(crate) fn parse_status_metrics(
-    raw: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> Vec<(String, HookMetric)> {
+/// Char-boundary-safe sanitize + cap (re-audit F1: `String::truncate` takes BYTES and panics off a
+/// char boundary; `.chars().take(n)` is panic-free and matches the documented "≤ N chars" rule).
+fn sanitize_cap(raw: &str, n: usize) -> String {
+    sanitize_reject_message(raw).chars().take(n).collect()
+}
+
+/// Parse + validate the metrics ARRAY of a `status` reply FAIL-OPEN: a malformed entry (bad
+/// name/type, non-finite value) is DROPPED whole, valid ones kept, capped at [`MAX_HOOK_METRICS`].
+/// Within an entry, malformed OPTIONAL members (an out-of-charset label key, a non-finite quantile,
+/// an inverted CI, an out-of-vocabulary viz) are dropped INDIVIDUALLY — the metric survives. Every
+/// exposed string is sanitized + length-bounded; every number is finite.
+pub(crate) fn parse_status_metrics(raw: &[serde_json::Value]) -> Vec<HookMetric> {
     let mut out = Vec::new();
-    for (name, v) in raw {
+    for v in raw {
         if out.len() >= MAX_HOOK_METRICS {
             break;
-        }
-        if !valid_metric_name(name) {
-            continue;
         }
         let Ok(mut m) = serde_json::from_value::<HookMetric>(v.clone()) else {
             continue;
         };
-        if !m.value.is_finite() || !matches!(m.kind.as_str(), "counter" | "gauge") {
+        // Drop the whole entry on the load-bearing invariants: name charset, known type, finite
+        // scalar. (A histogram may legitimately carry value 0 — the distribution is in quantiles.)
+        if !valid_metric_name(&m.name)
+            || !matches!(m.kind.as_str(), "counter" | "gauge" | "histogram")
+            || !m.value.is_finite()
+        {
             continue;
         }
-        // CHAR-boundary-safe caps (re-audit F1): `String::truncate` takes BYTES and panics off a
-        // char boundary — a hook replying multi-byte help (100 × '€') could panic the admin
-        // handler. `.chars().take(n)` caps in CHARS, panic-free, matching the documented "≤ N
-        // chars" rule. Hints are sanitized + bounded exactly like help; out-of-vocabulary /
-        // oversize values are dropped INDIVIDUALLY (the metric itself survives).
-        let cap = |raw: &str, n: usize| -> String {
-            sanitize_reject_message(raw).chars().take(n).collect()
-        };
-        m.help = m.help.map(|h| cap(&h, MAX_METRIC_HELP_CHARS));
-        m.label = m.label.map(|l| cap(&l, MAX_METRIC_LABEL_CHARS));
+        // Labels: keep only charset-valid keys with sanitized values, capped in count.
+        m.labels = m.labels.map(|labels| {
+            labels
+                .into_iter()
+                .filter(|(k, _)| valid_metric_name(k))
+                .map(|(k, val)| (k, sanitize_cap(&val, MAX_METRIC_LABEL_CHARS)))
+                .take(MAX_METRIC_LABELS)
+                .collect()
+        });
+        // Quantiles: keys parse to a probability in [0,1], values finite; drop the map if empty.
+        m.quantiles = m
+            .quantiles
+            .map(|q| {
+                q.into_iter()
+                    .filter(|(k, val)| {
+                        val.is_finite() && k.parse::<f64>().is_ok_and(|p| (0.0..=1.0).contains(&p))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .filter(|q| !q.is_empty());
+        // Confidence interval: both finite and ordered, else drop the pair entirely.
+        match (m.ci_low, m.ci_high) {
+            (Some(lo), Some(hi)) if lo.is_finite() && hi.is_finite() && lo <= hi => {}
+            _ => {
+                m.ci_low = None;
+                m.ci_high = None;
+            }
+        }
+        m.help = m.help.map(|h| sanitize_cap(&h, MAX_METRIC_HELP_CHARS));
+        m.label = m.label.map(|l| sanitize_cap(&l, MAX_METRIC_LABEL_CHARS));
         m.unit = m
             .unit
-            .map(|u| cap(&u, MAX_METRIC_UNIT_CHARS))
+            .map(|u| sanitize_cap(&u, MAX_METRIC_UNIT_CHARS))
             .filter(|s| !s.is_empty());
-        m.viz = m
-            .viz
-            .filter(|v| matches!(v.as_str(), "number" | "gauge" | "counter" | "sparkline"));
+        m.viz = m.viz.filter(|v| {
+            matches!(
+                v.as_str(),
+                "number" | "gauge" | "counter" | "sparkline" | "histogram"
+            )
+        });
         m.max = m.max.filter(|v| v.is_finite());
-        out.push((name.clone(), m));
+        out.push(m);
     }
     out
 }
@@ -641,15 +709,14 @@ mod tests {
     #[test]
     fn status_metric_hints_cap_char_safe() {
         let long_euro = "€".repeat(400);
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(
-            "ok_total".to_string(),
-            serde_json::json!({"type": "counter", "value": 1.0,
-                               "help": long_euro, "label": long_euro, "unit": long_euro}),
-        );
+        let m = [
+            serde_json::json!({"name": "ok_total", "type": "counter", "value": 1.0,
+                                    "help": long_euro, "label": long_euro, "unit": long_euro}),
+        ];
         let parsed = super::parse_status_metrics(&m);
         assert_eq!(parsed.len(), 1);
-        let (_, metric) = &parsed[0];
+        let metric = &parsed[0];
+        assert_eq!(metric.name, "ok_total");
         assert_eq!(
             metric.help.as_ref().unwrap().chars().count(),
             super::MAX_METRIC_HELP_CHARS
@@ -663,16 +730,55 @@ mod tests {
             super::MAX_METRIC_UNIT_CHARS
         );
         // Out-of-vocabulary viz + non-finite max drop individually; the metric survives.
-        let mut m2 = std::collections::BTreeMap::new();
-        m2.insert(
-            "g".to_string(),
-            serde_json::json!({"type": "gauge", "value": 0.5, "viz": "hologram",
-                               "max": f64::NAN}),
-        );
+        let m2 = [
+            serde_json::json!({"name": "g", "type": "gauge", "value": 0.5,
+                                     "viz": "hologram", "max": f64::NAN}),
+        ];
         let parsed2 = super::parse_status_metrics(&m2);
         assert_eq!(parsed2.len(), 1);
-        assert!(parsed2[0].1.viz.is_none());
-        assert!(parsed2[0].1.max.is_none());
+        assert!(parsed2[0].viz.is_none());
+        assert!(parsed2[0].max.is_none());
+    }
+
+    /// The redesigned metric shape (the Headroom fit-test): a Prometheus-style ARRAY carrying
+    /// per-dimension LABELS, a HISTOGRAM distribution via quantiles, and an ESTIMATE with a CI —
+    /// the shapes a real plugin dashboard needs and the old flat map could not express. Malformed
+    /// optional members are dropped individually; the entry survives.
+    #[test]
+    fn status_metrics_labels_quantiles_and_estimates() {
+        let m = [
+            // Two entries share a NAME, differ by pool label (the per-pool breakdown).
+            serde_json::json!({"name":"chars_saved_total","type":"counter","value":812000.0,
+                               "labels":{"pool":"chat"}}),
+            serde_json::json!({"name":"chars_saved_total","type":"counter","value":410000.0,
+                               "labels":{"pool":"code","BAD KEY":"dropped"}}),
+            // A histogram: value is the count, distribution rides quantiles; a >1 quantile drops.
+            serde_json::json!({"name":"compress_ms","type":"histogram","value":900.0,
+                               "quantiles":{"0.5":12.0,"0.95":34.0,"1.5":99.0,"x":1.0}}),
+            // An estimate with a valid CI; a second with an INVERTED CI (both bounds dropped).
+            serde_json::json!({"name":"dollars_saved","type":"gauge","value":31.2,
+                               "estimated":true,"ci_low":27.7,"ci_high":35.7}),
+            serde_json::json!({"name":"bad_ci","type":"gauge","value":1.0,
+                               "ci_low":9.0,"ci_high":1.0}),
+            // Whole-entry drops: bad name, unknown type.
+            serde_json::json!({"name":"Bad Name","type":"counter","value":1.0}),
+            serde_json::json!({"name":"weird","type":"summary","value":1.0}),
+        ];
+        let parsed = super::parse_status_metrics(&m);
+        assert_eq!(parsed.len(), 5, "2 bad entries dropped whole");
+        let by = |i: usize| &parsed[i];
+        // Labels: valid key kept, out-of-charset key dropped.
+        assert_eq!(by(0).labels.as_ref().unwrap()["pool"], "chat");
+        assert_eq!(by(1).labels.as_ref().unwrap().len(), 1);
+        assert!(!by(1).labels.as_ref().unwrap().contains_key("BAD KEY"));
+        // Quantiles: probabilities in [0,1] with finite values kept; "1.5"/"x" dropped.
+        let q = by(2).quantiles.as_ref().unwrap();
+        assert_eq!(q.len(), 2);
+        assert_eq!(q["0.95"], 34.0);
+        // Estimate CI: valid pair kept; inverted pair fully dropped.
+        assert_eq!(by(3).estimated, Some(true));
+        assert_eq!((by(3).ci_low, by(3).ci_high), (Some(27.7), Some(35.7)));
+        assert_eq!((by(4).ci_low, by(4).ci_high), (None, None));
     }
 
     use super::*;

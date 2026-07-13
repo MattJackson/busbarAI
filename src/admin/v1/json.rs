@@ -1449,10 +1449,16 @@ async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
                 .map(|m| {
                     crate::routing::wire::parse_status_metrics(m)
                         .into_iter()
-                        .map(|(name, metric)| {
-                            let mut entry = json!({"type": metric.kind, "value": metric.value});
+                        .map(|metric| {
+                            let mut entry =
+                                json!({"name": metric.name, "type": metric.kind, "value": metric.value});
                             // Optional members appear only when the hook sent them (absent ≠ null).
                             for (k, v) in [
+                                ("labels", metric.labels.map(|l| json!(l))),
+                                ("quantiles", metric.quantiles.map(|q| json!(q))),
+                                ("estimated", metric.estimated.map(serde_json::Value::from)),
+                                ("ci_low", metric.ci_low.map(serde_json::Value::from)),
+                                ("ci_high", metric.ci_high.map(serde_json::Value::from)),
                                 ("help", metric.help.map(serde_json::Value::from)),
                                 ("label", metric.label.map(serde_json::Value::from)),
                                 ("unit", metric.unit.map(serde_json::Value::from)),
@@ -1463,9 +1469,9 @@ async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
                                     entry[k] = v;
                                 }
                             }
-                            (name, entry)
+                            entry
                         })
-                        .collect::<serde_json::Map<_, _>>()
+                        .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
             json!({

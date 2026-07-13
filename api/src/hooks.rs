@@ -238,8 +238,9 @@ pub enum TransformOutcome {
 pub struct HookStatus {
     pub settings_version: Option<u64>,
     pub settings: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Raw metrics map (`name -> {type, value, help?}`); the engine validates/bounds entries.
-    pub metrics: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Raw metrics ARRAY (each entry `{name, type, value, labels?, quantiles?, ...}`); the engine
+    /// validates + bounds entries before exposing them.
+    pub metrics: Option<Vec<serde_json::Value>>,
 }
 
 /// THE transport-agnostic contract. webhook / socket / native all implement this.

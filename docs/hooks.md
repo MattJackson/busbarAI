@@ -160,21 +160,34 @@ changes. The rules a hook author must know:
   `status.metrics`), so one declaration drives both the config form and the plugin dashboard.
   Both members optional; don't answer (or `{}`) and the API reports `schema: null`.
 - **`status`** (`{"status": true}`) — the control-plane read: reply your **observed** state —
-  `{"status": {"settings_version": N, "settings": {...}, "metrics": {...}}}` — and Busbar surfaces
+  `{"status": {"settings_version": N, "settings": {...}, "metrics": [ ... ]}}` — and Busbar surfaces
   it at `GET /api/v1/admin/hooks/{name}/status` with a desired-vs-reported **drift** verdict. The
-  `metrics` map is how your hook feeds its own operational data to the control plane (a Headroom
+  `metrics` ARRAY is how your hook feeds its own operational data to the control plane (a Headroom
   compressor reports `chars_saved_total`; a dashboard built on Busbar sees what each plug is doing)
-  instead of running its own dashboard. Entry shape:
-  `"<name>": {"type": "counter"|"gauge", "value": <number>, "help"?, "label"?, "unit"?, "viz"?,
-  "max"?}` — names match `^[a-z][a-z0-9_]{0,63}$` (counters SHOULD end `_total`), values are
-  finite numbers, `help` ≤ 200 chars. The optional DISPLAY HINTS make a dashboard render your
-  metric correctly without per-plugin code: `label` (≤ 64 chars), `unit` (a short token like
-  `"ms"`/`"$"`/`"%"`, ≤ 16 chars), `viz` (`number` | `gauge` | `counter` | `sparkline`), `max`
-  (gauge ceiling). Busbar validates and BOUNDS everything (64 entries per reply; hints sanitized
-  like `help`); malformed entries/hints are dropped individually, never the reply. Time series are
-  the CONSUMER's job in 1.3 (a dashboard samples `status` and accumulates); an engine-side
-  `series` member on the entry is the reserved additive path. Optional: reply `{}` and Busbar
-  treats status as unsupported.
+  instead of running its own dashboard. Each entry is Prometheus/OpenMetrics-shaped:
+  ```jsonc
+  {"name": "chars_saved_total",       // ^[a-z][a-z0-9_]{0,63}$ ; counters SHOULD end _total
+   "type": "counter"|"gauge"|"histogram",
+   "value": 812000,                   // counter/gauge scalar; a histogram's is its sample count
+   "labels":    {"pool": "chat"},     // Prometheus DIMENSIONS: several entries may share a name
+   "quantiles": {"0.5": 12, "0.95": 34, "0.99": 51},   // a histogram's distribution (p50/p95/p99)
+   "estimated": true, "ci_low": 27.7, "ci_high": 35.7, // mark + bound an ESTIMATE vs a measured fact
+   "label": "Characters saved", "unit": "%", "viz": "counter"|"gauge"|"sparkline"|"histogram",
+   "max": 100, "help": "..."}
+  ```
+  Beyond `name`+`type` everything is optional — the simplest hook sends `{name, type, value}`.
+  **`labels` is how you break a metric down by dimension** (per-pool, per-model, per-strategy): a
+  hook that runs on several pools reports one entry per pool (it receives `request.pool` on every
+  message), so `GET /hooks/{name}/status` returns the whole picture and a dashboard drills down by
+  label — a hook is ONE process no matter how many pools reference it, so this labeled self-report,
+  not a per-pool endpoint, is how per-pool numbers surface. `histogram`+`quantiles` carries a
+  latency distribution a mean would hide; `estimated`/`ci_*` marks a value your hook derived from a
+  control group. Names/label keys are charset-enforced, every string sanitized + length-bounded,
+  every number finite (a `prompt: ro` hook cannot smuggle content into a scrape). Busbar BOUNDS
+  everything (64 entries/reply, 8 labels/entry); a malformed entry is dropped whole, a malformed
+  optional member individually — never the reply. Time series are the CONSUMER's job in 1.3 (a
+  dashboard samples `status` and accumulates); an engine-retained `series` member is the reserved
+  additive path. Optional: reply `{}` and Busbar treats status as unsupported.
 - **Reserved:** the reply field name **`report`** is reserved on per-request replies for per-request
   hook data (attached to the completion-stage tap payload in a future release) — do not use it for
   anything else.
