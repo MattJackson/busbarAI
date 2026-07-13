@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The protocol catch-all dispatch (design: web server listens for anything → Router IDs the
 //! protocol → that protocol's `RequestHandler` decides the operation → its OperationHandler). Holds
@@ -186,9 +186,10 @@ pub(crate) async fn operation_resolved(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some(resp) = governance_guard(app, gov, proto, model, started, charged_at).await {
-        return resp;
-    }
+    let charged = match governance_guard(app, gov, proto, model, started, charged_at).await {
+        Err(resp) => return resp,
+        Ok(charged) => charged,
+    };
 
     let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(model) {
         (c.clone(), model)
@@ -203,7 +204,7 @@ pub(crate) async fn operation_resolved(
             "",
         )
     } else {
-        return finish(
+        return finish_admitted(
             app,
             gov,
             proto,
@@ -216,6 +217,7 @@ pub(crate) async fn operation_resolved(
                 crate::forward::KIND_NOT_FOUND,
                 &not_found_message(model, gemini_api_version),
             ),
+            charged,
         );
     };
 
@@ -241,6 +243,10 @@ pub(crate) async fn operation_resolved(
             &req_ct_owned
         },
         caller_token,
+        // The key the auth layer resolved/synthesized for this caller — lets the routing-signal
+        // path project rate_headroom/identity for group/SSO principals whose token is not a
+        // virtual-key secret (so a token `lookup` would miss).
+        gov.key.as_ref(),
         pool_name,
         affinity_key.as_deref(),
         proto,
@@ -251,7 +257,7 @@ pub(crate) async fn operation_resolved(
         usage_sink(app, gov, charged_at),
     )
     .await;
-    finish(app, gov, proto, model, started, charged_at, resp)
+    finish_admitted(app, gov, proto, model, started, charged_at, resp, charged)
 }
 
 // (The per-operation axum wrappers are gone: the protocol catch-all `protocol_dispatch` resolves the
@@ -269,7 +275,7 @@ pub(crate) async fn operation_resolved(
 /// every operation → `operation_ingress` (the universal core). Unknown paths/methods keep the
 /// pre-collapse fallback shaping (native 404/405 envelopes, no proxy tells).
 pub(crate) async fn protocol_dispatch(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     OriginalUri(uri): OriginalUri,
     method: axum::http::Method,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,
@@ -321,7 +327,7 @@ pub(crate) async fn protocol_dispatch(
             let rest =
                 crate::observability::percent_decode(path.split("/models/").nth(1).unwrap_or(""));
             gemini_ingress(
-                State(app),
+                crate::state::CurrentApp(app),
                 Path(rest),
                 OriginalUri(uri),
                 axum::extract::Extension(gov),
@@ -339,7 +345,7 @@ pub(crate) async fn protocol_dispatch(
                 .unwrap_or_default();
             if path.ends_with("/converse") {
                 bedrock_converse(
-                    State(app),
+                    crate::state::CurrentApp(app),
                     Path(model),
                     axum::extract::Extension(gov),
                     axum::extract::Extension(caller),
@@ -349,7 +355,7 @@ pub(crate) async fn protocol_dispatch(
                 .await
             } else if path.ends_with("/converse-stream") {
                 bedrock_converse_stream(
-                    State(app),
+                    crate::state::CurrentApp(app),
                     Path(model),
                     axum::extract::Extension(gov),
                     axum::extract::Extension(caller),
@@ -359,7 +365,7 @@ pub(crate) async fn protocol_dispatch(
                 .await
             } else if path.ends_with("/invoke") {
                 bedrock_invoke(
-                    State(app),
+                    crate::state::CurrentApp(app),
                     Path(model),
                     OriginalUri(uri),
                     axum::extract::Extension(gov),
@@ -406,7 +412,7 @@ pub(crate) async fn protocol_dispatch(
 /// bedrock RequestHandler reads the BODY and decides the operation (`textToImageParams` ⇒ image,
 /// `inputText` ⇒ embeddings). An unrecognized body is a clean 400 in the Bedrock dialect.
 pub(crate) async fn bedrock_invoke(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(model_id): Path<String>,
     OriginalUri(uri): OriginalUri,
     axum::extract::Extension(gov): axum::extract::Extension<crate::governance::GovCtx>,

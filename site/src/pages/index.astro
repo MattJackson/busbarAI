@@ -50,6 +50,28 @@ const features = [
   },
 ];
 
+// Hooks: mini-apps for your AI that run on the path. Mirrors the "Built
+// reliability-first" trio (same .feature card markup, same h3 + body + enables
+// shape) — reliability earns the position in the request path; hooks are what
+// the position becomes.
+const hooks = [
+  {
+    title: 'Tap: watch every request',
+    body: 'Fire-and-forget observers on the path. A tap sees the full request and response and never blocks the hop — feed a SIEM, a compliance archive, custom alerting, and more. It runs alongside the request, so nothing waits on it.',
+    enables: 'A SIEM feed or compliance archive that sees every call, across every provider, from one place.',
+  },
+  {
+    title: 'Gate: decide on the path',
+    body: 'Fire-and-wait deciders that run before the request leaves. A gate can reject a call, restrict it to certain models, re-order or route it, or <strong>rewrite the request body outright</strong> — a PII-redaction guard, a cost-and-latency router, or Headroom compressing context before it ships.',
+    enables: 'Your policy enforced before the request runs, not reconstructed from logs after.',
+  },
+  {
+    title: 'Write once, run anywhere',
+    body: 'Hooks fire on Busbar’s normalized IR — the one internal representation every protocol is translated into, losslessly. Write a hook once and it runs against all six wire protocols and every provider, <strong>with failover and circuit-breaking underneath it, in one hop.</strong>',
+    enables: 'One hook covers OpenAI, Anthropic, Gemini, Bedrock, Cohere, and Responses at once — no per-provider plumbing to maintain.',
+  },
+];
+
 const trust = [
   { k: 'One binary', v: 'No Python runtime' },
   { k: 'Hardened', v: 'SSRF guards · constant-time auth' },
@@ -275,7 +297,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
               <div class="bb-sub">one endpoint · :8080</div>
             </div>
             <svg class="hook-line" viewBox="0 0 2 34" preserveAspectRatio="none" aria-hidden="true"><line x1="1" y1="0" x2="1" y2="34" /></svg>
-            <div class="hook-out">Hooks · your policy on the path</div>
+            <a class="hook-out" href="#hooks">Hooks · mini-apps for your AI on the path</a>
           </div>
 
           <div class="link-zone" aria-hidden="true">
@@ -370,6 +392,36 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
             <p class="enables"><span>Enables</span> <span set:html={f.enables}></span></p>
           </article>
         ))}
+      </div>
+    </section>
+
+    <!-- HOOKS — "…and now look what that lets you do." Reliability earns the
+         position in the request path (features section above); hooks are what
+         the position becomes. Same .core lede + .feature card system. -->
+    <section class="hooks" id="hooks">
+      <div class="core wrap">
+        <div class="core-inner">
+          <h2>Program the path.</h2>
+          <p>
+            Reliability earns Busbar a spot between your app and your models. <strong>Hooks are what
+            that spot becomes</strong> — a <strong>tap</strong> that watches, or a
+            <strong>gate</strong> that decides: reject, restrict, route, or rewrite. Because hooks
+            fire on Busbar’s normalized IR, you write one
+            once and it runs against all six protocols and every provider, with failover and circuit
+            breaking underneath it, in one hop. <strong>Busbar is where your AI middleware runs.</strong>
+          </p>
+        </div>
+      </div>
+      <div class="features wrap">
+        <div class="feature-grid feature-grid-3">
+          {hooks.map((h) => (
+            <article class="feature">
+              <h3>{h.title}</h3>
+              <p set:html={h.body}></p>
+              <p class="enables"><span>Enables</span> <span set:html={h.enables}></span></p>
+            </article>
+          ))}
+        </div>
       </div>
     </section>
 
@@ -503,6 +555,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
           <div>
             <h4>Project</h4>
             <a href="/download/">Download</a>
+            <a href="/blog/">Blog</a>
             <a href="/docs/changelog/">Changelog</a>
             <a href={GITHUB}>GitHub</a>
             <a href={`${GITHUB}/blob/main/LICENSE`}>Apache-2.0</a>
@@ -741,6 +794,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       .hook-line { position: absolute; top: calc(100% + 14px); left: 50%; transform: translateX(-50%); width: 2px; height: 34px; overflow: visible; }
       .hook-line line { stroke: #cbd5e1; stroke-width: 2; stroke-dasharray: 5 5; }
       .hook-out { position: absolute; top: 100%; left: 0; right: 0; margin-top: 54px; text-align: center; font-size: 11px; font-weight: 600; color: var(--muted); }
+      a.hook-out:hover { color: #4d7c0f; }
 
       /* SINGLE-PROVIDER MINI DIAGRAM (the "Already committed?" section): the hero
          diagram's visual language scaled down to a supporting illustration. Shares
@@ -759,6 +813,15 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
       /* FEATURES */
       .features { padding: 18px 28px 96px; }
       .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: repeat(2, auto 1fr auto); gap: 22px; }
+      /* A single row of three cards (the hooks trio) — one subgrid band, not two. */
+      .feature-grid-3 { grid-template-rows: auto 1fr auto; }
+
+      /* HOOKS — the payoff band. Tighten the .core lede's bottom padding so the
+         section heading sits close to its card trio, and lift the reliability
+         line with a lime rule. */
+      .hooks .core { padding-top: 40px; padding-bottom: 34px; }
+      .hooks .core strong { color: var(--slate); font-weight: 700; }
+      .hooks .features { padding-top: 0; }
       .feature {
         background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 26px 24px;
         display: grid; grid-template-rows: subgrid; grid-row: span 3; row-gap: 0;
@@ -822,6 +885,8 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .qs-grid, .adopt-grid { grid-template-columns: 1fr; gap: 32px; }
         .core-grid { grid-template-columns: 1fr; gap: 28px; }
         .feature-grid { grid-template-columns: repeat(2, 1fr); grid-template-rows: repeat(3, auto 1fr auto); }
+        /* Hooks trio: 3 cards over 2 columns = 2 rows. */
+        .feature-grid-3 { grid-template-rows: repeat(2, auto 1fr auto); }
         /* Diagram: collapse to a vertical stack, hide the SVG connectors. */
         .diagram { grid-template-columns: 1fr; gap: 0; padding: 32px 20px; }
         .link-zone { display: none; }
@@ -846,6 +911,7 @@ const qsRequest = `curl localhost:8080/v1/chat/completions \\
         .code-card code { font-size: 11px; }
         .qs-block code { font-size: 12px; }
         .feature-grid { grid-template-columns: 1fr; grid-template-rows: repeat(6, auto 1fr auto); }
+        .feature-grid-3 { grid-template-rows: repeat(3, auto 1fr auto); }
         .trust-grid { grid-template-columns: repeat(2, 1fr); }
         .hero-lead { padding-top: 44px; }
         .cta-row { padding-bottom: 40px; }

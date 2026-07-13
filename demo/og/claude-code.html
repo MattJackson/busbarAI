@@ -1,0 +1,33 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1200px; height:630px; }
+  body {
+    font-family: -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
+    background: radial-gradient(1200px 700px at 78% -12%, #1e293b 0%, #0f172a 55%, #0b1120 100%);
+    color:#e2e8f0; padding:70px 76px; position:relative; overflow:hidden;
+  }
+  .mark { display:flex; align-items:center; gap:13px; font-weight:800; letter-spacing:.16em;
+    font-size:22px; color:#a3e635; text-transform:uppercase; }
+  .mark .dot { width:16px; height:16px; border-radius:4px; background:#a3e635; transform:rotate(45deg); }
+  h1 { margin-top:64px; font-size:76px; line-height:1.04; font-weight:820; color:#f8fafc;
+    letter-spacing:-.02em; max-width:1000px; }
+  h1 .lime { color:#a3e635; }
+  .flow { position:absolute; left:76px; bottom:150px; display:flex; align-items:center; gap:18px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .chip { padding:14px 22px; border-radius:12px; font-size:26px; font-weight:600;
+    background:rgba(148,163,184,.10); border:1px solid rgba(148,163,184,.22); color:#cbd5e1; }
+  .chip.busbar { background:#a3e635; border-color:#a3e635; color:#0f172a; }
+  .arrow { color:#64748b; font-size:30px; }
+  .foot { position:absolute; left:76px; bottom:64px; display:flex; align-items:baseline; gap:20px; }
+  .foot .url { font-size:26px; font-weight:700; color:#f8fafc; }
+  .foot .sub { font-size:22px; color:#94a3b8; }
+</style></head><body>
+  <div class="mark"><span class="dot"></span>Busbar</div>
+  <h1>Claude Code, running on<br><span class="lime">AWS Bedrock</span>.</h1>
+  <div class="flow">
+    <span class="chip">Claude&nbsp;Code</span><span class="arrow">&rarr;</span>
+    <span class="chip busbar">Busbar</span><span class="arrow">&rarr;</span>
+    <span class="chip">Amazon&nbsp;Nova&nbsp;&middot;&nbsp;Bedrock</span>
+  </div>
+  <div class="foot"><span class="url">getbusbar.com</span><span class="sub">one env var &mdash; the agent never knows</span></div>
+</body></html>

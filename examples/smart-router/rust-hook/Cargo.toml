@@ -11,3 +11,7 @@ serde_json = "1"
 
 [profile.release]
 opt-level = 3
+
+# Standalone example — deliberately OUTSIDE the repo workspace (it is user-facing sample code,
+# not part of the busbar build graph).
+[workspace]

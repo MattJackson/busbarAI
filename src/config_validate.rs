@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 use std::collections::{HashMap, HashSet};
 
@@ -273,10 +273,13 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             .as_deref()
             .map(host_is_private_or_loopback)
             .unwrap_or(false);
+        // Case-INSENSITIVE scheme check (RFC 3986 §3.1) — a raw `starts_with("https://")` rejected
+        // the valid uppercase spelling reqwest would accept, and diverged from the webhook guard's
+        // `scheme_is`. (found: audit c2r5.)
         let scheme_ok =
-            base_url.starts_with("https://") || (host_is_local && base_url.starts_with("http://"));
+            scheme_is(base_url, "https") || (host_is_local && scheme_is(base_url, "http"));
         if !scheme_ok {
-            errors.push(if base_url.starts_with("http://") {
+            errors.push(if scheme_is(base_url, "http") {
                 // An http:// scheme that failed the check ⇒ the host is public (or unparseable):
                 // plaintext to a public host would leak the key.
                 format!(
@@ -588,6 +591,17 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         // affinity. Validate it at boot: ASCII only, non-empty, and a sane <= 64-char bound.
         if let Some(affinity) = &pool_cfg.affinity {
             if let Some(header_name) = &affinity.header_name {
+                // Non-empty: an empty header name is not a valid HTTP field-name, and it PASSES the
+                // ASCII + length checks (`"".is_ascii()` is true, `0 > 64` is false) yet silently
+                // disables affinity at runtime (`headers.get("")` is always None) — the exact
+                // "silently disable affinity" failure this validator's own comment promises to
+                // catch. (found: audit c2r3.)
+                if header_name.is_empty() {
+                    errors.push(format!(
+                        "pool '{}' affinity.header_name must not be empty (an empty HTTP header field-name silently disables session affinity)",
+                        pool_name
+                    ));
+                }
                 if !header_name.is_ascii() {
                     errors.push(format!(
                         "pool '{}' affinity.header_name '{}' must be ASCII (an HTTP header field-name cannot contain non-ASCII bytes)",
@@ -658,118 +672,333 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule (routing/webhook): a `route: webhook` pool MUST carry a `policy.url`, and that URL MUST
-    // pass the routing-webhook SSRF guard (the OTLP loopback carve-out: loopback/localhost sidecars
-    // allowed, link-local/IMDS/RFC1918/CGNAT/cloud-metadata blocked; plaintext http:// only on
-    // loopback). Rejected at startup rather than silently degrading to SWRR at runtime, so an operator
-    // who asked for a webhook policy learns immediately that it is misconfigured.
-    for (pool_name, pool_cfg) in &cfg.pools {
-        if pool_cfg.route != crate::config::RouteKind::Webhook {
-            continue;
+    // Rule (hooks/registry): every entry in the top-level `hooks:` registry is validated once, here.
+    // A hook declares EXACTLY ONE transport (`socket` XOR `webhook`); a webhook URL must pass the
+    // routing SSRF guard (OTLP loopback carve-out: loopback/localhost sidecars allowed, link-local/
+    // IMDS/RFC1918/CGNAT/cloud-metadata blocked; plaintext http:// only on loopback); a socket path
+    // must be non-empty + ABSOLUTE (a relative path silently depends on busbar's CWD) and the platform
+    // must support Unix domain sockets. Rejected at startup, never a silent degrade.
+    for (hook_name, hook) in &cfg.hooks {
+        match (hook.socket.as_deref(), hook.webhook.as_deref()) {
+            (None, None) | (Some(""), None) | (None, Some("")) => errors.push(format!(
+                "hook '{hook_name}' declares no transport: set exactly one of `socket` (a Unix \
+                 domain socket path) or `webhook` (an https URL)"
+            )),
+            (Some(_), Some(_)) => errors.push(format!(
+                "hook '{hook_name}' declares BOTH `socket` and `webhook`: a hook has exactly one \
+                 transport"
+            )),
+            (Some(path), None) => {
+                if !cfg!(unix) {
+                    errors.push(format!(
+                        "hook '{hook_name}' uses a `socket` transport, unavailable on this platform \
+                         (Unix domain sockets); use a `webhook` hook here"
+                    ));
+                } else if !path.starts_with('/') {
+                    errors.push(format!(
+                        "hook '{hook_name}' `socket` must be an absolute path (got '{path}'); a \
+                         relative path depends on busbar's working directory"
+                    ));
+                }
+            }
+            (None, Some(url)) => {
+                if let Err(msg) = crate::observability::validate_routing_webhook_url(Some(url)) {
+                    errors.push(format!("hook '{hook_name}' `webhook` is invalid: {msg}"));
+                }
+            }
         }
-        let url = pool_cfg.policy.as_ref().and_then(|p| p.url.as_deref());
-        if let Err(msg) = crate::observability::validate_routing_webhook_url(url) {
+        // `prompt: rw` grants the REWRITE arm, which only a GATE can return — a tap is fire-and-forget
+        // and never replies, so `rw` on a tap is a config error (it would silently never rewrite).
+        if hook.prompt == crate::config::PromptAccess::Rw
+            && hook.kind == crate::config::HookKind::Tap
+        {
             errors.push(format!(
-                "pool '{pool_name}' route: webhook is invalid: {msg}"
+                "hook '{hook_name}' is a tap with `prompt: rw`, but only a gate can rewrite (a tap \
+                 never replies). Use `kind: gate`, or lower to `prompt: ro`."
+            ));
+        }
+        // `default: true` marks the hook as a pool's base ORDERING — but a tap is fire-and-forget and
+        // never replies, so it can never order. A default tap is meaningless; reject it (the base
+        // must be an ordering gate, or the compiled-in backstop).
+        if hook.default && hook.kind == crate::config::HookKind::Tap {
+            errors.push(format!(
+                "hook '{hook_name}' is a tap with `default: true`, but a tap cannot be a pool's base \
+                 ordering (it never replies). Only a gate can be the default."
             ));
         }
     }
 
-    // Rule (routing/socket): a `route: socket` pool MUST carry a non-empty, ABSOLUTE `policy.socket`
-    // path (a relative path silently depends on busbar's CWD — a classic deploy footgun). The socket
-    // FILE may not exist yet (the hook binary can start after busbar; connection is lazy), so only
-    // the path's shape is validated. Rejected at startup rather than silently degrading to SWRR, so
-    // an operator who asked for a socket hook learns immediately that it is misconfigured. On
-    // non-unix platforms the transport is unavailable — also a startup error, pointing at webhook.
-    for (pool_name, pool_cfg) in &cfg.pools {
-        if pool_cfg.route != crate::config::RouteKind::Socket {
-            continue;
-        }
-        if !cfg!(unix) {
+    // Rule (hooks/reserved-names): a hook in ANY layer (base config, and — once the admin API can
+    // register hooks — the overlay) may NOT reuse a name that a compiled-in built-in already answers
+    // to. This is REGISTRY NAME UNIQUENESS, not a privileged-word list: `weighted`/`cheapest`/… are
+    // the native ranking strategies (becoming named registry hooks), and `tokens`/`admin-tokens` are
+    // the built-in auth modules. Two things can't answer to one name — which one would `on_error:
+    // weighted` or an `auth:`/`default hook` reference resolve to? A collision is a boot error naming
+    // the offender. Closing this before scope enforcement / `on_error`-as-string makes the shadowing
+    // path reachable. (`weighted` reserved even though it constructs no object today: it is still the
+    // name the default routing floor answers to.)
+    const RESERVED_HOOK_NAMES: &[&str] = &[
+        // native ranking strategies (PoolPolicy::native_name + the always-present `weighted` floor)
+        "weighted",
+        "cheapest",
+        "fastest",
+        "least_busy",
+        "usage",
+        // built-in auth modules (AuthModule::name)
+        "tokens",
+        "admin-tokens",
+    ];
+    for hook_name in cfg.hooks.keys() {
+        if RESERVED_HOOK_NAMES.contains(&hook_name.as_str()) {
             errors.push(format!(
-                "pool '{pool_name}' route: socket is not available on this platform (Unix domain \
-                 sockets); use route: webhook for an out-of-process routing hook here"
+                "hook '{hook_name}' uses a name reserved by a built-in (ranking strategy or auth \
+                 module); rename the hook — a runtime hook cannot shadow a compiled-in plugin's name"
             ));
-            continue;
-        }
-        match pool_cfg.policy.as_ref().and_then(|p| p.socket.as_deref()) {
-            None | Some("") => errors.push(format!(
-                "pool '{pool_name}' route: socket requires policy.socket (the hook binary's Unix \
-                 domain socket path)"
-            )),
-            Some(path) if !path.starts_with('/') => errors.push(format!(
-                "pool '{pool_name}' policy.socket must be an absolute path (got '{path}'); a \
-                 relative path depends on busbar's working directory"
-            )),
-            Some(_) => {}
         }
     }
 
-    // Rule 5: Validate auth-block semantics. `auth.mode` is now a parsed `AuthMode` enum (an invalid
-    // spelling fails at deserialize, so there is no longer an unknown-mode arm here). The legacy
-    // single-token `token:` field was removed in 1.0.0; `AuthCfg` is now `deny_unknown_fields`, so a
-    // stale `token:` key fails AT PARSE with serde's "unknown field `token`" — no validate-time check
-    // needed (and no silent credential drop).
+    // Rule (hooks/at-most-one-default): AT MOST ONE hook may claim `default: true` — it becomes the
+    // base ordering a pool inherits when it names none, REPLACING the compiled-in backstop. Two
+    // defaults are ambiguous (which base?), so >1 is a boot error naming every offender. This runs on
+    // the resolved config, so it fires at boot AND on every admin apply (the apply path re-resolves +
+    // re-validates), closing "add a second default live." 0 defaults ⇒ the compiled-in backstop; the
+    // single-default check needs no lower bound.
+    {
+        let mut defaults: Vec<&str> = cfg
+            .hooks
+            .iter()
+            .filter(|(_, h)| h.default)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if defaults.len() > 1 {
+            defaults.sort_unstable();
+            errors.push(format!(
+                "more than one hook sets `default: true` ({}); at most one hook may be the default \
+                 base ordering",
+                defaults.join(", ")
+            ));
+        }
+    }
+
+    // Rule (hooks/pool-ref): every gate a pool names (`hook:` / the non-strategy names in
+    // `hooks: [...]`) must reference a registry entry that is a GATE (a tap can't influence
+    // routing). Dangling or wrong-kind references are startup errors that name the hook.
+    for (pool_name, pool_cfg) in &cfg.pools {
+        for hook_name in &pool_cfg.gates {
+            match cfg.hooks.get(hook_name) {
+                None => errors.push(format!(
+                    "pool '{pool_name}' references unknown hook '{hook_name}'; define it under \
+                     top-level `hooks:`"
+                )),
+                Some(h) if h.kind != crate::config::HookKind::Gate => errors.push(format!(
+                    "pool '{pool_name}' hook '{hook_name}' is a tap, but a hook named in a pool's \
+                     `hooks:` list must be a gate (fire-and-wait); a tap cannot influence routing"
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+
+    // Rule (hooks/on_error): a hook's `on_error` is a NAME — a reserved terminal (`weighted` |
+    // `reject` | `first`), a built-in ranking strategy, or another registry GATE (a fallback
+    // chain: when the hook fails, the named fallback fires; if THAT fails, its own on_error
+    // chains further). Boot proves every chain TERMINATES: an unknown name, a tap fallback, or a
+    // cycle (including self-reference) is a startup error — the safety guarantee that a failing
+    // gate always bottoms out on something that cannot fail.
+    for (hook_name, hook) in &cfg.hooks {
+        let mut visited: Vec<&str> = vec![hook_name.as_str()];
+        let mut current: &str = hook.on_error.as_str();
+        loop {
+            // A reserved terminal ends the chain (weighted/reject/first cannot fail).
+            if crate::config::on_error_terminal(current).is_some() {
+                break;
+            }
+            // A built-in ranking strategy is infallible (sync, no I/O) — it terminates the chain.
+            // Compiled out (`--no-default-features`), naming one is a boot error, never a silent
+            // degrade (the same compliance-by-compilation stance as the pool strategy rule).
+            if matches!(current, "cheapest" | "fastest" | "least_busy" | "usage") {
+                if cfg!(not(feature = "hooks-ranking")) {
+                    errors.push(format!(
+                        "hook '{hook_name}' on_error names the built-in ranking strategy \
+                         '{current}' but this binary was built WITHOUT the `hooks-ranking` \
+                         feature. Rebuild with default features or use nothing|weighted|reject|first."
+                    ));
+                }
+                break;
+            }
+            if visited.contains(&current) {
+                errors.push(format!(
+                    "hook on_error chain does not terminate: {} -> {current} is a cycle; every \
+                     chain must bottom out on nothing|weighted|reject|first or a ranking strategy",
+                    visited.join(" -> ")
+                ));
+                break;
+            }
+            let Some(next) = cfg.hooks.get(current) else {
+                errors.push(format!(
+                    "hook '{hook_name}' on_error names unknown fallback '{current}'; use a \
+                     reserved terminal (nothing|weighted|reject|first), a ranking strategy, or another \
+                     gate in the `hooks:` registry"
+                ));
+                break;
+            };
+            if next.kind != crate::config::HookKind::Gate {
+                errors.push(format!(
+                    "hook '{hook_name}' on_error fallback '{current}' is a tap; a fallback must \
+                     be a gate (fire-and-wait) — a tap cannot decide"
+                ));
+                break;
+            }
+            visited.push(current);
+            current = next.on_error.as_str();
+        }
+    }
+
+    // Rule (admin_auth/known-modules): every name in the `admin_auth:` chain must resolve to a
+    // compiled-in admin auth module. `admin-tokens` is the only built-in; when it is compiled OUT
+    // (`--no-default-features`) the DEFAULT chain still names it — that combination simply leaves
+    // the admin API disabled (all-Pass ⇒ denied), matching the no-token posture, so it is not an
+    // error here; a CONFIGURED admin token with the module absent is rejected by
+    // `validate_governance` (a silent admin lockout must be loud). An unknown name is always a
+    // boot error — a typo must never silently drop an auth module.
+    for name in &cfg.admin_auth {
+        if name != "admin-tokens" {
+            errors.push(format!(
+                "admin_auth names unknown module '{name}'; the built-in admin module is \
+                 `admin-tokens` (external admin modules are registered at compile time)"
+            ));
+        }
+    }
+
+    // Rule (group_map/admin-scope): every `group_map.<group>.admin_scope` must be a known scope
+    // token. A typo'd scope must fail at boot, never silently grant nothing at runtime.
+    for (group, entry) in &cfg.group_map {
+        if let Some(scope) = entry.admin_scope.as_deref() {
+            if crate::admin::v1::contract::Scope::parse(scope).is_none() {
+                errors.push(format!(
+                    "group_map '{group}' has unknown admin_scope '{scope}': expected read-only, \
+                     hooks-register, or full"
+                ));
+            }
+        }
+    }
+
+    // Rule (auth.modules/max-scope): every `auth.modules.<name>.max_admin_scope` must be a known
+    // scope token (typos fail at boot), and `full` — lifting the default read-only ceiling on an
+    // external chain — is a LOUD boot warning: it is the explicit opt-in §2.4 requires.
+    if let Some(auth) = cfg.auth.as_ref() {
+        for (module, mc) in &auth.modules {
+            if let Some(scope) = mc.max_admin_scope.as_deref() {
+                match crate::admin::v1::contract::Scope::parse(scope) {
+                    None => errors.push(format!(
+                        "auth.modules '{module}' has unknown max_admin_scope '{scope}': expected                          read-only, hooks-register, or full"
+                    )),
+                    Some(crate::admin::v1::contract::Scope::Full) => tracing::warn!(
+                        module,
+                        "auth.modules grants max_admin_scope: full — principals identified by                          this module can hold FULL admin authority (the default ceiling is                          read-only); make sure this chain is trusted end to end"
+                    ),
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
+    // Rule (hooks/global-ref): every name in `global_hooks:` must reference a registry entry.
+    for name in &cfg.global_hooks {
+        if !cfg.hooks.contains_key(name) {
+            errors.push(format!(
+                "global_hooks references unknown hook '{name}'; define it under top-level `hooks:`"
+            ));
+        }
+    }
+
+    // Rule (compliance-by-compilation): the non-weighted ranking strategies are the `hooks-ranking`
+    // plugin. When it's compiled OUT (`--no-default-features`), a pool `policy: <non-weighted>` is a
+    // BOOT ERROR — never a silent degrade to weighted. (Inert in the default build; `weighted` always
+    // works — it's the engine's inline SWRR floor, not a plugin.)
+    #[cfg(not(feature = "hooks-ranking"))]
+    for (pool_name, pool_cfg) in &cfg.pools {
+        if pool_cfg.policy != crate::config::PoolPolicy::Weighted {
+            errors.push(format!(
+                "pool '{pool_name}' names the {:?} ranking strategy but this binary was built \
+                 WITHOUT the `hooks-ranking` feature — the built-in ranking strategies are absent. \
+                 Rebuild with default features, use `hooks: [weighted]` (or name no strategy), or \
+                 reference an external ranking hook.",
+                pool_cfg.policy
+            ));
+        }
+    }
+
+    // Rule 5: Validate auth-block semantics. `auth.chain` is a list of module names + `upstream_
+    // credentials` a snake_case enum, both validated below. `AuthCfg` is `deny_unknown_fields`, so a
+    // stale `mode:`/`token:` key fails AT PARSE with serde's "unknown field" — a loud clean-break
+    // boot error, no validate-time check needed (and no silent credential drop).
     if let Some(auth) = &cfg.auth {
-        match auth.mode {
-            crate::auth::AuthMode::Token => {
-                // Token mode with no client tokens rejects 100% of requests with no startup signal —
-                // the locked-out mirror of the loudly-warned open-relay (mode: none) case.
-                if effective_client_tokens_empty(auth) {
+        // Every module name in the chain must resolve to a COMPILED-IN auth module (only `tokens`
+        // today, and only when the `auth-tokens` feature is on). An unknown OR uncompiled name is a
+        // hard boot error — never a silently-dropped module (which would silently open the relay).
+        for name in &auth.chain {
+            let available = name == "tokens" && cfg!(feature = "auth-tokens");
+            if !available {
+                if name == "tokens" {
+                    // `--no-default-features` (compliance build): tokens auth is absent.
                     errors.push(
-                        "auth.mode is 'token' but no client_tokens are configured; token mode requires at least one client token (otherwise every request is rejected)".to_string(),
+                        "auth.chain names 'tokens' but this binary was built WITHOUT the \
+                         `auth-tokens` feature — the token auth module is absent from the binary. \
+                         Rebuild with default features, or configure a different auth module."
+                            .to_string(),
                     );
+                } else {
+                    errors.push(format!(
+                        "auth.chain names unknown module '{name}': the only built-in auth module is \
+                         'tokens' (external modules are added at compile time)"
+                    ));
                 }
             }
-            // Passthrough carries no token-allowlist requirement, but a configured upstream key on a
-            // passthrough provider is a MISCONFIGURATION worth flagging. forward.rs selects the upstream
-            // key as `caller_token.unwrap_or("")`: an UNAUTHENTICATED caller in passthrough mode
-            // forwards an EMPTY credential (the provider returns 401/403 attributed to the caller), NOT
-            // busbar's configured lane key. A passthrough deployment is meant to forward the CALLER's
-            // credential, never a configured one — so a provider whose `api_key_env` resolves to a
-            // NON-EMPTY value is a config smell (a key busbar will never use on this provider).
-            //
-            // We WARN (not hard-reject): a legit Bedrock-ingress passthrough provider authenticates
-            // per-request with SigV4 from the AWS credential chain, so its `api_key_env` normally
-            // resolves EMPTY and never trips this — but an operator may also have a deliberate
-            // static-key fallback provider, and rejecting would break that. Mirror main.rs's
-            // single env read (`std::env::var(api_key_env)`) so the guard sees the SAME value the
-            // lane will, and surface a prominent boot warning naming each offending provider. The
-            // resolved `_legacy_api_key` is always None (config::resolve discards+warns on it), so
-            // `api_key_env` is the only key source to check.
-            crate::auth::AuthMode::Passthrough => {
-                for (provider_name, provider_cfg) in &cfg.providers {
-                    let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
-                    if !resolved_key.trim().is_empty() {
-                        tracing::warn!(
-                            provider = %provider_name,
-                            api_key_env = %provider_cfg.api_key_env,
-                            "auth.mode=passthrough with a NON-EMPTY configured api_key for this \
-                             provider is a credential-leak risk: in passthrough mode an \
-                             UNAUTHENTICATED caller (no token) has busbar's OWN configured lane key \
-                             substituted upstream (caller_token.unwrap_or(lane.api_key)), forwarding \
-                             your secret on the caller's behalf. A passthrough deployment should \
-                             forward the CALLER credential, never a configured one. Unset the \
-                             environment variable named by api_key_env (Bedrock-ingress passthrough \
-                             signs per-request via SigV4 and needs no static key), or switch to \
-                             auth.mode=token to gate callers."
-                        );
-                    }
-                }
-            }
-            crate::auth::AuthMode::None => {
-                // mode=none is an open relay: `validate_token` admits every request unconditionally,
-                // so a configured `client_tokens` allowlist has ZERO enforcement effect. An operator
-                // who set BOTH `mode: none` and a `client_tokens` list believes the list constrains
-                // access while the server is wide open. This is not a hard boot error (none mode is
-                // intentionally permissive and may be deliberate in dev), but it MUST be loud — warn
-                // here at boot (config-visible) in addition to the runtime warning AuthMiddleware::new
-                // emits. NB: this is a no-op when no tokens are listed (the common none-mode case).
-                if !effective_client_tokens_empty(auth) {
+        }
+        let chain_has_tokens = auth.chain.iter().any(|n| n == "tokens");
+
+        // `tokens` in the chain with no client_tokens rejects 100% of requests with no startup signal
+        // — the locked-out mirror of the loudly-warned open-relay (empty chain) case.
+        if chain_has_tokens && effective_client_tokens_empty(auth) {
+            errors.push(
+                "auth.chain includes 'tokens' but no client_tokens are configured; the tokens module requires at least one client token (otherwise every request is rejected)".to_string(),
+            );
+        }
+
+        // An empty chain is an open relay: it admits every request unconditionally, so a configured
+        // `client_tokens` allowlist has ZERO enforcement effect. Not a hard error (an empty chain may
+        // be a deliberate dev open-relay), but it MUST be loud. No-op when no tokens are listed.
+        if auth.chain.is_empty() && !effective_client_tokens_empty(auth) {
+            tracing::warn!(
+                "auth.chain is empty (open relay) but client_tokens are configured: an empty chain \
+                 admits every request regardless of token, so the allowlist has no enforcement \
+                 effect. Add 'tokens' to auth.chain to enforce it."
+            );
+        }
+
+        // `upstream_credentials: passthrough` with a NON-EMPTY configured api_key on a provider is a
+        // credential-leak risk: forward.rs selects the upstream key as `caller_token.unwrap_or("")`,
+        // so an UNAUTHENTICATED caller forwards an EMPTY credential (the provider 401/403s the
+        // caller), NOT busbar's configured lane key — but a non-empty configured key means busbar's
+        // OWN secret gets substituted upstream on the caller's behalf. WARN (not hard-reject): a
+        // legit Bedrock-ingress passthrough provider signs per-request via SigV4 and resolves EMPTY
+        // here, and a deliberate static-key fallback provider is valid too.
+        if auth.upstream_credentials == crate::auth::UpstreamCreds::Passthrough {
+            for (provider_name, provider_cfg) in &cfg.providers {
+                let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
+                if !resolved_key.trim().is_empty() {
                     tracing::warn!(
-                        "auth.mode=none ignores the configured client_tokens: None mode is an open \
-                         relay that admits every request regardless of token, so the allowlist has \
-                         no enforcement effect. Set auth.mode=token to enforce it."
+                        provider = %provider_name,
+                        api_key_env = %provider_cfg.api_key_env,
+                        "upstream_credentials: passthrough with a NON-EMPTY configured api_key for \
+                         this provider is a credential-leak risk: an UNAUTHENTICATED caller has \
+                         busbar's OWN configured lane key substituted upstream \
+                         (caller_token.unwrap_or(lane.api_key)), forwarding your secret on the \
+                         caller's behalf. Passthrough should forward the CALLER credential, never a \
+                         configured one. Unset the environment variable named by api_key_env \
+                         (Bedrock-ingress passthrough signs per-request via SigV4 and needs no static \
+                         key), or use upstream_credentials: own to gate callers with an auth chain."
                     );
                 }
             }
@@ -924,6 +1153,21 @@ pub(crate) fn validate_governance(
     auth: Option<&crate::config::AuthCfg>,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+    // A configured admin token with the `admin-tokens` module compiled OUT would silently disable
+    // the admin API (the chain all-Passes) — a silent lockout must be a loud boot error instead.
+    #[cfg(not(feature = "auth-admin-tokens"))]
+    if governance
+        .admin_token
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+    {
+        errors.push(
+            "governance.admin_token is configured but this binary was built WITHOUT the \
+             `auth-admin-tokens` feature — the admin API would be silently disabled. Rebuild with \
+             default features or wire an external admin auth module."
+                .to_string(),
+        );
+    }
     if governance.enabled
         && governance
             .admin_token
@@ -954,9 +1198,11 @@ pub(crate) fn validate_governance(
              price_per_request_cents."
         );
     }
-    if governance.enabled && auth.is_some_and(|a| a.mode == crate::auth::AuthMode::Passthrough) {
+    if governance.enabled
+        && auth.is_some_and(|a| a.upstream_credentials == crate::auth::UpstreamCreds::Passthrough)
+    {
         errors.push(
-            "governance.enabled is true together with auth.mode=passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; set auth.mode=token (or omit the auth block) alongside governance.".to_string(),
+            "governance.enabled is true together with upstream_credentials: passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; use upstream_credentials: own (with an auth chain, or omit the auth block) alongside governance.".to_string(),
         );
     }
     // A 0 sweep interval would disable the rate-map's idle-entry eviction sweep entirely — it rides on
@@ -1058,12 +1304,25 @@ fn percent_decode_host(host: &str) -> String {
 /// reason over the EXACT host the connecting stack will, so neither can be bypassed by an authority
 /// trick (backslash, userinfo flip, percent-encoded dots, trailing dot) that only one of them
 /// normalized away.
+/// `url`'s scheme equals `scheme`, compared CASE-INSENSITIVELY per RFC 3986 §3.1 — the same guard
+/// `observability::scheme_is` uses for webhook URLs. A raw `starts_with("https://")` rejects the
+/// valid uppercase spelling `HTTPS://host/` that reqwest's `Url::parse` lowercases and accepts, so
+/// the provider base_url scheme check must match the webhook guard's case-insensitivity. (audit c2r5.)
+fn scheme_is(url: &str, scheme: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case(scheme))
+}
+
+/// Strip an `http`/`https` scheme case-insensitively, returning the authority+path remainder.
+fn strip_scheme(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once("://")?;
+    (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")).then_some(rest)
+}
+
 fn extract_normalized_host(url: &str) -> Option<String> {
-    // Strip the scheme. The host extraction is scheme-agnostic; accept either prefix so an
-    // `http://` upstream is still run through the metadata block.
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
+    // Strip the scheme (case-insensitively — see `scheme_is`). The host extraction is
+    // scheme-agnostic; accept either prefix so an `http://` upstream is still metadata-checked.
+    let rest = strip_scheme(url)?;
     // Normalize backslashes to forward slashes BEFORE splitting the authority. `https` is a WHATWG
     // "special" scheme, so reqwest's `url` crate converts every `\` to `/` while parsing — meaning a
     // `base_url` like `https://10.0.0.1\x.allowed.com` is parsed by reqwest with authority `10.0.0.1`
@@ -1508,6 +1767,10 @@ mod tests {
             providers,
             models,
             pools,
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             blocked_metadata_hosts: Vec::new(),
             allow_metadata_hosts: Vec::new(),
             allow_all_metadata: false,
@@ -1546,6 +1809,7 @@ mod tests {
     fn make_model(provider: &str, max_concurrent: usize) -> config::ModelCfg {
         config::ModelCfg {
             reasoning: None,
+            prompt_caching: None,
             max_requests: -1,
             provider: provider.into(),
             max_concurrent,
@@ -1562,8 +1826,9 @@ mod tests {
             failover: None,
             on_exhausted: None,
             affinity: None,
-            route: config::RouteKind::default(),
-            policy: None,
+            policy: config::PoolPolicy::default(),
+            gates: Vec::new(),
+            base_named: false,
         }
     }
 
@@ -2028,10 +2293,19 @@ mod tests {
     }
 
     fn make_auth(mode: &str, client_tokens: Vec<&str>) -> config::AuthCfg {
+        // Map the legacy mode string onto the 1.3 chain/upstream shape: token -> chain [tokens];
+        // none -> empty chain; passthrough -> empty chain + upstream passthrough.
+        let (chain, upstream): (Vec<String>, crate::auth::UpstreamCreds) = match mode {
+            "token" => (vec!["tokens".to_string()], crate::auth::UpstreamCreds::Own),
+            "none" => (vec![], crate::auth::UpstreamCreds::Own),
+            "passthrough" => (vec![], crate::auth::UpstreamCreds::Passthrough),
+            other => panic!("invalid auth mode in test: {other}"),
+        };
         config::AuthCfg {
-            mode: crate::auth::AuthMode::from_config_str(mode)
-                .unwrap_or_else(|| panic!("invalid auth mode in test: {mode}")),
+            chain,
+            upstream_credentials: upstream,
             client_tokens: client_tokens.into_iter().map(|s| s.to_string()).collect(),
+            modules: std::collections::HashMap::new(),
         }
     }
 
@@ -2663,6 +2937,41 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_bad_module_scope_and_group_map_scope() {
+        // Both scope-token rules: a typo'd `auth.modules.<m>.max_admin_scope` and a typo'd
+        // `group_map.<g>.admin_scope` each fail loud at boot, naming the offender.
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        let mut auth = config::AuthCfg::default_none();
+        auth.modules.insert(
+            "corp-ad".to_string(),
+            config::AuthModuleCfg {
+                allowed_groups: Some(vec!["llm-users".to_string()]),
+                max_admin_scope: Some("superuser".to_string()), // typo
+            },
+        );
+        cfg.auth = Some(auth);
+        cfg.group_map.insert(
+            "viewers".to_string(),
+            config::GroupMapEntry {
+                admin_scope: Some("readonly".to_string()), // typo (it's read-only)
+                ..Default::default()
+            },
+        );
+        let errs = validate(&cfg).expect_err("typo'd scope tokens must fail validation");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("auth.modules 'corp-ad'") && e.contains("superuser")),
+            "expected the max_admin_scope error; got: {errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("group_map 'viewers'") && e.contains("readonly")),
+            "expected the group_map scope error; got: {errs:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_accepts_known_failover_exclusion() {
         // An exclusion that names a real member of the pool is the supported case and must validate.
         let (mut providers, mut models, _) = valid_maps();
@@ -2713,6 +3022,8 @@ mod tests {
         }
     }
 
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_validate_governance_rejects_whitespace_only_admin_token() {
         // Regression (LOW #21): a WHITESPACE-ONLY admin_token (" ", "\t", "\n") passes a bare
@@ -2760,6 +3071,25 @@ mod tests {
         );
     }
 
+    /// FEATURELESS counterpart: a configured admin token in a binary WITHOUT the `admin-tokens`
+    /// module is a loud boot error (a silently-disabled admin API is a lockout, never acceptable).
+    #[cfg(not(feature = "auth-admin-tokens"))]
+    #[test]
+    fn test_validate_governance_rejects_admin_token_without_module() {
+        let gov = crate::config::GovernanceCfg {
+            enabled: true,
+            admin_token: Some("tok".to_string()),
+            ..Default::default()
+        };
+        let errs = validate_governance(&gov, None).expect_err("must be a boot error");
+        assert!(
+            errs.iter().any(|e| e.contains("auth-admin-tokens")),
+            "{errs:?}"
+        );
+    }
+
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_validate_governance_ok_when_enabled_with_admin_token() {
         let gov = config::GovernanceCfg {
@@ -2820,21 +3150,29 @@ mod tests {
     }
 
     fn auth_cfg(mode: &str) -> config::AuthCfg {
+        let (chain, upstream): (Vec<String>, crate::auth::UpstreamCreds) = match mode {
+            "token" => (vec!["tokens".to_string()], crate::auth::UpstreamCreds::Own),
+            "none" => (vec![], crate::auth::UpstreamCreds::Own),
+            "passthrough" => (vec![], crate::auth::UpstreamCreds::Passthrough),
+            other => panic!("invalid auth mode in test: {other}"),
+        };
         config::AuthCfg {
-            mode: crate::auth::AuthMode::from_config_str(mode)
-                .unwrap_or_else(|| panic!("invalid auth mode in test: {mode}")),
+            chain,
+            upstream_credentials: upstream,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         }
     }
 
     #[test]
     fn test_validate_governance_rejects_passthrough_combination() {
-        // Regression: governance.enabled + auth.mode=passthrough is a self-contradictory deployment.
+        // Regression: governance.enabled + upstream_credentials: passthrough is self-contradictory.
         // Governance supersedes passthrough (every request must resolve to an enabled virtual key),
         // so an operator who believes they are in passthrough silently rejects every caller lacking
         // a virtual key — a behaviour inversion that must fail loud at boot, not pass to a runtime
-        // warning. Case-insensitive / whitespace-tolerant, matching AuthMode::from_config_str.
-        for mode in ["passthrough", "  PassThrough "] {
+        // warning.
+        {
+            let mode = "passthrough";
             let gov = config::GovernanceCfg {
                 enabled: true,
                 db_path: "busbar-governance.db".to_string(),
@@ -2849,12 +3187,15 @@ mod tests {
                 .expect_err("governance + passthrough must be rejected at boot");
             assert!(
                 errs.iter()
-                    .any(|e| e.contains("auth.mode=passthrough") && e.contains("governance")),
+                    .any(|e| e.contains("upstream_credentials: passthrough")
+                        && e.contains("governance")),
                 "expected a governance+passthrough rejection for mode {mode:?}; got: {errs:?}"
             );
         }
     }
 
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_validate_governance_allows_token_and_none_modes() {
         // governance + auth.mode=token (or none) is the supported pairing and must NOT be rejected
@@ -2905,11 +3246,12 @@ mod tests {
         let errs = validate(&cfg).expect_err("token mode with no tokens must fail validation");
         assert!(
             errs.iter()
-                .any(|e| e.contains("token mode requires at least one client token")),
+                .any(|e| e.contains("the tokens module requires at least one client token")),
             "expected a token-mode lockout error; got: {errs:?}"
         );
     }
 
+    #[cfg(feature = "auth-tokens")]
     #[test]
     fn test_validate_token_mode_with_tokens_ok() {
         // The allowlist form satisfies the requirement (the legacy single-token form was removed in
@@ -3866,6 +4208,50 @@ models:
         );
     }
 
+    /// REGRESSION (audit c2r5): the provider `base_url` scheme check is CASE-INSENSITIVE (RFC 3986
+    /// §3.1) — an uppercase `HTTPS://` (which reqwest lowercases and accepts) must validate, not be
+    /// rejected with a misleading "must use http or https". Mirrors the webhook guard's `scheme_is`.
+    #[test]
+    fn test_validate_accepts_uppercase_url_scheme() {
+        let (mut providers, models, _) = valid_maps();
+        // Point an existing provider at an uppercase-scheme https URL.
+        if let Some((_, p)) = providers.iter_mut().next() {
+            p.base_url = "HTTPS://api.example.com".to_string();
+        }
+        let cfg = make_root_cfg(providers, models, HashMap::new());
+        assert!(
+            validate(&cfg).is_ok(),
+            "an uppercase HTTPS:// scheme is RFC-valid and must not be rejected: {:?}",
+            validate(&cfg)
+        );
+        // The scheme helper itself is case-insensitive and anchored on `://`.
+        assert!(scheme_is("HTTPS://h", "https"));
+        assert!(scheme_is("Http://h", "http"));
+        assert!(!scheme_is("httpsx://h", "https"));
+    }
+
+    /// REGRESSION (audit c2r3): an EMPTY `affinity.header_name` must be REJECTED at boot. It passes
+    /// the ASCII + length checks but silently disables session affinity at runtime
+    /// (`headers.get("")` is always None) — the exact silent-disable the validator's comment promises
+    /// to catch.
+    #[test]
+    fn test_validate_rejects_empty_affinity_header_name() {
+        let (providers, models, _) = valid_maps();
+        let mut pools = HashMap::new();
+        let mut pool = make_pool(vec![make_member("mymodel")]);
+        pool.affinity = Some(config::AffinityCfg {
+            mode: config::AffinityMode::Session,
+            header_name: Some(String::new()),
+        });
+        pools.insert("mypool".to_string(), pool);
+        let cfg = make_root_cfg(providers, models, pools);
+        let err = validate(&cfg).expect_err("empty header_name must be rejected");
+        assert!(
+            err.iter().any(|e| e.contains("must not be empty")),
+            "the error must name the empty-header-name problem: {err:?}"
+        );
+    }
+
     #[test]
     fn test_pool_member_model_with_unresolvable_provider_is_not_unknown_model() {
         // A pool member that names a model which IS defined, but whose provider does not resolve,
@@ -3965,21 +4351,284 @@ models:
         let mut models = HashMap::new();
         models.insert("m1".to_string(), make_model("prov", 4));
         let mut pool = make_pool(vec![make_member("m1")]);
-        pool.route = config::RouteKind::Webhook;
-        pool.policy = Some(config::PolicyCfg {
-            url: url.map(str::to_string),
-            socket: None,
-            timeout_ms: 150,
-            on_error: config::PolicyOnError::default(),
-            send_prompt: false,
-            send_user: false,
-            script: None,
-            script_file: None,
-            name: None,
-        });
+        pool.gates = vec!["h".to_string()];
         let mut pools = HashMap::new();
         pools.insert("p1".to_string(), pool);
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert("h".to_string(), gate_hook(None, url, 150));
+        cfg
+    }
+
+    /// A gate `HookCfg` with the given socket/webhook transport (test builder).
+    fn gate_hook(socket: Option<&str>, webhook: Option<&str>, timeout_ms: u64) -> config::HookCfg {
+        config::HookCfg {
+            kind: config::HookKind::Gate,
+            socket: socket.map(str::to_string),
+            webhook: webhook.map(str::to_string),
+            timeout_ms,
+            on_error: "weighted".to_string(),
+            prompt: config::PromptAccess::No,
+            user: config::UserAccess::No,
+            priority: 0,
+            at: None,
+            settings: serde_json::Map::new(),
+            on_empty: None,
+            global: false,
+            default: false,
+        }
+    }
+
+    /// A minimal valid RootCfg with an empty hooks registry (for on_error chain tests).
+    fn hooks_test_cfg() -> RootCfg {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
         make_root_cfg(providers, models, pools)
+    }
+
+    /// `on_error` naming an unknown fallback is a boot error (chains resolve against the registry).
+    #[test]
+    fn test_hook_on_error_unknown_name_rejected() {
+        let mut cfg = hooks_test_cfg();
+        let mut h = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        h.on_error = "nonexistent".to_string();
+        cfg.hooks.insert("a".to_string(), h);
+        let errs = validate(&cfg).expect_err("an unknown on_error name must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("unknown fallback 'nonexistent'")),
+            "{errs:?}"
+        );
+    }
+
+    /// `on_error` naming a TAP is a boot error (a fallback must decide; a tap only observes).
+    #[test]
+    fn test_hook_on_error_tap_fallback_rejected() {
+        let mut cfg = hooks_test_cfg();
+        let mut gate = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        gate.on_error = "watcher".to_string();
+        let mut tap = gate_hook(Some("/run/busbar/t.sock"), None, 150);
+        tap.kind = config::HookKind::Tap;
+        cfg.hooks.insert("a".to_string(), gate);
+        cfg.hooks.insert("watcher".to_string(), tap);
+        let errs = validate(&cfg).expect_err("a tap fallback must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("fallback 'watcher' is a tap")),
+            "{errs:?}"
+        );
+    }
+
+    /// An on_error CYCLE (including a self-reference) is a boot error — every chain must terminate.
+    #[test]
+    fn test_hook_on_error_cycle_rejected() {
+        // a -> b -> a
+        let mut cfg = hooks_test_cfg();
+        let mut a = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        a.on_error = "b".to_string();
+        let mut b = gate_hook(Some("/run/busbar/b.sock"), None, 150);
+        b.on_error = "a".to_string();
+        cfg.hooks.insert("a".to_string(), a);
+        cfg.hooks.insert("b".to_string(), b);
+        let errs = validate(&cfg).expect_err("an on_error cycle must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("does not terminate")),
+            "{errs:?}"
+        );
+
+        // self-reference
+        let mut cfg = hooks_test_cfg();
+        let mut selfy = gate_hook(Some("/run/busbar/s.sock"), None, 150);
+        selfy.on_error = "s".to_string();
+        cfg.hooks.insert("s".to_string(), selfy);
+        let errs = validate(&cfg).expect_err("a self-referencing on_error must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("does not terminate")),
+            "{errs:?}"
+        );
+    }
+
+    /// A terminating gate chain (a -> b -> weighted) and a strategy fallback are both accepted.
+    #[test]
+    fn test_hook_on_error_terminating_chain_ok() {
+        let mut cfg = hooks_test_cfg();
+        let mut a = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        a.on_error = "b".to_string();
+        let b = gate_hook(Some("/run/busbar/b.sock"), None, 150); // on_error: weighted
+        cfg.hooks.insert("a".to_string(), a);
+        cfg.hooks.insert("b".to_string(), b);
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("on_error")),
+                "a terminating chain must not trip the on_error rule; got: {errs:?}"
+            );
+        }
+
+        // A ranking-strategy fallback terminates the chain when the plugin is compiled in; when it
+        // is compiled out, naming one is a boot error (compliance-by-compilation).
+        let mut cfg = hooks_test_cfg();
+        let mut c = gate_hook(Some("/run/busbar/c.sock"), None, 150);
+        c.on_error = "cheapest".to_string();
+        cfg.hooks.insert("c".to_string(), c);
+        let result = validate(&cfg);
+        #[cfg(feature = "hooks-ranking")]
+        if let Err(errs) = result {
+            assert!(
+                !errs.iter().any(|e| e.contains("on_error")),
+                "a strategy fallback must be accepted when compiled in; got: {errs:?}"
+            );
+        }
+        #[cfg(not(feature = "hooks-ranking"))]
+        {
+            let errs = result.expect_err("a strategy fallback without the plugin must be rejected");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("WITHOUT the `hooks-ranking` feature")),
+                "{errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_reserved_name_rejected() {
+        // A hook cannot reuse a built-in's name (ranking strategy or auth module) — registry name
+        // uniqueness. Each reserved name, defined as a valid gate hook, must be rejected by name.
+        for reserved in [
+            "weighted",
+            "cheapest",
+            "fastest",
+            "least_busy",
+            "usage",
+            "tokens",
+            "admin-tokens",
+        ] {
+            let mut providers = HashMap::new();
+            providers.insert(
+                "prov".to_string(),
+                make_provider("anthropic", "https://api.example.com", "API_KEY"),
+            );
+            let mut models = HashMap::new();
+            models.insert("m1".to_string(), make_model("prov", 4));
+            let pools = {
+                let mut p = HashMap::new();
+                p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+                p
+            };
+            let mut cfg = make_root_cfg(providers, models, pools);
+            cfg.hooks.insert(
+                reserved.to_string(),
+                gate_hook(Some("/run/busbar/h.sock"), None, 150),
+            );
+            let errs = validate(&cfg).expect_err("a reserved hook name must be rejected");
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(&format!("hook '{reserved}'")) && e.contains("reserved")),
+                "reserved hook name '{reserved}' must be rejected by name; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_at_most_one_default() {
+        // Two hooks claiming `default: true` is a boot error naming both; one (or zero) is fine.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        let mut two = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+        two.default = true;
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert("rank_a".to_string(), two.clone());
+        cfg.hooks.insert("rank_b".to_string(), two);
+        let errs = validate(&cfg).expect_err("two defaults must be rejected");
+        assert!(
+            errs.iter().any(|e| e.contains("default: true")
+                && e.contains("rank_a")
+                && e.contains("rank_b")),
+            "the error must name both offending defaults; got: {errs:?}"
+        );
+
+        // Exactly one default is accepted (no default-rule error).
+        cfg.hooks.remove("rank_b");
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("more than one hook sets")),
+                "a single default must not trip the at-most-one rule; got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_default_on_tap_rejected() {
+        // `default: true` on a tap is meaningless (a tap never orders) → boot error.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        let mut tap = gate_hook(Some("/run/busbar/t.sock"), None, 150);
+        tap.kind = config::HookKind::Tap;
+        tap.default = true;
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert("watcher".to_string(), tap);
+        let errs = validate(&cfg).expect_err("default tap must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("watcher") && e.contains("default") && e.contains("tap")),
+            "error must name the default tap; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_hook_nonreserved_name_ok() {
+        // A normal hook name is NOT flagged by the reserved-name rule.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "prov".to_string(),
+            make_provider("anthropic", "https://api.example.com", "API_KEY"),
+        );
+        let mut models = HashMap::new();
+        models.insert("m1".to_string(), make_model("prov", 4));
+        let pools = {
+            let mut p = HashMap::new();
+            p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
+            p
+        };
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks.insert(
+            "headroom".to_string(),
+            gate_hook(Some("/run/busbar/h.sock"), None, 150),
+        );
+        if let Err(errs) = validate(&cfg) {
+            assert!(
+                !errs.iter().any(|e| e.contains("reserved")),
+                "a non-reserved hook name must not trip the reserved-name rule; got: {errs:?}"
+            );
+        }
     }
 
     #[test]
@@ -3996,7 +4645,9 @@ models:
             let res = validate(&cfg);
             if let Err(errs) = res {
                 assert!(
-                    !errs.iter().any(|e| e.contains("route: webhook")),
+                    !errs
+                        .iter()
+                        .any(|e| e.contains("hook 'h'") && e.contains("webhook")),
                     "loopback sidecar '{ok}' must pass the routing-webhook guard; got: {errs:?}"
                 );
             }
@@ -4018,7 +4669,7 @@ models:
                 .unwrap_err_or_default(format!("'{bad}' must fail routing-webhook validation"));
             assert!(
                 errs.iter()
-                    .any(|e| e.contains("p1") && e.contains("route: webhook")),
+                    .any(|e| e.contains("hook 'h'") && e.contains("webhook")),
                 "internal/plaintext target '{bad}' must be rejected; got: {errs:?}"
             );
         }
@@ -4029,11 +4680,11 @@ models:
         // A `route: webhook` pool with no `policy.url` is a misconfiguration caught at startup.
         let cfg = webhook_pool_cfg(None);
         let errs = validate(&cfg)
-            .unwrap_err_or_default("missing policy.url must fail validation".to_string());
+            .unwrap_err_or_default("missing webhook transport must fail validation".to_string());
         assert!(
             errs.iter()
-                .any(|e| e.contains("route: webhook") && e.contains("required")),
-            "missing url must be reported; got: {errs:?}"
+                .any(|e| e.contains("hook 'h'") && e.contains("no transport")),
+            "a hook with no transport must be reported; got: {errs:?}"
         );
     }
 
@@ -4049,21 +4700,13 @@ models:
         let mut models = HashMap::new();
         models.insert("m1".to_string(), make_model("prov", 4));
         let mut pool = make_pool(vec![make_member("m1")]);
-        pool.route = config::RouteKind::Socket;
-        pool.policy = Some(config::PolicyCfg {
-            url: None,
-            socket: socket.map(str::to_string),
-            timeout_ms: 150,
-            on_error: config::PolicyOnError::default(),
-            send_prompt: false,
-            send_user: false,
-            script: None,
-            script_file: None,
-            name: None,
-        });
+        pool.gates = vec!["h".to_string()];
         let mut pools = HashMap::new();
         pools.insert("p1".to_string(), pool);
-        make_root_cfg(providers, models, pools)
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.hooks
+            .insert("h".to_string(), gate_hook(socket, None, 150));
+        cfg
     }
 
     /// `route: socket` with a valid absolute path passes the socket rule (the socket FILE need not
@@ -4076,7 +4719,7 @@ models:
             assert!(
                 !errs
                     .iter()
-                    .any(|e| e.contains("route: socket") || e.contains("policy.socket")),
+                    .any(|e| e.contains("hook 'h'") && e.contains("socket")),
                 "an absolute socket path must pass the socket rule; got: {errs:?}"
             );
         }
@@ -4089,10 +4732,10 @@ models:
         for missing in [None, Some("")] {
             let cfg = socket_pool_cfg(missing);
             let errs = validate(&cfg)
-                .unwrap_err_or_default("missing policy.socket must fail validation".to_string());
+                .unwrap_err_or_default("missing socket transport must fail validation".to_string());
             assert!(
                 errs.iter()
-                    .any(|e| e.contains("route: socket") && e.contains("requires policy.socket")),
+                    .any(|e| e.contains("hook 'h'") && e.contains("no transport")),
                 "missing/empty socket path must be reported; got: {errs:?}"
             );
         }
@@ -4104,10 +4747,10 @@ models:
     fn test_socket_route_rejects_relative_path() {
         let cfg = socket_pool_cfg(Some("run/hook.sock"));
         let errs = validate(&cfg)
-            .unwrap_err_or_default("relative policy.socket must fail validation".to_string());
+            .unwrap_err_or_default("relative socket path must fail validation".to_string());
         assert!(
             errs.iter()
-                .any(|e| e.contains("policy.socket") && e.contains("absolute")),
+                .any(|e| e.contains("hook 'h'") && e.contains("absolute")),
             "relative socket path must be reported; got: {errs:?}"
         );
     }

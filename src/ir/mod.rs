@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The superset intermediate representation (IR) — request and response/stream sides — that every
 //! protocol's Reader/Writer maps to and from, so any ingress protocol can reach any backend

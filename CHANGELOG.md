@@ -9,7 +9,7 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
-## [Unreleased]
+## [1.3.0], 2026-07-13
 
 The API release. Everything you could only do by editing YAML and restarting, you can now do
 over an authenticated, audited API. And the routing hook grew into a hook system: gates,
@@ -17,7 +17,7 @@ taps, and routes, on every request.
 
 This release reshapes how hooks and policies are configured. Hooks are now defined once by
 name and referenced everywhere; the old inline `policy:` block and transport-named `route:`
-values are replaced. **Existing configs need a one-time update** — see the 1.2.x → 1.3
+values are replaced. **Existing configs need a one-time update**; see the 1.2.x → 1.3
 migration guide. The change is a clean cut with no silent fallbacks: an old-form key reports a
 clear startup error telling you exactly what to write instead.
 
@@ -32,14 +32,18 @@ clear startup error telling you exactly what to write instead.
   both human-readable, so "who set this" is always answerable.
 - **Admin audit log.** Every admin mutation is recorded: who changed what, when. Scoped admin
   tokens let you mint credentials that can, for example, only register hooks or only read.
-- **Named hooks.** Define a hook once under `hooks:`, reference it anywhere: `route:
-  my-router` on a pool, or `global_hooks:` to run on every request. The old `route: socket` +
-  `policy:` form still works and now just sugars into a named hook.
+- **Named hooks.** Define a hook once under `hooks:`, reference it anywhere: in a pool's
+  `hooks: [...]` list, or via `global_hooks:` to run on every request. One list carries both
+  jobs: a pool names its ranking strategy (weighted, cheapest, fastest, least_busy, usage)
+  and any gates together, e.g. `hooks: [cheapest, pii-guard]`. The old `route:` values and the
+  inline `policy:` block are removed; an old-form key is a clear startup error naming its
+  replacement (a clean cut, no silent fallback). See the 1.2.x → 1.3 migration guide
+  (`docs/migration-1.3.md`).
 - **Gates and taps.** A `gate` is a blocking hook that can reject a request or restrict which
   pool members may serve it; a `tap` is fire-and-forget observation (request, route,
   per-attempt, and completion stages) that can never delay or fail a request. Routes rank,
   gates decide, taps watch.
-- **The restrict verb.** A gate can reply "only members carrying these tags may serve this" —
+- **The restrict verb.** A gate can reply "only members carrying these tags may serve this":
   compliance-constrained routing (data residency, BAA-only lanes) without teaching your
   router about compliance. Restrictions hold across failover.
 - **Concurrent hooks.** All of a request's hooks fire at once, so added latency is the
@@ -47,24 +51,47 @@ clear startup error telling you exactly what to write instead.
   survives.
 - **Pluggable auth.** Authentication is now an ordered chain of modules: each module
   identifies the caller, rejects, or passes to the next. Today's token auth is the first
-  module and the default — and it is removable: list only your own module and tokens are
+  module and the default. And it is removable: list only your own module and tokens are
   gone. External modules speak the same hook transports; validated identities are cached
   (with instant admin flush), and auth always fails closed. Budgets, rate limits, pool
   access, and audit all follow the authenticated principal, whoever issued it.
 - **Admin API lockdown.** The admin API authenticates through its own pluggable chain, with
   scoped principals (read-only, hooks-register, full) replacing the single shared admin
-  token, and every mutation in the audit log attributed to the person who made it.
+  token, and every mutation in the audit log attributed to the person who made it. The chain
+  itself is live-mutable (`PUT /admin/v1/auth`) and guarded so a change that would lock the
+  caller out is refused instead of applied.
+- **The rewrite verb.** A trusted gate (`prompt: rw`) can replace the request body before
+  dispatch, context compression and redaction, across all six protocols at once, because it
+  fires on the normalized form. Rewrites persist across failover, token accounting uses the
+  rewritten body (the savings are real and measured), and a malformed or slow rewrite proceeds
+  with the original body untouched; a broken compressor can never corrupt a request.
+- **Live hook settings.** Push a settings map to a running hook over the admin API; the change
+  commits only when the hook acknowledges it, and a restarted hook always receives its current
+  settings before any traffic. Hooks can also describe their own settings schema, served
+  verbatim by the API.
+- **Config reload, and health that survives everything.** `POST /admin/v1/config/reload`
+  re-reads your config files and applies them atomically, and lane health (circuit breakers,
+  cooldowns, learned latency) is carried across by model identity, not list position, so a
+  reorder or an added model never resets what Busbar has learned. The same health state now
+  persists across restarts too: kill Busbar, fix the config, start it again. Sub-second, and
+  it comes back remembering which lanes were misbehaving. `--safe-mode` boots from your base
+  config alone when an API-applied overlay is the problem.
+- **Group-based governance.** Map identity-provider groups to authority in one place:
+  `group_map:` grants admin scopes and data-plane access (allowed pools, rate limits, budgets)
+  to groups, and a group-mapped user is governed by exactly the machinery a virtual key uses.
+  Per-module caps bound what any auth module can assert: an allowlist of groups it may claim,
+  and a ceiling on the admin scope obtainable through it.
 
 ### Changed
 
-- Completion telemetry now carries usage for every operation type — chat tokens, embeddings,
-  images, audio, rerank — plus a request id that correlates a request across hook stages.
+- Completion telemetry now carries usage for every operation type (chat tokens, embeddings,
+  images, audio, rerank) plus a request id that correlates a request across hook stages.
 
 ### Removed
 
 - **The inline `policy:` block and transport-named `route:` values.** A pool's `route:` now
   takes a hook name (defined once under `hooks:`) or a native policy name
-  (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`) — the old `route: socket` /
+  (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`); the old `route: socket` /
   `route: webhook` + `policy:` form is replaced. Each removed key reports a startup error with
   the exact replacement. See the migration guide.
 - **The embedded Rhai script routing policy (`route: script`).** Available only behind an

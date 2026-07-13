@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The protocol seam: a protocol-agnostic core, with each wire dialect's specifics confined to a
 //! `Reader` (wire → signal/IR) and a `Writer` (IR/intent → wire). `Protocol` bundles a Reader and
@@ -305,12 +305,13 @@ pub(crate) struct SigningContext<'a> {
     pub(crate) body: &'a [u8],
     /// Unix epoch seconds at signing time.
     pub(crate) timestamp_epoch: u64,
-    /// The front-door auth mode for this request. Lets a writer resolve a credential whose scheme is
-    /// otherwise ambiguous (e.g. Anthropic's API-key-vs-Bearer choice) to the single native header
-    /// the mode implies — Passthrough forwards the caller's Bearer token; Token/None present the
+    /// The UPSTREAM-credential mode for this request. Lets a writer resolve a credential whose scheme
+    /// is otherwise ambiguous (e.g. Anthropic's API-key-vs-Bearer choice) to the single native header
+    /// the mode implies — `Passthrough` forwards the caller's Bearer token; `Own` presents the
     /// configured-key shape. Without it, an ambiguous credential must emit BOTH headers, which is an
-    /// upstream-distinguishability tell no native client produces.
-    pub(crate) auth_mode: crate::auth::AuthMode,
+    /// upstream-distinguishability tell no native client produces. (The upstream-credential concern,
+    /// split out of the front-door auth mode in slice 2d.)
+    pub(crate) upstream_creds: crate::auth::UpstreamCreds,
 }
 
 /// ProtocolWriter rewrites intents for the upstream wire format.
@@ -378,6 +379,20 @@ pub(crate) trait ProtocolWriter: Send + Sync {
     /// `DEFAULT_MAX_TOKENS`) so source-optional clients keep working across the translation
     /// boundary. Default: `false` (source-optional == target-optional).
     fn requires_max_tokens(&self) -> bool {
+        false
+    }
+
+    /// Whether this writer projects the IR's `cache_control` breakpoints into a native wire
+    /// marker that is MODEL-GATED — a schema key some deployed models hard-reject with a 400
+    /// (Bedrock's `cachePoint`: Claude accepts it, Amazon Nova rejects it as "extraneous key
+    /// [cachePoint] is not permitted"). When true, the cross-protocol seam clears the cache ask
+    /// unless the lane declares the `prompt_caching` capability — the same operator-asserted
+    /// posture as `reasoning`, so a translation can never 400 a model over a marker the caller's
+    /// dialect allowed. Writers whose cache form is universally accepted by their API (Anthropic
+    /// `cache_control`), or who emit no cache marker at all, keep the default `false` and need no
+    /// capability flag. Same-protocol passthrough never consults this (byte-identical proxying:
+    /// a caller speaking the egress dialect natively gets exactly what a direct call would).
+    fn cache_markers_model_gated(&self) -> bool {
         false
     }
 
@@ -2758,6 +2773,68 @@ mod tests {
                     .contains_key("cache_control"));
             }
         }
+    }
+
+    /// REGRESSION (found live, Claude Code → Nova on Bedrock): an Anthropic `cache_control`
+    /// breakpoint translated to a Bedrock `cachePoint` marker, which Amazon Nova hard-rejects
+    /// (400 "extraneous key [cachePoint] is not permitted"). Bedrock's marker is MODEL-gated, so
+    /// the seam must clear the cache ask unless the lane asserts `prompt_caching` — mirroring the
+    /// `reasoning` gate. With the flag, the marker flows (Claude-on-Bedrock keeps its caching).
+    #[test]
+    fn cache_breakpoints_gated_by_lane_capability_on_bedrock() {
+        let registry = ProtocolRegistry::with_builtins();
+        let anthropic = registry.get("anthropic").unwrap();
+        let bedrock = registry.get("bedrock").unwrap();
+        assert!(bedrock.writer().cache_markers_model_gated());
+        assert!(!anthropic.writer().cache_markers_model_gated());
+
+        let body = serde_json::json!({
+            "model": "claude", "max_tokens": 64,
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"},
+                       "cache_control": {"type": "ephemeral"}}]
+        });
+
+        let prep = |allowed: bool| crate::ir::variant::EgressPrep {
+            ingress_protocol: "anthropic",
+            egress_requires_max_tokens: false,
+            lane_default_max_tokens: None,
+            global_default_max_tokens: 4096,
+            reasoning_allowed: false,
+            reasoning_budgets: [1024, 4096, 8192, 16384],
+            prompt_caching_allowed: allowed,
+        };
+        let contains_cache_point =
+            |wire: &serde_json::Value| serde_json::to_string(wire).unwrap().contains("cachePoint");
+
+        // Lane WITHOUT the capability: every breakpoint cleared, no cachePoint on the wire.
+        let ir = anthropic.reader().read_request(&body).unwrap();
+        let mut req = crate::ir::variant::IrReq::Chat(ir);
+        req.prepare_for_egress(&prep(false));
+        let crate::ir::variant::IrReq::Chat(ir) = req else {
+            unreachable!()
+        };
+        let wire = bedrock.writer().write_request(&ir);
+        assert!(
+            !contains_cache_point(&wire),
+            "an unasserted lane must never receive a cachePoint (Nova 400s on it): {wire}"
+        );
+
+        // Lane WITH `prompt_caching: true`: the breakpoints project (Claude on Bedrock).
+        let ir = anthropic.reader().read_request(&body).unwrap();
+        let mut req = crate::ir::variant::IrReq::Chat(ir);
+        req.prepare_for_egress(&prep(true));
+        let crate::ir::variant::IrReq::Chat(ir) = req else {
+            unreachable!()
+        };
+        let wire = bedrock.writer().write_request(&ir);
+        assert!(
+            contains_cache_point(&wire),
+            "an asserted lane keeps its cache markers: {wire}"
+        );
     }
 
     #[test]

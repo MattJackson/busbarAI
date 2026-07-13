@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Bedrock Converse protocol reader/writer implementation.
 
@@ -1989,7 +1989,15 @@ impl super::StreamFraming for BedrockStreamFraming {
         // exactly-one-metadata invariant holds even against a hostile backend. A well-behaved egress
         // (all 6 readers) emits at most one terminal stop-delta, so this is byte-identical for real
         // streams; once emitted, a repeat call yields only the (idempotent) stop frame.
-        let has_usage = usage.input_tokens != 0 || usage.output_tokens != 0;
+        // Cache-only usage counts too: a FULL cache hit can carry `input_tokens == 0 &&
+        // output_tokens == 0` yet non-zero `cache_read_input_tokens` / `cache_creation_input_tokens`.
+        // Omitting the cache fields deferred the metadata frame and later flushed a ZERO-usage
+        // `metadata` frame, so the Bedrock client SDK's stream-metadata callback under-reported the
+        // cache tokens on the wire. Include them so the real usage is emitted inline. (audit c2r4.)
+        let has_usage = usage.input_tokens != 0
+            || usage.output_tokens != 0
+            || usage.cache_read_input_tokens.unwrap_or(0) != 0
+            || usage.cache_creation_input_tokens.unwrap_or(0) != 0;
         if !self.emitted {
             if has_usage {
                 events.push(crate::ir::IrStreamEvent::MessageDelta {
@@ -2053,6 +2061,14 @@ pub(crate) struct BedrockWriter;
 impl ProtocolWriter for BedrockWriter {
     fn upstream_path(&self) -> &str {
         "/model"
+    }
+
+    /// Converse's `cachePoint` marker is validated per-model: Anthropic Claude accepts it, Amazon
+    /// Nova 400s with "extraneous key [cachePoint] is not permitted". Cross-protocol cache asks
+    /// therefore need the lane's `prompt_caching` capability assertion before this writer may
+    /// project them (see `cache_markers_model_gated` on the trait).
+    fn cache_markers_model_gated(&self) -> bool {
+        true
     }
 
     fn upstream_path_for(&self, model: &str) -> String {
@@ -3305,16 +3321,59 @@ pub(crate) fn bedrock_response_to_eventstream(
                 );
                 push(&IrStreamEvent::BlockStop { index }, &mut out);
             }
-            // Thinking/ToolResult/Image blocks have no native ConverseStream content-delta frame on
-            // this synthesized path (the Bedrock writer maps their start/delta to None); skip them
-            // rather than emit an orphaned/empty frame. These are enumerated EXPLICITLY (no `_`
-            // catch-all) so that adding a future `IrBlock` variant (e.g. a document or
-            // redacted-thinking block) is a COMPILE error here rather than silent data loss in the
-            // synthesized ConverseStream output — this is the newest, least-tested encoder path.
-            IrBlock::Thinking { .. }
-            | IrBlock::ToolResult { .. }
-            | IrBlock::Image { .. }
-            | IrBlock::Json(_) => {}
+            // A Thinking (reasoningContent) block DOES have native ConverseStream frames — the
+            // Bedrock writer emits `contentBlockStart{reasoningContent:{}}` for the
+            // `IrBlockMeta::Thinking` start and `contentBlockDelta{reasoningContent:{…}}` for the
+            // ThinkingDelta / SignatureDelta / RedactedReasoningDelta deltas. The old comment claimed
+            // the writer maps them to None and skipped the block, silently dropping upstream
+            // reasoning on a cross-protocol→Bedrock streaming client. Synthesize the same
+            // start/delta(s)/stop the live streaming path produces. (found: audit c2r2.)
+            IrBlock::Thinking {
+                text,
+                signature,
+                redacted,
+                ..
+            } => {
+                push(
+                    &IrStreamEvent::BlockStart {
+                        index,
+                        block: IrBlockMeta::Thinking,
+                    },
+                    &mut out,
+                );
+                if *redacted {
+                    // Opaque encrypted reasoning — `text` holds the bytes, ONE delta carries them.
+                    push(
+                        &IrStreamEvent::BlockDelta {
+                            index,
+                            delta: IrDelta::RedactedReasoningDelta(text.clone()),
+                        },
+                        &mut out,
+                    );
+                } else {
+                    push(
+                        &IrStreamEvent::BlockDelta {
+                            index,
+                            delta: IrDelta::ThinkingDelta(text.clone()),
+                        },
+                        &mut out,
+                    );
+                    if let Some(sig) = signature {
+                        push(
+                            &IrStreamEvent::BlockDelta {
+                                index,
+                                delta: IrDelta::SignatureDelta(sig.clone()),
+                            },
+                            &mut out,
+                        );
+                    }
+                }
+                push(&IrStreamEvent::BlockStop { index }, &mut out);
+            }
+            // ToolResult/Image/Json blocks have no native ConverseStream content-delta frame on this
+            // synthesized path; skip them. Enumerated EXPLICITLY (no `_` catch-all) so a future
+            // `IrBlock` variant is a COMPILE error here rather than silent data loss.
+            IrBlock::ToolResult { .. } | IrBlock::Image { .. } | IrBlock::Json(_) => {}
         }
     }
 
@@ -3420,7 +3479,7 @@ mod tests {
             canonical_uri: crate::sigv4::uri_encode_path("/model/anthropic.claude:0/converse"),
             body: br#"{"messages":[]}"#,
             timestamp_epoch: 1_440_938_160, // 20150830T123600Z
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         let headers = writer.sign_request("AKIDEXAMPLE:SECRETKEY", &ctx);
 
@@ -3455,7 +3514,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         let headers = writer.sign_request("AKID:SECRET:SESSIONTOKEN", &ctx);
         let tok = headers
@@ -3482,7 +3541,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         assert!(writer.sign_request("not-a-valid-key", &ctx).is_empty());
     }
@@ -4047,7 +4106,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         // CR/LF embedded in the access key id → invalid Authorization header value
         // (HeaderValue::from_str rejects ASCII control chars, including CR/LF). This is the
@@ -5176,7 +5235,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         // Session token with an embedded control char → un-encodable HeaderValue.
         let headers = writer.sign_request("AKID:SECRET:TOK\r\nEN", &ctx);
@@ -5294,6 +5353,57 @@ mod tests {
                 .pointer("/usage/outputTokens")
                 .and_then(|v| v.as_u64()),
             Some(1)
+        );
+    }
+
+    /// REGRESSION (audit c2r2): `bedrock_response_to_eventstream` (buffered 2xx → synthesized
+    /// ConverseStream, used when a Bedrock-streaming client gets a non-streaming cross-protocol 2xx)
+    /// must NOT drop a `Thinking` (reasoningContent) block. The old arm skipped it, silently losing
+    /// upstream reasoning; it now synthesizes the `reasoningContent` start/delta/stop frames.
+    #[test]
+    fn eventstream_emits_reasoning_content_for_thinking_block() {
+        let resp = crate::ir::IrResponse {
+            logprobs: Vec::new(),
+            role: crate::ir::IrRole::Assistant,
+            content: vec![
+                crate::ir::IrBlock::Thinking {
+                    text: "let me think".to_string(),
+                    signature: Some("sigblob".to_string()),
+                    redacted: false,
+                    cache_control: None,
+                },
+                crate::ir::IrBlock::Text {
+                    text: "answer".to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                },
+            ],
+            stop_reason: Some(crate::ir::IrStopReason::EndTurn),
+            usage: IrUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+            model: None,
+            id: None,
+            created: None,
+            system_fingerprint: None,
+            stop_sequence: None,
+        };
+        let bytes = bedrock_response_to_eventstream(&resp, Some(5));
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("reasoningContent"),
+            "a Thinking block must synthesize a reasoningContent frame, not be dropped"
+        );
+        assert!(
+            text.contains("let me think"),
+            "the thinking text must ride a reasoningContent delta"
+        );
+        assert!(
+            text.contains("sigblob"),
+            "the reasoning signature must ride a signature delta"
         );
     }
 
@@ -6189,7 +6299,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         let headers = writer.sign_request("AKID:SECRET", &ctx);
         let auth = headers
@@ -6218,7 +6328,7 @@ mod tests {
             canonical_uri: "/model/m/converse".to_string(),
             body: b"{}",
             timestamp_epoch: 1_440_938_160,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         let headers = writer.sign_request("AKID:SECRET", &ctx);
         let auth = headers
@@ -8607,6 +8717,43 @@ mod tests {
             metadata_delta_count(&second),
             0,
             "second call must emit ZERO metadata deltas (the !emitted guard suppresses the duplicate); got {second:?}"
+        );
+    }
+
+    /// REGRESSION (audit c2r4): a CACHE-ONLY stop-delta (`input_tokens == 0 && output_tokens == 0`
+    /// but non-zero cache tokens — a full cache hit) must emit its `metadata` frame INLINE with the
+    /// real cache tokens, not defer it and later flush a zero-usage frame. `has_usage` now includes
+    /// the cache fields.
+    #[test]
+    fn cache_only_usage_emits_metadata_inline() {
+        fn metadata_delta_count(events: &[crate::ir::IrStreamEvent]) -> usize {
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        crate::ir::IrStreamEvent::MessageDelta {
+                            stop_reason: None,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        }
+        let usage = crate::ir::IrUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(4096), // full cache hit
+        };
+        let mut framing = BedrockStreamFraming::default();
+        let evs = framing
+            .on_combined_stop_delta(crate::ir::IrStopReason::EndTurn, None, &usage)
+            .expect("stop-delta returns events");
+        assert_eq!(
+            metadata_delta_count(&evs),
+            1,
+            "a cache-only stop-delta must emit ONE metadata frame inline with the real cache tokens, not defer a zero-usage frame; got {evs:?}"
         );
     }
 

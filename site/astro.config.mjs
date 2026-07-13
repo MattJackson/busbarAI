@@ -118,6 +118,7 @@ export default defineConfig({
             { label: 'Governance', slug: 'docs/guides/governance' },
             { label: 'Security', slug: 'docs/security' },
             { label: 'Configuration', slug: 'docs/configuration' },
+            { label: 'Admin API', slug: 'docs/admin-api' },
             { label: 'Operations', slug: 'docs/operations' },
           ],
         },
@@ -126,6 +127,7 @@ export default defineConfig({
           items: [
             { label: 'Architecture', slug: 'docs/architecture' },
             { label: 'Benchmark', slug: 'docs/benchmark' },
+            { label: 'Migrating to 1.3', slug: 'docs/migration-1-3' },
             { label: 'Changelog', slug: 'docs/changelog' },
           ],
         },

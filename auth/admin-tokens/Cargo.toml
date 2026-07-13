@@ -1,0 +1,10 @@
+[package]
+name = "busbar-auth-admin-tokens"
+version = "1.3.0"
+edition = "2021"
+rust-version = "1.87"
+description = "The built-in `admin-tokens` admin-auth plugin for busbar: the single operator admin token, compared in constant time across both carriers."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../../api" }

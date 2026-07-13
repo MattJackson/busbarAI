@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 //
 // busbar — a native-protocol LLM gateway. It fronts many LLM providers and routes each request to
 // a model or to a weighted pool of models, translating losslessly between wire protocols and
@@ -39,6 +39,7 @@
 
 mod admin;
 mod auth;
+mod auth_cache;
 mod billing;
 mod breaker;
 mod config;
@@ -64,6 +65,7 @@ mod router;
 mod routing;
 mod sigv4;
 mod state;
+mod state_persist;
 mod store;
 #[cfg(test)]
 mod test_support;
@@ -165,6 +167,10 @@ USAGE:
 
 ENVIRONMENT:
     BUSBAR_PROVIDERS    path to providers.yaml  (default: /etc/busbar/providers.yaml)
+    BUSBAR_STATE_FILE   state-snapshot path ('' disables; default: busbar-state.json next to config)
+
+Flags:
+    --safe-mode         boot on base config.yaml alone (quarantine the persisted overlay)
     BUSBAR_CONFIG       path to config.yaml     (default: /etc/busbar/config.yaml)
     RUST_LOG            log level: error|warn|info|debug|trace  (default: info)
 
@@ -201,19 +207,18 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// Return the open-relay banner to emit when auth resolves to `mode=none`, or `None` when auth is
-/// engaged. `auth_present` distinguishes an explicit `mode: none` (operator opted in) from a
-/// missing `auth:` block (serde-defaulted to none — the silent foot-gun the banner must call out).
-/// Returns `None` for every non-`None` mode (and for an unparseable mode, which validation already
-/// rejects upstream) so the caller emits nothing.
-fn open_relay_banner(mode: Option<auth::AuthMode>, auth_present: bool) -> Option<&'static str> {
-    if mode != Some(auth::AuthMode::None) {
+/// Return the open-relay banner to emit when the auth chain is EMPTY (open front door), or `None`
+/// when an auth module is engaged. `chain_empty` = the resolved `auth.chain` is empty. `auth_present`
+/// distinguishes an explicit empty chain (operator opted in) from a missing `auth:` block
+/// (serde-defaulted to open — the silent foot-gun the banner must call out).
+fn open_relay_banner(chain_empty: bool, auth_present: bool) -> Option<&'static str> {
+    if !chain_empty {
         return None;
     }
     Some(if auth_present {
-        "auth is DISABLED (auth.mode=none) — busbar is running as an OPEN RELAY; do not run this in production"
+        "auth is DISABLED (auth.chain is empty) — busbar is running as an OPEN RELAY; do not run this in production"
     } else {
-        "auth is DISABLED: no `auth:` block in config — busbar is running as an OPEN RELAY (anyone can use it). Add `auth:` with `mode: token` (and `client_tokens`) before exposing it; do not run this in production"
+        "auth is DISABLED: no `auth:` block in config — busbar is running as an OPEN RELAY (anyone can use it). Add `auth:` with `chain: [tokens]` (and `client_tokens`) before exposing it; do not run this in production"
     })
 }
 
@@ -272,30 +277,23 @@ async fn main() {
     // acceptable trade for a daemon/k8s readiness path. Emission macros are no-ops until then.
     std::thread::spawn(metrics::init);
 
-    // Read providers.yaml (shipped definitions)
-    let providers_path =
-        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into());
-    let raw_providers = std::fs::read_to_string(&providers_path).unwrap_or_else(|e| {
-        die(format!(
-            "cannot read providers file '{providers_path}': {e} (set {ENV_PROVIDERS})"
-        ))
-    });
-    let interpolated_providers = config::interpolate_env(&raw_providers)
-        .unwrap_or_else(|e| die(format!("providers.yaml: {e}")));
-    let defs: HashMap<String, config::ProviderDef> = serde_yaml::from_str(&interpolated_providers)
-        .unwrap_or_else(|e| die(format!("providers.yaml: invalid YAML: {e}")));
-
-    // Read config.yaml (deployment)
-    let config_path = std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into());
-    let raw_config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-        die(format!(
-            "cannot read config file '{config_path}': {e} (set {ENV_CONFIG})"
-        ))
-    });
-    let interpolated_config =
-        config::interpolate_env(&raw_config).unwrap_or_else(|e| die(format!("config.yaml: {e}")));
-    let deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
-        .unwrap_or_else(|e| die(format!("config.yaml: invalid YAML: {e}")));
+    // Locate the two config files (env-overridable paths) and run the shared disk-load pipeline —
+    // the SAME pipeline `POST /admin/v1/config/reload` re-runs at runtime.
+    let providers_path = std::path::PathBuf::from(
+        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into()),
+    );
+    let config_path = std::path::PathBuf::from(
+        std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into()),
+    );
+    let safe_mode = std::env::args().any(|a| a == "--safe-mode");
+    let loaded =
+        load_config_from_disk(&config_path, &providers_path, safe_mode).unwrap_or_else(|e| die(e));
+    let LoadedConfig {
+        deploy,
+        defs,
+        overlay_path,
+        base_hook_names,
+    } = loaded;
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
@@ -309,32 +307,13 @@ async fn main() {
     // First line in the logs: which build is running. Operators need this to confirm a deploy /
     // correlate logs to a release without shelling in to run `--version`.
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "busbar starting");
+    // Stamp process start for the `GET /admin/v1/info` uptime read.
+    admin::mark_start();
 
-    // Resolve deployment + definitions into resolved RootCfg
+    // Resolve deployment + definitions into resolved RootCfg (semantic validation runs inside
+    // build_app_from_config — the one construction path).
     let cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
-    // No normalization step exists: config::resolve passes the auth block through as-is
-    // (`deploy.auth.clone()`). The legacy single-token `token:` field was removed in 1.0.0, so there
-    // is nothing to promote; the only post-resolve step is the `unwrap_or_else(default_none)` fallback
-    // for an absent `auth:` block.
-    let auth_cfg = cfg
-        .auth
-        .clone()
-        .unwrap_or_else(config::AuthCfg::default_none);
-
-    // Validate configuration before building lanes
-    if let Err(validation_errors) = config_validate::validate(&cfg) {
-        for err in &validation_errors {
-            eprintln!("[error] {}", err);
-        }
-        std::process::exit(1);
-    }
-
-    // Install the resolved operational limits process-wide BEFORE any subsystem reads them. The
-    // values threaded explicitly (client/store/router/TLS) read `cfg.limits` directly; the deep
-    // call-stack sites (forward translate-body cap, metrics gauge limit, observability webhook
-    // timeout, governance sqlite/sweep, health probe fallbacks, routing policy timeout) read these.
-    limits::install(&cfg.limits);
 
     // Metadata-SSRF protection status (discoverability). When the nuclear `allow_all_metadata` is set
     // the guard is OFF — that is a security-relevant degradation, so WARN. Otherwise report the count
@@ -350,334 +329,56 @@ async fn main() {
         );
     }
 
-    let mut lanes_data = Vec::new();
-    // Validated provider handle for each lane, captured in lockstep with `lanes_data` below. The
-    // first loop already resolves `cfg.providers.get(&mc.provider)` (failing loud via `die` on a
-    // missing provider), so the lane-build loop reuses that handle instead of re-looking it up —
-    // there is no second lookup and no `expect` on the startup path.
-    let mut lane_provider_cfgs: Vec<&config::ProviderCfg> = Vec::new();
-    let mut by_model = HashMap::new();
-    // Per-model configured default_max_tokens (injected at the translation seam for protocols that
-    // require max_tokens). Captured here because `cfg.models` is consumed by this loop.
-    let mut model_default_max_tokens: std::collections::HashMap<String, Option<u32>> =
-        std::collections::HashMap::new();
-    // Single source of truth for each provider's resolved API key. The secret-bearing env read
-    // happens exactly once per provider here; both the empty-key warning below and the later
-    // `Lane.api_key` population reuse this value, so the warning and the captured key can never
-    // diverge (and we don't read the same env var twice).
-    let mut provider_api_keys: HashMap<String, String> = HashMap::new();
-    // Build lanes in a DETERMINISTIC order (sorted by model name) rather than `cfg.models`'
-    // HashMap iteration order, which is randomized per process start. Lane index is assigned here
-    // (`by_model` → `lanes_data.len()`), so a random iteration order gave each lane a different
-    // index every boot — surfacing as non-reproducible `/stats` lane ordering and metric lane-series
-    // identity that shifts across restarts (a scrape/dashboard annoyance and a flaky-test source).
-    // Sorting makes the whole observable surface stable. (Mirrors the deterministic-resolution fix
-    // already applied to `model_context_max` below.)
-    let mut sorted_models: Vec<_> = cfg.models.into_iter().collect();
-    sorted_models.sort_by(|a, b| a.0.cmp(&b.0));
-    for (model, mc) in sorted_models {
-        model_default_max_tokens.insert(model.clone(), mc.default_max_tokens);
-        let provider_cfg = cfg.providers.get(&mc.provider).unwrap_or_else(|| {
-            die(format!(
-                "model '{model}' references unknown provider '{}'",
-                mc.provider
-            ))
-        });
-        let key = provider_api_keys
-            .entry(mc.provider.clone())
-            .or_insert_with(|| std::env::var(&provider_cfg.api_key_env).unwrap_or_default());
-        if key.is_empty() {
-            eprintln!(
-                "[warn] provider {} key env {} empty",
-                mc.provider, provider_cfg.api_key_env
-            );
-        }
-        let limited = mc.max_requests >= 0;
-        by_model.insert(model.clone(), lanes_data.len());
-        lane_provider_cfgs.push(provider_cfg);
-        lanes_data.push(LaneData {
-            model: model.clone(),
-            provider: mc.provider.clone(),
-            max: mc.max_concurrent,
-            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(mc.max_concurrent)),
-            limited,
-            budget: if limited { mc.max_requests } else { -1 },
-            cooldown_until: 0,
-            streak: 0,
-            dead: false,
-            dead_reason: String::new(),
-            ok: 0,
-            err: 0,
-            client_fault: 0,
-            upstream_model: mc.upstream_model.clone(),
-            attempt_timeout_ms: mc.attempt_timeout_ms,
-            reasoning: mc.reasoning.unwrap_or(false),
-        });
-
-        eprintln!(
-            "  model {} via {} ({}) max {}{}",
-            model,
-            mc.provider,
-            provider_cfg.base_url.trim_end_matches('/'),
-            mc.max_concurrent,
-            // Surface the alias→wire-id indirection at boot so an operator can see this lane sends a
-            // different model string upstream than the config key it's filed under.
-            match &mc.upstream_model {
-                Some(u) => format!(" → upstream {u}"),
-                None => String::new(),
-            }
-        );
-    }
-
-    let registry = ProtocolRegistry::with_builtins();
-
-    // Build a map from model name to context_max. A model is one lane shared across every pool that
-    // names it, so its context_max must be single-valued. Previously the last pool to iterate (in
-    // nondeterministic HashMap order) silently won, so a model carrying `context_max: Some(128000)`
-    // in one pool and `None` (or a different limit) in another could end up with whichever value the
-    // iteration happened to land on — defeating the context-length failover exclusion in forward.rs
-    // and losing pool-specific limits without a diagnostic. Resolve it deterministically and fail
-    // loud on a genuine conflict instead.
-    let model_context_max = match resolve_model_context_max(&cfg.pools) {
-        Ok(map) => map,
-        Err(conflict) => die(conflict),
-    };
-
-    let mut lanes = Vec::new();
-    for (idx, ld) in lanes_data.iter().enumerate() {
-        // Reuse the provider handle resolved (and validated via `die`) in the lanes_data loop above,
-        // captured in lockstep into `lane_provider_cfgs`. No redundant re-lookup / `expect` here.
-        let provider_cfg = lane_provider_cfgs[idx];
-        let protocol = registry.get(&provider_cfg.protocol).unwrap_or_else(|| {
-            die(format!(
-                "provider '{}' uses unknown protocol '{}' (supported: anthropic, openai, gemini, bedrock, responses, cohere)",
-                ld.provider, provider_cfg.protocol
-            ))
-        });
-        lanes.push(Lane {
-            model: ld.model.clone(),
-            provider: ld.provider.clone(),
-            base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
-            // Reuse the single env read captured in the lanes_data loop above (same source of truth
-            // as the empty-key warning); no second read of the secret-bearing env var.
-            api_key: provider_api_keys
-                .get(&ld.provider)
-                .cloned()
-                .unwrap_or_default(),
-            protocol,
-            max: ld.max,
-            error_map: Arc::new(provider_cfg.error_map.clone()),
-            context_max: model_context_max.get(&ld.model).copied().flatten(),
-            path: provider_cfg.path.clone(),
-            auth: provider_cfg.auth,
-            health: provider_cfg.health.clone(),
-            upstream_model: ld.upstream_model.clone(),
-            attempt_timeout_ms: ld.attempt_timeout_ms,
-            reasoning: ld.reasoning,
-            default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
-        });
-    }
-
-    let mut pools = HashMap::new();
-    for (name, pool) in &cfg.pools {
-        // Wire per-member weights from config into the pool structure.
-        // Each pool member has a weight; default is 1 if not specified.
-        let weighted_members: Vec<WeightedLane> = pool
-            .members
-            .iter()
-            .map(|m| {
-                let lane_idx = *by_model.get(&m.target).unwrap_or_else(|| {
-                    die(format!(
-                        "pool '{name}' references unknown model '{}'",
-                        m.target
-                    ))
-                });
-                WeightedLane {
-                    idx: lane_idx,
-                    weight: m.weight, // from config PoolMember.weight (default 1)
-                    // Per-member attempt cap: one model, different hang budgets per pool/workload.
-                    attempt_timeout_ms: m.attempt_timeout_ms,
-                    reasoning: m.reasoning,
-                }
-            })
-            .collect();
-        pools.insert(name.clone(), weighted_members);
-    }
-
-    eprintln!("busbar: {} models, {} pools", lanes.len(), pools.len());
-    for (n, wl_vec) in &pools {
-        let agg: usize = wl_vec.iter().map(|wl| lanes[wl.idx].max).sum();
-        eprintln!(
-            "  pool /{} = [{}] aggregate {}",
-            n,
-            wl_vec
-                .iter()
-                .map(|wl| lanes[wl.idx].model.clone())
-                .collect::<Vec<_>>()
-                .join(", "),
-            agg
-        );
-    }
-
     let listen = cfg.listen.clone();
     let tls_cfg = cfg.tls.clone();
+    let req_body_max = cfg.limits.request_body_max_bytes;
+    let max_inbound = cfg.limits.max_inbound_concurrent;
+    let app = Arc::new(
+        build_app_from_config(
+            cfg,
+            governance_cfg,
+            overlay_path,
+            base_hook_names,
+            (Some(config_path.clone()), Some(providers_path.clone())),
+            None,
+        )
+        .unwrap_or_else(|e| die(e)),
+    );
 
-    // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
-    // local dev) — but operators must not run this in production. NOTE: an ABSENT `auth:` block
-    // serde-defaults to mode=none too (`AuthCfg::default_none`), so a config that merely omits
-    // `auth:` silently becomes an open relay. Surface this at ERROR level (not warn — a warn is
-    // suppressed under RUST_LOG=error, the very level an operator most likely runs in production)
-    // AND unconditionally on stderr, so the open-relay state cannot be masked by log configuration.
-    if let Some(banner) = open_relay_banner(Some(auth_cfg.mode), cfg.auth.is_some()) {
-        eprintln!("[error] {banner}");
-        tracing::error!("{banner}");
-    }
+    // Record the BOOT snapshot as version 0 so the version history always has a rollback floor
+    // (the pre-any-mutation state).
+    app.versions
+        .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
 
-    let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
-    // Thread the operator-configured hard-down cooldown + honored-Retry-After ceiling into the store
-    // (both default to their historical const at the config layer).
-    let store = Arc::new(InMemoryStore::new_with_limits(
-        lanes_data.clone(),
-        cfg.limits.hard_down_cooldown_secs,
-        cfg.limits.max_honored_retry_after_secs,
-    ));
-
-    // Global default failover config — the fallback for pools that don't set their own. A fixed
-    // default (not "whatever pool HashMap iteration happens to yield first", which was
-    // nondeterministic across restarts).
-    let failover_cfg = Some(crate::config::FailoverCfg {
-        timeout_secs: crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
-        exclusions: None,
-        max_hops: crate::config::DEFAULT_FAILOVER_CAP,
-    });
-
-    // The fallback-pool routing table: on_exhausted `fallback_pool:<name>` looks a pool up here,
-    // so it mirrors the pools map (any pool can be a fallback target).
-    let fallback_pools = pools.clone();
-
-    // The shared upstream HTTP client, built ONCE. Constructed before the pool-runtime loop so the
-    // webhook routing transport can reuse it (a clone shares the connection pool + the `redirect:none`
-    // SSRF posture); the same client is then moved into `App` below.
-    let upstream_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(
-            cfg.limits.upstream_request_timeout_secs,
-        ))
-        .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
-        // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
-        // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
-        // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
-        // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
-        // localhost, RFC1918) and busbar would follow it — forwarding the signed request
-        // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
-        // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
-        // normal operation, so disabling redirect following entirely closes the vector at no cost.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build upstream HTTP client");
-
-    // Per-pool runtime config (failover/exclusions), keyed by pool name.
-    let mut pool_runtime = std::collections::HashMap::new();
-    for (pool_name, pool_cfg) in &cfg.pools {
-        pool_runtime.insert(
-            pool_name.clone(),
-            state::PoolRuntime {
-                failover: pool_cfg.failover.clone(),
-                affinity: pool_cfg.affinity.clone(),
-                breaker: pool_cfg.breaker.as_ref().map(store::BreakerCfg::from),
-                // Operator-declared member metadata (tier/cost/tags) keyed by lane idx, for the
-                // routing Candidate projection. Mirrors the WeightedLane construction's target→lane
-                // mapping (by_model). Read only inside the policy arm of the seam.
-                members: pool_cfg
-                    .members
-                    .iter()
-                    .filter_map(|m| {
-                        by_model.get(&m.target).map(|&idx| {
-                            (
-                                idx,
-                                state::MemberMeta {
-                                    tier: m.tier.clone(),
-                                    cost_per_mtok: m.cost_per_mtok,
-                                    tags: m.tags.clone(),
-                                },
-                            )
-                        })
-                    })
-                    .collect(),
-                // Resolve the routing policy ONCE here. `route: weighted` (default) ⇒ `None` ⇒ the
-                // zero-cost inline SWRR path; the webhook transport reuses the shared upstream client.
-                policy: routing::resolve_policy(pool_cfg, &upstream_client),
-            },
+    // D3 RESTORE: bring back the persisted process state (health by lane identity, audit ring,
+    // version history) so the restart forgot nothing. Fail-soft in every direction.
+    let state_file = state_persist::resolve_path(Some(&config_path));
+    if let Some(ref sf) = state_file {
+        if let Some(persisted) = state_persist::read(sf, store::now()) {
+            let restored = persisted.health.len();
+            // Rebuild the store WITH restored health (identity-keyed, so it survives any config
+            // edits made while busbar was down). The app was just built and is not yet served, so
+            // rebuilding its store here is safe; the swap-in happens before the first request.
+            // (Simplest correct wiring: restore INTO the existing store's lanes by identity.)
+            app.store.restore_health(&persisted.health);
+            crate::admin::audit::AUDIT.load(persisted.audit);
+            app.versions.load(persisted.versions);
+            // Re-record the boot floor ON TOP of the restored history (a fresh boot version entry).
+            app.versions.record(
+                app.config_version,
+                "system",
+                "boot (state restored)",
+                &app.hook_registry,
+                &app.global_hooks,
+            );
+            tracing::info!(path = %sf.display(), lanes = restored, "state restored from snapshot");
+        }
+    } else {
+        tracing::info!(
+            "state persistence disabled (no config path / BUSBAR_STATE_FILE empty); restarts \
+             start with fresh health state"
         );
     }
-
-    // Parse on_exhausted configs per pool
-    let mut on_exhausted_cfgs = std::collections::HashMap::new();
-    for (pool_name, pool_cfg) in &cfg.pools {
-        if let Some(ref on_exc) = pool_cfg.on_exhausted {
-            match crate::config::OnExhausted::parse(&on_exc.action) {
-                Ok(mode) => {
-                    tracing::info!(pool = %pool_name, on_exhausted = ?mode, "pool exhaustion policy");
-                    on_exhausted_cfgs.insert(pool_name.clone(), mode);
-                }
-                Err(e) => die(format!(
-                    "pool '{pool_name}' has invalid on_exhausted action '{}': {e}",
-                    on_exc.action
-                )),
-            }
-        } else {
-            // Default to Status503 if not specified
-            on_exhausted_cfgs.insert(pool_name.clone(), crate::config::OnExhausted::Status503);
-        }
-    }
-
-    // open the governance store + load the virtual-key cache when enabled.
-    let governance = match governance_cfg {
-        Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
-            Ok(store) => {
-                match governance::GovState::new(
-                    Arc::new(store),
-                    g.price_per_request_cents,
-                    g.price_per_1k_tokens_cents,
-                    g.admin_token.clone(),
-                ) {
-                    Ok(gs) => {
-                        // Thread the budget store-error fail-mode (allow|deny) onto GovState.
-                        let gs = gs.with_budget_on_store_error(g.budget_on_store_error);
-                        eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
-                        Some(Arc::new(gs))
-                    }
-                    Err(e) => {
-                        eprintln!("[error] governance init failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[error] governance db open failed ({}): {e}", g.db_path);
-                std::process::exit(1);
-            }
-        },
-        _ => None,
-    };
-
-    let app = Arc::new(App {
-        lanes,
-        store,
-        by_model,
-        pools,
-        client: upstream_client.clone(),
-        auth: auth_mw.clone(),
-        failover_cfg,
-        pool_runtime,
-        fallback_pools,
-        on_exhausted_cfgs,
-        governance,
-        default_max_tokens: cfg.limits.default_max_tokens,
-        reasoning_effort_budgets: {
-            let b = cfg.limits.reasoning_effort_budgets;
-            [b.minimal, b.low, b.medium, b.high]
-        },
-    });
 
     // configure the request-log webhook (reusing the pooled client). No-op if unset.
     observability::configure_webhook(
@@ -692,12 +393,18 @@ async fn main() {
     // Build the router with the operator-configured ingress body cap + optional inbound-concurrency
     // layer (0 = unlimited / no layer, today's default). `cfg` is moved field-by-field below, so read
     // the two values first.
-    let router = build_router_with_limits(
+    let (router, app_handle) = build_router_with_limits(
         app,
-        cfg.limits.request_body_max_bytes,
-        cfg.limits.max_inbound_concurrent,
+        req_body_max,
+        max_inbound,
         observability_cfg.emit_server_timing,
     );
+
+    // D3 SNAPSHOTTER: persist process state every ~30s (and once more on graceful shutdown below)
+    // so a restart — including an upgrade — forgets nothing.
+    if let Some(ref sf) = state_file {
+        state_persist::spawn_snapshotter(app_handle.clone(), sf.clone());
+    }
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -730,6 +437,16 @@ async fn main() {
             if let Err(e) = tls::serve(listener, router, server_config, shutdown_signal()).await {
                 die(format!("server error: {e}"));
             }
+        }
+    }
+    // D3: one FINAL state snapshot after the graceful drain, so the freshest health picture is
+    // what the next boot restores (the periodic 30s tick could be up to 30s stale).
+    if let Some(ref sf) = state_file {
+        let app = app_handle.load();
+        if let Err(e) = state_persist::write(sf, &state_persist::capture(&app)) {
+            tracing::warn!(path = %sf.display(), error = %e, "final state snapshot failed");
+        } else {
+            tracing::info!(path = %sf.display(), "state snapshot written on shutdown");
         }
     }
     observability::shutdown_tracing();
@@ -963,6 +680,549 @@ async fn reshape_oversized_413(
     )
 }
 
+/// Everything the DISK half of configuration produces, shared by boot and runtime reload.
+pub(crate) struct LoadedConfig {
+    pub(crate) deploy: config::DeployCfg,
+    pub(crate) defs: HashMap<String, config::ProviderDef>,
+    pub(crate) overlay_path: Option<std::path::PathBuf>,
+    pub(crate) base_hook_names: std::collections::HashSet<String>,
+}
+
+/// The disk-load pipeline: read providers.yaml + config.yaml, env-interpolate (from the process's
+/// boot-time environment — a live reload cannot see edited env files; documented), capture the
+/// BASE hook names, then merge the persisted overlay (opt-in, fail-soft). Shared verbatim by boot
+/// and `POST /admin/v1/config/reload`, so a reload IS a boot-equivalent read of disk truth.
+pub(crate) fn load_config_from_disk(
+    config_path: &std::path::Path,
+    providers_path: &std::path::Path,
+    safe_mode: bool,
+) -> Result<LoadedConfig, String> {
+    let raw_providers = std::fs::read_to_string(providers_path).map_err(|e| {
+        format!(
+            "cannot read providers file '{}': {e} (set {ENV_PROVIDERS})",
+            providers_path.display()
+        )
+    })?;
+    let interpolated_providers =
+        config::interpolate_env(&raw_providers).map_err(|e| format!("providers.yaml: {e}"))?;
+    let defs: HashMap<String, config::ProviderDef> = serde_yaml::from_str(&interpolated_providers)
+        .map_err(|e| format!("providers.yaml: invalid YAML: {e}"))?;
+
+    let raw_config = std::fs::read_to_string(config_path).map_err(|e| {
+        format!(
+            "cannot read config file '{}': {e} (set {ENV_CONFIG})",
+            config_path.display()
+        )
+    })?;
+    let interpolated_config =
+        config::interpolate_env(&raw_config).map_err(|e| format!("config.yaml: {e}"))?;
+    let mut deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
+        .map_err(|e| format!("config.yaml: invalid YAML: {e}"))?;
+
+    // Config-overlay persistence (opt-in via `BUSBAR_CONFIG_OVERLAY`): capture the BASE hook names
+    // BEFORE the overlay merges in API-registered hooks (the admin API refuses to PUT-replace a
+    // base hook), then merge. Absent/corrupt overlay is fail-soft.
+    let overlay_path = std::env::var("BUSBAR_CONFIG_OVERLAY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    let base_hook_names: std::collections::HashSet<String> = deploy.hooks.keys().cloned().collect();
+    if safe_mode {
+        // `--safe-mode` (D3): boot on the operator-owned base config ALONE — the persisted overlay
+        // (API-registered hooks) is quarantined, not deleted. The escape hatch for "an applied
+        // hook is harming traffic and re-applies itself every boot".
+        tracing::warn!(
+            "SAFE MODE: config overlay NOT merged — running on base config.yaml alone (the \
+             overlay file is untouched; boot without --safe-mode to re-apply it)"
+        );
+        return Ok(LoadedConfig {
+            deploy,
+            defs,
+            overlay_path,
+            base_hook_names,
+        });
+    }
+    if let Some(ref p) = overlay_path {
+        if let Some(doc) = config::overlay::read(p) {
+            tracing::info!(
+                path = %p.display(),
+                hooks = doc.hooks.len(),
+                "merging persisted config overlay onto base config"
+            );
+            config::overlay::merge_into(&mut deploy, doc);
+        }
+    }
+    Ok(LoadedConfig {
+        deploy,
+        defs,
+        overlay_path,
+        base_hook_names,
+    })
+}
+
+/// Build a complete `App` from a RESOLVED config — the ONE construction path shared by boot
+/// (`prior = None`) and the config plane's apply/reload (`prior = Some(current)`). On apply,
+/// process-lifetime state is REUSED from the prior snapshot (HTTP client pool, governance key DB,
+/// version history, mutation-rate windows) and the health store is rebuilt with every surviving
+/// lane's learned state RESTORED BY STABLE IDENTITY (D1) — so a lane-set change never
+/// misattributes or discards breaker/latency knowledge. Errors are returned (never process-exit):
+/// boot maps them to `die`, the apply endpoints to `invalid_request` — an invalid apply changes
+/// nothing.
+pub(crate) fn build_app_from_config(
+    cfg: config::RootCfg,
+    governance_cfg: Option<config::GovernanceCfg>,
+    overlay_path: Option<std::path::PathBuf>,
+    base_hook_names: std::collections::HashSet<String>,
+    config_paths: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
+    prior: Option<&state::App>,
+) -> Result<state::App, String> {
+    // Install the resolved operational limits process-wide BEFORE any subsystem reads them —
+    // running here (not in main) so a config APPLY/RELOAD refreshes them too. The values threaded
+    // explicitly (client/store/router/TLS) read `cfg.limits` directly; the deep call-stack sites
+    // (translate-body cap, metrics gauge limit, webhook timeout, governance sqlite/sweep, health
+    // probe fallbacks, routing policy timeout) read the installed values.
+    limits::install(&cfg.limits);
+    // Semantic validation — the same gate boot has always had, now on the ONE construction path
+    // so an apply/reload validates identically and an invalid config changes nothing.
+    if let Err(validation_errors) = config_validate::validate(&cfg) {
+        return Err(format!(
+            "config validation failed:\n  - {}",
+            validation_errors.join("\n  - ")
+        ));
+    }
+    let auth_cfg = cfg
+        .auth
+        .clone()
+        .unwrap_or_else(config::AuthCfg::default_none);
+    let mut lanes_data = Vec::new();
+    // Validated provider handle for each lane, captured in lockstep with `lanes_data` below. The
+    // first loop already resolves `cfg.providers.get(&mc.provider)` (failing loud via `die` on a
+    // missing provider), so the lane-build loop reuses that handle instead of re-looking it up —
+    // there is no second lookup and no `expect` on the startup path.
+    let mut lane_provider_cfgs: Vec<&config::ProviderCfg> = Vec::new();
+    let mut by_model = HashMap::new();
+    // Per-model configured default_max_tokens (injected at the translation seam for protocols that
+    // require max_tokens). Captured here because `cfg.models` is consumed by this loop.
+    let mut model_default_max_tokens: std::collections::HashMap<String, Option<u32>> =
+        std::collections::HashMap::new();
+    // Single source of truth for each provider's resolved API key. The secret-bearing env read
+    // happens exactly once per provider here; both the empty-key warning below and the later
+    // `Lane.api_key` population reuse this value, so the warning and the captured key can never
+    // diverge (and we don't read the same env var twice).
+    let mut provider_api_keys: HashMap<String, String> = HashMap::new();
+    // Build lanes in a DETERMINISTIC order (sorted by model name) rather than `cfg.models`'
+    // HashMap iteration order, which is randomized per process start. Lane index is assigned here
+    // (`by_model` → `lanes_data.len()`), so a random iteration order gave each lane a different
+    // index every boot — surfacing as non-reproducible `/stats` lane ordering and metric lane-series
+    // identity that shifts across restarts (a scrape/dashboard annoyance and a flaky-test source).
+    // Sorting makes the whole observable surface stable. (Mirrors the deterministic-resolution fix
+    // already applied to `model_context_max` below.)
+    let mut sorted_models: Vec<_> = cfg.models.into_iter().collect();
+    sorted_models.sort_by(|a, b| a.0.cmp(&b.0));
+    for (model, mc) in sorted_models {
+        model_default_max_tokens.insert(model.clone(), mc.default_max_tokens);
+        let Some(provider_cfg) = cfg.providers.get(&mc.provider) else {
+            return Err(format!(
+                "model '{model}' references unknown provider '{}'",
+                mc.provider
+            ));
+        };
+        let key = provider_api_keys
+            .entry(mc.provider.clone())
+            .or_insert_with(|| std::env::var(&provider_cfg.api_key_env).unwrap_or_default());
+        if key.is_empty() {
+            eprintln!(
+                "[warn] provider {} key env {} empty",
+                mc.provider, provider_cfg.api_key_env
+            );
+        }
+        let limited = mc.max_requests >= 0;
+        by_model.insert(model.clone(), lanes_data.len());
+        lane_provider_cfgs.push(provider_cfg);
+        lanes_data.push(LaneData {
+            model: model.clone(),
+            provider: mc.provider.clone(),
+            max: mc.max_concurrent,
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(mc.max_concurrent)),
+            limited,
+            budget: if limited { mc.max_requests } else { -1 },
+            cooldown_until: 0,
+            streak: 0,
+            dead: false,
+            dead_reason: String::new(),
+            ok: 0,
+            err: 0,
+            client_fault: 0,
+            upstream_model: mc.upstream_model.clone(),
+            attempt_timeout_ms: mc.attempt_timeout_ms,
+            reasoning: mc.reasoning.unwrap_or(false),
+            prompt_caching: mc.prompt_caching.unwrap_or(false),
+        });
+
+        eprintln!(
+            "  model {} via {} ({}) max {}{}",
+            model,
+            mc.provider,
+            provider_cfg.base_url.trim_end_matches('/'),
+            mc.max_concurrent,
+            // Surface the alias→wire-id indirection at boot so an operator can see this lane sends a
+            // different model string upstream than the config key it's filed under.
+            match &mc.upstream_model {
+                Some(u) => format!(" → upstream {u}"),
+                None => String::new(),
+            }
+        );
+    }
+
+    let registry = ProtocolRegistry::with_builtins();
+
+    // Build a map from model name to context_max. A model is one lane shared across every pool that
+    // names it, so its context_max must be single-valued. Previously the last pool to iterate (in
+    // nondeterministic HashMap order) silently won, so a model carrying `context_max: Some(128000)`
+    // in one pool and `None` (or a different limit) in another could end up with whichever value the
+    // iteration happened to land on — defeating the context-length failover exclusion in forward.rs
+    // and losing pool-specific limits without a diagnostic. Resolve it deterministically and fail
+    // loud on a genuine conflict instead.
+    let model_context_max = resolve_model_context_max(&cfg.pools)?;
+
+    let mut lanes = Vec::new();
+    for (idx, ld) in lanes_data.iter().enumerate() {
+        // Reuse the provider handle resolved (and validated via `die`) in the lanes_data loop above,
+        // captured in lockstep into `lane_provider_cfgs`. No redundant re-lookup / `expect` here.
+        let provider_cfg = lane_provider_cfgs[idx];
+        let Some(protocol) = registry.get(&provider_cfg.protocol) else {
+            return Err(format!(
+                "provider '{}' uses unknown protocol '{}' (supported: anthropic, openai, gemini, bedrock, responses, cohere)",
+                ld.provider, provider_cfg.protocol
+            ));
+        };
+        lanes.push(Lane {
+            model: ld.model.clone(),
+            provider: ld.provider.clone(),
+            base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
+            // Reuse the single env read captured in the lanes_data loop above (same source of truth
+            // as the empty-key warning); no second read of the secret-bearing env var.
+            api_key: provider_api_keys
+                .get(&ld.provider)
+                .cloned()
+                .unwrap_or_default(),
+            protocol,
+            max: ld.max,
+            error_map: Arc::new(provider_cfg.error_map.clone()),
+            context_max: model_context_max.get(&ld.model).copied().flatten(),
+            path: provider_cfg.path.clone(),
+            auth: provider_cfg.auth,
+            health: provider_cfg.health.clone(),
+            upstream_model: ld.upstream_model.clone(),
+            attempt_timeout_ms: ld.attempt_timeout_ms,
+            reasoning: ld.reasoning,
+            prompt_caching: ld.prompt_caching,
+            default_max_tokens: model_default_max_tokens.get(&ld.model).copied().flatten(),
+        });
+    }
+
+    let mut pools = HashMap::new();
+    for (name, pool) in &cfg.pools {
+        // Wire per-member weights from config into the pool structure.
+        // Each pool member has a weight; default is 1 if not specified.
+        let mut weighted_members: Vec<WeightedLane> = Vec::with_capacity(pool.members.len());
+        for m in pool.members.iter() {
+            {
+                let Some(&lane_idx) = by_model.get(&m.target) else {
+                    return Err(format!(
+                        "pool '{name}' references unknown model '{}'",
+                        m.target
+                    ));
+                };
+                weighted_members.push(WeightedLane {
+                    idx: lane_idx,
+                    weight: m.weight, // from config PoolMember.weight (default 1)
+                    // Per-member attempt cap: one model, different hang budgets per pool/workload.
+                    attempt_timeout_ms: m.attempt_timeout_ms,
+                    reasoning: m.reasoning,
+                });
+            }
+        }
+        pools.insert(name.clone(), weighted_members);
+    }
+
+    eprintln!("busbar: {} models, {} pools", lanes.len(), pools.len());
+    for (n, wl_vec) in &pools {
+        let agg: usize = wl_vec.iter().map(|wl| lanes[wl.idx].max).sum();
+        eprintln!(
+            "  pool /{} = [{}] aggregate {}",
+            n,
+            wl_vec
+                .iter()
+                .map(|wl| lanes[wl.idx].model.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            agg
+        );
+    }
+
+    // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
+    // local dev) — but operators must not run this in production. NOTE: an ABSENT `auth:` block
+    // serde-defaults to mode=none too (`AuthCfg::default_none`), so a config that merely omits
+    // `auth:` silently becomes an open relay. Surface this at ERROR level (not warn — a warn is
+    // suppressed under RUST_LOG=error, the very level an operator most likely runs in production)
+    // AND unconditionally on stderr, so the open-relay state cannot be masked by log configuration.
+    if let Some(banner) = open_relay_banner(auth_cfg.chain.is_empty(), cfg.auth.is_some()) {
+        eprintln!("[error] {banner}");
+        tracing::error!("{banner}");
+    }
+
+    let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
+    // Thread the operator-configured hard-down cooldown + honored-Retry-After ceiling into the store
+    // (both default to their historical const at the config layer).
+    // D1 carry-over: an APPLY/RELOAD (prior = Some) restores every surviving lane's learned
+    // health state BY STABLE IDENTITY from the prior store; boot (None) starts fresh.
+    let store: Arc<dyn crate::store::StateStore> = match prior {
+        Some(p) => Arc::new(InMemoryStore::new_with_limits_restored(
+            lanes_data.clone(),
+            cfg.limits.hard_down_cooldown_secs,
+            cfg.limits.max_honored_retry_after_secs,
+            &p.store.export_health(),
+        )),
+        None => Arc::new(InMemoryStore::new_with_limits(
+            lanes_data.clone(),
+            cfg.limits.hard_down_cooldown_secs,
+            cfg.limits.max_honored_retry_after_secs,
+        )),
+    };
+
+    // Global default failover config — the fallback for pools that don't set their own. A fixed
+    // default (not "whatever pool HashMap iteration happens to yield first", which was
+    // nondeterministic across restarts).
+    let failover_cfg = Some(crate::config::FailoverCfg {
+        timeout_secs: crate::config::DEFAULT_FAILOVER_DEADLINE_SECS,
+        exclusions: None,
+        max_hops: crate::config::DEFAULT_FAILOVER_CAP,
+    });
+
+    // The fallback-pool routing table: on_exhausted `fallback_pool:<name>` looks a pool up here,
+    // so it mirrors the pools map (any pool can be a fallback target).
+    let fallback_pools = pools.clone();
+
+    // The shared upstream HTTP client, built ONCE. Constructed before the pool-runtime loop so the
+    // webhook routing transport can reuse it (a clone shares the connection pool + the `redirect:none`
+    // SSRF posture); the same client is then moved into `App` below.
+    let upstream_client = if let Some(p) = prior {
+        // REUSED across applies: the pooled connections + their kept-alive upstream sockets.
+        p.client.clone()
+    } else {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(
+                cfg.limits.upstream_request_timeout_secs,
+            ))
+            .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
+            // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
+            // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
+            // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
+            // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
+            // localhost, RFC1918) and busbar would follow it — forwarding the signed request
+            // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
+            // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
+            // normal operation, so disabling redirect following entirely closes the vector at no cost.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build upstream HTTP client")
+    };
+
+    // The `default:` hook (if any) — the base ordering that pools which named none inherit, replacing
+    // the compiled-in weighted backstop (everything-is-a-hook model). At most one (validated).
+    let default_hook = routing::default_hook_name(&cfg.hooks).map(str::to_string);
+
+    // Per-pool runtime config (failover/exclusions), keyed by pool name.
+    let mut pool_runtime = std::collections::HashMap::new();
+    for (pool_name, pool_cfg) in &cfg.pools {
+        pool_runtime.insert(
+            pool_name.clone(),
+            state::PoolRuntime {
+                failover: pool_cfg.failover.clone(),
+                affinity: pool_cfg.affinity.clone(),
+                breaker: pool_cfg.breaker.as_ref().map(store::BreakerCfg::from),
+                // Operator-declared member metadata (tier/cost/tags) keyed by lane idx, for the
+                // routing Candidate projection. Mirrors the WeightedLane construction's target→lane
+                // mapping (by_model). Read only inside the policy arm of the seam.
+                members: pool_cfg
+                    .members
+                    .iter()
+                    .filter_map(|m| {
+                        by_model.get(&m.target).map(|&idx| {
+                            (
+                                idx,
+                                state::MemberMeta {
+                                    tier: m.tier.clone(),
+                                    cost_per_mtok: m.cost_per_mtok,
+                                    tags: m.tags.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect(),
+                // Resolve the routing policy ONCE here. `weighted` (default) ⇒ `None` ⇒ the zero-cost
+                // inline SWRR path; a `default:` hook replaces that base for pools that named none; the
+                // webhook transport reuses the shared upstream client.
+                policy: routing::resolve_pool_ordering(
+                    pool_cfg,
+                    &cfg.hooks,
+                    &upstream_client,
+                    default_hook.as_deref(),
+                ),
+                // This pool's decision gates, resolved once here (priority carried for the phase-2
+                // chain merge). NOT re-resolved on config apply yet — same scope caveat as `policy`.
+                gates: routing::resolve_pool_gates(pool_cfg, &cfg.hooks, &upstream_client),
+                rewrite_hooks: routing::resolve_pool_rewrites(
+                    pool_cfg,
+                    &cfg.hooks,
+                    &upstream_client,
+                ),
+            },
+        );
+    }
+
+    // Parse on_exhausted configs per pool
+    let mut on_exhausted_cfgs = std::collections::HashMap::new();
+    for (pool_name, pool_cfg) in &cfg.pools {
+        if let Some(ref on_exc) = pool_cfg.on_exhausted {
+            match crate::config::OnExhausted::parse(&on_exc.action) {
+                Ok(mode) => {
+                    tracing::info!(pool = %pool_name, on_exhausted = ?mode, "pool exhaustion policy");
+                    on_exhausted_cfgs.insert(pool_name.clone(), mode);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "pool '{pool_name}' has invalid on_exhausted action '{}': {e}",
+                        on_exc.action
+                    ))
+                }
+            }
+        } else {
+            // Default to Status503 if not specified
+            on_exhausted_cfgs.insert(pool_name.clone(), crate::config::OnExhausted::Status503);
+        }
+    }
+
+    // open the governance store + load the virtual-key cache when enabled.
+    let governance = if let Some(p) = prior {
+        // REUSED across applies: the key DB + spend/rate state must survive config changes.
+        p.governance.clone()
+    } else {
+        match governance_cfg {
+            Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
+                Ok(store) => {
+                    match governance::GovState::new(
+                        Arc::new(store),
+                        g.price_per_request_cents,
+                        g.price_per_1k_tokens_cents,
+                        g.admin_token.clone(),
+                    ) {
+                        Ok(gs) => {
+                            // Thread the budget store-error fail-mode (allow|deny) onto GovState.
+                            let gs = gs.with_budget_on_store_error(g.budget_on_store_error);
+                            eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
+                            Some(Arc::new(gs))
+                        }
+                        Err(e) => return Err(format!("governance init failed: {e}")),
+                    }
+                }
+                Err(e) => return Err(format!("governance db open failed ({}): {e}", g.db_path)),
+            },
+            _ => None,
+        }
+    };
+
+    // Resolve the global rewrite hooks (prompt: rw gates in global_hooks) into priority-ordered
+    // transports ONCE. Empty unless the operator configured a rewrite hook — zero cost by default.
+    let rewrite_hooks =
+        routing::resolve_rewrite_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+    // Resolve the global request-stage tap hooks the same way. Empty unless configured.
+    let tap_hooks = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Request,
+    );
+    let tap_hooks_route = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Route,
+    );
+    let tap_hooks_attempt = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Attempt,
+    );
+    let tap_hooks_completion = routing::resolve_tap_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        config::HookStage::Completion,
+    );
+    // Resolve the global DECISION gates (non-rewrite gates in global_hooks) — fired for a verdict on
+    // every request. Empty unless configured.
+    let global_gates = routing::resolve_gate_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+
+    Ok(App {
+        lanes,
+        store,
+        by_model,
+        pools,
+        client: upstream_client.clone(),
+        auth: auth_mw.clone(),
+        rewrite_hooks,
+        tap_hooks,
+        tap_hooks_route,
+        tap_hooks_attempt,
+        tap_hooks_completion,
+        global_gates,
+        hook_registry: cfg.hooks.clone(),
+        global_hooks: cfg.global_hooks.clone(),
+        // History + rate windows are Arc-shared across applies (process-lifetime state).
+        versions: prior.map_or_else(
+            || Arc::new(admin::versions::VersionLog::new()),
+            |p| p.versions.clone(),
+        ),
+        mutation_limiter: prior.map_or_else(
+            || Arc::new(admin::rate::MutationLimiter::new()),
+            |p| p.mutation_limiter.clone(),
+        ),
+        idempotency_cache: prior.map_or_else(
+            || Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            |p| p.idempotency_cache.clone(),
+        ),
+        base_hook_names,
+        admin_chain: cfg.admin_auth.clone(),
+        credential_cache: prior.map_or_else(
+            || Arc::new(auth_cache::CredentialCache::new()),
+            |p| p.credential_cache.clone(),
+        ),
+        auth_modules: cfg
+            .auth
+            .as_ref()
+            .map(|a| a.modules.clone())
+            .unwrap_or_default(),
+        group_map: cfg.group_map.clone(),
+        config_path: config_paths.0,
+        providers_path: config_paths.1,
+        overlay_path,
+        config_version: prior.map_or(0, |p| p.config_version.wrapping_add(1)),
+        failover_cfg,
+        pool_runtime,
+        fallback_pools,
+        on_exhausted_cfgs,
+        governance,
+        default_max_tokens: cfg.limits.default_max_tokens,
+        reasoning_effort_budgets: {
+            let b = cfg.limits.reasoning_effort_budgets;
+            [b.minimal, b.low, b.medium, b.high]
+        },
+    })
+}
+
 /// Build the busbar HTTP router for a given `App` state with default limits. Factored out so the
 /// full route table + auth middleware can be exercised end-to-end in tests; production (`main`) calls
 /// `build_router_with_limits` with the operator-configured values, so this convenience wrapper is
@@ -979,6 +1239,7 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
         crate::config::DEFAULT_MAX_INBOUND_CONCURRENT,
         crate::config::DEFAULT_EMIT_SERVER_TIMING,
     )
+    .0
 }
 
 /// Router builder with EXPLICIT limits, so a test can assert the body-size and inbound-concurrency
@@ -990,18 +1251,38 @@ fn build_router_with_limits(
     request_body_max_bytes: usize,
     max_inbound_concurrent: usize,
     emit_server_timing: bool,
-) -> Router {
+) -> (Router, std::sync::Arc<state::AppHandle>) {
     let router = Router::new()
         .route("/stats", get(endpoints::stats))
         .route("/healthz", get(endpoints::healthz))
         .route("/metrics", get(metrics::handler))
-        // virtual-key management API (admin-token guarded in auth_middleware).
+        // virtual-key management API (admin-token guarded in auth_middleware). The unversioned
+        // `/admin/keys*` routes are the DEPRECATED alias (design-admin-api-v1 §0.1); the canonical
+        // frozen surface is `/admin/v1/*`. Both point at the same handlers today.
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route(
             "/admin/keys/{id}",
-            axum::routing::delete(admin::delete_key).patch(admin::update_key),
+            get(admin::get_key)
+                .delete(admin::delete_key)
+                .patch(admin::update_key),
         )
         .route("/admin/keys/{id}/usage", get(admin::key_usage))
+        // ── Admin API v1 — the FROZEN, additive-only surface tooling builds against ────────────────
+        // Keys CRUD is served here on the legacy handlers under the versioned prefix (migration into
+        // the layered service is a follow-up slice); the v1-NATIVE endpoints (`info`, and the config/
+        // hooks/auth surface as it lands) are mounted via the `AdminTransport` adapter below.
+        .route(
+            "/admin/v1/keys",
+            post(admin::create_key).get(admin::list_keys),
+        )
+        .route(
+            "/admin/v1/keys/{id}",
+            get(admin::get_key)
+                .delete(admin::delete_key)
+                .patch(admin::update_key),
+        )
+        .route("/admin/v1/keys/{id}/usage", get(admin::key_usage))
+        .route("/admin/v1/keys/{id}/rotate", post(admin::rotate_key))
         // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery, admin,
         // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
@@ -1018,9 +1299,18 @@ fn build_router_with_limits(
         .fallback(route::protocol_dispatch)
         // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
         // treatment as the 404 fallback above.
-        .method_not_allowed_fallback(method_not_allowed_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler);
+    // Mount the Admin API v1 via the ports-and-adapters transport layer (a shared typed service
+    // behind a pluggable wire format). The JSON-REST adapter is the transport today; a GraphQL / MCP /
+    // gRPC adapter later is a one-line swap here over the SAME service.
+    let router = admin::transport::mount(router, &admin::JsonV1);
+    // The router's state is a swappable `AppHandle` (the config-apply hot-swap seam). Every handler
+    // reads the CURRENT snapshot via the `CurrentApp` extractor; the auth middleware loads it too.
+    // Until an admin apply calls `swap()`, this is behaviorally identical to a fixed `Arc<App>`.
+    let handle = std::sync::Arc::new(state::AppHandle::new(app));
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
-            app.clone(),
+            handle.clone(),
             auth::auth_middleware,
         ))
         // Cap request body size (buffered before the handler) to bound per-request memory. Driven by
@@ -1041,9 +1331,12 @@ fn build_router_with_limits(
             emit_server_timing,
             server_timing,
         ))
-        .with_state(app);
+        .with_state(handle.clone());
 
-    apply_inbound_concurrency_limit(router, max_inbound_concurrent)
+    (
+        apply_inbound_concurrency_limit(router, max_inbound_concurrent),
+        handle,
+    )
 }
 
 /// OUTERMOST inbound-concurrency cap. `max_inbound_concurrent == 0` (the default) returns the router
@@ -1153,8 +1446,9 @@ mod tests {
             failover: None,
             on_exhausted: None,
             affinity: None,
-            route: crate::config::RouteKind::default(),
-            policy: None,
+            policy: crate::config::PoolPolicy::default(),
+            gates: Vec::new(),
+            base_named: false,
         }
     }
 
@@ -1221,29 +1515,24 @@ mod tests {
 
     #[test]
     fn test_open_relay_banner_distinguishes_absent_vs_explicit_none() {
-        // Absent `auth:` block: banner must flag the silent open-relay foot-gun.
-        let absent = open_relay_banner(Some(auth::AuthMode::None), false)
-            .expect("mode=none must produce a banner");
+        // Absent `auth:` block (empty chain): banner must flag the silent open-relay foot-gun.
+        let absent = open_relay_banner(true, false).expect("empty chain must produce a banner");
         assert!(
             absent.contains("OPEN RELAY") && absent.contains("no `auth:` block"),
             "absent-auth banner must call out the missing block; got: {absent}"
         );
-        // Explicit mode: none: still an open relay, but the operator opted in.
-        let explicit = open_relay_banner(Some(auth::AuthMode::None), true)
-            .expect("explicit none must produce a banner");
+        // Explicit empty chain: still an open relay, but the operator opted in.
+        let explicit = open_relay_banner(true, true).expect("explicit empty chain must banner");
         assert!(
-            explicit.contains("OPEN RELAY") && explicit.contains("auth.mode=none"),
-            "explicit-none banner must reference auth.mode=none; got: {explicit}"
+            explicit.contains("OPEN RELAY") && explicit.contains("auth.chain is empty"),
+            "explicit-empty banner must reference auth.chain is empty; got: {explicit}"
         );
     }
 
     #[test]
     fn test_open_relay_banner_silent_when_auth_engaged() {
-        // Token / passthrough modes (and an unparseable mode, already rejected by validation) emit
-        // nothing — the banner is exclusively for the open-relay state.
-        assert!(open_relay_banner(Some(auth::AuthMode::Token), true).is_none());
-        assert!(open_relay_banner(Some(auth::AuthMode::Passthrough), true).is_none());
-        assert!(open_relay_banner(None, true).is_none());
+        // A non-empty chain emits nothing — the banner is exclusively for the open-relay state.
+        assert!(open_relay_banner(false, true).is_none());
     }
 
     /// The fallback handlers infer the ingress protocol from the

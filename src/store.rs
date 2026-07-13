@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,6 +30,23 @@ const MAX_HONORED_RETRY_AFTER_SECS: u64 = crate::config::DEFAULT_MAX_HONORED_RET
 const ST_CLOSED: u64 = 0;
 const ST_OPEN: u64 = 1;
 const ST_HALF_OPEN: u64 = 2;
+
+/// Normalize a breaker state being RESTORED from a snapshot (or inherited by a sibling cell):
+/// `ST_HALF_OPEN` becomes `ST_OPEN`. A restored HalfOpen cell has `probe_in_flight == false` (the
+/// snapshot never carries it, and the restore path never sets it), and both `cell_ready_breaker` and
+/// `cell_acquire_breaker` reject HalfOpen unconditionally — so the cell WEDGES: no dispatch can acquire
+/// it and no probe outcome (`cell_open`/`cell_closed`) ever runs against it, benching that (pool, lane)
+/// until an out-of-band `recover_lane` touches it (indefinitely when health probing is disabled).
+/// Restoring `ST_OPEN` instead lets the restored (already-expired) cooldown drive a fresh probe
+/// acquisition on the cell's first request. (found: audit c1r6 — restore lacked the sibling-create
+/// path's existing normalization.)
+fn restored_breaker_state(state: u64) -> u64 {
+    if state == ST_HALF_OPEN {
+        ST_OPEN
+    } else {
+        state
+    }
+}
 
 // Bounded capacity of each cell's sliding outcome window (recent request outcomes for the
 // error-rate trip computation).
@@ -145,6 +162,51 @@ pub(crate) struct LaneSnapshot {
 
 /// StateStore trait - the seam for lane state access.
 /// Operations, NOT field access. `lane: usize` identifies a member.
+/// One lane's PORTABLE health state, keyed by its STABLE IDENTITY (model + provider) instead of
+/// its array position (D1). This is the carrier that lets learned reliability state survive the
+/// two events that invalidate positional indexing: a config APPLY that changes the lane set (the
+/// new store is built with the surviving lanes' snapshots restored), and — via serde, for the D3
+/// persistence follow-up — a RESTART. Ephemeral state is deliberately NOT carried: semaphores /
+/// in-flight counts (empty by definition in a fresh store), the single-flight probe flag (reset —
+/// an in-flight probe records into the OLD store snapshot it was dispatched under), SWRR fairness
+/// counters (positional by nature; reset is harmless), and the rolling outcome windows (strictly
+/// time-windowed — they refill within seconds and carrying them would import stale samples).
+// Bin-target consumer is the config-apply core (next slice); tests exercise it now.
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LaneHealthSnapshot {
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    /// Remaining lifetime request budget (`-1` = unlimited).
+    pub(crate) budget: i64,
+    /// Default-cell breaker: FSM state, cooldown deadline (unix secs), consecutive-error streak.
+    pub(crate) breaker_state: u64,
+    pub(crate) cooldown_until: u64,
+    pub(crate) streak: u32,
+    /// Lane-global hard-down latch + reason.
+    pub(crate) dead: bool,
+    pub(crate) dead_reason: String,
+    /// Lifetime counters (feed /stats continuity).
+    pub(crate) ok: u64,
+    pub(crate) err: u64,
+    pub(crate) client_fault: u64,
+    /// Latency EWMA (raw f64 bits; 0 = no sample).
+    pub(crate) latency_ewma_bits: u64,
+    /// Per-(pool) breaker cells for this lane.
+    pub(crate) cells: Vec<PoolCellHealthSnapshot>,
+}
+
+/// One per-pool breaker cell's portable state (the FSM triple; windows/probe/SWRR stay ephemeral).
+#[allow(dead_code)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PoolCellHealthSnapshot {
+    pub(crate) pool: String,
+    pub(crate) breaker_state: u64,
+    pub(crate) cooldown_until: u64,
+    pub(crate) streak: u32,
+    pub(crate) err: u64,
+}
+
 pub(crate) trait StateStore: Send + Sync + 'static {
     // ── Health queries ─────────────────────────────────────────────────────────────────────────
     // The bare `lane` methods operate on the lane-default cell (direct/ad-hoc routes, `/stats`);
@@ -398,6 +460,15 @@ pub(crate) trait StateStore: Send + Sync + 'static {
 
     // stats snapshot for /stats
     fn snapshot(&self, lane: usize, now: u64) -> LaneSnapshot;
+
+    /// Export every lane's PORTABLE health state, keyed by stable identity (D1) — the input to a
+    /// state-carrying store rebuild (config apply) and to the persistence snapshotter (D3).
+    fn export_health(&self) -> Vec<LaneHealthSnapshot>;
+
+    /// Restore health state IN PLACE by stable identity (D3 boot restore — runs before the first
+    /// request is served). Lanes without a matching snapshot are untouched; snapshots without a
+    /// matching lane are dropped.
+    fn restore_health(&self, restored: &[LaneHealthSnapshot]);
 }
 
 /// Bounded sliding window of recent request outcomes, each tagged success/error, used to compute
@@ -475,6 +546,76 @@ struct BreakerCell {
     // (`cell_ready_breaker`/`cell_acquire_breaker` selection) does NOT take this lock — it stays
     // lock-free; only the (comparatively rare) transitions serialize against each other.
     transition_lock: std::sync::Mutex<()>,
+}
+
+impl InMemoryStore {
+    /// The identity-keyed restore shared by the state-carrying constructor (config apply) and the
+    /// in-place boot restore (D3): apply each matching snapshot's lane-global fields and recreate
+    /// its per-pool breaker cells eagerly (a restored Open cell blocks dispatch from request one).
+    fn restore_health_impl(&self, restored: &[LaneHealthSnapshot]) {
+        for (idx, lane) in self.lanes.iter().enumerate() {
+            let Some(snap) = restored
+                .iter()
+                .find(|s| s.model == lane.model && s.provider == lane.provider)
+            else {
+                continue;
+            };
+            // Carry over the remaining request budget ONLY when BOTH the snapshot and the new lane
+            // are limited, and never above the NEW cap. `export_health` writes the sentinel -1 for
+            // an unlimited lane; if the new config just ADDED `max_requests` to a lane that was
+            // unlimited at snapshot time, storing that -1 over the freshly-set cap would make
+            // `lane_admissible` (`limited && budget <= 0`) reject every dispatch with NO
+            // self-recovery path (the budget only rises on a successful dispatch, which is itself
+            // gated on admissibility). And if the operator LOWERED `max_requests`, the prior
+            // (larger) remaining budget must be clamped to the freshly-set cap the constructor
+            // already stored — otherwise the lane over-serves by up to (old_remaining - new_cap),
+            // silently blowing past the operator's newly-lowered hard ceiling. `min` with the
+            // current atomic (which holds the new cap at this point) handles same-cap and
+            // cap-increase carry-over unchanged while capping a reduction.
+            if lane.limited && snap.budget >= 0 {
+                let new_cap = lane.budget.load(Ordering::Relaxed);
+                lane.budget
+                    .store(snap.budget.min(new_cap), Ordering::Relaxed);
+            }
+            lane.breaker_state.store(
+                restored_breaker_state(snap.breaker_state),
+                Ordering::Relaxed,
+            );
+            lane.cooldown_until
+                .store(snap.cooldown_until, Ordering::Relaxed);
+            lane.streak.store(snap.streak, Ordering::Relaxed);
+            lane.dead.store(snap.dead, Ordering::Relaxed);
+            *lane.dead_reason.lock().unwrap_or_else(|e| e.into_inner()) = snap.dead_reason.clone();
+            lane.ok.store(snap.ok, Ordering::Relaxed);
+            lane.err.store(snap.err, Ordering::Relaxed);
+            lane.client_fault
+                .store(snap.client_fault, Ordering::Relaxed);
+            lane.latency_ewma_bits
+                .store(snap.latency_ewma_bits, Ordering::Relaxed);
+            let mut map = self.pool_cells.write().unwrap_or_else(|e| e.into_inner());
+            let cells = map.entry(idx).or_default();
+            for cs in &snap.cells {
+                // In-place restore may find the cell already lazily created — restore INTO it.
+                if let Some((_, cell)) = cells.iter().find(|(p, _)| p.as_ref() == cs.pool) {
+                    cell.breaker_state
+                        .store(restored_breaker_state(cs.breaker_state), Ordering::Relaxed);
+                    cell.cooldown_until
+                        .store(cs.cooldown_until, Ordering::Relaxed);
+                    cell.streak.store(cs.streak, Ordering::Relaxed);
+                    cell.err.store(cs.err, Ordering::Relaxed);
+                } else {
+                    let cell = Arc::new(BreakerCell::new());
+                    cell.breaker_state
+                        .store(restored_breaker_state(cs.breaker_state), Ordering::Relaxed);
+                    cell.cooldown_until
+                        .store(cs.cooldown_until, Ordering::Relaxed);
+                    cell.streak.store(cs.streak, Ordering::Relaxed);
+                    cell.err.store(cs.err, Ordering::Relaxed);
+                    cells.push((cs.pool.clone().into_boxed_str(), cell));
+                }
+            }
+        }
+    }
 }
 
 impl BreakerCell {
@@ -744,6 +885,30 @@ impl InMemoryStore {
         }
     }
 
+    /// Construct with PRIOR HEALTH STATE restored by stable lane identity (D1): each lane whose
+    /// (model, provider) appears in `restored` starts with that snapshot's breaker/cooldown/streak/
+    /// hard-down/latency/counters instead of fresh state — the carry-over that makes a lane-set
+    /// config APPLY (and, via the persistence layer, a restart) preserve learned reliability.
+    /// Matching is by IDENTITY, never position, so added/removed/reordered lanes are immune to the
+    /// index-shift misattribution this design exists to prevent. Unmatched snapshots are dropped
+    /// (their lane no longer exists); unmatched lanes start fresh (they are new). `LaneData`
+    /// baseline fields (budget/cooldown/streak/dead/counters) are OVERRIDDEN by a matching
+    /// snapshot — the snapshot IS the live truth the previous store held; per-pool cells are
+    /// re-created eagerly so a restored Open cell blocks dispatch from the first request.
+    // Bin-target consumer is the config-apply core (next slice); the carry-over tests use it now.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_limits_restored(
+        lanes: Vec<LaneData>,
+        hard_down_cooldown_secs: u64,
+        max_honored_retry_after_secs: u64,
+        restored: &[LaneHealthSnapshot],
+    ) -> Self {
+        let store =
+            Self::new_with_limits(lanes, hard_down_cooldown_secs, max_honored_retry_after_secs);
+        store.restore_health_impl(restored);
+        store
+    }
+
     fn get_lane(&self, lane: usize) -> &Arc<LaneState> {
         &self.lanes[lane]
     }
@@ -885,9 +1050,15 @@ impl InMemoryStore {
         let mut duration = if streak == 0 {
             cfg.base_cooldown_secs
         } else {
+            // `base * 2^streak`, saturating. NOTE: `checked_shl` only guards the shift COUNT (>= 64),
+            // NOT value overflow — `10u64.checked_shl(63)` is `Some(0)` (the high bits shift out), so
+            // an even `base_cooldown_secs` at `streak >= 63` WRAPPED TO 0, giving a zero cooldown
+            // (tripped cell re-admits instantly) exactly when the lane is failing hardest. Compute in
+            // u128 (base < 2^64, shift <= 63 → product < 2^127, no overflow) then saturate to u64.
+            // (found: audit c2r3.)
             let shift = streak.min(63);
-            cfg.base_cooldown_secs
-                .checked_shl(shift)
+            let shifted = (cfg.base_cooldown_secs as u128) << shift;
+            u64::try_from(shifted)
                 .unwrap_or(u64::MAX)
                 .min(cfg.max_cooldown_secs)
         };
@@ -948,7 +1119,12 @@ impl InMemoryStore {
                 duration.saturating_sub(jitter.unsigned_abs())
             };
             duration = jittered.clamp(
-                duration / 2, // At least half of base
+                // At least half of base, but NEVER below 1s. For `base_cooldown_secs = 1` (the
+                // minimum config_validate permits) the integer floor `1/2` truncates to 0, and a
+                // −1 jitter draw (~1/3 of trips) then produced a ZERO cooldown — the tripped cell
+                // re-admits instantly (`now >= cooldown_until`), the exact zero-backoff outcome the
+                // validator rejects a static `base_cooldown_secs = 0` to prevent. (found: audit c2r1.)
+                (duration / 2).max(1),
                 cfg.max_cooldown_secs,
             );
         }
@@ -1480,6 +1656,8 @@ pub(crate) struct LaneData {
     pub(crate) attempt_timeout_ms: Option<u64>,
     /// Operator-declared reasoning-capability flag (see `ModelCfg::reasoning`).
     pub(crate) reasoning: bool,
+    /// Operator-declared prompt-caching capability flag (see `ModelCfg::prompt_caching`).
+    pub(crate) prompt_caching: bool,
 }
 
 /// Helper for weighted selection tests - creates a lane with specific weight.
@@ -1502,6 +1680,7 @@ fn make_lane_data_with_weight(id: usize, max_permits: usize) -> (LaneData, u32) 
         upstream_model: None,
         attempt_timeout_ms: None,
         reasoning: false,
+        prompt_caching: false,
     };
     (lane, (id as u32) + 1) // weight = id + 1 (so lane 0 has weight 1, lane 1 has weight 2, etc.)
 }
@@ -2333,6 +2512,52 @@ impl StateStore for InMemoryStore {
         }
     }
 
+    fn restore_health(&self, restored: &[LaneHealthSnapshot]) {
+        self.restore_health_impl(restored);
+    }
+
+    fn export_health(&self) -> Vec<LaneHealthSnapshot> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .map(|(idx, ls)| LaneHealthSnapshot {
+                model: ls.model.clone(),
+                provider: ls.provider.clone(),
+                budget: if ls.limited {
+                    ls.budget.load(Ordering::Relaxed)
+                } else {
+                    -1
+                },
+                breaker_state: ls.breaker_state.load(Ordering::Relaxed),
+                cooldown_until: ls.cooldown_until.load(Ordering::Relaxed),
+                streak: ls.streak.load(Ordering::Relaxed),
+                dead: ls.dead.load(Ordering::Relaxed),
+                dead_reason: lock_recover(&ls.dead_reason).clone(),
+                ok: ls.ok.load(Ordering::Relaxed),
+                err: ls.err.load(Ordering::Relaxed),
+                client_fault: ls.client_fault.load(Ordering::Relaxed),
+                latency_ewma_bits: ls.latency_ewma_bits.load(Ordering::Relaxed),
+                cells: {
+                    let map = self.pool_cells.read().unwrap_or_else(|e| e.into_inner());
+                    map.get(&idx)
+                        .map(|cells| {
+                            cells
+                                .iter()
+                                .map(|(pool, cell)| PoolCellHealthSnapshot {
+                                    pool: pool.to_string(),
+                                    breaker_state: cell.breaker_state.load(Ordering::Relaxed),
+                                    cooldown_until: cell.cooldown_until.load(Ordering::Relaxed),
+                                    streak: cell.streak.load(Ordering::Relaxed),
+                                    err: cell.err.load(Ordering::Relaxed),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                },
+            })
+            .collect()
+    }
+
     // SWRR selection over the healthy subset (ADR-0001 algorithm). Uses the lane-default cells.
     #[cfg(test)]
     fn select_weighted(&self, candidates: &[usize], weights: &[u32], now: u64) -> Option<usize> {
@@ -2442,7 +2667,197 @@ mod tests {
             upstream_model: None,
             attempt_timeout_ms: None,
             reasoning: false,
+            prompt_caching: false,
         }
+    }
+
+    /// D1 CARRY-OVER: health state follows the lane's stable IDENTITY across a store rebuild —
+    /// not its array position. A tripped per-pool breaker, hard-down latch, latency EWMA, and
+    /// counters all survive a rebuild that REORDERS the lane set and inserts a new lane in front;
+    /// the new lane starts fresh; a removed lane's snapshot is dropped.
+    #[test]
+    fn test_health_state_follows_identity_across_rebuild() {
+        set_now_for_test(1000);
+        // Store A: lanes [model-0, model-1] at idx 0/1.
+        let a = InMemoryStore::new(vec![make_lane_data(0, 10), make_lane_data(1, 10)]);
+        let cfg = BreakerCfg::default();
+        // Trip model-1's breaker in pool "p" (error-rate: 5/5 >= 0.5) + teach it a latency.
+        for _ in 0..5 {
+            a.record_transient_in("p", 1, "5xx", &cfg, None);
+        }
+        assert!(!a.ready_in("p", 1, 1000), "model-1 tripped in pool p");
+        a.record_latency_in("p", 1, 123.0);
+        let snaps = a.export_health();
+        assert_eq!(snaps.len(), 2);
+        let s1 = snaps.iter().find(|s| s.model == "model-1").unwrap();
+        assert!(
+            !s1.cells.is_empty(),
+            "the tripped pool cell must be exported"
+        );
+
+        // Store B: model-9 (NEW) first, then model-1 — model-1 moved from idx 1 to idx 1→? and
+        // model-0 was REMOVED. Restore from A's snapshots.
+        let b = InMemoryStore::new_with_limits_restored(
+            vec![make_lane_data(9, 10), make_lane_data(1, 10)],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        // model-1 (now idx 1 in a DIFFERENT lane set) is still tripped in pool "p".
+        assert!(
+            !b.ready_in("p", 1, 1000),
+            "the tripped breaker must follow model-1's identity into the new store"
+        );
+        // Its latency EWMA survived too.
+        assert_eq!(
+            b.lane_latency_ms(1),
+            a.lane_latency_ms(1),
+            "latency EWMA carries by identity"
+        );
+        // The NEW lane (idx 0) starts completely fresh.
+        assert!(b.ready_in("p", 0, 1000), "a new lane starts fresh");
+        assert_eq!(b.lane_latency_ms(0), None, "no inherited latency");
+        // model-0's snapshot had no surviving lane — dropped without error.
+        let b_snaps = b.export_health();
+        assert!(b_snaps.iter().all(|s| s.model != "model-0"));
+
+        // And the carried state keeps EVOLVING normally: cooldown expiry recovers the lane.
+        set_now_for_test(1000 + 24 * 3600);
+        assert!(
+            b.usable_in("p", 1, 1000 + 24 * 3600),
+            "a restored cooldown still expires on schedule (usable_in performs the \
+             Open->HalfOpen probe transition)"
+        );
+    }
+
+    /// D1: a restored HARD-DOWN latch (dead + reason) survives the rebuild and keeps blocking.
+    #[test]
+    fn test_hard_down_follows_identity_across_rebuild() {
+        set_now_for_test(5000);
+        let a = InMemoryStore::new(vec![make_lane_data(3, 4)]);
+        a.record_hard_down(0, "auth rejected (HTTP 401)");
+        assert!(!a.usable(0, 5000), "hard-down blocks the default cell");
+        let snaps = a.export_health();
+        let b = InMemoryStore::new_with_limits_restored(
+            vec![make_lane_data(3, 4)],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        assert!(!b.usable(0, 5000), "hard-down must survive the rebuild");
+        let restored = &b.export_health()[0];
+        // Hard-down is recoverable-by-design (sticky Open + cooldown, NOT the dead latch); the
+        // reason string + the default-cell Open state are what carry.
+        assert_eq!(restored.dead_reason, "auth rejected (HTTP 401)");
+    }
+
+    /// REGRESSION (audit c1r6): a snapshot captured while a lane's single-flight probe was in flight
+    /// carries `ST_HALF_OPEN`. Restoring it verbatim WEDGES the cell (HalfOpen is rejected by both
+    /// `cell_ready_breaker`/`cell_acquire_breaker` and no probe outcome ever runs against a restored
+    /// cell whose `probe_in_flight` is false), benching the lane forever when health probing is off.
+    /// Restore must normalize HalfOpen → Open (the sibling-create path already did).
+    #[test]
+    fn restored_halfopen_state_normalizes_to_open() {
+        // The pure helper both restore sites share.
+        assert_eq!(restored_breaker_state(ST_HALF_OPEN), ST_OPEN);
+        assert_eq!(restored_breaker_state(ST_OPEN), ST_OPEN);
+        assert_eq!(restored_breaker_state(ST_CLOSED), ST_CLOSED);
+
+        // End to end: a snapshot with a HalfOpen lane-global state restores as Open, not wedged.
+        set_now_for_test(9000);
+        let a = InMemoryStore::new(vec![make_lane_data(3, 4)]);
+        let mut snaps = a.export_health();
+        snaps[0].breaker_state = ST_HALF_OPEN; // as if captured mid-probe
+        let b = InMemoryStore::new_with_limits_restored(
+            vec![make_lane_data(3, 4)],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        assert_eq!(
+            b.get_lane(0).breaker_state.load(Ordering::Relaxed),
+            ST_OPEN,
+            "a restored HalfOpen must become Open, or the lane wedges and never self-recovers"
+        );
+    }
+
+    /// REGRESSION (audit c1r7): `restore_health_impl` must not overwrite a newly-LIMITED lane's cap
+    /// with the unlimited sentinel (-1) a prior UNLIMITED snapshot carries. `export_health` writes -1
+    /// for an unlimited lane; if the operator later adds `max_requests` to that lane, blindly storing
+    /// -1 over the fresh cap makes `lane_admissible` (`limited && budget <= 0`) reject EVERY dispatch
+    /// with no self-recovery. Restore is gated on `lane.limited && snap.budget >= 0`.
+    #[test]
+    fn restore_does_not_clobber_new_limit_with_unlimited_sentinel() {
+        set_now_for_test(9000);
+        // Snapshot taken while the lane was UNLIMITED → exports budget -1.
+        let unlimited = InMemoryStore::new(vec![make_lane_data(3, 4)]);
+        let snaps = unlimited.export_health();
+        assert_eq!(
+            snaps[0].budget, -1,
+            "an unlimited lane exports the -1 sentinel"
+        );
+
+        // New config ADDS max_requests to the same identity (model-3/provider-3).
+        let limited_ld = LaneData {
+            limited: true,
+            budget: 100,
+            ..make_lane_data(3, 4)
+        };
+        let restored = InMemoryStore::new_with_limits_restored(
+            vec![limited_ld],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        assert_eq!(
+            restored.get_lane(0).budget.load(Ordering::Relaxed),
+            100,
+            "the fresh cap must survive; the unlimited -1 sentinel must NOT clobber it (lane would wedge)"
+        );
+        assert!(
+            restored.usable(0, 9000),
+            "the newly-limited lane must remain admissible, not permanently benched"
+        );
+
+        // And a genuine limited→limited carry-over still copies the REMAINING budget.
+        let mut spent = snaps.clone();
+        spent[0].budget = 40; // as if 60 of 100 were already spent before the snapshot
+        let carried = InMemoryStore::new_with_limits_restored(
+            vec![LaneData {
+                limited: true,
+                budget: 100,
+                ..make_lane_data(3, 4)
+            }],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &spent,
+        );
+        assert_eq!(
+            carried.get_lane(0).budget.load(Ordering::Relaxed),
+            40,
+            "limited→limited must carry the remaining budget, not reset to the full cap"
+        );
+
+        // REGRESSION (audit c1r8): a LOWERED cap must CLAMP the carried remaining budget — carrying a
+        // larger old remaining over a smaller new cap would over-serve past the operator's new hard
+        // ceiling. old cap 500, 100 served → snap remaining 400; new cap 300 → must clamp to 300.
+        let mut over = snaps.clone();
+        over[0].budget = 400;
+        let clamped = InMemoryStore::new_with_limits_restored(
+            vec![LaneData {
+                limited: true,
+                budget: 300, // operator LOWERED max_requests
+                ..make_lane_data(3, 4)
+            }],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &over,
+        );
+        assert_eq!(
+            clamped.get_lane(0).budget.load(Ordering::Relaxed),
+            300,
+            "a carried remaining above the NEW cap must clamp to the cap, not over-serve"
+        );
     }
 
     #[test]
@@ -2540,6 +2955,76 @@ mod tests {
     /// and the streak CANNOT advance while we hold it (stays 0). The OLD code bumped the streak before
     /// taking the lock, so the streak would advance to 1 even while the lock is held — this assertion
     /// fails against the old code and passes after the fix.
+    /// REGRESSION (audit c2r1): with `base_cooldown_secs = 1` (the minimum config_validate permits),
+    /// the ±10% jitter can draw −1, and the clamp floor `duration / 2 = 1/2` truncates to 0 — so a
+    /// tripped cell got a ZERO cooldown and re-admitted instantly (`now >= cooldown_until`), the exact
+    /// zero-backoff the validator rejects a static `base = 0` to prevent. The floor is now
+    /// `(duration/2).max(1)`. Sweep the jitter seed (via the test clock) so the −1 draw is exercised;
+    /// the cooldown must NEVER be 0.
+    #[test]
+    fn cooldown_never_zero_for_base_one() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let lane = store.get_lane(0).clone();
+        assert_eq!(lane.streak().load(Ordering::Relaxed), 0);
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 1,
+            max_cooldown_secs: 1000,
+            honor_retry_after: false,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                consecutive_n: 2,
+            },
+        };
+        // span = 3 for base=1, so ~1/3 of seeds draw jitter −1; the sweep is guaranteed to hit it.
+        for t in 0..600u64 {
+            set_now_for_test(t);
+            let cd = InMemoryStore::compute_cooldown_with_retry_after(&*lane, t, &cfg, None, 3600);
+            assert!(
+                cd >= 1,
+                "base_cooldown_secs=1 must never yield a 0 cooldown (t={t} gave {cd})"
+            );
+        }
+    }
+
+    /// REGRESSION (audit c2r3): the exponential backoff `base * 2^streak` must SATURATE, never wrap.
+    /// `checked_shl` guards only the shift COUNT (>= 64), not value overflow — `10u64.checked_shl(63)`
+    /// is `Some(0)` — so an EVEN `base_cooldown_secs` at a high streak wrapped to a ZERO cooldown
+    /// (tripped cell re-admits instantly) exactly when the lane is failing hardest.
+    #[test]
+    fn backoff_saturates_not_wraps_at_high_streak() {
+        set_now_for_test(0);
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let lane = store.get_lane(0).clone();
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 10, // EVEN base — the wrap-to-0 case
+            max_cooldown_secs: 3600,
+            honor_retry_after: false,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                consecutive_n: 2,
+            },
+        };
+        // Drive the streak to the danger zone (>= 63) and sweep the jitter seed.
+        for streak in [63u32, 64, 100, 1000] {
+            lane.streak().store(streak, Ordering::Relaxed);
+            for t in 0..80u64 {
+                set_now_for_test(t);
+                let cd =
+                    InMemoryStore::compute_cooldown_with_retry_after(&*lane, t, &cfg, None, 3600);
+                assert!(
+                    cd >= 1,
+                    "even base at streak {streak} must saturate toward max, never wrap to 0 (t={t} gave {cd})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_streak_bump_is_serialized_under_transition_lock() {
         set_now_for_test(1000);

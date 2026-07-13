@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Anthropic `RequestHandler`. Chat-only today (Anthropic ships no embeddings/images/audio API here);
 //! its non-chat operations stay `None` = no-handler 404. Chat dispatches through the same registry as

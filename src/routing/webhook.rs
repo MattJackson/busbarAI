@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The `webhook` routing transport — an operator-run HTTP sidecar that ranks pool members.
 //!
@@ -32,6 +32,27 @@
 use super::{Candidate, PolicyResult, RoutingContext, RoutingPolicy, RoutingRequest};
 use std::time::Duration;
 
+/// A hostile or buggy sidecar must never drive unbounded allocation on the busbar server: EVERY
+/// webhook response body — decide, configure, describe — is read through this 64 KiB cap. Mirrors
+/// the socket transport's `MAX_REPLY_BYTES`.
+const MAX_WEBHOOK_RESP_BYTES: usize = 64 * 1024;
+
+/// Read a webhook response body with the 64 KiB cap, aborting (rather than allocating) past it.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, super::PolicyError> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| -> super::PolicyError {
+        format!("webhook response read failed: {e}").into()
+    })? {
+        if buf.len() + chunk.len() > MAX_WEBHOOK_RESP_BYTES {
+            return Err(
+                format!("webhook response exceeded {MAX_WEBHOOK_RESP_BYTES} byte cap").into(),
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// A `WebhookPolicy` POSTs the request projection to an operator sidecar and returns the ranked
 /// order. Holds a clone of the SHARED upstream `reqwest::Client` (reused, not freshly built) so the
 /// connection pool and the `redirect::none` SSRF posture are inherited. The URL is validated at
@@ -49,31 +70,20 @@ impl WebhookPolicy {
     pub(crate) fn new(url: String, client: reqwest::Client) -> Self {
         Self { url, client }
     }
-}
 
-#[async_trait::async_trait]
-impl RoutingPolicy for WebhookPolicy {
-    async fn decide(
+    /// POST the request projection to the sidecar and parse the reply into a `HookResponse` (shared
+    /// by `decide` and `transform`). Bounded by `budget`; a non-2xx / oversize / malformed / timed-out
+    /// response surfaces as `Err`. Read under a TIGHT cap (a hostile sidecar must not drive unbounded
+    /// allocation) and depth-guarded parse (MAX_JSON_DEPTH). Parse errors are length-only (a sidecar
+    /// echoing prompt content into a malformed reply must not splash it into operator logs).
+    async fn send(
         &self,
         req: &RoutingRequest<'_>,
         candidates: &[Candidate<'_>],
         ctx: &RoutingContext<'_>,
         budget: Duration,
-    ) -> PolicyResult {
-        // Build the ONE shared hook wire projection (`routing::wire`) — identical for every
-        // out-of-process transport, so a hook moves between webhook and socket without changes.
-        let body = super::wire::build(req, candidates, ctx);
-
-        // Serialize the projection with `serde_json` and POST it as a raw body. We do NOT use
-        // reqwest's `.json()` helper because the request-path build does not enable reqwest's `json`
-        // feature (only the in-crate test harness does); marshaling by hand keeps the runtime
-        // dependency set unchanged — mirrors the `observability::fire_request_log` pattern.
-        let payload = serde_json::to_vec(&body)?;
-
-        // Hard per-decision timeout from policy config: the request `.timeout(budget)` gives up at the
-        // wall-clock deadline. The caller ALSO wraps `decide` in its own `tokio::time::timeout`; a
-        // reqwest timeout surfaces here as an `Err`, which the caller coerces to `on_error`. Either
-        // way a slow sidecar never blocks the served request.
+    ) -> Result<super::wire::HookResponse, super::PolicyError> {
+        let payload = serde_json::to_vec(&super::wire::build(req, candidates, ctx))?;
         let resp = self
             .client
             .post(&self.url)
@@ -85,43 +95,132 @@ impl RoutingPolicy for WebhookPolicy {
             .timeout(budget)
             .send()
             .await?;
+        let resp = resp.error_for_status()?;
+        let buf = read_capped(resp).await?;
+        crate::json::parse(&buf)
+            .map_err(|_| -> super::PolicyError { crate::json::parse_err_log(buf.len()).into() })
+    }
+}
 
-        // A non-2xx sidecar response is an error → coerced to `on_error` by the caller. We do not try
-        // to parse an error body as an order.
-        let mut resp = resp.error_for_status()?;
-
-        // A malformed/non-JSON body surfaces as `Err` → `on_error`. A well-formed body with an absent/
-        // empty `order` (or `abstain: true`) is the clean Abstain path. Read the body under a TIGHT cap
-        // — a routing decision is a short list of indices, so a hostile/buggy sidecar returning a huge
-        // body must not drive unbounded allocation (mirrors the forwarding path's capped reads). Stream
-        // chunks and abort past the cap → Err → coerced to `on_error`. Parse with `serde_json` (the
-        // request-path build has no reqwest `json` feature).
-        const MAX_WEBHOOK_RESP_BYTES: usize = 64 * 1024;
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
-            if buf.len() + chunk.len() > MAX_WEBHOOK_RESP_BYTES {
-                return Err(
-                    format!("webhook response exceeded {MAX_WEBHOOK_RESP_BYTES} byte cap").into(),
-                );
-            }
-            buf.extend_from_slice(&chunk);
-        }
-        // Parse through the `crate::json` depth-guard seam (MAX_JSON_DEPTH=128) so a hostile/buggy
-        // sidecar returning a pathologically nested body is rejected as `Err` (→ `on_error`) BEFORE a
-        // recursive deserialize can blow the stack — same guard the forwarding path uses. The 64 KiB
-        // cap above bounds size; this bounds nesting depth. Normalization (abstain / drop unknown
-        // idxs / dedup / empty → Abstain) is the shared `wire::normalize`, same as every transport.
-        // The parse error is REPLACED with a length-only message (`parse_err_log`): the raw
-        // sonic-rs Display embeds a fragment of the offending reply bytes, and this `Err` flows
-        // into `decide_policy_order`'s warn log — a sidecar that echoes prompt content into a
-        // malformed reply must not splash it into operator logs.
-        let parsed: super::wire::HookResponse =
-            crate::json::parse(&buf).map_err(|_| crate::json::parse_err_log(buf.len()))?;
+#[async_trait::async_trait]
+impl RoutingPolicy for WebhookPolicy {
+    async fn decide(
+        &self,
+        req: &RoutingRequest<'_>,
+        candidates: &[Candidate<'_>],
+        ctx: &RoutingContext<'_>,
+        budget: Duration,
+    ) -> PolicyResult {
+        // POST the shared wire projection via the `send` helper (identical for every out-of-process
+        // transport), then apply the shared normalizer (abstain / drop unknown idxs / dedup / empty →
+        // Abstain). A slow/errored/malformed sidecar surfaces as `Err` → the caller's `on_error`.
+        let parsed = self.send(req, candidates, ctx, budget).await?;
         Ok(super::wire::normalize(parsed, candidates))
     }
 
     fn name(&self) -> &'static str {
         "webhook"
+    }
+
+    /// REWRITE transform: POST the request projection, return the sidecar's `rewrite` reply.
+    /// FAIL-CLOSED — ANY error (timeout, non-2xx, malformed, no/empty rewrite) yields `None`, so the
+    /// caller proceeds with the ORIGINAL body. A rewrite hook reads the `request` projection, not the
+    /// candidate set, so an empty candidate list is sent.
+    #[allow(dead_code)] // dispatched by the forward global-hooks transform seam next (slice-4 step)
+    async fn transform(
+        &self,
+        req: &RoutingRequest<'_>,
+        budget: Duration,
+    ) -> Option<super::wire::RewriteReply> {
+        let empty: [Candidate<'_>; 0] = [];
+        let ctx = RoutingContext {
+            pool: req.pool,
+            budget_remaining: None,
+        };
+        let parsed = self.send(req, &empty, &ctx, budget).await.ok()?;
+        super::wire::parse_rewrite(&parsed.rewrite?)
+    }
+
+    /// TAP: fire-and-forget POST of the pre-serialized projection. The response is NOT read (a tap is
+    /// write-only). Bounded by `budget`; any error is swallowed — a tap never affects the request.
+    async fn configure(
+        &self,
+        hook_name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+        settings_version: u64,
+        budget: Duration,
+    ) -> Result<(), super::PolicyError> {
+        // HTTP is stateless — configure is a plain POST of the same body the socket wire frames;
+        // 2xx with an ack body = committed. (No per-connection preamble exists for webhooks; the
+        // PATCH push is the delivery, documented.)
+        let msg = super::wire::ConfigureMsg {
+            configure: super::wire::ConfigureBody {
+                hook: hook_name,
+                settings,
+                settings_version,
+                busbar_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let body = serde_json::to_vec(&msg)
+            .map_err(|e| -> super::PolicyError { format!("serialize configure: {e}").into() })?;
+        // `.timeout(budget)` on the builder (not an outer `tokio::time::timeout` around only
+        // `send()`) so the deadline also covers the BODY-read phase — a slow/dribbling ack body must
+        // not stall `configure` for the client-level total timeout (default 300s). (found: audit c2r2.)
+        let resp = self
+            .client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(budget)
+            .send()
+            .await
+            .map_err(|e| -> super::PolicyError { format!("configure POST failed: {e}").into() })?;
+        if !resp.status().is_success() {
+            return Err(format!("configure rejected: HTTP {}", resp.status()).into());
+        }
+        let bytes = read_capped(resp).await?;
+        let ack: super::wire::ConfigureAck =
+            serde_json::from_slice(&bytes).map_err(|e| -> super::PolicyError {
+                format!("configure reply unparsable: {e}").into()
+            })?;
+        match ack.ack {
+            Some(body) if body.settings_version == settings_version => Ok(()),
+            _ => Err("hook did not ack the configure push".into()),
+        }
+    }
+
+    async fn describe(&self, budget: Duration) -> Option<serde_json::Value> {
+        let body = serde_json::to_vec(&super::wire::DescribeMsg { describe: true }).ok()?;
+        // `.timeout(budget)` on the builder so the deadline covers the body-read too (see
+        // `configure`) — not just the header exchange. (found: audit c2r2.)
+        let resp = self
+            .client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(budget)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = read_capped(resp).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    async fn notify(&self, projection: &[u8], budget: Duration) {
+        let _ = self
+            .client
+            .post(&self.url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                crate::forward::APPLICATION_JSON,
+            )
+            .body(projection.to_vec())
+            .timeout(budget)
+            .send()
+            .await; // response intentionally dropped — a tap does not read a reply
     }
 }
 

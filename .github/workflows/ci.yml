@@ -28,13 +28,49 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build
-        run: cargo build --locked --verbose
+        run: cargo build --workspace --locked --verbose
 
       - name: Test
-        run: cargo test --locked --verbose
+        run: cargo test --workspace --locked --verbose
+
+  # Compliance-by-compilation gate: busbar must build + lint clean with the built-in `tokens` auth
+  # plugin COMPILED OUT (`--no-default-features`), so a regulated deployment can ship a binary that
+  # provably contains no client-token auth code. Build, clippy, AND the test suite all stay green on
+  # the featureless binary — the feature-dependent behavior tests (token auth, native ranking policies)
+  # are `#[cfg(feature = ...)]`-gated, so what remains proves the featureless binary works. This is the
+  # compliance-by-compilation guarantee: `auth.chain: [tokens]` is a boot error in this binary.
+  no-default-features:
+    name: no-default-features build · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (no-default-features)
+        run: cargo clippy --no-default-features --locked -- -D warnings
+      - name: Build (no-default-features)
+        run: cargo build --no-default-features --locked --verbose
+      - name: Test (no-default-features)
+        run: cargo test --no-default-features --locked --verbose
+
+  # TIMING GATE: the ignored hot-path latency test, in release mode. Its bounds are deliberately
+  # generous (25ms p50 / 250ms p99 through the full in-process router+mock round trip) so runner
+  # noise can never trip it — it exists to catch GROSS hot-path regressions (sync I/O, stray
+  # sleeps) the instant they land. Fine-grained overhead numbers are bench/latency/'s job.
+  timing:
+    name: timing gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Hot-path timing gate
+        run: cargo test --release --locked timing_gate -- --ignored
 
   # Portability gate: busbar must build + pass tests on Windows too (no OS-specific code).
   windows:
@@ -45,6 +81,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
       - name: Test
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose

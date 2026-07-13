@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Anthropic protocol reader/writer implementation.
 
@@ -784,7 +784,38 @@ impl ProtocolReader for AnthropicReader {
         data: &serde_json::Value,
         _state: &mut crate::ir::StreamDecodeState,
     ) -> Vec<IrStreamEvent> {
-        // Anthropic events are already block-structured (1:1): wrap the singular, ignore state.
+        // A streamed `redacted_thinking` block carries its full opaque encrypted `data` INLINE on the
+        // `content_block_start` event (Anthropic sends NO deltas for redacted blocks), so the 1:1
+        // single-event reader dropped it entirely (`_ => return None`). Emit the pair the IR models
+        // for redacted reasoning — a `Thinking` BlockStart plus a `RedactedReasoningDelta` carrying
+        // the opaque bytes — from this one start event (the natural `content_block_stop` that follows
+        // produces the BlockStop). Mirrors the Bedrock streaming reader + the non-stream `read_block`.
+        // (found: audit c2r2.)
+        if event_type == EVT_CONTENT_BLOCK_START {
+            if let Some(block) = data.get("content_block") {
+                if block.get("type").and_then(|t| t.as_str()) == Some(BLOCK_TYPE_REDACTED_THINKING)
+                {
+                    if let Some(index) = read_clamped_block_index(data) {
+                        let bytes = block
+                            .get("data")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return vec![
+                            IrStreamEvent::BlockStart {
+                                index,
+                                block: IrBlockMeta::Thinking,
+                            },
+                            IrStreamEvent::BlockDelta {
+                                index,
+                                delta: IrDelta::RedactedReasoningDelta(bytes),
+                            },
+                        ];
+                    }
+                }
+            }
+        }
+        // Anthropic events are otherwise already block-structured (1:1): wrap the singular.
         match self.read_response_event(event_type, data) {
             Some(ev) => vec![ev],
             None => vec![],
@@ -1772,7 +1803,7 @@ impl AnthropicWriter {
 /// load.
 fn anthropic_auth_headers(
     key: &str,
-    mode: Option<crate::auth::AuthMode>,
+    creds: Option<crate::auth::UpstreamCreds>,
 ) -> Vec<(HeaderName, HeaderValue)> {
     // Build a credential header pair, OMITTING it (returning None) when the value carries bytes
     // invalid for an HTTP header value. Never logs the key bytes — only the header name and the fact
@@ -1826,11 +1857,9 @@ fn anthropic_auth_headers(
         AnthropicCredScheme::OAuth => assemble(vec![authorization()]),
         // Unrecognized shape: the mode resolves it to a single native header on the wire path;
         // the mode-blind primitive falls back to both so neither path silently drops.
-        AnthropicCredScheme::Ambiguous => match mode {
-            Some(crate::auth::AuthMode::Passthrough) => assemble(vec![authorization()]),
-            Some(crate::auth::AuthMode::Token) | Some(crate::auth::AuthMode::None) => {
-                assemble(vec![x_api_key()])
-            }
+        AnthropicCredScheme::Ambiguous => match creds {
+            Some(crate::auth::UpstreamCreds::Passthrough) => assemble(vec![authorization()]),
+            Some(crate::auth::UpstreamCreds::Own) => assemble(vec![x_api_key()]),
             None => assemble(vec![x_api_key(), authorization()]),
         },
     }
@@ -1861,11 +1890,11 @@ impl ProtocolWriter for AnthropicWriter {
     }
 
     fn sign_request(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
-        // Wire path: the front-door auth mode (set by forward.rs into the SigningContext) resolves an
-        // Ambiguous Anthropic credential to the SINGLE native header that mode implies — Passthrough
-        // forwards the caller's token as `authorization: Bearer`; Token/None present the configured
-        // key as `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
-        anthropic_auth_headers(key, Some(ctx.auth_mode))
+        // Wire path: the upstream-credential mode (set by forward.rs into the SigningContext) resolves
+        // an Ambiguous Anthropic credential to the SINGLE native header it implies — Passthrough
+        // forwards the caller's token as `authorization: Bearer`; Own presents the configured key as
+        // `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
+        anthropic_auth_headers(key, Some(ctx.upstream_creds))
     }
 
     fn requires_max_tokens(&self) -> bool {
@@ -2648,7 +2677,7 @@ mod anthropic_hardening_tests {
             canonical_uri: PATH_UPSTREAM.to_string(),
             body: b"{}",
             timestamp_epoch: 0,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         };
         for headers in [
             AnthropicWriter.auth_headers(raw),
@@ -2695,7 +2724,7 @@ mod anthropic_hardening_tests {
             canonical_uri: PATH_UPSTREAM.to_string(),
             body: b"{}",
             timestamp_epoch: 0,
-            auth_mode: crate::auth::AuthMode::Passthrough,
+            upstream_creds: crate::auth::UpstreamCreds::Passthrough,
         };
         let pt = AnthropicWriter.sign_request(amb, &ctx);
         assert_eq!(
@@ -2734,17 +2763,17 @@ mod anthropic_hardening_tests {
     #[test]
     fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
         let body = b"{}";
-        let ctx = |mode| crate::proto::SigningContext {
+        let ctx = |creds| crate::proto::SigningContext {
             host: "api.anthropic.com".to_string(),
             canonical_uri: PATH_UPSTREAM.to_string(),
             body,
             timestamp_epoch: 0,
-            auth_mode: mode,
+            upstream_creds: creds,
         };
         let amb = "caller-specific-token-abc123";
 
         // Passthrough: forward the caller's token as Bearer ONLY (no x-api-key tell).
-        let pt = AnthropicWriter.sign_request(amb, &ctx(crate::auth::AuthMode::Passthrough));
+        let pt = AnthropicWriter.sign_request(amb, &ctx(crate::auth::UpstreamCreds::Passthrough));
         assert_eq!(
             header_value(&pt, "authorization").as_deref(),
             Some("Bearer caller-specific-token-abc123")
@@ -2754,21 +2783,20 @@ mod anthropic_hardening_tests {
             "passthrough wire path must NOT also emit x-api-key (dual-header tell)"
         );
 
-        // Token mode (configured lane key): present the API-key shape ONLY (no Bearer tell).
-        for mode in [crate::auth::AuthMode::Token, crate::auth::AuthMode::None] {
-            let h = AnthropicWriter.sign_request(amb, &ctx(mode));
-            assert_eq!(
-                header_value(&h, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
-                Some("caller-specific-token-abc123")
-            );
-            assert!(
-                header_value(&h, "authorization").is_none(),
-                "token/none wire path must NOT also emit authorization (dual-header tell)"
-            );
-        }
+        // Own (configured lane key): present the API-key shape ONLY (no Bearer tell).
+        let h = AnthropicWriter.sign_request(amb, &ctx(crate::auth::UpstreamCreds::Own));
+        assert_eq!(
+            header_value(&h, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
+            Some("caller-specific-token-abc123")
+        );
+        assert!(
+            header_value(&h, "authorization").is_none(),
+            "own-key wire path must NOT also emit authorization (dual-header tell)"
+        );
 
         // Clear API-key / OAuth credentials stay single-header on the wire path regardless of mode.
-        let api = AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::AuthMode::None));
+        let api =
+            AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::UpstreamCreds::Own));
         assert!(
             header_value(&api, "x-api-key").is_some() // golden wire-contract literal (kept bare on purpose)
                 && header_value(&api, "authorization").is_none()
@@ -3993,6 +4021,56 @@ mod anthropic_hardening_tests {
             }
             other => panic!("expected Thinking carrier for redacted_thinking, got {other:?}"),
         }
+    }
+
+    /// REGRESSION (audit c2r2): the STREAMING reader must not drop a `redacted_thinking` block. The
+    /// opaque `data` rides inline on `content_block_start` (no deltas follow), so the reader emits a
+    /// `Thinking` BlockStart + a `RedactedReasoningDelta` carrying the bytes; the later
+    /// `content_block_stop` yields the BlockStop. Before the fix the block hit `_ => None` and the
+    /// encrypted reasoning was silently lost on an any→Anthropic streaming passthrough.
+    #[test]
+    fn streaming_redacted_thinking_is_not_dropped() {
+        let reader = AnthropicReader;
+        let mut state = crate::ir::StreamDecodeState::default();
+        let start = serde_json::json!({
+            "type": EVT_CONTENT_BLOCK_START,
+            "index": 0,
+            "content_block": { "type": BLOCK_TYPE_REDACTED_THINKING, "data": "ENCRYPTED_BYTES" }
+        });
+        let evs = reader.read_response_events(EVT_CONTENT_BLOCK_START, &start, &mut state);
+        assert_eq!(
+            evs.len(),
+            2,
+            "redacted_thinking start emits BlockStart + delta, got {evs:?}"
+        );
+        assert!(
+            matches!(
+                &evs[0],
+                IrStreamEvent::BlockStart {
+                    index: 0,
+                    block: IrBlockMeta::Thinking
+                }
+            ),
+            "first event is a Thinking BlockStart: {:?}",
+            evs[0]
+        );
+        match &evs[1] {
+            IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: IrDelta::RedactedReasoningDelta(bytes),
+            } => assert_eq!(
+                bytes, "ENCRYPTED_BYTES",
+                "opaque bytes preserved, not dropped"
+            ),
+            other => panic!("expected RedactedReasoningDelta carrying the bytes, got {other:?}"),
+        }
+        // The following content_block_stop still yields a BlockStop.
+        let stop = serde_json::json!({"type": EVT_CONTENT_BLOCK_STOP, "index": 0});
+        let stop_evs = reader.read_response_events(EVT_CONTENT_BLOCK_STOP, &stop, &mut state);
+        assert!(
+            matches!(stop_evs.as_slice(), [IrStreamEvent::BlockStop { index: 0 }]),
+            "content_block_stop closes the redacted block: {stop_evs:?}"
+        );
     }
 
     /// Round-trip: an Anthropic `redacted_thinking` block read on the RESPONSE path must
@@ -6687,6 +6765,7 @@ mod reasoning_carry_tests {
             global_default_max_tokens: 32000,
             reasoning_allowed: allowed,
             reasoning_budgets: [1024, 2048, 3072, 4096],
+            prompt_caching_allowed: true,
         };
         let ir = crate::proto::openai_chat::OpenAiReader
             .read_request(&openai_effort_body("high"))

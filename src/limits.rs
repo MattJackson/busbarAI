@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
-//! Process-wide operational limits ("NEVER CODED CAPS"), installed ONCE at startup from the
-//! resolved config (`config::LimitsResolved`) and read by the use sites that live too deep in a
-//! call stack to thread `App`/`&self` through — mirroring the existing `OnceLock` set-once idiom in
-//! `observability.rs`.
+//! Process-wide operational limits ("NEVER CODED CAPS"), installed from the resolved config
+//! (`config::LimitsResolved`) at startup AND on every config apply/reload (the config plane
+//! refreshes them live), read by the use sites that live too deep in a call stack to thread
+//! `App`/`&self` through.
 //!
 //! Each accessor returns the operator-configured value when `install` has run, and otherwise the
 //! HISTORICAL hardcoded default (the same `config::DEFAULT_*` const the serde defaults use). So a
@@ -16,7 +16,7 @@
 //! retry-after ceiling) do NOT live here — they reach their site directly from `RootCfg.limits`.
 //! This module is only for the sites without such a path.
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use crate::config::{
     LimitsResolved, DEFAULT_KEY_GAUGE_LIMIT, DEFAULT_POLICY_TIMEOUT_MS,
@@ -25,19 +25,23 @@ use crate::config::{
     DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS,
 };
 
-/// The installed limits. Unset until `install` runs (then the use sites read it); an unset cell
-/// means "use the historical default", which is what the per-accessor fallback returns.
-static INSTALLED: OnceLock<LimitsResolved> = OnceLock::new();
+/// The installed limits. `None` until `install` runs; `None` means "use the historical default",
+/// which is what the per-accessor fallback returns. An `RwLock` (not `OnceLock`) because the
+/// config plane RE-installs on every apply/reload — limit changes take effect live. Accessors take
+/// an uncontended read lock (writes happen only on config changes); the values these guard are not
+/// per-byte hot (per-request/per-connection reads at most).
+static INSTALLED: RwLock<Option<LimitsResolved>> = RwLock::new(None);
 
-/// Install the resolved limits process-wide. Called ONCE from `main` after config resolution, before
-/// any router/store/prober is built. A second call is ignored (the first install wins) so the
-/// startup ordering can never panic here.
+/// Install (or RE-install) the resolved limits process-wide: at boot from `main`'s construction
+/// path, and again on every config apply/reload — the newest install wins, so operator limit
+/// changes are live without restart.
 pub(crate) fn install(resolved: &LimitsResolved) {
-    // First install wins (so startup ordering can never panic here), but a SECOND install is a bug
-    // in the call sequence — surface it instead of silently dropping the new limits.
-    if INSTALLED.set(resolved.clone()).is_err() {
-        tracing::warn!("limits already installed; second install ignored");
-    }
+    *INSTALLED.write().unwrap_or_else(|e| e.into_inner()) = Some(resolved.clone());
+}
+
+/// Read the installed value (or `None` when uninstalled — tests / pre-install).
+fn get() -> Option<LimitsResolved> {
+    INSTALLED.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The egress translate-body cap (bytes). COUPLED to ingress `request_body_max_bytes`: one knob
@@ -45,24 +49,21 @@ pub(crate) fn install(resolved: &LimitsResolved) {
 /// so a body the gateway accepts inbound is always buffer-translatable on the cross-protocol egress
 /// path. When uninstalled, falls back to the historical 32 MiB.
 pub(crate) fn translate_body_max_bytes() -> usize {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.request_body_max_bytes)
         .unwrap_or(DEFAULT_REQUEST_BODY_MAX_BYTES)
 }
 
 /// TLS handshake wall-clock bound (seconds), read per accepted connection in `tls::serve_one`.
 pub(crate) fn tls_handshake_timeout_secs() -> u64 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.tls_handshake_timeout_secs)
         .unwrap_or(crate::config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS)
 }
 
 /// Cap on a buffered upstream ERROR / verbatim-relay body (bytes).
 pub(crate) fn upstream_error_body_max_bytes() -> usize {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.upstream_error_body_max_bytes)
         // No standalone const re-export needed: the resolved value always carries the default.
         .unwrap_or(crate::config::DEFAULT_UPSTREAM_ERROR_BODY_MAX_BYTES)
@@ -70,64 +71,56 @@ pub(crate) fn upstream_error_body_max_bytes() -> usize {
 
 /// Max concurrent webhook deliveries.
 pub(crate) fn max_inflight_webhook_deliveries() -> usize {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.max_inflight_webhook_deliveries)
         .unwrap_or(crate::config::DEFAULT_MAX_INFLIGHT_WEBHOOK_DELIVERIES)
 }
 
 /// Per-delivery webhook timeout (seconds).
 pub(crate) fn webhook_delivery_timeout_secs() -> u64 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.webhook_delivery_timeout_secs)
         .unwrap_or(DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS)
 }
 
 /// Max per-key gauge series emitted per `/metrics` scrape.
 pub(crate) fn key_gauge_limit() -> usize {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.key_gauge_limit)
         .unwrap_or(DEFAULT_KEY_GAUGE_LIMIT)
 }
 
 /// SQLite `busy_timeout` (ms) for the governance store.
 pub(crate) fn sqlite_busy_timeout_ms() -> i64 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.sqlite_busy_timeout_ms)
         .unwrap_or(DEFAULT_SQLITE_BUSY_TIMEOUT_MS)
 }
 
 /// Rate-limiter stale-entry sweep amortization interval.
 pub(crate) fn rate_sweep_interval() -> u32 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.rate_sweep_interval)
         .unwrap_or(DEFAULT_RATE_SWEEP_INTERVAL)
 }
 
 /// Process-wide active-probe interval fallback (seconds). Per-lane `health.interval_secs` overrides.
 pub(crate) fn default_probe_interval_secs() -> u64 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.default_probe_interval_secs)
         .unwrap_or(DEFAULT_PROBE_INTERVAL_SECS)
 }
 
 /// Process-wide active-probe timeout fallback (seconds). Per-lane `health.timeout_secs` overrides.
 pub(crate) fn default_probe_timeout_secs() -> u64 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.default_probe_timeout_secs)
         .unwrap_or(DEFAULT_PROBE_TIMEOUT_SECS)
 }
 
 /// Global default routing-policy timeout (ms). Per-policy `policy.timeout_ms` overrides.
 pub(crate) fn default_policy_timeout_ms() -> u64 {
-    INSTALLED
-        .get()
+    get()
         .map(|l| l.default_policy_timeout_ms)
         .unwrap_or(DEFAULT_POLICY_TIMEOUT_MS)
 }
@@ -136,20 +129,14 @@ pub(crate) fn default_policy_timeout_ms() -> u64 {
 mod tests {
     use super::*;
 
-    /// Before `install` (the state in unit tests that never call it), every accessor returns the
-    /// historical hardcoded default — so an un-installed process is byte-for-byte today's behavior.
-    /// NOTE: this asserts the FALLBACK values directly rather than calling `install` (a single
-    /// process-wide `OnceLock` cannot be reset between tests, and `main` is the only real installer).
+    /// UNINSTALLED accessors return the historical hardcoded defaults — an un-installed (or
+    /// default-config-installed) process is byte-for-byte today's behavior. `install` is
+    /// re-runnable (the config plane refreshes limits live), so another test in this binary MAY
+    /// have installed by the time this runs; every in-test installer uses a default-limits config,
+    /// making the assertions below hold in either order. A future test installing NON-default
+    /// limits would break this — give such a test its own values and this note is the pointer.
     #[test]
     fn uninstalled_accessors_return_historical_defaults() {
-        // This test MUST run uninstalled so the fallback path is actually covered. A silent `if`
-        // skip would let the accessors' default branch go untested whenever another test installed
-        // first; assert the precondition LOUDLY instead (no test in this binary installs — install()
-        // is main-only — so this holds, and a future test that breaks it fails here, not silently).
-        assert!(
-            INSTALLED.get().is_none(),
-            "limits already installed by another test; uninstalled-default coverage was skipped"
-        );
         assert_eq!(translate_body_max_bytes(), DEFAULT_REQUEST_BODY_MAX_BYTES);
         assert_eq!(key_gauge_limit(), DEFAULT_KEY_GAUGE_LIMIT);
         assert_eq!(sqlite_busy_timeout_ms(), DEFAULT_SQLITE_BUSY_TIMEOUT_MS);

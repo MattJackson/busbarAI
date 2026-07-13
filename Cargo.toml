@@ -1,6 +1,9 @@
+[workspace]
+members = ["api", "auth/tokens", "auth/admin-tokens", "hooks/ranking"]
+
 [package]
 name = "busbar"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 # Effective MSRV: governance.rs uses `u32::is_multiple_of` (stabilized in Rust 1.87), and clippy's
 # `manual_is_multiple_of` lint rewrites `% N == 0` back to it, so 1.87 is the genuine minimum. Declare
@@ -15,6 +18,14 @@ name = "busbar"
 path = "src/main.rs"
 
 [dependencies]
+# The plugin CONTRACTS (auth-module trait, routing-policy trait, projections) — the one crate both
+# the engine and every plugin build against. See api/.
+busbar-api = { path = "api" }
+# The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
+# so the matching feature (below) compiles each IN or OUT of the binary.
+busbar-auth-tokens = { path = "auth/tokens", optional = true }
+busbar-auth-admin-tokens = { path = "auth/admin-tokens", optional = true }
+busbar-hooks-ranking = { path = "hooks/ranking", optional = true }
 axum = "0.8"
 # Already present transitively (axum's middleware stack). Pulled in directly ONLY for
 # `GlobalConcurrencyLimitLayer` — the OUTERMOST inbound-concurrency cap applied when the operator
@@ -93,15 +104,11 @@ getrandom = "0.4"
 # correct, fast CRC32. `crc32fast` is small, dependency-light, and the de-facto standard.
 crc32fast = "1"
 # The pluggable routing-policy contract (`RoutingPolicy`) is an async trait so the webhook transport
-# can do I/O; native/script policies return immediately. `async-trait` is the standard, zero-runtime
+# can do I/O; native/socket policies return immediately. `async-trait` is the standard, zero-runtime
 # (compile-time desugar to boxed futures) way to express object-safe async traits on stable Rust. It
 # is only ever entered for NON-default pools — a `route: weighted` (default) pool never constructs a
 # `RoutingPolicy` and never touches this boxing, preserving the zero-cost default.
 async-trait = "0.1"
-# Optional embedded scripting transport (`route: script`). Pure-Rust, no unsafe, sandboxable (op-count
-# cap, size caps, no I/O host fns). Feature-gated so operators who don't want the dependency build
-# without it; webhook + native transports work with the feature off.
-rhai = { version = "1", optional = true, default-features = false, features = ["sync"] }
 # Native inbound TLS termination (+ optional mTLS). `tokio-rustls` wraps the accepted TcpStream in a
 # rustls server handshake; it pins the `ring` crypto provider (already the only provider in the graph
 # via reqwest/hyper-rustls), so the process holds exactly one CryptoProvider — no aws-lc-rs.
@@ -130,9 +137,21 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 
 [features]
-default = []
-# Enables the Rhai `route: script` transport.
-script-policy = ["dep:rhai"]
+# The built-in `tokens` auth plugin is a DEFAULT-ON, REMOVABLE feature — compliance by compilation.
+# A `--no-default-features` build contains NO client-token auth code at all (the module, its
+# constant-time fold, and the allowlist are absent from the binary, provable by attestation +
+# symbols). `auth.chain: [tokens]` then BOOT-ERRORS instead of silently opening. A regulated
+# deployment ships tokens OUT and wires its own auth module (SAML/AD/OIDC) in the private repo.
+default = ["auth-tokens", "auth-admin-tokens", "hooks-ranking"]
+auth-tokens = ["dep:busbar-auth-tokens"]
+# The built-in `admin-tokens` ADMIN auth plugin (the single operator admin token) — same
+# default-on, removable, compliance-by-compilation stance. Removed, `admin_auth: [admin-tokens]`
+# (the default) boot-errors and an external admin module must be wired.
+auth-admin-tokens = ["dep:busbar-auth-admin-tokens"]
+# The built-in RANKING hooks (cheapest/fastest/least_busy/usage) are also a default-on, removable
+# feature. `--no-default-features` drops them; `weighted` stays (it's the engine's inline SWRR floor,
+# not a plugin). A pool `policy: cheapest` (etc.) is then a boot error.
+hooks-ranking = ["dep:busbar-hooks-ranking"]
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.

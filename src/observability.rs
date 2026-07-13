@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Observability sinks beyond Prometheus `/metrics`: a best-effort request-log webhook and
 //! OTLP trace export. Both are opt-in via the `observability` config section; with no

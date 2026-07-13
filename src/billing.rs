@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
 //! Polymorphic billable-item data model (design-operations-oop.md §0b/§5b).
 //!
 //! The billable UNIT is (operation, model)-dependent: chat/embeddings bill tokens, `whisper-1` bills

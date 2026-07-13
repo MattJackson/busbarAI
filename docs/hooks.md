@@ -1,105 +1,115 @@
 # Hooks: your logic on the request path
 
-Busbar owns the request path. Hooks are the sanctioned attachment points on it: the places where your own code sees what Busbar sees and steers what Busbar does. Every hook follows one design rule, enforced structurally rather than by convention: **a hook can steer and a hook can observe, but a hook can never break the request path.** A slow, crashed, or wrong hook degrades to a safe default; it never blocks, hangs, or fails a request on its own.
+Busbar owns the request path. Hooks are the sanctioned attachment points on it: the places where your own code sees what Busbar sees and steers what Busbar does. Every hook follows one design rule, enforced structurally rather than by convention: **a hook can steer, observe, or rewrite, but a hook can never break the request path.** A slow, crashed, or wrong hook degrades to a safe default; it never blocks, hangs, or fails a request on its own.
 
-Busbar ships two hooks today.
+A hook is your own code — a compiled binary on a local Unix domain socket (~8µs per call) or an HTTPS sidecar in any language — running on Busbar's **normalized IR**: the canonical request form Busbar produces after losslessly translating whatever dialect the caller spoke. Write a hook once and it runs against all six protocols and every provider, with failover and circuit breaking underneath it, in one hop.
 
-| Hook | Direction | What it does | Deep reference |
-|---|---|---|---|
-| Routing policy | Busbar asks you | Decide the ORDER in which pool members are tried, per request | [Routing](https://getbusbar.com/docs/routing/) |
-| Request log | Busbar tells you | Receive a JSON record of every completed request | [Observability](https://getbusbar.com/docs/observability/) |
+## Two kinds: tap and gate
 
----
+Every hook is one of two kinds. That is the only structural distinction — the rest is the same contract for both.
 
-## The routing policy hook
-
-Set `route: webhook` (an HTTP sidecar in any language) or `route: socket` (a compiled binary on a local Unix domain socket — same wire contract, about 8 microseconds per decision) on a pool, and your logic runs once per request, before the failover loop. (`route: script`, the embedded Rhai engine, is deprecated: the socket hook runs the same logic ~20x faster in its own process.)
-
-### What you receive
-
-Two things: a projection of the request, and a projection of every candidate lane.
-
-**The request projection** (what kind of work is this?):
-
-| Field | Meaning |
-|---|---|
-| `pool` | The pool being routed |
-| `ingress_protocol` | Which dialect the client spoke (`openai`, `anthropic`, `gemini`, `bedrock`, `cohere`, `responses`) |
-| `message_count` | Messages in the conversation |
-| `has_tools` | Whether tools are declared (scripts also get `tool_count`) |
-| `total_chars` | Text size across system + messages (~4 chars per token as a rule of thumb; token counts do not exist pre-dispatch) |
-| `max_tokens` | The caller's requested output cap, if any |
-| `stream` | Whether this is a streaming call |
-
-Scripts additionally get `requested_model` and `system_chars`.
-
-Two per-pool opt-ins extend the projection for hooks you trust with more (both default off; both work on webhook and socket):
-
-| Opt-in | Adds | For |
+| Kind | Mechanic | Reply |
 |---|---|---|
-| `policy.send_prompt: true` | `system` (flattened system-prompt text) and `messages` (`{role, text}` per message, text content only) | Content-screening hooks: PII detection, guardrails, audit |
-| `policy.send_user: true` | `user` (`key_id`/`key_name` from the governance virtual key, plus the body's end-user field) | Route-by-who: team lanes, per-user denies |
+| `tap` | fire-and-forget (watch) | none — it observes, it never answers |
+| `gate` | fire-and-wait (decide) | one reply arm: nothing / reject / restrict / order / rewrite |
 
-The caller's secret/token is never in the payload, under any configuration.
+A **tap** watches: logging, audit, metering, shipping records to a SIEM. It can never delay or change a request. A **gate** decides: it can reject the request, restrict which pool members may serve it, re-order the failover walk, or rewrite the request body. The PII guard, the smart router, and the Headroom compressor are all gates — same wire, same timing, same fail-safe, different reply arm.
 
-**The candidate projection** (what state is each option in?), one entry per healthy pool member:
+## The registry
 
-| Signal | Field | Where it comes from |
+Hooks are defined once, by name, in a top-level `hooks:` block, then attached where you want them:
+
+```yaml
+hooks:
+  request-log:  { kind: tap,  socket: /run/busbar/log.sock, prompt: ro }
+  pii-guard:    { kind: gate, socket: /run/busbar/pii.sock, prompt: ro, on_error: reject }
+  smart-router: { kind: gate, socket: /run/busbar/router.sock }          # returns `order`
+  headroom:     { kind: gate, socket: /run/busbar/headroom.sock, prompt: rw, global: true }
+
+global_hooks: [request-log, pii-guard]     # attach to EVERY request
+
+pools:
+  my-pool:
+    hooks: [cheapest, smart-router]        # this pool's base ordering + a gate
+    members:
+      - target: claude-opus
+      - target: claude-opus-bedrock
+        tags: ["baa"]
+```
+
+Each hook declares **exactly one transport** — `socket` (an absolute Unix-socket path; lazy-connect, so the hook may start after Busbar) or `webhook` (an `https://` URL, validated at boot against the SSRF blocklist: loopback sidecars allowed, RFC-1918 / link-local / CGNAT / cloud-metadata rejected).
+
+**Attach a hook** three ways: name it in a pool's `hooks:` list, list it in `global_hooks:`, or set `global: true` on the definition (sugar for "add me to `global_hooks`"). A pool's `hooks:` list carries its ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`) and any number of gates.
+
+**Gates fire concurrently.** All of a request's decision gates — the pool's own and every global — fire at once against the same candidate set, then reconcile deterministically: any **reject** wins (the lowest-`priority` gate's status/message surfaces), **restrict**s intersect, and with several **order**s the last in the priority chain wins, re-validated against the post-restrict set. Added latency is the slowest gate, not the sum.
+
+**A tap picks its observation stage** with `at:` (default `request`):
+
+| `at:` | Observes | Extra payload |
 |---|---|---|
-| Cost | `cost_per_mtok` | Operator-declared on the member |
-| Latency | `latency_ms` | Rolling EWMA per lane, updated every request |
-| Live load | `available_concurrency` | Free semaphore slots, right now |
-| Budget | `budget_remaining` | Per-lane `max_requests` remaining |
-| Rate headroom | `rate_headroom` | Remaining RPM/TPM headroom as a fraction, from governance counters |
-| Your labels | `tier`, `tags` | Operator-declared routing metadata on the member |
+| `request` | the effective (post-rewrite) request | prompt/identity per grants |
+| `route` | the routing decision | surviving candidate count |
+| `attempt` | every dispatch attempt | `attempt_number`, `target`, `remaining_candidates`, `previous_failure` |
+| `completion` | the outcome | `outcome: ok \| failed \| rejected_by_gate` + `status` — the **synthetic rejected completion**, so an audit tap sees denials, not just served traffic |
 
-This is the full task/latency/cost/quality picture: the request tells you the task, the candidates carry live latency and load, cost is your declared number, and quality is your judgment encoded in `tier` and `tags` (Busbar gives you the enforcement point; it does not pretend to know which model writes better poetry).
+## Access grants — what a hook is trusted to see
 
-### What you control
+By default a hook sees **shapes, not content**: sizes, counts, flags, live lane signals — never prompt text, never caller identity. Two per-hook grants, both default off, opt a trusted hook into more:
 
-You return a **ranked preference list** of candidate indices. That order becomes the failover walk: Busbar tries your first choice, and if it fails before the first byte, your second, and so on. You are choosing the order, not bypassing the machinery — the circuit breaker still gates tripped lanes, concurrency caps still apply, and the failover budget still bounds the request.
+| Grant | Levels | Adds |
+|---|---|---|
+| `prompt:` | `no` (default) · `ro` · `rw` | `ro` sends the flattened system + messages text (for PII screening, guardrails, audit). `rw` additionally lets a **gate** return the `rewrite` arm. |
+| `user:` | `no` (default) · `ro` | `ro` sends caller identity — the governance key's `id`/`name` and the body's end-user field. Never the secret/token, under any configuration. |
 
-You can also return an **abstain**, which means "no opinion, use the default weighted selection."
+Grants are a monotonic trust ladder (`no ⊂ ro ⊂ rw`) and are **immutable after registration** — you cannot register a hook with `prompt: no`, wire it in, then quietly raise it to `rw`. `rw` on a `tap` is a boot error (a tap never replies, so it can never rewrite).
 
-And you can return a **reject** (`{"reject": {"status": 451, "message": "..."}}`): no upstream is dispatched and the caller gets a dialect-native error. The status is clamped to 400–499 (default 403), picks the typed error class the caller's SDK catches (429 → rate-limit, 401 → authentication, ...), and the message is sanitized, so a hook can never mint a success or a 5xx. The verb is fail-closed: once a hook says reject, a malformed detail degrades to the defaults — never to silently routing the request. Combined with `send_prompt`, this is the PII-screen primitive — a hook that sees content can stop a request before it leaves your network. Rejections are counted in `busbar_route_policy_rejections_total`.
+### What a gate receives
 
-### What you cannot do
+- **The request projection** — `pool`, `ingress_protocol`, `message_count`, `has_tools`, `total_chars` (a size signal; token counts do not exist pre-dispatch), `max_tokens`, `stream`. With `prompt: ro`/`rw`, also the flattened `system` + `messages` text. With `user: ro`, also caller identity.
+- **The candidate projection** — one entry per healthy member: `cost_per_mtok` (operator-declared), `latency_ms` (rolling EWMA), `available_concurrency` (free slots now), `budget_remaining`, `rate_headroom` (fraction, from governance), and your `tier`/`tags` labels. The full task/latency/cost/quality picture — every signal a built-in strategy ranks on is on the wire, so an external hook can implement any of them identically.
 
-- You cannot mutate the request. Policies rank, or reject outright; they do not rewrite. (Request/response mutation hooks — redaction, steering — are the planned next tenant of this same fail-safe machinery. See the [roadmap](https://getbusbar.com/docs/roadmap/).)
-- You cannot make Busbar wait. The decision is bounded by `policy.timeout_ms` (default 1 ms; raise it when your hook calls a database or crosses the network), hard.
-- You cannot see the message text **unless the operator says so**. The default projection carries sizes, counts, and flags, not content — prompts do not leave the process just to make a routing decision. `policy.send_prompt` is the explicit, per-pool exception; it is never on by default.
+## The gate reply arms
 
-### What Busbar guarantees when your hook misbehaves
+A gate answers with exactly one of:
+
+- **nothing / abstain** — no opinion; Busbar proceeds as it normally would.
+- **reject** (`{"reject": {"status": 451, "message": "..."}}`) — no upstream is dispatched; the caller gets a dialect-native error. Status clamped to 400–499 (default 403) so the caller's SDK catches the right typed class (429 → rate-limit, 401 → auth, …); message sanitized. Fail-closed: a malformed reject degrades to the defaults, never to silently routing the request. With `prompt: ro`, this is the PII-screen primitive — see content, say no, before it leaves your network.
+- **restrict** (`{"restrict": {"tags_any": ["baa"]}}`) — only members carrying one of those `tags` may serve. The restriction **persists across failover** (every hop stays inside the surviving set); an empty intersection follows the gate's `on_empty` (default `reject`, fail-closed).
+- **order** (`{"order": [idx, ...]}`) — rank the surviving candidates, most-preferred first (omitted members are demoted, not excluded). That order becomes the failover walk: Busbar tries your first choice, and on a pre-first-byte failure walks to your second. You choose the order; the breaker, concurrency caps, and failover budget still apply.
+- **rewrite** (`{"rewrite": {"messages": [...], "tools": [...]}}`) — replace the request body (compression, redaction). Requires `prompt: rw`. Note the asymmetry: a hook *receives* messages as `{role, text}` (the flattened projection) but *replies* in body form (`{role, content}`); the system prompt is not rewritable; and a socket reply is capped at 64 KiB, which bounds very large rewrites. Body-only: a rewrite never changes routing, the principal, or the target dialect. It fires **before dispatch and before the routing decision**, so both the decision and every upstream see the rewritten body, and it persists across failover. Token accounting (budgets, metrics) is on the provider-reported usage of the rewritten body — the savings are real and measured. A malformed/oversized rewrite follows `on_error` (default: proceed with the body **unmodified** — a broken compressor never corrupts a request).
+
+## Defaults and ordering
+
+- **`default: true`** on an ordering gate makes it the base ordering that any pool which named none inherits — replacing the built-in `weighted` floor (exactly as `auth: [sso]` replaces the built-in `tokens`). At most one hook may be the default (a boot error names both otherwise); a pool that named its own base keeps its choice, and a pool's own gates layer ON TOP of whatever base it has. No default set ⇒ the zero-cost inline `weighted` backstop.
+- **`priority: <n>`** is the one ordering knob: it orders the rewrite transform chain (each rewrite sees the prior's output) and tie-breaks the concurrent decision reconcile — which reject's message surfaces, and which `order` counts as "last". Ties keep globals first, then config order.
+
+## What Busbar guarantees when a hook misbehaves
 
 | Failure | What happens |
 |---|---|
-| Hook is slow | Cut off at `timeout_ms`, decision coerced to `on_error` |
+| Hook is slow | Cut off at `timeout_ms` (default 1 ms — raise it when your hook hits a DB or the network), decision coerced to `on_error` |
 | Hook errors, returns garbage, or is saturated | Same: `on_error` |
-| `on_error: weighted` (default) | Falls back to the standard weighted selection — a broken hook is indistinguishable from no hook |
+| `on_error: nothing` (default) | **Does not participate**: the failing gate drops out of the decision entirely and can never displace another gate's verdict. The right posture for gates whose job is orthogonal to routing (a compressor, a logger-gate) — their failure should never reshape traffic. |
+| `on_error: weighted` | Falls back to the weighted floor — a broken hook is indistinguishable from no hook. Behaviorally identical to `nothing` (in the concurrent reconcile both mean "didn't participate"); the two names exist so a config reads correctly: `weighted` for ordering gates, `nothing` for everything else. |
 | `on_error: first` | Config order, deterministic |
-| `on_error: reject` | Fail closed with a 503, for pools where an unrouted request is worse than no request |
+| `on_error: reject` | Fail closed with a 503 — for security gates, where an unscreened request is worse than none. Docs mandate this for security gates. |
+| `on_error: <hook-name>` | **A named fallback**: when this gate fails, that hook fires in its place (its decision is honored exactly as a primary's, projected per **its own** grants). Its own `on_error` chains further; Busbar proves at boot that every chain terminates — an unknown name, a tap, or a cycle is a startup error. `weighted`/`reject`/`first` are the reserved chain terminals; a ranking strategy name (`cheapest`, …) is also a valid, infallible fallback. |
 
-Boot-time safety: a webhook URL is operator-config-only (never derived from a request) and validated against the SSRF blocklist at startup; scripts run under sandbox limits (see the routing guide). Every routed response can carry `x-busbar-route-policy` / `x-busbar-route-target` headers so you can see which policy made the call.
+A `tap`, being fire-and-forget, has no `on_error` to speak of: its reply is discarded, its errors swallowed, its delivery bounded and dropped-under-pressure — it can never delay, reorder, or fail a request.
 
----
+## Live settings: `configure` and `describe`
 
-## The request-log hook
+Beyond the decision traffic, the wire carries two management messages, so a hook can be reconfigured without a redeploy:
 
-Set `observability.request_log_webhook_url` and Busbar fires a fire-and-forget JSON POST for every completed request:
+- **`configure`** — Busbar pushes the hook's opaque `settings` map (from config or the admin API), stamped with a `settings_version` and Busbar's version. It is the **first message on every socket (re)connection** — a hook that crashes and reconnects always hears its current settings before any request traffic — and it is pushed live when an operator calls `PATCH /admin/v1/hooks/{name}/settings`. That PATCH is **commit-on-ack**: the hook must answer with an acknowledgment echoing the pushed `settings_version` (5s deadline) or Busbar commits nothing and the operator gets a 400 — a hook can never end up running settings Busbar doesn't know it accepted.
+- **`describe`** — Busbar asks the hook to describe its own settings schema; the reply is served verbatim at `GET /admin/v1/hooks/{name}/schema`. Optional: a hook that doesn't answer simply reports `schema: null`.
 
-```json
-{ "ts": 1760000000, "ingress_protocol": "openai", "pool": "fast", "outcome": "ok", "latency_ms": 412 }
-```
+Both are as fail-safe as everything else on the wire: a hook that ignores `configure` (never acks) keeps its previous settings; neither message can delay or fail request traffic.
 
-Pipe it anywhere: your SIEM, a Lambda, a log store, an S3 writer. Guarantees, same philosophy as above:
+## Managing hooks over the API
 
-- **Never on the request path.** Delivery is async with a 2-second timeout and at most 64 in flight; under pressure it drops rather than queues, and the client response is never delayed by it.
-- **SSRF-guarded and `https://` only.** The URL is operator config; RFC-1918, link-local, CGNAT, broadcast, and cloud-metadata targets are rejected at boot.
-
-For metrics and traces (rather than per-request records), Busbar also ships Prometheus `/metrics` and an OTLP trace exporter — those are pull/push telemetry, not hooks, and live in [Observability](https://getbusbar.com/docs/observability/).
+Hooks are also lifecycle-managed over the frozen admin API — register, inspect, health-check, and remove at runtime, with a tamper-evident audit trail, and (opt-in) persistence across restart. See the [Admin API guide](./admin-api.md).
 
 ---
 
-## Where hooks are going
-
-The routing hook is the first tenant of a general mechanism: bounded, fail-safe operator logic on the request path. With `send_prompt`, `send_user`, and the reject verb, that machinery already carries the screening class of hooks — see content, see the caller, say no. The next tenant is request/response **mutation** — redaction and steering, where the hook needs to change the request rather than block it. Same rules will apply: hard timeouts, safe fallbacks, SSRF-guarded destinations, and no hook ever able to take Busbar down with it.
+*Hooks fire on the normalized IR, after the request is understood and before dispatch. That is what makes one hook work across every protocol and provider at once — and what makes Busbar the place your middleware runs.*

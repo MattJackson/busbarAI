@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// The busbar-owned config overlay (persistence substrate for API-applied hook changes).
+pub(crate) mod overlay;
 
 // Re-export status_class_from_str for config validation
 pub(crate) use crate::breaker::status_class_from_str;
@@ -97,6 +100,23 @@ pub(crate) struct RootCfg {
     pub(crate) providers: HashMap<String, ProviderCfg>,
     pub(crate) models: HashMap<String, ModelCfg>,
     pub(crate) pools: HashMap<String, PoolCfg>,
+    /// The top-level hook registry (`hooks:`). Each entry is a named tap or gate; pools reference a
+    /// gate by name via `hook:`, and `global_hooks` names those firing on every request. Empty when
+    /// no `hooks:` block is present.
+    pub(crate) hooks: HashMap<String, HookCfg>,
+    /// The ADMIN auth chain (`admin_auth:`) — ordered module names gating `/admin/v1/*` (the
+    /// parallel of `auth.chain` for the operator surface). Default `[admin-tokens]` (the single
+    /// operator admin token, exactly 1.2.1 behavior). `[]` = OPEN admin (dev only; loud boot
+    /// warning). Each name must resolve to a compiled-in admin auth module.
+    pub(crate) admin_auth: Vec<String>,
+    /// `group_map:` — principal GROUPS (returned by external auth modules) → operator-owned
+    /// policy. Policy stays in config, never asserted by a plugin (design-hooks-v2 §2.3): a
+    /// module says WHO, this map says WHAT THEY MAY DO. Multiple groups union; the most
+    /// permissive `admin_scope` wins; unmapped groups grant NOTHING (fail closed).
+    pub(crate) group_map: HashMap<String, GroupMapEntry>,
+    /// Names of hooks that fire on EVERY request (`global_hooks:` plus any hook with inline
+    /// `global: true`, deduped). Validated to reference registry entries at boot.
+    pub(crate) global_hooks: Vec<String>,
     /// Operator-supplied additions to the hardcoded cloud-metadata denylist (see
     /// [`SecurityCfg::blocked_metadata_hosts`]). Resolved from `DeployCfg.security`; empty when no
     /// `security:` block is present. Threaded into `config_validate::validate` so a provider
@@ -138,13 +158,45 @@ pub(crate) struct TlsCfg {
     pub(crate) client_ca_file: Option<String>,
 }
 
+/// Per-module TRUST-BOUNDARY CAPS (`auth.modules.<name>:`) — design-hooks-v2 §2.4. An auth module
+/// is a fully trusted endpoint (a module returning `groups: ["busbar-admins"]` IS asserting an
+/// admin); these two operator-owned caps bound its blast radius. They apply to BOTH chains (the
+/// data-plane `auth.chain` and the admin `admin_auth:`) — the module namespace is shared.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthModuleCfg {
+    /// Groups this module may assert: busbar INTERSECTS the module's returned `groups` with this
+    /// allowlist BEFORE `group_map:` resolution, so a module cannot claim a group the operator did
+    /// not pre-authorize for it. Absent = no cap (every returned group passes through).
+    #[serde(default)]
+    pub(crate) allowed_groups: Option<Vec<String>>,
+    /// Ceiling on the ADMIN scope obtainable through this module, regardless of what `group_map:`
+    /// grants: `read-only` | `hooks-register` | `full`. Absent = `read-only` for every module
+    /// except the built-in `admin-tokens` operator credential (which is full by definition and
+    /// exempt) — `full` from an external chain is an explicit, boot-warned opt-in.
+    #[serde(default)]
+    pub(crate) max_admin_scope: Option<String>,
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthCfg {
-    #[serde(default = "default_auth_mode")]
-    pub(crate) mode: crate::auth::AuthMode,
+    /// The authentication CHAIN — ordered module names (e.g. `[tokens]`). Empty (the default) is the
+    /// open front door (the old `mode: none`). Replaces `mode:` — a stale `mode:` key is a loud boot
+    /// error (deny_unknown_fields). Each name must resolve to a compiled-in auth module.
+    #[serde(default)]
+    pub(crate) chain: Vec<String>,
+    /// Upstream-credential mode: `own` (default — busbar's configured lane key) or `passthrough`
+    /// (forward the caller's credential upstream; the old `mode: passthrough`).
+    #[serde(default)]
+    pub(crate) upstream_credentials: crate::auth::UpstreamCreds,
+    /// The `tokens` module's allowlist. Inert unless `tokens` is in `chain`.
     #[serde(default)]
     pub(crate) client_tokens: Vec<String>,
+    /// Per-module trust-boundary caps, keyed by module name (see [`AuthModuleCfg`]). Applies to
+    /// the module wherever it appears — data-plane chain or `admin_auth:`.
+    #[serde(default)]
+    pub(crate) modules: std::collections::HashMap<String, AuthModuleCfg>,
 }
 
 // MANUAL Debug that REDACTS every credential field. A derived `Debug` would print every entry of
@@ -155,7 +207,8 @@ pub(crate) struct AuthCfg {
 impl fmt::Debug for AuthCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthCfg")
-            .field("mode", &self.mode)
+            .field("chain", &self.chain)
+            .field("upstream_credentials", &self.upstream_credentials)
             .field(
                 "client_tokens",
                 &format_args!("<redacted; {} configured>", self.client_tokens.len()),
@@ -165,17 +218,15 @@ impl fmt::Debug for AuthCfg {
 }
 
 impl AuthCfg {
-    /// Create a default AuthCfg for initialization.
+    /// Create a default (open front door) AuthCfg for initialization.
     pub(crate) fn default_none() -> Self {
         Self {
-            mode: crate::auth::AuthMode::None,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         }
     }
-}
-
-fn default_auth_mode() -> crate::auth::AuthMode {
-    crate::auth::AuthMode::None
 }
 
 #[derive(Deserialize)]
@@ -325,6 +376,16 @@ pub(crate) struct ModelCfg {
     /// is byte-exact and ignores the flag.
     #[serde(default)]
     pub(crate) reasoning: Option<bool>,
+    /// Operator declaration that THIS model accepts prompt-cache markers on dialects where the
+    /// marker is model-gated (Bedrock Converse `cachePoint`: Claude accepts it, Amazon Nova
+    /// hard-rejects it with 400 "extraneous key"). Same family as `reasoning` — busbar keeps no
+    /// model database, the operator asserts what they deployed. When absent/false, cross-protocol
+    /// `cache_control` breakpoints headed to such a dialect are DROPPED at the seam with a warn
+    /// (the request proceeds uncached — fail-safe, never a translation-induced 400). Dialects
+    /// whose cache form is universally accepted (Anthropic `cache_control`) ignore this flag, as
+    /// does same-protocol passthrough (byte-exact).
+    #[serde(default)]
+    pub(crate) prompt_caching: Option<bool>,
 }
 
 fn neg1() -> i64 {
@@ -340,37 +401,34 @@ pub(crate) struct PoolCfg {
     pub(crate) failover: Option<FailoverCfg>,
     pub(crate) on_exhausted: Option<OnExhaustedCfg>,
     pub(crate) affinity: Option<AffinityCfg>,
-    /// Routing transport for this pool. `weighted` (the default, also the absent case) is today's
-    /// SWRR with ZERO added cost — no `RoutingPolicy` object is constructed and the hot path is
-    /// byte-identical to the pre-feature behavior. Any other value resolves a pluggable policy that
-    /// runs ONCE before the failover loop to produce a ranked member preference.
-    ///
-    /// Populated by [`PoolCfg`]'s manual `Deserialize`, which also desugars the NATIVE SHORTHANDS:
-    /// `route: cheapest` / `fastest` / `least_busy` / `usage` all map to `RouteKind::Native` with the
-    /// policy name folded into `policy.name` (see below), so the long form (`route: native` +
-    /// `policy.name: cheapest`) and the short form are byte-identical after load. `route: weighted`
-    /// (long or short) stays plain `RouteKind::Weighted` (the zero-cost default), NOT a native object.
-    pub(crate) route: RouteKind,
-    /// Per-transport policy configuration (URL/script/native-name/timeout/on_error). Inert when
-    /// `route: weighted`. For a native shorthand the resolved `name` is synthesized here so the
-    /// native registry lookup in `routing::resolve_policy` sees a single canonical shape.
-    pub(crate) policy: Option<PolicyCfg>,
+    /// The pool's native ranking STRATEGY (a strategy name in `hooks: [...]`). `weighted`
+    /// (default / absent) is today's SWRR
+    /// with ZERO added cost — no `RoutingPolicy` object, byte-identical hot path. `cheapest`/`fastest`/
+    /// `least_busy`/`usage` resolve a native ordering policy that runs once before the failover loop.
+    /// This is the pool's ranking FLOOR.
+    pub(crate) policy: PoolPolicy,
+    /// The pool's GATES (the non-strategy names in `hooks: [...]`). Each names an entry in the
+    /// top-level `hooks:` registry; validated to be `kind: gate` at startup.
+    /// Empty = no per-pool gate (pure native ordering). Config order is preserved — it is the
+    /// phase-2 chain order (order last-wins; reject/restrict commute).
+    pub(crate) gates: Vec<String>,
+    /// Whether the pool EXPLICITLY named its base ordering strategy (a strategy name in
+    /// `hooks: [...]`), vs leaving it defaulted. `false` (defaulted) is the pool that INHERITS the
+    /// `default:` hook when one is registered (else the compiled-in `weighted` backstop); `true` means
+    /// the operator picked a base, so the `default:` hook does NOT override it. `policy` alone can't
+    /// carry this — it defaults to `Weighted` indistinguishably from an explicit `weighted`.
+    pub(crate) base_named: bool,
 }
 
-/// Manual `Deserialize` for [`PoolCfg`] so the `route:` key accepts the NATIVE SHORTHANDS in
-/// addition to the long transport names. A bare `route: cheapest` (or `fastest` / `least_busy` /
-/// `usage`) desugars to `RouteKind::Native` with `policy.name` set to that shorthand, so the rest of
-/// the codebase only ever sees the canonical `(route: native, policy.name: <native>)` shape — the
-/// long form keeps working unchanged. `route: weighted` (long or short) stays `RouteKind::Weighted`
-/// (the zero-cost default); `webhook` / `script` / `native` keep their existing meaning. An explicit
-/// `policy.name` is never overwritten by the shorthand (a long-form config wins).
+/// Manual `Deserialize` for [`PoolCfg`] so retired config keys become CLEAN-BREAK migration errors
+/// instead of silent surprises: the removed 1.2.1 `route:` pool key AND the retired transitional
+/// `policy:`/`hook:` pair each fail loudly with the exact fix. `hooks: [...]` is THE pool form —
+/// one list naming an optional ordering strategy and any gates (everything is a hook).
 impl<'de> Deserialize<'de> for PoolCfg {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        // Raw mirror of the on-disk shape. `route` is captured as a free string so we can recognize
-        // the native shorthands that `RouteKind`'s snake_case enum cannot express on its own.
         #[derive(Deserialize)]
         struct RawPoolCfg {
             #[serde(default)]
@@ -383,67 +441,121 @@ impl<'de> Deserialize<'de> for PoolCfg {
             on_exhausted: Option<OnExhaustedCfg>,
             #[serde(default)]
             affinity: Option<AffinityCfg>,
+            /// RETIRED transitional key — captured only to emit a migration error naming the fix.
+            #[serde(default)]
+            policy: Option<serde::de::IgnoredAny>,
+            /// RETIRED transitional key — captured only to emit a migration error naming the fix.
+            #[serde(default)]
+            hook: Option<serde::de::IgnoredAny>,
+            /// THE pool form (everything-is-a-hook): a pool names the hooks it wants — an ordering
+            /// strategy (weighted/cheapest/…) and/or gates — in ONE list. Desugars into the internal
+            /// (base policy, gates) representation.
+            #[serde(default)]
+            hooks: Option<Vec<String>>,
+            /// REMOVED in 1.3 — captured only to emit a migration error naming the fix.
             #[serde(default)]
             route: Option<String>,
-            #[serde(default)]
-            policy: Option<PolicyCfg>,
+        }
+
+        // Is `name` one of the native ordering strategies (an ordering hook), vs a gate reference?
+        // The strategy set is fixed + known at parse time, so `hooks: [...]` classifies without the
+        // (not-yet-available) registry: a strategy name sets the base ordering; anything else is a gate.
+        fn is_strategy_name(name: &str) -> bool {
+            matches!(
+                name,
+                "weighted" | "cheapest" | "fastest" | "least_busy" | "usage"
+            )
         }
 
         let raw = RawPoolCfg::deserialize(deserializer)?;
-        // Desugar `route:` into `(RouteKind, Option<native shorthand name>)`. Unknown values are a
-        // hard error (matching serde's enum behavior), so a typo in `route:` still fails loudly.
-        let (route, shorthand_name): (RouteKind, Option<&'static str>) = match raw.route.as_deref()
-        {
-            None | Some(crate::routing::native::POLICY_NAME_WEIGHTED) => {
-                (RouteKind::Weighted, None)
-            }
-            Some("webhook") => (RouteKind::Webhook, None),
-            Some("socket") => (RouteKind::Socket, None),
-            Some("script") => (RouteKind::Script, None),
-            Some("native") => (RouteKind::Native, None),
-            // Native shorthands: a bare policy name in `route:` ⇒ Native + that name in policy.name.
-            Some(crate::routing::native::POLICY_NAME_CHEAPEST) => (
-                RouteKind::Native,
-                Some(crate::routing::native::POLICY_NAME_CHEAPEST),
-            ),
-            Some(crate::routing::native::POLICY_NAME_FASTEST) => (
-                RouteKind::Native,
-                Some(crate::routing::native::POLICY_NAME_FASTEST),
-            ),
-            Some(crate::routing::native::POLICY_NAME_LEAST_BUSY) => (
-                RouteKind::Native,
-                Some(crate::routing::native::POLICY_NAME_LEAST_BUSY),
-            ),
-            Some(crate::routing::native::POLICY_NAME_USAGE) => (
-                RouteKind::Native,
-                Some(crate::routing::native::POLICY_NAME_USAGE),
-            ),
-            Some(other) => {
-                return Err(serde::de::Error::custom(format!(
-                    "unknown route '{other}': expected one of weighted, webhook, socket, script, \
-                     native, or a native shorthand (cheapest, fastest, least_busy, usage)"
-                )));
-            }
-        };
 
-        // Fold the shorthand name into `policy.name` so downstream resolution sees one canonical
-        // shape. An explicit long-form `policy.name` always wins (never overwritten).
-        let mut policy = raw.policy;
-        if let Some(name) = shorthand_name {
-            // NOTE: `PolicyCfg::default()` leaves `timeout_ms = 0` because serde's
-            // `default = "default_policy_timeout_ms"` only fires on the deserialize path, never on a
-            // code-built struct. A shorthand pool (`route: cheapest`) has no `policy:` block on disk,
-            // so without this the desugared cfg would carry a 0ms policy timeout → an instant
-            // deadline at `resolve_policy`. Stamp the real default on a freshly-synthesized cfg.
-            let needs_default_timeout = policy.is_none();
-            let p = policy.get_or_insert_with(PolicyCfg::default);
-            if needs_default_timeout {
-                p.timeout_ms = DEFAULT_POLICY_TIMEOUT_MS;
-            }
-            if p.name.is_none() {
-                p.name = Some(name.to_string());
+        // The `route:` pool key is GONE in 1.3 (a pool names its hooks in one `hooks: [...]` list;
+        // `route` now means only the HTTP router). Name the fix per legacy value.
+        if let Some(route) = raw.route.as_deref() {
+            let msg = match route {
+                "weighted" | "cheapest" | "fastest" | "least_busy" | "usage" | "native" => {
+                    "the `route:` pool key was removed in 1.3; a pool names its ordering strategy \
+                     in its `hooks:` list — write `hooks: [<name>]` (e.g. `hooks: [cheapest]`)."
+                }
+                "socket" | "webhook" => {
+                    "the `route: socket|webhook` transport was removed in 1.3; define the hook once \
+                     under top-level `hooks:` (e.g. `hooks: { my-hook: { kind: gate, socket: ... } }`) \
+                     and name it in the pool's list: `hooks: [my-hook]`."
+                }
+                "script" => {
+                    "route: script (the embedded Rhai transport) was removed in 1.3. Define an \
+                     out-of-process gate under top-level `hooks:` (kind: gate, socket:) and name it \
+                     in the pool's `hooks: [...]` list. See the 1.2.x -> 1.3 migration guide."
+                }
+                _ => {
+                    "the `route:` pool key was removed in 1.3. Name the pool's ordering strategy \
+                     and/or gates in its `hooks: [...]` list (definitions live under top-level \
+                     `hooks:`)."
+                }
+            };
+            return Err(serde::de::Error::custom(msg));
+        }
+
+        // The transitional `policy:`/`hook:` pool keys are RETIRED — `hooks: [...]` is the one form.
+        if raw.policy.is_some() {
+            return Err(serde::de::Error::custom(
+                "the `policy:` pool key was retired in 1.3; a pool names its ordering strategy in \
+                 its `hooks:` list — write `hooks: [<strategy>]` (e.g. `hooks: [cheapest]`).",
+            ));
+        }
+        if raw.hook.is_some() {
+            return Err(serde::de::Error::custom(
+                "the `hook:` pool key was retired in 1.3; name the gate in the pool's `hooks:` \
+                 list — write `hooks: [my-gate]` (an ordering strategy may share the list, e.g. \
+                 `hooks: [cheapest, my-gate]`).",
+            ));
+        }
+
+        fn parse_strategy<E: serde::de::Error>(name: &str) -> Result<PoolPolicy, E> {
+            match name {
+                "weighted" => Ok(PoolPolicy::Weighted),
+                "cheapest" => Ok(PoolPolicy::Cheapest),
+                "fastest" => Ok(PoolPolicy::Fastest),
+                "least_busy" => Ok(PoolPolicy::LeastBusy),
+                "usage" => Ok(PoolPolicy::Usage),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown pool policy '{other}': expected weighted, cheapest, fastest, \
+                     least_busy, or usage"
+                ))),
             }
         }
+
+        // Resolve the internal (base policy, gates) representation from the `hooks: [...]` list.
+        let (policy, gates, base_named) = if let Some(names) = raw.hooks {
+            // Partition the list: ordering strategies set the base ranking; anything else is a gate ref
+            // (validated against the registry at startup). At most one strategy (a pool has ONE base
+            // ordering); ANY number of gates, keeping list order — that is the phase-2 chain
+            // tie-break order (reject/restrict commute; order last-wins; `priority` sorts first).
+            let mut policy: Option<PoolPolicy> = None;
+            let mut gates: Vec<String> = Vec::new();
+            for name in names {
+                if is_strategy_name(&name) {
+                    if policy.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "a pool `hooks:` list names more than one ordering strategy; a pool has \
+                             one base ordering",
+                        ));
+                    }
+                    policy = Some(parse_strategy(&name)?);
+                } else {
+                    gates.push(name);
+                }
+            }
+            // No strategy named ⇒ the base is the default (resolved at startup: the `default:` hook if
+            // one exists, else the compiled-in `weighted` backstop). Placeholder is `weighted` here;
+            // `base_named` records whether a strategy WAS named so resolution knows to inherit or not.
+            let base_named = policy.is_some();
+            (policy.unwrap_or_default(), gates, base_named)
+        } else {
+            // No `hooks:` list ⇒ the defaults: weighted-placeholder base (base NOT named, so the
+            // `default:` hook — if registered — becomes the base at resolution), no gates.
+            (PoolPolicy::default(), Vec::new(), false)
+        };
 
         Ok(PoolCfg {
             members: raw.members,
@@ -451,38 +563,117 @@ impl<'de> Deserialize<'de> for PoolCfg {
             failover: raw.failover,
             on_exhausted: raw.on_exhausted,
             affinity: raw.affinity,
-            route,
             policy,
+            gates,
+            base_named,
         })
     }
 }
 
-/// The routing transport for a pool. Resolved ONCE at config load into a runtime policy enum so the
-/// hot path never branches on a string; the default `Weighted` arm builds no policy object at all.
+/// A pool's native ranking STRATEGY — the `policy:` key. `weighted` (default / absent) is today's
+/// smooth-weighted-round-robin: ZERO added cost, no policy object constructed, the byte-identical hot
+/// path. The others resolve a Busbar-native ordering policy that runs once before the failover loop.
+/// This is the pool's ranking FLOOR; an optional `hook:` gate can override it per-request.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RouteKind {
-    /// Today's smooth-weighted-round-robin (SWRR). Default and also the absent case. Zero added cost.
+pub(crate) enum PoolPolicy {
+    /// Smooth-weighted-round-robin (SWRR). Default and also the absent case. Zero added cost.
     #[default]
     Weighted,
-    /// An operator-run HTTP sidecar that returns a ranked member preference.
-    Webhook,
-    /// An operator-run BINARY hook on a local Unix domain socket (`policy.socket`) — the same wire
-    /// contract as the webhook without the HTTP stack, for microsecond decisions. Unix-only.
-    Socket,
-    /// An embedded Rhai script (behind the `script-policy` cargo feature) returning a ranked order.
-    /// DEPRECATED: prefer `socket` (compiled hook, ~100x faster) or `webhook`.
-    Script,
-    /// A Busbar-native policy selected by `policy.name` (e.g. `cheapest`/`fastest`/`least_busy`/
-    /// `usage`/`weighted`).
-    Native,
+    Cheapest,
+    Fastest,
+    LeastBusy,
+    Usage,
 }
 
-/// Behavior when a policy times out, errors, abstains, or saturates. `Weighted` (default) is the
-/// non-negotiable safety stance: a broken/slow policy is indistinguishable from no policy and NEVER
-/// blocks or fails a request. `Reject` is fail-closed (503). `First` uses the configured member
-/// order (a deterministic degraded pick).
-#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+impl PoolPolicy {
+    /// The ranking-registry name for this strategy (`plugins::hooks::ranking::native_policy`).
+    /// `weighted` returns `None` — it IS the zero-cost inline-SWRR default and constructs no policy
+    /// object. String literals (not the ranking plugin's constants) so this stays engine-level and
+    /// compiles when the `hooks-ranking` plugin is removed; the plugin matches the same names.
+    pub(crate) fn native_name(&self) -> Option<&'static str> {
+        match self {
+            PoolPolicy::Weighted => None,
+            PoolPolicy::Cheapest => Some("cheapest"),
+            PoolPolicy::Fastest => Some("fastest"),
+            PoolPolicy::LeastBusy => Some("least_busy"),
+            PoolPolicy::Usage => Some("usage"),
+        }
+    }
+}
+
+/// A hook's MODE — the `kind:` key. A hook is one thing; `tap`/`gate` just say whether busbar waits
+/// for a reply. `tap` = fire-and-forget (watch). `gate` = fire-and-wait (decide: nothing / reject /
+/// restrict / order / rewrite). Only a gate can influence dispatch; a pool's `hook:` must name a gate.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HookKind {
+    Tap,
+    Gate,
+}
+
+/// A hook's PROMPT access grant (`prompt:`) — the trust ladder for request content, monotonic
+/// `no ⊂ ro ⊂ rw`. DEFAULT `no` (shape-only; no prompt text leaves the process). `ro` sends the
+/// prompt for READ-ONLY inspection (PII screening, guardrails, audit). `rw` additionally lets a GATE
+/// return a `rewrite` arm that mutates the body (compression, redaction) — rewrite REQUIRES read, so
+/// it is the top rung of the SAME ladder, not a separate flag. Immutable after registration.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptAccess {
+    #[default]
+    No,
+    Ro,
+    Rw,
+}
+
+impl PromptAccess {
+    /// Whether the prompt projection is built + sent (both `ro` and `rw`).
+    pub(crate) fn sends_prompt(self) -> bool {
+        !matches!(self, PromptAccess::No)
+    }
+    /// Whether the hook may return a `rewrite` arm (only `rw`). Wired in the slice-4 seam.
+    #[allow(dead_code)]
+    pub(crate) fn can_rewrite(self) -> bool {
+        matches!(self, PromptAccess::Rw)
+    }
+}
+
+/// A hook's caller-IDENTITY access grant (`user:`). `no` (default) = no identity in the payload; `ro`
+/// = the governance key id/name (NEVER the secret) + the body end-user field. No `rw`: identity is
+/// established by the auth plugin and hooks never rewrite it. Immutable after registration.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UserAccess {
+    #[default]
+    No,
+    Ro,
+}
+
+impl UserAccess {
+    /// Whether the caller-identity projection is built + sent (`ro`).
+    pub(crate) fn sends_user(self) -> bool {
+        matches!(self, UserAccess::Ro)
+    }
+}
+
+/// The pipeline stage a TAP observes (`at:`). Parsed now; the seam that fires taps at each stage
+/// lands in a later slice. Inert on a gate.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HookStage {
+    Request,
+    Route,
+    Attempt,
+    Completion,
+}
+
+/// A resolved on_error/on_empty TERMINAL. `Weighted` (default) is the non-negotiable safety
+/// stance: a broken/slow policy is indistinguishable from no policy and NEVER blocks or fails a
+/// request. `Reject` is fail-closed (503). `First` uses the configured member order (a
+/// deterministic degraded pick). The `on_error` CONFIG field is a free string (a fallback chain of
+/// hook names bottoming out on one of these three reserved terminals); `on_empty` parses this enum
+/// directly.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PolicyOnError {
     #[default]
@@ -491,75 +682,154 @@ pub(crate) enum PolicyOnError {
     First,
 }
 
-/// Per-pool policy configuration. All transports share `timeout_ms`/`on_error`; the transport-specific
-/// fields (`url`, `script`/`script_file`, `name`) are validated against `route` at startup.
-// The transport-specific fields (`url`, `script`/`script_file`, `name`) are consumed by
-// `routing::resolve_policy` at config load to construct the matching transport, and validated against
-// `route` at startup.
-#[derive(Debug, Deserialize, Clone, Default)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PolicyCfg {
-    // ── webhook transport ────────────────────────────────────────────────────────────────────────
-    /// The operator sidecar URL. Validated by the routing-URL SSRF guard (loopback allowed, IMDS/
-    /// RFC1918/CGNAT/metadata blocked — the OTLP precedent). Required when `route: webhook`.
-    #[serde(default)]
-    pub(crate) url: Option<String>,
-    // ── socket transport ─────────────────────────────────────────────────────────────────────────
-    /// Filesystem path of the hook binary's Unix domain socket. Required when `route: socket`.
-    /// The binary is operator-run (busbar never spawns it); the connection is lazy, so the hook may
-    /// start after busbar. Unix-only — on other platforms `route: socket` degrades to weighted.
-    #[serde(default)]
-    pub(crate) socket: Option<String>,
-    // ── shared ───────────────────────────────────────────────────────────────────────────────────
-    /// Hard wall-clock deadline for the policy decision, in milliseconds (default 1). The default
-    /// says hooks are FAST — a co-located socket hook decides in ~8us and a co-located webhook in
-    /// ~34us, so 1ms is 20x+ headroom. RAISE it when your hook is legitimately slower: it calls a
-    /// database, crosses the network, or asks a model. On timeout the decision is coerced to
-    /// `on_error` and the request proceeds regardless.
-    #[serde(default = "default_policy_timeout_ms")]
-    pub(crate) timeout_ms: u64,
-    /// Fallback behavior on timeout/error/abstain/saturation (default `weighted`).
-    #[serde(default)]
-    pub(crate) on_error: PolicyOnError,
-    /// Opt-in: include the request's prompt content (flattened `system` text + per-message
-    /// `{role, text}`) in the hook payload. DEFAULT OFF — the default payload is shape-only, so no
-    /// prompt text ever leaves the process unless the operator flips this per pool. Turning it on
-    /// says "this hook is trusted with request content" (PII screening, guardrails, audit).
-    /// Cost note: the hook payload then scales with the request body (bounded by the ingress body
-    /// cap; the serialized line is transiently held per decision) — budget hook memory accordingly.
-    /// Webhook/socket only; the script (deprecated) and native transports have no reader for it
-    /// and force it off at resolve, each with a startup warning.
-    #[serde(default)]
-    pub(crate) send_prompt: bool,
-    /// Opt-in: include caller identity in the hook payload — the governance virtual-key `id`/`name`
-    /// (NEVER the secret) and the request body's end-user field (`user` / `metadata.user_id`).
-    /// DEFAULT OFF. Turning it on enables route-by-who policies (team lanes, per-user denies).
-    /// Webhook/socket only; the script (deprecated) and native transports have no reader for it
-    /// and force it off at resolve, each with a startup warning.
-    #[serde(default)]
-    pub(crate) send_user: bool,
-    // ── script transport ─────────────────────────────────────────────────────────────────────────
-    /// Inline Rhai source. Exactly one of `script`/`script_file` is required when `route: script`.
-    /// Read by `routing::resolve_policy`'s script arm, which is gated on the `script-policy` feature;
-    /// the default build parses the field (configs round-trip) but compiles out the only reader.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
-    pub(crate) script: Option<String>,
-    /// Path to a Rhai script file. Alternative to inline `script`. Same `script-policy`-gated reader.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "script-policy"), allow(dead_code))]
-    pub(crate) script_file: Option<String>,
-    // ── native transport ─────────────────────────────────────────────────────────────────────────
-    /// Native policy name (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`). Required when
-    /// `route: native`.
-    #[serde(default)]
-    pub(crate) name: Option<String>,
+/// The serde default for a hook's `on_error` — `nothing` (Matthew's ruling): a failing gate
+/// DOES NOT PARTICIPATE by default — it cannot steer, and it cannot displace another gate's
+/// verdict. Security gates opt into `reject`; ordering gates name `weighted` explicitly.
+fn default_on_error() -> String {
+    ON_ERROR_NOTHING.to_string()
 }
 
-/// The default hard wall-clock deadline for a policy decision, in milliseconds. Used by serde's
-/// `default = "default_policy_timeout_ms"` AND applied explicitly to code-built `PolicyCfg`s (the
-/// native-shorthand desugar, where `PolicyCfg::default()` would otherwise leave `timeout_ms = 0`
-/// because serde defaults only fire on deserialize). Also the single source of truth consumed at the
+/// The RESERVED on_error terminal names — every fallback chain must bottom out on one.
+pub(crate) const ON_ERROR_WEIGHTED: &str = "weighted";
+pub(crate) const ON_ERROR_REJECT: &str = "reject";
+pub(crate) const ON_ERROR_FIRST: &str = "first";
+/// The explicit DO-NOT-PARTICIPATE terminal: the failing gate simply drops out of the decision —
+/// it cannot steer, and it cannot displace any OTHER gate's verdict (in the concurrent reconcile a
+/// non-participating outcome is skipped by every pass). The right posture for a gate whose job is
+/// orthogonal to routing (e.g. a compressor): its failure should never reshape traffic. Internally
+/// identical to the `weighted` terminal — "didn't participate" and "busbar's normal ordering" are
+/// the same behavior — but the NAME teaches the correct mental model.
+pub(crate) const ON_ERROR_NOTHING: &str = "nothing";
+
+/// Map an `on_error` NAME to its reserved terminal, if it is one. `None` = the name is a fallback
+/// hook reference (a ranking strategy or a registry gate), resolved by routing / validated at boot.
+pub(crate) fn on_error_terminal(name: &str) -> Option<PolicyOnError> {
+    match name {
+        ON_ERROR_WEIGHTED | ON_ERROR_NOTHING => Some(PolicyOnError::Weighted),
+        ON_ERROR_REJECT => Some(PolicyOnError::Reject),
+        ON_ERROR_FIRST => Some(PolicyOnError::First),
+        _ => None,
+    }
+}
+
+/// The serde default for `admin_auth:` — the built-in `admin-tokens` module (the single operator
+/// admin token; byte-identical to the pre-chain behavior).
+fn default_admin_auth() -> Vec<String> {
+    vec!["admin-tokens".to_string()]
+}
+
+/// One `group_map:` entry — the operator-owned policy granted to a principal GROUP (design-hooks-v2
+/// §2.3): the admin authorization scope AND the data-plane governance grants. A group-carrying
+/// principal (an external auth module's verdict) gets governance enforcement synthesized from the
+/// UNION of its mapped groups — identical machinery, keyed by the principal id, so an SSO user and
+/// a virtual key get identical enforcement. Unmapped groups grant nothing (fail closed).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupMapEntry {
+    /// The ADMIN scope this group grants: `read-only` | `hooks-register` | `full`. Absent = no
+    /// admin access from this group. Validated at boot; the most permissive of a principal's
+    /// mapped groups wins.
+    #[serde(default)]
+    pub(crate) admin_scope: Option<String>,
+    /// DATA-PLANE grant: pools this group may target. Setting this (even `[]`) is what grants the
+    /// group data-plane access at all; a group that only maps `admin_scope` confers none. Across a
+    /// principal's groups the pool lists UNION; an explicit `[]` grants access to EVERY pool
+    /// (mirroring a virtual key with no pool restriction).
+    #[serde(default)]
+    pub(crate) allowed_pools: Option<Vec<String>>,
+    /// Requests-per-minute cap for principals granted through this group. Most-permissive union:
+    /// a granting group WITHOUT a cap makes the principal uncapped; otherwise the max wins.
+    #[serde(default)]
+    pub(crate) rpm_limit: Option<u32>,
+    /// Tokens-per-minute cap; same most-permissive union as `rpm_limit`.
+    #[serde(default)]
+    pub(crate) tpm_limit: Option<u32>,
+    /// Spend cap in cents (an all-time "total" window); same most-permissive union.
+    #[serde(default)]
+    pub(crate) max_budget_cents: Option<i64>,
+}
+
+/// A named entry in the top-level `hooks:` registry — a single hook (tap or gate) and its transport.
+/// One transport per hook: exactly one of `socket` (Unix domain socket, ~8us) or `webhook` (HTTPS
+/// sidecar). Shared runtime knobs carry over from the 1.2.1 policy block. A pool references a GATE by
+/// name via its `hook:` key; global taps/gates via `global_hooks:` (or inline `global: true`).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HookCfg {
+    /// The hook's MODE: `tap` (fire-and-forget) or `gate` (fire-and-wait, returns a reply arm).
+    pub(crate) kind: HookKind,
+    // ── transport (exactly one) ──────────────────────────────────────────────────────────────────
+    /// Unix domain socket path of the operator-run hook binary. Lazy connect (the hook may start
+    /// after busbar). Unix-only. Mutually exclusive with `webhook`.
+    #[serde(default)]
+    pub(crate) socket: Option<String>,
+    /// HTTPS sidecar URL. Validated by the routing-URL SSRF guard (loopback allowed; IMDS/RFC1918/
+    /// CGNAT/metadata blocked — the OTLP precedent). Mutually exclusive with `socket`.
+    #[serde(default)]
+    pub(crate) webhook: Option<String>,
+    // ── shared runtime knobs ─────────────────────────────────────────────────────────────────────
+    /// Hard wall-clock deadline for a gate decision, in milliseconds (default 1). Co-located socket
+    /// ~8us, webhook ~34us, so 1ms is 20x+ headroom; RAISE it for a hook that hits a DB/network/model.
+    /// On timeout the decision is coerced to `on_error` and the request proceeds.
+    #[serde(default = "default_policy_timeout_ms")]
+    pub(crate) timeout_ms: u64,
+    /// Fallback when a GATE times out/errors/saturates — a NAME resolved against the same registry
+    /// as any hook (default `weighted` = proceed as busbar normally would). Reserved terminals:
+    /// `nothing` (do not participate — a failing gate drops out and cannot displace another gate's
+    /// verdict; the posture for non-routing gates like compressors) | `weighted` (same behavior,
+    /// named as the ordering floor) | `reject` (fail closed — security gates set this) | `first`.
+    /// Any other name is a
+    /// fallback HOOK (a built-in ranking strategy or another gate) fired when this one fails; its
+    /// own `on_error` chains further, and boot validation proves every chain terminates (unknown
+    /// names, taps, and cycles are boot errors).
+    #[serde(default = "default_on_error")]
+    pub(crate) on_error: String,
+    /// PROMPT access grant: `no` (default, shape-only) | `ro` (read prompt content) | `rw` (read +
+    /// may `rewrite` the body). The single trust ladder for request content; `rw` is how a gate is
+    /// granted rewrite. Immutable after registration. `rw` on a tap is a config error.
+    #[serde(default)]
+    pub(crate) prompt: PromptAccess,
+    /// Caller-IDENTITY access grant: `no` (default) | `ro` (governance key id/name — never the secret
+    /// — + body end-user field). Enables route-by-who gates. Immutable after registration.
+    #[serde(default)]
+    pub(crate) user: UserAccess,
+    /// Hook ordering key (default 0). Orders the rewrite transform chain and the phase-2 decision
+    /// chain (which reject surfaces; which order is "last" — see design-hooks-v2 §3.2). Ascending;
+    /// ties keep globals before pool gates, then config order.
+    #[serde(default)]
+    pub(crate) priority: u16,
+    /// TAP observation stage (`request`/`route`/`attempt`/`completion`; unset = `request`).
+    /// `request` observes the (post-rewrite) request; `route` the post-reconcile candidate set;
+    /// `attempt` every dispatch attempt (the failover story); `completion` the outcome — including
+    /// the SYNTHETIC rejected completion, so audit taps see denials. Inert on a gate.
+    #[serde(default)]
+    pub(crate) at: Option<HookStage>,
+    /// GATE restrict empty-intersection behavior (default `reject`, fail-closed; `weighted` is the
+    /// advisory escape — the gate's restriction is skipped). Applied per gate in the phase-2
+    /// reconcile.
+    #[serde(default)]
+    pub(crate) on_empty: Option<PolicyOnError>,
+    /// OPAQUE settings map pushed to the hook via the `configure` wire message (D2): sent as the
+    /// first line on every socket connection and re-pushed (commit-on-ack) by
+    /// `PATCH /admin/v1/hooks/{name}/settings`. Busbar never interprets the contents.
+    #[serde(default)]
+    pub(crate) settings: serde_json::Map<String, serde_json::Value>,
+    /// Fire on EVERY request — inline sugar for adding this name to `global_hooks:`. Default false.
+    #[serde(default)]
+    pub(crate) global: bool,
+    /// Mark this hook as THE default — the base a pool inherits when it names no hook of its own.
+    /// REPLACEMENT semantics (unlike `global:`, which is an overlay ON TOP of the base): a `default`
+    /// hook becomes the base, so the compiled-in backstop (`weighted`) is not used. Exactly like
+    /// `auth: [sso]` means the built-in `tokens` is not loaded. AT MOST ONE hook may set `default:
+    /// true` (boot AND every admin apply → error naming both); 0 ⇒ the compiled-in backstop. Only an
+    /// ordering hook (one that returns `order`) is a meaningful default. Default false. Resolution:
+    /// `routing::resolve_pool_ordering` gives this hook to every pool whose base is unnamed.
+    #[serde(default)]
+    pub(crate) default: bool,
+}
+
+/// The default hard wall-clock deadline for a gate decision, in milliseconds. Used by serde's
+/// `default = "default_policy_timeout_ms"`. Also the single source of truth consumed at the
 /// resolution sites in `routing/mod.rs`.
 pub(crate) const DEFAULT_POLICY_TIMEOUT_MS: u64 = 1;
 
@@ -575,7 +845,7 @@ pub(crate) struct PoolMember {
     #[serde(default)]
     pub(crate) context_max: Option<usize>,
     /// Operator-declared routing tier (e.g. `"large"`/`"small"`/`"primary"`/`"overflow"`). Projected
-    /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/script policies.
+    /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/socket policies.
     #[serde(default)]
     pub(crate) tier: Option<String>,
     /// Per-ATTEMPT time-to-response-headers cap (ms) for THIS member in THIS pool — overrides the
@@ -589,11 +859,11 @@ pub(crate) struct PoolMember {
     #[serde(default)]
     pub(crate) reasoning: Option<bool>,
     /// Operator-declared cost in currency-units per million tokens. Drives the native `cheapest`
-    /// policy and is exposed to webhook/script policies. Inert when unset.
+    /// policy and is exposed to webhook/socket policies. Inert when unset.
     #[serde(default)]
     pub(crate) cost_per_mtok: Option<f64>,
     /// Free-form operator tags (e.g. `["opus"]`) a policy can match on. Projected into the routing
-    /// `Candidate` and read by webhook/script policies.
+    /// `Candidate` and read by webhook/socket policies.
     #[serde(default)]
     pub(crate) tags: Vec<String>,
 }
@@ -932,6 +1202,19 @@ pub(crate) struct DeployCfg {
     /// without defining any pool.
     #[serde(default)]
     pub(crate) pools: HashMap<String, PoolCfg>,
+    /// The top-level hook registry (`hooks:`) — named taps + gates. Optional; absent = empty.
+    #[serde(default)]
+    pub(crate) hooks: HashMap<String, HookCfg>,
+    /// The ADMIN auth chain (`admin_auth:`). Absent ⇒ the default `[admin-tokens]`.
+    #[serde(default = "default_admin_auth")]
+    pub(crate) admin_auth: Vec<String>,
+    /// `group_map:` — principal groups → operator-owned policy. Optional; absent = empty.
+    #[serde(default)]
+    pub(crate) group_map: HashMap<String, GroupMapEntry>,
+    /// Hooks that fire on every request (`global_hooks:`). Optional; unioned at resolve with any hook
+    /// carrying inline `global: true`.
+    #[serde(default)]
+    pub(crate) global_hooks: Vec<String>,
     /// Optional observability sinks (OTLP traces + request-log webhook). Metrics
     /// (`/metrics`) are always on and need no config.
     #[serde(default)]
@@ -1537,6 +1820,21 @@ pub(crate) fn resolve(
             providers: resolved_providers,
             models: deploy.models.clone(),
             pools: deploy.pools.clone(),
+            hooks: deploy.hooks.clone(),
+            admin_auth: deploy.admin_auth.clone(),
+            group_map: deploy.group_map.clone(),
+            // global_hooks = explicit `global_hooks:` list UNIONed with any hook carrying inline
+            // `global: true`, deduped, order-stable (explicit list first, then inline in registry
+            // iteration order). Dangling refs are caught by config_validate.
+            global_hooks: {
+                let mut names = deploy.global_hooks.clone();
+                for (name, hook) in &deploy.hooks {
+                    if hook.global && !names.iter().any(|n| n == name) {
+                        names.push(name.clone());
+                    }
+                }
+                names
+            },
             blocked_metadata_hosts: deploy
                 .security
                 .as_ref()
@@ -1572,6 +1870,35 @@ pub(crate) fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hook config types are round-trippable (Deserialize + Serialize) — the foundation for the
+    /// config-overlay persistence that will let a runtime-registered hook survive a restart. A
+    /// `HookCfg` deserialized from JSON re-serializes + re-parses to an identical shape, exercising the
+    /// snake_case enums (kind/prompt/user) + the transport + the ordering/stage fields.
+    #[test]
+    fn hook_cfg_round_trips_for_overlay_persistence() {
+        let src = serde_json::json!({
+            "kind": "gate",
+            "webhook": "http://127.0.0.1:8900/",
+            "prompt": "rw",
+            "user": "ro",
+            "priority": 7,
+            "on_error": "reject",
+            "global": true,
+            "timeout_ms": 25
+        });
+        let cfg: HookCfg = serde_json::from_value(src).expect("HookCfg deserializes");
+        // Serialize -> re-deserialize -> re-serialize: the two JSON forms must be identical (stable).
+        let once = serde_json::to_value(&cfg).expect("HookCfg serializes");
+        let cfg2: HookCfg = serde_json::from_value(once.clone()).expect("re-deserializes");
+        let twice = serde_json::to_value(&cfg2).expect("re-serializes");
+        assert_eq!(once, twice, "HookCfg round-trips stably");
+        // Spot-check the snake_case enum projection survives.
+        assert_eq!(once["kind"], "gate");
+        assert_eq!(once["prompt"], "rw");
+        assert_eq!(once["user"], "ro");
+        assert_eq!(once["on_error"], "reject");
+    }
 
     /// Serializes tests that touch the *shared* `BUSBAR_CLIENT_TOKEN` env var. Env vars are
     /// process-global, and `cargo test` runs tests in parallel by default, so two tests that
@@ -1696,6 +2023,10 @@ models:
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: None,
             security: None,
@@ -1839,101 +2170,164 @@ models:
         );
     }
 
-    /// Native SHORTHAND desugaring: `route: cheapest` (a bare native name) must parse to
-    /// `RouteKind::Native` with `policy.name` folded in — byte-identical to the long form
-    /// `route: native` + `policy.name: cheapest`. Covers every shorthand.
+    /// The `hooks: [...]` list parses each native strategy name as the base; absent defaults to
+    /// weighted with base NOT named (so the `default:` hook can replace it at resolution).
     #[test]
-    fn test_route_native_shorthand_desugars() {
-        for name in ["cheapest", "fastest", "least_busy", "usage"] {
-            let yaml = format!("route: {name}\nmembers: []\n");
-            let pool: PoolCfg = serde_yaml::from_str(&yaml).expect("shorthand must parse");
-            assert_eq!(pool.route, RouteKind::Native, "{name} desugars to Native");
-            assert_eq!(
-                pool.policy.as_ref().and_then(|p| p.name.as_deref()),
-                Some(name),
-                "{name} shorthand must fold into policy.name"
-            );
-            // C1 / CH3: a desugared shorthand has no `policy:` block on disk, so its synthesized
-            // `PolicyCfg` must carry the REAL default timeout (DEFAULT_POLICY_TIMEOUT_MS), NOT the 0 that
-            // `PolicyCfg::default()` leaves behind (serde field-defaults don't fire on code-built
-            // structs). A 0 here becomes an instant 0ms policy deadline at resolution.
-            assert_eq!(
-                pool.policy.as_ref().map(|p| p.timeout_ms),
-                Some(DEFAULT_POLICY_TIMEOUT_MS),
-                "{name} shorthand must inherit the default {DEFAULT_POLICY_TIMEOUT_MS}ms policy timeout, not 0"
-            );
+    fn test_pool_policy_strategies_parse() {
+        for (name, expected) in [
+            ("cheapest", PoolPolicy::Cheapest),
+            ("fastest", PoolPolicy::Fastest),
+            ("least_busy", PoolPolicy::LeastBusy),
+            ("usage", PoolPolicy::Usage),
+            ("weighted", PoolPolicy::Weighted),
+        ] {
+            let yaml = format!("hooks: [{name}]\nmembers: []\n");
+            let pool: PoolCfg = serde_yaml::from_str(&yaml).expect("strategy name must parse");
+            assert_eq!(pool.policy, expected, "{name} must parse to its strategy");
+            assert!(pool.gates.is_empty());
+            assert!(pool.base_named, "a named strategy names the base");
         }
+        // Absent hooks: defaults to the zero-cost weighted strategy; base NOT named ⇒ inherits default:
+        let absent: PoolCfg = serde_yaml::from_str("members: []\n").expect("absent parses");
+        assert_eq!(absent.policy, PoolPolicy::Weighted);
+        assert!(absent.gates.is_empty());
+        assert!(!absent.base_named, "an absent hooks: did not name the base");
     }
 
-    /// `route: weighted` (shorthand or absent) stays the zero-cost `Weighted` default — it must NOT
-    /// be turned into a native policy object.
+    /// RETIRED transitional keys: the `policy:`/`hook:` pool pair each fail with a migration error
+    /// pointing at the `hooks: [...]` list.
     #[test]
-    fn test_route_weighted_and_absent_stay_default() {
-        let absent: PoolCfg = serde_yaml::from_str("members: []\n").expect("absent route parses");
-        assert_eq!(absent.route, RouteKind::Weighted);
-        assert!(absent.policy.is_none());
-
-        let explicit: PoolCfg =
-            serde_yaml::from_str("route: weighted\nmembers: []\n").expect("weighted parses");
-        assert_eq!(explicit.route, RouteKind::Weighted);
-    }
-
-    /// The LONG form still works and an explicit `policy.name` is never overwritten by a shorthand.
-    #[test]
-    fn test_route_long_form_and_explicit_name_preserved() {
-        let long: PoolCfg =
-            serde_yaml::from_str("route: native\nmembers: []\npolicy:\n  name: fastest\n")
-                .expect("long form parses");
-        assert_eq!(long.route, RouteKind::Native);
-        assert_eq!(long.policy.unwrap().name.as_deref(), Some("fastest"));
-
-        // webhook / script keep their kind.
-        let wh: PoolCfg =
-            serde_yaml::from_str("route: webhook\nmembers: []\npolicy:\n  url: http://x\n")
-                .expect("webhook parses");
-        assert_eq!(wh.route, RouteKind::Webhook);
-    }
-
-    /// The hook payload opt-ins (`policy.send_prompt` / `policy.send_user`) are SIMPLE booleans
-    /// that DEFAULT OFF: an absent flag parses false (the shape-only payload), an explicit `true`
-    /// parses true, and a non-boolean value is a parse error (no stringly "yes"/"on" coercion).
-    #[test]
-    fn test_policy_send_flags_default_off() {
-        let p: PoolCfg = serde_yaml::from_str(
-            "route: socket\nmembers: []\npolicy:\n  socket: /run/busbar/h.sock\n",
-        )
-        .expect("parse");
-        let pol = p.policy.unwrap();
-        assert!(!pol.send_prompt, "send_prompt must default off");
-        assert!(!pol.send_user, "send_user must default off");
-
-        let p: PoolCfg = serde_yaml::from_str(
-            "route: socket\nmembers: []\npolicy:\n  socket: /run/busbar/h.sock\n  send_prompt: true\n  send_user: true\n",
-        )
-        .expect("parse");
-        let pol = p.policy.unwrap();
-        assert!(pol.send_prompt);
-        assert!(pol.send_user);
-
+    fn test_pool_policy_and_hook_keys_retired() {
+        let e = serde_yaml::from_str::<PoolCfg>("policy: cheapest\nmembers: []\n")
+            .expect_err("policy: must be a retirement error");
         assert!(
-            serde_yaml::from_str::<PoolCfg>(
-                "route: socket\nmembers: []\npolicy:\n  socket: /s\n  send_prompt: \"yes\"\n"
-            )
-            .is_err(),
-            "a non-boolean send_prompt must fail to parse"
+            e.to_string().contains("retired") && e.to_string().contains("hooks: [cheapest]"),
+            "policy: must point at the hooks list — got: {e}"
+        );
+        let e = serde_yaml::from_str::<PoolCfg>("hook: smart-router\nmembers: []\n")
+            .expect_err("hook: must be a retirement error");
+        assert!(
+            e.to_string().contains("retired") && e.to_string().contains("hooks: [my-gate]"),
+            "hook: must point at the hooks list — got: {e}"
+        );
+        // The block form of the retired key errors the same way (IgnoredAny swallows any shape).
+        let e = serde_yaml::from_str::<PoolCfg>("members: []\npolicy:\n  socket: /s\n")
+            .expect_err("policy block must be a retirement error");
+        assert!(e.to_string().contains("retired"), "{e}");
+    }
+
+    /// The unified `hooks: [...]` pool form desugars into the internal (base policy, gate) rep: an
+    /// ordering-strategy name sets the base ranking, any other name is a gate reference.
+    #[test]
+    fn test_pool_hooks_list_desugars() {
+        // strategy + gate ⇒ base explicitly named
+        let pool: PoolCfg = serde_yaml::from_str("hooks: [cheapest, smart-router]\nmembers: []\n")
+            .expect("hooks list must parse");
+        assert_eq!(pool.policy, PoolPolicy::Cheapest);
+        assert_eq!(pool.gates, ["smart-router"]);
+        assert!(pool.base_named, "a named strategy sets base_named");
+
+        // gate only ⇒ base stays default (weighted placeholder); base NOT named ⇒ inherits default:
+        let g: PoolCfg = serde_yaml::from_str("hooks: [pii-guard]\nmembers: []\n")
+            .expect("gate-only list parses");
+        assert_eq!(g.policy, PoolPolicy::Weighted);
+        assert_eq!(g.gates, ["pii-guard"]);
+        assert!(
+            !g.base_named,
+            "a gate-only pool did not name its base ordering"
+        );
+
+        // strategy only ⇒ base set, no gate, base named
+        let s: PoolCfg =
+            serde_yaml::from_str("hooks: [fastest]\nmembers: []\n").expect("strategy-only parses");
+        assert_eq!(s.policy, PoolPolicy::Fastest);
+        assert!(s.gates.is_empty());
+        assert!(s.base_named);
+    }
+
+    /// A `hooks:` list may name SEVERAL gates — they fire concurrently in the phase-2 reconcile.
+    /// List order is preserved (the chain tie-break within equal `priority`).
+    #[test]
+    fn test_pool_hooks_list_accepts_multiple_gates() {
+        let pool: PoolCfg =
+            serde_yaml::from_str("hooks: [cheapest, pii-guard, compliance]\nmembers: []\n")
+                .expect("multi-gate list must parse");
+        assert_eq!(pool.policy, PoolPolicy::Cheapest);
+        assert_eq!(pool.gates, ["pii-guard", "compliance"]);
+        assert!(pool.base_named);
+    }
+
+    /// The retired keys error even alongside a valid `hooks:` list (the retirement check fires
+    /// before desugar — no silent half-migration).
+    #[test]
+    fn test_pool_hooks_and_legacy_pair_conflict() {
+        let e =
+            serde_yaml::from_str::<PoolCfg>("hooks: [cheapest]\npolicy: fastest\nmembers: []\n")
+                .expect_err("a retired key alongside hooks: must error");
+        assert!(e.to_string().contains("retired"), "{e}");
+    }
+
+    /// Two ordering strategies in one `hooks:` list is an error (a pool has one base ordering).
+    #[test]
+    fn test_pool_hooks_two_strategies_error() {
+        let e = serde_yaml::from_str::<PoolCfg>("hooks: [cheapest, fastest]\nmembers: []\n")
+            .expect_err("two strategies must error");
+        assert!(
+            e.to_string().contains("more than one ordering strategy"),
+            "{e}"
         );
     }
 
-    /// An unknown `route:` value fails loudly (no silent degrade to weighted at parse time).
+    /// Any `policy:` value — known strategy or not — is the same retirement error (the key is gone).
     #[test]
-    fn test_route_unknown_value_errors() {
-        let err = serde_yaml::from_str::<PoolCfg>("route: bogus\nmembers: []\n");
-        assert!(err.is_err(), "unknown route must be a parse error");
-        let msg = format!("{}", err.unwrap_err());
+    fn test_pool_policy_unknown_value_errors() {
+        let err = serde_yaml::from_str::<PoolCfg>("policy: bogus\nmembers: []\n")
+            .expect_err("the retired policy: key must be a parse error");
+        assert!(err.to_string().contains("retired"), "{err}");
+    }
+
+    /// CLEAN-BREAK migration errors: the removed `route:` pool key names its replacement per value —
+    /// every arm points at the `hooks: [...]` pool list.
+    #[test]
+    fn test_legacy_keys_are_migration_errors() {
+        // route: <native> -> hooks: [<name>]
+        let e = serde_yaml::from_str::<PoolCfg>("route: cheapest\nmembers: []\n")
+            .expect_err("route: <native> must error");
         assert!(
-            msg.contains("bogus"),
-            "error must name the bad value, got: {msg}"
+            e.to_string().contains("hooks: [cheapest]"),
+            "route:<native> must point at the hooks list — got: {e}"
         );
+        // route: socket|webhook -> hooks: registry + pool hooks: [name]
+        let e = serde_yaml::from_str::<PoolCfg>("route: socket\nmembers: []\n")
+            .expect_err("route: socket must error");
+        assert!(
+            e.to_string().contains("hooks: [my-hook]"),
+            "route: socket must point at the hooks registry + list — got: {e}"
+        );
+        // route: script -> gate under hooks:
+        let e = serde_yaml::from_str::<PoolCfg>("route: script\nmembers: []\n")
+            .expect_err("route: script must error");
+        assert!(
+            e.to_string().contains("removed in 1.3"),
+            "route: script must name the removal — got: {e}"
+        );
+    }
+
+    /// A hook's `prompt:` / `user:` grants parse the trust ladder; absent defaults to `no`.
+    #[test]
+    fn test_hook_access_grants_parse() {
+        let hook: HookCfg = serde_yaml::from_str("kind: gate\nsocket: /s\nprompt: rw\nuser: ro\n")
+            .expect("grants must parse");
+        assert_eq!(hook.prompt, PromptAccess::Rw);
+        assert!(hook.prompt.sends_prompt() && hook.prompt.can_rewrite());
+        assert_eq!(hook.user, UserAccess::Ro);
+        assert!(hook.user.sends_user());
+
+        let bare: HookCfg =
+            serde_yaml::from_str("kind: tap\nsocket: /s\n").expect("bare hook must parse");
+        assert_eq!(bare.prompt, PromptAccess::No, "prompt defaults to no");
+        assert_eq!(bare.user, UserAccess::No, "user defaults to no");
+        assert!(!bare.prompt.sends_prompt());
     }
 
     /// `governance.budget_on_store_error` parses `allow`/`deny`, defaults to `allow` (fail-
@@ -2179,6 +2573,10 @@ models:
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: None,
             security: None,
@@ -2264,6 +2662,10 @@ models: {}
             providers: HashMap::new(),
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: Some(GovernanceCfg {
                 enabled: true,
@@ -2289,6 +2691,8 @@ models: {}
         );
     }
 
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[test]
     fn test_resolve_accepts_enabled_governance_with_admin_token() {
         let defs = HashMap::new();
@@ -2299,6 +2703,10 @@ models: {}
             providers: HashMap::new(),
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: Some(GovernanceCfg {
                 enabled: true,
@@ -2350,6 +2758,10 @@ models: {}
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: None,
             security: None,
@@ -2412,6 +2824,10 @@ models: {}
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: None,
             security: None,
@@ -2482,6 +2898,10 @@ models: {}
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: None,
             security: None,
@@ -2601,11 +3021,13 @@ models: {}
         // AuthCfg: client_tokens (the 1.0.0 `token` field was removed — setting it is now a parse
         // error, so it can no longer reach `Debug`).
         let auth = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![
                 "SECRET-client-token-aaa".to_string(),
                 "SECRET-client-token-bbb".to_string(),
             ],
+            modules: std::collections::HashMap::new(),
         };
         let dbg = format!("{auth:?}");
         assert!(
@@ -2696,12 +3118,18 @@ models: {}
             listen: "127.0.0.1:8080".to_string(),
             tls: None,
             auth: Some(AuthCfg {
-                mode: crate::auth::AuthMode::Token,
+                chain: vec!["tokens".to_string()],
+                upstream_credentials: crate::auth::UpstreamCreds::Own,
                 client_tokens: vec!["SECRET-embedded-client-token".to_string()],
+                modules: std::collections::HashMap::new(),
             }),
             providers,
             models: HashMap::new(),
             pools: HashMap::new(),
+            hooks: HashMap::new(),
+            admin_auth: vec!["admin-tokens".to_string()],
+            group_map: HashMap::new(),
+            global_hooks: Vec::new(),
             observability: None,
             governance: Some(GovernanceCfg {
                 enabled: true,

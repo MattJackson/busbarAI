@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Virtual-key management API. Admin CRUD over `/admin/keys`, guarded by the
 //! configured admin token (enforced in `auth_middleware`, not here). Mutations refresh the
 //! `GovState` cache. Responses never include a key's `key_hash`; the plaintext secret is returned
 //! exactly once, on creation.
 
-use std::sync::Arc;
-
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Deserializer};
@@ -33,7 +31,6 @@ where
 }
 
 use crate::governance::{NewKeySpec, VirtualKey};
-use crate::state::App;
 
 /// Process-wide gate serializing the existence-sensitive critical sections of the key store.
 ///
@@ -105,6 +102,7 @@ const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
 pub(crate) const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
 pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
 const ERR_TYPE_INTERNAL: &str = "internal_error";
+const ERR_TYPE_CONFLICT: &str = "conflict_error";
 
 /// Maximum byte lengths for admin-API path / body fields (defense-in-depth DB/log-bloat guards).
 /// A real minted key id is `vk_` + 16 hex chars (19 chars); 64 is generous headroom.
@@ -148,7 +146,32 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
     )
 }
 
+// ── Admin API (the FROZEN surface — /admin/v1/*) ─────────────────────────────────────────────────
+//
+// Built engine + swappable layers (Matthew 7/11), VERSION-FIRST: each API version (`v1`, later `v2`)
+// is a self-contained unit under its own directory holding that version's CONTRACT (typed views +
+// stable error codes), its SERVICE (typed operations over the shared engine), and its TRANSPORT wire
+// adapters (`json`, later `graphql`). The transport PORT (`AdminTransport` in `transport`) is shared
+// across versions and transports. Releasing v2 is a LAYER copy of `v1/`, not a rewrite; v1 never
+// breaks. The legacy `/admin/keys` handlers below stay as a deprecated alias with their `{type}`
+// envelope while keys migrate into the versioned service.
+pub(crate) mod audit;
+pub(crate) mod rate;
+pub(crate) mod transport;
+pub(crate) mod v1;
+pub(crate) mod versions;
+
+pub(crate) use v1::json::JsonV1;
+pub(crate) use v1::service::mark_start;
+
 /// Key metadata for API responses — deliberately omits `key_hash`.
+/// A key record's ETag: a short digest of its mutable metadata. Changes whenever any PATCHable
+/// field changes, so `If-Match` detects a concurrent modification (409, no lost update).
+fn key_etag(k: &VirtualKey) -> String {
+    let meta = key_meta(k);
+    crate::sigv4::sha256_hex(meta.to_string().as_bytes())[..16].to_string()
+}
+
 fn key_meta(k: &VirtualKey) -> Value {
     json!({
         "id": k.id,
@@ -199,8 +222,92 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
     )
 }
 
+/// An in-flight idempotency RESERVATION. `create_key` inserts a `Null`-body sentinel under the
+/// cache lock the instant it decides to mint (atomic with the "already cached?" check), so a
+/// concurrent retry with the same `Idempotency-Key` sees the reservation and is rejected instead
+/// of double-minting. This guard clears that sentinel on drop UNLESS the mint committed — so a
+/// request that fails after reserving frees the key for a legitimate retry, while a successful
+/// mint (which replaced the sentinel with its real 201 body and disarmed the guard) keeps it.
+struct IdemReservation {
+    #[allow(clippy::type_complexity)]
+    cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<(String, String), (u64, serde_json::Value)>>,
+    >,
+    key: (String, String),
+    committed: bool,
+}
+
+impl Drop for IdemReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Only remove if it is STILL the pending sentinel — never clobber a real committed body
+        // (a success path that already replaced it).
+        if matches!(c.get(&self.key), Some((_, v)) if v.is_null()) {
+            c.remove(&self.key);
+        }
+    }
+}
+
 /// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
-pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Response {
+pub(crate) async fn create_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    // IDEMPOTENT MINT (optional `Idempotency-Key`): a retried POST with the same key inside the
+    // ~10min window returns the FIRST response verbatim (including the once-shown secret — the
+    // standard idempotency contract: a retry is the same request, not a second mint) instead of
+    // double-creating. Bounded: stale entries are swept on every use.
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    // The idempotency key is scoped to the PRINCIPAL: (actor, header). A different admin's identical
+    // Idempotency-Key value must never replay this principal's response (which carries a secret).
+    let idem_ckey: Option<(String, String)> = idem_key.as_ref().map(|k| (actor.clone(), k.clone()));
+    if let Some(ref ck) = idem_ckey {
+        let now = crate::store::now();
+        let mut cache = app
+            .idempotency_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
+        match cache.get(ck) {
+            // A COMPLETED prior mint (the real 201 object): replay it verbatim.
+            Some((_, cached)) if !cached.is_null() => {
+                return json_response(StatusCode::CREATED, cached.clone());
+            }
+            // An IN-FLIGHT reservation (Null sentinel): a concurrent request with the same key is
+            // still minting. Reject rather than double-mint (the TOCTOU a separate check+insert
+            // allowed); the client's retry succeeds once the first completes or the reservation
+            // expires.
+            Some(_) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    ERR_TYPE_CONFLICT,
+                    "a request with this Idempotency-Key is already in flight",
+                );
+            }
+            // First time: RESERVE under this SAME lock hold, so a concurrent request observes the
+            // reservation instead of an empty slot.
+            None => {
+                cache.insert(ck.clone(), (now, serde_json::Value::Null));
+            }
+        }
+    }
+    // Clears the reservation if we return before committing (parse / validation / mint failure);
+    // disarmed on success, where the real body replaces the sentinel.
+    let mut idem_reservation = idem_ckey.as_ref().map(|ck| IdemReservation {
+        cache: app.idempotency_cache.clone(),
+        key: ck.clone(),
+        committed: false,
+    });
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -323,6 +430,12 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
         let res = tokio::task::spawn_blocking(move || gov.create_key_with_aws(spec, now)).await;
         match res {
             Ok(Ok((key, secret, access_key_id, secret_access_key))) => {
+                audit::AUDIT.record_by(
+                    "key.create",
+                    &format!("key:{}", key.id),
+                    audit::OUTCOME_APPLIED,
+                    &actor,
+                );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // bearer secret, shown exactly once
                                                 // The AccessKeyId is NOT secret (it travels in plaintext in the SigV4 header), but it
@@ -330,6 +443,17 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
                                                 // never returned by any read API, mirroring the bearer `secret`.
                 body["aws_access_key_id"] = json!(access_key_id);
                 body["aws_secret_access_key"] = json!(secret_access_key);
+                if let Some(ref ck) = idem_ckey {
+                    app.idempotency_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(ck.clone(), (crate::store::now(), body.clone()));
+                }
+                // Mint committed and the sentinel replaced by the real body — disarm the guard so
+                // it does not remove the now-cached response.
+                if let Some(g) = idem_reservation.as_mut() {
+                    g.committed = true;
+                }
                 json_response(StatusCode::CREATED, body)
             }
             Ok(Err(e)) => internal_error("create_key", &e),
@@ -339,8 +463,25 @@ pub(crate) async fn create_key(State(app): State<Arc<App>>, body: Bytes) -> Resp
         let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
         match res {
             Ok(Ok((key, secret))) => {
+                audit::AUDIT.record_by(
+                    "key.create",
+                    &format!("key:{}", key.id),
+                    audit::OUTCOME_APPLIED,
+                    &actor,
+                );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // shown exactly once
+                if let Some(ref ck) = idem_ckey {
+                    app.idempotency_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(ck.clone(), (crate::store::now(), body.clone()));
+                }
+                // Mint committed and the sentinel replaced by the real body — disarm the guard so
+                // it does not remove the now-cached response.
+                if let Some(g) = idem_reservation.as_mut() {
+                    g.committed = true;
+                }
                 json_response(StatusCode::CREATED, body)
             }
             Ok(Err(e)) => internal_error("create_key", &e),
@@ -377,16 +518,28 @@ struct UpdateKeyReq {
 /// is kept at create-parity: a negative budget or a zero rate cap is a 400, exactly as `create_key`
 /// rejects them — otherwise PATCH would be a back door around those guards. 404 if the key is absent.
 pub(crate) async fn update_key(
-    State(app): State<Arc<App>>,
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
         return disabled();
     };
     if let Some(resp) = reject_overlong_id(&id) {
         return resp;
     }
+    // OPTIMISTIC CONCURRENCY (optional `If-Match`): the caller's ETag is compared against the
+    // CURRENT record — a stale tag is a 409, never a lost update. The compare must be ATOMIC with
+    // the write, so it is deferred INTO the gated write closure below (a separate pre-read here
+    // would leave a window in which a concurrent PATCH mutates the row between the check and this
+    // write, defeating the guard). Absent header = the transitional unguarded path.
+    let if_match: Option<String> = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_matches('"').to_string());
     // Parse via the depth-guarded `crate::json` seam, not axum's `Json<T>` (whose rejection body
     // echoes the raw serde error / an input fragment). Any failure maps to a GENERIC 400, logging
     // only the byte length via `parse_err_log` — no raw error, no input fragment.
@@ -452,38 +605,186 @@ pub(crate) async fn update_key(
     // handler. If the client drops the request, the already-scheduled closure still runs to completion
     // holding the gate — so a dropped outer future can never release the gate while the lookup→write
     // is still in flight (which would re-open the resurrection / double-revoke races).
-    let res = tokio::task::spawn_blocking(move || {
-        let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
-        gov.update_key(&id, enabled, rpm, tpm, budget)
-    })
-    .await;
+    // The If-Match compare and the write run TOGETHER under the existence gate, so the record the
+    // ETag was checked against is the same record that gets updated — no concurrent PATCH can slip
+    // between them and defeat the guard (the lost-update the separate pre-read allowed).
+    enum UpdateOutcome {
+        Updated(Box<crate::governance::VirtualKey>),
+        NotFound,
+        EtagStale,
+    }
+    let resource = format!("key:{id}");
+    let res =
+        tokio::task::spawn_blocking(move || -> crate::governance::StoreResult<UpdateOutcome> {
+            let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tag) = &if_match {
+                match gov.all_keys()?.into_iter().find(|k| k.id == id) {
+                    Some(k) if key_etag(&k) != *tag => return Ok(UpdateOutcome::EtagStale),
+                    None => return Ok(UpdateOutcome::NotFound),
+                    Some(_) => {}
+                }
+            }
+            Ok(match gov.update_key(&id, enabled, rpm, tpm, budget)? {
+                Some(key) => UpdateOutcome::Updated(Box::new(key)),
+                None => UpdateOutcome::NotFound,
+            })
+        })
+        .await;
     match res {
-        Ok(Ok(Some(key))) => json_response(StatusCode::OK, key_meta(&key)),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
+        Ok(Ok(UpdateOutcome::Updated(key))) => {
+            audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_APPLIED, &actor);
+            json_response(StatusCode::OK, key_meta(&key))
+        }
+        Ok(Ok(UpdateOutcome::EtagStale)) => {
+            audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(
+                StatusCode::CONFLICT,
+                ERR_TYPE_CONFLICT,
+                "If-Match ETag is stale: the key changed since you read it",
+            )
+        }
+        Ok(Ok(UpdateOutcome::NotFound)) => {
+            audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
         Ok(Err(e)) => internal_error("update_key", &e),
         Err(e) => join_error("update_key", &e),
     }
 }
 
-/// GET /admin/keys — list key metadata (no secrets/hashes).
-pub(crate) async fn list_keys(State(app): State<Arc<App>>) -> Response {
+/// GET /admin/keys — list key metadata (no secrets/hashes). Optional filters (design-admin-api-v1
+/// §2.1): `?enabled=true|false` (by enabled state), `?prefix=vk_ab` (by key-id prefix).
+pub(crate) async fn list_keys(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
     let gov = gov.clone();
+    let enabled = q.get("enabled").and_then(|s| s.parse::<bool>().ok());
+    let prefix = q.get("prefix").cloned();
+    // PAGINATION (design-admin-api-v1 §2.1): `?limit=&offset=` over the filtered, id-sorted set.
+    // Absent params = the full list (unchanged legacy shape); `total` counts the filtered set so a
+    // pager can compute pages without a second call.
+    let limit = q.get("limit").and_then(|s| s.parse::<usize>().ok());
+    let offset = q
+        .get("offset")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     let res = tokio::task::spawn_blocking(move || gov.all_keys()).await;
     match res {
-        Ok(Ok(keys)) => json_response(
-            StatusCode::OK,
-            json!({ "keys": keys.iter().map(key_meta).collect::<Vec<_>>() }),
-        ),
+        Ok(Ok(keys)) => {
+            let mut filtered: Vec<_> = keys
+                .iter()
+                .filter(|k| enabled.is_none_or(|e| k.enabled == e))
+                .filter(|k| prefix.as_deref().is_none_or(|p| k.id.starts_with(p)))
+                .collect();
+            // Deterministic page boundaries: sort by id (the store's iteration order is not a
+            // pagination contract).
+            filtered.sort_by(|a, b| a.id.cmp(&b.id));
+            let total = filtered.len();
+            let page: Vec<_> = filtered
+                .into_iter()
+                .skip(offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .map(key_meta)
+                .collect();
+            json_response(StatusCode::OK, json!({ "keys": page, "total": total }))
+        }
         Ok(Err(e)) => internal_error("list_keys", &e),
         Err(e) => join_error("list_keys", &e),
     }
 }
 
+/// POST /admin/v1/keys/{id}/rotate — mint a FRESH bearer secret for an existing key, in place: the
+/// id (and with it budgets, rate windows, usage, audit attribution) is unchanged; the old secret
+/// stops resolving immediately; the new secret is returned exactly once, exactly like mint. 404
+/// for an unknown id. An attached AWS SigV4 credential is not touched (separate lifecycle).
+pub(crate) async fn rotate_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(id): Path<String>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let Some(gov) = &app.governance else {
+        return disabled();
+    };
+    let gov = gov.clone();
+    let gid = id.clone();
+    // rotate is a check-then-act (get_key → mint → put_key over the UPSERT primitive), so it must
+    // hold EXISTENCE_GATE for the same reason update_key/delete_key do: without it a concurrent
+    // delete that lands between rotate's read and write is clobbered by rotate's put — RESURRECTING
+    // a revoked key with a fresh secret. Gate acquired INSIDE the closure for cancellation safety
+    // (a scheduled spawn_blocking runs to completion even if the handler future is dropped).
+    // (found: audit c1r6 — rotate was the one key-mutator missing the gate.)
+    let res = tokio::task::spawn_blocking(move || {
+        let _existence_guard = EXISTENCE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        gov.rotate_key(&gid)
+    })
+    .await;
+    let resource = format!("key:{id}");
+    match res {
+        Ok(Ok(Some((key, secret)))) => {
+            audit::AUDIT.record_by("key.rotate", &resource, audit::OUTCOME_APPLIED, &actor);
+            let mut body = key_meta(&key);
+            body["secret"] = json!(secret); // shown exactly once, exactly like mint
+            json_response(StatusCode::OK, body)
+        }
+        Ok(Ok(None)) => {
+            audit::AUDIT.record_by("key.rotate", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
+        Ok(Err(e)) => internal_error("rotate_key", &e),
+        Err(e) => join_error("rotate_key", &e),
+    }
+}
+
+/// GET /admin/keys/:id — one key's metadata (id/name/pools/budgets/limits/enabled; never the
+/// secret or key_hash). 404 when no key with `id` exists. Fills the single-key read gap in the key
+/// surface (design-admin-api-v1 §2.1); it stays on the legacy `{type}` envelope + `key_meta` shape so
+/// it is consistent with the sibling key routes (the full `{code}`-envelope migration is a follow-up).
+pub(crate) async fn get_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(gov) = &app.governance else {
+        return disabled();
+    };
+    if let Some(resp) = reject_overlong_id(&id) {
+        return resp;
+    }
+    let gov = gov.clone();
+    let id2 = id.clone();
+    // The synchronous store read runs on the blocking pool (the SQLite backend is sync). Read via
+    // `all_keys` + find (the same accessor the list handler uses) — admin scale, no hot path.
+    let res = tokio::task::spawn_blocking(move || {
+        gov.all_keys()
+            .map(|keys| keys.into_iter().find(|k| k.id == id2))
+    })
+    .await;
+    match res {
+        Ok(Ok(Some(k))) => {
+            let etag = key_etag(&k);
+            let mut meta = key_meta(&k);
+            meta["etag"] = json!(etag);
+            let mut resp = json_response(StatusCode::OK, meta);
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("\"{etag}\"")) {
+                resp.headers_mut().insert(axum::http::header::ETAG, v);
+            }
+            resp
+        }
+        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
+        Ok(Err(e)) => internal_error("get_key", &e),
+        Err(e) => join_error("get_key", &e),
+    }
+}
+
 /// GET /admin/keys/:id/usage — current-window usage counters.
-pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+pub(crate) async fn key_usage(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    Path(id): Path<String>,
+) -> Response {
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -508,7 +809,12 @@ pub(crate) async fn key_usage(State(app): State<Arc<App>>, Path(id): Path<String
 /// DELETE /admin/keys/:id — revoke a key. Returns 404 when no key with `id` exists (REST/OpenAPI
 /// contract), so a typo'd or already-deleted id is distinguishable from an actual revocation rather
 /// than masquerading as a spurious 200.
-pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+pub(crate) async fn delete_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(id): Path<String>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
     let Some(gov) = &app.governance else {
         return disabled();
     };
@@ -548,15 +854,25 @@ pub(crate) async fn delete_key(State(app): State<Arc<App>>, Path(id): Path<Strin
         }
     })
     .await;
+    let resource = format!("key:{id}");
     match res {
-        Ok(Ok(Some(()))) => json_response(StatusCode::OK, json!({"deleted": id})),
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found"),
+        Ok(Ok(Some(()))) => {
+            audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_APPLIED, &actor);
+            json_response(StatusCode::OK, json!({"deleted": id}))
+        }
+        Ok(Ok(None)) => {
+            audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
         Ok(Err(e)) => internal_error("delete_key", &e),
         Err(e) => join_error("delete_key", &e),
     }
 }
 
-#[cfg(test)]
+// The admin-surface e2e tests authenticate through the `admin-tokens` module; a
+// `--no-default-features` binary compiles it OUT, which DISABLES the admin API wholesale (the
+// admin_auth chain all-Passes ⇒ denied) — so this module only applies when the module exists.
+#[cfg(all(test, feature = "auth-admin-tokens"))]
 mod tests {
     use crate::governance::{GovState, NewKeySpec, SqliteStore};
     use crate::test_support::TestApp;
@@ -629,6 +945,3098 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (addr, handle)
+    }
+
+    /// `GET /admin/v1/info` flows end-to-end through the ports-and-adapters stack (JSON-REST
+    /// transport → service → contract view): admin-token guarded, returns the version, the
+    /// compiled-in plugin proof (with the default build's `tokens`/`ranking` present + the always-on
+    /// `weighted_floor`), and the topology counts. Proves the transport is mounted and the frozen
+    /// v1 surface answers.
+    #[tokio::test]
+    async fn test_admin_v1_info_reports_version_features_and_topology() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (addr, handle) = serve_with_gov(gov).await;
+        let client = reqwest::Client::new();
+
+        // Wrong token → 401 (the v1 surface is admin-guarded like the rest of /admin).
+        let unauth = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unauth.status().as_u16(),
+            401,
+            "v1/info must be admin-guarded"
+        );
+
+        let resp = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "info must report the build version"
+        );
+        // The `weighted_floor` is ALWAYS true (non-removable). `tokens`/`ranking` are present iff their
+        // feature is compiled in — so the compliance-by-compilation proof holds under
+        // `--no-default-features` too (the lists are empty there).
+        assert_eq!(body["build"]["weighted_floor"], serde_json::json!(true));
+        let auth_modules = body["build"]["auth_modules"].as_array().unwrap();
+        assert_eq!(
+            auth_modules.iter().any(|m| m == "tokens"),
+            cfg!(feature = "auth-tokens"),
+            "auth_modules must contain `tokens` iff the auth-tokens feature is compiled in: {auth_modules:?}"
+        );
+        let hook_plugins = body["build"]["hook_plugins"].as_array().unwrap();
+        assert_eq!(
+            hook_plugins.iter().any(|m| m == "ranking"),
+            cfg!(feature = "hooks-ranking"),
+            "hook_plugins must contain `ranking` iff the hooks-ranking feature is compiled in: {hook_plugins:?}"
+        );
+        // Topology keys are present and numeric (exact counts depend on the TestApp fixture).
+        assert!(body["topology"]["pools"].is_number());
+        assert!(body["topology"]["models"].is_number());
+        assert!(body["topology"]["providers"].is_number());
+        // No overlay configured in this fixture → persistence off.
+        assert_eq!(body["config_persistence"], false);
+
+        handle.abort();
+    }
+
+    /// The topology read surface (`/admin/v1/pools`, `/models`, `/providers`) flows through the
+    /// service and projects the pool/model/provider views. Built on a two-lane, two-provider fixture
+    /// so the provider aggregation + pool membership are observable.
+    #[tokio::test]
+    async fn test_admin_v1_topology_reads_pools_models_providers() {
+        use crate::test_support::LaneSpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "model-a",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("prov-x"),
+            )
+            .lane(
+                LaneSpec::new(
+                    "model-b",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("prov-y"),
+            )
+            .pool("mypool", &[(0, 3), (1, 1)])
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let get = |path: String| {
+            let url = format!("http://{addr}{path}");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let pools = get("/admin/v1/pools".into()).await;
+        let items = pools["items"].as_array().unwrap();
+        let mypool = items
+            .iter()
+            .find(|p| p["name"] == "mypool")
+            .expect("mypool present");
+        let members = mypool["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2, "pool has two members");
+        let weight_a = members.iter().find(|m| m["model"] == "model-a").unwrap()["weight"].as_u64();
+        assert_eq!(weight_a, Some(3), "model-a weight projected");
+
+        let models = get("/admin/v1/models".into()).await;
+        let m_items = models["items"].as_array().unwrap();
+        assert!(m_items
+            .iter()
+            .any(|m| m["model"] == "model-a" && m["provider"] == "prov-x"));
+        assert!(m_items
+            .iter()
+            .any(|m| m["model"] == "model-b" && m["provider"] == "prov-y"));
+
+        let providers = get("/admin/v1/providers".into()).await;
+        let p_items = providers["items"].as_array().unwrap();
+        let px = p_items.iter().find(|p| p["provider"] == "prov-x").unwrap();
+        assert_eq!(px["model_count"].as_u64(), Some(1));
+        assert!(p_items.iter().any(|p| p["provider"] == "prov-y"));
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/pools/{name}` projects each member's LIVE status (usable/cooldown/concurrency/
+    /// inflight/tallies) from the store; 404s an unknown pool.
+    #[tokio::test]
+    async fn test_admin_v1_pool_detail_live_status() {
+        use crate::test_support::LaneSpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "m1",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("p"),
+            )
+            .pool("mypool", &[(0, 5)])
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let ok: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/pools/mypool"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ok["name"], "mypool");
+        let members = ok["members"].as_array().unwrap();
+        assert_eq!(members.len(), 1);
+        let m = &members[0];
+        assert_eq!(m["model"], "m1");
+        assert_eq!(m["weight"], 5);
+        // Live-status fields present + typed. A fresh lane is usable with no cooldown.
+        assert_eq!(m["usable"], true);
+        assert_eq!(m["cooldown_remaining_s"], 0);
+        assert!(m["available_concurrency"].is_number());
+        assert!(m["inflight"].is_number());
+        assert!(m["ok"].is_number());
+        assert!(m["dead"].is_boolean());
+
+        // Unknown pool → 404 not_found.
+        let missing = client
+            .get(format!("http://{addr}/admin/v1/pools/nope"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        assert_eq!(
+            missing.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "not_found"
+        );
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/admin-auth` reports the admin-plane guard: with governance + an admin token it
+    /// is `configured: true` with the `admin-token` module. Never a secret.
+    #[tokio::test]
+    async fn test_admin_v1_admin_auth_read() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/admin-auth"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["configured"], true);
+        assert!(body["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "admin-token"));
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/keys/{id}` returns one key's metadata (never the secret/hash); 404 for an
+    /// unknown id. Fills the single-key read gap on the legacy key surface.
+    #[tokio::test]
+    async fn test_admin_v1_get_single_key() {
+        use crate::governance::NewKeySpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (minted, minted_secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "svc".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Found → 200 with metadata, no secret/hash.
+        let resp = client
+            .get(format!("http://{addr}/admin/v1/keys/{}", minted.id))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let text = resp.text().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["id"], minted.id);
+        assert_eq!(body["name"], "svc");
+        assert!(body.get("key_hash").is_none(), "never expose the hash");
+        assert!(
+            !text.contains(&minted_secret),
+            "never expose the secret on a read"
+        );
+
+        // Unknown id → 404.
+        let missing = client
+            .get(format!("http://{addr}/admin/v1/keys/vk_doesnotexist"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/usage` aggregates governance's per-key counters into fleet totals + a per-key
+    /// breakdown. A freshly minted key appears with zero usage; totals reflect it. Never leaks the
+    /// secret (id/name only).
+    #[tokio::test]
+    async fn test_admin_v1_usage_aggregates_per_key() {
+        use crate::governance::NewKeySpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        // Mint a key directly so the fleet has something to aggregate.
+        let (minted, minted_secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "team-a".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/usage"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(body["total"]["spend_cents"].is_number());
+        assert!(body["total"]["tokens"].is_number());
+        assert!(body["total"]["requests"].is_number());
+        let keys = body["keys"].as_array().unwrap();
+        let entry = keys
+            .iter()
+            .find(|k| k["name"] == "team-a")
+            .expect("minted key appears in usage");
+        assert_eq!(entry["id"], minted.id);
+        assert_eq!(entry["spend_cents"], 0, "fresh key has no spend");
+        // The secret is never present in the usage body.
+        let text = body.to_string();
+        assert!(
+            !text.contains(&minted_secret),
+            "usage must not leak the key secret"
+        );
+
+        handle.abort();
+    }
+
+    /// END-TO-END config apply: `POST /admin/v1/hooks` registers a hook at runtime (201), and a
+    /// subsequent `GET /admin/v1/hooks` SEES it — proving the AppHandle swap took effect AND the
+    /// per-request service reads the CURRENT snapshot. Invalid definitions reject with invalid_request.
+    /// D2 e2e (unix): PATCH settings pushes `configure` to the running hook and commits ON ACK
+    /// (the registry shows the new settings); a NACKing hook commits nothing; GET schema proxies
+    /// the hook's describe reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
+        crate::metrics::init();
+        // A fake hook binary: acks configure (echoing the pushed version), answers describe.
+        let dir = std::env::temp_dir().join(format!("busbar-d2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hook.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let ack_mode = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_ack = ack_mode.clone();
+        let hook_task = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let ack = hook_ack.clone();
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+                        let reply = if let Some(c) = v.get("configure") {
+                            if ack.load(std::sync::atomic::Ordering::Relaxed) {
+                                serde_json::json!({"ack": {"settings_version": c["settings_version"]}})
+                            } else {
+                                serde_json::json!({"error": "refused"})
+                            }
+                        } else if v.get("describe").is_some() {
+                            serde_json::json!({"schema": {"type": "object", "properties": {"ratio": {"type": "number"}}}})
+                        } else {
+                            serde_json::json!({})
+                        };
+                        if w.write_all(format!("{reply}\n").as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let serve = tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // Register the hook (overlay), then PATCH its settings — ack mode on: commits.
+        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+            .body(
+                serde_json::json!({
+                    "name": "cfg-hook",
+                    "config": {"kind": "gate", "socket": sock.to_str().unwrap()}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let patched =
+            admin(client.patch(format!("http://{addr}/admin/v1/hooks/cfg-hook/settings")))
+                .body(serde_json::json!({"settings": {"ratio": 0.4}}).to_string())
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(patched.status().as_u16(), 200, "{:?}", patched.text().await);
+        let got: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            got["settings"]["ratio"], 0.4,
+            "committed settings visible: {got}"
+        );
+
+        // NACK mode: the push is refused — nothing commits.
+        ack_mode.store(false, std::sync::atomic::Ordering::Relaxed);
+        let refused =
+            admin(client.patch(format!("http://{addr}/admin/v1/hooks/cfg-hook/settings")))
+                .body(serde_json::json!({"settings": {"ratio": 0.9}}).to_string())
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(refused.status().as_u16(), 400, "nack = not committed");
+        let still: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            still["settings"]["ratio"], 0.4,
+            "old settings intact: {still}"
+        );
+
+        // Schema proxy (ack mode back on — the committed settings ride the configure preamble on
+        // the fresh describe connection, and a nacking hook refuses connections by design).
+        ack_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+        let schema: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/hooks/cfg-hook/schema")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(
+            schema["schema"]["schema"]["properties"]["ratio"]["type"], "number",
+            "describe proxied: {schema}"
+        );
+
+        serve.abort();
+        hook_task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `POST /admin/v1/config/apply`: a body-carried full config swaps in atomically — the new
+    /// topology is live, the surviving identity keeps its tripped health, and a stale
+    /// expected_version is a 409 that changes nothing.
+    #[tokio::test]
+    async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new()
+            .lane(crate::test_support::LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .governance(gov)
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .store
+            .record_hard_down(0, "tripped before apply");
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        let body = serde_json::json!({
+            "providers": {
+                "test-provider": {"protocol": "anthropic", "base_url": "http://127.0.0.1:1/", "api_key_env": "BUSBAR_TEST_APPLY_NO_KEY"}
+            },
+            "config": {
+                "listen": "127.0.0.1:0",
+                "providers": {"test-provider": {"api_key_env": "BUSBAR_TEST_APPLY_NO_KEY"}},
+                "models": {
+                    "m0": {"provider": "test-provider", "max_concurrent": 4},
+                    "m-applied": {"provider": "test-provider", "max_concurrent": 4}
+                },
+                "pools": {"apply-pool": {"members": [{"target": "m0"}, {"target": "m-applied"}]}}
+            }
+        });
+        let resp = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+
+        let pool: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/pools/apply-pool")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let members = pool["members"].as_array().unwrap();
+        let m0 = members.iter().find(|m| m["model"] == "m0").unwrap();
+        let ma = members.iter().find(|m| m["model"] == "m-applied").unwrap();
+        assert_eq!(m0["usable"], false, "carried trip: {m0}");
+        assert_eq!(ma["usable"], true, "fresh lane: {ma}");
+
+        // Stale expected_version: 409, nothing applied.
+        let stale = admin(client.post(format!("http://{addr}/admin/v1/config/apply")))
+            .body(
+                serde_json::json!({
+                    "config": {"listen": "127.0.0.1:0", "providers": {}, "models": {}, "pools": {}},
+                    "expected_version": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status().as_u16(), 409);
+
+        handle.abort();
+    }
+
+    /// `POST /admin/v1/config/reload`: re-reads disk truth and swaps it in atomically — the new
+    /// topology is live, surviving lanes keep their learned health BY IDENTITY (a breaker tripped
+    /// before the reload is still tripped after it), and an invalid disk config rejects with 400
+    /// changing nothing.
+    #[tokio::test]
+    async fn test_admin_v1_config_reload_swaps_disk_truth_and_carries_health() {
+        crate::metrics::init();
+        let dir = std::env::temp_dir().join(format!("busbar-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let providers_path = dir.join("providers.yaml");
+        let config_path = dir.join("config.yaml");
+        std::fs::write(
+            &providers_path,
+            "test-provider:
+  protocol: anthropic
+  base_url: http://127.0.0.1:1/
+  api_key_env: BUSBAR_TEST_RELOAD_NO_SUCH_KEY
+",
+        )
+        .unwrap();
+        // Disk truth: the SAME identity as the running lane (m0 @ test-provider) plus a NEW model.
+        std::fs::write(
+            &config_path,
+            "listen: 127.0.0.1:0
+providers:
+  test-provider:
+    api_key_env: BUSBAR_TEST_RELOAD_NO_SUCH_KEY
+models:
+  m0:
+    provider: test-provider
+    max_concurrent: 4
+  m-new:
+    provider: test-provider
+    max_concurrent: 4
+pools:
+  reload-pool:
+    members:
+      - target: m0
+      - target: m-new
+",
+        )
+        .unwrap();
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new()
+            .lane(crate::test_support::LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .governance(gov)
+            .build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.config_path = Some(config_path.clone());
+            inner.providers_path = Some(providers_path.clone());
+            // Trip m0's default-cell breaker hard so the carried state is unmistakable.
+            inner.store.record_hard_down(0, "tripped before reload");
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| req.header("x-admin-token", "admintok");
+
+        // Reload: disk truth replaces the synthetic topology.
+        let resp = admin(client.post(format!("http://{addr}/admin/v1/config/reload")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{:?}", resp.text().await);
+        let models: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/models")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let names: Vec<&str> = models["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"m-new"),
+            "the reloaded topology is live: {names:?}"
+        );
+
+        // The surviving identity (m0 @ test-provider) carried its tripped health state.
+        let pool: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/pools/reload-pool")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let members = pool["members"].as_array().unwrap();
+        let m0 = members
+            .iter()
+            .find(|m| m["model"] == "m0")
+            .expect("m0 present");
+        let m_new = members
+            .iter()
+            .find(|m| m["model"] == "m-new")
+            .expect("m-new present");
+        assert_eq!(
+            m0["usable"], false,
+            "m0's pre-reload trip must survive by identity: {m0}"
+        );
+        assert_eq!(
+            m_new["usable"], true,
+            "the new lane starts healthy: {m_new}"
+        );
+
+        // Invalid disk config: 400, nothing changes.
+        std::fs::write(
+            &config_path,
+            "listen: 127.0.0.1:0
+models:
+  broken:
+    provider: nope
+    max_concurrent: 1
+providers: {}
+",
+        )
+        .unwrap();
+        let before: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/info")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let bad = admin(client.post(format!("http://{addr}/admin/v1/config/reload")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400, "invalid disk config rejects");
+        let after: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/info")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            before["config_version"], after["config_version"],
+            "a rejected reload changes nothing"
+        );
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-principal mutation rate limits: the config class (apply/rollback) caps at 10/min per
+    /// principal — the 11th attempt in the window is a 429 in the frozen envelope, and FAILED
+    /// attempts count (these are all 404s — anti-enumeration).
+    #[tokio::test]
+    async fn test_admin_v1_mutation_rate_limit_config_class() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // 10 rollback attempts to a bogus version (all 404 — still spend budget), then the 11th
+        // is limited. Tolerate landing exactly on a minute boundary (window refill mid-loop) by
+        // accepting the 429 anywhere from attempt 11 to 22, but REQUIRE it eventually.
+        let mut limited_at = None;
+        for i in 1..=22 {
+            let resp = client
+                .post(format!("http://{addr}/admin/v1/config/rollback"))
+                .header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+                .body(serde_json::json!({"version": 424242}).to_string())
+                .send()
+                .await
+                .unwrap();
+            match resp.status().as_u16() {
+                404 => continue,
+                429 => {
+                    assert!(i >= 11, "the budget is 10/min; limited too early at {i}");
+                    let body: serde_json::Value = resp.json().await.unwrap();
+                    assert_eq!(body["error"]["code"], "rate_limited");
+                    limited_at = Some(i);
+                    break;
+                }
+                other => panic!("unexpected status {other} at attempt {i}"),
+            }
+        }
+        assert!(
+            limited_at.is_some(),
+            "the limiter never fired in 22 attempts"
+        );
+
+        handle.abort();
+    }
+
+    /// The scope LADDER end-to-end with group-mapped NON-full principals (via the test-only
+    /// external module): read-only reads but cannot mint (403, audited); hooks-register registers
+    /// hooks but cannot mint keys; an unmapped group gets nothing at all (403 even on reads);
+    /// the operator token stays full.
+    #[tokio::test]
+    async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "viewers".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("read-only".to_string()),
+                    ..Default::default()
+                },
+            );
+            inner.group_map.insert(
+                "registrars".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("hooks-register".to_string()),
+                    ..Default::default()
+                },
+            );
+            // For the CAP proofs below: a group MAPPED full — the module ceiling must cut it
+            // down — and a group mapped full that the allowlist doesn't authorize at all.
+            inner.group_map.insert(
+                "admins-capped".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                    ..Default::default()
+                },
+            );
+            inner.group_map.insert(
+                "sneaky".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                    ..Default::default()
+                },
+            );
+            // §2.4 trust-boundary caps on the external module: it may only assert these groups
+            // (`sneaky` is deliberately NOT pre-authorized), and nothing through it can exceed
+            // hooks-register regardless of group_map.
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: Some(vec![
+                        "viewers".to_string(),
+                        "registrars".to_string(),
+                        "admins-capped".to_string(),
+                        "strangers".to_string(),
+                    ]),
+                    max_admin_scope: Some("hooks-register".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let with = |tok: &'static str, req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", tok)
+                .header("content-type", "application/json")
+        };
+        let hook_body = serde_json::json!({
+            "name": "scoped-hook",
+            "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        })
+        .to_string();
+        let key_body = serde_json::json!({"name": "k"}).to_string();
+
+        // read-only: GET 200, mutations 403 with the frozen envelope.
+        let r = with(
+            "grp:viewers",
+            client.get(format!("http://{addr}/admin/v1/info")),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "read-only can read");
+        let r = with(
+            "grp:viewers",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "read-only cannot mint");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "forbidden");
+        let r = with(
+            "grp:viewers",
+            client.post(format!("http://{addr}/admin/v1/hooks")),
+        )
+        .body(hook_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "read-only cannot register hooks");
+
+        // hooks-register: hook lifecycle yes, keys no (the escalation guard).
+        let r = with(
+            "grp:registrars",
+            client.post(format!("http://{addr}/admin/v1/hooks")),
+        )
+        .body(hook_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "hooks-register registers hooks");
+        let r = with(
+            "grp:registrars",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "hooks-register cannot mint keys");
+
+        // Unmapped group: authenticated but zero grants — 403 even on reads.
+        let r = with(
+            "grp:strangers",
+            client.get(format!("http://{addr}/admin/v1/info")),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "unmapped groups grant nothing");
+
+        // max_admin_scope CEILING: a group MAPPED full through the capped module lands at
+        // hooks-register — it registers hooks but still cannot mint keys.
+        let capped_hook = serde_json::json!({
+            "name": "capped-hook",
+            "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        })
+        .to_string();
+        let r = with(
+            "grp:admins-capped",
+            client.post(format!("http://{addr}/admin/v1/hooks")),
+        )
+        .body(capped_hook)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            201,
+            "the ceiling still allows what it grants (hooks-register)"
+        );
+        let r = with(
+            "grp:admins-capped",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body.clone())
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            403,
+            "group_map said full, the module ceiling says hooks-register — the ceiling wins"
+        );
+
+        // allowed_groups INTERSECTION: `sneaky` is mapped full in group_map but the module is not
+        // authorized to assert it — the group is dropped BEFORE mapping, leaving zero grants.
+        let r = with(
+            "grp:sneaky",
+            client.get(format!("http://{addr}/admin/v1/info")),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            403,
+            "a group outside allowed_groups never reaches group_map"
+        );
+
+        // The operator token is still full (admin-tokens is exempt from module ceilings).
+        let r = with(
+            "admintok",
+            client.post(format!("http://{addr}/admin/v1/keys")),
+        )
+        .body(key_body)
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "operator token stays full");
+
+        handle.abort();
+    }
+
+    /// §6.3 ESCALATION GUARD: a hooks-register principal may register a shape-only, non-global hook
+    /// but NOT one wired into a security-critical path — a `prompt: rw`/`ro` content-seeing gate, a
+    /// `user: ro` identity-seeing hook, or an inline `global: true` (chain wiring is full-only). The
+    /// operator (full) may register all of them.
+    #[tokio::test]
+    async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "registrars".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("hooks-register".to_string()),
+                    ..Default::default()
+                },
+            );
+            // The module ceiling defaults to read-only; lift it so registrars actually resolves to
+            // hooks-register (admin-tokens stays full — it is ceiling-exempt).
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: None,
+                    max_admin_scope: Some("full".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let post = |tok: &'static str, cfg: serde_json::Value| {
+            client
+                .post(format!("http://{addr}/admin/v1/hooks"))
+                .header("x-admin-token", tok)
+                .header("content-type", "application/json")
+                .body(serde_json::json!({"name": "h", "config": cfg}).to_string())
+                .send()
+        };
+        let base = |extra: serde_json::Value| {
+            let mut c = serde_json::json!({"kind": "gate", "webhook": "http://127.0.0.1:9969/"});
+            for (k, v) in extra.as_object().unwrap() {
+                c[k] = v.clone();
+            }
+            c
+        };
+
+        // hooks-register: each escalating form is 403 (forbidden), naming full.
+        for (label, cfg) in [
+            ("prompt: rw gate", base(serde_json::json!({"prompt": "rw"}))),
+            ("prompt: ro gate", base(serde_json::json!({"prompt": "ro"}))),
+            ("user: ro hook", base(serde_json::json!({"user": "ro"}))),
+            ("global: true", base(serde_json::json!({"global": true}))),
+        ] {
+            let r = post("grp:registrars", cfg).await.unwrap();
+            assert_eq!(
+                r.status().as_u16(),
+                403,
+                "hooks-register must not register a {label}"
+            );
+            let body: serde_json::Value = r.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "forbidden", "{label}");
+        }
+
+        // hooks-register CAN register a shape-only, non-global hook.
+        let r = post("grp:registrars", base(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            201,
+            "a shape-only, non-global hook is within hooks-register"
+        );
+
+        // The operator (full) can register a prompt: rw global gate (unique name — `h` is taken).
+        let r = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "op-hook",
+                    "config": base(serde_json::json!({"prompt": "rw", "global": true}))
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "full scope registers anything");
+
+        // REGRESSION (audit c1r6): a hooks-register token may not RETUNE (PATCH settings) a
+        // content-seeing / global hook it can neither create nor replace — PATCH must enforce the
+        // same §6.3 ceiling, keyed on the EXISTING hook's grants.
+        let patch = client
+            .patch(format!("http://{addr}/admin/v1/hooks/op-hook/settings"))
+            .header("x-admin-token", "grp:registrars")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"settings": {"k": "v"}}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patch.status().as_u16(),
+            403,
+            "hooks-register must not PATCH settings on a prompt:rw global hook"
+        );
+        assert_eq!(
+            patch.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "forbidden"
+        );
+
+        // REGRESSION (audit c1r13): a hooks-register token may not DELETE a content-seeing / global
+        // gate a full admin installed — tearing down that security gate is the same §6.3 escalation
+        // register/put/patch forbid.
+        let del = client
+            .delete(format!("http://{addr}/admin/v1/hooks/op-hook"))
+            .header("x-admin-token", "grp:registrars")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            del.status().as_u16(),
+            403,
+            "hooks-register must not DELETE a prompt:rw global hook"
+        );
+        assert_eq!(
+            del.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "forbidden"
+        );
+        // And the operator's gate is still there — the rejected delete did not remove it.
+        let still = client
+            .get(format!("http://{addr}/admin/v1/hooks/op-hook"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            still.status().as_u16(),
+            200,
+            "the gate survives the rejected delete"
+        );
+
+        handle.abort();
+    }
+
+    /// The idempotency cache is SCOPED TO THE PRINCIPAL: a second admin presenting the same
+    /// Idempotency-Key value must mint its OWN key, never replay the first principal's response
+    /// (which carries a once-shown secret). Two full principals, same key value, distinct results.
+    #[tokio::test]
+    async fn test_admin_v1_idempotency_key_is_principal_scoped() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            // A group mapped FULL so the second principal can also mint keys.
+            inner.group_map.insert(
+                "admins".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                    ..Default::default()
+                },
+            );
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: None,
+                    max_admin_scope: Some("full".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let mint = |tok: &'static str| {
+            client
+                .post(format!("http://{addr}/admin/v1/keys"))
+                .header("x-admin-token", tok)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "shared-value")
+                .body(serde_json::json!({"name": "k"}).to_string())
+                .send()
+        };
+
+        // Principal A (operator) mints under the shared key.
+        let a: serde_json::Value = mint("admintok").await.unwrap().json().await.unwrap();
+        // Principal B (a different full principal) mints under the SAME key value.
+        let b: serde_json::Value = mint("grp:admins").await.unwrap().json().await.unwrap();
+
+        assert!(a["id"].is_string() && b["id"].is_string());
+        assert_ne!(
+            a["id"], b["id"],
+            "a second principal's identical Idempotency-Key must mint a NEW key, not replay A's"
+        );
+        assert_ne!(
+            a["secret"], b["secret"],
+            "B must never receive A's once-shown secret via a cross-principal replay"
+        );
+        // And A replaying its OWN key still returns A's response (per-principal idempotency intact).
+        let a2: serde_json::Value = mint("admintok").await.unwrap().json().await.unwrap();
+        assert_eq!(a2["id"], a["id"], "A's own retry replays A's response");
+
+        handle.abort();
+    }
+
+    /// The credential cache end-to-end (§2.5): an external-module identify is CACHED (the second
+    /// request is served from the cache — observable via the flush count), `POST
+    /// /admin/v1/auth/cache/flush` drops it (full scope; read-only principals get 403), and the
+    /// built-in operator token is NEVER cached (flush finds nothing after operator calls).
+    #[tokio::test]
+    async fn test_admin_v1_credential_cache_and_flush_endpoint() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "viewers".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("read-only".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Two reads as a group-mapped principal: the module's Identify lands in the cache.
+        for _ in 0..2 {
+            let r = client
+                .get(format!("http://{addr}/admin/v1/info"))
+                .header("x-admin-token", "grp:viewers")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+        }
+
+        // A read-only principal cannot flush (full-scope mutation).
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "grp:viewers")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "flush is a full-scope mutation");
+
+        // Operator flushes the module partition: exactly ONE entry (the cached viewers identify;
+        // operator-token authentications are never cached).
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"module": "test-scope-module"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let body: serde_json::Value = r.json().await.unwrap();
+        // TWO entries in the module's partition: the viewers Identify, plus the PASS the module
+        // returned for the operator token (Pass IS cached, short-TTL — §2.5; only the built-in
+        // admin-tokens module's own verdicts are exempt). The flushing request's own Pass was
+        // inserted by its chain run before the handler flushed.
+        assert_eq!(
+            body["flushed"], 2,
+            "the viewers Identify + the operator credential's cached Pass"
+        );
+
+        // Flush-all with an empty body: nothing left.
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = r.json().await.unwrap();
+        // Exactly ONE: this very request's chain run re-cached a Pass for the operator credential
+        // under the external module before the handler flushed. Nothing else survived.
+        assert_eq!(
+            body["flushed"], 1,
+            "only this request's own cached Pass remained"
+        );
+
+        // Malformed body: invalid_request.
+        let r = client
+            .post(format!("http://{addr}/admin/v1/auth/cache/flush"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body("{\"module\": 7}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+
+        handle.abort();
+    }
+
+    /// `PUT /admin/v1/auth` end-to-end with the D4 dry-run guard: a chain that would lock the
+    /// CALLER out is a 409 and nothing changes; a chain the caller survives applies atomically
+    /// (the old credential stops working on the very next request, the surviving one carries on);
+    /// unknown modules and stale expected_version reject.
+    #[tokio::test]
+    async fn test_admin_v1_put_auth_dry_run_guard() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            // Chain starts as BOTH modules (so both credentials work); group_map + an explicit
+            // full ceiling make `grp:admins` a full principal through the external stand-in.
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "admins".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                    ..Default::default()
+                },
+            );
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: None,
+                    max_admin_scope: Some("full".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let put = |tok: &'static str, body: serde_json::Value| {
+            client
+                .put(format!("http://{addr}/admin/v1/auth"))
+                .header("x-admin-token", tok)
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send()
+        };
+
+        // Unknown module: 400, nothing changes.
+        let r = put("admintok", serde_json::json!({"admin_auth": ["saml"]}))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            400,
+            "unknown module is invalid_request"
+        );
+
+        // Stale expected_version: 409.
+        let r = put(
+            "admintok",
+            serde_json::json!({"admin_auth": ["admin-tokens"], "expected_version": 999}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.status().as_u16(), 409, "stale expected_version conflicts");
+
+        // THE D4 GUARD: the operator token would NOT survive a chain of only the external module
+        // (its credential has no grp: shape — all-Pass denies). 409, and the operator still works.
+        let r = put(
+            "admintok",
+            serde_json::json!({"admin_auth": ["test-scope-module"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            409,
+            "a chain that locks the caller out is refused"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "conflict");
+        let r = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "nothing changed on the refusal");
+
+        // The SAME change made by a caller who survives it (a full group-mapped principal through
+        // the external module) applies…
+        let r = put(
+            "grp:admins",
+            serde_json::json!({"admin_auth": ["test-scope-module"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            200,
+            "the surviving caller's change applies"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["applied"], true);
+
+        // …after which the operator token no longer authenticates (it is not in the chain)…
+        let r = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            401,
+            "the dropped module's credential stops working immediately"
+        );
+
+        // …and the surviving credential carries on.
+        let r = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "grp:admins")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+
+        handle.abort();
+    }
+
+    /// Idempotent mint + optimistic concurrency: a retried POST with the same Idempotency-Key
+    /// returns the FIRST response (same id + secret, no double-create); a PATCH with a stale
+    /// If-Match is a 409 that changes nothing; a fresh If-Match succeeds.
+    #[tokio::test]
+    async fn test_admin_v1_key_idempotent_mint_and_if_match() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // Same Idempotency-Key twice → identical response, ONE key.
+        let mint = |k: &'static str| {
+            admin(client.post(format!("http://{addr}/admin/v1/keys")))
+                .header("idempotency-key", k)
+                .body(serde_json::json!({"name": "idem"}).to_string())
+                .send()
+        };
+        let a: serde_json::Value = mint("abc").await.unwrap().json().await.unwrap();
+        let b: serde_json::Value = mint("abc").await.unwrap().json().await.unwrap();
+        assert_eq!(a["id"], b["id"], "replay returns the same key");
+        assert_eq!(
+            a["secret"], b["secret"],
+            "replay returns the FIRST response verbatim"
+        );
+        let listed: serde_json::Value = admin(client.get(format!(
+            "http://{addr}/admin/v1/keys?prefix={}",
+            a["id"].as_str().unwrap()
+        )))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(listed["total"], 1, "no double-create: {listed}");
+
+        // If-Match: stale = 409 untouched; current etag = applied.
+        let id = a["id"].as_str().unwrap();
+        let got: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/keys/{id}")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let etag = got["etag"].as_str().unwrap().to_string();
+        let stale = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
+            .header("if-match", "\"deadbeefdeadbeef\"")
+            .body(serde_json::json!({"rpm_limit": 5}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status().as_u16(), 409, "stale If-Match conflicts");
+        let fresh = admin(client.patch(format!("http://{addr}/admin/v1/keys/{id}")))
+            .header("if-match", format!("\"{etag}\""))
+            .body(serde_json::json!({"rpm_limit": 5}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fresh.status().as_u16(), 200, "current If-Match applies");
+
+        handle.abort();
+    }
+
+    /// The idempotency RESERVATION frees itself on a FAILED mint: a POST that reserves an
+    /// Idempotency-Key then fails validation must NOT leave a stuck in-flight sentinel — a
+    /// subsequent valid retry under the SAME key mints normally (not a spurious 409/replay).
+    #[tokio::test]
+    async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let post = |body: &'static str| {
+            client
+                .post(format!("http://{addr}/admin/v1/keys"))
+                .header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+                .header("idempotency-key", "reuse-key")
+                .body(body)
+                .send()
+        };
+
+        // Reserve the key, then fail validation (unknown budget_period).
+        let bad = post(r#"{"name": "x", "budget_period": "fortnightly"}"#)
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400, "invalid body is a 400");
+
+        // The SAME key now mints normally — the reservation was cleared, not stuck in-flight.
+        let good = post(r#"{"name": "x"}"#).await.unwrap();
+        assert_eq!(
+            good.status().as_u16(),
+            201,
+            "a valid retry under the same key mints (reservation freed on the prior failure)"
+        );
+
+        handle.abort();
+    }
+
+    /// Key ROTATION: the new secret works, the old stops resolving, the id + settings are
+    /// unchanged; unknown ids 404. And keys pagination: limit/offset over the id-sorted set with a
+    /// stable total.
+    #[tokio::test]
+    async fn test_admin_v1_key_rotate_and_pagination() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov.clone()).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // Mint three keys.
+        let mut ids = Vec::new();
+        for n in ["ka", "kb", "kc"] {
+            let created: serde_json::Value =
+                admin(client.post(format!("http://{addr}/admin/v1/keys")))
+                    .body(serde_json::json!({"name": n}).to_string())
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            ids.push((
+                created["id"].as_str().unwrap().to_string(),
+                created["secret"].as_str().unwrap().to_string(),
+            ));
+        }
+
+        // Pagination: limit 2 offset 0 then offset 2 covers all three exactly once, total stable.
+        let p1: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2&offset=0")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let p2: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/keys?limit=2&offset=2")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(p1["total"], 3);
+        assert_eq!(p1["keys"].as_array().unwrap().len(), 2);
+        assert_eq!(p2["keys"].as_array().unwrap().len(), 1);
+        let mut seen: Vec<String> = p1["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(p2["keys"].as_array().unwrap())
+            .map(|k| k["id"].as_str().unwrap().to_string())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "pages cover every key exactly once");
+
+        // Rotate the first key: same id, new secret; old secret dead, new secret resolves.
+        let (id, old_secret) = ids[0].clone();
+        let rotated: serde_json::Value =
+            admin(client.post(format!("http://{addr}/admin/v1/keys/{id}/rotate")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(rotated["id"], id.as_str(), "id is stable across rotation");
+        let new_secret = rotated["secret"].as_str().unwrap().to_string();
+        assert_ne!(new_secret, old_secret);
+        assert!(gov.lookup(&new_secret).is_some(), "new secret resolves");
+        assert!(
+            gov.lookup(&old_secret).is_none(),
+            "old secret stops resolving immediately"
+        );
+
+        // Unknown id → 404.
+        let missing = admin(client.post(format!("http://{addr}/admin/v1/keys/vk_nope/rotate")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+
+        handle.abort();
+    }
+
+    /// `PUT /admin/v1/hooks/{name}`: replaces an overlay hook live; 404 for an unknown name;
+    /// 409 for a grant change (immutability) and for a stale expected_version.
+    #[tokio::test]
+    async fn test_admin_v1_put_hook_replaces_live_with_guards() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| {
+            req.header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+        };
+
+        // PUT on an unknown name is 404 (PUT replaces; POST creates).
+        let missing = admin(client.put(format!("http://{addr}/admin/v1/hooks/nope")))
+            .body(
+                serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:1/"}})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+
+        // Create, then replace with a new transport target (same grants) — 200, live.
+        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+            .body(
+                serde_json::json!({
+                    "name": "rep",
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9971/"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let replaced = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .body(
+                serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9972/"}})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replaced.status().as_u16(), 200);
+        let got: serde_json::Value = admin(client.get(format!("http://{addr}/admin/v1/hooks/rep")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            got["transport"].to_string().contains("9972"),
+            "the replacement is live: {got}"
+        );
+
+        // Grant change via PUT is a 409 (immutability holds on the replace path too).
+        let escalate = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .body(serde_json::json!({"config": {"kind": "gate", "webhook": "http://127.0.0.1:9972/", "prompt": "rw"}}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(escalate.status().as_u16(), 409, "grants are immutable");
+
+        // Stale expected_version is a 409 conflict.
+        let stale = admin(client.put(format!("http://{addr}/admin/v1/hooks/rep")))
+            .body(
+                serde_json::json!({
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9973/"},
+                    "expected_version": 0
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            stale.status().as_u16(),
+            409,
+            "stale expected_version conflicts"
+        );
+
+        handle.abort();
+    }
+
+    /// The config version-history cycle: mutations record attributed versions; diff explains a
+    /// change; rollback restores a prior hook surface LIVE as a NEW version; unknown targets 404
+    /// and a stale expected_version conflicts.
+    #[tokio::test]
+    async fn test_admin_v1_config_versions_rollback_and_diff() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let admin = |req: reqwest::RequestBuilder| req.header("x-admin-token", "admintok");
+
+        // v1: register a hook. v2: delete it. (Boot floor is v0.)
+        let body = serde_json::json!({
+            "name": "rbk",
+            "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/"}
+        });
+        let created = admin(client.post(format!("http://{addr}/admin/v1/hooks")))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+        let deleted = admin(client.delete(format!("http://{addr}/admin/v1/hooks/rbk")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status().as_u16(), 204);
+
+        // The history lists boot + register + delete, newest first, attributed.
+        let versions: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/config/versions")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let list = versions["versions"].as_array().unwrap();
+        assert_eq!(list.len(), 3, "boot + register + delete: {versions}");
+        assert_eq!(list[0]["version"], 2);
+        assert!(list[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("hook.delete hook:rbk"));
+        assert_eq!(list[0]["principal"], "admin");
+
+        // Diff v1 -> v2: the hook was removed.
+        let diff: serde_json::Value =
+            admin(client.get(format!("http://{addr}/admin/v1/config/diff?from=1&to=2")))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(diff["hooks"]["removed"][0], "rbk", "{diff}");
+
+        // Rollback to v1 restores the hook, LIVE, as a NEW version (append-only history).
+        let rb = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"version": 1}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rb.status().as_u16(), 200);
+        let rb_body: serde_json::Value = rb.json().await.unwrap();
+        assert_eq!(rb_body["restored_version"], 1);
+        assert_eq!(rb_body["new_version"], 3);
+        let restored = admin(client.get(format!("http://{addr}/admin/v1/hooks/rbk")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.status().as_u16(),
+            200,
+            "the rolled-back hook is live again"
+        );
+
+        // Guard rails: unknown target = 404; stale expected_version = 409.
+        let missing = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"version": 999}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        let stale = admin(client.post(format!("http://{addr}/admin/v1/config/rollback")))
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"version": 1, "expected_version": 0}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status().as_u16(), 409);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_admin_v1_register_hook_takes_effect_live() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Before: no hooks.
+        let before: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(before["items"].as_array().unwrap().len(), 0);
+
+        // Register a global gate at runtime.
+        let body = serde_json::json!({
+            "name": "compress",
+            "config": {
+                "kind": "gate",
+                "webhook": "http://127.0.0.1:9977/",
+                "prompt": "rw",
+                "global": true
+            }
+        });
+        let created = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201, "hook registered");
+        let created_body: serde_json::Value = created.json().await.unwrap();
+        assert_eq!(created_body["name"], "compress");
+        assert_eq!(created_body["kind"], "gate");
+        assert_eq!(created_body["global"], true);
+
+        // After: the hook is LIVE — a fresh read sees it (swap took effect + reads-current).
+        let after: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = after["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "the registered hook is now in the live config"
+        );
+        assert_eq!(items[0]["name"], "compress");
+
+        // The config version bumped from 0 → 1 on the apply (drift-detection primitive).
+        let info: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/info"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            info["config_version"], 1,
+            "one apply bumped the config version"
+        );
+
+        // GET one by name also sees it.
+        let one = client
+            .get(format!("http://{addr}/admin/v1/hooks/compress"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(one.status().as_u16(), 200);
+
+        // Invalid definition (prompt:rw on a tap) → 400 invalid_request, no mutation.
+        let bad = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "bad",
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9977/", "prompt": "rw"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400);
+        assert_eq!(
+            bad.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+
+        // Grant immutability over the wire (§6.4): re-registering "compress" (a prompt:rw gate) with a
+        // DIFFERENT grant (prompt:ro) → 409 conflict, no mutation. Same grants would be idempotent.
+        let escalate = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "compress",
+                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:9977/", "prompt": "ro"}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            escalate.status().as_u16(),
+            409,
+            "grant change must conflict"
+        );
+        assert_eq!(
+            escalate.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "conflict"
+        );
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/audit` records admin mutations: registering a hook appears in the audit log as
+    /// `hook.register` / `applied`, with the resource named. (The audit ring is process-global, so
+    /// other concurrent tests may add entries — assert the specific action appears, not an exact count.)
+    #[tokio::test]
+    async fn test_admin_v1_audit_records_mutations() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // A uniquely-named hook so the audit assertion can't collide with a concurrent test.
+        let name = "audit_probe_hook_x7";
+        client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": name,
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let audit: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/audit"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let entries = audit["entries"].as_array().unwrap();
+        let mine = entries
+            .iter()
+            .find(|e| e["resource"] == format!("hook:{name}"))
+            .expect("the registration is recorded in the audit log");
+        assert_eq!(mine["action"], "hook.register");
+        assert_eq!(mine["outcome"], "applied");
+        assert!(mine["seq"].is_number() && mine["ts"].is_number());
+
+        // Filter by resource (§2.5): only this hook's entries come back.
+        let filtered: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/audit?resource=hook:{name}"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let f = filtered["entries"].as_array().unwrap();
+        assert!(!f.is_empty());
+        assert!(
+            f.iter().all(|e| e["resource"] == format!("hook:{name}")),
+            "the resource filter returns only matching entries"
+        );
+
+        // Filter by a non-matching action → empty.
+        let none: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/admin/v1/audit?resource=hook:{name}&action=key.create"
+            ))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(none["entries"].as_array().unwrap().len(), 0);
+
+        handle.abort();
+    }
+
+    /// REGRESSION (audit c1r9): the UNKNOWN-NAME 404 on `PUT /hooks/{name}` and
+    /// `PATCH /hooks/{name}/settings` must be AUDITED (like DELETE's 404) — an unaudited 404 lets a
+    /// principal probe which hook names exist by response code alone, with no trail.
+    #[tokio::test]
+    async fn test_admin_v1_hook_mutation_404_is_audited() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Two uniquely-named, NEVER-registered hooks so the audit assertions can't collide.
+        let put_name = "ghost_put_hook_q3";
+        let patch_name = "ghost_patch_hook_q3";
+
+        let put_resp = client
+            .put(format!("http://{addr}/admin/v1/hooks/{put_name}"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9978/"}})
+                    .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put_resp.status(), 404, "PUT on an unknown hook is a 404");
+
+        let patch_resp = client
+            .patch(format!(
+                "http://{addr}/admin/v1/hooks/{patch_name}/settings"
+            ))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"settings": {"k": "v"}}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_resp.status(),
+            404,
+            "PATCH on an unknown hook is a 404"
+        );
+
+        // Both 404s must appear in the audit log as REJECTED, resource-named.
+        for (name, action) in [(put_name, "hook.replace"), (patch_name, "hook.settings")] {
+            let filtered: serde_json::Value = client
+                .get(format!("http://{addr}/admin/v1/audit?resource=hook:{name}"))
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let entry = filtered["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["resource"] == format!("hook:{name}"))
+                .unwrap_or_else(|| panic!("the {action} 404 must be recorded in the audit log"));
+            assert_eq!(entry["action"], action);
+            assert_eq!(
+                entry["outcome"], "rejected",
+                "the unknown-name 404 is a rejected mutation, audited"
+            );
+        }
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/keys` supports `?prefix=` and `?enabled=` filters (§2.1): a full-id prefix
+    /// returns just that key; a non-matching prefix returns none; `?enabled=true` includes a fresh key.
+    #[tokio::test]
+    async fn test_admin_v1_list_keys_filters() {
+        use crate::governance::NewKeySpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let (minted, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "filter-probe".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: "total".to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                crate::store::now(),
+            )
+            .unwrap();
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let get = |query: String| {
+            let url = format!("http://{addr}/admin/v1/keys{query}");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Prefix = the full id → exactly this key.
+        let by_prefix = get(format!("?prefix={}", minted.id)).await;
+        let keys = by_prefix["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["id"], minted.id);
+
+        // Non-matching prefix → none.
+        let none = get("?prefix=vk_does_not_exist".into()).await;
+        assert_eq!(none["keys"].as_array().unwrap().len(), 0);
+
+        // enabled=true includes the fresh (enabled) key.
+        let enabled = get("?enabled=true".into()).await;
+        assert!(enabled["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["id"] == minted.id));
+
+        handle.abort();
+    }
+
+    /// GOLDEN PATH: the whole config plane working together in one flow — register → live + version
+    /// bump + audit + persist → delete → gone + version bump + audit. A coherent-flow regression anchor
+    /// for the marquee feature (catches integration breaks the per-feature tests miss).
+    #[tokio::test]
+    async fn test_admin_v1_config_plane_golden_path() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("t".to_string())).unwrap());
+        let overlay = std::env::temp_dir().join(format!(
+            "busbar-golden-{}-{}.json",
+            std::process::id(),
+            crate::store::now()
+        ));
+        let _ = std::fs::remove_file(&overlay);
+        let app = TestApp::new()
+            .governance(gov)
+            .overlay_path(overlay.clone())
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let c = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let get = |p: String| {
+            let (c, url) = (c.clone(), format!("{base}{p}"));
+            async move {
+                c.get(url)
+                    .header("x-admin-token", "t")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        let name = "golden_gate";
+
+        // Baseline: no hooks, version 0, persistence on.
+        assert_eq!(
+            get("/admin/v1/hooks".into()).await["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let info0 = get("/admin/v1/info".into()).await;
+        assert_eq!(info0["config_version"], 0);
+        assert_eq!(info0["config_persistence"], true);
+
+        // Register.
+        let created = c
+            .post(format!("{base}/admin/v1/hooks"))
+            .header("x-admin-token", "t")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({"name": name, "config":
+                    {"kind": "gate", "webhook": "http://127.0.0.1:9982/", "global": true}})
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+
+        // Live (read sees it), version bumped, persisted to disk.
+        assert!(get("/admin/v1/hooks".into()).await["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["name"] == name));
+        assert_eq!(get("/admin/v1/info".into()).await["config_version"], 1);
+        assert_eq!(get("/admin/v1/config".into()).await["version"], 1);
+        assert!(crate::config::overlay::read(&overlay)
+            .unwrap()
+            .hooks
+            .contains_key(name));
+        // Audit records it.
+        assert!(
+            get(format!("/admin/v1/audit?resource=hook:{name}")).await["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["action"] == "hook.register" && e["outcome"] == "applied")
+        );
+
+        // Delete.
+        let deleted = c
+            .delete(format!("{base}/admin/v1/hooks/{name}"))
+            .header("x-admin-token", "t")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status().as_u16(), 204);
+
+        // Gone, version bumped again, persisted removal.
+        assert_eq!(
+            get("/admin/v1/hooks".into()).await["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(get("/admin/v1/info".into()).await["config_version"], 2);
+        assert!(!crate::config::overlay::read(&overlay)
+            .unwrap()
+            .hooks
+            .contains_key(name));
+
+        let _ = std::fs::remove_file(&overlay);
+        handle.abort();
+    }
+
+    /// Config-overlay PERSISTENCE: with an overlay path set, registering a hook over the API writes it
+    /// to the overlay file, and merging that overlay onto a fresh base config (a "restart") restores
+    /// the hook — so a runtime-registered hook survives a restart.
+    #[tokio::test]
+    async fn test_admin_v1_hook_register_persists_to_overlay() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let overlay = std::env::temp_dir().join(format!(
+            "busbar-persist-test-{}-{}.json",
+            std::process::id(),
+            crate::store::now()
+        ));
+        let _ = std::fs::remove_file(&overlay);
+        let app = TestApp::new()
+            .governance(gov)
+            .overlay_path(overlay.clone())
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Register a global gate — the handler persists it to the overlay file.
+        let created = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "persisted_gate",
+                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:9981/", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+
+        // The overlay file now holds the hook.
+        let doc = crate::config::overlay::read(&overlay).expect("overlay written");
+        assert!(doc.hooks.contains_key("persisted_gate"));
+        assert!(doc.global_hooks.iter().any(|g| g == "persisted_gate"));
+
+        // "Restart": merge the overlay onto a fresh base config → the hook is restored.
+        let mut fresh: crate::config::DeployCfg =
+            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
+        crate::config::overlay::merge_into(&mut fresh, doc);
+        assert!(
+            fresh.hooks.contains_key("persisted_gate"),
+            "the runtime-registered hook survives a restart via the overlay"
+        );
+
+        let _ = std::fs::remove_file(&overlay);
+        handle.abort();
+    }
+
+    /// Key mutations are audited too (§6.7 — EVERY admin mutation): minting a key records
+    /// `key.create` / `applied` with the new key's id.
+    #[tokio::test]
+    async fn test_admin_v1_audit_records_key_mutations() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // Mint a uniquely-named key.
+        let minted: serde_json::Value = client
+            .post(format!("http://{addr}/admin/v1/keys"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(serde_json::json!({"name": "audit_key_probe_z3"}).to_string())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = minted["id"].as_str().unwrap().to_string();
+
+        let audit: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/audit"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mine = audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["resource"] == format!("key:{id}"))
+            .expect("the key creation is recorded in the audit log");
+        assert_eq!(mine["action"], "key.create");
+        assert_eq!(mine["outcome"], "applied");
+
+        handle.abort();
+    }
+
+    /// REGRESSION (audit c1r5): base-config hooks are READ-ONLY across every mutation verb — a
+    /// narrow hooks-register token must not be able to shadow/redirect (POST) or remove (DELETE) an
+    /// operator's file-defined hook (e.g. a `pii-guard` gate). PUT/PATCH already guarded; this pins
+    /// POST + DELETE to the same 409, matching the guard other verbs enforce.
+    #[tokio::test]
+    async fn test_admin_v1_base_hook_is_read_only_via_api() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let base: crate::config::HookCfg = serde_json::from_value(serde_json::json!({
+            "kind": "gate", "webhook": "http://127.0.0.1:9990/", "prompt": "no", "global": true
+        }))
+        .unwrap();
+        let app = TestApp::new()
+            .governance(gov)
+            .base_hook("pii-guard", base)
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // POST a same-shape definition over the base hook's name → 409 (no silent transport redirect).
+        let shadow = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "pii-guard",
+                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:6666/", "prompt": "no", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            shadow.status().as_u16(),
+            409,
+            "POST cannot shadow a base hook"
+        );
+
+        // DELETE the base hook → 409 (cannot remove an operator's base security gate via the API).
+        let del = client
+            .delete(format!("http://{addr}/admin/v1/hooks/pii-guard"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            del.status().as_u16(),
+            409,
+            "DELETE cannot remove a base hook"
+        );
+
+        // It is still present and unchanged.
+        let got: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/hooks/pii-guard"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            got["transport"].to_string().contains("9990"),
+            "base hook untouched: {got}"
+        );
+    }
+
+    /// `DELETE /admin/v1/hooks/{name}` removes a hook at runtime (live): register → delete (204) →
+    /// GET /hooks/{name} 404. Deleting an unregistered hook is 404.
+    #[tokio::test]
+    async fn test_admin_v1_delete_hook_takes_effect_live() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let tok = ("x-admin-token", "admintok");
+
+        // Register a global tap.
+        let created = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header(tok.0, tok.1)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "logger",
+                    "config": {"kind": "tap", "webhook": "http://127.0.0.1:9978/", "global": true}
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status().as_u16(), 201);
+
+        // Delete an absent hook → 404.
+        let absent = client
+            .delete(format!("http://{addr}/admin/v1/hooks/nope"))
+            .header(tok.0, tok.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(absent.status().as_u16(), 404);
+
+        // Delete the registered hook → 204, and it's gone live.
+        let deleted = client
+            .delete(format!("http://{addr}/admin/v1/hooks/logger"))
+            .header(tok.0, tok.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status().as_u16(), 204);
+
+        let after = client
+            .get(format!("http://{addr}/admin/v1/hooks/logger"))
+            .header(tok.0, tok.1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.status().as_u16(),
+            404,
+            "the hook is gone from the live config"
+        );
+
+        handle.abort();
+    }
+
+    /// The hooks read surface (`GET /admin/v1/hooks`, `GET /admin/v1/hooks/{name}`) projects the
+    /// registry definitions (kind/transport/grants/global), 404s an unknown name, and never leaks a
+    /// secret. Built on a fixture with one global gate.
+    #[tokio::test]
+    async fn test_admin_v1_hooks_read_surface() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+
+        let gate = crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9990/".to_string()),
+            timeout_ms: 25,
+            on_error: "reject".to_string(),
+            prompt: crate::config::PromptAccess::Rw,
+            user: crate::config::UserAccess::Ro,
+            priority: 7,
+            at: None,
+            settings: serde_json::Map::new(),
+            on_empty: None,
+            global: false,
+            default: false,
+        };
+        let app = TestApp::new()
+            .governance(gov)
+            .hook("compress", gate)
+            .global_hook("compress")
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        // List: the one hook, projected.
+        let list = client
+            .get(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let h = &items[0];
+        assert_eq!(h["name"], "compress");
+        assert_eq!(h["kind"], "gate");
+        assert_eq!(h["prompt"], "rw");
+        assert_eq!(h["user"], "ro");
+        assert_eq!(h["priority"], 7);
+        assert_eq!(h["on_error"], "reject");
+        assert_eq!(h["transport"]["kind"], "webhook");
+        assert_eq!(h["transport"]["target"], "http://127.0.0.1:9990/");
+        assert_eq!(
+            h["global"], true,
+            "named in global_hooks → reported as globally wired"
+        );
+
+        // Get one by name.
+        let one = client
+            .get(format!("http://{addr}/admin/v1/hooks/compress"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(one.status().as_u16(), 200);
+
+        // Unknown name → 404 with the stable v1 `not_found` code.
+        let missing = client
+            .get(format!("http://{addr}/admin/v1/hooks/nope"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status().as_u16(), 404);
+        let body: serde_json::Value = missing.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "not_found");
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/hooks/{name}/health` best-effort probes a hook's transport: 404 for an unknown
+    /// name; a webhook hook reports `reachable: null` (probed on demand); a socket hook pointing at a
+    /// nonexistent path reports `reachable: false`. Never fires the hook.
+    #[tokio::test]
+    async fn test_admin_v1_hook_health_best_effort() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mk = |socket: Option<&str>, webhook: Option<&str>| crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: socket.map(str::to_string),
+            webhook: webhook.map(str::to_string),
+            timeout_ms: 5,
+            on_error: "weighted".to_string(),
+            prompt: crate::config::PromptAccess::No,
+            user: crate::config::UserAccess::No,
+            priority: 0,
+            at: None,
+            settings: serde_json::Map::new(),
+            on_empty: None,
+            global: false,
+            default: false,
+        };
+        let app = TestApp::new()
+            .governance(gov)
+            .hook("web", mk(None, Some("http://127.0.0.1:9980/")))
+            .hook("sock", mk(Some("/nonexistent/busbar-hook.sock"), None))
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let get = |name: &str| {
+            let url = format!("http://{addr}/admin/v1/hooks/{name}/health");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Unknown → 404 not_found.
+        let missing = get("nope").await;
+        assert_eq!(missing.status().as_u16(), 404);
+        assert_eq!(
+            missing.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "not_found"
+        );
+
+        // Webhook → reachable null (not probed here).
+        let web: serde_json::Value = get("web").await.json().await.unwrap();
+        assert_eq!(web["name"], "web");
+        assert_eq!(web["transport"]["kind"], "webhook");
+        assert!(web["reachable"].is_null(), "webhook is not probed here");
+
+        // Socket to a nonexistent path → reachable false (best-effort connect failed).
+        let sock: serde_json::Value = get("sock").await.json().await.unwrap();
+        assert_eq!(sock["transport"]["kind"], "socket");
+        // On unix the connect fails → Some(false); on non-unix sockets aren't probed → null. Accept both.
+        assert!(
+            sock["reachable"] == serde_json::json!(false) || sock["reachable"].is_null(),
+            "socket to a dead path is unreachable (unix) or unprobed (non-unix): {}",
+            sock["reachable"]
+        );
+
+        handle.abort();
+    }
+
+    /// The plugin catalog (`GET /admin/v1/plugins?type=`) lists compiled-in plugins per type (the
+    /// same feature-gated source as `info`) plus external hooks from the registry, and rejects an
+    /// unknown/absent type with the stable `invalid_request` code.
+    #[tokio::test]
+    async fn test_admin_v1_plugins_catalog_by_type() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let gate = crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: Some("/run/busbar/h.sock".to_string()),
+            webhook: None,
+            timeout_ms: 5,
+            on_error: "weighted".to_string(),
+            prompt: crate::config::PromptAccess::No,
+            user: crate::config::UserAccess::No,
+            priority: 0,
+            at: None,
+            settings: serde_json::Map::new(),
+            on_empty: None,
+            global: false,
+            default: false,
+        };
+        let app = TestApp::new().governance(gov).hook("myhook", gate).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let get = |q: &str| {
+            let url = format!("http://{addr}/admin/v1/plugins?type={q}");
+            let client = client.clone();
+            async move {
+                client
+                    .get(url)
+                    .header("x-admin-token", "admintok")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // auth: the compiled-in tokens module — present iff the auth-tokens feature is compiled in.
+        let auth: serde_json::Value = get("auth").await.json().await.unwrap();
+        let a_items = auth["items"].as_array().unwrap();
+        let tokens = a_items.iter().find(|p| p["name"] == "tokens");
+        assert_eq!(
+            tokens.is_some(),
+            cfg!(feature = "auth-tokens"),
+            "tokens listed iff compiled in"
+        );
+        if let Some(tokens) = tokens {
+            assert_eq!(tokens["loader"], "compiled-in");
+            assert_eq!(tokens["type"], "auth");
+        }
+
+        // hooks: the weighted floor is ALWAYS compiled-in; ranking iff the feature is on; plus the
+        // external myhook.
+        let hooks: serde_json::Value = get("hooks").await.json().await.unwrap();
+        let h_items = hooks["items"].as_array().unwrap();
+        assert!(h_items
+            .iter()
+            .any(|p| p["name"] == "weighted" && p["loader"] == "compiled-in"));
+        assert_eq!(
+            h_items.iter().any(|p| p["name"] == "ranking"),
+            cfg!(feature = "hooks-ranking"),
+            "ranking listed iff compiled in"
+        );
+        let ext = h_items
+            .iter()
+            .find(|p| p["name"] == "myhook")
+            .expect("external hook listed");
+        assert_eq!(ext["loader"], "external");
+        assert_eq!(ext["active"], true);
+        assert_eq!(ext["target"], "/run/busbar/h.sock");
+
+        // Unknown type → 400 invalid_request.
+        let bad = get("nope").await;
+        assert_eq!(bad.status().as_u16(), 400);
+        let body: serde_json::Value = bad.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/auth` reports the ingress chain + upstream-credential mode, never a secret. A
+    /// governance-only fixture (no explicit auth chain) is the open front door.
+    #[tokio::test]
+    async fn test_admin_v1_auth_read() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/auth"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(body["chain"].is_array());
+        assert_eq!(body["open"], true, "no explicit chain → open front door");
+        assert_eq!(body["upstream_credentials"], "own");
+        // Sanity: no secret-looking field leaked.
+        assert!(body.get("client_tokens").is_none());
+
+        handle.abort();
+    }
+
+    /// `POST /admin/v1/config/validate` dry-runs a proposed config: a malformed body is a 400
+    /// `invalid_request`; a well-formed body describing an INVALID config (here a provider reference
+    /// absent from the defs) returns 200 with `ok:false` and the resolution errors — never mutating.
+    #[tokio::test]
+    async fn test_admin_v1_config_validate_dry_run() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/admin/v1/config/validate");
+
+        // Malformed body → 400 invalid_request (the REQUEST is broken, not the config).
+        let bad = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body("{\"config\": \"not-an-object\"}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status().as_u16(), 400);
+        let body: serde_json::Value = bad.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+
+        // Well-formed body, invalid config: deploy references provider "openai" but the defs are empty
+        // → resolve fails with a dangling-provider error → 200 ok:false.
+        let proposed = serde_json::json!({
+            "config": {
+                "providers": { "openai": { "api_key_env": "OPENAI_KEY" } },
+                "models": {}
+            },
+            "providers": {}
+        });
+        let resp = client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(proposed.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["ok"], false, "config with a dangling provider is invalid");
+        let errors = v["errors"].as_array().unwrap();
+        assert!(!errors.is_empty(), "invalid config must report errors");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap_or("").contains("openai")),
+            "the dangling provider is named in an error: {errors:?}"
+        );
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/config` composes the effective-config snapshot (auth + pools/models/providers +
+    /// hooks + global_hooks) from the redacted reads. Asserts the shape and that no secret-bearing
+    /// field (client tokens, provider keys) appears anywhere in the serialized body.
+    #[tokio::test]
+    async fn test_admin_v1_config_effective_snapshot_no_secrets() {
+        use crate::test_support::LaneSpec;
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let gate = crate::config::HookCfg {
+            kind: crate::config::HookKind::Gate,
+            socket: None,
+            webhook: Some("http://127.0.0.1:9970/".to_string()),
+            timeout_ms: 5,
+            on_error: "weighted".to_string(),
+            prompt: crate::config::PromptAccess::No,
+            user: crate::config::UserAccess::No,
+            priority: 0,
+            at: None,
+            settings: serde_json::Map::new(),
+            on_empty: None,
+            global: false,
+            default: false,
+        };
+        let app = TestApp::new()
+            .governance(gov)
+            .lane(
+                LaneSpec::new(
+                    "m",
+                    crate::proto::Protocol::anthropic(),
+                    "http://127.0.0.1:1/",
+                )
+                .provider("prov"),
+            )
+            .pool("p", &[(0, 1)])
+            .hook("g", gate)
+            .global_hook("g")
+            .build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{addr}/admin/v1/config"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let text = resp.text().await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // Composed sections present.
+        assert_eq!(body["version"], 0, "fresh config is version 0");
+        assert!(body["auth"]["chain"].is_array());
+        assert!(body["pools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "p"));
+        assert!(body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["model"] == "m"));
+        assert!(body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["provider"] == "prov"));
+        assert!(body["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["name"] == "g"));
+        assert!(body["global_hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n == "g"));
+        // No secret-bearing key names anywhere in the snapshot.
+        for needle in ["admintok", "client_tokens", "api_key", "secret"] {
+            assert!(
+                !text.contains(needle),
+                "effective config must not leak `{needle}`: {text}"
+            );
+        }
+
+        handle.abort();
+    }
+
+    /// `GET /admin/v1/openapi.json` returns a valid OpenAPI 3.1 doc, and — the DRIFT GUARD — every GET
+    /// path it documents (from V1_GET_PATHS) actually resolves on the live router (never a phantom
+    /// endpoint in the discovery contract). Also asserts the stable error `code` enum is present.
+    #[tokio::test]
+    async fn test_admin_v1_openapi_paths_all_resolve() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let doc: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/openapi.json"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert_eq!(doc["info"]["title"], "Busbar Admin API");
+        // The stable error code enum is documented.
+        let codes = doc["components"]["schemas"]["Error"]["properties"]["error"]["properties"]
+            ["code"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(codes.iter().any(|c| c == "not_found"));
+
+        // The runtime hook mutation methods are documented in the discovery contract.
+        assert!(
+            doc["paths"]["/admin/v1/hooks"]["post"].is_object(),
+            "POST /admin/v1/hooks (register) must be in the openapi doc"
+        );
+        assert!(
+            doc["paths"]["/admin/v1/hooks/{name}"]["delete"].is_object(),
+            "DELETE /admin/v1/hooks/{{name}} (remove) must be in the openapi doc"
+        );
+
+        // DRIFT GUARD: every documented GET path is both listed in the doc AND actually mounted.
+        for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
+            assert!(
+                doc["paths"][path]["get"].is_object(),
+                "documented path {path} missing from openapi doc"
+            );
+            let status = client
+                .get(format!("http://{addr}{path}"))
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status();
+            assert_ne!(
+                status.as_u16(),
+                404,
+                "openapi documents {path} but the router does not mount it (phantom endpoint)"
+            );
+        }
+
+        handle.abort();
+    }
+
+    /// SECURITY CONTRACT: every documented `/admin/v1` GET endpoint rejects a MISSING token and a
+    /// WRONG token with 401 — the whole surface is admin-guarded, no read leaks without the credential.
+    /// Iterates the same V1_GET_PATHS the openapi doc + drift guard use, so a newly-added endpoint is
+    /// automatically covered.
+    #[tokio::test]
+    async fn test_admin_v1_all_reads_require_admin_token() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let app = TestApp::new().governance(gov).build();
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        for (path, _) in crate::admin::v1::json::V1_GET_PATHS {
+            // No token → 401.
+            let none = client
+                .get(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                none.status().as_u16(),
+                401,
+                "{path} must reject a request with NO admin token"
+            );
+            // Wrong token → 401.
+            let wrong = client
+                .get(format!("http://{addr}{path}"))
+                .header("x-admin-token", "not-the-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                wrong.status().as_u16(),
+                401,
+                "{path} must reject a request with the WRONG admin token"
+            );
+        }
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -1291,7 +4699,13 @@ mod tests {
                     })
                     .to_string(),
                 );
-                let r1 = super::create_key(axum::extract::State(app.clone()), body1).await;
+                let r1 = super::create_key(
+                    crate::state::CurrentApp(app.clone()),
+                    axum::Extension(crate::auth::AuthPrincipal(None)),
+                    axum::http::HeaderMap::new(),
+                    body1,
+                )
+                .await;
                 let s1 = r1.status().as_u16();
 
                 // Request 2: references ONLY the configured pool — no warning expected.
@@ -1302,7 +4716,13 @@ mod tests {
                     })
                     .to_string(),
                 );
-                let r2 = super::create_key(axum::extract::State(app), body2).await;
+                let r2 = super::create_key(
+                    crate::state::CurrentApp(app),
+                    axum::Extension(crate::auth::AuthPrincipal(None)),
+                    axum::http::HeaderMap::new(),
+                    body2,
+                )
+                .await;
                 let s2 = r2.status().as_u16();
                 (s1, s2)
             })
@@ -1763,6 +5183,95 @@ mod tests {
             listed["keys"].as_array().unwrap().len(),
             0,
             "a PATCH must never resurrect a key a concurrent DELETE revoked: {listed}"
+        );
+        handle.abort();
+    }
+
+    /// REGRESSION (audit c1r6, SECURITY): `rotate_key` is a check-then-act (get_key → mint →
+    /// put_key over the UPSERT), so — exactly like update_key/delete_key — it must hold
+    /// EXISTENCE_GATE across lookup→write. Without it a DELETE that revokes the key between rotate's
+    /// read and its `put_key` is clobbered by the put, RESURRECTING the revoked key with a fresh
+    /// (attacker-usable) secret. Same deterministic `BarrierStore` interleaving as the PATCH test.
+    #[tokio::test]
+    async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
+        crate::metrics::init();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store = Arc::new(BarrierStore {
+            inner: SqliteStore::open_in_memory().unwrap(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let gov =
+            Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+        let (key, _secret) = gov
+            .create_key(
+                NewKeySpec {
+                    name: "k".to_string(),
+                    allowed_pools: vec![],
+                    max_budget_cents: None,
+                    budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
+                    rpm_limit: None,
+                    tpm_limit: None,
+                },
+                0,
+            )
+            .unwrap();
+        let (addr, handle) = serve_with_gov(gov).await;
+
+        // Arm the barrier so rotate's put_key (the next put) pauses between its check and its write.
+        store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let rotate_url = format!("http://{addr}/admin/v1/keys/{}/rotate", key.id);
+        let rotate_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(&rotate_url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        // Wait until rotate is parked inside put_key.
+        tokio::task::spawn_blocking(move || entered_rx.recv())
+            .await
+            .unwrap()
+            .expect("ROTATE must reach the instrumented put_key");
+
+        let delete_url = format!("http://{addr}/admin/keys/{}", key.id);
+        let delete_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .delete(&delete_url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        release_tx.send(()).unwrap();
+        let _ = rotate_task.await.unwrap();
+        let _ = delete_task.await.unwrap();
+
+        // DECISIVE: the revoked key must be GONE. A resurrecting rotate (ungated) leaves it PRESENT.
+        let listed: serde_json::Value = reqwest::Client::new()
+            .get(format!("http://{addr}/admin/keys"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["keys"].as_array().unwrap().len(),
+            0,
+            "rotate must never resurrect a key a concurrent DELETE revoked: {listed}"
         );
         handle.abort();
     }

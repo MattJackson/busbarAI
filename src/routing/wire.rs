@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The ONE hook wire contract — shared by every out-of-process routing transport (HTTP webhook,
 //! Unix-socket binary). A policy hook receives this exact JSON projection and returns this exact
@@ -19,12 +19,51 @@ pub(crate) struct HookRequest<'a> {
     pub(crate) request: HookReqProjection<'a>,
     pub(crate) candidates: Vec<HookCandidate<'a>>,
     pub(crate) context: HookContext<'a>,
+    /// TAP observation-stage payload — present ONLY on stage taps (`at: route|attempt|completion`);
+    /// absent on request-stage taps and every gate, so the pre-stages wire is byte-identical
+    /// (append-only schema).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stage: Option<HookStageProjection<'a>>,
 }
 
-/// The request projection (a cheap, read-only slice of the ingress request). Shape signals only BY
-/// DEFAULT — no prompt text or caller identity rides this projection unless the pool opted in
-/// (`policy.send_prompt` / `policy.send_user`). The opt-in fields are omitted from the JSON
-/// entirely when off, so the default payload is byte-identical to the pre-opt-in contract.
+/// The tap OBSERVATION-STAGE payload. Which fields are present depends on `at`:
+/// `route` carries the surviving candidate count after the decision reconcile;
+/// `attempt` carries the full failover story (attempt number, dispatched target, remaining
+/// candidates, and — from attempt 2 — why the previous attempt failed);
+/// `completion` carries the outcome (`ok` | `failed` | `rejected_by_gate` — the SYNTHETIC
+/// completion that lets an audit tap see denials) and the response status.
+#[derive(Serialize)]
+pub(crate) struct HookStageProjection<'a> {
+    pub(crate) at: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remaining_candidates: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) previous_failure: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<u16>,
+}
+
+/// The request projection sent to a hook. THE CONTRACT: a **default bucket** of shape/metadata
+/// signals is ALWAYS present (pool, protocol, counts, sizes, stream, max_tokens; plus every
+/// candidate's metadata + live signals in `HookCandidate`) — nothing sensitive. On top of that, at
+/// most **two access-gated SECURITY fields** ride the projection, each opted in per hook by an
+/// explicit grant:
+///   - `prompt` grant (`no|ro|rw`): `system` + `messages` (flattened text) — present when the grant
+///     is `ro` OR `rw`. The REQUEST wire is IDENTICAL for `ro` and `rw` (a hook must SEE the prompt to
+///     screen it or to rewrite it); the extra power of `rw` is on the REPLY only — a `rw` hook's
+///     `rewrite` arm is applied, a `ro` hook's is dropped (enforced at the rewrite seam by the grant).
+///   - `user` grant (`no|ro`): caller identity — present when `ro`.
+///
+/// A grant of `no` OMITS the field from the JSON entirely AND is fail-closed the other direction too
+/// (a returned value for a field the hook wasn't granted is ignored): `ro`'s rewrite is dropped,
+/// `no` sends nothing and accepts nothing back. These are the ONLY two fields that ever carry caller
+/// content/identity.
 #[derive(Serialize)]
 pub(crate) struct HookReqProjection<'a> {
     pub(crate) pool: &'a str,
@@ -34,16 +73,16 @@ pub(crate) struct HookReqProjection<'a> {
     pub(crate) total_chars: usize,
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
-    /// `policy.send_prompt` opt-in: the flattened system prompt text. Absent when off — AND when
-    /// on but the request carries no (or an empty) system prompt, so a hook must key the opt-in
-    /// off `messages` (always present, possibly `[]`, when on), never off `system`.
+    /// SECURITY (`prompt: ro|rw` grant): the flattened system prompt text. Absent when the grant is
+    /// `no` — AND when granted but the request carries no (or an empty) system prompt, so a hook must
+    /// key the grant off `messages` (always present, possibly `[]`, when granted), never off `system`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) system: Option<&'a str>,
-    /// `policy.send_prompt` opt-in: every message as `{role, text}`. Absent when off.
+    /// SECURITY (`prompt: ro|rw` grant): every message as `{role, text}`. Absent when the grant is `no`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) messages: Option<Vec<HookMessage<'a>>>,
-    /// `policy.send_user` opt-in: caller identity (key id/name + end-user field, NEVER the secret).
-    /// Absent when off.
+    /// SECURITY (`user: ro` grant): caller identity (key id/name + end-user field, NEVER the secret).
+    /// Absent when the grant is `no`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) user: Option<HookUser<'a>>,
 }
@@ -69,11 +108,22 @@ pub(crate) struct HookUser<'a> {
 }
 
 /// One candidate as seen by the hook. `idx` is the stable handle the hook echoes back in `order`;
-/// the rest are the live signals + operator metadata a policy ranks on.
+/// the rest are the live signals + operator metadata a policy ranks on. The contract projects
+/// EVERYTHING a built-in ranking strategy reads, so an external hook can implement any of them
+/// identically ("no hook is different"): `weight` (SWRR), `provider` (provider-preference),
+/// `context_max` (context-fit), plus the cost/latency/concurrency/headroom live signals.
 #[derive(Serialize)]
 pub(crate) struct HookCandidate<'a> {
     pub(crate) idx: usize,
     pub(crate) model: &'a str,
+    /// Upstream provider name — lets a hook prefer/avoid a provider (a provider-preference strategy).
+    pub(crate) provider: &'a str,
+    /// The configured SWRR weight — lets an external hook implement a weighted-variant strategy (the
+    /// signal the built-in `weighted` floor ranks on; projected so the contract is complete).
+    pub(crate) weight: u32,
+    /// Member context-window ceiling — lets a hook route by context-fit. `None` if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) context_max: Option<usize>,
     pub(crate) tier: Option<&'a str>,
     pub(crate) cost_per_mtok: Option<f64>,
     pub(crate) latency_ms: Option<f64>,
@@ -92,6 +142,46 @@ pub(crate) struct HookCandidate<'a> {
 pub(crate) struct HookContext<'a> {
     pub(crate) pool: &'a str,
     pub(crate) budget_remaining: Option<i64>,
+}
+
+/// The CONFIGURE message (D2) — the FIRST line busbar sends on every socket connection (and the
+/// push a settings PATCH makes before committing): the hook's current desired-state settings.
+/// Top-level `configure` key discriminates it from decide/transform payloads (which carry
+/// `request`/`candidates`/`context`), so a hook branches on the first key. Idempotent
+/// desired-state: re-sending the same settings must be a no-op for the hook.
+#[derive(Serialize)]
+pub(crate) struct ConfigureMsg<'a> {
+    pub(crate) configure: ConfigureBody<'a>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ConfigureBody<'a> {
+    /// The hook's own registry name (context echo).
+    pub(crate) hook: &'a str,
+    /// The opaque settings map from the hook's registry entry (operator/API-owned).
+    pub(crate) settings: &'a serde_json::Map<String, serde_json::Value>,
+    /// Monotonic settings version (the config_version that committed them) — the ack echoes it.
+    pub(crate) settings_version: u64,
+    pub(crate) busbar_version: &'static str,
+}
+
+/// The hook's configure ACK: `{"ack": {"settings_version": N}}`. Anything else (error, wrong
+/// version, garbage, timeout) is a FAILED configure — a settings PATCH does not commit.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigureAck {
+    pub(crate) ack: Option<ConfigureAckBody>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigureAckBody {
+    pub(crate) settings_version: u64,
+}
+
+/// The DESCRIBE request (D2): `{"describe": true}` — the hook replies its settings JSON Schema
+/// (any JSON value; busbar proxies it verbatim on `GET /admin/v1/hooks/{name}/schema`).
+#[derive(Serialize)]
+pub(crate) struct DescribeMsg {
+    pub(crate) describe: bool,
 }
 
 /// The hook's reply. `order` is the ranked preference (candidate `idx` values, most-preferred
@@ -117,6 +207,72 @@ pub(crate) struct HookResponse {
     /// rejects.
     #[serde(default)]
     pub(crate) reject: Option<serde_json::Value>,
+    /// RESTRICT the surviving candidate set to members carrying ANY of these tags
+    /// (`{"restrict": {"tags_any": [...]}}`). A compliance gate ("only BAA-covered lanes"). Untyped +
+    /// FAIL-CLOSED like `reject`: a malformed restrict must fall to the gate's `on_error`/`on_empty`,
+    /// never silently allow-all. Parsed by `parse_restrict`. Wired into the two-phase decision seam in
+    /// a later slice-4 step; the reply contract + parser land here first (tested in isolation).
+    #[serde(default)]
+    pub(crate) restrict: Option<serde_json::Value>,
+    /// REWRITE the request body (`{"rewrite": {"messages": [...], "tools": [...]}}`) — the
+    /// compression/redaction arm (Headroom). Untyped + FAIL-CLOSED: a malformed/oversize rewrite must
+    /// proceed with the UNMODIFIED body, never a corrupted one. Requires the hook's `prompt: rw` grant.
+    /// Parsed by `parse_rewrite`. Applied by the priority-ordered transform pass wired in a later
+    /// slice-4 step; the reply contract + parser land here first (tested in isolation).
+    #[serde(default)]
+    #[allow(dead_code)]
+    // consumed when the priority-ordered transform pass is wired (later slice-4 step)
+    pub(crate) rewrite: Option<serde_json::Value>,
+}
+
+/// A parsed, validated `restrict` reply: the set of tags a surviving candidate must carry at least
+/// one of. FAIL-CLOSED — `parse_restrict` returns `None` for a malformed/empty restrict so the caller
+/// routes it to `on_error`, never to an accidental allow-all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestrictReply {
+    pub(crate) tags_any: Vec<String>,
+}
+
+/// Parse the untyped `restrict` value fail-closed. A well-formed restrict is `{"tags_any": [non-empty
+/// strings]}`; anything else (not an object, missing/empty/non-array `tags_any`, no usable string
+/// entries) yields `None` — the caller treats that as the gate's `on_error`, never allow-all. Tag
+/// strings are trimmed; empty/whitespace-only entries are dropped.
+pub(crate) fn parse_restrict(value: &serde_json::Value) -> Option<RestrictReply> {
+    let tags_any: Vec<String> = value
+        .get("tags_any")?
+        .as_array()?
+        .iter()
+        .filter_map(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    if tags_any.is_empty() {
+        return None;
+    }
+    Some(RestrictReply { tags_any })
+}
+
+/// A parsed, validated `rewrite` reply — part of the hook contract (`busbar-api`); re-exported so
+/// engine-internal paths are unchanged. FAIL-CLOSED: `parse_rewrite` (below) returns `None` for a
+/// malformed rewrite so the caller proceeds with the ORIGINAL body, never a corrupted one.
+pub(crate) use busbar_api::RewriteReply;
+
+/// Parse the untyped `rewrite` value fail-closed. A well-formed rewrite is `{"messages": [...],
+/// "tools"?: [...]}` with a NON-EMPTY messages array; anything else yields `None` (proceed with the
+/// original body). `tools` is optional (defaults empty).
+#[allow(dead_code)] // applied by the priority-ordered transform pass in a later slice-4 step
+pub(crate) fn parse_rewrite(value: &serde_json::Value) -> Option<RewriteReply> {
+    let messages: Vec<serde_json::Value> = value.get("messages")?.as_array()?.clone();
+    if messages.is_empty() {
+        return None;
+    }
+    let tools = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Some(RewriteReply { messages, tools })
 }
 
 /// Reject-status clamp range + fallback: any status outside 400..=499 becomes 403.
@@ -200,6 +356,9 @@ pub(crate) fn build<'a>(
             .map(|c| HookCandidate {
                 idx: c.idx,
                 model: c.model,
+                provider: c.provider,
+                weight: c.weight,
+                context_max: c.context_max,
                 tier: c.tier,
                 cost_per_mtok: c.cost_per_mtok,
                 latency_ms: c.latency_ms,
@@ -209,6 +368,7 @@ pub(crate) fn build<'a>(
                 tags: c.tags,
             })
             .collect(),
+        stage: None,
         context: HookContext {
             pool: ctx.pool,
             budget_remaining: ctx.budget_remaining,
@@ -235,6 +395,17 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
                 reject.get("message").and_then(|m| m.as_str()).unwrap_or(""),
             );
             return RoutingDecision::Reject { status, message };
+        }
+    }
+    // RESTRICT comes after reject (reject wins) and before order. FAIL-CLOSED like reject: any
+    // `restrict` value except an explicit `false` restricts; a malformed one (parse_restrict → None)
+    // yields an EMPTY tag set, which downstream resolves via the gate's `on_empty` — never allow-all.
+    if let Some(restrict) = parsed.restrict {
+        if restrict != serde_json::Value::Bool(false) {
+            let tags_any = parse_restrict(&restrict)
+                .map(|r| r.tags_any)
+                .unwrap_or_default();
+            return RoutingDecision::Restrict { tags_any };
         }
     }
     if parsed.abstain {
@@ -548,5 +719,77 @@ mod tests {
             RoutingDecision::Abstain
         ));
         assert!(matches!(norm(r#"{}"#), RoutingDecision::Abstain));
+    }
+
+    /// `normalize` maps `restrict` to `RoutingDecision::Restrict` with reject > restrict > order
+    /// precedence; a malformed restrict is fail-closed to an EMPTY tag set (→ on_empty downstream),
+    /// and `restrict: false` is the explicit opt-out.
+    #[test]
+    fn normalize_restrict_precedence_and_fail_closed() {
+        // Well-formed restrict → the tags.
+        match norm(r#"{"restrict":{"tags_any":["baa"]}}"#) {
+            RoutingDecision::Restrict { tags_any } => assert_eq!(tags_any, vec!["baa".to_string()]),
+            other => panic!("expected Restrict, got {other:?}"),
+        }
+        // reject WINS over a co-present restrict.
+        assert!(matches!(
+            norm(r#"{"reject":{"status":403},"restrict":{"tags_any":["baa"]}}"#),
+            RoutingDecision::Reject { .. }
+        ));
+        // restrict WINS over a co-present order.
+        assert!(matches!(
+            norm(r#"{"restrict":{"tags_any":["x"]},"order":[0,1]}"#),
+            RoutingDecision::Restrict { .. }
+        ));
+        // Malformed restrict → fail-closed empty tag set (→ on_empty), never allow-all/order.
+        match norm(r#"{"restrict":{"tags_any":[]}}"#) {
+            RoutingDecision::Restrict { tags_any } => assert!(tags_any.is_empty()),
+            other => panic!("malformed restrict must stay Restrict (fail-closed), got {other:?}"),
+        }
+        // Explicit opt-out: `restrict: false` is NOT a restriction.
+        assert!(matches!(
+            norm(r#"{"restrict":false,"order":[1,0]}"#),
+            RoutingDecision::Prefer(_)
+        ));
+    }
+
+    /// `parse_restrict` is FAIL-CLOSED: a well-formed restrict yields the trimmed non-empty tags; any
+    /// malformed shape yields `None` (the caller routes to on_error, never allow-all).
+    #[test]
+    fn parse_restrict_is_fail_closed() {
+        let ok = parse_restrict(&serde_json::json!({"tags_any": ["baa", " gpu ", ""]}))
+            .expect("well-formed restrict parses");
+        assert_eq!(ok.tags_any, vec!["baa".to_string(), "gpu".to_string()]);
+
+        // Malformed → None (fail-closed): no tags_any, empty list, whitespace-only, non-array, non-object.
+        assert!(parse_restrict(&serde_json::json!({})).is_none());
+        assert!(parse_restrict(&serde_json::json!({"tags_any": []})).is_none());
+        assert!(parse_restrict(&serde_json::json!({"tags_any": ["", "  "]})).is_none());
+        assert!(parse_restrict(&serde_json::json!({"tags_any": "baa"})).is_none());
+        assert!(parse_restrict(&serde_json::json!("baa")).is_none());
+    }
+
+    /// `parse_rewrite` is FAIL-CLOSED: a well-formed rewrite yields the messages (+ optional tools);
+    /// any malformed shape yields `None` (the caller keeps the ORIGINAL body).
+    #[test]
+    fn parse_rewrite_is_fail_closed() {
+        let ok = parse_rewrite(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "headroom_retrieve"}]
+        }))
+        .expect("well-formed rewrite parses");
+        assert_eq!(ok.messages.len(), 1);
+        assert_eq!(ok.tools.len(), 1);
+
+        // tools optional → defaults empty.
+        let no_tools = parse_rewrite(&serde_json::json!({"messages": [{"role": "user"}]}))
+            .expect("rewrite without tools parses");
+        assert!(no_tools.tools.is_empty());
+
+        // Malformed → None (fail-closed): no messages, empty messages, non-array, non-object.
+        assert!(parse_rewrite(&serde_json::json!({})).is_none());
+        assert!(parse_rewrite(&serde_json::json!({"messages": []})).is_none());
+        assert!(parse_rewrite(&serde_json::json!({"messages": "hi"})).is_none());
+        assert!(parse_rewrite(&serde_json::json!("hi")).is_none());
     }
 }

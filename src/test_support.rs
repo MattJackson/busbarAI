@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! In-crate mock-upstream test harness (/).
 
@@ -588,6 +588,7 @@ impl LaneSpec {
     fn to_lane(&self) -> crate::state::Lane {
         crate::state::Lane {
             reasoning: false,
+            prompt_caching: false,
             model: self.model.clone(),
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
@@ -611,6 +612,7 @@ impl LaneSpec {
     fn to_lane_data(&self) -> crate::store::LaneData {
         crate::store::LaneData {
             reasoning: false,
+            prompt_caching: false,
             model: self.model.clone(),
             provider: self.provider.clone(),
             max: self.max,
@@ -643,6 +645,10 @@ pub(crate) struct TestApp {
     pool_runtime: std::collections::HashMap<String, crate::state::PoolRuntime>,
     fallback_pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
     on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
+    hook_registry: std::collections::HashMap<String, crate::config::HookCfg>,
+    global_hooks: Vec<String>,
+    base_hook_names: std::collections::HashSet<String>,
+    overlay_path: Option<std::path::PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -657,7 +663,34 @@ impl TestApp {
             pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),
             on_exhausted_cfgs: std::collections::HashMap::new(),
+            hook_registry: std::collections::HashMap::new(),
+            global_hooks: Vec::new(),
+            base_hook_names: std::collections::HashSet::new(),
+            overlay_path: None,
         }
+    }
+
+    /// Enable config-overlay persistence at `path` (for testing runtime-change durability).
+    pub(crate) fn overlay_path(mut self, path: std::path::PathBuf) -> Self {
+        self.overlay_path = Some(path);
+        self
+    }
+    /// Register a hook definition in the `hooks:` registry (for the Admin API v1 hooks read surface).
+    pub(crate) fn hook(mut self, name: &str, cfg: crate::config::HookCfg) -> Self {
+        self.hook_registry.insert(name.into(), cfg);
+        self
+    }
+    /// Register a BASE-config-defined hook (registry AND `base_hook_names`) so the API's base-hook
+    /// read-only guards (register/put/patch/delete return 409) can be exercised.
+    pub(crate) fn base_hook(mut self, name: &str, cfg: crate::config::HookCfg) -> Self {
+        self.hook_registry.insert(name.into(), cfg);
+        self.base_hook_names.insert(name.into());
+        self
+    }
+    /// Add a name to the `global_hooks:` list (globally-wired hooks).
+    pub(crate) fn global_hook(mut self, name: &str) -> Self {
+        self.global_hooks.push(name.into());
+        self
     }
     pub(crate) fn lane(mut self, spec: LaneSpec) -> Self {
         self.lanes.push(spec);
@@ -668,17 +701,15 @@ impl TestApp {
         self.pools.insert(name.into(), weighted(members));
         self
     }
-    /// Set the auth mode by installing an `AuthMiddleware` configured for that mode (empty
-    /// `client_tokens`). The middleware is now the SINGLE source of the mode (see `App::auth_mode`),
-    /// so this drives BOTH the ingress gate and egress credential selection — matching production,
-    /// where the two are always the same value. Tests that need a specific `client_tokens` allowlist
-    /// (token-mode ingress) should use `.auth(...)` with an explicit middleware instead; calling both
-    /// is last-wins.
-    pub(crate) fn auth_mode(mut self, m: crate::auth::AuthMode) -> Self {
-        // Struct-update from `default_none()` (mode none, empty client_tokens) so we only override
-        // `mode` and stay forward-compatible with any future `AuthCfg` field.
+    /// Install an `AuthMiddleware` with an EMPTY chain (open front door) and the given upstream-
+    /// credential mode — driving the egress credential-selection path. `Own` = the old `mode: none`;
+    /// `Passthrough` = the old `mode: passthrough`. Tests needing a `tokens`-chain ingress gate should
+    /// use `.auth(...)` with an explicit middleware; calling both is last-wins.
+    pub(crate) fn upstream_creds(mut self, uc: crate::auth::UpstreamCreds) -> Self {
+        // Struct-update from `default_none()` (empty chain, empty client_tokens) so we only override
+        // the upstream-credential mode and stay forward-compatible with future `AuthCfg` fields.
         let cfg = crate::config::AuthCfg {
-            mode: m,
+            upstream_credentials: uc,
             ..crate::config::AuthCfg::default_none()
         };
         self.auth = Some(std::sync::Arc::new(crate::auth::AuthMiddleware::new(&cfg)));
@@ -722,13 +753,35 @@ impl TestApp {
                 &crate::config::AuthCfg::default_none(),
             ))
         });
-        std::sync::Arc::new(crate::state::App {
+        let app = std::sync::Arc::new(crate::state::App {
             lanes,
             store: std::sync::Arc::new(crate::store::InMemoryStore::new(lane_data)),
             by_model,
             pools: self.pools,
             client: reqwest::Client::builder().build().unwrap(),
             auth,
+            rewrite_hooks: Vec::new(),
+            tap_hooks: Vec::new(),
+            tap_hooks_route: Vec::new(),
+            tap_hooks_attempt: Vec::new(),
+            tap_hooks_completion: Vec::new(),
+            global_gates: Vec::new(),
+            hook_registry: self.hook_registry,
+            global_hooks: self.global_hooks,
+            versions: std::sync::Arc::new(crate::admin::versions::VersionLog::new()),
+            mutation_limiter: std::sync::Arc::new(crate::admin::rate::MutationLimiter::new()),
+            idempotency_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            base_hook_names: self.base_hook_names,
+            admin_chain: vec!["admin-tokens".to_string()],
+            credential_cache: std::sync::Arc::new(crate::auth_cache::CredentialCache::new()),
+            auth_modules: std::collections::HashMap::new(),
+            group_map: std::collections::HashMap::new(),
+            config_path: None,
+            providers_path: None,
+            overlay_path: self.overlay_path,
+            config_version: 0,
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,
@@ -736,8 +789,36 @@ impl TestApp {
             governance: self.governance,
             default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
             reasoning_effort_budgets: [1024, 4096, 8192, 16384],
-        })
+        });
+        // Mirror main's boot-version floor so rollback tests have a v0 to restore.
+        app.versions
+            .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
+        app
     }
+}
+
+/// THE METRICS RECORDER HARNESS: sum every exposition sample of `name` whose label set contains
+/// ALL the given `key="value"` pairs, read from a fresh scrape of the process-global recorder
+/// (`metrics::init` + `render` internally — callers never touch the recorder directly).
+///
+/// The global recorder is shared by every test in the process, so absolute values are meaningless;
+/// assert STRICT DELTAS across the action under test (`before`/`after`), and give the test its own
+/// pool/lane label values so parallel tests can't contribute to the matched sample. Matching is by
+/// exact metric name (the char after the name must open the label set / value, so a name never
+/// matches a longer neighbor it happens to prefix).
+pub(crate) fn metric_sum(name: &str, labels: &[(&str, &str)]) -> f64 {
+    crate::metrics::init();
+    let frags: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+    crate::metrics::render()
+        .lines()
+        .filter(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+        })
+        .filter(|l| frags.iter().all(|f| l.contains(f.as_str())))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .sum()
 }
 
 fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
@@ -1352,6 +1433,8 @@ mod tests {
                     affinity: None,
                     breaker: None,
                     policy: None,
+                    gates: Vec::new(),
+                    rewrite_hooks: Vec::new(),
                 },
             )
             .build();
@@ -1457,6 +1540,7 @@ mod tests {
     /// that re-added `/metrics` to the always-open allowlist alongside `/healthz` (auth.rs)
     /// would let this unauthenticated scrape through and fail here. The same request WITH the
     /// configured token is admitted (200), proving the gate is token-based, not a blanket block.
+    #[cfg(feature = "auth-tokens")]
     #[tokio::test]
     async fn test_metrics_requires_auth_in_token_mode() {
         crate::metrics::init();
@@ -1464,8 +1548,10 @@ mod tests {
 
         let token = "sk-metrics-scrape";
         let auth_cfg = crate::config::AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec![token.to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
@@ -2156,6 +2242,8 @@ mod tests {
 
     /// the /admin management API — create→list→usage→delete, admin-token gating, and a minted
     /// secret then authenticating as a working virtual key.
+    // Admin-token behavior — requires the compile-removable `admin-tokens` module.
+    #[cfg(feature = "auth-admin-tokens")]
     #[tokio::test]
     async fn test_governance_admin_api() {
         use crate::governance::{GovState, SqliteStore};
@@ -2661,8 +2749,10 @@ mod tests {
 
         // Scenario A: Passthrough mode — lane should NOT be tripped
         let auth_cfg_passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         };
         let app_passthrough = TestApp::new()
             .lane(
@@ -2722,8 +2812,10 @@ mod tests {
         });
 
         let auth_cfg_token = AuthCfg {
-            mode: crate::auth::AuthMode::Token,
+            chain: vec!["tokens".to_string()],
+            upstream_credentials: crate::auth::UpstreamCreds::Own,
             client_tokens: vec!["caller-token-123".to_string()],
+            modules: std::collections::HashMap::new(),
         };
         let app_token = TestApp::new()
             .lane(
@@ -2832,8 +2924,10 @@ mod tests {
         let server = MockServer::new(state.clone()).await;
 
         let auth_cfg_passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             client_tokens: vec![],
+            modules: std::collections::HashMap::new(),
         };
         let app = TestApp::new()
             .lane(
@@ -3845,6 +3939,7 @@ mod tests {
 
             let model = crate::config::ModelCfg {
                 reasoning: None,
+                prompt_caching: None,
                 max_requests: -1,
                 provider: "p".into(),
                 max_concurrent: 10,
@@ -3867,8 +3962,9 @@ mod tests {
                 failover: None,
                 on_exhausted: None,
                 affinity: None,
-                route: crate::config::RouteKind::default(),
-                policy: None,
+                policy: crate::config::PoolPolicy::default(),
+                gates: Vec::new(),
+                base_named: false,
             };
             let make = |error_map: std::collections::HashMap<String, String>| {
                 let mut providers = HashMap::new();
@@ -3894,9 +3990,13 @@ mod tests {
                     listen: "0.0.0.0:8080".into(),
                     tls: None,
                     auth: None,
+                    admin_auth: vec!["admin-tokens".to_string()],
+                    group_map: std::collections::HashMap::new(),
                     providers,
                     models,
                     pools,
+                    hooks: HashMap::new(),
+                    global_hooks: Vec::new(),
                     blocked_metadata_hosts: Vec::new(),
                     allow_metadata_hosts: Vec::new(),
                     allow_all_metadata: false,
@@ -5388,7 +5488,7 @@ mod tests {
 
         // Attacker-chosen provider/model that isn't configured → 404, no upstream reached.
         let resp = route::adhoc(
-            State(app.clone()),
+            crate::state::CurrentApp(app.clone()),
             axum::extract::Path(("evil.example.com".to_string(), "../secret".to_string())),
             axum::extract::Extension(crate::governance::GovCtx::default()),
             axum::extract::Extension(crate::auth::CallerToken::default()),
@@ -5403,7 +5503,7 @@ mod tests {
 
         // Configured model but WRONG provider → 400 (must match the lane's provider).
         let resp2 = route::adhoc(
-            State(app),
+            crate::state::CurrentApp(app),
             axum::extract::Path(("wrong-provider".to_string(), "test-model".to_string())),
             axum::extract::Extension(crate::governance::GovCtx::default()),
             axum::extract::Extension(crate::auth::CallerToken::default()),

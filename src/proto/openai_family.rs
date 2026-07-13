@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Shared helpers and constants for the OpenAI-family protocols (Chat Completions and Responses).
 //! Both wire formats belong to the same provider family; items that are identical across them

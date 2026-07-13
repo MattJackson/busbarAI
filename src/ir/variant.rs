@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The per-operation IR enums (design §12.4): `IrReq` / `IrResp`, one variant per operation. The
 //! design's single `enum Ir` reconciles to TWO enums because the engine already splits request from
@@ -89,6 +89,44 @@ impl IrReq {
                         ir.reasoning = None;
                     }
                 }
+                // The prompt-cache gate — the cache twin of the reasoning gate above. Fires only
+                // when the EGRESS writer's cache marker is model-gated (Bedrock `cachePoint`) and
+                // the lane did not assert `prompt_caching`: the breakpoints are cleared so the
+                // writer emits no marker a model like Amazon Nova would 400 on. The request still
+                // proceeds, uncached — fail-safe over fail-hard.
+                if !prep.prompt_caching_allowed {
+                    let mut cleared = false;
+                    let mut clear_blocks = |blocks: &mut [crate::ir::IrBlock]| {
+                        for b in blocks {
+                            let cc = match b {
+                                crate::ir::IrBlock::Text { cache_control, .. }
+                                | crate::ir::IrBlock::Thinking { cache_control, .. }
+                                | crate::ir::IrBlock::ToolUse { cache_control, .. }
+                                | crate::ir::IrBlock::ToolResult { cache_control, .. }
+                                | crate::ir::IrBlock::Image { cache_control, .. } => cache_control,
+                                // A raw JSON tool-result block carries no cache breakpoint.
+                                crate::ir::IrBlock::Json(_) => continue,
+                            };
+                            cleared |= cc.take().is_some();
+                        }
+                    };
+                    clear_blocks(&mut ir.system);
+                    for m in &mut ir.messages {
+                        clear_blocks(&mut m.content);
+                    }
+                    for t in &mut ir.tools {
+                        cleared |= t.cache_control.take().is_some();
+                    }
+                    if cleared {
+                        tracing::warn!(
+                            ingress = %prep.ingress_protocol,
+                            "dropping cross-protocol prompt-cache breakpoints: the target lane's \
+                             dialect gates its cache marker per model and the lane does not \
+                             declare the capability; set `prompt_caching: true` on the model if \
+                             this backend accepts cache markers (e.g. Claude on Bedrock)"
+                        );
+                    }
+                }
                 ir.extra.clear();
             }
             IrReq::Embeddings(_)
@@ -144,6 +182,11 @@ pub(crate) struct EgressPrep<'a> {
     /// The resolved effort-word → budget table (limits.reasoning_effort_budgets), stamped onto the
     /// IR for writers to project words ↔ numbers with the operator's numbers.
     pub(crate) reasoning_budgets: [u32; 4],
+    /// The prompt-cache gate: `lane.prompt_caching || !writer.cache_markers_model_gated()`,
+    /// resolved by the caller. When false and the request carries `cache_control` breakpoints,
+    /// they are CLEARED here with a warn — the one place the gate lives, so no writer can emit a
+    /// model-gated cache marker (Bedrock `cachePoint`) to a lane that did not claim it.
+    pub(crate) prompt_caching_allowed: bool,
 }
 
 impl IrResp {

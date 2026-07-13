@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! OpenAI Responses `RequestHandler`. Chat-only (the `/v1/responses` conversational API); non-chat
 //! operations stay `None` = no-handler 404. Chat dispatches through the same registry as every op.

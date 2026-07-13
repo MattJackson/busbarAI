@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Unix-socket** routing hook (`route: socket`) — an operator-run BINARY that ranks pool
 //! members over a local Unix domain socket. The fast rung of the hook ladder: same wire contract as
@@ -52,6 +52,10 @@ pub(crate) struct SocketPolicy {
     /// appear after boot — the hook binary can start later, connection is lazy).
     path: String,
     conn: Mutex<Option<Conn>>,
+    /// The pre-serialized `configure` line (D2), sent FIRST on every fresh connection so a
+    /// (re)started hook always holds its current settings before its first request. `None` = the
+    /// legacy 3-message wire (no settings configured) — old binaries keep working untouched.
+    configure_line: Option<Vec<u8>>,
 }
 
 impl SocketPolicy {
@@ -59,7 +63,53 @@ impl SocketPolicy {
         Self {
             path,
             conn: Mutex::new(None),
+            configure_line: None,
         }
+    }
+
+    /// Construct with a configure preamble (D2): `settings` are serialized ONCE into the line sent
+    /// first on every fresh connection. The connect-time ack read shares the request's own budget.
+    pub(crate) fn with_configure(
+        path: String,
+        hook_name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+        settings_version: u64,
+    ) -> Self {
+        let msg = super::wire::ConfigureMsg {
+            configure: super::wire::ConfigureBody {
+                hook: hook_name,
+                settings,
+                settings_version,
+                busbar_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let mut line = serde_json::to_vec(&msg).unwrap_or_default();
+        line.push(b'\n');
+        Self {
+            path,
+            conn: Mutex::new(None),
+            configure_line: (!settings.is_empty()).then_some(line),
+        }
+    }
+
+    /// Establish a fresh connection, sending the configure preamble (when configured) and reading
+    /// its ack line before the connection is considered usable — a hook that answers requests
+    /// without acking its settings is running blind, so the ack is REQUIRED once a preamble exists.
+    async fn connect(&self) -> Result<Conn, std::io::Error> {
+        let stream = UnixStream::connect(&self.path).await?;
+        let (r, w) = stream.into_split();
+        let mut conn: Conn = (BufReader::new(r), w);
+        if let Some(ref line) = self.configure_line {
+            let ack = Self::round_trip(&mut conn, line).await?;
+            let parsed: Result<super::wire::ConfigureAck, _> = serde_json::from_slice(&ack);
+            if !matches!(parsed, Ok(super::wire::ConfigureAck { ack: Some(_) })) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hook did not ack its configure preamble",
+                ));
+            }
+        }
+        Ok(conn)
     }
 
     /// One request/reply round trip on an established connection. Any I/O error bubbles as `Err`;
@@ -88,6 +138,55 @@ impl SocketPolicy {
         }
         Ok(reply)
     }
+
+    /// Send one newline-terminated line and read the reply, bounded by `budget`, reusing the
+    /// kept-alive connection and reconnecting ONCE on a stale one. Shared by `decide` and
+    /// `transform` so both get identical timeout + connection-reuse + poison-on-timeout semantics.
+    async fn exchange(&self, line: &[u8], budget: Duration) -> Result<Vec<u8>, super::PolicyError> {
+        let exchange = async {
+            let mut guard = self.conn.lock().await;
+            if let Some(mut conn) = guard.take() {
+                match Self::round_trip(&mut conn, line).await {
+                    Ok(reply) => {
+                        *guard = Some(conn);
+                        return Ok::<Vec<u8>, std::io::Error>(reply);
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "socket hook: cached connection failed; reconnecting");
+                    }
+                }
+            }
+            let mut conn = self.connect().await?;
+            let reply = Self::round_trip(&mut conn, line).await?;
+            *guard = Some(conn);
+            Ok(reply)
+        };
+        tokio::time::timeout(budget, exchange)
+            .await
+            .map_err(|_| -> super::PolicyError {
+                format!("socket hook deadline ({budget:?}) exceeded").into()
+            })?
+            .map_err(|e| -> super::PolicyError { e.into() })
+    }
+
+    /// WRITE one newline-terminated line WITHOUT reading a reply — the tap (fire-and-forget) path. A
+    /// tap is write-only in steady state, so we never read. Reuses the kept-alive connection,
+    /// reconnecting ONCE on a stale one.
+    async fn write_only(&self, line: &[u8]) -> Result<(), std::io::Error> {
+        let mut guard = self.conn.lock().await;
+        if let Some(mut conn) = guard.take() {
+            if conn.1.write_all(line).await.is_ok() && conn.1.flush().await.is_ok() {
+                *guard = Some(conn);
+                return Ok(());
+            }
+            // Stale after a tap-binary restart — fall through to a fresh connect.
+        }
+        let mut conn = self.connect().await?;
+        conn.1.write_all(line).await?;
+        conn.1.flush().await?;
+        *guard = Some(conn);
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -105,42 +204,10 @@ impl RoutingPolicy for SocketPolicy {
         line.reserve_exact(1); // to_vec returns an exact-fit Vec; avoid a guaranteed realloc
         line.push(b'\n');
 
-        // Hard wall-clock deadline over the WHOLE exchange (connect + write + read): the caller also
-        // wraps `decide` in its own timeout, but holding the budget here keeps the mutex hold time
-        // bounded too. On timeout the half-exchanged connection is dropped (poisoned mid-protocol —
-        // never reuse it), and the caller coerces the `Err` to the pool's `on_error`.
-        let exchange = async {
-            let mut guard = self.conn.lock().await;
-            // Reuse the kept-alive connection; on ANY error retry ONCE on a fresh connection, so a
-            // hook-binary restart costs zero failed requests (the cached half-dead connection is the
-            // common failure after a restart, not an actual outage).
-            if let Some(mut conn) = guard.take() {
-                match Self::round_trip(&mut conn, &line).await {
-                    Ok(reply) => {
-                        *guard = Some(conn);
-                        return Ok::<Vec<u8>, std::io::Error>(reply);
-                    }
-                    Err(e) => {
-                        // Stale after a hook restart — fall through to a fresh connect. Debug (not
-                        // warn): a single reconnect is normal across a hook restart, but a hook that
-                        // crash-loops shows up as a steady stream of these.
-                        tracing::debug!(error = %e, "socket hook: cached connection failed; reconnecting");
-                    }
-                }
-            }
-            let stream = UnixStream::connect(&self.path).await?;
-            let (r, w) = stream.into_split();
-            let mut conn: Conn = (BufReader::new(r), w);
-            let reply = Self::round_trip(&mut conn, &line).await?;
-            *guard = Some(conn);
-            Ok(reply)
-        };
-        let reply =
-            tokio::time::timeout(budget, exchange)
-                .await
-                .map_err(|_| -> super::PolicyError {
-                    format!("socket hook deadline ({budget:?}) exceeded").into()
-                })??;
+        // Hard wall-clock deadline over the WHOLE exchange (connect + write + read), with connection
+        // reuse + reconnect-once, in the shared `exchange` helper. On timeout the half-exchanged
+        // connection is dropped (poisoned); the caller coerces the `Err` to the pool's `on_error`.
+        let reply = self.exchange(&line, budget).await?;
 
         // Depth-guarded parse (MAX_JSON_DEPTH) + the shared normalizer — identical hostile-peer
         // posture and identical liberal-in-what-you-accept rules as the webhook transport. The
@@ -155,6 +222,79 @@ impl RoutingPolicy for SocketPolicy {
 
     fn name(&self) -> &'static str {
         "socket"
+    }
+
+    /// REWRITE transform: send the request projection, return the hook's `rewrite` reply. FAIL-CLOSED
+    /// — ANY error (timeout, I/O, malformed reply, no/empty rewrite) yields `None`, so the caller
+    /// proceeds with the ORIGINAL body. A rewrite hook reads the `request` projection (its `prompt`),
+    /// not the candidate set, so an empty candidate list is sent.
+    #[allow(dead_code)] // wired into the forward global-hooks transform seam next (slice-4 step)
+    async fn transform(
+        &self,
+        req: &RoutingRequest<'_>,
+        budget: Duration,
+    ) -> Option<super::wire::RewriteReply> {
+        let empty: [Candidate<'_>; 0] = [];
+        let ctx = RoutingContext {
+            pool: req.pool,
+            budget_remaining: None,
+        };
+        let mut line = serde_json::to_vec(&super::wire::build(req, &empty, &ctx)).ok()?;
+        line.push(b'\n');
+        // Fail-closed: any transport/parse error → None (proceed with the original body).
+        let reply = self.exchange(&line, budget).await.ok()?;
+        let parsed: super::wire::HookResponse = crate::json::parse(&reply).ok()?;
+        super::wire::parse_rewrite(&parsed.rewrite?)
+    }
+
+    /// TAP: write-only fire-and-forget send of the pre-serialized projection. No reply is read.
+    /// Bounded by `budget`; any error is swallowed — a tap never affects the served request.
+    async fn configure(
+        &self,
+        hook_name: &str,
+        settings: &serde_json::Map<String, serde_json::Value>,
+        settings_version: u64,
+        budget: Duration,
+    ) -> Result<(), super::PolicyError> {
+        let msg = super::wire::ConfigureMsg {
+            configure: super::wire::ConfigureBody {
+                hook: hook_name,
+                settings,
+                settings_version,
+                busbar_version: env!("CARGO_PKG_VERSION"),
+            },
+        };
+        let mut line = serde_json::to_vec(&msg)
+            .map_err(|e| -> super::PolicyError { format!("serialize configure: {e}").into() })?;
+        line.push(b'\n');
+        let reply = self.exchange(&line, budget).await?;
+        let parsed: super::wire::ConfigureAck =
+            serde_json::from_slice(&reply).map_err(|e| -> super::PolicyError {
+                format!("configure reply unparsable: {e}").into()
+            })?;
+        match parsed.ack {
+            Some(body) if body.settings_version == settings_version => Ok(()),
+            Some(body) => Err(format!(
+                "hook acked the wrong settings_version ({} != {settings_version})",
+                body.settings_version
+            )
+            .into()),
+            None => Err("hook did not ack the configure push".into()),
+        }
+    }
+
+    async fn describe(&self, budget: Duration) -> Option<serde_json::Value> {
+        let mut line = serde_json::to_vec(&super::wire::DescribeMsg { describe: true }).ok()?;
+        line.push(b'\n');
+        let reply = self.exchange(&line, budget).await.ok()?;
+        serde_json::from_slice(&reply).ok()
+    }
+
+    async fn notify(&self, projection: &[u8], budget: Duration) {
+        let mut line = Vec::with_capacity(projection.len() + 1);
+        line.extend_from_slice(projection);
+        line.push(b'\n');
+        let _ = tokio::time::timeout(budget, self.write_only(&line)).await;
     }
 }
 
@@ -303,6 +443,36 @@ mod tests {
         );
     }
 
+    /// TAP `notify`: writes the request projection fire-and-forget (no reply read). The tap receives
+    /// the projection line; notify returns without waiting on a reply.
+    #[tokio::test]
+    async fn notify_writes_projection_fire_and_forget() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempdir();
+        let path = dir.path().join("hook.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        let policy = SocketPolicy::new(path.to_string_lossy().into_owned());
+        let projection =
+            serde_json::to_vec(&super::super::wire::build(&req(), &[], &ctx())).unwrap();
+        policy.notify(&projection, Duration::from_secs(2)).await;
+        let received = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("tap should receive the projection")
+            .unwrap();
+        assert!(
+            received.contains("\"pool\"") && received.ends_with('\n'),
+            "tap must receive the newline-delimited projection: {received}"
+        );
+    }
+
     /// The happy path: hook returns an order → ranked Prefer; a second decide REUSES the connection.
     #[tokio::test]
     async fn returns_prefer_and_reuses_connection() {
@@ -317,6 +487,35 @@ mod tests {
                 .expect("ok decision");
             assert_eq!(d, RoutingDecision::Prefer(vec![2, 0, 1]));
         }
+    }
+
+    /// The `transform` (rewrite) call parses a well-formed `rewrite` reply into a `RewriteReply`, and
+    /// is FAIL-CLOSED — a reply with no `rewrite` (e.g. a bare `order`) yields `None` so the caller
+    /// keeps the original body.
+    #[tokio::test]
+    async fn transform_parses_rewrite_and_is_fail_closed() {
+        let dir = tempdir();
+        let path = mock_hook(
+            dir.path(),
+            r#"{"rewrite":{"messages":[{"role":"user","content":"compressed"}],"tools":[{"name":"headroom_retrieve"}]}}"#,
+        )
+        .await;
+        let policy = SocketPolicy::new(path);
+        let rw = policy
+            .transform(&req(), Duration::from_secs(2))
+            .await
+            .expect("well-formed rewrite parses");
+        assert_eq!(rw.messages.len(), 1);
+        assert_eq!(rw.tools.len(), 1);
+
+        // A reply with no rewrite → None (fail-closed).
+        let dir2 = tempdir();
+        let path2 = mock_hook(dir2.path(), r#"{"order":[0]}"#).await;
+        let policy2 = SocketPolicy::new(path2);
+        assert!(policy2
+            .transform(&req(), Duration::from_secs(2))
+            .await
+            .is_none());
     }
 
     /// Explicit abstain and empty-object replies are the clean Abstain path, not errors.

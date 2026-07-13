@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! Prometheus metrics: a process-wide recorder + the `/metrics` exposition.
 //!
@@ -39,11 +39,10 @@
 //! Client-supplied values (raw model strings from request bodies, user-facing key secrets, etc.)
 //! MUST NOT appear as metric labels. See the taxonomy constant block below for per-metric notes.
 
-use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use crate::state::App;
 
@@ -376,7 +375,7 @@ fn refresh_scrape_gauges(app: &App) {
 ///
 /// Refreshes all scrape-time gauges (spend, budget-remaining, tokens, lane health) from
 /// in-process reads immediately before rendering, so values are current at observation time.
-pub(crate) async fn handler(State(app): State<Arc<App>>) -> Response {
+pub(crate) async fn handler(crate::state::CurrentApp(app): crate::state::CurrentApp) -> Response {
     // Refresh scrape-time gauges on a blocking thread so the SQLite usage reads do not stall
     // the Tokio executor. `refresh_scrape_gauges` is synchronous (SQLite is not async), so it
     // must not run on an async task thread. `spawn_blocking` returns a `JoinHandle`; we await it

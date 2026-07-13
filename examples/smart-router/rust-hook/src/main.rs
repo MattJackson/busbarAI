@@ -1,14 +1,14 @@
-//! A smart-router hook for busbar (`route: socket`).
+//! A smart-router hook for busbar (a `socket:` ordering gate).
 //!
 //! This binary IS the routing policy. Busbar connects to the Unix socket below, writes one line of
 //! JSON per decision (the request's shape + every candidate lane's live signals), and reads one
 //! line back: the order to try the lanes in. That's the whole job.
 //!
 //! Run it:            cargo run --release -- /run/busbar/router.sock
-//! Point busbar at it:  route: socket / policy.socket: /run/busbar/router.sock
+//! Point busbar at it:  hooks: { smart-router: { kind: gate, socket: /run/busbar/router.sock } }
 //!
-//! If this process is slow, wrong, or dead, busbar falls back per the pool's `on_error` after
-//! `policy.timeout_ms` (default 1 ms). Kill it mid-traffic and requests keep flowing.
+//! If this process is slow, wrong, or dead, busbar falls back per the hook's `on_error` after
+//! its `timeout_ms` (default 1 ms). Kill it mid-traffic and requests keep flowing.
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;

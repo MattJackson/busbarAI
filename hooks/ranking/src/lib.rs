@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
-//! Busbar-native routing policies — small, sync sorts over the live signals projected into
-//! `Candidate`. Each native is the proof-of-completeness for its input signal (the scope-lock
+//! The built-in RANKING hooks — `cheapest` / `fastest` / `least_busy` / `usage`: busbar-native
+//! routing policies, each a small sync sort over the live signals projected into `Candidate`.
+//!
+//! These are removable built-in order-hooks (the `hooks-ranking` engine feature): each implements
+//! the `RoutingPolicy` contract (`busbar-api`) and ranks on a signal the hook wire already
+//! projects, so an external hook could do the same. `weighted` is NOT here — it is the engine's
+//! non-removable inline SWRR floor, never a plugin (the `weighted` NAME/entry lives alongside for
+//! registry completeness, but the floor's zero-cost behavior is the engine's inline path). Each native is the proof-of-completeness for its input signal (the scope-lock
 //! conformance rule): if a native can't be written, the contract's in-data is incomplete.
 //!
 //! All natives are SYNC and never touch async or I/O; the async-trait wrapper is free for them. The
@@ -12,7 +18,7 @@
 //! The native bodies + `native_policy` registry are live: `resolve_policy` looks a non-weighted name
 //! up here at config load, and `forward::decide_policy_order` invokes the resolved policy per request.
 
-use super::{
+use busbar_api::{
     Candidate, PolicyResult, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
 };
 use std::time::Duration;
@@ -23,11 +29,11 @@ use std::time::Duration;
 //   • the `native_policy` registry match arms below,
 //   • `config.rs` (deserialization / shorthand desugar),
 //   • `routing/mod.rs` (zero-cost-path guard).
-pub(crate) const POLICY_NAME_WEIGHTED: &str = "weighted";
-pub(crate) const POLICY_NAME_CHEAPEST: &str = "cheapest";
-pub(crate) const POLICY_NAME_FASTEST: &str = "fastest";
-pub(crate) const POLICY_NAME_LEAST_BUSY: &str = "least_busy";
-pub(crate) const POLICY_NAME_USAGE: &str = "usage";
+const POLICY_NAME_WEIGHTED: &str = "weighted";
+const POLICY_NAME_CHEAPEST: &str = "cheapest";
+const POLICY_NAME_FASTEST: &str = "fastest";
+const POLICY_NAME_LEAST_BUSY: &str = "least_busy";
+const POLICY_NAME_USAGE: &str = "usage";
 
 /// `weighted` — the explicit form of the default. Always `Abstain`, so selection falls through to
 /// the unchanged inline SWRR. Lets operators write `route: native, policy.name: weighted` and get
@@ -189,7 +195,7 @@ impl RoutingPolicy for UsagePolicy {
 
 /// Resolve a native policy name to a boxed policy. `None` for an unknown name (rejected at startup
 /// validation). `weighted` returns the Abstaining default native.
-pub(crate) fn native_policy(name: &str) -> Option<std::sync::Arc<dyn RoutingPolicy>> {
+pub fn native_policy(name: &str) -> Option<std::sync::Arc<dyn RoutingPolicy>> {
     use std::sync::Arc;
     match name {
         POLICY_NAME_WEIGHTED => Some(Arc::new(WeightedPolicy)),

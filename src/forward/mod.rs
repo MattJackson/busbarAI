@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -426,6 +426,10 @@ fn translate_request_cross_protocol(
                 global_default_max_tokens: app.default_max_tokens,
                 reasoning_allowed,
                 reasoning_budgets: app.reasoning_effort_budgets,
+                // The cache twin of `reasoning_allowed`: a lane whose writer's cache marker is
+                // model-gated (Bedrock) must assert `prompt_caching` to receive breakpoints.
+                prompt_caching_allowed: app.lanes[i].prompt_caching
+                    || !app.lanes[i].protocol.writer().cache_markers_model_gated(),
             });
             ir_req.set_model(app.lanes[i].wire_model());
             return Ok(eh.write_request(&ir_req).to_vec());
@@ -488,6 +492,8 @@ fn translate_request_cross_protocol(
                     global_default_max_tokens: app.default_max_tokens,
                     reasoning_allowed,
                     reasoning_budgets: app.reasoning_effort_budgets,
+                    prompt_caching_allowed: app.lanes[i].prompt_caching
+                        || !app.lanes[i].protocol.writer().cache_markers_model_gated(),
                 });
                 let Some(eh) = egress_handler else {
                     return Err(Box::new(ingress_error(
@@ -1394,6 +1400,17 @@ impl<S, P> FirstByteBody<S, P> {
     }
 }
 
+/// A compliance restrict captured on the PRIMARY pool that must persist across every failover hop —
+/// including a `fallback_pool` spill to an independent pool. `tags_any` is the eligible tag set,
+/// `on_empty` decides what happens when a hop's candidates carry none of them (fail-closed reject vs
+/// advisory weighted-escape), and `name` is the gate name for logs/metrics.
+#[derive(Debug, Clone)]
+struct RestrictConstraint {
+    tags_any: Vec<String>,
+    on_empty: crate::config::PolicyOnError,
+    name: &'static str,
+}
+
 /// Context for request lifecycle: deadline, accumulated exclusions, and visited pools.
 #[derive(Debug, Clone)]
 struct RequestCtx {
@@ -1403,6 +1420,10 @@ struct RequestCtx {
     excluded: std::collections::HashSet<usize>,
     /// Visited pool names for loop prevention in fallback chains (e.g., A→B→A).
     visited_pools: std::collections::HashSet<String>,
+    /// Compliance restricts in force for this request (captured at the primary pool's gate
+    /// reconcile). Re-applied on every downstream hop so a `Restrict` gate's "only these lanes,
+    /// ever" guarantee holds across a `fallback_pool` spill — see [`RequestCtx::enforce_restricts`].
+    active_restricts: Vec<RestrictConstraint>,
 }
 
 impl RequestCtx {
@@ -1412,7 +1433,45 @@ impl RequestCtx {
             deadline: start.saturating_add(deadline_secs),
             excluded: std::collections::HashSet::new(),
             visited_pools: std::collections::HashSet::new(),
+            active_restricts: Vec::new(),
         }
+    }
+
+    /// Re-apply the captured compliance restricts against a DOWNSTREAM pool's candidate set, keyed by
+    /// THAT pool's own member tags (lane `idx` are global; `pool_runtime.members` is idx-keyed). The
+    /// primary-pool gate reconcile shrinks `cands` in place, which keeps the restriction across
+    /// in-pool failover — but a `fallback_pool` hop rebuilds candidates from an INDEPENDENT pool's
+    /// full membership, so without re-applying here a compliance (e.g. BAA-only) restrict would be
+    /// silently dropped at the pool boundary. Mirrors Reconcile-2 exactly: a `Weighted` on_empty is an
+    /// advisory escape (skip this restrict on this hop); the fail-closed default returns `Err(name)`
+    /// so the caller REJECTS rather than spilling to an ineligible lane. (found: audit c1r13.)
+    fn enforce_restricts(
+        &self,
+        app: &App,
+        pool_name: &str,
+        cands: Vec<WeightedLane>,
+    ) -> Result<Vec<WeightedLane>, &'static str> {
+        let mut cands = cands;
+        for r in &self.active_restricts {
+            let members = app.pool_runtime.get(pool_name).map(|rt| &rt.members);
+            let restricted: Vec<WeightedLane> = cands
+                .iter()
+                .filter(|wl| {
+                    members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                        meta.tags.iter().any(|t| r.tags_any.iter().any(|w| w == t))
+                    })
+                })
+                .cloned()
+                .collect();
+            if restricted.is_empty() {
+                if matches!(r.on_empty, crate::config::PolicyOnError::Weighted) {
+                    continue; // advisory escape — skip this restrict on this hop
+                }
+                return Err(r.name); // fail closed — no eligible lane satisfies a required restrict
+            }
+            cands = restricted;
+        }
+        Ok(cands)
     }
 
     /// Check if deadline has been exceeded.
@@ -2031,32 +2090,313 @@ enum PolicyOutcome {
         message: String,
         name: &'static str,
     },
+    /// The hook's RESTRICT verb: the failover candidate set must be intersected with members carrying
+    /// one of `tags_any` BEFORE selection, and that restriction persists across hops. An EMPTY
+    /// intersection is fail-closed (`on_empty` default reject) — never allow-all. `tags_any` may be
+    /// empty (a fail-closed-normalized malformed restrict), which forces the empty intersection.
+    Restrict {
+        tags_any: Vec<String>,
+        name: &'static str,
+        /// Behavior when the intersection is empty: `Reject` (default, fail-closed 503) or `Weighted`
+        /// (advisory escape — SWRR over the FULL pool). `First` is treated as `Reject` (a restrict
+        /// with no eligible member has no "first" to fall to).
+        on_empty: crate::config::PolicyOnError,
+    },
 }
 
-/// Chars of the request's system prompt: a bare string, or — when the system value is a block
-/// array (Anthropic allows both) — the sum of every block's `text` string (keyed on the `text`
-/// field's presence, not on `type`). The SAME shapes
-/// `build_prompt_projection` flattens, so the SIZE signal and the opt-in content projection never
-/// diverge on a block-array system prompt. Cheap v1 SIZE signal (NOT a token count).
-fn system_text_chars(v: &Value) -> usize {
-    match v.get("system") {
-        Some(Value::String(s)) => s.chars().count(),
-        Some(Value::Array(blocks)) => blocks
+/// Apply a hook's `rewrite` reply to the INGRESS body, rendered PER DIALECT (the reply carries
+/// `{role, content}` messages in body form; each ingress protocol frames conversation content
+/// differently). Fail-safe throughout: a body without the dialect's conversation container, or a
+/// rewrite message whose content isn't plain text where the dialect needs re-framing, leaves the
+/// body untouched and returns `false` — never a corrupted request.
+///
+/// Dialect rendering:
+/// - openai / anthropic / cohere: `messages: [{role, content}]` — inserted verbatim (all three
+///   accept string content). Abstract `tools` injection applies here only (their tool shapes are
+///   compatible enough to append; the other dialects' tool framings differ — deferred, fail-safe).
+/// - bedrock (Converse): `messages: [{role, content: [{text}]}]` — each rewrite message is
+///   RE-FRAMED into a one-block text content list (a verbatim insert would corrupt the block
+///   shape — bedrock also has a `messages` key, so this arm is load-bearing, not cosmetic).
+/// - gemini: `contents: [{role, parts: [{text}]}]` — re-framed, with the role mapping gemini
+///   requires (`assistant` → `model`; everything else → `user`).
+/// - responses: `input: [{role, content}]` — re-framed into the EasyInputMessage list (string
+///   content is accepted); a string `input` is replaced by the list.
+fn apply_rewrite_to_body(
+    v: &mut Value,
+    rewrite: &crate::routing::wire::RewriteReply,
+    ingress_protocol: &str,
+) -> bool {
+    if rewrite.messages.is_empty() {
+        return false;
+    }
+    let Some(obj) = v.as_object_mut() else {
+        return false;
+    };
+    // Extract (role, text) pairs when a dialect needs re-framing. `None` = a message without
+    // plain-string content — abort untouched (fail-safe).
+    let as_text_pairs = || -> Option<Vec<(String, String)>> {
+        rewrite
+            .messages
             .iter()
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .map(|t| t.chars().count())
-            .sum(),
-        _ => 0,
+            .map(|m| {
+                let role = m.get("role").and_then(Value::as_str)?.to_string();
+                let text = m.get("content").and_then(Value::as_str)?.to_string();
+                Some((role, text))
+            })
+            .collect()
+    };
+    match ingress_protocol {
+        "bedrock" => {
+            if !obj.get("messages").is_some_and(Value::is_array) {
+                return false;
+            }
+            let Some(pairs) = as_text_pairs() else {
+                return false;
+            };
+            let framed: Vec<Value> = pairs
+                .into_iter()
+                .map(|(role, text)| {
+                    serde_json::json!({ "role": role, "content": [{ "text": text }] })
+                })
+                .collect();
+            obj.insert("messages".to_string(), Value::Array(framed));
+            true
+        }
+        "gemini" => {
+            if !obj.get("contents").is_some_and(Value::is_array) {
+                return false;
+            }
+            let Some(pairs) = as_text_pairs() else {
+                return false;
+            };
+            let framed: Vec<Value> = pairs
+                .into_iter()
+                .map(|(role, text)| {
+                    // Accept BOTH the canonical `assistant` AND the gemini-native `model` on the
+                    // hook's reply — a hook that echoes the role it was PROJECTED (see the
+                    // gemini-role canonicalization in build_prompt_projection) or one written to the
+                    // gemini vocabulary must both round-trip to `model`, not silently fall through to
+                    // `user` and corrupt every assistant turn. (found: audit c1r14.)
+                    let g_role = if role == "assistant" || role == "model" {
+                        "model"
+                    } else {
+                        "user"
+                    };
+                    serde_json::json!({ "role": g_role, "parts": [{ "text": text }] })
+                })
+                .collect();
+            obj.insert("contents".to_string(), Value::Array(framed));
+            true
+        }
+        "responses" => {
+            if obj.get("input").is_none() {
+                return false;
+            }
+            let Some(pairs) = as_text_pairs() else {
+                return false;
+            };
+            let framed: Vec<Value> = pairs
+                .into_iter()
+                .map(|(role, text)| serde_json::json!({ "role": role, "content": text }))
+                .collect();
+            obj.insert("input".to_string(), Value::Array(framed));
+            true
+        }
+        // openai / anthropic / cohere: the reply IS the dialect's message shape.
+        _ => {
+            if !obj.get("messages").is_some_and(Value::is_array) {
+                return false;
+            }
+            obj.insert(
+                "messages".to_string(),
+                Value::Array(rewrite.messages.clone()),
+            );
+            if !rewrite.tools.is_empty() {
+                match obj.get_mut("tools").and_then(Value::as_array_mut) {
+                    Some(existing) => existing.extend(rewrite.tools.iter().cloned()),
+                    None => {
+                        obj.insert("tools".to_string(), Value::Array(rewrite.tools.clone()));
+                    }
+                }
+            }
+            true
+        }
     }
 }
 
-/// Total chars across the system prompt + every message's text content. Anthropic's `content` is
-/// either a bare string or an array of blocks (`{type:"text", text:"…"}`); both shapes are summed.
-/// A best-effort projection over the pristine ingress body — never fails, never allocates per char.
-fn total_text_chars(v: &Value, system_chars: usize) -> usize {
+/// Build the request projection a rewrite (`prompt: rw`) gate receives. The prompt is ALWAYS sent (a
+/// rewrite hook is a content hook); identity is omitted (rewrite operates on content, not caller
+/// identity — the `user` grant projection for rewrite hooks is a follow-up). Borrows from `v`.
+fn build_rewrite_request<'a>(
+    v: &'a Value,
+    pool_name: &'a str,
+    ingress_protocol: &'a str,
+    wants_stream: bool,
+    with_prompt: bool,
+) -> crate::routing::RoutingRequest<'a> {
+    let system_chars = system_text_chars(v, ingress_protocol);
+    crate::routing::RoutingRequest {
+        pool: pool_name,
+        ingress_protocol,
+        requested_model: v.get("model").and_then(|m| m.as_str()),
+        message_count: turn_count(v, ingress_protocol),
+        tool_count: v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        has_tools: v
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .is_some_and(|a| !a.is_empty()),
+        total_chars: total_text_chars(v, ingress_protocol, system_chars),
+        system_chars,
+        max_tokens: max_tokens_for(v, ingress_protocol),
+        stream: wants_stream,
+        // A `prompt: rw` rewrite gate needs the prompt content (`with_prompt`). A TAP gets the
+        // shape-only default bucket (`with_prompt == false`) — a per-grant prompt projection for
+        // `prompt: ro` taps is a follow-up; shape-only never OVER-shares, so the grant holds.
+        prompt: with_prompt.then(|| build_prompt_projection(v, ingress_protocol)),
+        identity: None,
+    }
+}
+
+/// The GLOBAL REWRITE (transform) pass: fire each `prompt: rw` gate in PRIORITY order, each seeing the
+/// prior gate's output (the projection is rebuilt from the CURRENT body every iteration — a true
+/// transform chain), and apply its rewrite to the body in place. FAIL-SAFE end to end: a hook that
+/// errors/times out/abstains yields `None` (`transform`) and is skipped; `apply_rewrite_to_body` only
+/// touches a chat-shaped body. Zero cost when no rewrite hook is configured (the caller guards on the
+/// empty list before calling).
+/// Returns whether ANY rewrite actually committed to the body — the caller must then invalidate
+/// every retained copy of the ORIGINAL bytes (the same-protocol pristine short-circuit and the
+/// failover re-parse both read them), or the rewrite silently vanishes on those paths.
+async fn apply_global_rewrites(
+    rewrite_hooks: &[(
+        std::time::Duration,
+        std::sync::Arc<dyn crate::routing::RoutingPolicy>,
+    )],
+    v: &mut Value,
+    pool_name: &str,
+    ingress_protocol: &str,
+    wants_stream: bool,
+) -> bool {
+    let mut applied = false;
+    for (timeout, hook) in rewrite_hooks {
+        // Rebuild the projection from the current body so a later hook sees the earlier rewrite.
+        let req = build_rewrite_request(v, pool_name, ingress_protocol, wants_stream, true);
+        let rewritten = hook.transform(&req, *timeout).await;
+        drop(req); // end the immutable borrow of `v` before mutating it
+        if let Some(rw) = rewritten {
+            applied |= apply_rewrite_to_body(v, &rw, ingress_protocol);
+        }
+    }
+    applied
+}
+
+/// The ingress body's conversation-turn array, DIALECT-AWARE — the READ-side mirror of
+/// `apply_rewrite_to_body`'s write dialects: gemini carries turns in `contents`
+/// (`{role, parts: [{text}]}`), the Responses API in a list `input` (`{role, content}`), and
+/// every other protocol in `messages`. Reading only `messages` here made every projection
+/// (rewrite request, `send_prompt`, stage-tap shape) EMPTY on gemini/responses ingress — a
+/// rewrite gate saw `message_count: 0` and no prompt, so it abstained and silently no-oped.
+fn conversation_turns<'a>(v: &'a Value, ingress_protocol: &str) -> Option<&'a Vec<Value>> {
+    let key = match ingress_protocol {
+        "gemini" => "contents",
+        "responses" => "input",
+        _ => "messages",
+    };
+    v.get(key).and_then(|m| m.as_array())
+}
+
+/// Dialect-aware conversation-turn count. The Responses API also allows a bare-string `input`
+/// (one implicit user turn) — counted as 1 so the SIZE signal matches what the hook projection
+/// yields for the same body.
+fn turn_count(v: &Value, ingress_protocol: &str) -> usize {
+    match conversation_turns(v, ingress_protocol) {
+        Some(turns) => turns.len(),
+        None => usize::from(
+            ingress_protocol == "responses" && v.get("input").and_then(Value::as_str).is_some(),
+        ),
+    }
+}
+
+/// Dialect-aware max-output-tokens SIZE signal from the pristine ingress body. The OpenAI Responses
+/// API names this field `max_output_tokens` (see `proto::openai_responses`), NOT `max_tokens`, and a
+/// pure responses-ingress body never carries `max_tokens` — so reading `max_tokens` unconditionally
+/// projected `None` for EVERY responses request, silently blinding any routing policy or tap hook
+/// that keys on the size signal. Mirrors the other dialect-aware projections (`turn_count`,
+/// `system_text_chars`). Saturating narrow: an absurd cap (> u32::MAX) still signals "huge ask"
+/// rather than wrapping to a small number.
+fn max_tokens_for(v: &Value, ingress_protocol: &str) -> Option<u32> {
+    let key = if ingress_protocol == "responses" {
+        "max_output_tokens"
+    } else {
+        "max_tokens"
+    };
+    v.get(key)
+        .and_then(|m| m.as_u64())
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Sum the chars of every `parts[].text` string in a gemini Content object (`systemInstruction`
+/// or a `contents[]` turn). Non-text parts (inlineData, functionCall, …) contribute 0.
+fn gemini_parts_chars(content: &Value) -> usize {
+    content
+        .get("parts")
+        .and_then(|p| p.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Chars of the request's system prompt, DIALECT-AWARE: `system` as a bare string or a block
+/// array (Anthropic allows both; blocks keyed on the `text` field's presence, not on `type`),
+/// gemini's `systemInstruction` (`{parts: [{text}]}`), or the Responses API's bare-string
+/// `instructions`. The SAME shapes `build_prompt_projection` flattens, so the SIZE signal and
+/// the opt-in content projection never diverge. Cheap v1 SIZE signal (NOT a token count).
+fn system_text_chars(v: &Value, ingress_protocol: &str) -> usize {
+    match ingress_protocol {
+        "gemini" => v
+            .get("systemInstruction")
+            .map(gemini_parts_chars)
+            .unwrap_or(0),
+        "responses" => v
+            .get("instructions")
+            .and_then(|i| i.as_str())
+            .map(|s| s.chars().count())
+            .unwrap_or(0),
+        _ => match v.get("system") {
+            Some(Value::String(s)) => s.chars().count(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum(),
+            _ => 0,
+        },
+    }
+}
+
+/// Total chars across the system prompt + every conversation turn's text content, DIALECT-AWARE.
+/// `content` is a bare string or an array of blocks carrying `text` (Anthropic text blocks,
+/// Bedrock `[{text}]`, or Responses `input_text` blocks NESTED inside a message's `content[]`);
+/// gemini turns carry `parts[].text` instead. The Responses API ALSO allows a TOP-LEVEL typed item
+/// directly in `input[]` (`{type: "input_text", text: "…"}`, no `content` key) — that text lives at
+/// the item root, so a responses turn with no `content` falls back to its own `text` key (mirroring
+/// the proto reader). A best-effort projection over the pristine ingress body — never fails.
+fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> usize {
     let mut total = system_chars;
-    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
-        for m in msgs {
+    if let Some(turns) = conversation_turns(v, ingress_protocol) {
+        for m in turns {
+            if ingress_protocol == "gemini" {
+                total += gemini_parts_chars(m);
+                continue;
+            }
             match m.get("content") {
                 Some(Value::String(s)) => total += s.chars().count(),
                 Some(Value::Array(blocks)) => {
@@ -2066,8 +2406,20 @@ fn total_text_chars(v: &Value, system_chars: usize) -> usize {
                         }
                     }
                 }
+                // A top-level Responses `input_text`/`output_text` item carries its text at the
+                // item root, not under `content` — count it so the SIZE signal is not blinded.
+                _ if ingress_protocol == "responses" => {
+                    if let Some(t) = m.get("text").and_then(Value::as_str) {
+                        total += t.chars().count();
+                    }
+                }
                 _ => {}
             }
+        }
+    } else if ingress_protocol == "responses" {
+        // Bare-string `input` = one implicit user turn.
+        if let Some(s) = v.get("input").and_then(Value::as_str) {
+            total += s.chars().count();
         }
     }
     total
@@ -2118,7 +2470,10 @@ fn body_end_user(v: &Value) -> Option<String> {
 /// `{role, text: ""}`, never silently vanishes. Bare-string content BORROWS from the parsed body
 /// (`Cow::Borrowed`, the common case); only block arrays allocate a joined string. Runs ONLY
 /// behind the per-pool opt-in, so even that cost never touches a default pool.
-fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection<'_> {
+fn build_prompt_projection<'a>(
+    v: &'a Value,
+    ingress_protocol: &str,
+) -> crate::routing::PromptProjection<'a> {
     use std::borrow::Cow;
     // A content value is a bare string (borrowed as-is) or an array of blocks (text blocks joined
     // by newline into an owned string).
@@ -2140,23 +2495,84 @@ fn build_prompt_projection(v: &Value) -> crate::routing::PromptProjection<'_> {
             _ => Cow::Borrowed(""),
         }
     }
-    let system = v
-        .get("system")
-        .map(|s| flatten_content(Some(s)))
-        .filter(|s| !s.is_empty());
-    let messages = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|msgs| {
-            msgs.iter()
-                .map(|m| {
-                    let role: Cow<'_, str> =
-                        Cow::Borrowed(m.get("role").and_then(|r| r.as_str()).unwrap_or(""));
-                    (role, flatten_content(m.get("content")))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // A gemini Content object: join `parts[].text` with newlines (mirrors `gemini_parts_chars`,
+    // which counts what this flattens). Borrows a lone text part (the common case).
+    fn flatten_gemini_parts(c: &Value) -> Cow<'_, str> {
+        match c.get("parts").and_then(|p| p.as_array()) {
+            Some(parts) => {
+                let mut texts = parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .peekable();
+                match texts.next() {
+                    Some(first) if texts.peek().is_none() => Cow::Borrowed(first),
+                    Some(first) => {
+                        let mut out = String::from(first);
+                        for t in texts {
+                            out.push('\n');
+                            out.push_str(t);
+                        }
+                        Cow::Owned(out)
+                    }
+                    None => Cow::Borrowed(""),
+                }
+            }
+            None => Cow::Borrowed(""),
+        }
+    }
+    let system = match ingress_protocol {
+        "gemini" => v.get("systemInstruction").map(flatten_gemini_parts),
+        "responses" => v
+            .get("instructions")
+            .and_then(|i| i.as_str())
+            .map(Cow::Borrowed),
+        _ => v.get("system").map(|s| flatten_content(Some(s))),
+    }
+    .filter(|s| !s.is_empty());
+    let messages = match conversation_turns(v, ingress_protocol) {
+        Some(turns) => turns
+            .iter()
+            .map(|m| {
+                let text = if ingress_protocol == "gemini" {
+                    flatten_gemini_parts(m)
+                } else if ingress_protocol == "responses" && m.get("content").is_none() {
+                    // A top-level Responses typed item (`{type: "input_text"/"output_text", text}`)
+                    // carries its text at the item root, not under `content`.
+                    m.get("text")
+                        .and_then(Value::as_str)
+                        .map_or(Cow::Borrowed(""), Cow::Borrowed)
+                } else {
+                    flatten_content(m.get("content"))
+                };
+                let role: Cow<'_, str> = match m.get("role").and_then(|r| r.as_str()) {
+                    // CANONICALIZE the gemini-native assistant role `model` → `assistant` so a
+                    // `prompt: rw` hook sees the SAME canonical-IR vocabulary on every dialect (the
+                    // hook contract promises normalized IR). Without this a hook that echoes the role
+                    // it received emitted `model`, which the gemini write-back then mapped to `user`,
+                    // silently corrupting assistant turns. Mirrors the responses arm below. (c1r14.)
+                    Some("model") if ingress_protocol == "gemini" => Cow::Borrowed("assistant"),
+                    Some(r) => Cow::Borrowed(r),
+                    // Top-level typed item without a `role`: infer from its `type` so a `prompt: rw`
+                    // hook sees the correct speaker (`output_text` = assistant, else user).
+                    None if ingress_protocol == "responses" => {
+                        match m.get("type").and_then(Value::as_str) {
+                            Some("output_text") => Cow::Borrowed("assistant"),
+                            _ => Cow::Borrowed("user"),
+                        }
+                    }
+                    None => Cow::Borrowed(""),
+                };
+                (role, text)
+            })
+            .collect(),
+        // The Responses API's bare-string `input` = one implicit user turn.
+        None if ingress_protocol == "responses" => v
+            .get("input")
+            .and_then(Value::as_str)
+            .map(|s| vec![(Cow::Borrowed("user"), Cow::Borrowed(s))])
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     crate::routing::PromptProjection { system, messages }
 }
 
@@ -2180,6 +2596,7 @@ async fn decide_policy_order(
     ingress_protocol: &str,
     wants_stream: bool,
     caller_token: Option<&str>,
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
 ) -> PolicyOutcome {
     use crate::routing::{
         Candidate, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingRequest,
@@ -2187,15 +2604,26 @@ async fn decide_policy_order(
 
     // A weighted/default pool resolves to `None` at config load (no policy object is constructed), so
     // the only `ResolvedPolicy` that can reach this seam is a constructed `Policy`.
-    let (policy, on_error, timeout, send_prompt, send_user) = match resolved {
-        ResolvedPolicy::Policy {
-            policy,
-            on_error,
-            timeout,
-            send_prompt,
-            send_user,
-        } => (policy, on_error, *timeout, *send_prompt, *send_user),
-    };
+    let (policy, on_error, on_error_chain, timeout, send_prompt, send_user, on_empty) =
+        match resolved {
+            ResolvedPolicy::Policy {
+                policy,
+                on_error,
+                on_error_chain,
+                timeout,
+                send_prompt,
+                send_user,
+                on_empty,
+            } => (
+                policy,
+                on_error,
+                on_error_chain,
+                *timeout,
+                *send_prompt,
+                *send_user,
+                on_empty,
+            ),
+        };
 
     // The candidate set the policy ranks over = this pool's members MINUS the already-excluded ones
     // (configured exclusions). `idx` is the stable lane handle the ordered walk speaks.
@@ -2207,15 +2635,20 @@ async fn decide_policy_order(
         return PolicyOutcome::Weighted;
     }
 
-    // ONE governance key lookup serves both consumers: the per-key rate headroom (always, same
-    // value across candidates today — rate limits are per-key; see `Candidate.rate_headroom`) and,
-    // behind `policy.send_user`, the caller identity projection. The secret is CONSUMED here by
-    // `lookup`; only the returned key RECORD flows forward — nothing downstream sees the token.
+    // ONE governance key serves both consumers: the per-key rate headroom (always, same value
+    // across candidates today — rate limits are per-key; see `Candidate.rate_headroom`) and, behind
+    // `policy.send_user`, the caller identity projection. A virtual-key caller resolves via
+    // `lookup` (which CONSUMES the secret; only the returned key RECORD flows forward — nothing
+    // downstream sees the token). A GROUP/SSO principal's token is NOT a virtual-key secret, so
+    // `lookup` misses — fall back to the key the auth layer already SYNTHESIZED for it (carried in
+    // `GovCtx.key`, threaded here as `resolved_gov_key`). Without this fallback `rate_headroom` and
+    // `identity` were silently `None` for every group principal, blinding usage/identity policies.
     let gov = app.governance.as_ref();
     let gov_key = match (gov, caller_token) {
         (Some(g), Some(tok)) => g.lookup(tok),
         _ => None,
-    };
+    }
+    .or_else(|| resolved_gov_key.cloned());
     let rate_headroom: Option<f64> = match (gov, gov_key.as_ref()) {
         (Some(g), Some(key)) => g.rate_headroom(key, now()),
         _ => None,
@@ -2238,7 +2671,7 @@ async fn decide_policy_order(
     // `policy.send_prompt` opt-in (default off): flatten the prompt content for the hook. The
     // allocation cost lives entirely behind the flag — a shape-only pool never runs this.
     let prompt = if send_prompt {
-        Some(build_prompt_projection(v))
+        Some(build_prompt_projection(v, ingress_protocol))
     } else {
         None
     };
@@ -2248,17 +2681,13 @@ async fn decide_policy_order(
     // Count the system prompt's chars ONCE: it feeds both `total_chars` (via `total_text_chars`) and
     // `system_chars`, so computing it inline twice would run the O(n) UTF-8 scan over the system block
     // twice. Off the zero-cost default path (only non-default route policies reach here).
-    let system_chars = system_text_chars(v);
+    let system_chars = system_text_chars(v, ingress_protocol);
 
     let req = RoutingRequest {
         pool: pool_name,
         ingress_protocol,
         requested_model: v.get("model").and_then(|m| m.as_str()),
-        message_count: v
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0),
+        message_count: turn_count(v, ingress_protocol),
         tool_count: v
             .get("tools")
             .and_then(|t| t.as_array())
@@ -2268,14 +2697,11 @@ async fn decide_policy_order(
             .get("tools")
             .and_then(|t| t.as_array())
             .is_some_and(|a| !a.is_empty()),
-        total_chars: total_text_chars(v, system_chars),
+        total_chars: total_text_chars(v, ingress_protocol, system_chars),
         system_chars,
-        // Saturating narrow: an absurd caller cap (> u32::MAX) still signals "huge ask" to the
-        // policy instead of wrapping to a small number. A SIZE signal, not a limit.
-        max_tokens: v
-            .get("max_tokens")
-            .and_then(|m| m.as_u64())
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        // Saturating narrow (in `max_tokens_for`): an absurd caller cap (> u32::MAX) still signals
+        // "huge ask" to the policy instead of wrapping to a small number. A SIZE signal, not a limit.
+        max_tokens: max_tokens_for(v, ingress_protocol),
         stream: wants_stream,
         prompt,
         identity,
@@ -2334,7 +2760,16 @@ async fn decide_policy_order(
                 error = %e,
                 "routing policy failed; applying on_error fallback"
             );
-            return coerce_on_error(on_error, &candidates, policy.name());
+            return run_on_error_chain(
+                on_error_chain,
+                on_error,
+                &req,
+                &candidates,
+                &ctx,
+                policy.name(),
+                pool_name,
+            )
+            .await;
         }
         // Timed out at the seam's own hard deadline: same fallback, same visibility. The policy/
         // transport stays cancel-safe — a dropped future on timeout is fine.
@@ -2345,9 +2780,101 @@ async fn decide_policy_order(
                 timeout_ms = timeout.as_millis() as u64,
                 "routing policy deadline exceeded; applying on_error fallback"
             );
-            return coerce_on_error(on_error, &candidates, policy.name());
+            return run_on_error_chain(
+                on_error_chain,
+                on_error,
+                &req,
+                &candidates,
+                &ctx,
+                policy.name(),
+                pool_name,
+            )
+            .await;
         }
     };
+
+    map_decision(decision, policy.name(), &candidates, on_empty)
+}
+
+/// Walk a failed gate's resolved `on_error` fallback CHAIN: fire each fallback in order (bounded by
+/// ITS deadline, projected per ITS grants — a fallback never sees prompt/identity its own grants
+/// don't allow), and let the FIRST one that answers decide, exactly as a primary decision would.
+/// Every link failing lands on the chain's reserved TERMINAL (weighted/reject/first). The common
+/// case — `on_error: weighted` etc. — has an EMPTY chain and goes straight to the terminal.
+async fn run_on_error_chain(
+    chain: &[crate::routing::FallbackHook],
+    terminal: &crate::config::PolicyOnError,
+    req: &crate::routing::RoutingRequest<'_>,
+    candidates: &[crate::routing::Candidate<'_>],
+    ctx: &crate::routing::RoutingContext<'_>,
+    failed_policy_name: &'static str,
+    pool_name: &str,
+) -> PolicyOutcome {
+    for fb in chain {
+        // Re-project per the FALLBACK's grants: it may see at most what the primary projection
+        // built AND its own grants allow (never over-shares; a fallback with a grant the primary
+        // lacked gets shape-only — the projection was never built).
+        let fb_req = crate::routing::RoutingRequest {
+            prompt: if fb.send_prompt {
+                req.prompt.clone()
+            } else {
+                None
+            },
+            identity: if fb.send_user {
+                req.identity.clone()
+            } else {
+                None
+            },
+            ..req.clone()
+        };
+        match tokio::time::timeout(
+            fb.timeout,
+            fb.policy.decide(&fb_req, candidates, ctx, fb.timeout),
+        )
+        .await
+        {
+            Ok(Ok(decision)) => {
+                tracing::info!(
+                    policy = failed_policy_name,
+                    fallback = fb.policy.name(),
+                    pool = pool_name,
+                    "on_error fallback hook answered for the failed gate"
+                );
+                return map_decision(decision, fb.policy.name(), candidates, &fb.on_empty);
+            }
+            // This link failed too — follow the chain to the next (its own on_error was flattened
+            // into this chain at resolution).
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    fallback = fb.policy.name(),
+                    pool = pool_name,
+                    error = %e,
+                    "on_error fallback hook failed; continuing down the chain"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    fallback = fb.policy.name(),
+                    pool = pool_name,
+                    timeout_ms = fb.timeout.as_millis() as u64,
+                    "on_error fallback hook deadline exceeded; continuing down the chain"
+                );
+            }
+        }
+    }
+    coerce_on_error(terminal, candidates, failed_policy_name)
+}
+
+/// Map a policy's `RoutingDecision` to the seam's `PolicyOutcome` — shared by the primary decision
+/// and every on_error fallback, so a fallback's reject/restrict/order carries the same clamping,
+/// sanitizing, and normalization guarantees as a primary's.
+fn map_decision(
+    decision: crate::routing::RoutingDecision,
+    policy_name: &'static str,
+    candidates: &[crate::routing::Candidate<'_>],
+    on_empty: &crate::config::PolicyOnError,
+) -> PolicyOutcome {
+    use crate::routing::RoutingDecision;
 
     match decision {
         RoutingDecision::Prefer(order) => {
@@ -2358,12 +2885,15 @@ async fn decide_policy_order(
             match RoutingDecision::from_ranked(order, &valid) {
                 RoutingDecision::Prefer(o) => PolicyOutcome::Order {
                     order: o,
-                    name: policy.name(),
+                    name: policy_name,
                 },
                 RoutingDecision::Abstain => PolicyOutcome::Weighted,
                 // `from_ranked` only ever produces Prefer/Abstain — it normalizes an order, it
-                // cannot invent a rejection.
+                // cannot invent a rejection or a restriction.
                 RoutingDecision::Reject { .. } => unreachable!("from_ranked never rejects"),
+                RoutingDecision::Restrict { .. } => {
+                    unreachable!("from_ranked never restricts")
+                }
             }
         }
         // Abstain is the clean "no opinion" — today's exact SWRR (NOT coerced via on_error).
@@ -2382,7 +2912,16 @@ async fn decide_policy_order(
                 403
             },
             message: crate::routing::wire::sanitize_reject_message(&message),
-            name: policy.name(),
+            name: policy_name,
+        },
+        // The hook's RESTRICT verb: keep only candidates carrying one of `tags_any` (a compliance
+        // gate). The intersection + on_empty are applied at the failover-set seam in `forward_with_
+        // pool`; here we just carry the tag set through. An empty `tags_any` (malformed restrict,
+        // normalized fail-closed) forces the empty intersection → on_empty, never allow-all.
+        RoutingDecision::Restrict { tags_any } => PolicyOutcome::Restrict {
+            tags_any,
+            name: policy_name,
+            on_empty: on_empty.clone(),
         },
     }
 }
@@ -2406,17 +2945,167 @@ fn coerce_on_error(
     }
 }
 
+/// Shape scalars captured ONCE per request for the STAGE tap payloads (route/attempt/completion).
+/// All owned/`'static`-free scalars except the pool/protocol names (which outlive the request), so
+/// the capture survives `v` being consumed by the first dispatch hop. Stage taps are SHAPE-ONLY in
+/// this increment: the default signal bucket plus the stage object — never prompt content or caller
+/// identity, regardless of grant (never over-shares; a granted tap still gets content at the
+/// `request` stage).
+pub(crate) struct StageShape<'a> {
+    pool: &'a str,
+    ingress_protocol: &'a str,
+    message_count: usize,
+    has_tools: bool,
+    total_chars: usize,
+    max_tokens: Option<u32>,
+    stream: bool,
+}
+
+/// Capture the stage-tap shape from the parsed body (`None` = an opaque/binary body: zeroed shape).
+pub(crate) fn capture_stage_shape<'a>(
+    v: Option<&Value>,
+    pool: &'a str,
+    ingress_protocol: &'a str,
+    stream: bool,
+) -> StageShape<'a> {
+    let (message_count, has_tools, total_chars, max_tokens) = match v {
+        Some(v) => {
+            let system_chars = system_text_chars(v, ingress_protocol);
+            (
+                turn_count(v, ingress_protocol),
+                v.get("tools")
+                    .and_then(|t| t.as_array())
+                    .is_some_and(|a| !a.is_empty()),
+                total_text_chars(v, ingress_protocol, system_chars),
+                max_tokens_for(v, ingress_protocol),
+            )
+        }
+        None => (0, false, 0, None),
+    };
+    StageShape {
+        pool,
+        ingress_protocol,
+        message_count,
+        has_tools,
+        total_chars,
+        max_tokens,
+        stream,
+    }
+}
+
+/// Fire one STAGE's taps (route/attempt/completion) fire-and-forget: serialize the shape-only
+/// projection + stage object ONCE, then spawn one detached task per tap. A tap can never delay,
+/// reorder, or fail the request; a serialization failure silently skips the fire (observation is
+/// best-effort). ZERO COST when the stage has no taps (first-line empty check).
+pub(crate) fn fire_stage_taps(
+    taps: &[(
+        std::time::Duration,
+        bool,
+        Arc<dyn crate::routing::RoutingPolicy>,
+    )],
+    shape: &StageShape<'_>,
+    stage: crate::routing::wire::HookStageProjection<'_>,
+) {
+    if taps.is_empty() {
+        return;
+    }
+    let hook_req = crate::routing::wire::HookRequest {
+        request: crate::routing::wire::HookReqProjection {
+            pool: shape.pool,
+            ingress_protocol: shape.ingress_protocol,
+            message_count: shape.message_count,
+            has_tools: shape.has_tools,
+            total_chars: shape.total_chars,
+            max_tokens: shape.max_tokens,
+            stream: shape.stream,
+            system: None,
+            messages: None,
+            user: None,
+        },
+        candidates: Vec::new(),
+        context: crate::routing::wire::HookContext {
+            pool: shape.pool,
+            budget_remaining: None,
+        },
+        stage: Some(stage),
+    };
+    let Ok(bytes) = serde_json::to_vec(&hook_req) else {
+        return;
+    };
+    let bytes = std::sync::Arc::new(bytes);
+    for (timeout, _send_prompt, hook) in taps {
+        let policy = hook.clone();
+        let budget = *timeout;
+        let proj = bytes.clone();
+        tokio::spawn(async move { policy.notify(&proj, budget).await });
+    }
+}
+
+/// Response-extension marker set by every GATE-produced rejection return, so the completion-stage
+/// taps can report the SYNTHETIC `rejected_by_gate` outcome (audit taps see denials) instead of a
+/// generic `failed`.
+#[derive(Clone)]
+struct GateRejected;
+
+/// Tag a gate-produced rejection response with the [`GateRejected`] marker.
+fn gate_rejected(mut resp: Response) -> Response {
+    resp.extensions_mut().insert(GateRejected);
+    resp
+}
+
 /// Forward with pool name context for on_exhausted config lookup.
 /// Thin wrapper: parse the body ONCE for callers that only hold bytes (tests, ad-hoc routes), then
 /// delegate. The ingress hot path (`route::forward_resolved`) instead calls
 /// [`forward_with_pool_parsed`] directly with the `Value` it ALREADY parsed to resolve the model —
 /// so a normal request parses the body once across the route+forward layers, not twice.
+///
+/// Carries NO pre-resolved governance key — a virtual-key caller still resolves via the token
+/// `lookup` inside `decide_policy_order`. Real ingress routes that hold a `GovCtx` (whose key may be
+/// a SYNTHESIZED group/SSO principal key the token can't resolve to) must call
+/// [`forward_with_pool_keyed`] and pass `gov.key.as_ref()` so the routing-signal path is not blind.
+///
+/// Test-only convenience now: every production ingress route holds a `GovCtx` and goes through
+/// [`forward_with_pool_keyed`]; this bytes-only, key-less form survives solely for the many tests
+/// that construct a request from raw bytes.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_with_pool(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     body: Bytes,
     caller_token: Option<&str>,
+    pool_name: &str,
+    affinity_key: Option<&str>,
+    ingress_protocol: &str,
+    op: crate::handlers::Op,
+    usage_sink: Option<UsageSink>,
+) -> Response {
+    forward_with_pool_keyed(
+        app,
+        cands,
+        body,
+        caller_token,
+        None,
+        pool_name,
+        affinity_key,
+        ingress_protocol,
+        op,
+        usage_sink,
+    )
+    .await
+}
+
+/// [`forward_with_pool`] plus the caller's pre-resolved governance key (`GovCtx.key`). The named /
+/// ad-hoc anthropic-dialect routes use this so a GROUP/SSO principal — whose bearer token is not a
+/// virtual-key secret and so never resolves via the `lookup` fallback — still projects
+/// `rate_headroom` / `identity` into a pool's routing policy, matching the universal dispatch path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_with_pool_keyed(
+    app: Arc<App>,
+    cands: Vec<WeightedLane>,
+    body: Bytes,
+    caller_token: Option<&str>,
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -2442,6 +3131,7 @@ pub(crate) async fn forward_with_pool(
         Some(v),
         APPLICATION_JSON,
         caller_token,
+        resolved_gov_key,
         pool_name,
         affinity_key,
         ingress_protocol,
@@ -2468,13 +3158,95 @@ pub(crate) async fn forward_with_pool_parsed(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     body: Bytes,
+    v: Option<Value>,
+    req_content_type: &str,
+    caller_token: Option<&str>,
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
+    pool_name: &str,
+    affinity_key: Option<&str>,
+    ingress_protocol: &str,
+    op: crate::handlers::Op,
+    usage_sink: Option<UsageSink>,
+) -> Response {
+    // ── STAGE TAPS: completion ── capture the shape BEFORE `v` moves into the dispatch core, fire
+    // AFTER the response head is known. `outcome`: a gate-produced rejection (marker extension) is
+    // the SYNTHETIC `rejected_by_gate`; else 2xx = `ok`, anything else = `failed`. For a STREAMING
+    // response this fires at response-HEAD time (status known, body still flowing) — stream-tail
+    // outcomes are a later increment. ZERO COST when no completion tap is configured.
+    let completion_shape = if app.tap_hooks_completion.is_empty() {
+        None
+    } else {
+        Some(capture_stage_shape(
+            v.as_ref(),
+            pool_name,
+            ingress_protocol,
+            v.as_ref()
+                .and_then(|b| b.get("stream"))
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false),
+        ))
+    };
+    let completion_app = app.clone();
+    let resp = forward_with_pool_parsed_inner(
+        app,
+        cands,
+        body,
+        v,
+        req_content_type,
+        caller_token,
+        resolved_gov_key,
+        pool_name,
+        affinity_key,
+        ingress_protocol,
+        op,
+        usage_sink,
+    )
+    .await;
+    if let Some(shape) = completion_shape {
+        let outcome = if resp.extensions().get::<GateRejected>().is_some() {
+            "rejected_by_gate"
+        } else if resp.status().is_success() {
+            "ok"
+        } else {
+            "failed"
+        };
+        fire_stage_taps(
+            &completion_app.tap_hooks_completion,
+            &shape,
+            crate::routing::wire::HookStageProjection {
+                at: "completion",
+                target: None,
+                attempt_number: None,
+                remaining_candidates: None,
+                previous_failure: None,
+                outcome: Some(outcome),
+                status: Some(resp.status().as_u16()),
+            },
+        );
+    }
+    resp
+}
+
+/// The dispatch core behind [`forward_with_pool_parsed`] (the thin wrapper exists only to fire the
+/// completion-stage taps around the whole request).
+//
+// Plumbing function: same parameter set as the public wrapper.
+#[allow(clippy::too_many_arguments)]
+async fn forward_with_pool_parsed_inner(
+    app: Arc<App>,
+    cands: Vec<WeightedLane>,
+    mut body: Bytes,
     // The request body parsed ONCE by the caller for JSON-body operations; `None` for an OPAQUE
     // ingress body (multipart transcription, binary) — those relay/translate at the BYTE level via
-    // the operation codecs and skip every JSON-only read below.
-    v: Option<Value>,
+    // the operation codecs and skip every JSON-only read below. `mut` so the global rewrite pass can
+    // mutate it before dispatch.
+    mut v: Option<Value>,
     // The ingress request Content-Type — the byte-level codec's parse hint (multipart boundary).
     req_content_type: &str,
     caller_token: Option<&str>,
+    // The key the auth layer already resolved/synthesized for this caller (`GovCtx.key`) — used as
+    // the routing-signal source when the token is not a virtual-key secret (group/SSO principals).
+    resolved_gov_key: Option<&crate::governance::VirtualKey>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -2490,7 +3262,7 @@ pub(crate) async fn forward_with_pool_parsed(
     // not a valid egress for the operation — a clean no-handler 404 in the CALLER's dialect, never a
     // silent dispatch. Dormant while all six protocols serve chat; load-bearing the moment one is
     // removed (the deletion test).
-    let cands: Vec<WeightedLane> = {
+    let mut cands: Vec<WeightedLane> = {
         let (kept, dropped): (Vec<WeightedLane>, Vec<WeightedLane>) =
             cands.into_iter().partition(|wl| {
                 crate::handlers::request_handler(app.lanes[wl.idx].protocol.name())
@@ -2519,6 +3291,111 @@ pub(crate) async fn forward_with_pool_parsed(
     // Delegated to the operation: chat reads the OpenAI-family `stream` boolean (byte-identical to
     // the previous inline read); a non-streaming op always returns false.
     let wants_stream = v.as_ref().map(|v| op.wants_stream(v)).unwrap_or(false);
+
+    // ── GLOBAL REWRITE (transform) PASS ─────────────────────────────────────────────────────────
+    // Fire the global `prompt: rw` gates (compression/redaction) BEFORE dispatch AND before the
+    // routing decision, so the decision + upstream both see the rewritten body. Priority-ordered
+    // transform chain; fail-safe throughout (a broken hook is skipped, a non-chat body is untouched).
+    // ZERO COST when no rewrite hook is configured — the common case is a single always-false branch.
+    // The pool's own rewrite chain (rw gates in its `hooks: [...]` list) fires AFTER the globals —
+    // each chain internally priority-ordered, globals always first.
+    let pool_rewrites: &[(
+        std::time::Duration,
+        std::sync::Arc<dyn crate::routing::RoutingPolicy>,
+    )] = app
+        .pool_runtime
+        .get(pool_name)
+        .map(|r| r.rewrite_hooks.as_slice())
+        .unwrap_or(&[]);
+    if !app.rewrite_hooks.is_empty() || !pool_rewrites.is_empty() {
+        if let Some(parsed) = v.as_mut() {
+            let mut applied = apply_global_rewrites(
+                &app.rewrite_hooks,
+                parsed,
+                pool_name,
+                ingress_protocol,
+                wants_stream,
+            )
+            .await;
+            applied |= apply_global_rewrites(
+                pool_rewrites,
+                parsed,
+                pool_name,
+                ingress_protocol,
+                wants_stream,
+            )
+            .await;
+            // A committed rewrite makes the RETAINED bytes stale: the same-protocol pristine
+            // short-circuit re-emits them verbatim, and failover hops 2+ re-parse them — either
+            // path would silently discard the rewrite. Re-serialize the rewritten body as the new
+            // retained bytes so every downstream reader of `body` sees the effective request.
+            // Cost only on the rewrite path (a no-op request never reaches this serialize).
+            if applied {
+                match crate::json::to_vec(parsed) {
+                    Ok(bytes) => body = Bytes::from(bytes),
+                    // Serialization of a Value we just built cannot realistically fail; if it
+                    // somehow does, keep the original bytes (the pre-rewrite request is still a
+                    // valid request — fail-safe, never a corrupted body).
+                    Err(e) => {
+                        tracing::warn!(error = %e, "re-serializing rewritten body failed; keeping the original bytes");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── GLOBAL TAP (observe) FIRE ────────────────────────────────────────────────────────────────
+    // Fire the global request-stage `kind: tap` hooks FIRE-AND-FORGET: serialize the projection(s) to
+    // owned bytes ONCE, then spawn one detached task per tap. A tap gets a write-only send with its
+    // own deadline; its reply (if any) is ignored, its errors swallowed — a tap can NEVER delay,
+    // reorder, or fail the request. Runs AFTER the rewrite pass so a tap observes the effective
+    // (post-compression) body. Each tap receives the projection its GRANT allows: a `prompt: ro` tap
+    // gets the prompt-content projection, a `prompt: no` (default) tap gets shape-only — so a tap
+    // never over-shares. At most TWO projections are built (shape-only + with-prompt), regardless of
+    // tap count. ZERO COST when no tap is configured (empty-list branch).
+    if !app.tap_hooks.is_empty() {
+        if let Some(body) = v.as_ref() {
+            let ctx = crate::routing::RoutingContext {
+                pool: pool_name,
+                budget_remaining: None,
+            };
+            let build_proj = |with_prompt: bool| {
+                let req = build_rewrite_request(
+                    body,
+                    pool_name,
+                    ingress_protocol,
+                    wants_stream,
+                    with_prompt,
+                );
+                serde_json::to_vec(&crate::routing::wire::build(&req, &[], &ctx))
+                    .ok()
+                    .map(std::sync::Arc::new)
+            };
+            // Shape-only is needed whenever any tap lacks the prompt grant; the prompt projection only
+            // when at least one tap holds `prompt: ro`. Build each at most once.
+            let any_prompt = app.tap_hooks.iter().any(|(_, send_prompt, _)| *send_prompt);
+            let any_shape = app
+                .tap_hooks
+                .iter()
+                .any(|(_, send_prompt, _)| !*send_prompt);
+            let shape_proj = if any_shape { build_proj(false) } else { None };
+            let prompt_proj = if any_prompt { build_proj(true) } else { None };
+            for (timeout, send_prompt, hook) in &app.tap_hooks {
+                // A granted tap prefers the prompt projection; fall back to shape-only if it failed to
+                // serialize (never over-share, always safe).
+                let proj = if *send_prompt {
+                    prompt_proj.clone().or_else(|| shape_proj.clone())
+                } else {
+                    shape_proj.clone()
+                };
+                if let Some(proj) = proj {
+                    let policy = hook.clone();
+                    let budget = *timeout;
+                    tokio::spawn(async move { policy.notify(&proj, budget).await });
+                }
+            }
+        }
+    }
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
     // body, not SSE. The route layer signals this via a router shim key (read here; stripped from the
@@ -2610,91 +3487,372 @@ pub(crate) async fn forward_with_pool_parsed(
     // `x-busbar-route-policy` transparency header). It stays `None` on the default path AND when a
     // configured policy Abstains / errors-to-weighted (both fall through to SWRR, which is not a
     // "policy choice" worth advertising).
-    let mut chosen_policy_name: Option<&'static str> = None;
-    let policy_order: Option<Vec<usize>> = match app
+    // ── PHASE-2 DECISION GATES (concurrent at t0) ───────────────────────────────────────────────
+    // Fire the GLOBAL decision gates and this pool's OWN gates for a verdict on this request,
+    // BEFORE pool routing. All gates fire CONCURRENTLY against the same t0 candidate set — reject
+    // and restrict COMMUTE (veto; intersect), and an order is re-validated against the FINAL
+    // (post-restrict) set — then the outcomes reconcile deterministically over ONE chain, sorted by
+    // ascending `priority` (stable: globals before pool gates on ties, then config order):
+    //   1. any reject ⇒ reject wins. The FIRST rejecting gate in chain order (the priority
+    //      tie-break) supplies the surfacing status/message; nothing is dispatched.
+    //   2. else restricts INTERSECT, applied in chain order; a gate whose intersection empties the
+    //      set applies ITS `on_empty` (weighted = advisory escape, that gate's restriction is
+    //      skipped; the fail-closed default rejects with a 503).
+    //   3. else the LAST ordering gate in the chain wins, filtered to the surviving candidate set
+    //      (an order captured at t0 may name members a restrict excluded — the filter is what makes
+    //      the concurrent firing sound). Empty after filtering = abstain (the pool's base ordering
+    //      below applies).
+    // The restriction persists across failover (hops select from the shrunk `cands`). ZERO COST
+    // when no gate is configured (both sources empty ⇒ the pass is skipped).
+    let pool_gates: &[(u16, crate::routing::ResolvedPolicy)] = app
         .pool_runtime
         .get(pool_name)
-        .and_then(|r| r.policy.as_ref())
-    {
-        // Default fast path: no policy ⇒ SWRR, byte-identical to pre-feature behavior. NOTHING below
-        // this arm runs — no projection, no async, one predictable branch.
-        None => None,
-        // A non-default policy is configured: build the projection, run the decision (bounded by its
-        // timeout), and coerce the outcome to a ranked order (or `None` ⇒ SWRR) per `on_error`.
-        Some(resolved) => {
-            let outcome = decide_policy_order(
-                &app,
-                resolved,
-                &cands,
-                &request_ctx,
-                v.as_ref().unwrap_or(&Value::Null),
-                pool_name,
-                ingress_protocol,
-                wants_stream,
-                caller_token,
-            )
+        .map(|r| r.gates.as_slice())
+        .unwrap_or(&[]);
+    let mut gate_order: Option<(Vec<usize>, &'static str)> = None;
+    if !app.global_gates.is_empty() || !pool_gates.is_empty() {
+        // The chain: globals (pre-sorted ascending by priority) then pool gates (config order),
+        // stable-sorted by priority — ties keep globals-first, then config order.
+        let mut chain: Vec<&(u16, crate::routing::ResolvedPolicy)> =
+            app.global_gates.iter().chain(pool_gates.iter()).collect();
+        chain.sort_by_key(|(p, _)| *p);
+        // Every concurrently-firing gate borrows the same parsed body; the shared Null stands in
+        // for a non-JSON body (the same projection the sequential path used).
+        static NULL_BODY: Value = Value::Null;
+        let gate_body: &Value = v.as_ref().unwrap_or(&NULL_BODY);
+        let outcomes: Vec<PolicyOutcome> =
+            futures::future::join_all(chain.iter().map(|(_, gate)| {
+                decide_policy_order(
+                    &app,
+                    gate,
+                    &cands,
+                    &request_ctx,
+                    gate_body,
+                    pool_name,
+                    ingress_protocol,
+                    wants_stream,
+                    caller_token,
+                    resolved_gov_key,
+                )
+            }))
             .await;
+
+        // Reconcile 1: REJECT WINS. The first rejecting gate in chain order surfaces — that is the
+        // `priority` tie-break when several gates reject at once. A deliberate RejectRequest was
+        // status-clamped 400..=499 + message-sanitized at the producing seam; a fail-closed errored
+        // gate (`on_error: reject`) is a 503, never a silent proceed — it was declared load-bearing.
+        for outcome in &outcomes {
             match outcome {
-                // The policy returned a usable ranked order — record its name (for the
-                // `x-busbar-route-policy` header + the metric) and hand the order to the ordered walk.
-                PolicyOutcome::Order { order, name } => {
-                    chosen_policy_name = Some(name);
-                    metrics::counter!(
-                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
-                        "policy" => name,
-                        "pool" => pool_name.to_string(),
-                    )
-                    .increment(1);
-                    Some(order)
-                }
-                // Abstain / error-coerced-to-weighted: fall through to today's exact SWRR.
-                PolicyOutcome::Weighted => None,
-                // on_error == reject (and the policy errored/timed out / saturated): fail closed with a
-                // 503 rather than silently degrading. Never strands as a hang — a clean rejection.
-                PolicyOutcome::Reject => {
-                    return ingress_error(
-                        ingress_protocol,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        KIND_OVERLOADED,
-                        "The routing policy could not select an upstream. Please retry shortly.",
-                    );
-                }
-                // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
-                // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
-                // operator-visible counter. `status` was clamped to 400..=499 and `message`
-                // sanitized at the seam that constructed the outcome (for every producer, wire or
-                // direct), so this arm can trust both.
                 PolicyOutcome::RejectRequest {
                     status,
                     message,
                     name,
                 } => {
-                    // The `status` label is hook-influenced but BOUNDED: the seam that built this
-                    // outcome clamps it to 400..=499 for every producer, so the worst-case series
-                    // fan-out is 100 per (policy, pool).
                     metrics::counter!(
                         crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
-                        "policy" => name,
+                        "policy" => *name,
                         "pool" => pool_name.to_string(),
                         "status" => status.to_string(),
                     )
                     .increment(1);
-                    // The message is safe to log: the seam that built this outcome sanitized it
-                    // (control/invisible chars stripped, length capped — for EVERY producer, not
-                    // just the wire transports), and it is the exact string the CLIENT receives.
                     tracing::info!(
                         policy = name,
                         pool = pool_name,
                         status,
                         message = %message,
-                        "routing policy rejected the request"
+                        "decision gate rejected the request"
                     );
-                    return ingress_error(
+                    return gate_rejected(ingress_error(
                         ingress_protocol,
-                        StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
-                        reject_kind_for_status(status),
-                        &message,
-                    );
+                        StatusCode::from_u16(*status).unwrap_or(StatusCode::FORBIDDEN),
+                        reject_kind_for_status(*status),
+                        message,
+                    ));
+                }
+                PolicyOutcome::Reject => {
+                    return gate_rejected(ingress_error(
+                        ingress_protocol,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        KIND_OVERLOADED,
+                        "A required gate could not complete. Please retry shortly.",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        // Reconcile 2: RESTRICTS INTERSECT, in chain order (intersection commutes — the final set
+        // is order-independent; the chain order only decides WHOSE on_empty applies first when the
+        // set empties). Shrinking `cands` makes the restriction persist across every failover hop
+        // and keeps any ordering — gate or base — inside the eligible set.
+        for outcome in &outcomes {
+            if let PolicyOutcome::Restrict {
+                tags_any,
+                name,
+                on_empty,
+            } = outcome
+            {
+                // Capture this restrict so it PERSISTS across a `fallback_pool` hop (which rebuilds
+                // candidates from an independent pool). Recorded for every restrict regardless of
+                // whether it narrows here — the fail-closed reject case returns below before any
+                // fallback, so a stray record is harmless. (found: audit c1r13.)
+                request_ctx.active_restricts.push(RestrictConstraint {
+                    tags_any: tags_any.clone(),
+                    on_empty: on_empty.clone(),
+                    name,
+                });
+                let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
+                let restricted: Vec<WeightedLane> = cands
+                    .iter()
+                    .filter(|wl| {
+                        members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                            meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if restricted.is_empty() {
+                    if matches!(on_empty, crate::config::PolicyOnError::Weighted) {
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            "decision gate restrict left no eligible lane; on_empty: weighted \
+                             escape — this gate's restriction is skipped"
+                        );
+                        // leave `cands` unchanged and continue reconciling the next restrict.
+                    } else {
+                        metrics::counter!(
+                            crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                            "policy" => *name,
+                            "pool" => pool_name.to_string(),
+                            "status" => "503".to_string(),
+                        )
+                        .increment(1);
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            "decision gate restrict left no eligible lane (on_empty: reject)"
+                        );
+                        return gate_rejected(ingress_error(
+                            ingress_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            KIND_OVERLOADED,
+                            "No upstream satisfies a required gate's restriction. Please retry \
+                             shortly.",
+                        ));
+                    }
+                } else {
+                    cands = restricted;
+                    metrics::counter!(
+                        crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                        "policy" => *name,
+                        "pool" => pool_name.to_string(),
+                    )
+                    .increment(1);
+                }
+            }
+        }
+
+        // Reconcile 3: ORDER — LAST in the chain wins, re-validated against the FINAL candidate
+        // set (the t0 order may name members a restrict excluded). An order that filters to empty
+        // abstains — the pool's base ordering below applies.
+        let surviving: std::collections::HashSet<usize> = cands.iter().map(|wl| wl.idx).collect();
+        for outcome in outcomes {
+            if let PolicyOutcome::Order { order, name } = outcome {
+                let filtered: Vec<usize> = order
+                    .into_iter()
+                    .filter(|i| surviving.contains(i))
+                    .collect();
+                if !filtered.is_empty() {
+                    gate_order = Some((filtered, name));
+                }
+            }
+        }
+        if let Some((_, name)) = &gate_order {
+            metrics::counter!(
+                crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                "policy" => *name,
+                "pool" => pool_name.to_string(),
+            )
+            .increment(1);
+        }
+    }
+
+    let mut chosen_policy_name: Option<&'static str> = None;
+    let policy_order: Option<Vec<usize>> = if let Some((order, name)) = gate_order {
+        // A phase-2 gate ORDERED: it overrides the pool's base ordering (a gate's abstain was the
+        // reconciled fall-through to the base, handled above).
+        chosen_policy_name = Some(name);
+        Some(order)
+    } else {
+        match app
+            .pool_runtime
+            .get(pool_name)
+            .and_then(|r| r.policy.as_ref())
+        {
+            // Default fast path: no policy ⇒ SWRR, byte-identical to pre-feature behavior. NOTHING below
+            // this arm runs — no projection, no async, one predictable branch.
+            None => None,
+            // A non-default policy is configured: build the projection, run the decision (bounded by its
+            // timeout), and coerce the outcome to a ranked order (or `None` ⇒ SWRR) per `on_error`.
+            Some(resolved) => {
+                let outcome = decide_policy_order(
+                    &app,
+                    resolved,
+                    &cands,
+                    &request_ctx,
+                    v.as_ref().unwrap_or(&Value::Null),
+                    pool_name,
+                    ingress_protocol,
+                    wants_stream,
+                    caller_token,
+                    resolved_gov_key,
+                )
+                .await;
+                match outcome {
+                    // The policy returned a usable ranked order — record its name (for the
+                    // `x-busbar-route-policy` header + the metric) and hand the order to the ordered walk.
+                    PolicyOutcome::Order { order, name } => {
+                        chosen_policy_name = Some(name);
+                        metrics::counter!(
+                            crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                            "policy" => name,
+                            "pool" => pool_name.to_string(),
+                        )
+                        .increment(1);
+                        Some(order)
+                    }
+                    // Abstain / error-coerced-to-weighted: fall through to today's exact SWRR.
+                    PolicyOutcome::Weighted => None,
+                    // on_error == reject (and the policy errored/timed out / saturated): fail closed with a
+                    // 503 rather than silently degrading. Never strands as a hang — a clean rejection.
+                    PolicyOutcome::Reject => {
+                        return gate_rejected(ingress_error(
+                            ingress_protocol,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            KIND_OVERLOADED,
+                            "The routing policy could not select an upstream. Please retry \
+                             shortly.",
+                        ));
+                    }
+                    // The hook's REJECT verb: a deliberate, first-class policy decision (a guardrail /
+                    // PII screen said no) — a 4xx to the caller, no upstream dispatched, and an
+                    // operator-visible counter. `status` was clamped to 400..=499 and `message`
+                    // sanitized at the seam that constructed the outcome (for every producer, wire or
+                    // direct), so this arm can trust both.
+                    PolicyOutcome::RejectRequest {
+                        status,
+                        message,
+                        name,
+                    } => {
+                        // The `status` label is hook-influenced but BOUNDED: the seam that built this
+                        // outcome clamps it to 400..=499 for every producer, so the worst-case series
+                        // fan-out is 100 per (policy, pool).
+                        metrics::counter!(
+                            crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                            "policy" => name,
+                            "pool" => pool_name.to_string(),
+                            "status" => status.to_string(),
+                        )
+                        .increment(1);
+                        // The message is safe to log: the seam that built this outcome sanitized it
+                        // (control/invisible chars stripped, length capped — for EVERY producer, not
+                        // just the wire transports), and it is the exact string the CLIENT receives.
+                        tracing::info!(
+                            policy = name,
+                            pool = pool_name,
+                            status,
+                            message = %message,
+                            "routing policy rejected the request"
+                        );
+                        return gate_rejected(ingress_error(
+                            ingress_protocol,
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                            reject_kind_for_status(status),
+                            &message,
+                        ));
+                    }
+                    // The hook's RESTRICT verb: intersect the failover candidate set with members
+                    // carrying one of `tags_any`, then let SWRR pick among the survivors. Shrinking
+                    // `cands` here makes the restriction PERSIST across every failover hop (each hop
+                    // selects from this set) — the compliance guarantee ("only these lanes, ever"). An
+                    // EMPTY intersection is fail-closed (`on_empty` default reject), never allow-all;
+                    // an empty `tags_any` (fail-closed-normalized malformed restrict) forces it.
+                    PolicyOutcome::Restrict {
+                        tags_any,
+                        name,
+                        on_empty,
+                    } => {
+                        // Capture this restrict so it PERSISTS across a `fallback_pool` hop, exactly
+                        // as the GATE reconcile arm does. Shrinking `cands` below only covers in-pool
+                        // failover; the fallback pool rebuilds candidates independently and consults
+                        // `enforce_restricts`. The gate arm was the c1r13 fix; this BASE routing-policy
+                        // arm (pool `route:` hook) is the sibling path that was still leaking a
+                        // compliance restrict at the pool boundary. (found: audit c1r14.)
+                        request_ctx.active_restricts.push(RestrictConstraint {
+                            tags_any: tags_any.clone(),
+                            on_empty: on_empty.clone(),
+                            name,
+                        });
+                        let members = app.pool_runtime.get(pool_name).map(|r| &r.members);
+                        // Filter into a temp so the ORIGINAL `cands` survives for a weighted on_empty
+                        // escape; only commit the restriction when the intersection is non-empty.
+                        let restricted: Vec<WeightedLane> = cands
+                            .iter()
+                            .filter(|wl| {
+                                members.and_then(|m| m.get(&wl.idx)).is_some_and(|meta| {
+                                    meta.tags.iter().any(|t| tags_any.iter().any(|w| w == t))
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        if restricted.is_empty() {
+                            // Empty intersection → the gate's `on_empty`. `Weighted` is the advisory escape
+                            // (leave `cands` as the full pool → SWRR); default (and `First`, which has no
+                            // eligible "first") is fail-closed reject.
+                            if matches!(on_empty, crate::config::PolicyOnError::Weighted) {
+                                tracing::info!(
+                                policy = name,
+                                pool = pool_name,
+                                "routing policy restrict left no eligible lane; on_empty: weighted \
+                                 escape to full-pool SWRR"
+                            );
+                                None
+                            } else {
+                                metrics::counter!(
+                                    crate::metrics::ROUTE_POLICY_REJECTIONS_TOTAL,
+                                    "policy" => name,
+                                    "pool" => pool_name.to_string(),
+                                    "status" => "503".to_string(),
+                                )
+                                .increment(1);
+                                tracing::info!(
+                                policy = name,
+                                pool = pool_name,
+                                "routing policy restrict left no eligible lane (on_empty: reject)"
+                            );
+                                return gate_rejected(ingress_error(
+                                    ingress_protocol,
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    KIND_OVERLOADED,
+                                    "No upstream satisfies the routing policy's restriction. \
+                                     Please retry shortly.",
+                                ));
+                            }
+                        } else {
+                            // Commit the restriction: shrink `cands` to the survivors so it PERSISTS
+                            // across every failover hop, then let SWRR pick among them.
+                            cands = restricted;
+                            chosen_policy_name = Some(name);
+                            metrics::counter!(
+                                crate::metrics::ROUTE_POLICY_SELECTIONS_TOTAL,
+                                "policy" => name,
+                                "pool" => pool_name.to_string(),
+                            )
+                            .increment(1);
+                            None
+                        }
+                    }
                 }
             }
         }
@@ -2705,8 +3863,39 @@ pub(crate) async fn forward_with_pool_parsed(
     // the retained `body` bytes — never from a previous hop's egress-shaped Value — preserving the
     // mixed-protocol-pool correctness the per-hop re-parse was introduced for.
     let body_is_json = v.is_some();
+    // ── STAGE TAPS: route + attempt shape ── captured ONCE (scalars only, so it survives `v`
+    // moving into the first hop). Fire the `route` taps now: the decision reconcile + base ordering
+    // above produced the FINAL candidate set for dispatch. ZERO COST when no stage tap is configured.
+    let stage_shape = if app.tap_hooks_route.is_empty() && app.tap_hooks_attempt.is_empty() {
+        None
+    } else {
+        Some(capture_stage_shape(
+            v.as_ref(),
+            pool_name,
+            ingress_protocol,
+            wants_stream,
+        ))
+    };
+    if let Some(shape) = &stage_shape {
+        fire_stage_taps(
+            &app.tap_hooks_route,
+            shape,
+            crate::routing::wire::HookStageProjection {
+                at: "route",
+                target: None,
+                attempt_number: None,
+                remaining_candidates: Some(cands.len()),
+                previous_failure: None,
+                outcome: None,
+                status: None,
+            },
+        );
+    }
+    // Why the PREVIOUS attempt failed — feeds the attempt-stage tap payload (the failover story).
+    let mut last_failure: Option<&'static str> = None;
+
     let mut first_hop_v = v;
-    for _attempt in 0..=max_cap {
+    for attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
         if request_ctx.expired(now()) {
             return ingress_error(
@@ -2760,6 +3949,31 @@ pub(crate) async fn forward_with_pool_parsed(
 
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
+
+        // ── STAGE TAPS: attempt ── the full failover story, per dispatch attempt: which lane,
+        // which attempt number, how many candidates remain untried, and why the previous attempt
+        // failed (None on the first).
+        if let Some(shape) = &stage_shape {
+            let remaining = cands
+                .iter()
+                .filter(|wl| !request_ctx.excluded.contains(&wl.idx))
+                .count();
+            fire_stage_taps(
+                &app.tap_hooks_attempt,
+                shape,
+                crate::routing::wire::HookStageProjection {
+                    at: "attempt",
+                    target: Some(&app.lanes[i].model),
+                    attempt_number: Some(
+                        u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX),
+                    ),
+                    remaining_candidates: Some(remaining),
+                    previous_failure: last_failure,
+                    outcome: None,
+                    status: None,
+                },
+            );
+        }
 
         // The bounded `pool` LABEL for THIS hop's upstream/failover/breaker metrics (LOW #25).
         // Resolves to the routed lane's model name on the default (`""`) cell so these series
@@ -2840,7 +4054,7 @@ pub(crate) async fn forward_with_pool_parsed(
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
-        let key = match app.auth_mode() {
+        let key = match app.upstream_creds() {
             // Passthrough forwards the CALLER's credential upstream. When the caller presents NO
             // credential, fall back to an EMPTY credential — NOT the lane operator's `api_key`
             // (LOW #15 SECURITY): borrowing the operator key would let an unauthenticated caller
@@ -2849,8 +4063,8 @@ pub(crate) async fn forward_with_pool_parsed(
             // lane penalty), matching the documented passthrough contract. No-op in canonical
             // keyless passthrough (lane.api_key already empty); only changes the misconfigured
             // passthrough+configured-key case.
-            crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
-            crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
+            crate::auth::UpstreamCreds::Passthrough => caller_token.unwrap_or(""),
+            crate::auth::UpstreamCreds::Own => &app.lanes[i].api_key,
         };
 
         // per-request auth (SigV4 for Bedrock; static for others) needs the host/path/body.
@@ -2886,7 +4100,7 @@ pub(crate) async fn forward_with_pool_parsed(
             canonical_uri,
             body: &payload,
             timestamp_epoch: now(),
-            auth_mode: app.auth_mode(),
+            upstream_creds: app.upstream_creds(),
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
@@ -2985,6 +4199,7 @@ pub(crate) async fn forward_with_pool_parsed(
                             attempt_timeout_ms = ms,
                             "no response headers within the attempt cap; failing over"
                         );
+                        last_failure = Some("attempt_timeout");
                         drop(permit);
                         continue;
                     }
@@ -3025,6 +4240,7 @@ pub(crate) async fn forward_with_pool_parsed(
                     "reason" => err_type.to_string()
                 )
                 .increment(1);
+                last_failure = Some(err_type);
                 drop(permit);
                 continue;
             }
@@ -3035,8 +4251,8 @@ pub(crate) async fn forward_with_pool_parsed(
                 if !status.is_success() {
                     // caveat: passthrough 401/403 is caller's key failing, not busbar's
                     // Do NOT trip breaker / change member health; relay verbatim to caller
-                    let auth_mode = app.auth_mode();
-                    let is_passthrough_40x = auth_mode == crate::auth::AuthMode::Passthrough
+                    let is_passthrough_40x = app.upstream_creds()
+                        == crate::auth::UpstreamCreds::Passthrough
                         && (status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN);
 
                     // Clone headers before consuming r with bytes(). The upstream `Retry-After`
@@ -3257,6 +4473,7 @@ pub(crate) async fn forward_with_pool_parsed(
                                 "reason" => DISPOSITION_TRANSIENT
                             )
                             .increment(1);
+                            last_failure = Some(DISPOSITION_TRANSIENT);
                             drop(permit);
                             continue;
                         }
@@ -3361,6 +4578,7 @@ pub(crate) async fn forward_with_pool_parsed(
                                 "reason" => DISPOSITION_HARD_DOWN
                             )
                             .increment(1);
+                            last_failure = Some(DISPOSITION_HARD_DOWN);
                             continue;
                         }
                         Disposition::ContextLength => {
@@ -3405,6 +4623,7 @@ pub(crate) async fn forward_with_pool_parsed(
                             // HalfOpen until the slow out-of-band prober rescues it. Release it so the
                             // lane is immediately probe-eligible again for normal-size requests.
                             app.store.release_probe_in(pool_name, i);
+                            last_failure = Some(DISPOSITION_CONTEXT_LENGTH);
                             drop(permit);
                             continue;
                         }
@@ -4045,6 +5264,11 @@ async fn forward_once(
     op: crate::handlers::Op,
     req_content_type: &str,
     usage_sink: Option<UsageSink>,
+    // The selected pool member's `reasoning` override (`WeightedLane.reasoning`), resolved by the
+    // caller from its candidate slice. `None` = no member override → fall back to the lane flag. The
+    // degraded path has no `cands` in scope, so the caller passes the already-resolved override here
+    // (mirrors the hot path's `effective_reasoning`). (found: audit c2r3.)
+    reasoning_override: Option<bool>,
 ) -> Result<Response, ()> {
     // Re-parse body for per-lane model rewriting. An OPAQUE (non-JSON) body — multipart/binary
     // operations — parses to `None` and relays/translates at the byte level, exactly like the main
@@ -4119,8 +5343,9 @@ async fn forward_once(
         op,
         v,
         req_content_type,
-        // Degraded path selects by pool cell, not member row: lane-level flag only.
-        app.lanes[i].reasoning,
+        // Honor the pool member's `reasoning` override (as the hot path does via
+        // `effective_reasoning`), falling back to the lane-level flag. (found: audit c2r3.)
+        reasoning_override.unwrap_or(app.lanes[i].reasoning),
         body,
     ) {
         Ok(p) => p,
@@ -4135,7 +5360,7 @@ async fn forward_once(
     let base = &app.lanes[i].base_url;
 
     // Mode-aware key selection: passthrough uses caller token, others use lane's api_key.
-    let key = match app.auth_mode() {
+    let key = match app.upstream_creds() {
         // Passthrough forwards the CALLER's credential upstream. When the caller presents NO
         // credential, fall back to an EMPTY credential — NOT the lane operator's `api_key`
         // (LOW #15 SECURITY): borrowing the operator key would let an unauthenticated caller
@@ -4144,8 +5369,8 @@ async fn forward_once(
         // lane penalty), matching the documented passthrough contract. No-op in canonical
         // keyless passthrough (lane.api_key already empty); only changes the misconfigured
         // passthrough+configured-key case.
-        crate::auth::AuthMode::Passthrough => caller_token.unwrap_or(""),
-        crate::auth::AuthMode::Token | crate::auth::AuthMode::None => &app.lanes[i].api_key,
+        crate::auth::UpstreamCreds::Passthrough => caller_token.unwrap_or(""),
+        crate::auth::UpstreamCreds::Own => &app.lanes[i].api_key,
     };
 
     // per-request auth (SigV4 for Bedrock; static otherwise).
@@ -4174,7 +5399,7 @@ async fn forward_once(
         canonical_uri,
         body: &payload,
         timestamp_epoch: now(),
-        auth_mode: app.auth_mode(),
+        upstream_creds: app.upstream_creds(),
     };
     let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
 
@@ -4788,6 +6013,28 @@ async fn handle_fallback_pool(
         return handle_status_503(&app, &[], now(), pool_name, ingress_protocol);
     };
 
+    // Re-apply any compliance restrict from the primary pool against THIS fallback pool's own member
+    // tags — the fallback pool is an independent membership, so without this the "restrictions hold
+    // across failover" guarantee would break at the pool boundary. Fail closed (503) if a required
+    // restrict leaves no eligible fallback lane. (found: audit c1r13.)
+    let fallback_cands = match request_ctx.enforce_restricts(&app, pool_name, fallback_cands) {
+        Ok(c) => c,
+        Err(name) => {
+            tracing::info!(
+                policy = name,
+                pool = pool_name,
+                "compliance restrict left no eligible lane in the fallback pool; fail closed \
+                 rather than spill to an ineligible upstream"
+            );
+            return gate_rejected(ingress_error(
+                ingress_protocol,
+                StatusCode::SERVICE_UNAVAILABLE,
+                KIND_OVERLOADED,
+                "No upstream satisfies a required gate's restriction. Please retry shortly.",
+            ));
+        }
+    };
+
     // Mark before re-entering so a cycle back to this pool is detected.
     request_ctx.mark_pool_visited(pool_name);
 
@@ -4846,6 +6093,11 @@ async fn handle_fallback_pool(
             // Clone per attempt: a transient transport failure retries the next member, so the sink
             // must survive into the next loop iteration; only a successful stream consumes it.
             usage_sink.clone(),
+            // The selected member's `reasoning` override from this fallback pool's candidate slice.
+            fallback_cands
+                .iter()
+                .find(|w| w.idx == i)
+                .and_then(|w| w.reasoning),
         )
         .await
         {
@@ -4905,6 +6157,11 @@ async fn handle_least_bad(
         op,
         req_content_type,
         usage_sink,
+        // The least-bad member's `reasoning` override from this pool's candidate slice.
+        cands
+            .iter()
+            .find(|w| w.idx == soonest_idx)
+            .and_then(|w| w.reasoning),
     )
     .await
     {
@@ -4918,6 +6175,200 @@ mod usage_tap_tests {
     use super::{record_ir_usage, stable_hash, UsageSink};
     use crate::ir::IrUsage;
     use std::sync::Arc;
+
+    /// `apply_rewrite_to_body` replaces the `messages` array + injects tools on a chat-shaped body,
+    /// and is FAIL-SAFE — a body with no `messages` array (or an empty rewrite) is left UNTOUCHED and
+    /// returns false, so the request proceeds with the original body.
+    #[test]
+    fn apply_rewrite_to_body_swaps_messages_and_is_fail_safe() {
+        use crate::routing::wire::RewriteReply;
+
+        // Chat-shaped body → messages replaced, tool injected (appended to existing tools).
+        let mut v = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "a very long original prompt"}],
+            "tools": [{"name": "existing"}]
+        });
+        let rw = RewriteReply {
+            messages: vec![serde_json::json!({"role": "user", "content": "compressed"})],
+            tools: vec![serde_json::json!({"name": "headroom_retrieve"})],
+        };
+        assert!(super::apply_rewrite_to_body(&mut v, &rw, "openai"));
+        assert_eq!(
+            v["messages"],
+            serde_json::json!([{"role":"user","content":"compressed"}])
+        );
+        assert_eq!(
+            v["tools"].as_array().unwrap().len(),
+            2,
+            "tool injected, existing kept"
+        );
+        assert_eq!(v["model"], "m", "unrelated fields untouched");
+
+        // No `messages` array (e.g. gemini `contents`) → untouched, returns false.
+        let mut g = serde_json::json!({"contents": [{"parts": []}]});
+        let before = g.clone();
+        assert!(!super::apply_rewrite_to_body(&mut g, &rw, "openai"));
+        assert_eq!(g, before, "non-chat body left untouched (fail-safe)");
+
+        // Empty rewrite → untouched, false.
+        let mut v2 = serde_json::json!({"messages": [{"role":"user","content":"x"}]});
+        let before2 = v2.clone();
+        let empty = RewriteReply {
+            messages: vec![],
+            tools: vec![],
+        };
+        assert!(!super::apply_rewrite_to_body(&mut v2, &empty, "openai"));
+        assert_eq!(v2, before2);
+    }
+
+    /// Per-dialect rewrite rendering: bedrock re-frames into content BLOCKS (the load-bearing arm
+    /// — a verbatim insert corrupts its shape), gemini into contents/parts with the role mapping,
+    /// responses into the input list; a non-text rewrite message aborts untouched.
+    #[test]
+    fn apply_rewrite_renders_per_dialect() {
+        use crate::routing::wire::RewriteReply;
+        let rw = RewriteReply {
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "compressed"}),
+                serde_json::json!({"role": "assistant", "content": "prior"}),
+            ],
+            tools: vec![],
+        };
+
+        // bedrock: {role, content:[{text}]} blocks.
+        let mut b = serde_json::json!({"messages": [{"role":"user","content":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(&mut b, &rw, "bedrock"));
+        assert_eq!(b["messages"][0]["content"][0]["text"], "compressed");
+        assert_eq!(b["messages"][1]["content"][0]["text"], "prior");
+
+        // gemini: contents/parts + assistant→model.
+        let mut g = serde_json::json!({"contents": [{"role":"user","parts":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(&mut g, &rw, "gemini"));
+        assert_eq!(g["contents"][0]["parts"][0]["text"], "compressed");
+        assert_eq!(g["contents"][1]["role"], "model");
+
+        // responses: input list (string input replaced).
+        let mut r = serde_json::json!({"input": "orig"});
+        assert!(super::apply_rewrite_to_body(&mut r, &rw, "responses"));
+        assert_eq!(r["input"][0]["content"], "compressed");
+
+        // Fail-safe: a rewrite message with NON-string content aborts a re-framing dialect
+        // untouched.
+        let blocky = RewriteReply {
+            messages: vec![serde_json::json!({"role":"user","content":[{"type":"text"}]})],
+            tools: vec![],
+        };
+        let mut b2 = serde_json::json!({"messages": [{"role":"user","content":[{"text":"orig"}]}]});
+        let before = b2.clone();
+        assert!(!super::apply_rewrite_to_body(&mut b2, &blocky, "bedrock"));
+        assert_eq!(b2, before, "non-text rewrite leaves bedrock untouched");
+    }
+
+    /// REGRESSION (audit c1r14): the gemini rewrite-hook role vocabulary must round-trip. Gemini
+    /// assistant turns are natively `role: "model"`; the projection now CANONICALIZES that to
+    /// `assistant` (so the hook sees canonical IR), AND the write-back accepts BOTH `assistant` and
+    /// `model` — so a hook that echoes the role it received no longer corrupts assistant turns into
+    /// user turns.
+    #[test]
+    fn gemini_rewrite_role_round_trips_model_and_assistant() {
+        use crate::routing::wire::RewriteReply;
+
+        // Projection canonicalizes the gemini-native `model` role to `assistant`.
+        let g_body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [{"text": "hello"}]}
+            ]
+        });
+        let p = super::build_prompt_projection(&g_body, "gemini");
+        assert_eq!(
+            p.messages[1].0, "assistant",
+            "a gemini `model` turn must project as canonical `assistant`, not leak `model`"
+        );
+
+        // Write-back: a hook reply echoing the gemini-native `model` role must map back to `model`,
+        // NOT fall through to `user`.
+        let echo_model = RewriteReply {
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "u"}),
+                serde_json::json!({"role": "model", "content": "m"}),
+            ],
+            tools: vec![],
+        };
+        let mut g = serde_json::json!({"contents": [{"role":"user","parts":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(&mut g, &echo_model, "gemini"));
+        assert_eq!(
+            g["contents"][1]["role"], "model",
+            "a hook echoing `model` must round-trip to `model`, not corrupt to `user`"
+        );
+        // Canonical `assistant` still works too.
+        let echo_assistant = RewriteReply {
+            messages: vec![serde_json::json!({"role": "assistant", "content": "a"})],
+            tools: vec![],
+        };
+        let mut g2 = serde_json::json!({"contents": [{"role":"user","parts":[{"text":"orig"}]}]});
+        assert!(super::apply_rewrite_to_body(
+            &mut g2,
+            &echo_assistant,
+            "gemini"
+        ));
+        assert_eq!(g2["contents"][0]["role"], "model");
+    }
+
+    /// `apply_global_rewrites` fires the hooks in order and each sees the prior's output (a true
+    /// transform chain): a two-hook chain where hook A rewrites "orig"→"A" and hook B rewrites
+    /// whatever it sees →"B" ends at "B", proving B ran on A's output.
+    #[tokio::test]
+    async fn apply_global_rewrites_chains_in_order() {
+        use crate::routing::wire::RewriteReply;
+        use crate::routing::{
+            Candidate, PolicyResult, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
+        };
+
+        // A mock rewrite hook that replaces the (single) message content with a fixed marker.
+        struct RewriteMock(&'static str);
+        #[async_trait::async_trait]
+        impl RoutingPolicy for RewriteMock {
+            async fn decide(
+                &self,
+                _r: &RoutingRequest<'_>,
+                _c: &[Candidate<'_>],
+                _x: &RoutingContext<'_>,
+                _b: std::time::Duration,
+            ) -> PolicyResult {
+                Ok(RoutingDecision::Abstain)
+            }
+            fn name(&self) -> &'static str {
+                "mock-rewrite"
+            }
+            async fn transform(
+                &self,
+                _req: &RoutingRequest<'_>,
+                _budget: std::time::Duration,
+            ) -> Option<RewriteReply> {
+                Some(RewriteReply {
+                    messages: vec![serde_json::json!({"role": "user", "content": self.0})],
+                    tools: vec![],
+                })
+            }
+        }
+
+        let hooks: Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> = vec![
+            (
+                std::time::Duration::from_millis(50),
+                Arc::new(RewriteMock("A")),
+            ),
+            (
+                std::time::Duration::from_millis(50),
+                Arc::new(RewriteMock("B")),
+            ),
+        ];
+        let mut v = serde_json::json!({"messages": [{"role": "user", "content": "orig"}]});
+        super::apply_global_rewrites(&hooks, &mut v, "pool", "anthropic", false).await;
+        // Last hook in the chain wins; B ran on A's rewritten body.
+        assert_eq!(v["messages"][0]["content"], "B");
+    }
 
     // Regression for #29: the token fee charged at response completion must be attributed to the
     // SAME budget window the request was admitted in (`UsageSink::charged_at`, the header-arrival
@@ -5515,6 +6966,7 @@ mod auth_style_tests {
     fn lane_with_auth(auth: Option<&str>) -> Lane {
         Lane {
             reasoning: false,
+            prompt_caching: false,
             default_max_tokens: None,
             model: "gpt-4o".to_string(),
             provider: "azure".to_string(),
@@ -5544,7 +6996,7 @@ mod auth_style_tests {
             canonical_uri: "/openai/deployments/gpt-4o/chat/completions".to_string(),
             body,
             timestamp_epoch: 0,
-            auth_mode: crate::auth::AuthMode::Token,
+            upstream_creds: crate::auth::UpstreamCreds::Own,
         }
     }
 
@@ -5823,6 +7275,7 @@ mod max_tokens_precedence_tests {
     fn anthropic_lane(default_max_tokens: Option<u32>) -> Lane {
         Lane {
             reasoning: false,
+            prompt_caching: false,
             default_max_tokens,
             model: "claude".to_string(),
             provider: "anthropic".to_string(),
@@ -5856,6 +7309,7 @@ mod max_tokens_precedence_tests {
             global_default_max_tokens: global,
             reasoning_allowed: true,
             reasoning_budgets: crate::ir::REASONING_BUDGET_DEFAULTS,
+            prompt_caching_allowed: true,
         };
         let apply = |ir: IrRequest, lane: &Lane, global: u32| -> Option<u32> {
             let mut req = IrReq::Chat(ir);
@@ -7469,7 +8923,8 @@ mod ingress_indistinguishability_tests {
         // Passthrough mode + a MISCONFIGURED lane that DOES carry an operator key. Lane speaks OpenAI
         // (Bearer auth), ingress same-protocol openai.
         let passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             ..AuthCfg::default_none()
         };
         let app = TestApp::new()
@@ -8359,7 +9814,8 @@ data: {"type":"message_stop"}"#
 
         // Passthrough auth mode + anthropic lane, same-protocol anthropic ingress.
         let passthrough = AuthCfg {
-            mode: crate::auth::AuthMode::Passthrough,
+            chain: vec![],
+            upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
             ..AuthCfg::default_none()
         };
         let app = TestApp::new()
@@ -10143,6 +11599,7 @@ mod probe_guard_tests {
     fn lane(max: usize) -> LaneData {
         LaneData {
             reasoning: false,
+            prompt_caching: false,
             model: "m0".into(),
             provider: "p0".into(),
             max,
@@ -10239,7 +11696,7 @@ mod hook_opt_in_projection_tests {
                 ]}
             ]
         });
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.system.as_deref(), Some("be brief"));
         assert_eq!(
             p.messages,
@@ -10262,15 +11719,15 @@ mod hook_opt_in_projection_tests {
             "system": [{"type": "text", "text": "sys a"}, {"type": "text", "text": "sys b"}],
             "messages": []
         });
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.system.as_deref(), Some("sys a\nsys b"));
 
         let v: Value = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.system, None);
 
         // A non-JSON / bodyless request (v == Null) projects empty, never panics.
-        let p = build_prompt_projection(&Value::Null);
+        let p = build_prompt_projection(&Value::Null, "anthropic");
         assert_eq!(p.system, None);
         assert!(p.messages.is_empty());
     }
@@ -10287,7 +11744,7 @@ mod hook_opt_in_projection_tests {
                 {"content": "no role on this one"}
             ]
         });
-        let p = build_prompt_projection(&v);
+        let p = build_prompt_projection(&v, "anthropic");
         assert_eq!(p.messages.len(), 2, "media-only entries must not vanish");
         assert_eq!(p.messages[0].0, "user");
         assert_eq!(p.messages[0].1, "", "media-only turn reads as empty text");
@@ -10304,14 +11761,162 @@ mod hook_opt_in_projection_tests {
             "system": [{"type": "text", "text": "abcde"}, {"type": "text", "text": "fgh"}],
             "messages": []
         });
-        assert_eq!(system_text_chars(&v), 8);
-        let p = build_prompt_projection(&v);
+        assert_eq!(system_text_chars(&v, "anthropic"), 8);
+        let p = build_prompt_projection(&v, "anthropic");
         // The flattened projection joins with a newline; the SIZE signal counts text only.
         assert_eq!(p.system.as_deref(), Some("abcde\nfgh"));
 
         let v: Value = serde_json::json!({"system": "plain", "messages": []});
-        assert_eq!(system_text_chars(&v), 5);
-        assert_eq!(system_text_chars(&Value::Null), 0);
+        assert_eq!(system_text_chars(&v, "anthropic"), 5);
+        assert_eq!(system_text_chars(&Value::Null, "anthropic"), 0);
+    }
+
+    /// REGRESSION (audit c1r4): the projection read-path was blind to GEMINI ingress — it read
+    /// only `messages`/`system`, so a gemini body (`contents`/`systemInstruction`/`parts`)
+    /// projected EMPTY: a rewrite gate saw `message_count: 0` with no prompt and silently
+    /// no-oped. The read side must mirror the dialects `apply_rewrite_to_body` writes.
+    #[test]
+    fn prompt_projection_reads_gemini_contents() {
+        let v: Value = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "be brief"}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "hello"}]},
+                {"role": "model", "parts": [
+                    {"text": "part one"},
+                    {"inlineData": {"mimeType": "image/png", "data": "AAAA"}},
+                    {"text": "part two"}
+                ]}
+            ]
+        });
+        let p = build_prompt_projection(&v, "gemini");
+        assert_eq!(p.system.as_deref(), Some("be brief"));
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".into(), "hello".into()),
+                // Gemini-native `model` is CANONICALIZED to `assistant` for the hook's IR view
+                // (audit c1r14) — the hook sees the same vocabulary on every dialect.
+                ("assistant".into(), "part one\npart two".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
+        );
+        // SIZE signals agree with the projection (minus join separators).
+        assert_eq!(system_text_chars(&v, "gemini"), 8);
+        assert_eq!(turn_count(&v, "gemini"), 2);
+        assert_eq!(total_text_chars(&v, "gemini", 8), 8 + 5 + 16);
+        // And the rewrite-request projection (the gate's view) is POPULATED, not blind.
+        let req = build_rewrite_request(&v, "p", "gemini", false, true);
+        assert_eq!(req.message_count, 2);
+        assert!(req.total_chars > 0);
+        assert_eq!(req.prompt.as_ref().unwrap().messages.len(), 2);
+    }
+
+    /// REGRESSION (audit c1r4), Responses-API half: `input` (list OR bare string) and
+    /// `instructions` must project — the old read-path saw neither.
+    #[test]
+    fn prompt_projection_reads_responses_input() {
+        let v: Value = serde_json::json!({
+            "instructions": "be brief",
+            "input": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "hi there"}]}
+            ]
+        });
+        let p = build_prompt_projection(&v, "responses");
+        assert_eq!(p.system.as_deref(), Some("be brief"));
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".into(), "hello".into()),
+                ("assistant".into(), "hi there".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
+        );
+        assert_eq!(system_text_chars(&v, "responses"), 8);
+        assert_eq!(turn_count(&v, "responses"), 2);
+
+        // A bare-string `input` is ONE implicit user turn — in the projection AND the count.
+        let v: Value = serde_json::json!({"input": "just a question"});
+        let p = build_prompt_projection(&v, "responses");
+        assert_eq!(
+            p.messages,
+            vec![("user".into(), "just a question".into())]
+                as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>
+        );
+        assert_eq!(turn_count(&v, "responses"), 1);
+        assert_eq!(total_text_chars(&v, "responses", 0), 15);
+
+        let req = build_rewrite_request(&v, "p", "responses", false, true);
+        assert_eq!(req.message_count, 1);
+        assert_eq!(req.total_chars, 15);
+
+        // REGRESSION (audit c1r9): TOP-LEVEL typed items in `input[]` carry text at the item ROOT
+        // (`{type:"input_text", text}`), not under `content`. They must project (not blank) and
+        // count toward the SIZE signal, with role inferred from `type`.
+        let v: Value = serde_json::json!({
+            "input": [
+                {"type": "input_text", "text": "hello"},
+                {"type": "output_text", "text": "hi back"}
+            ]
+        });
+        let p = build_prompt_projection(&v, "responses");
+        assert_eq!(
+            p.messages,
+            vec![
+                ("user".into(), "hello".into()),
+                ("assistant".into(), "hi back".into()),
+            ] as Vec<(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)>,
+            "top-level input_text/output_text items must project with inferred roles, not blank"
+        );
+        assert_eq!(
+            total_text_chars(&v, "responses", 0),
+            5 + 7,
+            "top-level item text must count toward the size signal, not read as 0"
+        );
+        let req = build_rewrite_request(&v, "p", "responses", false, true);
+        assert_eq!(req.message_count, 2);
+        assert_eq!(req.total_chars, 12);
+    }
+
+    /// REGRESSION (audit c1r7): the `max_tokens` routing SIZE signal must be dialect-aware. The
+    /// Responses API names it `max_output_tokens`, so reading `max_tokens` unconditionally projected
+    /// `None` for every responses-ingress request — silently blinding any routing policy/tap that
+    /// keys on the size signal. Non-responses dialects still read `max_tokens`.
+    #[test]
+    fn max_tokens_signal_is_dialect_aware_for_responses() {
+        // Responses ingress: only `max_output_tokens` is present.
+        let resp: Value = serde_json::json!({"input": "hi", "max_output_tokens": 4096});
+        assert_eq!(max_tokens_for(&resp, "responses"), Some(4096));
+        // A stray `max_tokens` on a responses body is NOT the signal — the dialect ignores it.
+        let resp_stray: Value =
+            serde_json::json!({"input": "hi", "max_tokens": 999, "max_output_tokens": 4096});
+        assert_eq!(max_tokens_for(&resp_stray, "responses"), Some(4096));
+        // The routing projection is now populated for a responses request.
+        let req = build_rewrite_request(&resp, "p", "responses", false, true);
+        assert_eq!(req.max_tokens, Some(4096));
+
+        // Every other dialect keeps reading `max_tokens`.
+        let anth: Value = serde_json::json!({"messages": [], "max_tokens": 512});
+        assert_eq!(max_tokens_for(&anth, "anthropic"), Some(512));
+        assert_eq!(max_tokens_for(&anth, "gemini"), Some(512));
+        // Absurd cap saturates rather than wrapping.
+        let huge: Value = serde_json::json!({"max_tokens": u64::MAX});
+        assert_eq!(max_tokens_for(&huge, "anthropic"), Some(u32::MAX));
+    }
+
+    /// Bedrock ingress rides the `messages` default: its `content: [{text}]` blocks (no `type`
+    /// key) flatten via the same text-keyed match as Anthropic blocks.
+    #[test]
+    fn prompt_projection_reads_bedrock_messages() {
+        let v: Value = serde_json::json!({
+            "system": [{"text": "sys"}],
+            "messages": [
+                {"role": "user", "content": [{"text": "hello"}, {"text": "again"}]}
+            ]
+        });
+        let p = build_prompt_projection(&v, "bedrock");
+        assert_eq!(p.system.as_deref(), Some("sys"));
+        assert_eq!(p.messages[0].1, "hello\nagain");
+        assert_eq!(turn_count(&v, "bedrock"), 1);
+        assert_eq!(total_text_chars(&v, "bedrock", 3), 3 + 10);
     }
 
     /// `body_end_user` is dialect-aware: OpenAI `user` first, Anthropic `metadata.user_id` second,
@@ -10433,9 +12038,11 @@ mod hook_seam_tests {
                 reject,
             }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt,
             send_user,
+            on_empty: crate::config::PolicyOnError::Reject,
         };
         let cands = vec![WeightedLane {
             reasoning: None,
@@ -10453,6 +12060,7 @@ mod hook_seam_tests {
             "p",
             "anthropic",
             false,
+            None,
             None,
         )
         .await;
@@ -10478,6 +12086,1118 @@ mod hook_seam_tests {
         assert!(captured.prompt.is_none(), "send_prompt off ⇒ no prompt");
         assert!(captured.identity.is_none(), "send_user off ⇒ no identity");
         assert!(matches!(out, PolicyOutcome::Weighted), "abstain ⇒ weighted");
+    }
+
+    /// FIRING: a GLOBAL decision gate that rejects short-circuits the whole request — no upstream is
+    /// dispatched (the lane URL is a dead localhost that would fail if reached) and the caller gets the
+    /// gate's clamped 4xx. Proves `App.global_gates` is actually fired in `forward_with_pool_parsed`
+    /// before pool routing, not just resolved.
+    #[tokio::test]
+    async fn global_gate_reject_short_circuits_the_request() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead — a dispatch would fail; the reject must prevent it
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: Arc::new(StdMutex::new(None)),
+                reject: Some((451, "blocked by global policy".to_string())),
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        // Inject the global gate (Arc refcount is 1 right after build()).
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
+
+        let body =
+            serde_json::to_vec(&serde_json::json!({"model": "p", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}))
+                .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            body.into(),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "a global reject gate must short-circuit with its clamped status, before any dispatch"
+        );
+    }
+
+    /// A GLOBAL gate that ABSTAINS does not interfere — the request proceeds past the global-gate loop
+    /// to normal routing (and here fails to connect to the dead lane, i.e. NOT a 451). Proves the
+    /// global-gate loop is a no-op on abstain.
+    #[tokio::test]
+    async fn global_gate_abstain_does_not_reject() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: Arc::new(StdMutex::new(None)),
+                reject: None, // abstain
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
+
+        let body =
+            serde_json::to_vec(&serde_json::json!({"model": "p", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 10}))
+                .unwrap();
+        let resp = forward_with_pool(
+            app.clone(),
+            vec![WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            body.into(),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+        assert_ne!(
+            resp.status().as_u16(),
+            451,
+            "an abstaining global gate must not reject the request"
+        );
+    }
+
+    /// A canned phase-2 decision for the reconcile tests below.
+    enum Canned {
+        Order(Vec<usize>),
+        Restrict(Vec<String>),
+        Reject(u16, &'static str),
+    }
+
+    /// A test gate returning a fixed decision — the reconcile tests' building block.
+    struct CannedGate {
+        canned: Canned,
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for CannedGate {
+        async fn decide(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            Ok(match &self.canned {
+                Canned::Order(order) => RoutingDecision::Prefer(order.clone()),
+                Canned::Restrict(tags) => RoutingDecision::Restrict {
+                    tags_any: tags.clone(),
+                },
+                Canned::Reject(status, message) => RoutingDecision::Reject {
+                    status: *status,
+                    message: (*message).to_string(),
+                },
+            })
+        }
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    /// Wrap a canned decision as a resolved gate transport (shape-only, fail-closed defaults).
+    fn canned_gate(canned: Canned, name: &'static str) -> ResolvedPolicy {
+        ResolvedPolicy::Policy {
+            policy: Arc::new(CannedGate { canned, name }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        }
+    }
+
+    /// A `PoolRuntime` carrying per-lane tags (for restrict reconciles) and the pool's own gates.
+    fn pool_runtime_with(
+        tags_by_idx: &[(usize, &[&str])],
+        gates: Vec<(u16, ResolvedPolicy)>,
+    ) -> crate::state::PoolRuntime {
+        let mut members = std::collections::HashMap::new();
+        for (idx, tags) in tags_by_idx {
+            members.insert(
+                *idx,
+                crate::state::MemberMeta {
+                    tier: None,
+                    cost_per_mtok: None,
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                },
+            );
+        }
+        crate::state::PoolRuntime {
+            members,
+            failover: None,
+            affinity: None,
+            breaker: None,
+            policy: None,
+            gates,
+            rewrite_hooks: Vec::new(),
+        }
+    }
+
+    /// REGRESSION (audit c1r13, compliance): a `Restrict` gate on the primary pool must persist onto
+    /// a `fallback_pool` hop, re-applied against the FALLBACK pool's own member tags. A required
+    /// (`on_empty: reject`) restrict fails CLOSED when no fallback lane carries the tag; a `weighted`
+    /// restrict is an advisory escape (skip).
+    #[test]
+    fn enforce_restricts_reapplies_compliance_tags_across_pools() {
+        // Fallback pool "fb": lane 0 carries `baa`, lane 1 carries nothing.
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .lane(LaneSpec::new(
+                "m1",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("fb", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "fb",
+                pool_runtime_with(&[(0, &["baa"]), (1, &[])], Vec::new()),
+            )
+            .build();
+        let cands = vec![
+            WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+            WeightedLane {
+                reasoning: None,
+                idx: 1,
+                weight: 1,
+                attempt_timeout_ms: None,
+            },
+        ];
+
+        // A required `baa` restrict narrows the fallback pool to ONLY the tagged lane — the untagged
+        // lane 1 is dropped, so the compliance constraint holds across the pool hop.
+        let mut rc = RequestCtx::new(60);
+        rc.active_restricts.push(RestrictConstraint {
+            tags_any: vec!["baa".to_string()],
+            on_empty: crate::config::PolicyOnError::Reject,
+            name: "baa-gate",
+        });
+        let out = rc.enforce_restricts(&app, "fb", cands.clone()).unwrap();
+        assert_eq!(
+            out.iter().map(|w| w.idx).collect::<Vec<_>>(),
+            vec![0],
+            "only the baa-tagged fallback lane may survive a required restrict"
+        );
+
+        // A required restrict with NO matching fallback lane fails CLOSED (Err), never spills.
+        let mut rc_reject = RequestCtx::new(60);
+        rc_reject.active_restricts.push(RestrictConstraint {
+            tags_any: vec!["hipaa".to_string()],
+            on_empty: crate::config::PolicyOnError::Reject,
+            name: "hipaa-gate",
+        });
+        assert!(
+            rc_reject
+                .enforce_restricts(&app, "fb", cands.clone())
+                .is_err(),
+            "a required restrict with no eligible fallback lane must fail closed, not spill"
+        );
+
+        // A `weighted` restrict with no match is an advisory escape — candidates pass unchanged.
+        let mut rc_weighted = RequestCtx::new(60);
+        rc_weighted.active_restricts.push(RestrictConstraint {
+            tags_any: vec!["hipaa".to_string()],
+            on_empty: crate::config::PolicyOnError::Weighted,
+            name: "hipaa-advisory",
+        });
+        let out = rc_weighted
+            .enforce_restricts(&app, "fb", cands.clone())
+            .unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "a weighted restrict with no eligible lane escapes (candidates unchanged)"
+        );
+
+        // No active restrict → identity.
+        let rc_none = RequestCtx::new(60);
+        assert_eq!(
+            rc_none.enforce_restricts(&app, "fb", cands).unwrap().len(),
+            2
+        );
+    }
+
+    /// REGRESSION (audit c1r14), END-TO-END: a BASE routing-policy (`route:` hook) `Restrict` must
+    /// persist across a `fallback_pool` spill exactly like a gate restrict. Primary pool's only
+    /// baa-eligible lane is dead → the request exhausts and spills to a fallback pool whose lane is
+    /// NOT baa-tagged; the compliance restrict must FAIL CLOSED there, not serve the ineligible lane.
+    #[tokio::test]
+    async fn base_policy_restrict_persists_across_fallback_pool_hop() {
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "primary",
+                    crate::proto::Protocol::anthropic(),
+                    "http://localhost",
+                )
+                .dead("down for test"),
+            )
+            .lane(LaneSpec::new(
+                "fbmember",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime("p", {
+                let mut rt = pool_runtime_with(&[(0, &["baa"])], Vec::new());
+                rt.policy = Some(canned_gate(
+                    Canned::Restrict(vec!["baa".to_string()]),
+                    "compliance",
+                ));
+                rt
+            })
+            .fallback_pool("fb", &[(1, 1)])
+            .pool_runtime("fb", pool_runtime_with(&[(1, &[])], Vec::new()))
+            .on_exhausted("p", crate::config::OnExhausted::FallbackPool("fb".into()))
+            .build();
+
+        let resp = forward_with_pool(
+            app,
+            vec![WeightedLane {
+                reasoning: None,
+                idx: 0,
+                weight: 1,
+                attempt_timeout_ms: None,
+            }],
+            Bytes::from(chat_body()),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "a base-policy compliance restrict must fail closed at the fallback boundary"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("restriction"),
+            "the 503 must be the compliance fail-closed, not a generic transport 503: {text}"
+        );
+    }
+
+    fn chat_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "model": "p",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10
+        }))
+        .unwrap()
+    }
+
+    fn lanes(n: usize) -> Vec<WeightedLane> {
+        (0..n)
+            .map(|idx| WeightedLane {
+                reasoning: None,
+                idx,
+                weight: 1,
+                attempt_timeout_ms: None,
+            })
+            .collect()
+    }
+
+    async fn fire(app: Arc<App>, n_lanes: usize) -> Response {
+        forward_with_pool(
+            app,
+            lanes(n_lanes),
+            chat_body().into(),
+            None,
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::CHAT,
+            None,
+        )
+        .await
+    }
+
+    /// An Anthropic-shaped 200 whose `model` names the serving lane — the observable that tells the
+    /// reconcile tests WHICH lane actually got dispatched.
+    async fn mock_lane(model: &'static str) -> crate::test_support::MockServer {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        for _ in 0..4 {
+            state.push(crate::test_support::MockResponse::Ok {
+                status: StatusCode::OK,
+                body: serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "model": model,
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }),
+            });
+        }
+        crate::test_support::MockServer::new(state).await
+    }
+
+    async fn body_model(resp: Response) -> String {
+        use http_body_util::BodyExt as _;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        v.get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Build a webhook TAP transport pointed at a mock server, as the App stage-tap triple.
+    async fn webhook_tap() -> (
+        crate::test_support::MockServer,
+        Arc<crate::test_support::MockServerState>,
+        (
+            std::time::Duration,
+            bool,
+            Arc<dyn crate::routing::RoutingPolicy>,
+        ),
+    ) {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        for _ in 0..4 {
+            state.push(crate::test_support::MockResponse::Ok {
+                status: StatusCode::OK,
+                body: serde_json::json!({}),
+            });
+        }
+        let server = crate::test_support::MockServer::new(state.clone()).await;
+        let url = crate::observability::validate_routing_webhook_url(Some(&format!(
+            "{}/tap",
+            server.base_url()
+        )))
+        .expect("loopback tap url");
+        let policy: Arc<dyn crate::routing::RoutingPolicy> = Arc::new(
+            crate::routing::webhook::WebhookPolicy::new(url, reqwest::Client::new()),
+        );
+        (
+            server,
+            state,
+            (std::time::Duration::from_millis(500), false, policy),
+        )
+    }
+
+    /// Poll the mock tap server until it records a request body (taps are detached tasks).
+    async fn wait_for_tap_body(state: &crate::test_support::MockServerState) -> serde_json::Value {
+        for _ in 0..200 {
+            if let Some(body) = state.get_last_request_body() {
+                return serde_json::from_slice(&body).expect("tap payload is JSON");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("tap was never delivered");
+    }
+
+    /// STAGE TAPS: an UNAUTHENTICATED request fires the synthetic `rejected_by_auth` completion
+    /// (through the real auth middleware) — audit taps see auth denials too. Requires the tokens
+    /// module (featureless builds have no data-plane auth to reject with).
+    #[cfg(feature = "auth-tokens")]
+    #[tokio::test]
+    async fn completion_tap_fires_synthetic_rejected_by_auth() {
+        crate::metrics::init();
+        let (server, state, tap) = webhook_tap().await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .auth(Arc::new(crate::auth::AuthMiddleware::new(
+                &serde_yaml::from_str::<crate::config::AuthCfg>(
+                    "chain: [tokens]\nclient_tokens: [good-token]\n",
+                )
+                .unwrap(),
+            )))
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_completion = vec![tap];
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/p/v1/messages"))
+            .header("x-api-key", "wrong-token")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "completion");
+        assert_eq!(payload["stage"]["outcome"], "rejected_by_auth");
+        assert_eq!(payload["stage"]["status"], 401);
+        serve.abort();
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (audit c1r6): the completion-tap `status` must be the PROTOCOL-NATIVE auth-failure
+    /// status the client actually receives — not a hardcoded 401. A Gemini ingress bad-key denial is
+    /// HTTP 400 (INVALID_ARGUMENT), so a tap watching it must see 400, matching the served response.
+    /// Gated on the tokens module (featureless builds have no data-plane auth to reject with).
+    #[cfg(feature = "auth-tokens")]
+    #[tokio::test]
+    async fn completion_tap_status_is_protocol_native_gemini_400() {
+        crate::metrics::init();
+        let (server, state, tap) = webhook_tap().await;
+        let mut app = TestApp::new()
+            .auth(Arc::new(crate::auth::AuthMiddleware::new(
+                &serde_yaml::from_str::<crate::config::AuthCfg>(
+                    "chain: [tokens]\nclient_tokens: [good-token]\n",
+                )
+                .unwrap(),
+            )))
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_completion = vec![tap];
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        // Gemini ingress path + bad key → the served response is HTTP 400 (not 401).
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/v1beta/models/gemini-x:generateContent"
+            ))
+            .header("x-goog-api-key", "wrong-key")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400, "gemini bad-key is native 400");
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["outcome"], "rejected_by_auth");
+        assert_eq!(
+            payload["stage"]["status"], 400,
+            "the tap status must match the client-visible native status, not a hardcoded 401"
+        );
+        serve.abort();
+        server.shutdown().await;
+    }
+
+    /// STAGE TAPS: a completion tap fires with the SYNTHETIC `rejected_by_gate` outcome when a
+    /// decision gate rejects — audit taps see denials, not just served requests.
+    #[tokio::test]
+    async fn completion_tap_fires_synthetic_rejected_by_gate() {
+        let (server, state, tap) = webhook_tap().await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.tap_hooks_completion = vec![tap];
+            inner.global_gates = vec![(0u16, canned_gate(Canned::Reject(451, "denied"), "denier"))];
+        }
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 451);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "completion");
+        assert_eq!(payload["stage"]["outcome"], "rejected_by_gate");
+        assert_eq!(payload["stage"]["status"], 451);
+        server.shutdown().await;
+    }
+
+    /// STAGE TAPS: a completion tap reports `ok` + the status for a served request.
+    #[tokio::test]
+    async fn completion_tap_reports_ok_outcome() {
+        let (server, state, tap) = webhook_tap().await;
+        let lane = mock_lane("served").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &lane.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_completion = vec![tap];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "completion");
+        assert_eq!(payload["stage"]["outcome"], "ok");
+        assert_eq!(payload["stage"]["status"], 200);
+        server.shutdown().await;
+        lane.shutdown().await;
+    }
+
+    /// STAGE TAPS: an attempt tap carries the failover story — attempt number + dispatched target.
+    #[tokio::test]
+    async fn attempt_tap_carries_attempt_story() {
+        let (server, state, tap) = webhook_tap().await;
+        let lane = mock_lane("served").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &lane.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app)
+            .expect("sole owner")
+            .tap_hooks_attempt = vec![tap];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "attempt");
+        assert_eq!(payload["stage"]["attempt_number"], 1);
+        assert_eq!(payload["stage"]["target"], "m0");
+        assert!(
+            payload["stage"].get("previous_failure").is_none(),
+            "no failure precedes the first attempt"
+        );
+        server.shutdown().await;
+        lane.shutdown().await;
+    }
+
+    /// STAGE TAPS: a route tap observes the post-reconcile candidate-set size.
+    #[tokio::test]
+    async fn route_tap_reports_surviving_candidates() {
+        let (server, state, tap) = webhook_tap().await;
+        let lane = mock_lane("served").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &lane.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").tap_hooks_route = vec![tap];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let payload = wait_for_tap_body(&state).await;
+        assert_eq!(payload["stage"]["at"], "route");
+        assert_eq!(payload["stage"]["remaining_candidates"], 1);
+        server.shutdown().await;
+        lane.shutdown().await;
+    }
+
+    /// A rewrite-arm test gate: abstains as a decision, rewrites the message content on transform.
+    struct RewritingGate(&'static str);
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for RewritingGate {
+        async fn decide(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            Ok(crate::routing::RoutingDecision::Abstain)
+        }
+        fn name(&self) -> &'static str {
+            "rewriter"
+        }
+        async fn transform(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _budget: std::time::Duration,
+        ) -> Option<crate::routing::wire::RewriteReply> {
+            Some(crate::routing::wire::RewriteReply {
+                messages: vec![serde_json::json!({"role": "user", "content": self.0})],
+                tools: vec![],
+            })
+        }
+    }
+
+    /// REGRESSION (Headroom e2e finding): a committed GLOBAL REWRITE must reach the upstream on a
+    /// SAME-PROTOCOL passthrough. The pristine-bytes short-circuit re-emits the retained request
+    /// bytes verbatim; before the fix those were the PRE-rewrite bytes, so a global compressor's
+    /// output was silently discarded exactly on the fast path.
+    #[tokio::test]
+    async fn same_protocol_passthrough_carries_global_rewrite() {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        state.push(crate::test_support::MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "m0",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        });
+        let server = crate::test_support::MockServer::new(state.clone()).await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(), // anthropic ingress → anthropic lane: same-protocol
+                &server.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").rewrite_hooks = vec![(
+            std::time::Duration::from_millis(500),
+            Arc::new(RewritingGate("COMPRESSED")),
+        )];
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let upstream_body = state
+            .get_last_request_body()
+            .expect("upstream must have been dispatched");
+        let v: Value = serde_json::from_slice(&upstream_body).unwrap();
+        assert_eq!(
+            v["messages"][0]["content"], "COMPRESSED",
+            "the upstream must see the REWRITTEN body on the same-protocol fast path"
+        );
+        server.shutdown().await;
+    }
+
+    /// REGRESSION (Headroom e2e finding): a POOL-scoped `prompt: rw` gate joins the phase-1
+    /// transform pass — its rewrite reaches the upstream (before the fix it fired as a decision
+    /// gate, its rewrite reply normalized to Abstain, and the request paid its deadline for
+    /// nothing).
+    #[tokio::test]
+    async fn pool_scoped_rw_gate_rewrites_the_body() {
+        let state = Arc::new(crate::test_support::MockServerState::new());
+        state.push(crate::test_support::MockResponse::Ok {
+            status: StatusCode::OK,
+            body: serde_json::json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+                "model": "m0",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        });
+        let server = crate::test_support::MockServer::new(state.clone()).await;
+        let mut rt = pool_runtime_with(&[], Vec::new());
+        rt.rewrite_hooks = vec![(
+            std::time::Duration::from_millis(500),
+            Arc::new(RewritingGate("POOL-COMPRESSED")),
+        )];
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime("p", rt)
+            .build();
+        let resp = fire(app, 1).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        let upstream_body = state
+            .get_last_request_body()
+            .expect("upstream must have been dispatched");
+        let v: Value = serde_json::from_slice(&upstream_body).unwrap();
+        assert_eq!(
+            v["messages"][0]["content"], "POOL-COMPRESSED",
+            "a pool-scoped rw gate must rewrite the dispatched body"
+        );
+        server.shutdown().await;
+    }
+
+    /// A test policy whose decide always errors — the on_error-chain tests' failing primary.
+    struct ErroringPolicy;
+
+    #[async_trait::async_trait]
+    impl RoutingPolicy for ErroringPolicy {
+        async fn decide(
+            &self,
+            _req: &RoutingRequest<'_>,
+            _candidates: &[Candidate<'_>],
+            _ctx: &RoutingContext<'_>,
+            _budget: std::time::Duration,
+        ) -> PolicyResult {
+            Err("deliberately broken".into())
+        }
+        fn name(&self) -> &'static str {
+            "erroring"
+        }
+    }
+
+    /// ON_ERROR CHAIN: a failing gate's named fallback hook FIRES and its decision is honored
+    /// exactly as a primary's would be (here: the fallback rejects with 451).
+    #[tokio::test]
+    async fn on_error_fallback_hook_fires_and_decides() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(ErroringPolicy),
+            on_error: crate::config::PolicyOnError::Weighted,
+            on_error_chain: vec![crate::routing::FallbackHook {
+                policy: Arc::new(CannedGate {
+                    canned: Canned::Reject(451, "fallback says no"),
+                    name: "backup",
+                }),
+                timeout: std::time::Duration::from_millis(500),
+                send_prompt: false,
+                send_user: false,
+                on_empty: crate::config::PolicyOnError::Reject,
+            }],
+            timeout: std::time::Duration::from_millis(50),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "the failed gate's fallback hook must fire and its reject must be honored"
+        );
+    }
+
+    /// ON_ERROR CHAIN: every link failing lands on the chain's reserved TERMINAL (here `reject`
+    /// ⇒ fail-closed 503) — never a silent proceed.
+    #[tokio::test]
+    async fn on_error_chain_exhausted_applies_terminal() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let gate = ResolvedPolicy::Policy {
+            policy: Arc::new(ErroringPolicy),
+            on_error: crate::config::PolicyOnError::Reject,
+            on_error_chain: vec![crate::routing::FallbackHook {
+                policy: Arc::new(ErroringPolicy), // the fallback fails too
+                timeout: std::time::Duration::from_millis(50),
+                send_prompt: false,
+                send_user: false,
+                on_empty: crate::config::PolicyOnError::Reject,
+            }],
+            timeout: std::time::Duration::from_millis(50),
+            send_prompt: false,
+            send_user: false,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![(0u16, gate)];
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "an exhausted chain must land on the fail-closed reject terminal"
+        );
+    }
+
+    /// RECONCILE: a pool's OWN gate (from `PoolRuntime.gates`) fires in phase 2 — its reject
+    /// short-circuits before dispatch, proving the pool-gate half of the chain is wired.
+    #[tokio::test]
+    async fn pool_gate_reject_fires_from_pool_runtime_gates() {
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead — the reject must prevent dispatch
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(
+                    &[],
+                    vec![(
+                        0u16,
+                        canned_gate(Canned::Reject(451, "pool gate says no"), "pg"),
+                    )],
+                ),
+            )
+            .build();
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            451,
+            "a pool gate in PoolRuntime.gates must fire in the phase-2 reconcile"
+        );
+    }
+
+    /// RECONCILE: when several gates reject at once, the LOWEST-priority gate's status/message
+    /// surfaces (the chain sort is the tie-break) — regardless of injection order.
+    #[tokio::test]
+    async fn reject_priority_tie_break_surfaces_lowest_priority() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        // Deliberately injected out of order: the firing site's stable sort must put 1 before 5.
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (
+                5u16,
+                canned_gate(Canned::Reject(451, "high priority number"), "late"),
+            ),
+            (
+                1u16,
+                canned_gate(Canned::Reject(452, "low priority number"), "early"),
+            ),
+        ];
+        let resp = fire(app, 1).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            452,
+            "the lowest-priority rejecting gate must supply the surfacing status"
+        );
+    }
+
+    /// RECONCILE: two concurrent restricts INTERSECT. Disjoint tag sets empty the intersection and
+    /// fail closed (the fail-closed default on_empty ⇒ 503) — never allow-all.
+    #[tokio::test]
+    async fn multi_restrict_disjoint_intersection_fails_closed() {
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "eu-lane",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .lane(LaneSpec::new(
+                "baa-lane",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/",
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(&[(0, &["eu"]), (1, &["baa"])], Vec::new()),
+            )
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (
+                0u16,
+                canned_gate(Canned::Restrict(vec!["eu".to_string()]), "geo"),
+            ),
+            (
+                1u16,
+                canned_gate(Canned::Restrict(vec!["baa".to_string()]), "hipaa"),
+            ),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "disjoint concurrent restricts must intersect to empty and fail closed"
+        );
+    }
+
+    /// RECONCILE: two concurrent restricts INTERSECT to the one lane carrying BOTH tags — and the
+    /// request dispatches to exactly that lane (the restriction bounds dispatch, not just ranking).
+    #[tokio::test]
+    async fn multi_restrict_intersection_dispatches_only_the_survivor() {
+        let survivor = mock_lane("both").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "eu-only",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead: dispatching here would error, not 200
+            ))
+            .lane(LaneSpec::new(
+                "eu-baa",
+                crate::proto::Protocol::anthropic(),
+                &survivor.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(&[(0, &["eu"]), (1, &["eu", "baa"])], Vec::new()),
+            )
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (
+                0u16,
+                canned_gate(Canned::Restrict(vec!["eu".to_string()]), "geo"),
+            ),
+            (
+                1u16,
+                canned_gate(Canned::Restrict(vec!["baa".to_string()]), "hipaa"),
+            ),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "both",
+            "dispatch must stay inside the restrict intersection"
+        );
+        survivor.shutdown().await;
+    }
+
+    /// RECONCILE index-space: an ORDER captured at t0 naming only members a concurrent RESTRICT
+    /// excluded filters to empty ⇒ abstain — the request proceeds on the surviving set (never a
+    /// strand, never a resurrected excluded member).
+    #[tokio::test]
+    async fn stale_order_filtered_against_post_restrict_set() {
+        let survivor = mock_lane("kept").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "excluded",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1/", // dead: the stale order names ONLY this lane
+            ))
+            .lane(LaneSpec::new(
+                "kept-lane",
+                crate::proto::Protocol::anthropic(),
+                &survivor.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .pool_runtime(
+                "p",
+                pool_runtime_with(&[(0, &["a"]), (1, &["b"])], Vec::new()),
+            )
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (0u16, canned_gate(Canned::Order(vec![0]), "orderer")),
+            (
+                1u16,
+                canned_gate(Canned::Restrict(vec!["b".to_string()]), "restrictor"),
+            ),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "kept",
+            "a t0 order naming only restricted-out members must abstain to the surviving set"
+        );
+        survivor.shutdown().await;
+    }
+
+    /// RECONCILE: with two ordering gates, the LAST in the chain wins. Both lanes are healthy, so
+    /// whichever order wins is dispatched first with no failover — the serving lane is the proof.
+    #[tokio::test]
+    async fn order_last_in_chain_wins() {
+        let alpha = mock_lane("alpha").await;
+        let beta = mock_lane("beta").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "lane-a",
+                crate::proto::Protocol::anthropic(),
+                &alpha.base_url(),
+            ))
+            .lane(LaneSpec::new(
+                "lane-b",
+                crate::proto::Protocol::anthropic(),
+                &beta.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates = vec![
+            (0u16, canned_gate(Canned::Order(vec![0, 1]), "first")),
+            (1u16, canned_gate(Canned::Order(vec![1, 0]), "second")),
+        ];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "beta",
+            "the LAST ordering gate in the chain must win the reconcile"
+        );
+        alpha.shutdown().await;
+        beta.shutdown().await;
+    }
+
+    /// RECONCILE: a global gate ORDER is now honored (the previously-deferred arm): a single global
+    /// ordering gate reorders dispatch away from config order.
+    #[tokio::test]
+    async fn global_gate_order_arm_is_honored() {
+        let alpha = mock_lane("alpha").await;
+        let beta = mock_lane("beta").await;
+        let mut app = TestApp::new()
+            .lane(LaneSpec::new(
+                "lane-a",
+                crate::proto::Protocol::anthropic(),
+                &alpha.base_url(),
+            ))
+            .lane(LaneSpec::new(
+                "lane-b",
+                crate::proto::Protocol::anthropic(),
+                &beta.base_url(),
+            ))
+            .pool("p", &[(0, 1), (1, 1)])
+            .build();
+        Arc::get_mut(&mut app).expect("sole owner").global_gates =
+            vec![(0u16, canned_gate(Canned::Order(vec![1]), "prefer-b"))];
+        let resp = fire(app, 2).await;
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(
+            body_model(resp).await,
+            "beta",
+            "a global ordering gate must steer dispatch (the ORDER arm is live)"
+        );
+        alpha.shutdown().await;
+        beta.shutdown().await;
     }
 
     /// `send_prompt: true` alone: the policy sees the flattened content; identity stays absent.
@@ -10533,6 +13253,7 @@ mod hook_seam_tests {
             PolicyOutcome::Weighted => "Weighted",
             PolicyOutcome::Reject => "Reject",
             PolicyOutcome::RejectRequest { .. } => "RejectRequest",
+            PolicyOutcome::Restrict { .. } => "Restrict",
         }
     }
 
@@ -10588,9 +13309,11 @@ mod hook_seam_tests {
                 reject: None,
             }),
             on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
             timeout: std::time::Duration::from_millis(500),
             send_prompt: false,
             send_user: true,
+            on_empty: crate::config::PolicyOnError::Reject,
         };
         let cands = vec![WeightedLane {
             reasoning: None,
@@ -10610,6 +13333,7 @@ mod hook_seam_tests {
             "anthropic",
             false,
             Some(&secret),
+            None,
         )
         .await;
         let captured = seen.lock().unwrap().clone().expect("policy called");
@@ -10620,6 +13344,152 @@ mod hook_seam_tests {
         // The secret NEVER rides the projection, under any configuration.
         assert_ne!(key_id.as_deref(), Some(secret.as_str()));
         assert_ne!(key_name.as_deref(), Some(secret.as_str()));
+    }
+
+    /// REGRESSION (audit c1r10): a GROUP/SSO principal's token is not a virtual-key secret, so the
+    /// `decide_policy_order` token `lookup` MISSES — but the auth layer already synthesized a key
+    /// for it (`GovCtx.key`, threaded as `resolved_gov_key`). The identity projection must fall back
+    /// to that synthesized key so `send_user` policies see the caller, instead of silently `None`.
+    #[tokio::test]
+    async fn send_user_falls_back_to_synthesized_group_key_identity() {
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .build();
+        let seen = Arc::new(StdMutex::new(None));
+        let resolved = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: seen.clone(),
+                reject: None,
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: true,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        let cands = vec![WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
+        // A synthesized principal key exactly as the auth layer builds one for a group/SSO caller:
+        // id/name carry the principal, key_hash is a non-secret marker never inserted into by_hash.
+        let synth = crate::governance::VirtualKey {
+            id: "eng-oncall".to_string(),
+            key_hash: "principal:eng-oncall".to_string(),
+            name: "eng-oncall".to_string(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        };
+        let rc = RequestCtx::new(60);
+        let v = body();
+        // caller_token is the RAW SSO bearer — NOT a virtual-key secret, so lookup would miss.
+        decide_policy_order(
+            &app,
+            &resolved,
+            &cands,
+            &rc,
+            &v,
+            "p",
+            "anthropic",
+            false,
+            Some("sso-jwt-not-a-vkey-secret"),
+            Some(&synth),
+        )
+        .await;
+        let captured = seen.lock().unwrap().clone().expect("policy called");
+        let (key_id, key_name, _user) = captured.identity.expect("identity present");
+        assert_eq!(
+            key_id.as_deref(),
+            Some("eng-oncall"),
+            "a group principal's synthesized key id must project, not fall through to None"
+        );
+        assert_eq!(key_name.as_deref(), Some("eng-oncall"));
+    }
+
+    /// REGRESSION (audit c1r11): the named / ad-hoc anthropic routes go through `forward_with_pool`,
+    /// which carries NO resolved key — so the c1r10 fallback never fired there and a group principal
+    /// on `/{pool}/v1/messages` was still routing-signal-blind. `forward_with_pool_keyed` threads
+    /// `GovCtx.key` down; this exercises that path end-to-end via a pool's `send_user` policy.
+    #[tokio::test]
+    async fn forward_with_pool_keyed_threads_group_key_to_pool_policy() {
+        let seen = Arc::new(StdMutex::new(None));
+        let policy = ResolvedPolicy::Policy {
+            policy: Arc::new(CapturingPolicy {
+                seen: seen.clone(),
+                reject: None,
+            }),
+            on_error: crate::config::PolicyOnError::default(),
+            on_error_chain: Vec::new(),
+            timeout: std::time::Duration::from_millis(500),
+            send_prompt: false,
+            send_user: true,
+            on_empty: crate::config::PolicyOnError::Reject,
+        };
+        let mut rt = pool_runtime_with(&[(0, &[])], Vec::new());
+        rt.policy = Some(policy);
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m0",
+                crate::proto::Protocol::anthropic(),
+                "http://localhost",
+            ))
+            .pool("p", &[(0, 1)])
+            .pool_runtime("p", rt)
+            .build();
+        let synth = crate::governance::VirtualKey {
+            id: "eng-oncall".to_string(),
+            key_hash: "principal:eng-oncall".to_string(),
+            name: "eng-oncall".to_string(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        };
+        let body = Bytes::from(serde_json::to_vec(&body()).unwrap());
+        let cands = vec![WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }];
+        // The forward will fail to reach the fake upstream, but the routing policy captures FIRST.
+        // caller_token is a non-vkey SSO bearer → lookup misses; only the threaded key can save it.
+        let _ = forward_with_pool_keyed(
+            app,
+            cands,
+            body,
+            Some("sso-jwt-not-a-vkey-secret"),
+            Some(&synth),
+            "p",
+            None,
+            "anthropic",
+            crate::handlers::chat("anthropic"),
+            None,
+        )
+        .await;
+        let captured = seen.lock().unwrap().clone().expect("pool policy ran");
+        let (key_id, _name, _user) = captured.identity.expect("identity present");
+        assert_eq!(
+            key_id.as_deref(),
+            Some("eng-oncall"),
+            "forward_with_pool_keyed must thread the group key into the pool policy, not pass None"
+        );
     }
 
     /// DEFENSE IN DEPTH at the seam: the shipped transports clamp/sanitize in `wire::normalize`,
@@ -10697,10 +13567,14 @@ mod hook_seam_tests {
                             reject: Some((451, "PII detected".to_string())),
                         }),
                         on_error: crate::config::PolicyOnError::default(),
+                        on_error_chain: Vec::new(),
                         timeout: std::time::Duration::from_millis(500),
                         send_prompt: false,
                         send_user: false,
+                        on_empty: crate::config::PolicyOnError::Reject,
                     }),
+                    gates: Vec::new(),
+                    rewrite_hooks: Vec::new(),
                 },
             )
             .build();

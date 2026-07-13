@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! The ingress Router (design-operations-oop.md §6, the 1.2 lynchpin): DUMB protocol identification.
 //! `(path, headers)` → which protocol dialect the client is speaking — that is the Router's ENTIRE

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Busbar Inc and contributors
+
 //! Pure, std-only network-address primitives shared by busbar's SSRF guards.
 //!
 //! These predicates are the *context-free* atoms of the SSRF obfuscation defense: they answer

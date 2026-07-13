@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Matthew Jackson
+# Copyright (C) 2026 Busbar Inc and contributors
 #
 # Provider catalog for the REAL-provider latency benchmark (Anthropic). One provider, `anthropic`,
 # pointed at the public API. The release binary already trusts api.anthropic.com's public-CA cert,

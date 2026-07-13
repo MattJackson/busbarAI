@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Matthew Jackson
+// Copyright (C) 2026 Busbar Inc and contributors
 
 //! AWS Signature Version 4 request signing — hand-rolled with RustCrypto (sha2 + hmac), no
 //! AWS SDK. Used by the Bedrock protocol writer to sign Converse requests. The core algorithm is
@@ -8,7 +8,7 @@
 
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -34,10 +34,9 @@ pub(crate) const X_AMZ_CONTENT_SHA256: &str = "x-amz-content-sha256";
 /// The canonical lowercase name of the `x-amz-security-token` header (STS session credentials).
 pub(crate) const X_AMZ_SECURITY_TOKEN: &str = "x-amz-security-token";
 
-/// Lowercase hex SHA-256 of `data`.
-pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
-}
+/// Lowercase hex SHA-256 of `data` — re-exported from the `busbar-api` contract crate (plugins
+/// hash credentials under the SAME digest facility).
+pub(crate) use busbar_api::sha256_hex;
 
 /// HMAC-SHA256 of `data` under `key`. `Hmac::new_from_slice` is infallible for HMAC — the spec
 /// accepts a key of ANY length — so the `Err` arm is unreachable. We still avoid `expect()`/panic
