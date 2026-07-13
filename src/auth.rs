@@ -782,7 +782,7 @@ fn unauthorized_with_completion_taps(app: &crate::state::App, path: &str) -> Res
             &shape,
             crate::routing::wire::HookStageProjection {
                 at: "completion",
-                target: None,
+                model: None,
                 attempt_number: None,
                 remaining_candidates: None,
                 previous_failure: None,

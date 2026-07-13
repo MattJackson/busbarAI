@@ -78,12 +78,13 @@ impl WebhookPolicy {
     /// echoing prompt content into a malformed reply must not splash it into operator logs).
     async fn send(
         &self,
+        op: &'static str,
         req: &RoutingRequest<'_>,
         candidates: &[Candidate<'_>],
         ctx: &RoutingContext<'_>,
         budget: Duration,
     ) -> Result<super::wire::HookResponse, super::PolicyError> {
-        let payload = serde_json::to_vec(&super::wire::build(req, candidates, ctx))?;
+        let payload = serde_json::to_vec(&super::wire::build(op, req, candidates, ctx))?;
         let resp = self
             .client
             .post(&self.url)
@@ -114,7 +115,9 @@ impl RoutingPolicy for WebhookPolicy {
         // POST the shared wire projection via the `send` helper (identical for every out-of-process
         // transport), then apply the shared normalizer (abstain / drop unknown idxs / dedup / empty →
         // Abstain). A slow/errored/malformed sidecar surfaces as `Err` → the caller's `on_error`.
-        let parsed = self.send(req, candidates, ctx, budget).await?;
+        let parsed = self
+            .send(super::wire::OP_DECIDE, req, candidates, ctx, budget)
+            .await?;
         Ok(super::wire::normalize(parsed, candidates))
     }
 
@@ -122,23 +125,26 @@ impl RoutingPolicy for WebhookPolicy {
         "webhook"
     }
 
-    /// REWRITE transform: POST the request projection, return the sidecar's `rewrite` reply.
-    /// FAIL-CLOSED — ANY error (timeout, non-2xx, malformed, no/empty rewrite) yields `None`, so the
-    /// caller proceeds with the ORIGINAL body. A rewrite hook reads the `request` projection, not the
-    /// candidate set, so an empty candidate list is sent.
-    #[allow(dead_code)] // dispatched by the forward global-hooks transform seam next (slice-4 step)
+    /// REWRITE transform: POST the request projection; reject > rewrite > abstain (shared
+    /// normalizer — see `wire::transform_outcome`). Transport/parse failures abstain (proceed with
+    /// the ORIGINAL body); a parsed reject is HONORED (audit W-H1).
     async fn transform(
         &self,
         req: &RoutingRequest<'_>,
         budget: Duration,
-    ) -> Option<super::wire::RewriteReply> {
+    ) -> busbar_api::TransformOutcome {
         let empty: [Candidate<'_>; 0] = [];
         let ctx = RoutingContext {
             pool: req.pool,
             budget_remaining: None,
         };
-        let parsed = self.send(req, &empty, &ctx, budget).await.ok()?;
-        super::wire::parse_rewrite(&parsed.rewrite?)
+        match self
+            .send(super::wire::OP_TRANSFORM, req, &empty, &ctx, budget)
+            .await
+        {
+            Ok(parsed) => super::wire::transform_outcome(parsed),
+            Err(_) => busbar_api::TransformOutcome::Abstain,
+        }
     }
 
     /// TAP: fire-and-forget POST of the pre-serialized projection. The response is NOT read (a tap is
@@ -207,6 +213,26 @@ impl RoutingPolicy for WebhookPolicy {
         }
         let bytes = read_capped(resp).await.ok()?;
         serde_json::from_slice(&bytes).ok()
+    }
+
+    async fn status(&self, budget: Duration) -> Option<busbar_api::HookStatus> {
+        let body = serde_json::to_vec(&super::wire::StatusMsg { status: true }).ok()?;
+        let resp = self
+            .client
+            .post(self.url.clone())
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(budget)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let bytes = read_capped(resp).await.ok()?;
+        // `{}` (no `status` key) = unsupported — fail open (None), per the unknown-op rule.
+        let parsed: super::wire::StatusEnvelope = crate::json::parse(&bytes).ok()?;
+        parsed.status.map(Into::into)
     }
 
     async fn notify(&self, projection: &[u8], budget: Duration) {
@@ -589,10 +615,14 @@ mod tests {
             v["context"]["budget_remaining"], 500,
             "context.budget_remaining must be serialized with the RoutingContext value"
         );
-        assert_eq!(
-            v["context"]["pool"], "p",
-            "context.pool must carry the pool name"
+        // context.pool was REMOVED (wire audit L12): request.pool is the one carrier.
+        assert!(
+            v["context"].get("pool").is_none(),
+            "context must not duplicate the pool name"
         );
+        assert_eq!(v["request"]["pool"], "p");
+        // Per-request payloads carry the explicit op discriminator (wire audit #5).
+        assert_eq!(v["op"], "decide");
 
         // The request projection must reflect the live RoutingRequest (req()).
         assert_eq!(v["request"]["pool"], "p");

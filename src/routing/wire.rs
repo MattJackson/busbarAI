@@ -10,15 +10,28 @@
 use super::{Candidate, RoutingContext, RoutingDecision, RoutingRequest};
 use serde::{Deserialize, Serialize};
 
+/// PER-REQUEST message kinds — the explicit `op` discriminator every per-request payload carries
+/// (contract audit #5: the three kinds were wire-indistinguishable; a hook binary receiving bytes
+/// had to infer the kind from field presence/endpoint, and two registrations sharing one socket
+/// provably could not tell them apart). MANAGEMENT messages stay key-discriminated (a top-level
+/// `configure` / `describe` / `status` key); everything else is a per-request message and `op`
+/// says which. The vocabulary is append-only — hooks MUST ignore unknown ops per the contract.
+pub(crate) const OP_DECIDE: &str = "decide";
+pub(crate) const OP_TRANSFORM: &str = "transform";
+pub(crate) const OP_NOTIFY: &str = "notify";
+
 /// The stable request schema sent to a hook: the request projection, every candidate, and context.
 /// The request-side wire structs deliberately do NOT derive `Debug`: behind the opt-ins they
 /// borrow prompt text and end-user identity, and a derived Debug would bypass the redacting
 /// impls on `PromptProjection`/`CallerIdentity`.
 #[derive(Serialize)]
 pub(crate) struct HookRequest<'a> {
+    /// The message kind: `decide` (a gate's blocking decision), `transform` (a rewrite pass), or
+    /// `notify` (a fire-and-forget tap — never answer it). See [`OP_DECIDE`].
+    pub(crate) op: &'static str,
     pub(crate) request: HookReqProjection<'a>,
     pub(crate) candidates: Vec<HookCandidate<'a>>,
-    pub(crate) context: HookContext<'a>,
+    pub(crate) context: HookContext,
     /// TAP observation-stage payload — present ONLY on stage taps (`at: route|attempt|completion`);
     /// absent on request-stage taps and every gate, so the pre-stages wire is byte-identical
     /// (append-only schema).
@@ -35,8 +48,10 @@ pub(crate) struct HookRequest<'a> {
 #[derive(Serialize)]
 pub(crate) struct HookStageProjection<'a> {
     pub(crate) at: &'static str,
+    /// The dispatched candidate's model name (ONE name for one concept across the wire — the
+    /// same string `candidates[].model` carries on decide payloads).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) target: Option<&'a str>,
+    pub(crate) model: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) attempt_number: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +86,8 @@ pub(crate) struct HookReqProjection<'a> {
     pub(crate) message_count: usize,
     pub(crate) has_tools: bool,
     pub(crate) total_chars: usize,
+    /// Omitted when the request declares none (ONE idiom for optional signals: absent = unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
     pub(crate) stream: bool,
     /// SECURITY (`prompt: ro|rw` grant): the flattened system prompt text. Absent when the grant is
@@ -124,11 +141,18 @@ pub(crate) struct HookCandidate<'a> {
     /// Member context-window ceiling — lets a hook route by context-fit. `None` if unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) context_max: Option<usize>,
+    // Optional live signals — omitted when unset (ONE idiom across the wire: absent = unset,
+    // never a mix of `null` and absence; contract audit #6).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cost_per_mtok: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) latency_ms: Option<f64>,
     pub(crate) available_concurrency: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) budget_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rate_headroom: Option<f64>,
     /// The member's operator-declared free-form `tags` (whatever the config author wrote — team
     /// names, regions, compliance labels). Omitted when the member declares none, so untagged
@@ -137,10 +161,12 @@ pub(crate) struct HookCandidate<'a> {
     pub(crate) tags: &'a [String],
 }
 
-/// The routing context projection.
+/// The POOL-SCOPED signal bucket (distinct from the per-candidate signals). `request.pool` already
+/// names the pool — it is not duplicated here (contract audit #12).
 #[derive(Serialize)]
-pub(crate) struct HookContext<'a> {
-    pub(crate) pool: &'a str,
+pub(crate) struct HookContext {
+    /// Pool-level remaining request budget; omitted when the pool is uncapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) budget_remaining: Option<i64>,
 }
 
@@ -182,6 +208,106 @@ pub(crate) struct ConfigureAckBody {
 #[derive(Serialize)]
 pub(crate) struct DescribeMsg {
     pub(crate) describe: bool,
+}
+
+/// The STATUS management message: `{"status": true}` — mirrors `describe`'s key-discriminated
+/// idiom. The hook replies its OBSERVED state: `{"status": {"settings_version"?: N,
+/// "settings"?: {...}, "metrics"?: {"<name>": {"type": "counter"|"gauge", "value": <number>,
+/// "help"?: "..."}}}}`. Every reply key is optional; unknown keys are ignored; a hook that does
+/// not implement `status` replies `{}` (busbar treats empty/absent as "unsupported" and fails
+/// open). This is the control-plane read that lets busbar surface a hook's own settings and
+/// operational data ("Your AI Control Plane" — a dashboard on busbar sees what each plug is
+/// doing). Metric names: `^[a-z][a-z0-9_]{0,63}$`, counters SHOULD end `_total`; per-reply and
+/// per-hook-lifetime name counts are bounded by busbar (a hostile hook cannot flood the registry).
+#[derive(Serialize)]
+pub(crate) struct StatusMsg {
+    pub(crate) status: bool,
+}
+
+/// One hook-reported metric entry (parsed liberally; malformed ENTRIES are dropped, never the
+/// whole reply). `type` is `counter` (monotonic over the hook's lifetime) or `gauge`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct HookMetric {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) value: f64,
+    #[serde(default)]
+    pub(crate) help: Option<String>,
+}
+
+/// The hook's `status` reply body (liberal: every field optional, unknown fields ignored),
+/// deserialized into the shared `busbar_api::HookStatus` shape.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct StatusReply {
+    #[serde(default)]
+    pub(crate) settings_version: Option<u64>,
+    #[serde(default)]
+    pub(crate) settings: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub(crate) metrics: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+impl From<StatusReply> for busbar_api::HookStatus {
+    fn from(r: StatusReply) -> Self {
+        busbar_api::HookStatus {
+            settings_version: r.settings_version,
+            settings: r.settings,
+            metrics: r.metrics,
+        }
+    }
+}
+
+/// The `status` reply envelope (`{"status": {...}}`); `None`/absent = the hook doesn't speak it
+/// (per the unknown-op contract rule, `{}` = unsupported → busbar fails open).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct StatusEnvelope {
+    #[serde(default)]
+    pub(crate) status: Option<StatusReply>,
+}
+
+/// Per-reply cap on hook-reported metric entries (excess dropped with a warn — bounded registry).
+pub(crate) const MAX_HOOK_METRICS: usize = 64;
+/// Metric-help length cap (chars), sanitized through `sanitize_reject_message` before exposure.
+pub(crate) const MAX_METRIC_HELP_CHARS: usize = 200;
+
+/// Validate a hook-reported metric NAME: `^[a-z][a-z0-9_]{0,63}$`. Anything else is dropped —
+/// names become Prometheus label values, so the charset is enforced structurally (a hook granted
+/// `prompt: ro` physically cannot smuggle content into a scrape).
+pub(crate) fn valid_metric_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z'))
+        && name.len() <= 64
+        && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// Parse + validate the metrics map of a `status` reply fail-open: malformed entries (bad name,
+/// unknown type, non-finite value) are DROPPED individually, valid ones kept, capped at
+/// [`MAX_HOOK_METRICS`]. Help strings are sanitized + length-capped.
+pub(crate) fn parse_status_metrics(
+    raw: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Vec<(String, HookMetric)> {
+    let mut out = Vec::new();
+    for (name, v) in raw {
+        if out.len() >= MAX_HOOK_METRICS {
+            break;
+        }
+        if !valid_metric_name(name) {
+            continue;
+        }
+        let Ok(mut m) = serde_json::from_value::<HookMetric>(v.clone()) else {
+            continue;
+        };
+        if !m.value.is_finite() || !matches!(m.kind.as_str(), "counter" | "gauge") {
+            continue;
+        }
+        m.help = m.help.map(|h| {
+            let mut s = sanitize_reject_message(&h);
+            s.truncate(MAX_METRIC_HELP_CHARS);
+            s
+        });
+        out.push((name.clone(), m));
+    }
+    out
 }
 
 /// The hook's reply. `order` is the ranked preference (candidate `idx` values, most-preferred
@@ -275,6 +401,37 @@ pub(crate) fn parse_rewrite(value: &serde_json::Value) -> Option<RewriteReply> {
     Some(RewriteReply { messages, tools })
 }
 
+/// Extract a reject's (status, message) fail-closed: status CLAMPED to client errors (anything
+/// else — absent, non-integer, 0, 200, 302, 500, 70000, -1 — becomes 403), message sanitized +
+/// capped. ONE extraction for both the decide path (`normalize`) and the transform path (a `rw`
+/// gate's reject) so the two can never diverge.
+pub(crate) fn parse_reject_detail(reject: &serde_json::Value) -> (u16, String) {
+    let status = match reject.get("status").and_then(|s| s.as_i64()) {
+        Some(s) if (400..=499).contains(&s) => s as u16,
+        _ => REJECT_STATUS_DEFAULT,
+    };
+    let message =
+        sanitize_reject_message(reject.get("message").and_then(|m| m.as_str()).unwrap_or(""));
+    (status, message)
+}
+
+/// Normalize a parsed reply on the TRANSFORM path: reject > rewrite > abstain. `restrict`/`order`
+/// are decide-path verbs and are ignored here (documented in the contract). Shared by both
+/// transports so they can never diverge.
+pub(crate) fn transform_outcome(parsed: HookResponse) -> busbar_api::TransformOutcome {
+    use busbar_api::TransformOutcome;
+    if let Some(reject) = &parsed.reject {
+        if *reject != serde_json::Value::Bool(false) {
+            let (status, message) = parse_reject_detail(reject);
+            return TransformOutcome::Reject { status, message };
+        }
+    }
+    match parsed.rewrite.as_ref().and_then(parse_rewrite) {
+        Some(rw) => TransformOutcome::Rewrite(rw),
+        None => TransformOutcome::Abstain,
+    }
+}
+
 /// Reject-status clamp range + fallback: any status outside 400..=499 becomes 403.
 const REJECT_STATUS_DEFAULT: u16 = 403;
 /// Reject-message length cap (chars). Long enough for a real reason, short enough for an error body.
@@ -319,11 +476,13 @@ pub(crate) fn sanitize_reject_message(raw: &str) -> String {
 /// Build the wire projection from the live request/candidates/context. Borrows everywhere — the
 /// projection is serialized immediately by the transport, never stored.
 pub(crate) fn build<'a>(
+    op: &'static str,
     req: &'a RoutingRequest<'_>,
     candidates: &'a [Candidate<'_>],
     ctx: &'a RoutingContext<'_>,
 ) -> HookRequest<'a> {
     HookRequest {
+        op,
         request: HookReqProjection {
             pool: req.pool,
             ingress_protocol: req.ingress_protocol,
@@ -370,7 +529,6 @@ pub(crate) fn build<'a>(
             .collect(),
         stage: None,
         context: HookContext {
-            pool: ctx.pool,
             budget_remaining: ctx.budget_remaining,
         },
     }
@@ -385,15 +543,7 @@ pub(crate) fn normalize(parsed: HookResponse, candidates: &[Candidate<'_>]) -> R
     // safe defaults rather than downgrading the verb.
     if let Some(reject) = parsed.reject {
         if reject != serde_json::Value::Bool(false) {
-            // Clamp: a hook may only speak client errors. Anything else (absent, non-integer, 0,
-            // 200, 302, 500, 70000, -1) → 403.
-            let status = match reject.get("status").and_then(|s| s.as_i64()) {
-                Some(s) if (400..=499).contains(&s) => s as u16,
-                _ => REJECT_STATUS_DEFAULT,
-            };
-            let message = sanitize_reject_message(
-                reject.get("message").and_then(|m| m.as_str()).unwrap_or(""),
-            );
+            let (status, message) = parse_reject_detail(&reject);
             return RoutingDecision::Reject { status, message };
         }
     }
@@ -472,7 +622,7 @@ mod tests {
         let r = req();
         let cands = [cand(0, &[])];
         let c = ctx();
-        let json = serde_json::to_string(&build(&r, &cands, &c)).unwrap();
+        let json = serde_json::to_string(&build(OP_DECIDE, &r, &cands, &c)).unwrap();
         for key in ["\"system\"", "\"messages\"", "\"user\"", "\"tags\""] {
             assert!(!json.contains(key), "default payload leaked {key}: {json}");
         }
@@ -496,7 +646,7 @@ mod tests {
         });
         let cands = [cand(0, TAGS.as_slice())];
         let c = ctx();
-        let json = serde_json::to_string(&build(&r, &cands, &c)).unwrap();
+        let json = serde_json::to_string(&build(OP_DECIDE, &r, &cands, &c)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["request"]["system"], "be brief");
         assert_eq!(v["request"]["messages"][0]["role"], "user");
@@ -523,8 +673,10 @@ mod tests {
         });
         let cands = [cand(0, &[])];
         let c = ctx();
-        let v: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&build(&r, &cands, &c)).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&build(OP_DECIDE, &r, &cands, &c)).unwrap(),
+        )
+        .unwrap();
         assert!(v["request"].get("system").is_none());
         assert_eq!(v["request"]["messages"], serde_json::json!([]));
     }
@@ -678,8 +830,10 @@ mod tests {
         });
         let cands = [cand(0, &[])];
         let c = ctx();
-        let v: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&build(&r, &cands, &c)).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&build(OP_DECIDE, &r, &cands, &c)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["request"]["user"], serde_json::json!({}));
     }
 
@@ -696,7 +850,7 @@ mod tests {
         });
         let cands = [cand(0, &[])];
         let c = ctx();
-        let line = serde_json::to_string(&build(&r, &cands, &c)).unwrap();
+        let line = serde_json::to_string(&build(OP_DECIDE, &r, &cands, &c)).unwrap();
         assert!(
             !line.contains('\n') && !line.contains('\r'),
             "serialized hook payload must contain no raw newline bytes: {line}"

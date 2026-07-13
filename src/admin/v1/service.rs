@@ -237,33 +237,42 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
     );
     next.tap_hooks = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Completion,
     );
-    next.global_gates =
-        crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.global_gates = crate::routing::resolve_gate_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        next.config_version,
+    );
     Ok(next)
 }
 
@@ -285,33 +294,42 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
     );
     next.tap_hooks = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Completion,
     );
-    next.global_gates =
-        crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.global_gates = crate::routing::resolve_gate_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        next.config_version,
+    );
     Ok(next)
 }
 
@@ -365,33 +383,42 @@ pub(crate) fn build_with_registry(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
     );
     next.tap_hooks = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::routing::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
         &next.client,
+        next.config_version,
         crate::config::HookStage::Completion,
     );
-    next.global_gates =
-        crate::routing::resolve_gate_hooks(&next.hook_registry, &next.global_hooks, &next.client);
+    next.global_gates = crate::routing::resolve_gate_hooks(
+        &next.hook_registry,
+        &next.global_hooks,
+        &next.client,
+        next.config_version,
+    );
     Ok(next)
 }
 
@@ -706,9 +733,26 @@ impl AdminService {
     /// responses (the metering tap), not admissions; budget-enforcement state stays on
     /// `GET /keys/{id}/usage`. Read scope. Empty aggregations when governance is disabled. The
     /// store reads run on a blocking thread; never returns a secret — ids/names only.
-    pub(crate) async fn get_usage(&self) -> Result<UsageView, AdminError> {
+    /// `window`: a caller-selected PAST bucket start (validated: bucket-aligned, not in the
+    /// future); `None` = the current bucket. The response shape is pinned: always one bucket.
+    pub(crate) async fn get_usage(&self, window: Option<u64>) -> Result<UsageView, AdminError> {
         let now = crate::store::now();
-        let bucket = crate::governance::metering_bucket(now);
+        let current = crate::governance::metering_bucket(now);
+        let bucket = match window {
+            None => current,
+            Some(w) => {
+                if w % crate::governance::METERING_BUCKET_SECS != 0 {
+                    return Err(AdminError::Validation(format!(
+                        "window must be a UTC-day bucket start (a multiple of {}); got {w}",
+                        crate::governance::METERING_BUCKET_SECS
+                    )));
+                }
+                if w > current {
+                    return Err(AdminError::Validation("window is in the future".into()));
+                }
+                w
+            }
+        };
         let window = UsageWindow {
             start: bucket,
             end: bucket + crate::governance::METERING_BUCKET_SECS,
@@ -721,6 +765,7 @@ impl AdminService {
             by_model: Vec::new(),
             by_key: Vec::new(),
             by_key_truncated: false,
+            others: None,
         };
         let Some(gov) = self.app.governance.clone() else {
             return Ok(empty());
@@ -805,6 +850,24 @@ impl AdminService {
                 .then_with(|| a.id.cmp(&b.id))
         });
         let by_key_truncated = by_key.len() > BY_KEY_CAP;
+        // FinOps completeness: the tail beyond the cap is summed into an `others` bucket, so
+        // total == sum(by_key) + others and every unit stays attributable.
+        let others = by_key_truncated.then(|| {
+            let mut o = UsageBreakdown::default();
+            for row in &by_key[BY_KEY_CAP..] {
+                o.tokens_input = o.tokens_input.saturating_add(row.usage.tokens_input);
+                o.tokens_output = o.tokens_output.saturating_add(row.usage.tokens_output);
+                o.tokens_cache_read = o
+                    .tokens_cache_read
+                    .saturating_add(row.usage.tokens_cache_read);
+                o.tokens_cache_creation = o
+                    .tokens_cache_creation
+                    .saturating_add(row.usage.tokens_cache_creation);
+                o.requests = o.requests.saturating_add(row.usage.requests);
+                o.spend_micros = o.spend_micros.saturating_add(row.usage.spend_micros);
+            }
+            o
+        });
         by_key.truncate(BY_KEY_CAP);
         Ok(UsageView {
             window,
@@ -814,6 +877,7 @@ impl AdminService {
             by_model,
             by_key,
             by_key_truncated,
+            others,
         })
     }
 

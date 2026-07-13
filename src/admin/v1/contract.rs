@@ -134,8 +134,14 @@ pub(crate) enum AdminError {
     /// The request is structurally invalid (bad field, unknown enum, failed validation). `code =
     /// invalid_request`.
     Validation(String),
-    /// Optimistic-concurrency mismatch: the caller's `expected_version`/`If-Match` is stale. `code =
-    /// conflict`.
+    /// Optimistic-concurrency mismatch: the caller's `If-Match` is STALE — re-read the resource
+    /// and retry. `code = version_conflict`. Split from `conflict` (external review R3): a client
+    /// must distinguish RETRYABLE (this) from TERMINAL state conflicts without string-matching the
+    /// human message.
+    VersionConflict(String),
+    /// A TERMINAL state conflict: the request contradicts server state in a way a retry cannot fix
+    /// (governance disabled, base-defined hook, immutable grant change, in-flight idempotency
+    /// reservation). `code = conflict`.
     Conflict(String),
     /// The principal exhausted its per-minute mutation budget (§6.6). `code = rate_limited`.
     RateLimited,
@@ -153,6 +159,7 @@ impl AdminError {
             AdminError::MethodNotAllowed => "method_not_allowed",
             AdminError::Forbidden { .. } => "forbidden",
             AdminError::Validation(_) => "invalid_request",
+            AdminError::VersionConflict(_) => "version_conflict",
             AdminError::Conflict(_) => "conflict",
             AdminError::RateLimited => "rate_limited",
             AdminError::Internal => "internal",
@@ -167,6 +174,7 @@ impl AdminError {
             AdminError::MethodNotAllowed => 405,
             AdminError::Forbidden { .. } => 403,
             AdminError::Validation(_) => 400,
+            AdminError::VersionConflict(_) => 409,
             AdminError::Conflict(_) => 409,
             AdminError::RateLimited => 429,
             AdminError::Internal => 500,
@@ -188,6 +196,7 @@ impl AdminError {
                 )
             }
             AdminError::Validation(msg) => msg.clone(),
+            AdminError::VersionConflict(msg) => msg.clone(),
             AdminError::Conflict(msg) => msg.clone(),
             AdminError::RateLimited => {
                 "admin mutation rate limit exceeded; retry next minute".to_string()
@@ -508,10 +517,19 @@ pub(crate) const USAGE_CURRENCY: &str = "USD";
 /// is busbar's DERIVED estimate from the operator's configured global prices, computed at read time
 /// (raw counts are what's stored — a price change re-prices history consistently).
 ///
-/// Time base: one fixed UTC-day bucket (`window`), deliberately decoupled from per-key budget
-/// windows so per-model aggregation across keys is well-defined. Budget ENFORCEMENT state (cents
-/// spent against a key's own budget window) lives on `GET /keys/{id}/usage`, not here. Empty
-/// aggregations when governance is disabled. No secrets — key ids/names only, never a token.
+/// Time base — THE PINNED SHAPE RULING (external review R3 #1): a usage response is ALWAYS exactly
+/// ONE fixed UTC-day metering bucket (`window`). `?window=<bucket-start-epoch>` selects a PAST
+/// bucket (default: the current one); a multi-window series is the CLIENT fetching N buckets — or
+/// a future additive `?from=&to=` returning an ARRAY OF THIS SAME PER-BUCKET SHAPE, never a
+/// differently-shaped merged view. Billing periods aggregate client-side from day buckets (raw
+/// counts are stored, so the math is exact). Deliberately decoupled from per-key budget windows so
+/// per-model aggregation across keys is well-defined; budget ENFORCEMENT state lives on
+/// `GET /keys/{id}/usage`, not here. Empty aggregations when governance is disabled. No secrets —
+/// key ids/names only, never a token.
+///
+/// LEDGER RULE (one loud contract sentence): `spend_micros` is a MUTABLE ESTIMATE — derived at
+/// read time from the operator's CURRENT prices, so a price change re-prices history. Never store
+/// it as a ledger charge; bill from the raw token split.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct UsageView {
     /// The UTC-day metering bucket this response aggregates: `[start, end)` epoch seconds.
@@ -529,6 +547,11 @@ pub(crate) struct UsageView {
     /// True when `by_key` was truncated to the cap (a deployment with more active keys than the
     /// cap). `by_model` is never capped (bounded by the configured model fleet).
     pub(crate) by_key_truncated: bool,
+    /// The summed remainder BEYOND the `by_key` cap — present exactly when `by_key_truncated`, so
+    /// every unit of consumption is attributable at least to "others" (FinOps completeness:
+    /// `total == sum(by_key) + others`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) others: Option<UsageBreakdown>,
 }
 
 /// A metering window: `[start, end)` epoch seconds.

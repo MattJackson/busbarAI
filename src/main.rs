@@ -797,6 +797,10 @@ pub(crate) fn build_app_from_config(
     // (translate-body cap, metrics gauge limit, webhook timeout, governance sqlite/sweep, health
     // probe fallbacks, routing policy timeout) read the installed values.
     limits::install(&cfg.limits);
+    // The config version this App will carry — computed ONCE up front because hook-transport
+    // resolution stamps it into every socket configure preamble (W-M4: the preamble's
+    // settings_version must be the REAL version of the settings it delivers, not a hardcoded 0).
+    let app_config_version = prior.map_or(0, |p| p.config_version.wrapping_add(1));
     // Semantic validation — the same gate boot has always had, now on the ONE construction path
     // so an apply/reload validates identically and an invalid config changes nothing.
     if let Err(validation_errors) = config_validate::validate(&cfg) {
@@ -1084,14 +1088,21 @@ pub(crate) fn build_app_from_config(
                     &cfg.hooks,
                     &upstream_client,
                     default_hook.as_deref(),
+                    app_config_version,
                 ),
                 // This pool's decision gates, resolved once here (priority carried for the phase-2
                 // chain merge). NOT re-resolved on config apply yet — same scope caveat as `policy`.
-                gates: routing::resolve_pool_gates(pool_cfg, &cfg.hooks, &upstream_client),
+                gates: routing::resolve_pool_gates(
+                    pool_cfg,
+                    &cfg.hooks,
+                    &upstream_client,
+                    app_config_version,
+                ),
                 rewrite_hooks: routing::resolve_pool_rewrites(
                     pool_cfg,
                     &cfg.hooks,
                     &upstream_client,
+                    app_config_version,
                 ),
             },
         );
@@ -1150,36 +1161,49 @@ pub(crate) fn build_app_from_config(
 
     // Resolve the global rewrite hooks (prompt: rw gates in global_hooks) into priority-ordered
     // transports ONCE. Empty unless the operator configured a rewrite hook — zero cost by default.
-    let rewrite_hooks =
-        routing::resolve_rewrite_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+    let rewrite_hooks = routing::resolve_rewrite_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        app_config_version,
+    );
     // Resolve the global request-stage tap hooks the same way. Empty unless configured.
     let tap_hooks = routing::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
+        app_config_version,
         config::HookStage::Request,
     );
     let tap_hooks_route = routing::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
+        app_config_version,
         config::HookStage::Route,
     );
     let tap_hooks_attempt = routing::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
+        app_config_version,
         config::HookStage::Attempt,
     );
     let tap_hooks_completion = routing::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
         &upstream_client,
+        app_config_version,
         config::HookStage::Completion,
     );
     // Resolve the global DECISION gates (non-rewrite gates in global_hooks) — fired for a verdict on
     // every request. Empty unless configured.
-    let global_gates = routing::resolve_gate_hooks(&cfg.hooks, &cfg.global_hooks, &upstream_client);
+    let global_gates = routing::resolve_gate_hooks(
+        &cfg.hooks,
+        &cfg.global_hooks,
+        &upstream_client,
+        app_config_version,
+    );
 
     Ok(App {
         lanes,
@@ -1224,7 +1248,7 @@ pub(crate) fn build_app_from_config(
         config_path: config_paths.0,
         providers_path: config_paths.1,
         overlay_path,
-        config_version: prior.map_or(0, |p| p.config_version.wrapping_add(1)),
+        config_version: app_config_version,
         failover_cfg,
         pool_runtime,
         fallback_pools,

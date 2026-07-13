@@ -103,6 +103,9 @@ pub(crate) const ERR_TYPE_NOT_FOUND: &str = "not_found_error";
 pub(crate) const ERR_TYPE_INVALID_REQUEST: &str = "invalid_request_error";
 const ERR_TYPE_INTERNAL: &str = "internal_error";
 const ERR_TYPE_CONFLICT: &str = "conflict_error";
+/// RETRYABLE optimistic-concurrency staleness — maps to the frozen `version_conflict` code
+/// (re-read + retry), split from terminal `conflict` (external review R3).
+const ERR_TYPE_VERSION_CONFLICT: &str = "version_conflict_error";
 
 /// Maximum byte lengths for admin-API path / body fields (defense-in-depth DB/log-bloat guards).
 /// A real minted key id is `vk_` + 16 hex chars (19 chars); 64 is generous headroom.
@@ -134,6 +137,7 @@ fn error_response(status: StatusCode, error_type: &str, message: impl Into<Strin
         ERR_TYPE_NOT_FOUND => "not_found",
         ERR_TYPE_INVALID_REQUEST => "invalid_request",
         ERR_TYPE_CONFLICT => "conflict",
+        ERR_TYPE_VERSION_CONFLICT => "version_conflict",
         ERR_TYPE_INTERNAL => "internal",
         // Every caller passes one of the four above; fall back safely to the generic 4xx/5xx code
         // rather than leaking an unmapped token onto the frozen wire.
@@ -710,8 +714,8 @@ pub(crate) async fn update_key(
             audit::AUDIT.record_by("key.patch", &resource, audit::OUTCOME_REJECTED, &actor);
             error_response(
                 StatusCode::CONFLICT,
-                ERR_TYPE_CONFLICT,
-                "If-Match ETag is stale: the key changed since you read it",
+                ERR_TYPE_VERSION_CONFLICT,
+                "If-Match ETag is stale: the key changed since you read it (re-read and retry)",
             )
         }
         Ok(Ok(UpdateOutcome::NotFound)) => {
@@ -1103,8 +1107,8 @@ pub(crate) async fn delete_key(
             audit::AUDIT.record_by("key.delete", &resource, audit::OUTCOME_REJECTED, &actor);
             error_response(
                 StatusCode::CONFLICT,
-                ERR_TYPE_CONFLICT,
-                "If-Match ETag is stale: the key changed since you read it",
+                ERR_TYPE_VERSION_CONFLICT,
+                "If-Match ETag is stale: the key changed since you read it (re-read and retry)",
             )
         }
         Ok(Err(e)) => internal_error("delete_key", &e),

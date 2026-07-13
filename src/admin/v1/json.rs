@@ -64,6 +64,7 @@ impl AdminTransport for JsonV1 {
             .route("/hooks/{name}/health", get(hook_health))
             .route("/hooks/{name}/settings", patch(patch_hook_settings))
             .route("/hooks/{name}/schema", get(hook_schema))
+            .route("/hooks/{name}/status", get(hook_status))
             .route("/plugins", get(list_plugins))
             .route("/auth", get(get_auth))
             .route("/admin-auth", get(get_admin_auth).put(put_auth))
@@ -251,7 +252,9 @@ fn if_match_version(headers: &axum::http::HeaderMap) -> Result<Option<u64>, Resp
 /// vs the live one. `None` (absent / `*`) never rejects.
 fn stale_if_match(expected: Option<u64>, current: u64) -> Option<AdminError> {
     match expected {
-        Some(v) if v != current => Some(AdminError::Conflict(format!(
+        // RETRYABLE: re-read the resource (fresh ETag) and retry — its own frozen code, split
+        // from terminal `conflict` (external review R3).
+        Some(v) if v != current => Some(AdminError::VersionConflict(format!(
             "If-Match version {v} is stale (current is {current})"
         ))),
         _ => None,
@@ -362,8 +365,24 @@ async fn get_admin_auth(State(handle): State<Arc<AppHandle>>) -> Response {
 
 /// `GET /api/v1/admin/usage` — the fleet METERING read: current UTC-day bucket, raw token split
 /// per (model, provider) and per key + derived spend_micros (see the service/contract docs).
-async fn get_usage(State(handle): State<Arc<AppHandle>>) -> Response {
-    respond(StatusCode::OK, service(&handle).get_usage().await)
+/// `?window=<bucket-start-epoch>` selects a PAST UTC-day bucket (default: current). The response
+/// is ALWAYS one bucket — the pinned shape (see the contract doc).
+async fn get_usage(
+    State(handle): State<Arc<AppHandle>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let window = match q.get("window") {
+        None => None,
+        Some(v) => match v.parse::<u64>() {
+            Ok(w) => Some(w),
+            Err(_) => {
+                return err_json(&AdminError::Validation(
+                    "invalid `window`: expected a UTC-day bucket start epoch".into(),
+                ))
+            }
+        },
+    };
+    respond(StatusCode::OK, service(&handle).get_usage(window).await)
 }
 
 /// `GET /api/v1/admin/config` — the effective running config snapshot (redacted; no secrets;
@@ -1389,8 +1408,73 @@ async fn hook_schema(State(handle): State<Arc<AppHandle>>, Path(name): Path<Stri
     let Some(hook) = current.hook_registry.get(&name) else {
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
-    let schema = crate::routing::fetch_schema(hook, &current.client).await;
+    let schema =
+        crate::routing::fetch_schema(&name, hook, current.config_version, &current.client).await;
     ok_json(StatusCode::OK, &json!({ "name": name, "schema": schema }))
+}
+
+/// `GET /api/v1/admin/hooks/{name}/status` — the hook's OBSERVED state, live-queried over its
+/// transport: the settings it is actually running + its version (vs busbar's DESIRED registry
+/// copy, with a `drift` verdict) and its self-reported metrics (validated + bounded — a hostile
+/// hook cannot flood; names/help are charset-enforced/sanitized so no content can ride a metric).
+/// `reported: null` when the hook doesn't answer status (fail-open; the desired view still serves).
+/// This is the control-plane read: a dashboard built on busbar sees what each plug is doing.
+async fn hook_status(State(handle): State<Arc<AppHandle>>, Path(name): Path<String>) -> Response {
+    let current = handle.load();
+    let Some(hook) = current.hook_registry.get(&name) else {
+        return err_json(&AdminError::NotFound(format!("hook `{name}`")));
+    };
+    let desired_version = current.config_version;
+    let reported =
+        crate::routing::fetch_status(&name, hook, desired_version, &current.client).await;
+    let as_of = crate::store::now();
+    let body = match reported {
+        Some(r) => {
+            // Drift: the hook runs a different settings version, or a DESIRED key is missing/
+            // changed in its observed settings (extra self-managed keys are NOT drift).
+            let settings_drift = r
+                .settings
+                .as_ref()
+                .is_some_and(|obs| hook.settings.iter().any(|(k, v)| obs.get(k) != Some(v)));
+            let version_drift = r.settings_version.is_some_and(|v| v != desired_version);
+            let metrics = r
+                .metrics
+                .as_ref()
+                .map(|m| {
+                    crate::routing::wire::parse_status_metrics(m)
+                        .into_iter()
+                        .map(|(name, metric)| {
+                            (
+                                name,
+                                json!({"type": metric.kind, "value": metric.value,
+                                       "help": metric.help}),
+                            )
+                        })
+                        .collect::<serde_json::Map<_, _>>()
+                })
+                .unwrap_or_default();
+            json!({
+                "name": name,
+                "desired": {"settings": hook.settings, "settings_version": desired_version},
+                "reported": {"settings": r.settings, "settings_version": r.settings_version},
+                "drift": settings_drift || version_drift,
+                "metrics": metrics,
+                "as_of": as_of,
+                "source": "live",
+            })
+        }
+        None => json!({
+            "name": name,
+            "desired": {"settings": hook.settings, "settings_version": desired_version},
+            "reported": serde_json::Value::Null,
+            "drift": serde_json::Value::Null,
+            "metrics": {},
+            "as_of": as_of,
+            "source": "live",
+            "note": "hook did not answer status (unsupported or unreachable)",
+        }),
+    };
+    ok_json(StatusCode::OK, &body)
 }
 
 /// The stable v1 GET endpoints (RELATIVE path, summary), the single source for both the
@@ -1628,6 +1712,23 @@ fn openapi_doc() -> serde_json::Value {
                 }],
                 "responses": {
                     "200": {"description": "`{name, schema}` (`schema` null when the hook doesn't answer describe)"},
+                    "404": {"description": "Unknown hook (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        ap("/hooks/{name}/status"),
+        json!({
+            "get": {
+                "summary": "The hook's OBSERVED state, live-queried: running settings + version (vs busbar's desired copy, with a drift verdict) and self-reported metrics. reported=null when the hook doesn't answer (fail-open)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "`{name, desired, reported, drift, metrics, as_of, source}`"},
                     "404": {"description": "Unknown hook (error code `not_found`)"}
                 }
             }
@@ -1904,6 +2005,14 @@ fn openapi_doc() -> serde_json::Value {
             &[("type", "Plugin type: `auth` | `hooks` (required)", true)],
         ),
         (
+            "/usage",
+            &[(
+                "window",
+                "A PAST UTC-day bucket start epoch (default: current bucket). The response is always ONE bucket; spend_micros is a read-time estimate — bill from the raw token split, never store spend_micros as a ledger charge",
+                false,
+            )],
+        ),
+        (
             "/pools",
             &[(
                 "detail",
@@ -1995,8 +2104,9 @@ fn openapi_doc() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "code": {"type": "string",
-                                    "enum": ["not_found", "unauthorized", "forbidden", "invalid_request",
-                                             "conflict", "rate_limited", "internal"]},
+                                    "enum": ["not_found", "unauthorized", "method_not_allowed", "forbidden",
+                                             "invalid_request", "version_conflict", "conflict",
+                                             "rate_limited", "internal"]},
                                 "message": {"type": "string"}
                             },
                             "required": ["code", "message"]
@@ -2192,7 +2302,9 @@ mod tests {
             AdminError::Forbidden {
                 needed: crate::admin::v1::contract::Scope::Full,
             },
+            AdminError::MethodNotAllowed,
             AdminError::Validation(String::new()),
+            AdminError::VersionConflict(String::new()),
             AdminError::Conflict(String::new()),
             AdminError::RateLimited,
             AdminError::Internal,

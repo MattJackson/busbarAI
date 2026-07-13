@@ -214,6 +214,34 @@ pub struct RewriteReply {
     pub tools: Vec<serde_json::Value>,
 }
 
+/// The outcome of a REWRITE-phase (`transform`) call. A `prompt: rw` gate's reply may carry ANY
+/// gate verb — in particular `reject` (a compressor that also screens for PII returns
+/// `{"reject": ...}`). Dropping that reject silently (the pre-1.3 behavior) was a fail-OPEN from
+/// the hook author's view: the request the hook tried to stop got routed. Precedence on the
+/// transform path: Reject > Rewrite > Abstain. (`restrict`/`order` remain decide-path verbs and
+/// are still ignored on transform — documented in the wire contract.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransformOutcome {
+    /// Replace the request body (the rewrite arm; fail-closed parsed).
+    Rewrite(RewriteReply),
+    /// Reject the request outright — same clamped/sanitized semantics as a decide-path reject.
+    Reject { status: u16, message: String },
+    /// No opinion / unsupported / any transport failure (proceed with the ORIGINAL body).
+    Abstain,
+}
+
+/// A hook's self-reported OBSERVED state — the `status` management reply (control plane): the
+/// settings it is actually running (vs busbar's desired-state registry copy), their version, and
+/// its own operational metrics (e.g. a compressor's `tokens_compressed_total`). Every field
+/// optional; a hook that doesn't implement `status` simply never produces one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HookStatus {
+    pub settings_version: Option<u64>,
+    pub settings: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Raw metrics map (`name -> {type, value, help?}`); the engine validates/bounds entries.
+    pub metrics: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
 /// THE transport-agnostic contract. webhook / socket / native all implement this.
 #[async_trait::async_trait]
 pub trait RoutingPolicy: Send + Sync + 'static {
@@ -243,8 +271,8 @@ pub trait RoutingPolicy: Send + Sync + 'static {
         &self,
         _req: &RoutingRequest<'_>,
         _budget: std::time::Duration,
-    ) -> Option<RewriteReply> {
-        None
+    ) -> TransformOutcome {
+        TransformOutcome::Abstain
     }
 
     /// PUSH a settings map to the hook (`PATCH /admin/v1/hooks/{name}/settings`): send the
@@ -264,6 +292,13 @@ pub trait RoutingPolicy: Send + Sync + 'static {
     /// Ask the hook to DESCRIBE its settings schema (`GET /admin/v1/hooks/{name}/schema`).
     /// `None` = the transport/hook doesn't answer describe. Proxied verbatim.
     async fn describe(&self, _budget: std::time::Duration) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Ask the hook for its STATUS (observed settings + self-reported metrics — the control-plane
+    /// read behind `GET /api/v1/admin/hooks/{name}/status`). `None` = the transport/hook doesn't
+    /// answer (fail-open: never affects any request). Default: in-process natives have no status.
+    async fn status(&self, _budget: std::time::Duration) -> Option<HookStatus> {
         None
     }
 

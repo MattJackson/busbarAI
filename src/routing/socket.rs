@@ -53,17 +53,24 @@ pub(crate) struct SocketPolicy {
     path: String,
     conn: Mutex<Option<Conn>>,
     /// The pre-serialized `configure` line (D2), sent FIRST on every fresh connection so a
-    /// (re)started hook always holds its current settings before its first request. `None` = the
-    /// legacy 3-message wire (no settings configured) — old binaries keep working untouched.
+    /// (re)started hook always holds its current settings before its first request (ALWAYS present
+    /// on production transports — audit W-H2; `None` only via the bare test constructor).
     configure_line: Option<Vec<u8>>,
+    /// The settings_version the preamble carries — the ack must echo EXACTLY this (one ack rule
+    /// for preamble and PATCH push alike; audit W-M4).
+    configure_version: u64,
 }
 
 impl SocketPolicy {
+    /// Bare transport with NO preamble — TEST-ONLY (unit tests exercising the 3-message wire in
+    /// isolation). Production transports are always built `with_configure` (audit W-H2).
+    #[cfg(test)]
     pub(crate) fn new(path: String) -> Self {
         Self {
             path,
             conn: Mutex::new(None),
             configure_line: None,
+            configure_version: 0,
         }
     }
 
@@ -88,7 +95,10 @@ impl SocketPolicy {
         Self {
             path,
             conn: Mutex::new(None),
-            configure_line: (!settings.is_empty()).then_some(line),
+            // ALWAYS send the preamble (audit W-H2): empty settings are still valid desired-state,
+            // and the preamble is the only busbar_version delivery most hooks see.
+            configure_line: Some(line),
+            configure_version: settings_version,
         }
     }
 
@@ -102,10 +112,19 @@ impl SocketPolicy {
         if let Some(ref line) = self.configure_line {
             let ack = Self::round_trip(&mut conn, line).await?;
             let parsed: Result<super::wire::ConfigureAck, _> = serde_json::from_slice(&ack);
-            if !matches!(parsed, Ok(super::wire::ConfigureAck { ack: Some(_) })) {
+            // ONE ack rule everywhere (audit W-M4): the hook must echo the EXACT version it was
+            // sent — the same rule the settings-PATCH push enforces, so a hook implements one
+            // behavior for both deliveries.
+            let acked = matches!(
+                parsed,
+                Ok(super::wire::ConfigureAck {
+                    ack: Some(super::wire::ConfigureAckBody { settings_version })
+                }) if settings_version == self.configure_version
+            );
+            if !acked {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "hook did not ack its configure preamble",
+                    "hook did not ack its configure preamble with the sent settings_version",
                 ));
             }
         }
@@ -200,7 +219,12 @@ impl RoutingPolicy for SocketPolicy {
     ) -> PolicyResult {
         // The ONE shared hook wire projection — byte-identical JSON to the webhook's POST body, so a
         // hook graduates between transports without changing its logic. One line, newline-terminated.
-        let mut line = serde_json::to_vec(&super::wire::build(req, candidates, ctx))?;
+        let mut line = serde_json::to_vec(&super::wire::build(
+            super::wire::OP_DECIDE,
+            req,
+            candidates,
+            ctx,
+        ))?;
         line.reserve_exact(1); // to_vec returns an exact-fit Vec; avoid a guaranteed realloc
         line.push(b'\n');
 
@@ -233,18 +257,33 @@ impl RoutingPolicy for SocketPolicy {
         &self,
         req: &RoutingRequest<'_>,
         budget: Duration,
-    ) -> Option<super::wire::RewriteReply> {
+    ) -> busbar_api::TransformOutcome {
+        use busbar_api::TransformOutcome;
         let empty: [Candidate<'_>; 0] = [];
         let ctx = RoutingContext {
             pool: req.pool,
             budget_remaining: None,
         };
-        let mut line = serde_json::to_vec(&super::wire::build(req, &empty, &ctx)).ok()?;
+        let Ok(mut line) = serde_json::to_vec(&super::wire::build(
+            super::wire::OP_TRANSFORM,
+            req,
+            &empty,
+            &ctx,
+        )) else {
+            return TransformOutcome::Abstain;
+        };
         line.push(b'\n');
-        // Fail-closed: any transport/parse error → None (proceed with the original body).
-        let reply = self.exchange(&line, budget).await.ok()?;
-        let parsed: super::wire::HookResponse = crate::json::parse(&reply).ok()?;
-        super::wire::parse_rewrite(&parsed.rewrite?)
+        // Fail-safe on TRANSPORT/PARSE errors → Abstain (proceed with the original body). But a
+        // parsed reply's REJECT is honored — precedence reject > rewrite > abstain, exactly like
+        // the decide path (audit W-H1: a rw gate that also screens must be able to stop the
+        // request; dropping its reject was fail-OPEN from the author's view).
+        let Ok(reply) = self.exchange(&line, budget).await else {
+            return TransformOutcome::Abstain;
+        };
+        let Ok(parsed) = crate::json::parse::<super::wire::HookResponse>(&reply) else {
+            return TransformOutcome::Abstain;
+        };
+        super::wire::transform_outcome(parsed)
     }
 
     /// TAP: write-only fire-and-forget send of the pre-serialized projection. No reply is read.
@@ -288,6 +327,15 @@ impl RoutingPolicy for SocketPolicy {
         line.push(b'\n');
         let reply = self.exchange(&line, budget).await.ok()?;
         serde_json::from_slice(&reply).ok()
+    }
+
+    async fn status(&self, budget: Duration) -> Option<busbar_api::HookStatus> {
+        let mut line = serde_json::to_vec(&super::wire::StatusMsg { status: true }).ok()?;
+        line.push(b'\n');
+        let reply = self.exchange(&line, budget).await.ok()?;
+        // `{}` (no `status` key) = the hook doesn't speak status — fail open (None).
+        let parsed: super::wire::StatusEnvelope = crate::json::parse(&reply).ok()?;
+        parsed.status.map(Into::into)
     }
 
     async fn notify(&self, projection: &[u8], budget: Duration) {
@@ -460,8 +508,13 @@ mod tests {
             let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
         });
         let policy = SocketPolicy::new(path.to_string_lossy().into_owned());
-        let projection =
-            serde_json::to_vec(&super::super::wire::build(&req(), &[], &ctx())).unwrap();
+        let projection = serde_json::to_vec(&super::super::wire::build(
+            super::super::wire::OP_DECIDE,
+            &req(),
+            &[],
+            &ctx(),
+        ))
+        .unwrap();
         policy.notify(&projection, Duration::from_secs(2)).await;
         let received = tokio::time::timeout(Duration::from_secs(2), rx)
             .await
@@ -501,21 +554,40 @@ mod tests {
         )
         .await;
         let policy = SocketPolicy::new(path);
-        let rw = policy
-            .transform(&req(), Duration::from_secs(2))
-            .await
-            .expect("well-formed rewrite parses");
+        let busbar_api::TransformOutcome::Rewrite(rw) =
+            policy.transform(&req(), Duration::from_secs(2)).await
+        else {
+            panic!("well-formed rewrite parses")
+        };
         assert_eq!(rw.messages.len(), 1);
         assert_eq!(rw.tools.len(), 1);
 
-        // A reply with no rewrite → None (fail-closed).
+        // A reply with no rewrite → Abstain (proceed with the original body).
         let dir2 = tempdir();
         let path2 = mock_hook(dir2.path(), r#"{"order":[0]}"#).await;
         let policy2 = SocketPolicy::new(path2);
-        assert!(policy2
-            .transform(&req(), Duration::from_secs(2))
-            .await
-            .is_none());
+        assert_eq!(
+            policy2.transform(&req(), Duration::from_secs(2)).await,
+            busbar_api::TransformOutcome::Abstain
+        );
+
+        // W-H1: a rw gate's REJECT is honored on the transform path (reject > rewrite > abstain) —
+        // a compressor that also screens can stop the request; previously the reject was silently
+        // dropped (fail-open from the hook author's view).
+        let dir3 = tempdir();
+        let path3 = mock_hook(
+            dir3.path(),
+            r#"{"reject":{"status":451,"message":"policy screen"},"rewrite":{"messages":[{"role":"user","content":"x"}]}}"#,
+        )
+        .await;
+        let policy3 = SocketPolicy::new(path3);
+        match policy3.transform(&req(), Duration::from_secs(2)).await {
+            busbar_api::TransformOutcome::Reject { status, message } => {
+                assert_eq!(status, 451);
+                assert_eq!(message, "policy screen");
+            }
+            other => panic!("reject wins over rewrite on transform; got {other:?}"),
+        }
     }
 
     /// Explicit abstain and empty-object replies are the clean Abstain path, not errors.

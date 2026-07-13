@@ -2312,9 +2312,12 @@ fn build_rewrite_request<'a>(
 /// errors/times out/abstains yields `None` (`transform`) and is skipped; `apply_rewrite_to_body` only
 /// touches a chat-shaped body. Zero cost when no rewrite hook is configured (the caller guards on the
 /// empty list before calling).
-/// Returns whether ANY rewrite actually committed to the body — the caller must then invalidate
-/// every retained copy of the ORIGINAL bytes (the same-protocol pristine short-circuit and the
-/// failover re-parse both read them), or the rewrite silently vanishes on those paths.
+/// Returns `Ok(applied)` — whether ANY rewrite actually committed to the body (the caller must
+/// then invalidate every retained copy of the ORIGINAL bytes: the same-protocol pristine
+/// short-circuit and the failover re-parse both read them, or the rewrite silently vanishes on
+/// those paths) — or `Err((status, message))` when a hook REJECTED the request (audit W-H1:
+/// reject > rewrite > abstain on the transform path too; a rw gate that also screens must be able
+/// to stop the request — dropping its reject was fail-OPEN from the author's view).
 async fn apply_global_rewrites(
     rewrite_hooks: &[(
         std::time::Duration,
@@ -2324,18 +2327,25 @@ async fn apply_global_rewrites(
     pool_name: &str,
     ingress_protocol: &str,
     wants_stream: bool,
-) -> bool {
+) -> Result<bool, (u16, String)> {
     let mut applied = false;
     for (timeout, hook) in rewrite_hooks {
         // Rebuild the projection from the current body so a later hook sees the earlier rewrite.
         let req = build_rewrite_request(v, pool_name, ingress_protocol, wants_stream, true);
-        let rewritten = hook.transform(&req, *timeout).await;
+        let outcome = hook.transform(&req, *timeout).await;
         drop(req); // end the immutable borrow of `v` before mutating it
-        if let Some(rw) = rewritten {
-            applied |= apply_rewrite_to_body(v, &rw, ingress_protocol);
+        match outcome {
+            busbar_api::TransformOutcome::Rewrite(rw) => {
+                applied |= apply_rewrite_to_body(v, &rw, ingress_protocol);
+            }
+            busbar_api::TransformOutcome::Reject { status, message } => {
+                // Already status-clamped + message-sanitized at the wire seam.
+                return Err((status, message));
+            }
+            busbar_api::TransformOutcome::Abstain => {}
         }
     }
-    applied
+    Ok(applied)
 }
 
 /// The ingress body's conversation-turn array, DIALECT-AWARE — the READ-side mirror of
@@ -3055,6 +3065,7 @@ pub(crate) fn fire_stage_taps(
         return;
     }
     let hook_req = crate::routing::wire::HookRequest {
+        op: crate::routing::wire::OP_NOTIFY,
         request: crate::routing::wire::HookReqProjection {
             pool: shape.pool,
             ingress_protocol: shape.ingress_protocol,
@@ -3069,7 +3080,6 @@ pub(crate) fn fire_stage_taps(
         },
         candidates: Vec::new(),
         context: crate::routing::wire::HookContext {
-            pool: shape.pool,
             budget_remaining: None,
         },
         stage: Some(stage),
@@ -3260,7 +3270,7 @@ pub(crate) async fn forward_with_pool_parsed(
             &shape,
             crate::routing::wire::HookStageProjection {
                 at: "completion",
-                target: None,
+                model: None,
                 attempt_number: None,
                 remaining_candidates: None,
                 previous_failure: None,
@@ -3354,22 +3364,46 @@ async fn forward_with_pool_parsed_inner(
         .unwrap_or(&[]);
     if !app.rewrite_hooks.is_empty() || !pool_rewrites.is_empty() {
         if let Some(parsed) = v.as_mut() {
-            let mut applied = apply_global_rewrites(
+            // A rewrite hook's REJECT stops the request here — the same client shaping a decide-
+            // path gate rejection gets (clamped status, sanitized message, native envelope).
+            let reject = |status: u16, message: String| {
+                tracing::info!(
+                    pool = pool_name,
+                    status,
+                    message = %message,
+                    "rewrite gate rejected the request"
+                );
+                gate_rejected(ingress_error(
+                    ingress_protocol,
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                    reject_kind_for_status(status),
+                    &message,
+                ))
+            };
+            let mut applied = match apply_global_rewrites(
                 &app.rewrite_hooks,
                 parsed,
                 pool_name,
                 ingress_protocol,
                 wants_stream,
             )
-            .await;
-            applied |= apply_global_rewrites(
+            .await
+            {
+                Ok(a) => a,
+                Err((status, message)) => return reject(status, message),
+            };
+            applied |= match apply_global_rewrites(
                 pool_rewrites,
                 parsed,
                 pool_name,
                 ingress_protocol,
                 wants_stream,
             )
-            .await;
+            .await
+            {
+                Ok(a) => a,
+                Err((status, message)) => return reject(status, message),
+            };
             // A committed rewrite makes the RETAINED bytes stale: the same-protocol pristine
             // short-circuit re-emits them verbatim, and failover hops 2+ re-parse them — either
             // path would silently discard the rewrite. Re-serialize the rewritten body as the new
@@ -3412,9 +3446,14 @@ async fn forward_with_pool_parsed_inner(
                     wants_stream,
                     with_prompt,
                 );
-                serde_json::to_vec(&crate::routing::wire::build(&req, &[], &ctx))
-                    .ok()
-                    .map(std::sync::Arc::new)
+                serde_json::to_vec(&crate::routing::wire::build(
+                    crate::routing::wire::OP_NOTIFY,
+                    &req,
+                    &[],
+                    &ctx,
+                ))
+                .ok()
+                .map(std::sync::Arc::new)
             };
             // Shape-only is needed whenever any tap lacks the prompt grant; the prompt projection only
             // when at least one tap holds `prompt: ro`. Build each at most once.
@@ -3927,7 +3966,7 @@ async fn forward_with_pool_parsed_inner(
             shape,
             crate::routing::wire::HookStageProjection {
                 at: "route",
-                target: None,
+                model: None,
                 attempt_number: None,
                 remaining_candidates: Some(cands.len()),
                 previous_failure: None,
@@ -4008,7 +4047,7 @@ async fn forward_with_pool_parsed_inner(
                 shape,
                 crate::routing::wire::HookStageProjection {
                     at: "attempt",
-                    target: Some(&app.lanes[i].model),
+                    model: Some(&app.lanes[i].model),
                     attempt_number: Some(
                         u32::try_from(attempt.saturating_add(1)).unwrap_or(u32::MAX),
                     ),
@@ -6407,8 +6446,8 @@ mod usage_tap_tests {
                 &self,
                 _req: &RoutingRequest<'_>,
                 _budget: std::time::Duration,
-            ) -> Option<RewriteReply> {
-                Some(RewriteReply {
+            ) -> busbar_api::TransformOutcome {
+                busbar_api::TransformOutcome::Rewrite(RewriteReply {
                     messages: vec![serde_json::json!({"role": "user", "content": self.0})],
                     tools: vec![],
                 })
@@ -6426,7 +6465,9 @@ mod usage_tap_tests {
             ),
         ];
         let mut v = serde_json::json!({"messages": [{"role": "user", "content": "orig"}]});
-        super::apply_global_rewrites(&hooks, &mut v, "pool", "anthropic", false).await;
+        super::apply_global_rewrites(&hooks, &mut v, "pool", "anthropic", false)
+            .await
+            .expect("no rewrite hook rejected");
         // Last hook in the chain wins; B ran on A's rewritten body.
         assert_eq!(v["messages"][0]["content"], "B");
     }
@@ -12770,7 +12811,9 @@ mod hook_seam_tests {
         let payload = wait_for_tap_body(&state).await;
         assert_eq!(payload["stage"]["at"], "attempt");
         assert_eq!(payload["stage"]["attempt_number"], 1);
-        assert_eq!(payload["stage"]["target"], "m0");
+        // Renamed target -> model (wire audit L10: one name for one concept — the same string
+        // candidates[].model carries).
+        assert_eq!(payload["stage"]["model"], "m0");
         assert!(
             payload["stage"].get("previous_failure").is_none(),
             "no failure precedes the first attempt"
@@ -12823,8 +12866,8 @@ mod hook_seam_tests {
             &self,
             _req: &RoutingRequest<'_>,
             _budget: std::time::Duration,
-        ) -> Option<crate::routing::wire::RewriteReply> {
-            Some(crate::routing::wire::RewriteReply {
+        ) -> busbar_api::TransformOutcome {
+            busbar_api::TransformOutcome::Rewrite(crate::routing::wire::RewriteReply {
                 messages: vec![serde_json::json!({"role": "user", "content": self.0})],
                 tools: vec![],
             })

@@ -157,12 +157,13 @@ pub(crate) fn resolve_pool_ordering(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
     default_hook: Option<&str>,
+    settings_version: u64,
 ) -> Option<ResolvedPolicy> {
     if !cfg.base_named {
         if let Some(name) = default_hook {
             if let Some(hook) = hooks.get(name) {
                 // The default gate becomes this pool's base ordering.
-                return resolve_gate_transport(hook, hooks, client);
+                return resolve_gate_transport(name, hook, hooks, client, settings_version);
             }
         }
     }
@@ -178,6 +179,7 @@ pub(crate) fn resolve_pool_gates(
     cfg: &crate::config::PoolCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> Vec<(u16, ResolvedPolicy)> {
     cfg.gates
         .iter()
@@ -192,7 +194,8 @@ pub(crate) fn resolve_pool_gates(
             if hook.prompt.can_rewrite() {
                 return None;
             }
-            resolve_gate_transport(hook, hooks, client).map(|rp| (hook.priority, rp))
+            resolve_gate_transport(name, hook, hooks, client, settings_version)
+                .map(|rp| (hook.priority, rp))
         })
         .collect()
 }
@@ -206,6 +209,7 @@ pub(crate) fn resolve_pool_rewrites(
     cfg: &crate::config::PoolCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
     let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
     for name in &cfg.gates {
@@ -217,7 +221,7 @@ pub(crate) fn resolve_pool_rewrites(
         }
         if let Some(ResolvedPolicy::Policy {
             policy, timeout, ..
-        }) = resolve_gate_transport(hook, hooks, client)
+        }) = resolve_gate_transport(name, hook, hooks, client, settings_version)
         {
             ranked.push((hook.priority, timeout, policy));
         }
@@ -230,12 +234,14 @@ pub(crate) fn resolve_pool_rewrites(
 /// projections are gated by the hook's `prompt:`/`user:` grants (`ro`/`rw` send the prompt; `ro` sends
 /// identity). A missing/invalid transport degrades to `None` — config_validate surfaces it loudly.
 fn resolve_gate_transport(
+    name: &str,
     hook: &crate::config::HookCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> Option<ResolvedPolicy> {
-    let policy = gate_transport_only(hook, client)?;
-    let (on_error_chain, on_error) = resolve_on_error_chain(hook, hooks, client);
+    let policy = gate_transport_named(name, hook, client, settings_version)?;
+    let (on_error_chain, on_error) = resolve_on_error_chain(hook, hooks, client, settings_version);
     Some(ResolvedPolicy::Policy {
         policy,
         on_error,
@@ -247,41 +253,42 @@ fn resolve_gate_transport(
     })
 }
 
-/// The bare transport of a gate — webhook (SSRF-validated at load) or Unix socket (lazy connect) —
-/// without the surrounding policy config. Shared by the primary resolution and the on_error chain.
-fn gate_transport_only(
+/// The bare transport of a gate, with its IDENTITY — webhook (SSRF-validated at load) or Unix
+/// socket (lazy connect). `name` + `settings_version` feed the socket's configure preamble.
+fn gate_transport_named(
+    name: &str,
     hook: &crate::config::HookCfg,
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> Option<Arc<dyn RoutingPolicy>> {
     if let Some(url) = hook.webhook.as_deref() {
         let url = crate::observability::validate_routing_webhook_url(Some(url)).ok()?;
         return Some(Arc::new(webhook::WebhookPolicy::new(url, client.clone())));
     }
-    gate_socket_transport(hook)
+    gate_socket_transport(name, hook, settings_version)
 }
 
-/// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`], carrying the configure
-/// preamble (D2) when the hook declares settings — sent first on every fresh connection so a
-/// restarted hook always holds current settings.
+/// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`]. The configure preamble is
+/// ALWAYS sent on every fresh connection (audit W-H2: the doc always promised "first message on
+/// every socket (re)connection" — an empty `settings: {}` is still valid desired-state, and the
+/// preamble is the ONLY delivery of `busbar_version` most hooks ever see), carrying the hook's
+/// REGISTRY name and the REAL settings version (audit W-M4 — previously path-as-name + hardcoded 0).
 #[cfg(unix)]
-fn gate_socket_transport(hook: &crate::config::HookCfg) -> Option<Arc<dyn RoutingPolicy>> {
+fn gate_socket_transport(
+    name: &str,
+    hook: &crate::config::HookCfg,
+    settings_version: u64,
+) -> Option<Arc<dyn RoutingPolicy>> {
     let path = hook.socket.as_deref()?;
     if path.is_empty() {
         return None;
     }
-    if hook.settings.is_empty() {
-        Some(Arc::new(socket::SocketPolicy::new(path.to_string())))
-    } else {
-        Some(Arc::new(socket::SocketPolicy::with_configure(
-            path.to_string(),
-            // The registry NAME isn't threaded to this seam; the hook's own name is echoed in the
-            // configure context for multi-hook binaries. Absent a name here, the socket path is
-            // the stable identity the hook can key on.
-            path,
-            &hook.settings,
-            0,
-        )))
-    }
+    Some(Arc::new(socket::SocketPolicy::with_configure(
+        path.to_string(),
+        name,
+        &hook.settings,
+        settings_version,
+    )))
 }
 
 /// The configure-push deadline (spec `configure_timeout_ms` default): distinct from the
@@ -296,7 +303,7 @@ pub(crate) async fn push_configure(
     settings_version: u64,
     client: &reqwest::Client,
 ) -> Result<(), String> {
-    let Some(transport) = gate_transport_only(hook, client) else {
+    let Some(transport) = gate_transport_named(name, hook, client, settings_version) else {
         return Err("hook transport unresolvable".to_string());
     };
     transport
@@ -310,13 +317,30 @@ pub(crate) async fn push_configure(
         .map_err(|e| e.to_string())
 }
 
+/// Fetch a hook's self-reported STATUS (observed settings + metrics) over its transport — the
+/// control-plane read behind `GET /api/v1/admin/hooks/{name}/status`. Fresh transport per call
+/// (never contends the hot request connection); `None` = unsupported/unreachable (fail-open).
+pub(crate) async fn fetch_status(
+    name: &str,
+    hook: &crate::config::HookCfg,
+    settings_version: u64,
+    client: &reqwest::Client,
+) -> Option<busbar_api::HookStatus> {
+    let transport = gate_transport_named(name, hook, client, settings_version)?;
+    transport
+        .status(std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS))
+        .await
+}
+
 /// Fetch a hook's self-described settings schema over its transport (D2,
 /// `GET /api/v1/admin/hooks/{name}/schema`). `None` = the hook/transport doesn't answer describe.
 pub(crate) async fn fetch_schema(
+    name: &str,
     hook: &crate::config::HookCfg,
+    settings_version: u64,
     client: &reqwest::Client,
 ) -> Option<serde_json::Value> {
-    let transport = gate_transport_only(hook, client)?;
+    let transport = gate_transport_named(name, hook, client, settings_version)?;
     transport
         .describe(std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS))
         .await
@@ -332,6 +356,7 @@ fn resolve_on_error_chain<'a>(
     hook: &'a crate::config::HookCfg,
     hooks: &'a std::collections::HashMap<String, crate::config::HookCfg>,
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> (Vec<FallbackHook>, crate::config::PolicyOnError) {
     let mut chain: Vec<FallbackHook> = Vec::new();
     let mut visited: Vec<&str> = Vec::new();
@@ -362,7 +387,7 @@ fn resolve_on_error_chain<'a>(
         if h.kind != crate::config::HookKind::Gate {
             return (chain, crate::config::PolicyOnError::default());
         }
-        if let Some(policy) = gate_transport_only(h, client) {
+        if let Some(policy) = gate_transport_named(current, h, client, settings_version) {
             chain.push(FallbackHook {
                 policy,
                 timeout: policy_timeout(h.timeout_ms),
@@ -395,6 +420,7 @@ pub(crate) fn resolve_rewrite_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
     let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
     for name in global_hooks {
@@ -407,7 +433,7 @@ pub(crate) fn resolve_rewrite_hooks(
         }
         if let Some(ResolvedPolicy::Policy {
             policy, timeout, ..
-        }) = resolve_gate_transport(hook, hooks, client)
+        }) = resolve_gate_transport(name, hook, hooks, client, settings_version)
         {
             ranked.push((hook.priority, timeout, policy));
         }
@@ -425,6 +451,7 @@ pub(crate) fn resolve_tap_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
     client: &reqwest::Client,
+    settings_version: u64,
     stage: crate::config::HookStage,
 ) -> Vec<(std::time::Duration, bool, Arc<dyn RoutingPolicy>)> {
     let mut ranked: Vec<(u16, std::time::Duration, bool, Arc<dyn RoutingPolicy>)> = Vec::new();
@@ -446,7 +473,7 @@ pub(crate) fn resolve_tap_hooks(
             timeout,
             send_prompt,
             ..
-        }) = resolve_gate_transport(hook, hooks, client)
+        }) = resolve_gate_transport(name, hook, hooks, client, settings_version)
         {
             ranked.push((hook.priority, timeout, send_prompt, policy));
         }
@@ -468,6 +495,7 @@ pub(crate) fn resolve_gate_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
     client: &reqwest::Client,
+    settings_version: u64,
 ) -> Vec<(u16, ResolvedPolicy)> {
     let mut ranked: Vec<(u16, ResolvedPolicy)> = Vec::new();
     for name in global_hooks {
@@ -479,7 +507,7 @@ pub(crate) fn resolve_gate_hooks(
         if hook.kind != crate::config::HookKind::Gate || hook.prompt.can_rewrite() {
             continue;
         }
-        if let Some(rp) = resolve_gate_transport(hook, hooks, client) {
+        if let Some(rp) = resolve_gate_transport(name, hook, hooks, client, settings_version) {
             ranked.push((hook.priority, rp));
         }
     }
@@ -620,7 +648,7 @@ mod tests {
         let mut unnamed = pool_with_hook("x");
         unnamed.gates.clear(); // base_named is already false from pool_with_hook
         assert!(
-            resolve_pool_ordering(&unnamed, &hooks, &client, Some("def")).is_some(),
+            resolve_pool_ordering(&unnamed, &hooks, &client, Some("def"), 0).is_some(),
             "an unnamed-base pool inherits the default hook as its ordering"
         );
 
@@ -630,7 +658,8 @@ mod tests {
                 &pool_policy(PoolPolicy::Weighted),
                 &hooks,
                 &client,
-                Some("def")
+                Some("def"),
+                0
             )
             .is_none(),
             "a pool that named its base keeps it; the default does not override"
@@ -641,18 +670,18 @@ mod tests {
         // its own gate resolves separately via resolve_pool_gates.
         let gated = pool_with_hook("h");
         assert!(
-            resolve_pool_ordering(&gated, &hooks, &client, Some("def")).is_some(),
+            resolve_pool_ordering(&gated, &hooks, &client, Some("def"), 0).is_some(),
             "an unnamed-base pool with its own gate still inherits the default as base"
         );
         assert_eq!(
-            resolve_pool_gates(&gated, &hooks, &client).len(),
+            resolve_pool_gates(&gated, &hooks, &client, 0).len(),
             1,
             "the pool's own gate resolves separately, on top of the inherited base"
         );
 
         // No default registered ⇒ identical to resolve_policy (backstop): unnamed pool ⇒ None.
         assert!(
-            resolve_pool_ordering(&unnamed, &HashMap::new(), &client, None).is_none(),
+            resolve_pool_ordering(&unnamed, &HashMap::new(), &client, None, 0).is_none(),
             "no default hook ⇒ the compiled-in weighted backstop (None)"
         );
     }
@@ -673,7 +702,7 @@ mod tests {
     fn unknown_hook_ref_falls_back_to_none() {
         let client = reqwest::Client::new();
         let hooks = HashMap::new();
-        assert!(resolve_pool_gates(&pool_with_hook("nonexistent"), &hooks, &client).is_empty());
+        assert!(resolve_pool_gates(&pool_with_hook("nonexistent"), &hooks, &client, 0).is_empty());
     }
 
     /// A pool `hook:` naming a socket gate resolves to a constructed socket gate policy (unix); an
@@ -689,7 +718,7 @@ mod tests {
                 ..base_gate()
             },
         );
-        match resolve_pool_gates(&pool_with_hook("h"), &hooks, &client)
+        match resolve_pool_gates(&pool_with_hook("h"), &hooks, &client, 0)
             .into_iter()
             .next()
         {
@@ -716,7 +745,7 @@ mod tests {
                 ..base_gate()
             },
         );
-        assert!(resolve_pool_gates(&pool_with_hook("h"), &empty, &client).is_empty());
+        assert!(resolve_pool_gates(&pool_with_hook("h"), &empty, &client, 0).is_empty());
     }
 
     /// The plain default (`policy: weighted`, no hook) stays the zero-cost `None` path.
@@ -742,7 +771,7 @@ mod tests {
         let mut hooks = registry("a", a);
         hooks.insert("b".to_string(), b);
 
-        let resolved = resolve_pool_gates(&pool_with_hook("a"), &hooks, &client);
+        let resolved = resolve_pool_gates(&pool_with_hook("a"), &hooks, &client, 0);
         let Some((
             _,
             ResolvedPolicy::Policy {
@@ -776,7 +805,7 @@ mod tests {
                 on_error_chain,
                 ..
             },
-        )) = resolve_pool_gates(&pool_with_hook("n"), &hooks_n, &client)
+        )) = resolve_pool_gates(&pool_with_hook("n"), &hooks_n, &client, 0)
             .into_iter()
             .next()
         else {
@@ -801,7 +830,7 @@ mod tests {
                 on_error_chain,
                 ..
             },
-        )) = resolve_pool_gates(&pool_with_hook("c"), &hooks, &client)
+        )) = resolve_pool_gates(&pool_with_hook("c"), &hooks, &client, 0)
             .into_iter()
             .next()
         else {
@@ -827,7 +856,7 @@ mod tests {
                 on_error_chain,
                 ..
             },
-        )) = resolve_pool_gates(&pool_with_hook("g"), &hooks, &client)
+        )) = resolve_pool_gates(&pool_with_hook("g"), &hooks, &client, 0)
             .into_iter()
             .next()
         else {
@@ -851,11 +880,11 @@ mod tests {
         let hooks = registry("rw", rw);
         let pool = pool_with_hook("rw");
         assert!(
-            resolve_pool_gates(&pool, &hooks, &client).is_empty(),
+            resolve_pool_gates(&pool, &hooks, &client, 0).is_empty(),
             "an rw gate must not resolve as a decision gate"
         );
         assert_eq!(
-            resolve_pool_rewrites(&pool, &hooks, &client).len(),
+            resolve_pool_rewrites(&pool, &hooks, &client, 0).len(),
             1,
             "an rw gate must resolve into the pool rewrite chain"
         );
@@ -864,8 +893,8 @@ mod tests {
         plain.socket = Some("/run/busbar/plain.sock".to_string());
         let hooks = registry("plain", plain);
         let pool = pool_with_hook("plain");
-        assert_eq!(resolve_pool_gates(&pool, &hooks, &client).len(), 1);
-        assert!(resolve_pool_rewrites(&pool, &hooks, &client).is_empty());
+        assert_eq!(resolve_pool_gates(&pool, &hooks, &client, 0).len(), 1);
+        assert!(resolve_pool_rewrites(&pool, &hooks, &client, 0).is_empty());
     }
 
     /// SECURITY INVARIANT: `resolve_rewrite_hooks` admits ONLY `prompt: rw` GATES as rewrite hooks.
@@ -903,7 +932,7 @@ mod tests {
             "no-gate".to_string(),
             "rw-tap".to_string(),
         ];
-        let resolved = resolve_rewrite_hooks(&hooks, &global, &client);
+        let resolved = resolve_rewrite_hooks(&hooks, &global, &client, 0);
         assert_eq!(
             resolved.len(),
             1,
@@ -944,7 +973,7 @@ mod tests {
             "no-gate".to_string(),
             "a-tap".to_string(),
         ];
-        let resolved = resolve_gate_hooks(&hooks, &global, &client);
+        let resolved = resolve_gate_hooks(&hooks, &global, &client, 0);
         assert_eq!(
             resolved.len(),
             2,
@@ -991,8 +1020,13 @@ mod tests {
             "tap-completion".to_string(),
             "a-gate".to_string(),
         ];
-        let resolved =
-            resolve_tap_hooks(&hooks, &global, &client, crate::config::HookStage::Request);
+        let resolved = resolve_tap_hooks(
+            &hooks,
+            &global,
+            &client,
+            0,
+            crate::config::HookStage::Request,
+        );
         assert_eq!(
             resolved.len(),
             2,
@@ -1003,13 +1037,20 @@ mod tests {
             &hooks,
             &global,
             &client,
+            0,
             crate::config::HookStage::Completion,
         );
         assert_eq!(completion.len(), 1, "one completion-stage tap");
         // And a stage nothing observes resolves empty (the zero-cost skip).
         assert!(
-            resolve_tap_hooks(&hooks, &global, &client, crate::config::HookStage::Attempt)
-                .is_empty(),
+            resolve_tap_hooks(
+                &hooks,
+                &global,
+                &client,
+                0,
+                crate::config::HookStage::Attempt
+            )
+            .is_empty(),
             "no attempt-stage tap is configured"
         );
         // Every resolved tap here is `prompt: no`, so `send_prompt` (the middle tuple element) is false.
@@ -1047,6 +1088,7 @@ mod tests {
             &hooks,
             &["ro-tap".to_string(), "no-tap".to_string()],
             &client,
+            0,
             crate::config::HookStage::Request,
         );
         assert_eq!(resolved.len(), 2);
@@ -1055,12 +1097,14 @@ mod tests {
             &hooks,
             &["ro-tap".to_string()],
             &client,
+            0,
             crate::config::HookStage::Request,
         );
         let no = resolve_tap_hooks(
             &hooks,
             &["no-tap".to_string()],
             &client,
+            0,
             crate::config::HookStage::Request,
         );
         assert!(ro[0].1, "prompt:ro tap carries send_prompt = true");
@@ -1150,7 +1194,7 @@ mod tests {
             ),
         ));
         for (label, hooks) in cases {
-            match resolve_pool_gates(&pool_with_hook("h"), &hooks, &client)
+            match resolve_pool_gates(&pool_with_hook("h"), &hooks, &client, 0)
                 .into_iter()
                 .next()
             {

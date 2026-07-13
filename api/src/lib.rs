@@ -20,6 +20,6 @@ mod hooks;
 
 pub use auth::{constant_time_eq, sha256_hex, AuthModule, AuthOutcome, Principal};
 pub use hooks::{
-    CallerIdentity, Candidate, PolicyError, PolicyResult, PromptProjection, RewriteReply,
-    RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
+    CallerIdentity, Candidate, HookStatus, PolicyError, PolicyResult, PromptProjection,
+    RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest, TransformOutcome,
 };
