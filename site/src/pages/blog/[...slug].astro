@@ -3,10 +3,7 @@ import { getCollection, render } from 'astro:content';
 import BlogLayout from '../../layouts/BlogLayout.astro';
 
 export async function getStaticPaths() {
-  // Future-dated posts are scheduled: they only build once their date has arrived
-  // (compared at build time). Redeploy on/after the date to publish.
-  const now = Date.now();
-  const posts = (await getCollection('blog')).filter((p) => p.data.date.valueOf() <= now);
+  const posts = await getCollection('blog');
   return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
 }
 
