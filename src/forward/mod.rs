@@ -2189,10 +2189,7 @@ fn build_rewrite_request<'a>(
             .is_some_and(|a| !a.is_empty()),
         total_chars: total_text_chars(v, ingress_protocol, system_chars),
         system_chars,
-        max_tokens: v
-            .get("max_tokens")
-            .and_then(|m| m.as_u64())
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        max_tokens: max_tokens_for(v, ingress_protocol),
         stream: wants_stream,
         // A `prompt: rw` rewrite gate needs the prompt content (`with_prompt`). A TAP gets the
         // shape-only default bucket (`with_prompt == false`) — a per-grant prompt projection for
@@ -2259,6 +2256,24 @@ fn turn_count(v: &Value, ingress_protocol: &str) -> usize {
             ingress_protocol == "responses" && v.get("input").and_then(Value::as_str).is_some(),
         ),
     }
+}
+
+/// Dialect-aware max-output-tokens SIZE signal from the pristine ingress body. The OpenAI Responses
+/// API names this field `max_output_tokens` (see `proto::openai_responses`), NOT `max_tokens`, and a
+/// pure responses-ingress body never carries `max_tokens` — so reading `max_tokens` unconditionally
+/// projected `None` for EVERY responses request, silently blinding any routing policy or tap hook
+/// that keys on the size signal. Mirrors the other dialect-aware projections (`turn_count`,
+/// `system_text_chars`). Saturating narrow: an absurd cap (> u32::MAX) still signals "huge ask"
+/// rather than wrapping to a small number.
+fn max_tokens_for(v: &Value, ingress_protocol: &str) -> Option<u32> {
+    let key = if ingress_protocol == "responses" {
+        "max_output_tokens"
+    } else {
+        "max_tokens"
+    };
+    v.get(key)
+        .and_then(|m| m.as_u64())
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 /// Sum the chars of every `parts[].text` string in a gemini Content object (`systemInstruction`
@@ -2585,12 +2600,9 @@ async fn decide_policy_order(
             .is_some_and(|a| !a.is_empty()),
         total_chars: total_text_chars(v, ingress_protocol, system_chars),
         system_chars,
-        // Saturating narrow: an absurd caller cap (> u32::MAX) still signals "huge ask" to the
-        // policy instead of wrapping to a small number. A SIZE signal, not a limit.
-        max_tokens: v
-            .get("max_tokens")
-            .and_then(|m| m.as_u64())
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+        // Saturating narrow (in `max_tokens_for`): an absurd caller cap (> u32::MAX) still signals
+        // "huge ask" to the policy instead of wrapping to a small number. A SIZE signal, not a limit.
+        max_tokens: max_tokens_for(v, ingress_protocol),
         stream: wants_stream,
         prompt,
         identity,
@@ -2866,9 +2878,7 @@ pub(crate) fn capture_stage_shape<'a>(
                     .and_then(|t| t.as_array())
                     .is_some_and(|a| !a.is_empty()),
                 total_text_chars(v, ingress_protocol, system_chars),
-                v.get("max_tokens")
-                    .and_then(|m| m.as_u64())
-                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX)),
+                max_tokens_for(v, ingress_protocol),
             )
         }
         None => (0, false, 0, None),
@@ -11577,6 +11587,32 @@ mod hook_opt_in_projection_tests {
         let req = build_rewrite_request(&v, "p", "responses", false, true);
         assert_eq!(req.message_count, 1);
         assert_eq!(req.total_chars, 15);
+    }
+
+    /// REGRESSION (audit c1r7): the `max_tokens` routing SIZE signal must be dialect-aware. The
+    /// Responses API names it `max_output_tokens`, so reading `max_tokens` unconditionally projected
+    /// `None` for every responses-ingress request — silently blinding any routing policy/tap that
+    /// keys on the size signal. Non-responses dialects still read `max_tokens`.
+    #[test]
+    fn max_tokens_signal_is_dialect_aware_for_responses() {
+        // Responses ingress: only `max_output_tokens` is present.
+        let resp: Value = serde_json::json!({"input": "hi", "max_output_tokens": 4096});
+        assert_eq!(max_tokens_for(&resp, "responses"), Some(4096));
+        // A stray `max_tokens` on a responses body is NOT the signal — the dialect ignores it.
+        let resp_stray: Value =
+            serde_json::json!({"input": "hi", "max_tokens": 999, "max_output_tokens": 4096});
+        assert_eq!(max_tokens_for(&resp_stray, "responses"), Some(4096));
+        // The routing projection is now populated for a responses request.
+        let req = build_rewrite_request(&resp, "p", "responses", false, true);
+        assert_eq!(req.max_tokens, Some(4096));
+
+        // Every other dialect keeps reading `max_tokens`.
+        let anth: Value = serde_json::json!({"messages": [], "max_tokens": 512});
+        assert_eq!(max_tokens_for(&anth, "anthropic"), Some(512));
+        assert_eq!(max_tokens_for(&anth, "gemini"), Some(512));
+        // Absurd cap saturates rather than wrapping.
+        let huge: Value = serde_json::json!({"max_tokens": u64::MAX});
+        assert_eq!(max_tokens_for(&huge, "anthropic"), Some(u32::MAX));
     }
 
     /// Bedrock ingress rides the `messages` default: its `content: [{text}]` blocks (no `type`

@@ -1472,6 +1472,12 @@ fn openapi_doc() -> serde_json::Value {
     paths.insert(
         "/admin/v1/keys".to_string(),
         json!({
+            // These key endpoints are served by the LEGACY admin handlers, which emit the legacy
+            // envelope `{error:{message,type}}` (type = `*_error`), NOT the v1 `Error` schema's
+            // `{error:{code,message}}`. The full `{code}`-envelope migration is a follow-up; this
+            // marker keeps the doc HONEST until then so a machine reader does not branch on
+            // `error.code` for these paths.
+            "x-busbar-error-envelope": "legacy {error:{message,type}} — type e.g. not_found_error/invalid_request_error/conflict_error",
             "get": {
                 "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=",
                 "security": [{"adminToken": []}],
@@ -1485,8 +1491,8 @@ fn openapi_doc() -> serde_json::Value {
                 "security": [{"adminToken": []}],
                 "responses": {
                     "201": {"description": "Created (body includes the once-shown secret)"},
-                    "400": {"description": "Malformed body / invalid budget or rate (`invalid_request`)"},
-                    "409": {"description": "An Idempotency-Key request is already in flight (`conflict`)"}
+                    "400": {"description": "Malformed body / invalid budget or rate (type `invalid_request_error`)"},
+                    "409": {"description": "An Idempotency-Key request is already in flight (type `conflict_error`)"}
                 }
             }
         }),
@@ -1494,13 +1500,15 @@ fn openapi_doc() -> serde_json::Value {
     paths.insert(
         "/admin/v1/keys/{id}".to_string(),
         json!({
+            // Legacy `{error:{message,type}}` envelope — see the note on `/admin/v1/keys`.
+            "x-busbar-error-envelope": "legacy {error:{message,type}} — type e.g. not_found_error/invalid_request_error/conflict_error",
             "get": {
                 "summary": "One key's metadata + `ETag` (never the secret/hash)",
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
                     "200": {"description": "Key metadata (+ `ETag` header)"},
-                    "404": {"description": "Unknown key (`not_found`)"}
+                    "404": {"description": "Unknown key (type `not_found_error`)"}
                 }
             },
             "patch": {
@@ -1509,9 +1517,9 @@ fn openapi_doc() -> serde_json::Value {
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
                     "200": {"description": "Updated metadata"},
-                    "400": {"description": "Invalid budget/rate (`invalid_request`)"},
-                    "404": {"description": "Unknown key (`not_found`)"},
-                    "409": {"description": "Stale `If-Match` ETag (`conflict`)"}
+                    "400": {"description": "Invalid budget/rate (type `invalid_request_error`)"},
+                    "404": {"description": "Unknown key (type `not_found_error`)"},
+                    "409": {"description": "Stale `If-Match` ETag (type `conflict_error`)"}
                 }
             },
             "delete": {
@@ -1520,7 +1528,7 @@ fn openapi_doc() -> serde_json::Value {
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
                     "200": {"description": "Revoked"},
-                    "404": {"description": "Unknown key (`not_found`)"}
+                    "404": {"description": "Unknown key (type `not_found_error`)"}
                 }
             }
         }),
@@ -1528,13 +1536,15 @@ fn openapi_doc() -> serde_json::Value {
     paths.insert(
         "/admin/v1/keys/{id}/usage".to_string(),
         json!({
+            // Legacy `{error:{message,type}}` envelope — see the note on `/admin/v1/keys`.
+            "x-busbar-error-envelope": "legacy {error:{message,type}} — type e.g. not_found_error",
             "get": {
                 "summary": "Current-window usage for one key (spend / tokens / requests)",
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
                     "200": {"description": "Usage counters"},
-                    "404": {"description": "Unknown key (`not_found`)"}
+                    "404": {"description": "Unknown key (type `not_found_error`)"}
                 }
             }
         }),
@@ -1542,13 +1552,15 @@ fn openapi_doc() -> serde_json::Value {
     paths.insert(
         "/admin/v1/keys/{id}/rotate".to_string(),
         json!({
+            // Legacy `{error:{message,type}}` envelope — see the note on `/admin/v1/keys`.
+            "x-busbar-error-envelope": "legacy {error:{message,type}} — type e.g. not_found_error",
             "post": {
                 "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving",
                 "security": [{"adminToken": []}],
                 "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
                 "responses": {
                     "200": {"description": "Rotated (body includes the once-shown new secret)"},
-                    "404": {"description": "Unknown key (`not_found`)"}
+                    "404": {"description": "Unknown key (type `not_found_error`)"}
                 }
             }
         }),
@@ -1761,6 +1773,9 @@ mod tests {
                     "put" => axum::http::Method::PUT,
                     "patch" => axum::http::Method::PATCH,
                     "delete" => axum::http::Method::DELETE,
+                    // Path-item `x-*` specification extensions (e.g. `x-busbar-error-envelope`) are
+                    // valid OpenAPI and are not operations — they carry no scope annotation.
+                    ext if ext.starts_with("x-") => continue,
                     other => panic!("unexpected method {other} on {path}"),
                 };
                 let annotated = op["x-busbar-required-scope"]

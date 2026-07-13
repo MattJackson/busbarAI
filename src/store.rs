@@ -560,7 +560,18 @@ impl InMemoryStore {
             else {
                 continue;
             };
-            lane.budget.store(snap.budget, Ordering::Relaxed);
+            // Carry over the remaining request budget ONLY when BOTH the snapshot and the new lane
+            // are limited. `export_health` writes the sentinel -1 for an unlimited lane; if the new
+            // config just ADDED `max_requests` to a lane that was unlimited at snapshot time,
+            // storing that -1 over the freshly-set cap would make `lane_admissible`
+            // (`limited && budget <= 0`) reject every dispatch with NO self-recovery path (the
+            // budget only rises on a successful dispatch, which is itself gated on admissibility).
+            // Guard on both flags: preserve the remaining budget when limited→limited, keep the
+            // constructor's cap when unlimited→limited, and ignore the value when the new lane is
+            // unlimited (`budget` is not consulted there anyway).
+            if lane.limited && snap.budget >= 0 {
+                lane.budget.store(snap.budget, Ordering::Relaxed);
+            }
             lane.breaker_state.store(
                 restored_breaker_state(snap.breaker_state),
                 Ordering::Relaxed,
@@ -2751,6 +2762,64 @@ mod tests {
             b.get_lane(0).breaker_state.load(Ordering::Relaxed),
             ST_OPEN,
             "a restored HalfOpen must become Open, or the lane wedges and never self-recovers"
+        );
+    }
+
+    /// REGRESSION (audit c1r7): `restore_health_impl` must not overwrite a newly-LIMITED lane's cap
+    /// with the unlimited sentinel (-1) a prior UNLIMITED snapshot carries. `export_health` writes -1
+    /// for an unlimited lane; if the operator later adds `max_requests` to that lane, blindly storing
+    /// -1 over the fresh cap makes `lane_admissible` (`limited && budget <= 0`) reject EVERY dispatch
+    /// with no self-recovery. Restore is gated on `lane.limited && snap.budget >= 0`.
+    #[test]
+    fn restore_does_not_clobber_new_limit_with_unlimited_sentinel() {
+        set_now_for_test(9000);
+        // Snapshot taken while the lane was UNLIMITED → exports budget -1.
+        let unlimited = InMemoryStore::new(vec![make_lane_data(3, 4)]);
+        let snaps = unlimited.export_health();
+        assert_eq!(
+            snaps[0].budget, -1,
+            "an unlimited lane exports the -1 sentinel"
+        );
+
+        // New config ADDS max_requests to the same identity (model-3/provider-3).
+        let limited_ld = LaneData {
+            limited: true,
+            budget: 100,
+            ..make_lane_data(3, 4)
+        };
+        let restored = InMemoryStore::new_with_limits_restored(
+            vec![limited_ld],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &snaps,
+        );
+        assert_eq!(
+            restored.get_lane(0).budget.load(Ordering::Relaxed),
+            100,
+            "the fresh cap must survive; the unlimited -1 sentinel must NOT clobber it (lane would wedge)"
+        );
+        assert!(
+            restored.usable(0, 9000),
+            "the newly-limited lane must remain admissible, not permanently benched"
+        );
+
+        // And a genuine limited→limited carry-over still copies the REMAINING budget.
+        let mut spent = snaps.clone();
+        spent[0].budget = 40; // as if 60 of 100 were already spent before the snapshot
+        let carried = InMemoryStore::new_with_limits_restored(
+            vec![LaneData {
+                limited: true,
+                budget: 100,
+                ..make_lane_data(3, 4)
+            }],
+            crate::config::DEFAULT_HARD_DOWN_COOLDOWN_SECS,
+            crate::config::DEFAULT_MAX_HONORED_RETRY_AFTER_SECS,
+            &spent,
+        );
+        assert_eq!(
+            carried.get_lane(0).budget.load(Ordering::Relaxed),
+            40,
+            "limited→limited must carry the remaining budget, not reset to the full cap"
         );
     }
 
