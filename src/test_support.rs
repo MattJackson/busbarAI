@@ -784,6 +784,30 @@ impl TestApp {
     }
 }
 
+/// THE METRICS RECORDER HARNESS: sum every exposition sample of `name` whose label set contains
+/// ALL the given `key="value"` pairs, read from a fresh scrape of the process-global recorder
+/// (`metrics::init` + `render` internally — callers never touch the recorder directly).
+///
+/// The global recorder is shared by every test in the process, so absolute values are meaningless;
+/// assert STRICT DELTAS across the action under test (`before`/`after`), and give the test its own
+/// pool/lane label values so parallel tests can't contribute to the matched sample. Matching is by
+/// exact metric name (the char after the name must open the label set / value, so a name never
+/// matches a longer neighbor it happens to prefix).
+pub(crate) fn metric_sum(name: &str, labels: &[(&str, &str)]) -> f64 {
+    crate::metrics::init();
+    let frags: Vec<String> = labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+    crate::metrics::render()
+        .lines()
+        .filter(|l| {
+            l.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+        })
+        .filter(|l| frags.iter().all(|f| l.contains(f.as_str())))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .sum()
+}
+
 fn weighted(members: &[(usize, u32)]) -> Vec<crate::state::WeightedLane> {
     members
         .iter()

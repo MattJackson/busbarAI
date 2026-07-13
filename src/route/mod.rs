@@ -3200,6 +3200,159 @@ mod tests {
         handle.abort();
     }
 
+    /// The SUCCESS half of the observability contract the pre-routing regressions lock for
+    /// failures: ONE served 200 strictly increments `REQUESTS_TOTAL{outcome="ok"}`, the request
+    /// duration histogram's count, AND `UPSTREAM_ATTEMPTS_TOTAL` for the dispatched lane — all
+    /// under the request's own pool label (this test's pool/lane names are unique to it, so
+    /// parallel tests cannot contribute to the matched samples).
+    #[tokio::test]
+    async fn test_served_request_increments_hot_path_metrics() {
+        use crate::test_support::metric_sum;
+        const POOL: &str = "metrics-harness-pool";
+        const MODEL: &str = "metrics-harness-model";
+
+        let state = StdArc::new(MockServerState::new());
+        state.push(MockResponse::Ok {
+            status: axum::http::StatusCode::OK,
+            body: openai_ok_body(),
+        });
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(MODEL, crate::proto::Protocol::openai(), &server.base_url())
+                    .provider("zai"),
+            )
+            .pool(POOL, &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let dur_count = format!("{}_count", crate::metrics::REQUEST_DURATION_SECONDS);
+        let req_before = metric_sum(
+            crate::metrics::REQUESTS_TOTAL,
+            &[("pool", POOL), ("outcome", "ok")],
+        );
+        let dur_before = metric_sum(&dur_count, &[("pool", POOL)]);
+        let att_before = metric_sum(
+            crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
+            &[("pool", POOL), ("lane", MODEL)],
+        );
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("t")
+            .header("content-type", "application/json")
+            .body(
+                json!({"model": POOL, "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        let req_after = metric_sum(
+            crate::metrics::REQUESTS_TOTAL,
+            &[("pool", POOL), ("outcome", "ok")],
+        );
+        let dur_after = metric_sum(&dur_count, &[("pool", POOL)]);
+        let att_after = metric_sum(
+            crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
+            &[("pool", POOL), ("lane", MODEL)],
+        );
+        assert!(
+            req_after > req_before,
+            "a served 200 must increment REQUESTS_TOTAL(outcome=ok): {req_before} -> {req_after}"
+        );
+        assert!(
+            dur_after > dur_before,
+            "a served 200 must observe the duration histogram: {dur_before} -> {dur_after}"
+        );
+        assert!(
+            att_after > att_before,
+            "a served 200 must count its upstream attempt: {att_before} -> {att_after}"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
+    /// CI TIMING GATE (ignored by default; CI runs it explicitly in release mode). Serves warm-up
+    /// plus a measured batch through the REAL router against an instant in-process mock upstream
+    /// and gates the measured p50/p99 full-request latency under DELIBERATELY GENEROUS bounds —
+    /// busbar's real added overhead is microseconds, so these only trip on a GROSS hot-path
+    /// regression (accidental sync I/O, a stray sleep, an O(n²) body walk), never on runner noise.
+    /// Fine-grained overhead numbers stay the latency bench's job (bench/latency/).
+    #[tokio::test]
+    #[ignore = "timing gate — run explicitly (CI: cargo test --release -- --ignored timing_gate)"]
+    async fn timing_gate_hot_path_p50_p99() {
+        const WARMUP: usize = 100;
+        const MEASURED: usize = 500;
+        const P50_MAX_MS: u128 = 25;
+        const P99_MAX_MS: u128 = 250;
+
+        let state = StdArc::new(MockServerState::new());
+        // One queued response per request (warm-up + measured), instant upstream.
+        for _ in 0..(WARMUP + MEASURED) {
+            state.push(MockResponse::Ok {
+                status: axum::http::StatusCode::OK,
+                body: openai_ok_body(),
+            });
+        }
+        let server = MockServer::new(state.clone()).await;
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new(
+                    "timing-gate-model",
+                    crate::proto::Protocol::openai(),
+                    &server.base_url(),
+                )
+                .provider("zai"),
+            )
+            .pool("timing-gate-pool", &[(0, 1)])
+            .build();
+        let (addr, handle) = serve(app).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let body =
+            json!({"model": "timing-gate-pool", "messages": [{"role": "user", "content": "hi"}]})
+                .to_string();
+
+        let mut samples: Vec<u128> = Vec::with_capacity(MEASURED);
+        for i in 0..(WARMUP + MEASURED) {
+            let start = std::time::Instant::now();
+            let resp = client
+                .post(&url)
+                .bearer_auth("t")
+                .header("content-type", "application/json")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            let _ = resp.bytes().await.unwrap();
+            assert_eq!(
+                status, 200,
+                "request {i} failed — the gate measures 200s only"
+            );
+            if i >= WARMUP {
+                samples.push(start.elapsed().as_millis());
+            }
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        let p99 = samples[samples.len() * 99 / 100];
+        assert!(
+            p50 <= P50_MAX_MS,
+            "hot-path p50 {p50}ms exceeded the {P50_MAX_MS}ms gate — a gross regression \
+             (the real overhead is microseconds; check for sync I/O / sleeps on the request path)"
+        );
+        assert!(
+            p99 <= P99_MAX_MS,
+            "hot-path p99 {p99}ms exceeded the {P99_MAX_MS}ms gate — a gross regression"
+        );
+        handle.abort();
+        server.shutdown().await;
+    }
+
     /// MED #4 (re-audit, completeness): a MISSING `model` field on a body-model ingress is likewise a
     /// pre-routing failure and must flow through `finish` (bounded `pool="unresolved"`), not a silent
     /// early-return. Asserts a strict counter increase, so it fails against the old early-return.

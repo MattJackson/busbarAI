@@ -1227,12 +1227,90 @@ async fn validate_config(
 mod tests {
     use super::*;
 
+    /// Collect an axum Response into (status, content-type, parsed JSON body) for the wire-helper
+    /// micro-tests below.
+    async fn parts(resp: Response) -> (StatusCode, String, serde_json::Value) {
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        use http_body_util::BodyExt;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).expect("body is JSON");
+        (status, ct, body)
+    }
+
     /// The error envelope projection is `{"error":{"code","message"}}` with the error's status — the
-    /// shape v1 tooling parses.
+    /// shape v1 tooling parses — served as application/json.
+    #[tokio::test]
+    async fn err_json_uses_stable_envelope() {
+        let (status, ct, body) = parts(err_json(&AdminError::NotFound("hook".into()))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(ct, crate::forward::APPLICATION_JSON);
+        assert_eq!(body["error"]["code"], "not_found");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
+            "message is human text, never empty"
+        );
+        assert_eq!(
+            body["error"].as_object().unwrap().len(),
+            2,
+            "the envelope is exactly code+message (additive changes go OUTSIDE error)"
+        );
+    }
+
+    /// `ok_json` serializes the view verbatim with the GIVEN status and application/json.
+    #[tokio::test]
+    async fn ok_json_serializes_view_with_given_status() {
+        #[derive(Serialize)]
+        struct View {
+            name: &'static str,
+            n: u32,
+        }
+        let (status, ct, body) =
+            parts(ok_json(StatusCode::CREATED, &View { name: "x", n: 7 })).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(ct, crate::forward::APPLICATION_JSON);
+        assert_eq!(body, json!({"name": "x", "n": 7}));
+    }
+
+    /// `respond` — the single seam every v1 handler funnels through — maps Ok to the given status
+    /// and Err to the error's own status + envelope (the Ok-status never leaks onto an error).
+    #[tokio::test]
+    async fn respond_maps_ok_and_err() {
+        let ok: Result<serde_json::Value, AdminError> = Ok(json!({"ok": true}));
+        let (status, _, body) = parts(respond(StatusCode::OK, ok)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+
+        let err: Result<serde_json::Value, AdminError> = Err(AdminError::RateLimited);
+        let (status, _, body) = parts(respond(StatusCode::OK, err)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["error"]["code"], "rate_limited");
+    }
+
+    /// Structural lock on the discovery doc: OpenAPI 3.1, an info.version that matches the crate,
+    /// and every path under the frozen `/admin/v1/` prefix (the deprecated aliases are documented
+    /// elsewhere; v1's own doc never mixes prefixes).
     #[test]
-    fn err_json_uses_stable_envelope() {
-        let resp = err_json(&AdminError::NotFound("hook".into()));
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    fn openapi_doc_is_31_and_v1_prefixed() {
+        let doc = openapi_doc();
+        assert!(
+            doc["openapi"].as_str().unwrap().starts_with("3.1"),
+            "discovery doc is OpenAPI 3.1"
+        );
+        assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
+        for path in doc["paths"].as_object().unwrap().keys() {
+            assert!(
+                path.starts_with("/admin/v1/"),
+                "{path} escaped the frozen /admin/v1/ prefix"
+            );
+        }
     }
 
     /// CONTRACT LOCK: every openapi path+method is annotated with `x-busbar-required-scope`, and

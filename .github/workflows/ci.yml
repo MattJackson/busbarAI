@@ -58,6 +58,20 @@ jobs:
       - name: Test (no-default-features)
         run: cargo test --no-default-features --locked --verbose
 
+  # TIMING GATE: the ignored hot-path latency test, in release mode. Its bounds are deliberately
+  # generous (25ms p50 / 250ms p99 through the full in-process router+mock round trip) so runner
+  # noise can never trip it — it exists to catch GROSS hot-path regressions (sync I/O, stray
+  # sleeps) the instant they land. Fine-grained overhead numbers are bench/latency/'s job.
+  timing:
+    name: timing gate (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Hot-path timing gate
+        run: cargo test --release --locked timing_gate -- --ignored
+
   # Portability gate: busbar must build + pass tests on Windows too (no OS-specific code).
   windows:
     name: windows build · test
