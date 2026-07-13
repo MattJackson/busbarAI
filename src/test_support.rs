@@ -3989,6 +3989,8 @@ mod tests {
                 RootCfg {
                     listen: "0.0.0.0:8080".into(),
                     tls: None,
+                    admin_listen: crate::config::DEFAULT_ADMIN_LISTEN_ADDR.to_string(),
+                    admin_tls: None,
                     auth: None,
                     admin_auth: vec!["admin-tokens".to_string()],
                     group_map: std::collections::HashMap::new(),

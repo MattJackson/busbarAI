@@ -1753,6 +1753,8 @@ mod tests {
         config::RootCfg {
             listen: crate::config::DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: crate::config::DEFAULT_ADMIN_LISTEN_ADDR.to_string(),
+            admin_tls: None,
             auth: None,
             providers,
             models,

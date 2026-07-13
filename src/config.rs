@@ -97,6 +97,11 @@ pub(crate) struct RootCfg {
     pub(crate) listen: String,
     /// Optional native inbound TLS. `None` ⇒ plain HTTP (today's path, byte-for-byte).
     pub(crate) tls: Option<TlsCfg>,
+    /// Separate admin listen address — the admin API is served ONLY here, never on the data
+    /// listener. Defaults to loopback (`127.0.0.1:8081`).
+    pub(crate) admin_listen: String,
+    /// TLS/mTLS for the admin listener (only meaningful with `admin_listen`).
+    pub(crate) admin_tls: Option<TlsCfg>,
     pub(crate) auth: Option<AuthCfg>,
     pub(crate) providers: HashMap<String, ProviderCfg>,
     pub(crate) models: HashMap<String, ModelCfg>,
@@ -1137,6 +1142,35 @@ fn default_listen() -> String {
     DEFAULT_LISTEN_ADDR.into()
 }
 
+/// Default admin-plane listen address. The admin API (`/api/v1/admin/…`) ALWAYS runs on its own
+/// listener, never sharing the data port — the management plane is privileged and stays isolated by
+/// default. The default binds LOOPBACK so a zero-config deployment boots (an exposed default would
+/// trip the mTLS boot-guard); to manage Busbar off-host, set an exposed `admin_listen` with
+/// `admin_tls.client_ca_file` (mTLS) or an explicit `admin_insecure` waiver.
+pub(crate) const DEFAULT_ADMIN_LISTEN_ADDR: &str = "127.0.0.1:8081";
+
+fn default_admin_listen() -> String {
+    DEFAULT_ADMIN_LISTEN_ADDR.into()
+}
+
+/// True iff `addr` (a `host:port` bind string) binds ONLY to the loopback interface, so a service
+/// on it is unreachable from off-host. Drives the admin-plane boot-guard: a loopback admin listener
+/// is safe without mTLS; anything else is treated as network-exposed. Unclassifiable hostnames fail
+/// CLOSED (treated as exposed) so an ambiguous bind never silently waives the mTLS requirement.
+pub(crate) fn bind_is_loopback(addr: &str) -> bool {
+    // Strip the trailing `:port`. IPv6 literals contain colons, so split from the RIGHT, then peel
+    // the `[...]` brackets an IPv6 host carries in `[::1]:8081` form.
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _port)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false, // a hostname we can't resolve here → assume exposed (fail closed)
+    }
+}
+
 /// Provider definition - vetted knowledge shipped in providers.yaml (no keys).
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct ProviderDef {
@@ -1234,6 +1268,23 @@ pub(crate) struct DeployCfg {
     /// Optional native inbound TLS / mTLS. Absent ⇒ plain HTTP (unchanged default).
     #[serde(default)]
     pub(crate) tls: Option<TlsCfg>,
+    /// SEPARATE listen address for the admin API (`/api/v1/admin/*`). The admin surface ALWAYS runs
+    /// here and is NEVER mounted on the data `listen` — the management plane stays isolated so it can
+    /// carry its own TLS/mTLS, bind, and firewall posture independent of public LLM traffic. Defaults
+    /// to loopback (`127.0.0.1:8081`); set an exposed address (+ `admin_tls`) to manage off-host.
+    #[serde(default = "default_admin_listen")]
+    pub(crate) admin_listen: String,
+    /// TLS/mTLS for the admin listener (only meaningful with `admin_listen`). Its own cert + optional
+    /// `client_ca_file`, so admin can require client certificates without forcing them on data-plane
+    /// clients. A network-exposed `admin_listen` REQUIRES `client_ca_file` here unless `admin_insecure`.
+    #[serde(default)]
+    pub(crate) admin_tls: Option<TlsCfg>,
+    /// Deliberate waiver of the exposed-admin-requires-mTLS boot-guard. `false` (default) ⇒ a
+    /// non-loopback `admin_listen` without `admin_tls.client_ca_file` REFUSES to boot. `true` ⇒ the
+    /// operator accepts a token-only admin plane on an exposed address (e.g. fronted by a mesh that
+    /// terminates mTLS). Never silently assumed.
+    #[serde(default)]
+    pub(crate) admin_insecure: bool,
     pub(crate) auth: Option<AuthCfg>,
     pub(crate) providers: HashMap<String, ProviderDeploy>,
     pub(crate) models: HashMap<String, ModelCfg>,
@@ -1851,10 +1902,34 @@ pub(crate) fn resolve(
         }
     }
 
+    // ADMIN-PLANE BOOT-GUARD: a network-exposed admin listener MUST require client certificates
+    // (mTLS) — the management surface is the highest-value target and must not sit on a public bind
+    // behind a bearer token alone. Loopback binds are safe (unreachable off-host); an explicit
+    // `admin_insecure: true` waives the guard for operators fronting admin with a mesh that
+    // terminates mTLS. Anything else that would expose admin without a client CA refuses to boot.
+    {
+        let admin_listen = &deploy.admin_listen;
+        let exposed = !bind_is_loopback(admin_listen);
+        let has_client_mtls = deploy
+            .admin_tls
+            .as_ref()
+            .is_some_and(|t| t.client_ca_file.is_some());
+        if exposed && !has_client_mtls && !deploy.admin_insecure {
+            errors.push(format!(
+                "admin_listen '{admin_listen}' is network-exposed but the admin plane has no mTLS \
+                 (admin_tls.client_ca_file is unset). Require client certificates by supplying \
+                 admin_tls.client_ca_file, bind admin_listen to loopback, or set admin_insecure: \
+                 true to deliberately run a token-only admin plane (e.g. behind a mesh)."
+            ));
+        }
+    }
+
     if errors.is_empty() {
         Ok(RootCfg {
             listen: deploy.listen.clone(),
             tls: deploy.tls.clone(),
+            admin_listen: deploy.admin_listen.clone(),
+            admin_tls: deploy.admin_tls.clone(),
             auth: deploy.auth.clone(),
             providers: resolved_providers,
             models: deploy.models.clone(),
@@ -2058,6 +2133,9 @@ models:
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers,
             models: HashMap::new(),
@@ -2086,6 +2164,109 @@ models:
             Some(HealthMode::Dead),
             "config.yaml provider health must resolve into ProviderCfg"
         );
+    }
+
+    #[test]
+    fn bind_is_loopback_classification() {
+        // Loopback binds — safe for a token-only admin plane.
+        assert!(bind_is_loopback("127.0.0.1:8081"));
+        assert!(bind_is_loopback("localhost:8081"));
+        assert!(bind_is_loopback("LocalHost:8081")); // case-insensitive
+        assert!(bind_is_loopback("[::1]:8081")); // IPv6 loopback with brackets
+        assert!(bind_is_loopback("127.0.0.1")); // no :port
+        assert!(bind_is_loopback("127.0.0.2:80")); // whole 127/8 is loopback
+                                                   // Exposed binds — the boot-guard must treat these as network-reachable.
+        assert!(!bind_is_loopback("0.0.0.0:8081"));
+        assert!(!bind_is_loopback("10.0.0.5:8081"));
+        assert!(!bind_is_loopback("[::]:8081")); // IPv6 unspecified
+        assert!(!bind_is_loopback("admin.internal:8081")); // hostname → fail closed (exposed)
+    }
+
+    /// The admin-plane boot-guard: a network-exposed `admin_listen` refuses to boot without mTLS,
+    /// unless deliberately waived. Loopback binds and mTLS-equipped exposed binds resolve cleanly.
+    #[test]
+    fn admin_plane_boot_guard() {
+        fn build(
+            admin_listen: &str,
+            client_ca: Option<&str>,
+            admin_insecure: bool,
+        ) -> Result<RootCfg, Vec<String>> {
+            let mut defs = HashMap::new();
+            defs.insert(
+                "p".to_string(),
+                ProviderDef {
+                    protocol: "openai".to_string(),
+                    base_url: "https://api.example.com/v1".to_string(),
+                    error_map: HashMap::new(),
+                    health: None,
+                    path: None,
+                    auth: None,
+                    allow_metadata_hosts: Vec::new(),
+                },
+            );
+            let mut providers = HashMap::new();
+            providers.insert(
+                "p".to_string(),
+                ProviderDeploy {
+                    api_key_env: "P_KEY".to_string(),
+                    protocol: None,
+                    base_url: None,
+                    error_map: None,
+                    path: None,
+                    auth: None,
+                    health: None,
+                    _legacy_api_key: None,
+                    allow_metadata_hosts: None,
+                },
+            );
+            let deploy = DeployCfg {
+                listen: DEFAULT_LISTEN_ADDR.into(),
+                tls: None,
+                admin_listen: admin_listen.to_string(),
+                admin_tls: client_ca.map(|ca| TlsCfg {
+                    cert_file: "cert.pem".into(),
+                    key_file: "key.pem".into(),
+                    client_ca_file: Some(ca.to_string()),
+                }),
+                admin_insecure,
+                auth: None,
+                providers,
+                models: HashMap::new(),
+                pools: HashMap::new(),
+                hooks: HashMap::new(),
+                admin_auth: vec!["admin-tokens".to_string()],
+                group_map: HashMap::new(),
+                global_hooks: Vec::new(),
+                observability: None,
+                governance: None,
+                security: None,
+                limits: LimitsCfg::default(),
+                metrics: MetricsCfg::default(),
+                health: HealthDefaultsCfg::default(),
+                routing: RoutingCfg::default(),
+            };
+            resolve(&deploy, &defs)
+        }
+
+        // DEFAULT: the zero-config admin listener is loopback, so it boots with no mTLS.
+        assert!(
+            build(DEFAULT_ADMIN_LISTEN_ADDR, None, false).is_ok(),
+            "the default loopback admin_listen must resolve"
+        );
+        // Loopback admin plane is safe without mTLS (unreachable off-host).
+        assert!(build("127.0.0.1:8081", None, false).is_ok());
+        assert!(build("[::1]:8081", None, false).is_ok());
+        assert!(build("localhost:8081", None, false).is_ok());
+        // EXPOSED admin plane without mTLS and without waiver → REFUSE TO BOOT.
+        let err = build("0.0.0.0:8081", None, false)
+            .expect_err("exposed admin without mTLS must refuse to boot");
+        let joined = err.join("\n");
+        assert!(joined.contains("admin_listen"), "guard message: {joined}");
+        assert!(joined.contains("mTLS"), "guard message: {joined}");
+        // Exposed admin WITH client-cert mTLS → allowed.
+        assert!(build("0.0.0.0:8081", Some("client-ca.pem"), false).is_ok());
+        // Exposed admin with an explicit insecure waiver → allowed (operator's deliberate choice).
+        assert!(build("0.0.0.0:8081", None, true).is_ok());
     }
 
     /// The shipped example config.yaml must parse and resolve cleanly against providers.yaml
@@ -2608,6 +2789,9 @@ models:
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers,
             models: HashMap::new(),
@@ -2697,6 +2881,9 @@ models: {}
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers: HashMap::new(),
             models: HashMap::new(),
@@ -2738,6 +2925,9 @@ models: {}
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers: HashMap::new(),
             models: HashMap::new(),
@@ -2793,6 +2983,9 @@ models: {}
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers,
             models: HashMap::new(),
@@ -2859,6 +3052,9 @@ models: {}
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers,
             models: HashMap::new(),
@@ -2933,6 +3129,9 @@ models: {}
         let deploy = DeployCfg {
             listen: DEFAULT_LISTEN_ADDR.into(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: None,
             providers,
             models: HashMap::new(),
@@ -3156,6 +3355,9 @@ models: {}
         let deploy = DeployCfg {
             listen: "127.0.0.1:8080".to_string(),
             tls: None,
+            admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
+            admin_tls: None,
+            admin_insecure: false,
             auth: Some(AuthCfg {
                 chain: vec!["tokens".to_string()],
                 upstream_credentials: crate::auth::UpstreamCreds::Own,

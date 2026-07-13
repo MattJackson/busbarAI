@@ -102,6 +102,13 @@ clear startup error telling you exactly what to write instead.
   to groups, and a group-mapped user is governed by exactly the machinery a virtual key uses.
   Per-module caps bound what any auth module can assert: an allowlist of groups it may claim,
   and a ceiling on the admin scope obtainable through it.
+- **The admin API runs on its own listener, always.** The management surface (`/api/v1/admin/…`)
+  is served on a dedicated `admin_listen` and is never mounted on the data `listen` — the public
+  bind cannot serve `/api/v1/admin/*` at all. It carries its own `admin_tls:` (cert + optional
+  `client_ca_file` for client-certificate mTLS), so the control plane can require client certs,
+  bind, and firewall independently of public LLM traffic. `admin_listen` defaults to loopback
+  (`127.0.0.1:8081`), so a zero-config deployment boots with admin reachable only on-host; point
+  it at an exposed address (with mTLS) to manage Busbar remotely.
 
 ### Changed
 
@@ -125,6 +132,15 @@ clear startup error telling you exactly what to write instead.
   opt-in build flag and deprecated in 1.2.1, it is gone. A compiled hook over a socket or an
   HTTP webhook does the same job with real process isolation; if you want scripting, run a hook
   that embeds it.
+
+### Security
+
+- **Exposed admin plane requires mTLS — fail closed.** A network-exposed `admin_listen` (any
+  non-loopback bind) refuses to boot unless it is protected by client-certificate mTLS
+  (`admin_tls.client_ca_file`). A loopback admin bind is exempt (unreachable off-host), and an
+  operator fronting admin with a mesh that terminates mTLS can waive the guard explicitly with
+  `admin_insecure: true`. The management plane is never silently published behind a bearer token
+  alone.
 
 ## [1.2.1], 2026-07-11
 

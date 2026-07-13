@@ -19,6 +19,24 @@
 # ── Listen address ───────────────────────────────────────────────────────────────────────────────
 listen: "0.0.0.0:8080"
 
+# ── Admin plane (always its own listener) ──────────────────────────────────────────────────────────
+# The admin API (/api/v1/admin/…) ALWAYS runs on its OWN listener — it is never served on the data
+# `listen` above. The management plane is privileged, so it stays isolated with its own TLS/mTLS,
+# bind, and firewall posture, independent of public LLM traffic. `admin_listen` defaults to loopback
+# (127.0.0.1:8081), so a zero-config deployment boots with admin reachable only on-host.
+#
+# SECURITY: a network-exposed admin_listen (any non-loopback bind) REFUSES TO BOOT unless it requires
+# client-certificate mTLS via admin_tls.client_ca_file. A loopback bind (127.0.0.1 / ::1 / localhost)
+# is exempt. To run a token-only admin plane on an exposed address on purpose — e.g. behind a mesh
+# that terminates mTLS — set `admin_insecure: true` to waive the guard deliberately.
+#
+# admin_listen: "127.0.0.1:8081"    # default; set an exposed address (+ admin_tls) to manage off-host
+# admin_tls:
+#   cert_file: "/etc/busbar/admin-cert.pem"
+#   key_file:  "/etc/busbar/admin-key.pem"
+#   client_ca_file: "/etc/busbar/admin-client-ca.pem"   # present ⇒ mTLS required on the admin plane
+# admin_insecure: false                                  # true ⇒ waive the exposed-admin mTLS guard
+
 # ── Client authentication ────────────────────────────────────────────────────────────────────────
 # auth.chain — an ordered list of auth modules that identify the caller. `tokens` is the built-in:
 #   clients must send `Authorization: Bearer <token>` matching the allowlist below. An EMPTY chain is

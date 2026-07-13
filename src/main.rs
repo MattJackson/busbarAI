@@ -331,6 +331,12 @@ async fn main() {
 
     let listen = cfg.listen.clone();
     let tls_cfg = cfg.tls.clone();
+    // The admin plane ALWAYS runs on its own listener (`admin_listen`, default loopback 127.0.0.1:8081)
+    // with its own optional TLS/mTLS — never on the data listener. The exposed-admin-requires-mTLS
+    // boot-guard has already run in `config::resolve`, so by here `admin_listen` is loopback, mTLS,
+    // or an explicit `admin_insecure` waiver.
+    let admin_listen = cfg.admin_listen.clone();
+    let admin_tls_cfg = cfg.admin_tls.clone();
     let req_body_max = cfg.limits.request_body_max_bytes;
     let max_inbound = cfg.limits.max_inbound_concurrent;
     let app = Arc::new(
@@ -390,10 +396,11 @@ async fn main() {
     // `mode: none` / has no `health:` block.
     health::spawn_probers(app.clone());
 
-    // Build the router with the operator-configured ingress body cap + optional inbound-concurrency
-    // layer (0 = unlimited / no layer, today's default). `cfg` is moved field-by-field below, so read
-    // the two values first.
-    let (router, app_handle) = build_router_with_limits(
+    // Build the two routers with the operator-configured ingress body cap + optional inbound-
+    // concurrency layer (0 = unlimited / no layer, the default). The admin surface is built onto its
+    // OWN router (ABSENT from the data router) and served on `admin_listen` below; the data router
+    // serves the protocols. Both share one `app_handle`, so config-apply hot-swaps reach both planes.
+    let (data_router, admin_router, app_handle) = build_split_routers_with_limits(
         app,
         req_body_max,
         max_inbound,
@@ -406,39 +413,41 @@ async fn main() {
         state_persist::spawn_snapshotter(app_handle.clone(), sf.clone());
     }
 
-    let listener = tokio::net::TcpListener::bind(&listen)
-        .await
-        .unwrap_or_else(|e| die(format!("cannot bind listen address '{listen}': {e}")));
     // Graceful shutdown: on ctrl_c (SIGINT) or SIGTERM, stop accepting new connections, let
     // in-flight requests drain, then flush the OTLP tracer so the final (most diagnostic) spans are
     // exported rather than dropped when the runtime tears down. The signal future is panic-free —
     // a failed registration logs and parks forever (so a missing signal facility degrades to "no
     // graceful shutdown", never a crash), and `shutdown_tracing()` is a no-op when OTLP is off.
-    match tls_cfg {
-        // DEFAULT PATH — no `tls:` block. Serves plain HTTP over the TcpListener with graceful
-        // shutdown, via the shared native hyper loop so the plain listener gets the SAME slow-loris
-        // header-read timeout the TLS listener has (the prior `axum::serve` path exposed no such
-        // bound). Behavior is otherwise identical: TCP_NODELAY on, graceful drain on shutdown.
-        None => {
-            tracing::info!(%listen, "busbar listening");
-            if let Err(e) = tls::serve_plain(listener, router, shutdown_signal()).await {
-                die(format!("server error: {e}"));
-            }
-        }
-        // TLS PATH — terminate TLS natively (+ mTLS if client_ca_file is set). Cert/key/CA are loaded
-        // and validated here so a bad path/parse fails fast at startup (`die`) rather than per
-        // request. The crypto provider is installed once before building the ServerConfig.
-        Some(tls) => {
-            tls::install_crypto_provider();
-            let server_config = tls::build_server_config(&tls)
-                .unwrap_or_else(|e| die(format!("TLS configuration error: {e}")));
-            let mtls = tls.client_ca_file.is_some();
-            tracing::info!(%listen, mtls, "busbar listening (TLS)");
-            if let Err(e) = tls::serve(listener, router, server_config, shutdown_signal()).await {
-                die(format!("server error: {e}"));
-            }
-        }
+    // ONE signal fans out to BOTH listeners (data + admin) so both planes drain together.
+    let (shutdown_tx, _keep_open) = tokio::sync::broadcast::channel::<()>(1);
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(());
+        });
     }
+
+    // Data plane on `listen`, admin plane on its own `admin_listen`, served concurrently — each with
+    // its own TLS/mTLS. `tokio::join!` returns only once BOTH have drained.
+    let data_listener = bind_listener(&listen).await;
+    let admin_listener = bind_listener(&admin_listen).await;
+    tokio::join!(
+        serve_listener(
+            data_listener,
+            data_router,
+            tls_cfg,
+            &listen,
+            recv_shutdown(shutdown_tx.subscribe()),
+        ),
+        serve_listener(
+            admin_listener,
+            admin_router,
+            admin_tls_cfg,
+            &admin_listen,
+            recv_shutdown(shutdown_tx.subscribe()),
+        ),
+    );
     // D3: one FINAL state snapshot after the graceful drain, so the freshest health picture is
     // what the next boot restores (the periodic 30s tick could be up to 30s stale).
     if let Some(ref sf) = state_file {
@@ -450,6 +459,52 @@ async fn main() {
         }
     }
     observability::shutdown_tracing();
+}
+
+/// Bind a TCP listener or `die` with a clear, address-named message. Shared by the data and admin
+/// listeners so both fail fast and identically on a bad bind.
+async fn bind_listener(addr: &str) -> tokio::net::TcpListener {
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| die(format!("cannot bind listen address '{addr}': {e}")))
+}
+
+/// One shutdown-broadcast subscription resolved into a plain future. Any receive outcome — a send,
+/// or a closed/lagged channel — means "shut down now", so every arm resolves the future.
+async fn recv_shutdown(mut rx: tokio::sync::broadcast::Receiver<()>) {
+    let _ = rx.recv().await;
+}
+
+/// Serve one listener (data OR admin plane) to graceful shutdown. Picks plain-HTTP vs native TLS/mTLS
+/// from `tls_cfg` exactly as the single-listener path always has: `None` ⇒ plain HTTP over the shared
+/// slow-loris-hardened hyper loop; `Some` ⇒ terminate TLS (mTLS when `client_ca_file` is set), with
+/// cert/key/CA loaded and validated up front so a bad path/parse `die`s at startup, not per request.
+/// `label` names the plane in log lines and error messages. Any serve error `die`s the process.
+async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    tls_cfg: Option<crate::config::TlsCfg>,
+    label: &str,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    match tls_cfg {
+        None => {
+            tracing::info!(listen = %label, "busbar listening");
+            if let Err(e) = tls::serve_plain(listener, router, shutdown).await {
+                die(format!("server error on '{label}': {e}"));
+            }
+        }
+        Some(tls) => {
+            tls::install_crypto_provider();
+            let server_config = tls::build_server_config(&tls)
+                .unwrap_or_else(|e| die(format!("TLS configuration error for '{label}': {e}")));
+            let mtls = tls.client_ca_file.is_some();
+            tracing::info!(listen = %label, mtls, "busbar listening (TLS)");
+            if let Err(e) = tls::serve(listener, router, server_config, shutdown).await {
+                die(format!("server error on '{label}': {e}"));
+            }
+        }
+    }
 }
 
 /// Resolve when the process receives a shutdown signal (SIGINT/ctrl_c, or SIGTERM on Unix). Used as
@@ -1281,25 +1336,41 @@ pub(crate) fn build_router(app: std::sync::Arc<state::App>) -> Router {
     .0
 }
 
-/// Router builder with EXPLICIT limits, so a test can assert the body-size and inbound-concurrency
-/// wiring without touching the process-wide install. `max_inbound_concurrent == 0` ⇒ NO concurrency
-/// layer is added (a true no-op, today's behavior); `> 0` wraps the whole router in a tower
-/// `GlobalConcurrencyLimitLayer` as the OUTERMOST layer.
+/// Router builder with EXPLICIT limits, building the COMBINED router (admin mounted on the data
+/// routes). Used only by the test harness (`build_router`) to exercise the full route table + auth
+/// middleware end-to-end on one router; production always serves admin on its OWN listener via
+/// `build_split_routers_with_limits`, so admin and data never share a listener at runtime.
+/// `max_inbound_concurrent == 0` ⇒ NO concurrency layer (a true no-op); `> 0` wraps the whole router
+/// in a tower `GlobalConcurrencyLimitLayer` as the OUTERMOST layer.
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_router_with_limits(
     app: std::sync::Arc<state::App>,
     request_body_max_bytes: usize,
     max_inbound_concurrent: usize,
     emit_server_timing: bool,
 ) -> (Router, std::sync::Arc<state::AppHandle>) {
-    let router = Router::new()
+    let handle = std::sync::Arc::new(state::AppHandle::new(app));
+    // TEST-ONLY combined router: mount the Admin API v1 onto the DATA route table so one router
+    // exercises the whole surface. Production never does this — `build_split_routers_with_limits`
+    // mounts admin on its OWN router served on a separate listener.
+    let router = admin::transport::mount(base_data_router(), &admin::JsonV1);
+    let router = apply_common_layers(router, &handle, request_body_max_bytes, emit_server_timing);
+    (
+        apply_inbound_concurrency_limit(router, max_inbound_concurrent),
+        handle,
+    )
+}
+
+/// The DATA-plane route table — protocols, discovery, and health/metrics/stats — WITHOUT the admin
+/// surface. Pre-state (`Router<Arc<AppHandle>>`); the admin API is mounted separately (onto this
+/// router in the single-listener case, or onto its own router in the split case) so it can move to
+/// a dedicated listener without any of these routes coming with it.
+fn base_data_router() -> Router<std::sync::Arc<state::AppHandle>> {
+    Router::new()
         .route("/stats", get(endpoints::stats))
         .route("/healthz", get(endpoints::healthz))
         .route("/metrics", get(metrics::handler))
-        // The Admin API v1 — the FROZEN, additive-only surface tooling builds against — mounts as
-        // one router (keys included) under `/api/v1/admin` via the `AdminTransport` adapter below.
-        // The pre-release `/admin/*` paths (and the unversioned `/admin/keys` alias) are GONE — 1.3
-        // is the first release of the surface, so it ships exactly one path grammar.
-        // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery, admin,
+        // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery,
         // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.
         // Governance-scoped like /stats (restricted keys see only their reachable names).
@@ -1315,17 +1386,23 @@ fn build_router_with_limits(
         .fallback(route::protocol_dispatch)
         // Wrong-method hits on a VALID path (axum's built-in 405) get the same native-envelope
         // treatment as the 404 fallback above.
-        .method_not_allowed_fallback(method_not_allowed_handler);
-    // Mount the Admin API v1 via the ports-and-adapters transport layer (a shared typed service
-    // behind a pluggable wire format), at its ALGORITHMIC `/api/<version>/<area>` prefix. The
-    // JSON-REST adapter is the transport today; a GraphQL / MCP / gRPC adapter — or a future area
-    // (`events`, `metrics`) or a `v2` — is one more `mount` call here over the SAME service.
-    let router = admin::transport::mount(router, &admin::JsonV1);
-    // The router's state is a swappable `AppHandle` (the config-apply hot-swap seam). Every handler
-    // reads the CURRENT snapshot via the `CurrentApp` extractor; the auth middleware loads it too.
-    // Until an admin apply calls `swap()`, this is behaviorally identical to a fixed `Arc<App>`.
-    let handle = std::sync::Arc::new(state::AppHandle::new(app));
-    let router = router
+        .method_not_allowed_fallback(method_not_allowed_handler)
+}
+
+/// Apply the shared middleware stack — auth chain, request-body cap, 413 reshaping, server-timing —
+/// and bind the swappable `AppHandle` state. Identical for the single-listener router and each
+/// split-plane router, so both planes get the SAME auth + limit posture and both see config-apply
+/// hot-swaps (they share one `handle`).
+fn apply_common_layers(
+    router: Router<std::sync::Arc<state::AppHandle>>,
+    handle: &std::sync::Arc<state::AppHandle>,
+    request_body_max_bytes: usize,
+    emit_server_timing: bool,
+) -> Router {
+    router
+        // The router's state is a swappable `AppHandle` (the config-apply hot-swap seam). Every
+        // handler reads the CURRENT snapshot via the `CurrentApp` extractor; the auth middleware
+        // loads it too. Until an admin apply calls `swap()`, this is identical to a fixed `Arc<App>`.
         .layer(axum::middleware::from_fn_with_state(
             handle.clone(),
             auth::auth_middleware,
@@ -1348,12 +1425,40 @@ fn build_router_with_limits(
             emit_server_timing,
             server_timing,
         ))
-        .with_state(handle.clone());
+        .with_state(handle.clone())
+}
 
-    (
-        apply_inbound_concurrency_limit(router, max_inbound_concurrent),
-        handle,
-    )
+/// Build SEPARATE data-plane and admin-plane routers sharing ONE `AppHandle`, for the split-listener
+/// deployment (`admin_listen` set). The admin surface is mounted ONLY on the admin router — it is
+/// absent from the data router, so the data listener physically cannot serve `/api/v1/admin/*` (no
+/// double-exposure: the whole point of splitting is that admin is not reachable on the public bind).
+/// Both planes carry the identical middleware stack; the inbound-concurrency cap applies to the DATA
+/// plane only (the low-volume admin plane is uncapped, matching today's default). Returns
+/// `(data_router, admin_router, shared_handle)`.
+fn build_split_routers_with_limits(
+    app: std::sync::Arc<state::App>,
+    request_body_max_bytes: usize,
+    max_inbound_concurrent: usize,
+    emit_server_timing: bool,
+) -> (Router, Router, std::sync::Arc<state::AppHandle>) {
+    let handle = std::sync::Arc::new(state::AppHandle::new(app));
+    // DATA plane: protocols + health/metrics/stats, NO admin mount.
+    let data = apply_common_layers(
+        base_data_router(),
+        &handle,
+        request_body_max_bytes,
+        emit_server_timing,
+    );
+    let data = apply_inbound_concurrency_limit(data, max_inbound_concurrent);
+    // ADMIN plane: a liveness probe (unauthenticated, like the data plane's) + the admin surface,
+    // nothing else. `/healthz` bypasses auth so probes work on the admin port too; every
+    // `/api/v1/admin/*` route stays behind the admin auth chain.
+    let admin = admin::transport::mount(
+        Router::new().route("/healthz", get(endpoints::healthz)),
+        &admin::JsonV1,
+    );
+    let admin = apply_common_layers(admin, &handle, request_body_max_bytes, emit_server_timing);
+    (data, admin, handle)
 }
 
 /// OUTERMOST inbound-concurrency cap. `max_inbound_concurrent == 0` (the default) returns the router
@@ -1698,6 +1803,70 @@ mod tests {
             resp.headers().get("x-amzn-requestid").is_none(),
             "non-bedrock fallback must NOT carry x-amzn-* headers"
         );
+    }
+
+    /// SPLIT-LISTENER NO-DOUBLE-EXPOSURE: with a separate admin listener the admin surface must live
+    /// ONLY on the admin router. `build_split_routers_with_limits` must yield an admin router that
+    /// serves `/api/v1/admin/*` and a data router that does NOT — even for a request carrying a VALID
+    /// admin token (the route is ABSENT, not merely auth-guarded), so the public data bind can never
+    /// reach the management plane. Both planes keep an open, unauthenticated `/healthz`.
+    #[tokio::test]
+    async fn split_admin_listener_no_double_exposure() {
+        use crate::governance::{GovState, SqliteStore};
+        use crate::test_support::{LaneSpec, TestApp};
+        use std::sync::Arc;
+        crate::metrics::init();
+
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        // One configured lane so `/healthz` reports ready (200) rather than "no usable lanes" (503) —
+        // the probe URL is never actually dialed here; the test only exercises routing/auth.
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                "http://127.0.0.1:1",
+            ))
+            .pool("pa", &[(0, 1)])
+            .governance(gov)
+            .build();
+        let (data_router, admin_router, _handle) = build_split_routers_with_limits(
+            app,
+            limits::translate_body_max_bytes(),
+            crate::config::DEFAULT_MAX_INBOUND_CONCURRENT,
+            crate::config::DEFAULT_EMIT_SERVER_TIMING,
+        );
+
+        async fn get(router: Router, path: &str, token: Option<&str>) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let mut req = reqwest::Client::new().get(format!("http://{addr}{path}"));
+            if let Some(t) = token {
+                req = req.bearer_auth(t);
+            }
+            let code = req.send().await.unwrap().status().as_u16();
+            server.abort();
+            code
+        }
+
+        let admin_path = format!("{}/keys", crate::admin::v1::contract::ADMIN_PREFIX);
+        // Admin surface SERVED on the admin plane (valid token ⇒ 200).
+        assert_eq!(
+            get(admin_router.clone(), &admin_path, Some("admintok")).await,
+            200,
+            "admin router must serve the admin surface"
+        );
+        // Admin surface ABSENT on the data plane — even WITH a valid admin token it is a hard 404,
+        // proving the route is not mounted here (no double-exposure), not merely auth-blocked.
+        assert_eq!(
+            get(data_router.clone(), &admin_path, Some("admintok")).await,
+            404,
+            "data router must NOT serve the admin surface even for an authenticated admin request"
+        );
+        // Both planes keep an open, unauthenticated liveness probe.
+        assert_eq!(get(admin_router, "/healthz", None).await, 200);
+        assert_eq!(get(data_router, "/healthz", None).await, 200);
     }
 
     /// `Server-Timing` reports Busbar's OWN processing time = total − upstream RTT, with the
