@@ -1,14 +1,19 @@
 # Compression gate: rewrite the request body before it ships
 
-A minimal **rewrite gate** — the hook arm that replaces a request's body before dispatch. The
-compressor here just collapses whitespace runs (deliberately trivial, so the wire is the lesson);
-swap one function for a real semantic compressor and everything around it stays the same.
+A **rewrite gate** — the hook arm that replaces a request's body before dispatch — dressed as the
+real [**Headroom**](https://github.com/chopratejas/headroom) context-compression tool ("Compress
+tool outputs, logs, files, and RAG chunks before they reach the LLM. 60-95% fewer tokens, same
+answers"). The compressor here just collapses whitespace runs (deliberately trivial, so the wire is
+the lesson); swap `compress_text` for a real semantic compressor and everything around it stays the
+same. The point is that a hook exposes **its own configuration** (via `describe`) and **its own
+operational data** (via `status`), exactly the settings + metrics Headroom surfaces on its own
+`headroom dashboard`.
 
 ## Register it
 
 ```yaml
 hooks:
-  compressor:
+  headroom:
     kind: gate
     socket: /run/busbar/compress.sock
     prompt: rw                     # rewrite requires the read-write prompt grant
@@ -25,25 +30,56 @@ cd rust-hook && cargo run --release -- /run/busbar/compress.sock
 ## What rides the wire
 
 Because the hook is registered `prompt: rw`, busbar projects the flattened prompt text
-(`messages: [{role, text}]`) into each call; the hook replies with a replacement body in body form
-(`{"rewrite": {"messages": [{role, content}]}}`) — or `{}` to abstain when the savings aren't worth
-a body swap. The rewrite fires **before routing and before dispatch**, persists across failover,
-and token accounting uses the provider-reported usage of the rewritten body: the savings are real
-and measured.
+(`messages: [{role, text}]`) into each `transform` call; the hook replies with a replacement body in
+body form (`{"rewrite": {"messages": [{role, content}]}}`) — or `{}` to abstain when the savings
+aren't worth a body swap. The rewrite fires **before routing and before dispatch**, persists across
+failover, and token accounting uses the provider-reported usage of the rewritten body: the savings
+are real and measured. Per-request messages carry an `op` field: this gate handles `transform`,
+writes **nothing** for a tap `notify`, and replies `{}` to any unknown/future `op`.
 
-It also speaks the two management messages:
+## Configuration — exposed via `describe.schema`
 
-- **configure** — busbar's first message on every connection, and the live push behind
-  `PATCH /api/v1/admin/hooks/compressor/settings`. The hook applies `min_savings_pct` and acks by
-  echoing the pushed `settings_version`; a bad value gets no ack, so busbar keeps the old settings
-  and the operator's PATCH gets a 400.
-- **describe** — answers with the settings JSON schema, served verbatim at
-  `GET /api/v1/admin/hooks/compressor/schema`.
+`describe` returns the self-description **envelope** `{schema, dashboard}`. The `schema` is a JSON
+Schema for the hook's knobs, served verbatim at `GET /api/v1/admin/hooks/headroom/schema` and used
+to render the config form; a `configure` push applies them (all-or-nothing — one out-of-range value
+refuses the whole push with no ack, so busbar keeps the previous settings). The Headroom-style
+knobs:
+
+| Setting | Type | Meaning |
+|---|---|---|
+| `min_savings_pct` | int 0–100 | Rewrite only when the body shrinks by at least this percent; below it, abstain. |
+| `target_ratio_pct` | int 0–100 | Target compressed size as a percent of the original (Headroom's compression target). |
+| `min_trigger_chars` | int ≥ 0 | Only attempt compression once the request is at least this many characters. |
+| `system_aware` | bool | System-prompt-aware compression: be conservative near the system prompt. |
+| `price_udollars_per_kchar` | int ≥ 0 | Assumed input price (micro-$ per 1K chars) used to estimate dollars saved. |
+
+## Data — reported via `status.metrics` + a declared dashboard
+
+`status` returns the hook's **observed** settings plus its own operational metrics, surfaced at
+`GET /api/v1/admin/hooks/headroom/status` (with a desired-vs-reported drift verdict). Each metric
+carries display hints (`label`/`unit`/`viz`/`max`) so a dashboard renders it without per-plugin
+code; the matching widget layout is declared in `describe.dashboard`, so **one** declaration drives
+both the config form and the dashboard tiles. The metric set mirrors Headroom's dashboard:
+
+| Metric | Type | Hint | What it is |
+|---|---|---|---|
+| `requests_seen_total` | counter | counter | Transform requests observed on the compression path. |
+| `requests_compressed_total` | counter | counter | Requests whose savings cleared `min_savings_pct`. |
+| `chars_in_total` / `chars_out_total` | counter | counter | Input / output characters on compressed requests (before / after). |
+| `chars_saved_total` | counter | counter | Characters removed — Headroom's headline "tokens saved". |
+| `compression_ratio` | gauge | gauge `%` max 100 | Percent fewer characters across all compressed requests. |
+| `compressed_rate` | gauge | gauge `%` max 100 | Share of seen requests that cleared the threshold. |
+| `dollars_saved` | gauge | number `$` | Estimated input cost saved (Headroom's "Proxy $ saved" tile). |
+| `avg_compress_latency` | gauge | number `ms` | Average per-request compression latency. |
+
+Counters end `_total` and metric names match `^[a-z][a-z0-9_]{0,63}$`; busbar validates, bounds
+(64 entries/reply), and sanitizes every entry and hint.
 
 ## Fail-safe
 
 Everything degrades to the original body: a malformed reply, a timeout, a dead socket — with the
 default `on_error: nothing` the gate simply drops out of the decision. A broken compressor never
-corrupts (or blocks) a request.
+corrupts (or blocks) a request. `describe` and `status` are fully optional; the socket `configure`
+preamble is not — a hook that never acks it has every connection rejected.
 
 Unix-domain sockets are macOS/Linux; on Windows register the same hook as a `webhook:` transport.
