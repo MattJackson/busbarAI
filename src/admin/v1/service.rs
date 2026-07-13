@@ -625,23 +625,14 @@ impl AdminService {
     }
 
     /// `GET /admin/v1/admin-auth` — the ADMIN-plane auth config (distinct from the ingress chain).
-    /// Read scope. Today reports the built-in admin-token gate; when the pluggable `admin_auth` chain
-    /// lands it reports that chain. Never a secret.
+    /// Read scope. Reports the live `admin_auth` chain — the SAME resource `PUT /admin/v1/admin-auth`
+    /// writes, so a read-after-write is coherent (previously this hard-coded `["admin-token"]` and
+    /// never reflected a PUT). Never a secret.
     pub(crate) async fn get_admin_auth(&self) -> Result<AdminAuthView, AdminError> {
-        // The admin plane is guarded by the governance admin token today.
-        let configured = self
-            .app
-            .governance
-            .as_ref()
-            .map(|g| g.admin_token_hash().is_some())
-            .unwrap_or(false);
-        let modules = if configured {
-            vec!["admin-token"]
-        } else {
-            Vec::new()
-        };
+        let modules = self.app.admin_chain.clone();
         Ok(AdminAuthView {
-            configured,
+            // An empty chain is the open (anonymous, full-authority) dev posture — NOT configured.
+            configured: !modules.is_empty(),
             modules,
         })
     }
@@ -697,8 +688,9 @@ impl AdminService {
     }
 
     /// `GET /admin/v1/auth` — the ingress auth chain + upstream-credential mode. Read scope. Never a
-    /// secret: only module names and the mode. The mutation half (`PUT /admin/v1/auth`, with the
-    /// anti-self-lockout guard) lands with the config-plane write path.
+    /// secret: only module names and the mode. This is READ-ONLY at runtime — the ingress chain is
+    /// mutated through the config-plane write path (`PUT/POST /admin/v1/config`), not a dedicated PUT.
+    /// (The ADMIN-plane chain, by contrast, has `PUT /admin/v1/admin-auth`.)
     pub(crate) async fn get_auth(&self) -> Result<AuthView, AdminError> {
         Ok(AuthView {
             chain: self.app.auth.chain_names(),

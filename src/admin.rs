@@ -1201,11 +1201,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body["configured"], true);
+        // modules reports the live admin_auth chain verbatim (the SAME resource PUT admin-auth writes)
         assert!(body["modules"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m == "admin-token"));
+            .any(|m| m == "admin-tokens"));
 
         handle.abort();
     }
@@ -2264,7 +2265,7 @@ providers: {}
         handle.abort();
     }
 
-    /// `PUT /admin/v1/auth` end-to-end with the D4 dry-run guard: a chain that would lock the
+    /// `PUT /admin/v1/admin-auth` end-to-end with the D4 dry-run guard: a chain that would lock the
     /// CALLER out is a 409 and nothing changes; a chain the caller survives applies atomically
     /// (the old credential stops working on the very next request, the surviving one carries on);
     /// unknown modules and stale expected_version reject.
@@ -2301,7 +2302,7 @@ providers: {}
         let client = reqwest::Client::new();
         let put = |tok: &'static str, body: serde_json::Value| {
             client
-                .put(format!("http://{addr}/admin/v1/auth"))
+                .put(format!("http://{addr}/admin/v1/admin-auth"))
                 .header("x-admin-token", tok)
                 .header("content-type", "application/json")
                 .body(body.to_string())
@@ -2387,6 +2388,25 @@ providers: {}
             .await
             .unwrap();
         assert_eq!(r.status().as_u16(), 200);
+
+        // READ-AFTER-WRITE (L3): GET /admin/v1/admin-auth reflects exactly what the PUT installed —
+        // the write and read now name the SAME resource (previously PUT lived on /auth and GET
+        // admin-auth reported a hard-coded module, so they could never agree).
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/admin/v1/admin-auth"))
+            .header("x-admin-token", "grp:admins")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["configured"], true);
+        assert_eq!(
+            body["modules"],
+            serde_json::json!(["test-scope-module"]),
+            "GET admin-auth mirrors the PUT'd chain verbatim"
+        );
 
         handle.abort();
     }

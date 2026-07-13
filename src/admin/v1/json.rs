@@ -57,8 +57,8 @@ impl AdminTransport for JsonV1 {
             )
             .route("/admin/v1/hooks/{name}/schema", get(hook_schema))
             .route("/admin/v1/plugins", get(list_plugins))
-            .route("/admin/v1/auth", get(get_auth).put(put_auth))
-            .route("/admin/v1/admin-auth", get(get_admin_auth))
+            .route("/admin/v1/auth", get(get_auth))
+            .route("/admin/v1/admin-auth", get(get_admin_auth).put(put_auth))
             .route("/admin/v1/usage", get(get_usage))
             .route("/admin/v1/config", get(get_config))
             .route("/admin/v1/audit", get(get_audit))
@@ -687,7 +687,9 @@ async fn rollback_config(
     }
 }
 
-/// `PUT /admin/v1/auth` — replace the ADMIN auth chain (`admin_auth:`) at runtime. Body:
+/// `PUT /admin/v1/admin-auth` — replace the ADMIN auth chain (`admin_auth:`) at runtime. Pairs with
+/// `GET /admin/v1/admin-auth`, which reports the same `admin_auth` chain (read-after-write coherent).
+/// Body:
 /// `{"admin_auth": ["module", ...], "expected_version"?: N}`. Guarded three ways:
 /// - every name must be a compiled-in admin module (a typo can never silently drop auth);
 /// - optimistic concurrency via `expected_version` (409 `conflict` when stale);
@@ -747,7 +749,7 @@ async fn put_auth(
     }
     if req.admin_auth.is_empty() {
         tracing::warn!(
-            "PUT /admin/v1/auth applied an EMPTY admin_auth chain — the admin API is now the \
+            "PUT /admin/v1/admin-auth applied an EMPTY admin_auth chain — the admin API is now the \
              open (anonymous, full-authority) dev posture"
         );
     }
@@ -1428,7 +1430,7 @@ fn openapi_doc() -> serde_json::Value {
             }
         }),
     );
-    if let Some(auth_path) = paths.get_mut("/admin/v1/auth") {
+    if let Some(auth_path) = paths.get_mut("/admin/v1/admin-auth") {
         auth_path["put"] = json!({
             "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
             "security": [{"adminToken": []}],
