@@ -48,8 +48,9 @@ a time (`busbar;dur`, µs):
 | Busbar + Headroom | 569 | 601 | 634 |
 | **Headroom's added cost** | **547** | 576 | 604 |
 
-Two things I like about that. **Busbar itself is 22 microseconds (µs)** — the gateway isn't where
-your latency goes. And **Headroom adds ~550 µs** to compress the history, with a tail that barely
+Two things I like about that. **Busbar itself is 22 microseconds (µs)** — as our own
+[benchmark](/docs/benchmark/) has shown, the gateway isn't where your latency goes. And **Headroom
+adds ~550 µs** to compress the history, with a tail that barely
 moves: p99 is only about 1.1× p50, because Busbar and the hook are both single Rust binaries with
 no garbage collector to pause the path.
 
