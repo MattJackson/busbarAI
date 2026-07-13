@@ -79,6 +79,32 @@ fn service(handle: &Arc<AppHandle>) -> AdminService {
     AdminService::new(handle.load())
 }
 
+/// §6.3 BODY-DERIVED AUTHORIZATION REFINEMENT for hook registration. The route matrix admits a
+/// `hooks-register` principal to POST/PUT `/admin/v1/hooks*`, but that scope is "define a hook,
+/// don't wire it into a security-critical path". A non-`Full` caller therefore may NOT register a
+/// hook that (a) sees or rewrites caller content/identity (`prompt`/`user` above `no`) or (b) sets
+/// inline `global: true` — attaching to every request is chain WIRING, which is full-only. `Full`
+/// (operator token, mapped-full, or the open dev posture) is unrestricted. Returns the 403 to
+/// surface, or `None` to allow.
+fn hooks_register_escalation(
+    scope: crate::auth::AdminScope,
+    cfg: &crate::config::HookCfg,
+) -> Option<AdminError> {
+    use crate::admin::v1::contract::Scope;
+    if scope.0 == Some(Scope::Full) {
+        return None;
+    }
+    if cfg.global
+        || cfg.prompt != crate::config::PromptAccess::No
+        || cfg.user != crate::config::UserAccess::No
+    {
+        return Some(AdminError::Forbidden {
+            needed: Scope::Full,
+        });
+    }
+    None
+}
+
 /// Serializes config-plane MUTATIONS (hook register/replace/delete, config apply/reload/rollback,
 /// settings, auth chain) so each `read current → build next → swap → record` runs atomically with
 /// respect to the others. READS stay lock-free (`handle.load()`), and mutations are rare
@@ -226,6 +252,7 @@ struct PutHookReq {
 async fn register_hook(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     body: axum::body::Bytes,
 ) -> Response {
     let actor = principal.actor_id().to_string();
@@ -233,6 +260,16 @@ async fn register_hook(
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
     };
+    // §6.3: a hooks-register principal may not register a content-seeing / global (wired) hook.
+    if let Some(e) = hooks_register_escalation(scope, &req.config) {
+        audit::AUDIT.record_by(
+            "hook.register",
+            &format!("hook:{}", req.name),
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&e);
+    }
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{}", req.name);
@@ -288,6 +325,7 @@ async fn register_hook(
 async fn put_hook(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    axum::Extension(scope): axum::Extension<crate::auth::AdminScope>,
     Path(name): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
@@ -296,6 +334,16 @@ async fn put_hook(
         Ok(r) => r,
         Err(e) => return err_json(&AdminError::Validation(format!("malformed hook body: {e}"))),
     };
+    // §6.3: a hooks-register principal may not replace a hook into a content-seeing / global form.
+    if let Some(e) = hooks_register_escalation(scope, &req.config) {
+        audit::AUDIT.record_by(
+            "hook.replace",
+            &format!("hook:{name}"),
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&e);
+    }
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
     let resource = format!("hook:{name}");

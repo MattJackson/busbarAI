@@ -199,10 +199,14 @@ pub(crate) struct App {
     pub(crate) mutation_limiter: Arc<crate::admin::rate::MutationLimiter>,
     /// Idempotency-Key replay cache for key minting (bounded, ~10min TTL): a retried POST with the
     /// same key returns the FIRST response verbatim instead of double-creating. Arc-shared across
-    /// swaps. Maps key → (created_at, cached 201 body).
+    /// swaps. Maps (principal id, Idempotency-Key) → (created_at, cached 201 body). The key is
+    /// SCOPED TO THE PRINCIPAL: a different admin presenting the same Idempotency-Key value must
+    /// NOT replay another principal's response (which carries a once-shown secret) — the header is
+    /// a client-chosen string, not a cross-principal handle.
     #[allow(clippy::type_complexity)]
-    pub(crate) idempotency_cache:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, (u64, serde_json::Value)>>>,
+    pub(crate) idempotency_cache: Arc<
+        std::sync::Mutex<std::collections::HashMap<(String, String), (u64, serde_json::Value)>>,
+    >,
     /// Config VERSION HISTORY — every successful config-plane mutation records its snapshot here.
     /// Arc-shared across apply snapshots (survives every swap); bounded ring (see
     /// `admin::versions`).

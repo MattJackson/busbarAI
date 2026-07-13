@@ -90,8 +90,13 @@ impl AuditLog {
         outcome: &'static str,
         principal: &str,
     ) {
-        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Allocate `seq` INSIDE the entries lock so it matches insertion order: fetching it before
+        // the lock let two concurrent recorders interleave (thread B takes the lock with the higher
+        // seq and pushes first, thread A pushes its lower seq behind it), producing out-of-order
+        // seq numbers in the ring. Under the lock, Relaxed is sufficient (the mutex is the ordering
+        // point).
         let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Chain to the most recent entry (the back), before any prune.
         let prev_hash = q.back().map(|e| e.hash.clone()).unwrap_or_default();
         let mut entry = AuditEntry {

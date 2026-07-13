@@ -472,6 +472,14 @@ fn extract_admin_header_token(req: &Request<Body>) -> Option<String> {
 #[derive(Debug, Clone)]
 pub(crate) struct AuthPrincipal(pub(crate) Option<Principal>);
 
+/// The EFFECTIVE admin scope resolved by the admin middleware (group_map + module ceiling), attached
+/// to admin-path requests so mutation handlers can apply body-derived authorization refinements the
+/// route-level `required_scope` matrix cannot (design-admin-api-v1 §6.3). `None` = no admin grant
+/// (the request would have been 403'd) OR the explicit open posture; a handler treats non-`Full` as
+/// "restricted automation".
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdminScope(pub(crate) Option<crate::admin::v1::contract::Scope>);
+
 impl AuthPrincipal {
     /// The attribution handle for audit records: the principal id, or `anonymous` for the
     /// explicit open-front-door postures.
@@ -892,6 +900,11 @@ pub(crate) async fn auth_middleware(
             }
         }
         req.extensions_mut().insert(AuthPrincipal(principal));
+        // The EFFECTIVE admin scope (resolved + capped) is attached so mutation handlers can apply
+        // the §6.3 body-derived refinements the route-level `required_scope` matrix cannot express —
+        // e.g. a `hooks-register` principal may create a hook DEFINITION but must not register one
+        // wired into a security-critical path (a `prompt: ro|rw` gate, or an inline `global: true`).
+        req.extensions_mut().insert(AdminScope(scope));
         // INTENTIONAL governance bypass for the operator admin token. A successful admin auth attaches
         // an EMPTY `GovCtx::default()` (no resolved virtual key) and returns HERE — BEFORE the
         // virtual-key governance resolution below — so per-key controls (`allowed_pools`, budget, RPM/

@@ -229,10 +229,11 @@ fn join_error(op: &str, e: &tokio::task::JoinError) -> Response {
 /// request that fails after reserving frees the key for a legitimate retry, while a successful
 /// mint (which replaced the sentinel with its real 201 body and disarmed the guard) keeps it.
 struct IdemReservation {
+    #[allow(clippy::type_complexity)]
     cache: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, (u64, serde_json::Value)>>,
+        std::sync::Mutex<std::collections::HashMap<(String, String), (u64, serde_json::Value)>>,
     >,
-    key: String,
+    key: (String, String),
     committed: bool,
 }
 
@@ -267,14 +268,17 @@ pub(crate) async fn create_key(
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
         .map(str::to_string);
-    if let Some(ref k) = idem_key {
+    // The idempotency key is scoped to the PRINCIPAL: (actor, header). A different admin's identical
+    // Idempotency-Key value must never replay this principal's response (which carries a secret).
+    let idem_ckey: Option<(String, String)> = idem_key.as_ref().map(|k| (actor.clone(), k.clone()));
+    if let Some(ref ck) = idem_ckey {
         let now = crate::store::now();
         let mut cache = app
             .idempotency_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cache.retain(|_, (t, _)| now.saturating_sub(*t) < 600);
-        match cache.get(k) {
+        match cache.get(ck) {
             // A COMPLETED prior mint (the real 201 object): replay it verbatim.
             Some((_, cached)) if !cached.is_null() => {
                 return json_response(StatusCode::CREATED, cached.clone());
@@ -293,15 +297,15 @@ pub(crate) async fn create_key(
             // First time: RESERVE under this SAME lock hold, so a concurrent request observes the
             // reservation instead of an empty slot.
             None => {
-                cache.insert(k.clone(), (now, serde_json::Value::Null));
+                cache.insert(ck.clone(), (now, serde_json::Value::Null));
             }
         }
     }
     // Clears the reservation if we return before committing (parse / validation / mint failure);
     // disarmed on success, where the real body replaces the sentinel.
-    let mut idem_reservation = idem_key.as_ref().map(|k| IdemReservation {
+    let mut idem_reservation = idem_ckey.as_ref().map(|ck| IdemReservation {
         cache: app.idempotency_cache.clone(),
-        key: k.clone(),
+        key: ck.clone(),
         committed: false,
     });
     let Some(gov) = &app.governance else {
@@ -439,11 +443,11 @@ pub(crate) async fn create_key(
                                                 // never returned by any read API, mirroring the bearer `secret`.
                 body["aws_access_key_id"] = json!(access_key_id);
                 body["aws_secret_access_key"] = json!(secret_access_key);
-                if let Some(ref k) = idem_key {
+                if let Some(ref ck) = idem_ckey {
                     app.idempotency_cache
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(k.clone(), (crate::store::now(), body.clone()));
+                        .insert(ck.clone(), (crate::store::now(), body.clone()));
                 }
                 // Mint committed and the sentinel replaced by the real body — disarm the guard so
                 // it does not remove the now-cached response.
@@ -467,11 +471,11 @@ pub(crate) async fn create_key(
                 );
                 let mut body = key_meta(&key);
                 body["secret"] = json!(secret); // shown exactly once
-                if let Some(ref k) = idem_key {
+                if let Some(ref ck) = idem_ckey {
                     app.idempotency_cache
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .insert(k.clone(), (crate::store::now(), body.clone()));
+                        .insert(ck.clone(), (crate::store::now(), body.clone()));
                 }
                 // Mint committed and the sentinel replaced by the real body — disarm the guard so
                 // it does not remove the now-cached response.
@@ -1915,6 +1919,168 @@ providers: {}
         .await
         .unwrap();
         assert_eq!(r.status().as_u16(), 201, "operator token stays full");
+
+        handle.abort();
+    }
+
+    /// §6.3 ESCALATION GUARD: a hooks-register principal may register a shape-only, non-global hook
+    /// but NOT one wired into a security-critical path — a `prompt: rw`/`ro` content-seeing gate, a
+    /// `user: ro` identity-seeing hook, or an inline `global: true` (chain wiring is full-only). The
+    /// operator (full) may register all of them.
+    #[tokio::test]
+    async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            inner.group_map.insert(
+                "registrars".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("hooks-register".to_string()),
+                    ..Default::default()
+                },
+            );
+            // The module ceiling defaults to read-only; lift it so registrars actually resolves to
+            // hooks-register (admin-tokens stays full — it is ceiling-exempt).
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: None,
+                    max_admin_scope: Some("full".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let post = |tok: &'static str, cfg: serde_json::Value| {
+            client
+                .post(format!("http://{addr}/admin/v1/hooks"))
+                .header("x-admin-token", tok)
+                .header("content-type", "application/json")
+                .body(serde_json::json!({"name": "h", "config": cfg}).to_string())
+                .send()
+        };
+        let base = |extra: serde_json::Value| {
+            let mut c = serde_json::json!({"kind": "gate", "webhook": "http://127.0.0.1:9969/"});
+            for (k, v) in extra.as_object().unwrap() {
+                c[k] = v.clone();
+            }
+            c
+        };
+
+        // hooks-register: each escalating form is 403 (forbidden), naming full.
+        for (label, cfg) in [
+            ("prompt: rw gate", base(serde_json::json!({"prompt": "rw"}))),
+            ("prompt: ro gate", base(serde_json::json!({"prompt": "ro"}))),
+            ("user: ro hook", base(serde_json::json!({"user": "ro"}))),
+            ("global: true", base(serde_json::json!({"global": true}))),
+        ] {
+            let r = post("grp:registrars", cfg).await.unwrap();
+            assert_eq!(
+                r.status().as_u16(),
+                403,
+                "hooks-register must not register a {label}"
+            );
+            let body: serde_json::Value = r.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "forbidden", "{label}");
+        }
+
+        // hooks-register CAN register a shape-only, non-global hook.
+        let r = post("grp:registrars", base(serde_json::json!({})))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            201,
+            "a shape-only, non-global hook is within hooks-register"
+        );
+
+        // The operator (full) can register a prompt: rw global gate (unique name — `h` is taken).
+        let r = client
+            .post(format!("http://{addr}/admin/v1/hooks"))
+            .header("x-admin-token", "admintok")
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "name": "op-hook",
+                    "config": base(serde_json::json!({"prompt": "rw", "global": true}))
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "full scope registers anything");
+
+        handle.abort();
+    }
+
+    /// The idempotency cache is SCOPED TO THE PRINCIPAL: a second admin presenting the same
+    /// Idempotency-Key value must mint its OWN key, never replay the first principal's response
+    /// (which carries a once-shown secret). Two full principals, same key value, distinct results.
+    #[tokio::test]
+    async fn test_admin_v1_idempotency_key_is_principal_scoped() {
+        crate::metrics::init();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let mut app = TestApp::new().governance(gov).build();
+        {
+            let inner = Arc::get_mut(&mut app).expect("sole owner");
+            inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+            // A group mapped FULL so the second principal can also mint keys.
+            inner.group_map.insert(
+                "admins".to_string(),
+                crate::config::GroupMapEntry {
+                    admin_scope: Some("full".to_string()),
+                    ..Default::default()
+                },
+            );
+            inner.auth_modules.insert(
+                "test-scope-module".to_string(),
+                crate::config::AuthModuleCfg {
+                    allowed_groups: None,
+                    max_admin_scope: Some("full".to_string()),
+                },
+            );
+        }
+        let router = crate::build_router(app);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let mint = |tok: &'static str| {
+            client
+                .post(format!("http://{addr}/admin/v1/keys"))
+                .header("x-admin-token", tok)
+                .header("content-type", "application/json")
+                .header("idempotency-key", "shared-value")
+                .body(serde_json::json!({"name": "k"}).to_string())
+                .send()
+        };
+
+        // Principal A (operator) mints under the shared key.
+        let a: serde_json::Value = mint("admintok").await.unwrap().json().await.unwrap();
+        // Principal B (a different full principal) mints under the SAME key value.
+        let b: serde_json::Value = mint("grp:admins").await.unwrap().json().await.unwrap();
+
+        assert!(a["id"].is_string() && b["id"].is_string());
+        assert_ne!(
+            a["id"], b["id"],
+            "a second principal's identical Idempotency-Key must mint a NEW key, not replay A's"
+        );
+        assert_ne!(
+            a["secret"], b["secret"],
+            "B must never receive A's once-shown secret via a cross-principal replay"
+        );
+        // And A replaying its OWN key still returns A's response (per-principal idempotency intact).
+        let a2: serde_json::Value = mint("admintok").await.unwrap().json().await.unwrap();
+        assert_eq!(a2["id"], a["id"], "A's own retry replays A's response");
 
         handle.abort();
     }
