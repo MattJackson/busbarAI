@@ -102,7 +102,7 @@ const INCOMPLETE_REASON_OTHER: &str = "other";
 
 /// Top-level `object` field value and vendor tag for the Responses protocol.
 const OBJ_RESPONSE: &str = "response";
-const VENDOR_NAME: &str = "responses";
+const VENDOR_NAME: &str = crate::proto::PROTO_RESPONSES;
 
 /// Synthesized id prefixes (bare prefix without trailing underscore for item ids).
 const RESPONSE_ID_PREFIX: &str = "resp_";

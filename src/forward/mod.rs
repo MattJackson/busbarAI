@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::breaker::{classify as classify_disposition, normalize_raw_error, Disposition};
 use crate::config::OnExhausted;
-use crate::proto::{convert_headers, StatusClass};
+use crate::proto::{convert_headers, StatusClass, PROTO_BEDROCK, PROTO_GEMINI, PROTO_RESPONSES};
 use crate::state::{App, WeightedLane};
 use crate::store::{now, Permit};
 
@@ -2191,7 +2191,7 @@ fn apply_rewrite_to_body(
             .collect()
     };
     match ingress_protocol {
-        "bedrock" => {
+        PROTO_BEDROCK => {
             if !obj.get("messages").is_some_and(Value::is_array) {
                 return false;
             }
@@ -2207,7 +2207,7 @@ fn apply_rewrite_to_body(
             obj.insert("messages".to_string(), Value::Array(framed));
             true
         }
-        "gemini" => {
+        PROTO_GEMINI => {
             if !obj.get("contents").is_some_and(Value::is_array) {
                 return false;
             }
@@ -2233,7 +2233,7 @@ fn apply_rewrite_to_body(
             obj.insert("contents".to_string(), Value::Array(framed));
             true
         }
-        "responses" => {
+        PROTO_RESPONSES => {
             if obj.get("input").is_none() {
                 return false;
             }
@@ -2356,8 +2356,8 @@ async fn apply_global_rewrites(
 /// rewrite gate saw `message_count: 0` and no prompt, so it abstained and silently no-oped.
 fn conversation_turns<'a>(v: &'a Value, ingress_protocol: &str) -> Option<&'a Vec<Value>> {
     let key = match ingress_protocol {
-        "gemini" => "contents",
-        "responses" => "input",
+        PROTO_GEMINI => "contents",
+        PROTO_RESPONSES => "input",
         _ => "messages",
     };
     v.get(key).and_then(|m| m.as_array())
@@ -2370,7 +2370,7 @@ fn turn_count(v: &Value, ingress_protocol: &str) -> usize {
     match conversation_turns(v, ingress_protocol) {
         Some(turns) => turns.len(),
         None => usize::from(
-            ingress_protocol == "responses" && v.get("input").and_then(Value::as_str).is_some(),
+            ingress_protocol == PROTO_RESPONSES && v.get("input").and_then(Value::as_str).is_some(),
         ),
     }
 }
@@ -2383,7 +2383,7 @@ fn turn_count(v: &Value, ingress_protocol: &str) -> usize {
 /// `system_text_chars`). Saturating narrow: an absurd cap (> u32::MAX) still signals "huge ask"
 /// rather than wrapping to a small number.
 fn max_tokens_for(v: &Value, ingress_protocol: &str) -> Option<u32> {
-    let key = if ingress_protocol == "responses" {
+    let key = if ingress_protocol == PROTO_RESPONSES {
         "max_output_tokens"
     } else {
         "max_tokens"
@@ -2416,11 +2416,11 @@ fn gemini_parts_chars(content: &Value) -> usize {
 /// the opt-in content projection never diverge. Cheap v1 SIZE signal (NOT a token count).
 fn system_text_chars(v: &Value, ingress_protocol: &str) -> usize {
     match ingress_protocol {
-        "gemini" => v
+        PROTO_GEMINI => v
             .get("systemInstruction")
             .map(gemini_parts_chars)
             .unwrap_or(0),
-        "responses" => v
+        PROTO_RESPONSES => v
             .get("instructions")
             .and_then(|i| i.as_str())
             .map(|s| s.chars().count())
@@ -2448,7 +2448,7 @@ fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> u
     let mut total = system_chars;
     if let Some(turns) = conversation_turns(v, ingress_protocol) {
         for m in turns {
-            if ingress_protocol == "gemini" {
+            if ingress_protocol == PROTO_GEMINI {
                 total += gemini_parts_chars(m);
                 continue;
             }
@@ -2463,7 +2463,7 @@ fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> u
                 }
                 // A top-level Responses `input_text`/`output_text` item carries its text at the
                 // item root, not under `content` — count it so the SIZE signal is not blinded.
-                _ if ingress_protocol == "responses" => {
+                _ if ingress_protocol == PROTO_RESPONSES => {
                     if let Some(t) = m.get("text").and_then(Value::as_str) {
                         total += t.chars().count();
                     }
@@ -2471,7 +2471,7 @@ fn total_text_chars(v: &Value, ingress_protocol: &str, system_chars: usize) -> u
                 _ => {}
             }
         }
-    } else if ingress_protocol == "responses" {
+    } else if ingress_protocol == PROTO_RESPONSES {
         // Bare-string `input` = one implicit user turn.
         if let Some(s) = v.get("input").and_then(Value::as_str) {
             total += s.chars().count();
@@ -2576,8 +2576,8 @@ fn build_prompt_projection<'a>(
         }
     }
     let system = match ingress_protocol {
-        "gemini" => v.get("systemInstruction").map(flatten_gemini_parts),
-        "responses" => v
+        PROTO_GEMINI => v.get("systemInstruction").map(flatten_gemini_parts),
+        PROTO_RESPONSES => v
             .get("instructions")
             .and_then(|i| i.as_str())
             .map(Cow::Borrowed),
@@ -2588,9 +2588,9 @@ fn build_prompt_projection<'a>(
         Some(turns) => turns
             .iter()
             .map(|m| {
-                let text = if ingress_protocol == "gemini" {
+                let text = if ingress_protocol == PROTO_GEMINI {
                     flatten_gemini_parts(m)
-                } else if ingress_protocol == "responses" && m.get("content").is_none() {
+                } else if ingress_protocol == PROTO_RESPONSES && m.get("content").is_none() {
                     // A top-level Responses typed item (`{type: "input_text"/"output_text", text}`)
                     // carries its text at the item root, not under `content`.
                     m.get("text")
@@ -2605,11 +2605,11 @@ fn build_prompt_projection<'a>(
                     // hook contract promises normalized IR). Without this a hook that echoes the role
                     // it received emitted `model`, which the gemini write-back then mapped to `user`,
                     // silently corrupting assistant turns. Mirrors the responses arm below. (c1r14.)
-                    Some("model") if ingress_protocol == "gemini" => Cow::Borrowed("assistant"),
+                    Some("model") if ingress_protocol == PROTO_GEMINI => Cow::Borrowed("assistant"),
                     Some(r) => Cow::Borrowed(r),
                     // Top-level typed item without a `role`: infer from its `type` so a `prompt: rw`
                     // hook sees the correct speaker (`output_text` = assistant, else user).
-                    None if ingress_protocol == "responses" => {
+                    None if ingress_protocol == PROTO_RESPONSES => {
                         match m.get("type").and_then(Value::as_str) {
                             Some("output_text") => Cow::Borrowed("assistant"),
                             _ => Cow::Borrowed("user"),
@@ -2621,7 +2621,7 @@ fn build_prompt_projection<'a>(
             })
             .collect(),
         // The Responses API's bare-string `input` = one implicit user turn.
-        None if ingress_protocol == "responses" => v
+        None if ingress_protocol == PROTO_RESPONSES => v
             .get("input")
             .and_then(Value::as_str)
             .map(|s| vec![(Cow::Borrowed("user"), Cow::Borrowed(s))])

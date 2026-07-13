@@ -162,7 +162,7 @@ pub(crate) const STREAM_ABORT_DETAIL: &str = "The response stream was interrupte
 pub(crate) fn proto_for_path(path: &str) -> &'static str {
     if path.starts_with("/v1beta/models") {
         // `/v1beta/models/...` is a Gemini-only surface (OpenAI has no v1beta), so always Gemini.
-        "gemini"
+        PROTO_GEMINI
     } else if path.starts_with("/v1/models/") {
         // `/v1/models/...` is ambiguous: Gemini packs a `:<action>` into the LAST path segment
         // (`/v1/models/gemini-pro:generateContent`), whereas the OpenAI SDK's `model.retrieve`
@@ -182,25 +182,25 @@ pub(crate) fn proto_for_path(path: &str) -> &'static str {
             ":batchEmbedContents",
         ];
         if GEMINI_ACTIONS.iter().any(|a| last_segment.ends_with(a)) {
-            "gemini"
+            PROTO_GEMINI
         } else {
-            "openai"
+            PROTO_OPENAI
         }
     } else if path.starts_with("/model/")
         && (path.ends_with("/converse") || path.ends_with("/converse-stream"))
     {
-        "bedrock"
+        PROTO_BEDROCK
     } else if path == "/v1/messages" || path.ends_with("/v1/messages") {
-        "anthropic"
+        PROTO_ANTHROPIC
     } else if path == "/v1/chat/completions" {
-        "openai"
+        PROTO_OPENAI
     } else if path == "/v2/chat" {
-        "cohere"
+        PROTO_COHERE
     } else if path == "/v1/responses" {
-        "responses"
+        PROTO_RESPONSES
     } else {
         // Unknown ingress: fall back to the widely-understood OpenAI envelope.
-        "openai"
+        PROTO_OPENAI
     }
 }
 
@@ -1000,32 +1000,32 @@ impl Protocol {
 
     /// Construct an Anthropic protocol instance.
     pub(crate) fn anthropic() -> Self {
-        Self::new("anthropic", AnthropicReader, AnthropicWriter)
+        Self::new(PROTO_ANTHROPIC, AnthropicReader, AnthropicWriter)
     }
 
     /// Construct an OpenAI protocol instance.
     pub(crate) fn openai() -> Self {
-        Self::new("openai", OpenAiReader, OpenAiWriter)
+        Self::new(PROTO_OPENAI, OpenAiReader, OpenAiWriter)
     }
 
     /// Construct a Gemini protocol instance.
     pub(crate) fn gemini() -> Self {
-        Self::new("gemini", GeminiReader, GeminiWriter)
+        Self::new(PROTO_GEMINI, GeminiReader, GeminiWriter)
     }
 
     /// Construct an OpenAI Responses protocol instance.
     pub(crate) fn responses() -> Self {
-        Self::new("responses", ResponsesReader, ResponsesWriter)
+        Self::new(PROTO_RESPONSES, ResponsesReader, ResponsesWriter)
     }
 
     /// Construct a Bedrock protocol instance.
     pub(crate) fn bedrock() -> Self {
-        Self::new("bedrock", BedrockReader, BedrockWriter)
+        Self::new(PROTO_BEDROCK, BedrockReader, BedrockWriter)
     }
 
     /// Construct a Cohere (v2 chat) protocol instance.
     pub(crate) fn cohere() -> Self {
-        Self::new("cohere", CohereReader, CohereWriter)
+        Self::new(PROTO_COHERE, CohereReader, CohereWriter)
     }
 }
 
@@ -1040,12 +1040,12 @@ impl Protocol {
 /// these allocations on the hot path.
 pub(crate) fn protocol_for(name: &str) -> Option<Protocol> {
     match name {
-        "anthropic" => Some(Protocol::anthropic()),
-        "bedrock" => Some(Protocol::bedrock()),
-        "cohere" => Some(Protocol::cohere()),
-        "gemini" => Some(Protocol::gemini()),
-        "openai" => Some(Protocol::openai()),
-        "responses" => Some(Protocol::responses()),
+        PROTO_ANTHROPIC => Some(Protocol::anthropic()),
+        PROTO_BEDROCK => Some(Protocol::bedrock()),
+        PROTO_COHERE => Some(Protocol::cohere()),
+        PROTO_GEMINI => Some(Protocol::gemini()),
+        PROTO_OPENAI => Some(Protocol::openai()),
+        PROTO_RESPONSES => Some(Protocol::responses()),
         _ => None,
     }
 }
@@ -1117,16 +1117,16 @@ fn native_tool_id_prefix(protocol_name: &str) -> Option<&'static str> {
     match protocol_name {
         // Anthropic `toolu_…`, OpenAI/Responses `call_…`, Bedrock `tooluse_…` are the documented
         // native shapes — each is a stable prefix the encode can prepend and the decode can gate on.
-        "anthropic" => Some("toolu_"),
-        "openai" | "responses" => Some("call_"),
-        "bedrock" => Some("tooluse_"),
+        PROTO_ANTHROPIC => Some("toolu_"),
+        PROTO_OPENAI | PROTO_RESPONSES => Some("call_"),
+        PROTO_BEDROCK => Some("tooluse_"),
         // Cohere tool ids are free-form with NO canonical prefix. An empty prefix would make the
         // reversibility marker (`bb1`) itself the only distinguishing signal, which collides with a
         // legitimate client-authored id of shape `bb1<even-len-hex-UTF8>` (e.g. `bb161626364` → the
         // decode silently rewrites it to `abcd`) — corrupting tool_use/tool_result correlation on a
         // Cohere-ingress cross-protocol hop. Return `None` (like Gemini) so Cohere ids pass through
         // verbatim: the egress id is never reshaped, so there is nothing to mis-decode on the echo.
-        "cohere" => None,
+        PROTO_COHERE => None,
         // Gemini carries no tool id on the wire — its writer drops `ToolUse.id` entirely — so there is
         // nothing to reshape and no risk of a foreign id leaking to a Gemini client.
         _ => None,
@@ -2170,6 +2170,16 @@ use gemini::GeminiJsonArrayFramer;
 use openai_chat::{OpenAiReader, OpenAiWriter};
 use openai_responses::{ResponsesReader, ResponsesWriter};
 
+/// Canonical protocol-id vocabulary. Every PRODUCTION comparison / match arm / registry insertion on
+/// a protocol name goes through these consts so the router, dispatch, projections, and registry
+/// cannot drift on a typo'd literal. Tests keep raw literals by convention (golden-value checks).
+pub(crate) const PROTO_ANTHROPIC: &str = "anthropic";
+pub(crate) const PROTO_OPENAI: &str = "openai";
+pub(crate) const PROTO_GEMINI: &str = "gemini";
+pub(crate) const PROTO_BEDROCK: &str = "bedrock";
+pub(crate) const PROTO_COHERE: &str = "cohere";
+pub(crate) const PROTO_RESPONSES: &str = "responses";
+
 /// Every protocol name busbar ships a built-in `Protocol` for. SINGLE SOURCE OF TRUTH shared by
 /// `ProtocolRegistry::with_builtins` (which builds its map from these names) and the config validator
 /// (`config_validate.rs`, which rejects a provider whose `protocol` is not in this set so an unknown
@@ -2180,11 +2190,11 @@ use openai_responses::{ResponsesReader, ResponsesWriter};
 /// assertion in any debug/test build.
 pub(crate) const KNOWN_PROTOCOLS: &[&str] = &[
     "anthropic",
-    "openai",
-    "gemini",
-    "bedrock",
-    "responses",
-    "cohere",
+    PROTO_OPENAI,
+    PROTO_GEMINI,
+    PROTO_BEDROCK,
+    PROTO_RESPONSES,
+    PROTO_COHERE,
 ];
 
 /// String-keyed registry mapping a provider's protocol name to its `Protocol`.
@@ -2202,12 +2212,12 @@ impl ProtocolRegistry {
             // Build the registry from the single-source-of-truth name list so the registry and the
             // config validator (which validates against `KNOWN_PROTOCOLS`) cannot drift.
             let protocol = match name {
-                "anthropic" => Protocol::anthropic(),
-                "openai" => Protocol::openai(),
-                "gemini" => Protocol::gemini(),
-                "bedrock" => Protocol::bedrock(),
-                "responses" => Protocol::responses(),
-                "cohere" => Protocol::cohere(),
+                PROTO_ANTHROPIC => Protocol::anthropic(),
+                PROTO_OPENAI => Protocol::openai(),
+                PROTO_GEMINI => Protocol::gemini(),
+                PROTO_BEDROCK => Protocol::bedrock(),
+                PROTO_RESPONSES => Protocol::responses(),
+                PROTO_COHERE => Protocol::cohere(),
                 // Startup-only construction: if a name is added to `KNOWN_PROTOCOLS` without a
                 // matching constructor arm here, fail loud in debug/test builds. In release this
                 // skips the unmapped name (it simply will not be registered), and the lane-build

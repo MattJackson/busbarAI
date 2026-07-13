@@ -11,6 +11,7 @@ pub(crate) mod overlay;
 
 // Re-export status_class_from_str for config validation
 pub(crate) use crate::breaker::status_class_from_str;
+use crate::proto::PROTO_ANTHROPIC;
 
 /// Reject an env-var value that could break out of the surrounding YAML scalar when substituted
 /// into the raw config text BEFORE parsing. `interpolate_env` splices each value in verbatim, so a
@@ -294,7 +295,7 @@ impl fmt::Debug for ProviderCfg {
 
 /// Default provider protocol when not specified. Wire-contract: providers.yaml catalog entries
 /// and un-overridden deployments use this protocol for the dispatch registry lookup.
-const DEFAULT_PROTOCOL: &str = "anthropic";
+const DEFAULT_PROTOCOL: &str = PROTO_ANTHROPIC;
 
 fn default_protocol() -> String {
     DEFAULT_PROTOCOL.to_string()

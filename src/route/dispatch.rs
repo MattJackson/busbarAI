@@ -322,7 +322,7 @@ pub(crate) async fn protocol_dispatch(
     }
     match proto {
         // Path-model protocols keep their full arms (streaming variants, native action errors).
-        "gemini" => {
+        PROTO_GEMINI => {
             // axum's {*rest} wildcard percent-decoded the tail before the collapse; match it.
             let rest =
                 crate::observability::percent_decode(path.split("/models/").nth(1).unwrap_or(""));
@@ -337,9 +337,9 @@ pub(crate) async fn protocol_dispatch(
             )
             .await
         }
-        "bedrock" => {
+        PROTO_BEDROCK => {
             // axum's Path extractor percent-decoded {model_id} before the collapse; match it.
-            let model = crate::handlers::request_handler("bedrock")
+            let model = crate::handlers::request_handler(PROTO_BEDROCK)
                 .and_then(|rh| rh.path_model(&path))
                 .map(|m| crate::observability::percent_decode(&m))
                 .unwrap_or_default();
@@ -420,11 +420,11 @@ pub(crate) async fn bedrock_invoke(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(operation) = crate::handlers::request_handler("bedrock")
+    let Some(operation) = crate::handlers::request_handler(PROTO_BEDROCK)
         .and_then(|rh| rh.resolve_operation(uri.path(), &body))
     else {
         return ingress_error(
-            "bedrock",
+            PROTO_BEDROCK,
             StatusCode::BAD_REQUEST,
             crate::forward::KIND_INVALID_REQUEST,
             "InvokeModel body is not a supported operation (expected inputText or textToImageParams).",
@@ -436,7 +436,7 @@ pub(crate) async fn bedrock_invoke(
         &caller,
         &headers,
         body,
-        "bedrock",
+        PROTO_BEDROCK,
         operation,
         Some(model_id),
     )

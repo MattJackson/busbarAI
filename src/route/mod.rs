@@ -12,6 +12,7 @@ use axum::{
 };
 use serde_json::Value;
 
+use crate::proto::{PROTO_ANTHROPIC, PROTO_BEDROCK, PROTO_GEMINI};
 use crate::state::{App, WeightedLane};
 
 /// enforce a virtual key's allowed-pools list against the resolved target pool. No-op
@@ -782,7 +783,7 @@ pub(crate) async fn gemini_ingress(
 
     // The gemini RequestHandler resolves WHICH operation this request is (path action + body for the
     // generateContent multiplex) — ONE resolution, and every operation takes the SAME flow below.
-    let operation = crate::handlers::request_handler("gemini")
+    let operation = crate::handlers::request_handler(PROTO_GEMINI)
         .and_then(|rh| rh.resolve_operation(uri.path(), &body));
 
     // Only the two generate actions are proxied (see the route doc above). Any other action is an
@@ -861,12 +862,12 @@ pub(crate) async fn gemini_ingress(
         return finish_rejected(
             &app,
             &gov,
-            "gemini",
+            PROTO_GEMINI,
             crate::forward::POOL_LABEL_UNRESOLVED,
             started,
             charged_at,
             ingress_error(
-                "gemini",
+                PROTO_GEMINI,
                 StatusCode::NOT_FOUND,
                 crate::forward::KIND_NOT_FOUND,
                 "This endpoint does not support that operation.",
@@ -883,7 +884,7 @@ pub(crate) async fn gemini_ingress(
         operation,
         stream,
         gemini_json_array,
-        "gemini",
+        PROTO_GEMINI,
         // Thread the path-derived api_version so a model-not-found 404 says
         // "models/{model} is not found for API version {api_version}, …" (the native Gemini
         // message), not the OpenAI-style copy — a distinguishability tell for SDKs that match on
@@ -951,11 +952,11 @@ pub(crate) async fn bedrock_converse(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(op) = crate::handlers::request_handler("bedrock")
+    let Some(op) = crate::handlers::request_handler(PROTO_BEDROCK)
         .and_then(|rh| rh.resolve_operation(&format!("/model/{model_id}/converse"), &body))
     else {
         return ingress_error(
-            "bedrock",
+            PROTO_BEDROCK,
             StatusCode::NOT_FOUND,
             crate::forward::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
@@ -978,11 +979,11 @@ pub(crate) async fn bedrock_converse_stream(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(op) = crate::handlers::request_handler("bedrock")
+    let Some(op) = crate::handlers::request_handler(PROTO_BEDROCK)
         .and_then(|rh| rh.resolve_operation(&format!("/model/{model_id}/converse-stream"), &body))
     else {
         return ingress_error(
-            "bedrock",
+            PROTO_BEDROCK,
             StatusCode::NOT_FOUND,
             crate::forward::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
@@ -1016,7 +1017,17 @@ async fn bedrock_ingress(
     // Bedrock never uses the gemini JSON-array framing, and a model-not-found 404 uses the canonical
     // (non-gemini) message, so no api_version is threaded.
     ingress_path_model(
-        app, gov, caller, headers, body, model_id, operation, stream, false, "bedrock", None,
+        app,
+        gov,
+        caller,
+        headers,
+        body,
+        model_id,
+        operation,
+        stream,
+        false,
+        PROTO_BEDROCK,
+        None,
     )
     .await
 }
@@ -1062,12 +1073,12 @@ pub(crate) async fn named(
     // Deletion switch (chat is a standard operation): the named/adhoc conveniences are the
     // anthropic-dialect chat surface, so they consult the anthropic chat OperationHandler exactly
     // like the catch-all does. Absent handler → the standard no-handler 404 in the caller's dialect.
-    if crate::handlers::request_handler("anthropic")
+    if crate::handlers::request_handler(PROTO_ANTHROPIC)
         .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
         .is_none()
     {
         return crate::forward::ingress_error(
-            "anthropic",
+            PROTO_ANTHROPIC,
             StatusCode::NOT_FOUND,
             crate::forward::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
@@ -1084,11 +1095,11 @@ pub(crate) async fn named(
     // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
     // inside `governance_guard` (this handler just returns that response). On admission it reports
     // whether the flat fee was CHARGED, so the post-admission finish only refunds when it landed.
-    let charged = match governance_guard(&app, &gov, "anthropic", &name, started, charged_at).await
-    {
-        Err(resp) => return resp,
-        Ok(charged) => charged,
-    };
+    let charged =
+        match governance_guard(&app, &gov, PROTO_ANTHROPIC, &name, started, charged_at).await {
+            Err(resp) => return resp,
+            Ok(charged) => charged,
+        };
 
     if let Some(cands) = app.pools.get(&name) {
         let affinity_key = headers
@@ -1104,15 +1115,15 @@ pub(crate) async fn named(
             gov.key.as_ref(),
             &name,
             affinity_key,
-            "anthropic",
-            crate::handlers::chat("anthropic"),
+            PROTO_ANTHROPIC,
+            crate::handlers::chat(PROTO_ANTHROPIC),
             usage_sink(&app, &gov, charged_at),
         )
         .await;
         return finish_admitted(
             &app,
             &gov,
-            "anthropic",
+            PROTO_ANTHROPIC,
             &name,
             started,
             charged_at,
@@ -1136,15 +1147,15 @@ pub(crate) async fn named(
             gov.key.as_ref(),
             "",
             None,
-            "anthropic",
-            crate::handlers::chat("anthropic"),
+            PROTO_ANTHROPIC,
+            crate::handlers::chat(PROTO_ANTHROPIC),
             usage_sink(&app, &gov, charged_at),
         )
         .await;
         return finish_admitted(
             &app,
             &gov,
-            "anthropic",
+            PROTO_ANTHROPIC,
             &name,
             started,
             charged_at,
@@ -1162,12 +1173,12 @@ pub(crate) async fn named(
     finish_admitted(
         &app,
         &gov,
-        "anthropic",
+        PROTO_ANTHROPIC,
         pool_label(&app, &name),
         started,
         charged_at,
         ingress_error(
-            "anthropic",
+            PROTO_ANTHROPIC,
             StatusCode::NOT_FOUND,
             crate::forward::KIND_NOT_FOUND,
             // Anthropic ingress: canonical (non-gemini) model-not-found copy.
@@ -1187,12 +1198,12 @@ pub(crate) async fn adhoc(
     body: Bytes,
 ) -> Response {
     // Deletion switch — same consult as `named` (this is the other anthropic-dialect chat surface).
-    if crate::handlers::request_handler("anthropic")
+    if crate::handlers::request_handler(PROTO_ANTHROPIC)
         .and_then(|rh| rh.operation_handler(crate::operation::Operation::Chat))
         .is_none()
     {
         return crate::forward::ingress_error(
-            "anthropic",
+            PROTO_ANTHROPIC,
             StatusCode::NOT_FOUND,
             crate::forward::KIND_NOT_FOUND,
             "This endpoint does not support that operation.",
@@ -1206,11 +1217,11 @@ pub(crate) async fn adhoc(
     // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
     // inside `governance_guard` (this handler just returns that response). `charged` gates the
     // post-admission refund so an un-charged (store-error-Allow) admit never blind-refunds.
-    let charged = match governance_guard(&app, &gov, "anthropic", &model, started, charged_at).await
-    {
-        Err(resp) => return resp,
-        Ok(charged) => charged,
-    };
+    let charged =
+        match governance_guard(&app, &gov, PROTO_ANTHROPIC, &model, started, charged_at).await {
+            Err(resp) => return resp,
+            Ok(charged) => charged,
+        };
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {
@@ -1229,15 +1240,15 @@ pub(crate) async fn adhoc(
                 gov.key.as_ref(),
                 "",
                 None,
-                "anthropic",
-                crate::handlers::chat("anthropic"),
+                PROTO_ANTHROPIC,
+                crate::handlers::chat(PROTO_ANTHROPIC),
                 usage_sink(&app, &gov, charged_at),
             )
             .await;
             finish_admitted(
                 &app,
                 &gov,
-                "anthropic",
+                PROTO_ANTHROPIC,
                 &model,
                 started,
                 charged_at,
@@ -1262,12 +1273,12 @@ pub(crate) async fn adhoc(
             finish_admitted(
                 &app,
                 &gov,
-                "anthropic",
+                PROTO_ANTHROPIC,
                 pool_label(&app, &model),
                 started,
                 charged_at,
                 ingress_error(
-                    "anthropic",
+                    PROTO_ANTHROPIC,
                     StatusCode::BAD_REQUEST,
                     crate::forward::KIND_INVALID_REQUEST,
                     // Anthropic ingress: canonical (non-gemini) model-not-found copy.
@@ -1281,12 +1292,12 @@ pub(crate) async fn adhoc(
         None => finish_admitted(
             &app,
             &gov,
-            "anthropic",
+            PROTO_ANTHROPIC,
             pool_label(&app, &model),
             started,
             charged_at,
             ingress_error(
-                "anthropic",
+                PROTO_ANTHROPIC,
                 StatusCode::NOT_FOUND,
                 crate::forward::KIND_NOT_FOUND,
                 // Anthropic ingress: canonical (non-gemini) model-not-found copy.
