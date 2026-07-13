@@ -647,9 +647,11 @@ pub(crate) enum PolicyOnError {
     First,
 }
 
-/// The serde default for a hook's `on_error` — the `weighted` reserved terminal.
+/// The serde default for a hook's `on_error` — `nothing` (Matthew's ruling): a failing gate
+/// DOES NOT PARTICIPATE by default — it cannot steer, and it cannot displace another gate's
+/// verdict. Security gates opt into `reject`; ordering gates name `weighted` explicitly.
 fn default_on_error() -> String {
-    ON_ERROR_WEIGHTED.to_string()
+    ON_ERROR_NOTHING.to_string()
 }
 
 /// The RESERVED on_error terminal names — every fallback chain must bottom out on one.
