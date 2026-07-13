@@ -1113,7 +1113,12 @@ impl InMemoryStore {
                 duration.saturating_sub(jitter.unsigned_abs())
             };
             duration = jittered.clamp(
-                duration / 2, // At least half of base
+                // At least half of base, but NEVER below 1s. For `base_cooldown_secs = 1` (the
+                // minimum config_validate permits) the integer floor `1/2` truncates to 0, and a
+                // −1 jitter draw (~1/3 of trips) then produced a ZERO cooldown — the tripped cell
+                // re-admits instantly (`now >= cooldown_until`), the exact zero-backoff outcome the
+                // validator rejects a static `base_cooldown_secs = 0` to prevent. (found: audit c2r1.)
+                (duration / 2).max(1),
                 cfg.max_cooldown_secs,
             );
         }
@@ -2944,6 +2949,40 @@ mod tests {
     /// and the streak CANNOT advance while we hold it (stays 0). The OLD code bumped the streak before
     /// taking the lock, so the streak would advance to 1 even while the lock is held — this assertion
     /// fails against the old code and passes after the fix.
+    /// REGRESSION (audit c2r1): with `base_cooldown_secs = 1` (the minimum config_validate permits),
+    /// the ±10% jitter can draw −1, and the clamp floor `duration / 2 = 1/2` truncates to 0 — so a
+    /// tripped cell got a ZERO cooldown and re-admitted instantly (`now >= cooldown_until`), the exact
+    /// zero-backoff the validator rejects a static `base = 0` to prevent. The floor is now
+    /// `(duration/2).max(1)`. Sweep the jitter seed (via the test clock) so the −1 draw is exercised;
+    /// the cooldown must NEVER be 0.
+    #[test]
+    fn cooldown_never_zero_for_base_one() {
+        let store = Arc::new(InMemoryStore::new(vec![make_lane_data(0, 10)]));
+        let lane = store.get_lane(0).clone();
+        assert_eq!(lane.streak().load(Ordering::Relaxed), 0);
+        let cfg = BreakerCfg {
+            base_cooldown_secs: 1,
+            max_cooldown_secs: 1000,
+            honor_retry_after: false,
+            trip: TripConfig {
+                mode: TripMode::Consecutive,
+                window_s: 30,
+                threshold: 0.5,
+                min_requests: 5,
+                consecutive_n: 2,
+            },
+        };
+        // span = 3 for base=1, so ~1/3 of seeds draw jitter −1; the sweep is guaranteed to hit it.
+        for t in 0..600u64 {
+            set_now_for_test(t);
+            let cd = InMemoryStore::compute_cooldown_with_retry_after(&*lane, t, &cfg, None, 3600);
+            assert!(
+                cd >= 1,
+                "base_cooldown_secs=1 must never yield a 0 cooldown (t={t} gave {cd})"
+            );
+        }
+    }
+
     #[test]
     fn test_streak_bump_is_serialized_under_transition_lock() {
         set_now_for_test(1000);

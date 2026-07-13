@@ -186,9 +186,10 @@ pub(crate) async fn operation_resolved(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if let Some(resp) = governance_guard(app, gov, proto, model, started, charged_at).await {
-        return resp;
-    }
+    let charged = match governance_guard(app, gov, proto, model, started, charged_at).await {
+        Err(resp) => return resp,
+        Ok(charged) => charged,
+    };
 
     let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(model) {
         (c.clone(), model)
@@ -203,7 +204,7 @@ pub(crate) async fn operation_resolved(
             "",
         )
     } else {
-        return finish(
+        return finish_admitted(
             app,
             gov,
             proto,
@@ -216,6 +217,7 @@ pub(crate) async fn operation_resolved(
                 crate::forward::KIND_NOT_FOUND,
                 &not_found_message(model, gemini_api_version),
             ),
+            charged,
         );
     };
 
@@ -255,7 +257,7 @@ pub(crate) async fn operation_resolved(
         usage_sink(app, gov, charged_at),
     )
     .await;
-    finish(app, gov, proto, model, started, charged_at, resp)
+    finish_admitted(app, gov, proto, model, started, charged_at, resp, charged)
 }
 
 // (The per-operation axum wrappers are gone: the protocol catch-all `protocol_dispatch` resolves the

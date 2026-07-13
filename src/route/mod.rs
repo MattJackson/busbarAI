@@ -137,12 +137,16 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
 /// so the charge-and-check and the later token charge must read the SAME window — else, when a
 /// request straddles a window boundary, a fresh clock here could admit/charge against an empty new
 /// window while the token fee falls into the old one, or vice-versa (#29 sibling of the token pin).
+/// `Ok(true)` = admitted AND the flat per-request fee was CHARGED (a non-2xx must refund it).
+/// `Ok(false)` = admitted WITHOUT a charge (governance off / no key / store-error fail-open) — a
+/// non-2xx must NOT refund, because `refund_request` is a blind decrement that would erode ANOTHER
+/// request's spend/count in the same window (see `finish_rejected`). `Err(resp)` = rejected.
 async fn budget_check(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     proto: &str,
     charged_at: u64,
-) -> Option<Response> {
+) -> Result<bool, Response> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
         // ATOMIC budget check-and-charge (fix 2a): one indivisible UPSERT charges the flat per-request
         // fee + one request IFF it stays within the cap. This replaces the old non-atomic read
@@ -153,7 +157,7 @@ async fn budget_check(
         // runs LAST in `governance_guard` (after pool/rate), so no later guard can reject an
         // already-charged request.
         match g.try_charge_request_within_budget(key, charged_at).await {
-            Ok(true) => {} // charged + admitted — proceed
+            Ok(true) => Ok(true), // charged + admitted — a non-2xx refunds this flat fee
             Ok(false) => {
                 // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the OpenAI
                 // writer passes it through verbatim as a real type; the Responses writer maps it
@@ -171,12 +175,12 @@ async fn budget_check(
                 let status = crate::proto::protocol_for(proto)
                     .map(|p| p.writer().quota_exceeded_status())
                     .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-                return Some(ingress_error(
+                Err(ingress_error(
                     proto,
                     status,
                     crate::forward::KIND_INSUFFICIENT_QUOTA,
                     "You have exceeded your current quota. Please check your plan and billing details.",
-                ));
+                ))
             }
             Err(e) => {
                 // fix 2b: store error on the budget charge → consult the configured fail-mode.
@@ -187,24 +191,29 @@ async fn budget_check(
                 match g.budget_on_store_error() {
                     crate::config::BudgetOnStoreError::Allow => {
                         tracing::warn!(key_id = %key.id, error = %e, "budget charge store error; failing open (allow)");
+                        // Admitted, but the atomic UPSERT did NOT commit — nothing was charged, so a
+                        // later non-2xx must NOT refund (that would decrement OTHER requests' spend).
+                        Ok(false)
                     }
                     crate::config::BudgetOnStoreError::Deny => {
                         tracing::warn!(key_id = %key.id, error = %e, "budget charge store error; failing closed (deny)");
                         let status = crate::proto::protocol_for(proto)
                             .map(|p| p.writer().quota_exceeded_status())
                             .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-                        return Some(ingress_error(
+                        Err(ingress_error(
                             proto,
                             status,
                             crate::forward::KIND_INSUFFICIENT_QUOTA,
                             "You have exceeded your current quota. Please check your plan and billing details.",
-                        ));
+                        ))
                     }
                 }
             }
         }
+    } else {
+        // Governance off or no resolved key → no charge landed; nothing to refund on a non-2xx.
+        Ok(false)
     }
-    None
 }
 
 /// Run the three governance guards (pool-allowed / over-budget / rate-limited) for a request that
@@ -225,14 +234,14 @@ async fn governance_guard(
     pool: &str,
     started: Instant,
     charged_at: u64,
-) -> Option<Response> {
+) -> Result<bool, Response> {
     // A governance rejection fires BEFORE the model is resolved to a configured pool, so the raw
     // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs)
     // before it reaches `finish` (which stamps it onto REQUESTS_TOTAL / the duration histogram /
     // the request-log webhook). Passing it raw was an unbounded-cardinality DoS vector.
     let label = pool_label(app, pool);
     if let Some(resp) = pool_authorized(gov, pool, proto) {
-        return Some(finish_rejected(
+        return Err(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
         ));
     }
@@ -243,7 +252,7 @@ async fn governance_guard(
     // `forward::handle_fallback_pool` does not — and cannot — re-check the key; the ACL is enforced
     // at this ingress boundary). A denial is the SAME protocol-native 403 the initial check emits.
     if let Some(resp) = fallback_pools_authorized(app, gov, pool, proto) {
-        return Some(finish_rejected(
+        return Err(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
         ));
     }
@@ -251,19 +260,21 @@ async fn governance_guard(
     // admission (fix 2a), so it must be the LAST guard — nothing may reject an already-charged
     // request. A rate-limited request is rejected here without ever being charged.
     if let Some(resp) = rate_check(app, gov, proto, charged_at) {
-        return Some(finish_rejected(
+        return Err(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
         ));
     }
-    // Budget charge LAST. On rejection (`Some`) nothing was charged → `finish_rejected` (no refund);
-    // on `None` the flat fee is now billed, and the post-admission `finish` refunds it if the upstream
-    // produces a non-2xx result.
-    if let Some(resp) = budget_check(app, gov, proto, charged_at).await {
-        return Some(finish_rejected(
+    // Budget charge LAST. On rejection nothing was charged → `finish_rejected` (no refund). On
+    // admission, `budget_check` reports whether the flat fee actually LANDED: `Ok(true)` means the
+    // post-admission `finish` must refund it on a non-2xx; `Ok(false)` (governance off / no key /
+    // store-error fail-open) means NO charge landed, so the caller must NOT refund — a blind refund
+    // there erodes another request's spend (found: audit c2r1). That flag is the guard's return.
+    match budget_check(app, gov, proto, charged_at).await {
+        Err(resp) => Err(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
-        ));
+        )),
+        Ok(charged) => Ok(charged),
     }
-    None
 }
 
 /// reject (429 + Retry-After) before forwarding when the resolved virtual key is over
@@ -332,6 +343,11 @@ fn pool_label<'a>(app: &Arc<App>, model: &'a str) -> &'a str {
 /// REFUNDS that flat fee — preserving the "bill 2xx only" flat-fee policy now that the hard-cap
 /// charge bills every admitted request up front. Token fees are charged post-response only on success
 /// (via `UsageSink`), so this keeps both fee policies "successful requests only".
+///
+/// Test-only now: every production admission threads the `charged` flag through
+/// [`finish_admitted`] (a store-error fail-open admit must not refund); this unconditional-refund
+/// form survives only for the in-module tests that always charge.
+#[cfg(test)]
 fn finish(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
@@ -350,6 +366,34 @@ fn finish(
         charged_at,
         resp,
         true,
+    )
+}
+
+/// Post-admission finish whose non-2xx refund is CONDITIONAL on whether the flat fee actually landed
+/// at admission (`charged`, from `governance_guard`). Admitting a request WITHOUT charging (store-
+/// error fail-open, or governance off) and then refunding on a non-2xx would blind-decrement OTHER
+/// requests' spend/count in the same window — so those requests must finish with `charged = false`.
+/// (found: audit c2r1.)
+#[allow(clippy::too_many_arguments)]
+fn finish_admitted(
+    app: &Arc<App>,
+    gov: &crate::governance::GovCtx,
+    ingress_protocol: &str,
+    pool: &str,
+    started: Instant,
+    charged_at: u64,
+    resp: Response,
+    charged: bool,
+) -> Response {
+    finish_inner(
+        app,
+        gov,
+        ingress_protocol,
+        pool,
+        started,
+        charged_at,
+        resp,
+        charged,
     )
 }
 
@@ -1038,11 +1082,13 @@ pub(crate) async fn named(
     let charged_at = crate::store::now();
 
     // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
-    // inside `governance_guard` (this handler just returns that response).
-    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &name, started, charged_at).await
+    // inside `governance_guard` (this handler just returns that response). On admission it reports
+    // whether the flat fee was CHARGED, so the post-admission finish only refunds when it landed.
+    let charged = match governance_guard(&app, &gov, "anthropic", &name, started, charged_at).await
     {
-        return resp;
-    }
+        Err(resp) => return resp,
+        Ok(charged) => charged,
+    };
 
     if let Some(cands) = app.pools.get(&name) {
         let affinity_key = headers
@@ -1063,7 +1109,16 @@ pub(crate) async fn named(
             usage_sink(&app, &gov, charged_at),
         )
         .await;
-        return finish(&app, &gov, "anthropic", &name, started, charged_at, resp);
+        return finish_admitted(
+            &app,
+            &gov,
+            "anthropic",
+            &name,
+            started,
+            charged_at,
+            resp,
+            charged,
+        );
     }
     if let Some(&i) = app.by_model.get(&name) {
         // Model-based routing: anthropic ingress, lane-default breaker OperationHandler (empty pool name → the
@@ -1086,7 +1141,16 @@ pub(crate) async fn named(
             usage_sink(&app, &gov, charged_at),
         )
         .await;
-        return finish(&app, &gov, "anthropic", &name, started, charged_at, resp);
+        return finish_admitted(
+            &app,
+            &gov,
+            "anthropic",
+            &name,
+            started,
+            charged_at,
+            resp,
+            charged,
+        );
     }
 
     // Model/pool miss: wrap the 404 in `finish` so it is still counted in REQUESTS_TOTAL /
@@ -1095,7 +1159,7 @@ pub(crate) async fn named(
     // Both maps missed, so `name` is an unresolved, client-supplied URL segment — stamp the bounded
     // sentinel as the `pool` label (metrics.rs), never the raw segment (unbounded-cardinality
     // DoS). `pool_label` returns `"unresolved"` here by construction.
-    finish(
+    finish_admitted(
         &app,
         &gov,
         "anthropic",
@@ -1109,6 +1173,7 @@ pub(crate) async fn named(
             // Anthropic ingress: canonical (non-gemini) model-not-found copy.
             &not_found_message(&name, None),
         ),
+        charged,
     )
 }
 
@@ -1139,11 +1204,13 @@ pub(crate) async fn adhoc(
     let charged_at = crate::store::now();
 
     // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
-    // inside `governance_guard` (this handler just returns that response).
-    if let Some(resp) = governance_guard(&app, &gov, "anthropic", &model, started, charged_at).await
+    // inside `governance_guard` (this handler just returns that response). `charged` gates the
+    // post-admission refund so an un-charged (store-error-Allow) admit never blind-refunds.
+    let charged = match governance_guard(&app, &gov, "anthropic", &model, started, charged_at).await
     {
-        return resp;
-    }
+        Err(resp) => return resp,
+        Ok(charged) => charged,
+    };
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {
@@ -1167,7 +1234,16 @@ pub(crate) async fn adhoc(
                 usage_sink(&app, &gov, charged_at),
             )
             .await;
-            finish(&app, &gov, "anthropic", &model, started, charged_at, resp)
+            finish_admitted(
+                &app,
+                &gov,
+                "anthropic",
+                &model,
+                started,
+                charged_at,
+                resp,
+                charged,
+            )
         }
         // Provider mismatch / model miss: wrap the 4xx in `finish` so the client error is counted
         // in REQUESTS_TOTAL / REQUEST_DURATION_SECONDS and fires the request-log webhook, matching
@@ -1183,7 +1259,7 @@ pub(crate) async fn adhoc(
             );
             // The model IS a configured by-model lane (bounded), but route the label through
             // `pool_label` for uniformity with the other ingress paths; it returns `model` here.
-            finish(
+            finish_admitted(
                 &app,
                 &gov,
                 "anthropic",
@@ -1197,11 +1273,12 @@ pub(crate) async fn adhoc(
                     // Anthropic ingress: canonical (non-gemini) model-not-found copy.
                     &not_found_message(&model, None),
                 ),
+                charged,
             )
         }
         // Model miss: `model` is an unresolved, client-supplied string — stamp the bounded sentinel
         // as the `pool` label (metrics.rs). `pool_label` returns `"unresolved"` here.
-        None => finish(
+        None => finish_admitted(
             &app,
             &gov,
             "anthropic",
@@ -1215,6 +1292,7 @@ pub(crate) async fn adhoc(
                 // Anthropic ingress: canonical (non-gemini) model-not-found copy.
                 &not_found_message(&model, None),
             ),
+            charged,
         ),
     }
 }
@@ -1700,11 +1778,11 @@ mod tests {
         // Gate keyed off the (past) `charged_at` window sees spend ≥ cap → reject.
         let rejected = budget_check(&app, &govctx, "openai", past_day).await;
         assert!(
-            rejected.is_some(),
+            rejected.is_err(),
             "budget_check must reject against the charged_at window where the spend lives (#29)"
         );
         assert_eq!(
-            rejected.unwrap().status(),
+            rejected.unwrap_err().status(),
             StatusCode::TOO_MANY_REQUESTS,
             "over-budget on an OpenAI ingress maps to 429"
         );
@@ -1713,7 +1791,7 @@ mod tests {
         // would have WRONGLY admitted. This proves the bug was real and the pin fixes it.
         let admitted_today = budget_check(&app, &govctx, "openai", crate::store::now()).await;
         assert!(
-            admitted_today.is_none(),
+            admitted_today.is_ok(),
             "today's window is empty; the old clock-based gate would have admitted here"
         );
     }
@@ -1803,7 +1881,9 @@ mod tests {
         use crate::governance::{GovState, SqliteStore};
         crate::metrics::init();
 
-        // allow (default): store error → proceed (budget_check returns None).
+        // allow (default): store error → PROCEED, but reporting `Ok(false)` = admitted WITHOUT a
+        // charge, so a later non-2xx must NOT refund (the c2r1 fix; a blind refund would erode
+        // another request's spend).
         let store = Arc::new(ErrChargeStore(SqliteStore::open_in_memory().unwrap()));
         let gov = Arc::new(
             GovState::new(store, 1, 0, None)
@@ -1812,10 +1892,11 @@ mod tests {
         );
         let (app, govctx) = govctx_for(&gov);
         assert!(
-            budget_check(&app, &govctx, "openai", 1_700_000_000)
-                .await
-                .is_none(),
-            "allow fail-mode must PROCEED on a store error"
+            matches!(
+                budget_check(&app, &govctx, "openai", 1_700_000_000).await,
+                Ok(false)
+            ),
+            "allow fail-mode must PROCEED WITHOUT charge (Ok(false)) on a store error"
         );
 
         // deny: same store error → reject (429 on openai).
@@ -1828,10 +1909,13 @@ mod tests {
         let (app, govctx) = govctx_for(&gov);
         let rejected = budget_check(&app, &govctx, "openai", 1_700_000_000).await;
         assert!(
-            rejected.is_some(),
+            rejected.is_err(),
             "deny fail-mode must REJECT on a store error"
         );
-        assert_eq!(rejected.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rejected.unwrap_err().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     // ---- universal-ingress routing tests (cohere/responses/gemini/bedrock) ----
@@ -4361,7 +4445,7 @@ mod tests {
             key: Some(key.clone()),
         };
 
-        // Request a pool the key is NOT allowed on → 403, and the guard returns Some(response).
+        // Request a pool the key is NOT allowed on → 403, and the guard returns Err(response).
         let rejected = governance_guard(
             &app,
             &gov,
@@ -4371,7 +4455,7 @@ mod tests {
             crate::store::now(),
         )
         .await
-        .expect("a disallowed pool must be rejected by the governance guard");
+        .expect_err("a disallowed pool must be rejected by the governance guard");
         assert_eq!(
             rejected.status(),
             StatusCode::FORBIDDEN,
@@ -4420,8 +4504,52 @@ mod tests {
         )
         .await;
         assert!(
-            passed.is_none(),
-            "an allowed, in-budget, in-rate request is not rejected"
+            matches!(passed, Ok(true)),
+            "an allowed, in-budget, in-rate request is admitted AND charged (Ok(true))"
+        );
+    }
+
+    /// REGRESSION (audit c2r1): a request ADMITTED WITHOUT a charge (store-error fail-open) that then
+    /// gets a non-2xx must NOT refund — `refund_request` is a blind decrement that would erode a
+    /// DIFFERENT, legitimately-charged request's spend/count in the same window. `finish_admitted`
+    /// gates the refund on the `charged` flag from `governance_guard`.
+    #[tokio::test]
+    async fn finish_admitted_does_not_refund_an_uncharged_admit() {
+        crate::metrics::init();
+        let (app, key) = governed_app_pool_restricted();
+        let gov = crate::governance::GovCtx {
+            key: Some(key.clone()),
+        };
+        let at = 1_700_000_000;
+        // A PRIOR legitimate request charges the flat fee (price=30) into this window.
+        let g = app.governance.as_ref().unwrap();
+        assert!(matches!(
+            g.try_charge_request_within_budget(&key, at).await,
+            Ok(true)
+        ));
+        let charged_spend = key_spend(&app, &key.id);
+        assert_eq!(charged_spend, 30, "prior request charged the flat fee");
+
+        // A SECOND request admitted WITHOUT charge (charged=false) then fails (non-2xx). The refund
+        // path must never even be entered (`refund_on_non_2xx` is false), so the first request's
+        // spend is DETERMINISTICALLY untouched — no blind decrement. (The positive charged=true
+        // refund is offloaded/async and is covered by the flat-fee refund tests.)
+        let non2xx = (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+        let out = finish_admitted(
+            &app,
+            &gov,
+            "openai",
+            "allowed-only",
+            Instant::now(),
+            at,
+            non2xx,
+            false,
+        );
+        assert_eq!(out.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            key_spend(&app, &key.id),
+            30,
+            "an uncharged admit must not refund — the prior request's spend is untouched"
         );
     }
 
@@ -4461,7 +4589,7 @@ mod tests {
         };
         let resp = budget_check(&app2, &gov2, "openai", crate::store::now())
             .await
-            .expect("zero-budget key ⇒ over-budget response");
+            .expect_err("zero-budget key ⇒ over-budget response");
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = body_string(resp).await;
         assert_leak_free(&body, &key2.id, "any-pool");
@@ -4474,7 +4602,7 @@ mod tests {
         };
         let resp = budget_check(&app2b, &gov2b, "bedrock", crate::store::now())
             .await
-            .expect("zero-budget key ⇒ over-budget response (bedrock)");
+            .expect_err("zero-budget key ⇒ over-budget response (bedrock)");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_string(resp).await;
         assert!(
