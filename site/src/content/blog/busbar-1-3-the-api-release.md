@@ -86,7 +86,8 @@ lanes were misbehaving.
 ## Still one binary
 
 Everything above ships in the same single static Rust binary. We roughly doubled the surface (hooks,
-auth chains, the whole config plane) and the `FROM scratch` Docker image is still about 5 MB. The
+auth chains, the whole config plane) and the `FROM scratch` Docker image is still a handful of
+megabytes, compressed. The
 default path, with no hooks and no chains configured, is byte-identical to 1.2; the zero-cost floor
 is a design rule, not an accident. Over 2,000 tests, the full suite green with every plugin compiled
 out, on Linux, macOS, and Windows.

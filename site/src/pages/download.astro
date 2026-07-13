@@ -17,6 +17,19 @@ const REL = `${GITHUB}/releases/latest/download`;
 const YEAR = new Date().getFullYear();
 const version = release.version || '';
 
+// Docker Hub pull count, fetched ONCE at build time (no client JS, no CORS, no layout shift) and
+// baked into the page — refreshes on every rebuild/deploy. Fail-safe: any error leaves it null and
+// the badge simply doesn't render, so a Docker Hub hiccup never breaks the build.
+let dockerPulls: number | null = null;
+try {
+  const res = await fetch('https://hub.docker.com/v2/repositories/getbusbar/busbar/');
+  if (res.ok) {
+    const n = (await res.json())?.pull_count;
+    if (typeof n === 'number' && n > 0) dockerPulls = n;
+  }
+} catch { /* offline / rate-limited build → no badge */ }
+const dockerPullsLabel = dockerPulls != null ? dockerPulls.toLocaleString('en-US') : null;
+
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
 const SOFTWARE = { '@context': 'https://schema.org', '@type': 'SoftwareApplication', name: 'Busbar', applicationCategory: 'DeveloperApplication', operatingSystem: 'Linux, macOS, Windows', offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' }, url: 'https://getbusbar.com', description: 'The reliability and fidelity layer for multi-model AI traffic, lossless cross-protocol translation, fault-aware circuit breaking, and in-flight failover in one static Rust binary.' };
@@ -90,10 +103,16 @@ const groups = [
 
       <!-- Docker -->
       <section class="dl-install">
-        <a class="dl-install-tag dl-tag-link" href="https://hub.docker.com/r/getbusbar/busbar">
-          <img src={dockerMark.src} alt="" width="15" height="15" />
-          Docker · multi-arch (amd64 + arm64)
-        </a>
+        <div class="dl-tag-row">
+          <a class="dl-install-tag dl-tag-link" href="https://hub.docker.com/r/getbusbar/busbar">
+            <img src={dockerMark.src} alt="" width="15" height="15" />
+            Docker · multi-arch (amd64 + arm64)
+          </a>
+          {dockerPullsLabel && (
+            <a class="dl-pulls" href="https://hub.docker.com/r/getbusbar/busbar"
+               title="Docker Hub pulls">{dockerPullsLabel} pulls</a>
+          )}
+        </div>
         <div class="dl-cmd">
           <code>docker pull getbusbar/busbar</code>
           <button class="dl-copy" data-copy="docker pull getbusbar/busbar" aria-label="Copy docker pull command">Copy</button>
@@ -271,6 +290,18 @@ const groups = [
         display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
         text-transform: uppercase; color: #4d7c0f; margin-bottom: 12px;
       }
+      /* Header row: the docker tag on the left, the live pull count right-aligned on the same line.
+         The tag keeps its own margin-bottom, so the row needs none. */
+      .dl-tag-row {
+        display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+      }
+      .dl-tag-row .dl-install-tag { margin-bottom: 12px; }
+      .dl-pulls {
+        margin-left: auto; flex: none; font-size: 10.5px; font-weight: 700;
+        letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+        text-decoration: none; white-space: nowrap;
+      }
+      .dl-pulls:hover { color: var(--slate); }
       .dl-tag-link {
         display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
       }
