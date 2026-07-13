@@ -715,6 +715,22 @@ fn admin_scope_for(
 
 /// A 403 in the frozen admin error envelope (`{"error":{"code":"forbidden","message":…}}`),
 /// naming the scope that WOULD have sufficed — never any other principal's data.
+/// A 401 in the frozen admin error envelope — no/invalid admin credential. The admin plane's
+/// most-frequent error must carry the SAME `{error:{code,message}}` shape tooling branches on
+/// (3rd-party audit #9); the data plane keeps vendor-native 401 shaping (`unauthorized_response`).
+fn admin_unauthorized_response() -> Response {
+    let e = crate::admin::v1::contract::AdminError::Unauthorized;
+    let body = serde_json::json!({
+        "error": { "code": e.code(), "message": e.message() }
+    })
+    .to_string();
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static unauthorized response")
+}
+
 fn forbidden_response(needed: crate::admin::v1::contract::Scope) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -842,7 +858,11 @@ pub(crate) async fn auth_middleware(
             // The explicit `admin_auth: []` OPEN posture (dev): anonymous, full authority —
             // symmetric with the data plane's empty chain. The default config never lands here.
             ChainVerdict::Open => None,
-            ChainVerdict::Denied => return Err(unauthorized_response(&path)),
+            // The ADMIN plane 401 speaks the frozen v1 envelope ({error:{code:"unauthorized"}}) —
+            // the most frequent error a tooling consumer hits (setup/rotation) must branch on the
+            // SAME `code` seam as every other admin error, never a protocol-shaped body (the
+            // vendor-native shaping below is for the DATA plane, whose SDKs must parse it).
+            ChainVerdict::Denied => return Err(admin_unauthorized_response()),
         };
         // AUTHORIZATION: resolve the principal's admin scope (module-intrinsic for the operator
         // token; `group_map:` for group-carrying principals — most permissive wins, unmapped

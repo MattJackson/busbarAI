@@ -1241,6 +1241,30 @@ mod tests {
         assert!(m["inflight"].is_number());
         assert!(m["ok"].is_number());
         assert!(m["dead"].is_boolean());
+        // Trip observability (audit #5): a MONOTONIC trip counter + last-trip epoch, so a poller
+        // detects transient breaker episodes it can never catch live. Fresh lane: 0 / null.
+        assert_eq!(m["trip_count"], 0);
+        assert!(m["last_trip_at"].is_null());
+
+        // ?detail=true on the COLLECTION returns the same row shape for every pool in ONE call
+        // (audit #7 — no more M+1 dashboard fan-out).
+        let detailed: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/admin/pools?detail=true"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = detailed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "mypool");
+        assert_eq!(
+            items[0]["members"][0]["usable"], true,
+            "detail rows carry the live status inline: {detailed}"
+        );
+        assert_eq!(items[0]["members"][0]["trip_count"], 0);
 
         // Unknown pool → 404 not_found.
         let missing = client
@@ -3121,6 +3145,35 @@ providers: {}
             .unwrap();
         assert_eq!(one.status().as_u16(), 200);
 
+        // A RESERVED name (an on_error terminal / built-in) rejects on the register path too —
+        // previously only boot validation checked this, so a runtime hook named `reject` could
+        // shadow the terminal and make every consumer's on_error parse ambiguous (audit #8).
+        for reserved in ["reject", "weighted", "nothing", "cheapest", "admin-tokens"] {
+            let shadow = client
+                .post(format!("http://{addr}/api/v1/admin/hooks"))
+                .header("x-admin-token", "admintok")
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "name": reserved,
+                        "config": {"kind": "gate", "webhook": "http://127.0.0.1:9977/"}
+                    })
+                    .to_string(),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                shadow.status().as_u16(),
+                400,
+                "hook name `{reserved}` is reserved and must reject"
+            );
+            assert_eq!(
+                shadow.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+                "invalid_request"
+            );
+        }
+
         // Invalid definition (prompt:rw on a tap) → 400 invalid_request, no mutation.
         let bad = client
             .post(format!("http://{addr}/api/v1/admin/hooks"))
@@ -4273,7 +4326,9 @@ providers: {}
 
         for (rel, _) in crate::admin::v1::json::V1_GET_PATHS {
             let path = format!("{}{rel}", crate::admin::v1::contract::ADMIN_PREFIX);
-            // No token → 401.
+            // No token → 401, in the FROZEN v1 envelope (code `unauthorized`) — the most frequent
+            // error a tooling consumer hits must branch on the same code seam as every other
+            // (3rd-party audit #9; previously a protocol-shaped body).
             let none = client
                 .get(format!("http://{addr}{path}"))
                 .send()
@@ -4283,6 +4338,11 @@ providers: {}
                 none.status().as_u16(),
                 401,
                 "{path} must reject a request with NO admin token"
+            );
+            let body: serde_json::Value = none.json().await.unwrap();
+            assert_eq!(
+                body["error"]["code"], "unauthorized",
+                "{path}: the admin 401 speaks the v1 envelope: {body}"
             );
             // Wrong token → 401.
             let wrong = client

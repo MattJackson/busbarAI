@@ -268,8 +268,16 @@ async fn info(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).info().await)
 }
 
-/// `GET /api/v1/admin/pools` — pool topology read.
-async fn list_pools(State(handle): State<Arc<AppHandle>>) -> Response {
+/// `GET /api/v1/admin/pools` — pool topology read. `?detail=true` inlines each member's LIVE status
+/// (same row shape as `GET /pools/{name}`) so a dashboard reads the whole topology-with-health in
+/// ONE call instead of an M+1 fan-out (audit #7).
+async fn list_pools(
+    State(handle): State<Arc<AppHandle>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if q.get("detail").map(String::as_str) == Some("true") {
+        return respond(StatusCode::OK, service(&handle).list_pools_detailed().await);
+    }
     respond(StatusCode::OK, service(&handle).list_pools().await)
 }
 
@@ -1341,7 +1349,10 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
         "/info",
         "Version, compiled-in plugin proof, uptime, topology",
     ),
-    ("/pools", "Pool topology (members + weights)"),
+    (
+        "/pools",
+        "Pool topology (members + weights). ?detail=true inlines live member status (one call, no N+1)",
+    ),
     ("/models", "Model lanes + upstream providers"),
     ("/providers", "Distinct providers + lane counts"),
     ("/hooks", "Hook registry (definitions)"),
@@ -1820,7 +1831,7 @@ fn openapi_doc() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "code": {"type": "string",
-                                    "enum": ["not_found", "forbidden", "invalid_request",
+                                    "enum": ["not_found", "unauthorized", "forbidden", "invalid_request",
                                              "conflict", "rate_limited", "internal"]},
                                 "message": {"type": "string"}
                             },
@@ -2013,6 +2024,7 @@ mod tests {
         // The exhaustive set of AdminError codes — kept in lock-step with `AdminError::code`.
         let actual_codes: BTreeSet<String> = [
             AdminError::NotFound(String::new()),
+            AdminError::Unauthorized,
             AdminError::Forbidden {
                 needed: crate::admin::v1::contract::Scope::Full,
             },

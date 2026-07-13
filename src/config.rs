@@ -712,6 +712,30 @@ pub(crate) fn on_error_terminal(name: &str) -> Option<PolicyOnError> {
     }
 }
 
+/// Names a hook may NOT take, enforced on EVERY hook-write path (boot validation, config apply, and
+/// the runtime register/PUT API). Two reasons, one rule:
+/// - REGISTRY UNIQUENESS: the native ranking strategies + built-in auth modules already answer to
+///   their names — two things can't answer to one name.
+/// - UNION DISAMBIGUATION (3rd-party audit #8): `on_error` is a string union of "reserved terminal"
+///   vs "fallback hook name". Reserving EVERY terminal word (`weighted`/`reject`/`first`/`nothing`)
+///   as an illegal hook name makes the union closed and unambiguous for machine consumers: a value
+///   in this set is a terminal; anything else is a hook reference — no hook can ever collide.
+pub(crate) const RESERVED_HOOK_NAMES: &[&str] = &[
+    // on_error terminals (see ON_ERROR_*) — includes `weighted`, which is ALSO the native floor.
+    ON_ERROR_WEIGHTED,
+    ON_ERROR_REJECT,
+    ON_ERROR_FIRST,
+    ON_ERROR_NOTHING,
+    // native ranking strategies (PoolPolicy::native_name)
+    "cheapest",
+    "fastest",
+    "least_busy",
+    "usage",
+    // built-in auth modules (AuthModule::name)
+    "tokens",
+    "admin-tokens",
+];
+
 /// The serde default for `admin_auth:` — the built-in `admin-tokens` module (the single operator
 /// admin token; byte-identical to the pre-chain behavior).
 fn default_admin_auth() -> Vec<String> {

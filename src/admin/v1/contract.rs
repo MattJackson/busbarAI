@@ -117,6 +117,9 @@ pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
 pub(crate) enum AdminError {
     /// The named resource does not exist. `code = not_found`.
     NotFound(String),
+    /// No/invalid admin credential (the auth middleware could not authenticate the caller).
+    /// `code = unauthorized`. Distinct from `forbidden` (authenticated but under-scoped).
+    Unauthorized,
     /// The principal's scope is insufficient for the endpoint. `code = forbidden`. Carries the scope
     /// that WOULD have sufficed, for a precise client message (never leaks other principals' data).
     Forbidden { needed: Scope },
@@ -138,6 +141,7 @@ impl AdminError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             AdminError::NotFound(_) => "not_found",
+            AdminError::Unauthorized => "unauthorized",
             AdminError::Forbidden { .. } => "forbidden",
             AdminError::Validation(_) => "invalid_request",
             AdminError::Conflict(_) => "conflict",
@@ -150,6 +154,7 @@ impl AdminError {
     pub(crate) fn http_status(&self) -> u16 {
         match self {
             AdminError::NotFound(_) => 404,
+            AdminError::Unauthorized => 401,
             AdminError::Forbidden { .. } => 403,
             AdminError::Validation(_) => 400,
             AdminError::Conflict(_) => 409,
@@ -162,6 +167,9 @@ impl AdminError {
     pub(crate) fn message(&self) -> String {
         match self {
             AdminError::NotFound(what) => format!("{what} not found"),
+            AdminError::Unauthorized => {
+                "missing or invalid admin credential (Bearer or x-admin-token)".to_string()
+            }
             AdminError::Forbidden { needed } => {
                 format!(
                     "insufficient scope: this endpoint requires `{}`",
@@ -189,6 +197,10 @@ pub(crate) struct InfoView {
     pub(crate) build: BuildInfo,
     /// Seconds since process start, or `None` if the start instant was never stamped.
     pub(crate) uptime_seconds: Option<u64>,
+    /// Epoch seconds of process start — the BOOT EPOCH marker: `config_version` (and any
+    /// process-local counter) resets on restart, so a consumer that sees `started_at` change knows
+    /// to read a counter reset as "new epoch", never as "reverted" (audit minor #2 / #4).
+    pub(crate) started_at: Option<u64>,
     pub(crate) topology: TopologyInfo,
     /// Whether config-overlay persistence is enabled (`BUSBAR_CONFIG_OVERLAY` set): `true` = API-applied
     /// config changes are durable across restarts; `false` = live-only (lost on restart). Lets tooling
@@ -268,6 +280,13 @@ pub(crate) struct PoolMemberStatusView {
     pub(crate) err: u64,
     /// Whether the lane is hard-down/dead (distinct from a transiently-tripped breaker).
     pub(crate) dead: bool,
+    /// MONOTONIC count of Closed→Open breaker trips on this lane. Breaker episodes are transient
+    /// and can open+close entirely between two polls — a consumer alerting on trips diffs this
+    /// count instead of trying to catch the live edge (audit #5). Carried across config apply and
+    /// restart with the rest of the learned health.
+    pub(crate) trip_count: u64,
+    /// Epoch seconds of the most recent trip; `None` = never tripped.
+    pub(crate) last_trip_at: Option<u64>,
 }
 
 /// A model lane in the topology read (`GET /api/v1/admin/models`): the config key + its upstream
@@ -304,8 +323,11 @@ pub(crate) struct HookView {
     pub(crate) priority: u16,
     /// TAP observation stage (`"request"`/`"route"`/`"attempt"`/`"completion"`), or `None` for a gate.
     pub(crate) at: Option<&'static str>,
-    /// Gate fallback on timeout/error — a reserved terminal (`"weighted"` | `"reject"` |
-    /// `"first"`) or the NAME of the fallback hook the chain continues through.
+    /// Gate fallback on timeout/error — a CLOSED, unambiguous string union (audit #8): one of the
+    /// reserved terminals (`"weighted"` | `"reject"` | `"first"` | `"nothing"`) or the NAME of the
+    /// fallback hook the chain continues through. Unambiguous by construction: the terminal words
+    /// are ILLEGAL hook names on every write path (`config::RESERVED_HOOK_NAMES`), so a value in
+    /// the terminal set is always a terminal and anything else is always a hook reference.
     pub(crate) on_error: String,
     /// Gate decision deadline in milliseconds.
     pub(crate) timeout_ms: u64,

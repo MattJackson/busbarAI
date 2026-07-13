@@ -51,11 +51,15 @@ fn derive_spend_micros(b: &UsageBreakdown, (per_request_cents, per_1k_cents): (i
 /// A missing value (never stamped — e.g. a unit test that skips `main`) yields a `None` uptime
 /// rather than a panic.
 static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// Process start EPOCH (unix seconds) — `info.started_at`, the boot-epoch marker consumers use to
+/// detect that process-local counters (config_version, breaker trip counts) reset.
+static PROCESS_START_EPOCH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
-/// Stamp the process start instant for the `info` uptime read. Idempotent (first `set` wins), so it
-/// is safe to call unconditionally at startup.
+/// Stamp the process start instant + epoch for the `info` reads. Idempotent (first `set` wins), so
+/// it is safe to call unconditionally at startup.
 pub(crate) fn mark_start() {
     let _ = PROCESS_START.set(std::time::Instant::now());
+    let _ = PROCESS_START_EPOCH.set(crate::store::now());
 }
 
 /// The auth modules COMPILED INTO this binary (feature-gated at compile time — real `#[cfg]` on each
@@ -171,6 +175,16 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
         return Err(AdminError::Validation(format!(
             "hook name is {} chars; must be <= {MAX_HOOK_NAME_LEN}",
             name.len()
+        )));
+    }
+    // Reserved names — the SAME rule boot validation enforces (config::RESERVED_HOOK_NAMES): a
+    // runtime-registered hook can neither shadow a built-in nor collide with an `on_error` terminal
+    // word (which would make the on_error string union ambiguous for every consumer). Previously
+    // only the boot/apply path checked this — the register API was the one write path missing it.
+    if crate::config::RESERVED_HOOK_NAMES.contains(&name) {
+        return Err(AdminError::Validation(format!(
+            "hook name `{name}` is reserved (a built-in ranking strategy, auth module, or on_error \
+             terminal); pick another name"
         )));
     }
     // The `settings` map rides register/PUT too — cap it here so it is bounded on EVERY write path,
@@ -413,6 +427,7 @@ impl AdminService {
                 weighted_floor: true,
             },
             uptime_seconds: PROCESS_START.get().map(|s| s.elapsed().as_secs()),
+            started_at: PROCESS_START_EPOCH.get().copied(),
             topology: TopologyInfo {
                 pools: self.app.pools.len(),
                 models: self.app.by_model.len(),
@@ -456,6 +471,12 @@ impl AdminService {
             .pools
             .get(name)
             .ok_or_else(|| AdminError::NotFound(format!("pool `{name}`")))?;
+        Ok(self.pool_detail(name, members))
+    }
+
+    /// Project one pool's LIVE member status — the shared core of `GET /pools/{name}` and
+    /// `GET /pools?detail=true` (one projection, two readers — the shapes can never diverge).
+    fn pool_detail(&self, name: &str, members: &[crate::state::WeightedLane]) -> PoolDetailView {
         let now = crate::store::now();
         let members = members
             .iter()
@@ -474,13 +495,29 @@ impl AdminService {
                     ok: snap.ok,
                     err: snap.err,
                     dead: snap.dead,
+                    trip_count: snap.trips,
+                    last_trip_at: (snap.last_trip_at > 0).then_some(snap.last_trip_at),
                 }
             })
             .collect();
-        Ok(PoolDetailView {
+        PoolDetailView {
             name: name.to_string(),
             members,
-        })
+        }
+    }
+
+    /// `GET /api/v1/admin/pools?detail=true` — the WHOLE topology with live member status in ONE
+    /// call (audit #7: the summary + per-pool detail split forced an M+1 fan-out per dashboard
+    /// refresh). Same row shape as `GET /pools/{name}` via the shared projection. Sorted by name.
+    pub(crate) async fn list_pools_detailed(&self) -> Result<Page<PoolDetailView>, AdminError> {
+        let mut pools: Vec<PoolDetailView> = self
+            .app
+            .pools
+            .iter()
+            .map(|(name, members)| self.pool_detail(name, members))
+            .collect();
+        pools.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Page::single(pools))
     }
 
     /// `GET /api/v1/admin/models` — every model lane + its upstream provider. Read scope. Sorted by

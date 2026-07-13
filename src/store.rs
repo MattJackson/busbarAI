@@ -158,6 +158,10 @@ pub(crate) struct LaneSnapshot {
     pub(crate) cooldown_remaining_s: u64,
     pub(crate) streak: u32,
     pub(crate) budget: i64,
+    /// Monotonic Closed→Open trip count + the most recent trip's epoch (0 = never) — the
+    /// poll-safe "did a trip happen since I last looked" signal (audit #5).
+    pub(crate) trips: u64,
+    pub(crate) last_trip_at: u64,
 }
 
 /// StateStore trait - the seam for lane state access.
@@ -192,6 +196,12 @@ pub(crate) struct LaneHealthSnapshot {
     pub(crate) client_fault: u64,
     /// Latency EWMA (raw f64 bits; 0 = no sample).
     pub(crate) latency_ewma_bits: u64,
+    /// Monotonic Closed→Open trip count + last-trip epoch (0 = never) — learned reliability, so it
+    /// carries across apply/restart like ok/err. `serde(default)` reads pre-1.3 persisted snapshots.
+    #[serde(default)]
+    pub(crate) trips: u64,
+    #[serde(default)]
+    pub(crate) last_trip_at: u64,
     /// Per-(pool) breaker cells for this lane.
     pub(crate) cells: Vec<PoolCellHealthSnapshot>,
 }
@@ -592,6 +602,9 @@ impl InMemoryStore {
                 .store(snap.client_fault, Ordering::Relaxed);
             lane.latency_ewma_bits
                 .store(snap.latency_ewma_bits, Ordering::Relaxed);
+            lane.trips.store(snap.trips, Ordering::Relaxed);
+            lane.last_trip_at
+                .store(snap.last_trip_at, Ordering::Relaxed);
             let mut map = self.pool_cells.write().unwrap_or_else(|e| e.into_inner());
             let cells = map.entry(idx).or_default();
             for cs in &snap.cells {
@@ -810,6 +823,14 @@ struct LaneState {
     // breaker cell), so it lives on `LaneState`, not on `BreakerCell`. Read by the `fastest` policy
     // via `lane_latency_ms`; updated after each request completes via `record_latency_in`.
     latency_ewma_bits: AtomicU64,
+    // MONOTONIC count of genuine Closed→Open breaker trips on this lane (any cell) + the epoch of
+    // the most recent one (0 = never). Breaker open→close is transient — a poll-only consumer can
+    // miss the whole episode between two polls; a monotonic count + last-trip timestamp let it
+    // detect "a trip happened since I last looked" without catching the live edge (3rd-party audit
+    // #5). Lane-global (like ok/err): a trip in ANY pool cell counts. Carried across config apply /
+    // restart with the rest of the learned health.
+    trips: AtomicU64,
+    last_trip_at: AtomicU64,
 }
 
 /// Smoothing factor (α) for the per-lane latency EWMA: `ewma = α·sample + (1-α)·ewma`. A smaller α
@@ -870,6 +891,8 @@ impl InMemoryStore {
                     transition_lock: std::sync::Mutex::new(()),
                     // `0` bits == "no latency sample yet" (see `latency_ewma_bits`).
                     latency_ewma_bits: AtomicU64::new(0),
+                    trips: AtomicU64::new(0),
+                    last_trip_at: AtomicU64::new(0),
                 })
             })
             .collect();
@@ -1918,6 +1941,13 @@ impl InMemoryStore {
         if !pool.is_empty() {
             self.get_lane(lane).err.fetch_add(1, Ordering::Relaxed);
         }
+        // Genuine Closed→Open trip: bump the lane's MONOTONIC trip counter + stamp the epoch, at
+        // the same seam that mints BREAKER_TRIPS_TOTAL — one logical trip, counted once (audit #5).
+        if tripped {
+            let ls = self.get_lane(lane);
+            ls.trips.fetch_add(1, Ordering::Relaxed);
+            ls.last_trip_at.store(now_time, Ordering::Relaxed);
+        }
         tripped
     }
 
@@ -2509,6 +2539,8 @@ impl StateStore for InMemoryStore {
             } else {
                 -1
             },
+            trips: ls.trips.load(Ordering::Relaxed),
+            last_trip_at: ls.last_trip_at.load(Ordering::Relaxed),
         }
     }
 
@@ -2537,6 +2569,8 @@ impl StateStore for InMemoryStore {
                 err: ls.err.load(Ordering::Relaxed),
                 client_fault: ls.client_fault.load(Ordering::Relaxed),
                 latency_ewma_bits: ls.latency_ewma_bits.load(Ordering::Relaxed),
+                trips: ls.trips.load(Ordering::Relaxed),
+                last_trip_at: ls.last_trip_at.load(Ordering::Relaxed),
                 cells: {
                     let map = self.pool_cells.read().unwrap_or_else(|e| e.into_inner());
                     map.get(&idx)

@@ -728,31 +728,15 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         }
     }
 
-    // Rule (hooks/reserved-names): a hook in ANY layer (base config, and — once the admin API can
-    // register hooks — the overlay) may NOT reuse a name that a compiled-in built-in already answers
-    // to. This is REGISTRY NAME UNIQUENESS, not a privileged-word list: `weighted`/`cheapest`/… are
-    // the native ranking strategies (becoming named registry hooks), and `tokens`/`admin-tokens` are
-    // the built-in auth modules. Two things can't answer to one name — which one would `on_error:
-    // weighted` or an `auth:`/`default hook` reference resolve to? A collision is a boot error naming
-    // the offender. Closing this before scope enforcement / `on_error`-as-string makes the shadowing
-    // path reachable. (`weighted` reserved even though it constructs no object today: it is still the
-    // name the default routing floor answers to.)
-    const RESERVED_HOOK_NAMES: &[&str] = &[
-        // native ranking strategies (PoolPolicy::native_name + the always-present `weighted` floor)
-        "weighted",
-        "cheapest",
-        "fastest",
-        "least_busy",
-        "usage",
-        // built-in auth modules (AuthModule::name)
-        "tokens",
-        "admin-tokens",
-    ];
+    // Rule (hooks/reserved-names): a hook in ANY layer (base config, overlay, or the runtime
+    // register API — all three write paths share `config::RESERVED_HOOK_NAMES`) may NOT take a name
+    // a built-in answers to or an `on_error` terminal word. Registry uniqueness + the closed
+    // `on_error` string union (see the const's doc). A collision is a boot error naming the offender.
     for hook_name in cfg.hooks.keys() {
-        if RESERVED_HOOK_NAMES.contains(&hook_name.as_str()) {
+        if crate::config::RESERVED_HOOK_NAMES.contains(&hook_name.as_str()) {
             errors.push(format!(
-                "hook '{hook_name}' uses a name reserved by a built-in (ranking strategy or auth \
-                 module); rename the hook — a runtime hook cannot shadow a compiled-in plugin's name"
+                "hook '{hook_name}' uses a reserved name (a built-in ranking strategy, auth module, \
+                 or on_error terminal); rename the hook — a hook can never shadow a reserved word"
             ));
         }
     }
