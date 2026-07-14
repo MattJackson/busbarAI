@@ -31,8 +31,8 @@ hooks:
 On each request Busbar sends the hook a `transform` message carrying the flattened prompt (`messages: [{role, text}]`). The hook compresses each message and replies with a replacement body in body form — or `{}` to abstain when the savings are not worth a body swap:
 
 ```jsonc
-// Busbar -> hook  (request.pool names the pool this request is routing through)
-{"op": "transform", "request": {"pool": "chat", "messages": [{"role": "user", "text": "…lots of whitespace…"}]}}
+// Busbar -> hook  (discriminated by the top-level key; request.pool names the routing pool)
+{"request": {"pool": "chat", "messages": [{"role": "user", "text": "…lots of whitespace…"}]}, "candidates": […], "context": {…}}
 
 // hook -> Busbar  (or "{}" to leave the request untouched)
 {"rewrite": {"messages": [{"role": "user", "content": "…collapsed…"}]}}
