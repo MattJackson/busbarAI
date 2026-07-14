@@ -35,6 +35,7 @@ fn policy_timeout(timeout_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+pub(crate) mod scrape;
 pub(crate) mod socket;
 pub(crate) mod webhook;
 pub(crate) mod wire;

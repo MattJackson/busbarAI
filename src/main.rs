@@ -1369,6 +1369,11 @@ fn base_data_router() -> Router<std::sync::Arc<state::AppHandle>> {
         .route("/stats", get(endpoints::stats))
         .route("/healthz", get(endpoints::healthz))
         .route("/metrics", get(metrics::handler))
+        // The Prometheus scrape of HOOK-reported metrics — a SEPARATE exposition from busbar's own
+        // `/metrics` so a hook can never type-conflict or shadow a first-party series. Verbatim hook
+        // metric names + an auto `hook="<name>"` label, so an external dashboard built against a hook
+        // repoints here and just works. Stale-while-revalidate; never blocks on a hook socket.
+        .route("/metrics/hooks", get(crate::hooks::scrape::handler))
         // busbar's OWN API keeps explicit routes (it is not a protocol dialect): discovery,
         // health/metrics/stats above, and the named/adhoc conveniences below.
         // OpenAI list-models: SDKs call `models.list()` first; UIs build pickers from it.

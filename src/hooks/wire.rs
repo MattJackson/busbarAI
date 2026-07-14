@@ -250,7 +250,7 @@ pub(crate) struct StatusMsg {
 /// Anti-exfiltration holds structurally: `name`/label KEYS are charset-enforced, every string
 /// (label values, `help`, `label`, `unit`) is sanitized + length-bounded, and every number must be
 /// finite — a `prompt: ro` hook cannot smuggle content into a scrape.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct HookMetric {
     /// The series name: `^[a-z][a-z0-9_]{0,63}$` (counters SHOULD end `_total`).
     pub(crate) name: String,
