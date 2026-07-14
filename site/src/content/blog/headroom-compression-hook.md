@@ -105,44 +105,51 @@ curl -s -H "x-admin-token: $TOK" \
   "as_of": "2026-07-13T17:04:11Z",
   "source": "socket",
   "metrics": [
-    // chars_saved_total, one entry per pool — same name, different labels.pool
-    {"name":"chars_saved_total","type":"counter","value":28927142,
+    // Headroom's OWN documented Prometheus names — one entry per pool, same
+    // name, different labels.pool
+    {"name":"headroom_tokens_saved_total","type":"counter","value":28927142,
      "labels":{"pool":"chat"},  "label":"Tokens saved","viz":"counter"},
-    {"name":"chars_saved_total","type":"counter","value":9044310,
+    {"name":"headroom_tokens_saved_total","type":"counter","value":9044310,
      "labels":{"pool":"batch"}, "label":"Tokens saved","viz":"counter"},
 
-    {"name":"compressed_rate","type":"gauge","value":75.7,
-     "labels":{"pool":"chat"},"label":"Compressed rate","unit":"%","viz":"gauge","max":100},
+    {"name":"headroom_requests_total","type":"counter","value":382104,
+     "labels":{"pool":"chat","mode":"optimize"},"label":"Requests","viz":"counter"},
 
-    // dollars_saved is an ESTIMATE (priced off an assumed rate / holdout control),
-    // so it is marked estimated and bounded by a confidence interval
+    // compression_ratio is a NATIVE histogram: le buckets (cumulative counts),
+    // so histogram_quantile() works on the scrape — value is the sample count
+    {"name":"headroom_compression_ratio","type":"histogram","value":289012,
+     "buckets":{"0.4":41210,"0.5":198400,"0.7":270100,"0.9":289012},
+     "labels":{"pool":"chat"},"label":"Compression ratio","viz":"histogram"},
+
+    // dollars_saved is an ESTIMATE (priced off an assumed rate), so it is
+    // marked estimated and bounded by a confidence interval
     {"name":"dollars_saved","type":"gauge","value":1446.35,"estimated":true,
      "ci_low":1229.40,"ci_high":1663.30,
      "labels":{"pool":"chat"},"label":"Proxy $ saved","unit":"$","viz":"number"},
 
-    // compress latency is a DISTRIBUTION, not a mean: value is the sample count,
-    // the p50/p95/p99 ride quantiles
-    {"name":"compress_latency_us","type":"histogram","value":128401,
-     "quantiles":{"0.5":18,"0.95":54,"0.99":91},
-     "labels":{"pool":"chat"},"label":"Compress latency","unit":"us","viz":"histogram"}
+    // latency is a NATIVE histogram in seconds: le buckets, queryable with
+    // histogram_quantile() for p50/p95/p99
+    {"name":"headroom_latency_seconds","type":"histogram","value":128401,
+     "buckets":{"0.001":9200,"0.005":121400,"0.01":128401},
+     "labels":{"pool":"chat"},"label":"Compression latency","unit":"s","viz":"histogram"}
   ]
 }
 ```
 
-Three entry types earn their keep. A **counter** or **gauge** carries a scalar `value`. A **histogram** reports a distribution — `value` is the observation count and `quantiles` holds p50/p95/p99, so a slow-tail pool shows up where a mean would hide it. And any value the hook *derived* rather than measured — here the dollars saved, priced off an assumed rate the way Headroom estimates savings from a holdout control — carries `estimated: true` with a `ci_low`/`ci_high` interval, so a dashboard renders it as an estimate with error bars, not a hard fact.
+Three entry types earn their keep. A **counter** or **gauge** carries a scalar `value`. A **histogram** reports a distribution — `value` is the observation count and `buckets` are native Prometheus `le` buckets, so `histogram_quantile()` computes p50/p95/p99 on the scrape and a slow-tail pool shows up where a mean would hide it. And any value the hook *derived* rather than measured — here the dollars saved, priced off an assumed rate — carries `estimated: true` with a `ci_low`/`ci_high` interval, so a dashboard renders it as an estimate with error bars, not a hard fact.
 
 Every entry also carries display hints — `label`, `unit`, `viz`, `max` — so a dashboard renders each tile with no per-plugin code, and the hook's `describe` reply declares the matching widget layout, so **one** declaration drives both the config form and the dashboard. Busbar bounds and sanitizes everything (64 entries per reply, 8 labels per entry; a malformed entry is dropped whole, a malformed optional member individually), so a hook granted `prompt: rw` still cannot smuggle prompt content into a metric name, a label key, or a hint.
 
-The metric set mirrors what a real compression tool surfaces to its users:
+The metric set uses **Headroom's own documented Prometheus names**, so a dashboard built against Headroom lights up unchanged:
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `requests_seen_total` / `requests_compressed_total` | counter | Traffic seen vs. actually compressed. |
-| `compressed_rate` | gauge | Share of requests that cleared the savings threshold. |
-| `chars_in_total` / `chars_out_total` / `chars_saved_total` | counter | Before / after / removed — Headroom's headline "tokens saved". |
-| `compression_ratio` | gauge | Percent fewer characters across all compressed requests. |
-| `dollars_saved` | gauge (estimated + CI) | Estimated input cost saved — Headroom's "Proxy $ saved" tile. |
-| `compress_latency_us` | histogram (p50/p95/p99) | Per-request compression latency distribution. |
+| `headroom_requests_total` | counter | Requests processed (labelled by `mode`). |
+| `headroom_tokens_saved_total` | counter | Tokens saved since start — Headroom's headline "tokens saved". |
+| `headroom_persistent_savings_tokens_saved_total` | counter | Durable lifetime tokens saved. |
+| `headroom_compression_ratio` | histogram (`le` buckets) | Compressed/original distribution; `histogram_quantile()` for the median. |
+| `headroom_latency_seconds` | histogram (`le` buckets) | Per-request compression latency; `histogram_quantile()` for p50/p95/p99. |
+| `dollars_saved` | gauge (estimated + CI) | Estimated input cost saved — Headroom's "Proxy $ saved" tile (busbar extra). |
 
 Every one is reported per pool.
 
@@ -156,7 +163,9 @@ curl -s -H "x-admin-token: $TOK" \
         | {value, ci_low, ci_high}'
 ```
 
-Or poll it on an interval and let your own dashboard accumulate the time series — that is the consumer's job by design; the hook reports point-in-time state, the scraper keeps the history. And `drift` tells you at a glance whether the hook is running what you pushed: a differing settings version, or a desired key missing or changed in the observed settings, flips it to `true` (it is `null` if the hook doesn't answer), so alerting diffs one field instead of comparing maps.
+Because the hook emits Headroom's own metric names, Busbar also re-exposes them on its Prometheus scrape (`/metrics/hooks`, auto-labelled `hook="headroom"` and per pool) — so an existing Headroom Grafana dashboard flips over with no change. There's a ready-to-import one in [the hook repo](https://github.com/GetBusbar/headroom-hook/tree/main/grafana) (also [proposed upstream](https://github.com/headroomlabs-ai/headroom/pull/2168) so it becomes Headroom's own).
+
+Or poll the Admin API on an interval and let your own dashboard accumulate the time series — that is the consumer's job by design; the hook reports point-in-time state, the scraper keeps the history. And `drift` tells you at a glance whether the hook is running what you pushed: a differing settings version, or a desired key missing or changed in the observed settings, flips it to `true` (it is `null` if the hook doesn't answer), so alerting diffs one field instead of comparing maps.
 
 ## Run it
 

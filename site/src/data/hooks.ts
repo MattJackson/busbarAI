@@ -69,7 +69,7 @@ export const hooks: Hook[] = [
     prompt: rw          # the rewrite grant
     global: true        # attach to every request
     on_error: nothing   # a broken compressor never touches a request`,
-      foot: 'The hook speaks a Unix socket, so it runs on Linux and macOS (any arch). There is no native Windows build — run Busbar and the hook together inside WSL2 or a Linux container, where the socket works normally.',
+      foot: 'The hook emits Headroom’s own <code>headroom_*</code> Prometheus metrics, so Busbar re-exposes them on <code>/metrics/hooks</code> and an existing Headroom Grafana dashboard works unchanged — there’s a ready-to-import one in the <a href="https://github.com/GetBusbar/headroom-hook/tree/main/grafana" target="_blank" rel="noopener">hook repo</a>.<br><br>The hook speaks a Unix socket, so it runs on Linux and macOS (any arch). There is no native Windows build — run Busbar and the hook together inside WSL2 or a Linux container, where the socket works normally.',
     },
     note: 'Powered by the open-source <a href="https://headroomlabs-ai.github.io/headroom/" target="_blank" rel="noopener">Headroom</a> project.',
     detail: [
