@@ -56,18 +56,15 @@ curl -s -H "x-admin-token: $TOK" \
   "name": "headroom",
   "schema": {
     "type": "object",
-    "title": "Headroom compression",
+    "title": "headroom-hook settings",
+    "additionalProperties": false,
     "properties": {
-      "min_savings_pct":  {"type":"integer","minimum":0,"maximum":100,"default":10,
-        "description":"Rewrite only when the body shrinks by at least this percent; below it, abstain."},
-      "target_ratio_pct": {"type":"integer","minimum":0,"maximum":100,"default":60,
-        "description":"Target compressed size as a percent of the original."},
-      "min_trigger_chars":{"type":"integer","minimum":0,"default":0,
-        "description":"Only attempt compression once the request is at least this many characters."},
-      "system_aware":     {"type":"boolean","default":true,
-        "description":"System-prompt-aware compression: be conservative near the system prompt."},
-      "price_udollars_per_kchar": {"type":"integer","minimum":0,"default":50,
-        "description":"Assumed input price (micro-$ per 1K chars) used to estimate dollars saved."}
+      "target_ratio": {"type":"number","minimum":0.05,"maximum":1.0,"default":0.5,
+        "description":"Fraction of tokens KEPT per compressed history message."},
+      "min_savings_pct": {"type":"number","minimum":0,"maximum":100,"default":10,
+        "description":"Abstain (pass the prompt through unmodified) unless whole-prompt char savings reach this percentage."},
+      "price_udollars_per_ktok": {"type":"number","minimum":0,"maximum":1000000,"default":2500,
+        "description":"Assumed input price (micro-dollars per 1,000 tokens) used to estimate dollars saved."}
     }
   }
 }
@@ -78,7 +75,7 @@ That schema is the config form — one declaration, rendered by any tooling that
 ```bash
 # Raise the savings floor to 25% and bill dollars at a higher input price
 curl -s -X PATCH -H "x-admin-token: $TOK" -H 'content-type: application/json' \
-  --data '{"min_savings_pct":25,"price_udollars_per_kchar":75}' \
+  --data '{"min_savings_pct":25,"price_udollars_per_ktok":3000}' \
   http://localhost:8080/api/v1/admin/hooks/headroom/settings
 ```
 
@@ -98,9 +95,8 @@ curl -s -H "x-admin-token: $TOK" \
 ```jsonc
 {
   "name": "headroom",
-  "desired":  {"min_savings_pct": 25, "price_udollars_per_kchar": 75},
-  "reported": {"min_savings_pct": 25, "target_ratio_pct": 60, "min_trigger_chars": 0,
-               "system_aware": true, "price_udollars_per_kchar": 75},
+  "desired":  {"min_savings_pct": 25, "price_udollars_per_ktok": 3000},
+  "reported": {"target_ratio": 0.5, "min_savings_pct": 25, "price_udollars_per_ktok": 3000},
   "drift": false,
   "as_of": "2026-07-13T17:04:11Z",
   "source": "socket",
