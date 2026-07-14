@@ -1,5 +1,6 @@
 ---
 title: "Busbar 1.0.0-rc.1, the first release candidate"
+ogImage: "/og/rc1-first-release-candidate.png"
 description: "From an empty repo to a feature-complete, API-stable release candidate. Six protocols, lossless translation, in-flight failover, and fault-attributed breaking, in one Rust binary."
 date: 2026-06-03
 author: "Matthew Jackson"

@@ -1,5 +1,6 @@
 ---
 title: "Busbar 1.3: your code on the request path"
+ogImage: "/og/busbar-1-3-the-api-release.png"
 description: "Hooks put your logic on the normalized request path across all six protocols. Auth becomes a pluggable chain you can compile out. And the admin API v1 is frozen: the surface tools get to build on."
 date: 2026-07-14
 author: "Matthew Jackson"

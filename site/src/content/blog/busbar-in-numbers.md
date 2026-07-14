@@ -1,5 +1,6 @@
 ---
 title: "Busbar, in numbers"
+ogImage: "/og/busbar-in-numbers.png"
 description: "A fast, lightweight, single-binary AI control plane isn't my roadmap. It's what shipped. Straight answers on memory, latency, throughput, reproducibility, and what you actually deploy."
 date: 2026-07-01
 author: "Matthew Jackson"

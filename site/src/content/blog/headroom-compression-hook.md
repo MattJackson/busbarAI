@@ -1,5 +1,6 @@
 ---
 title: "Headroom: a compression hook that reports its own savings"
+ogImage: "/og/headroom-compression-hook.png"
 description: "Context compression belongs on the request path, not bolted onto your app. Busbar runs it as a rewrite gate: prompt text in, a smaller body out, before routing and before dispatch. And because the hook self-describes its settings and self-reports its metrics, you configure it and read its savings entirely through the frozen Admin API — no second dashboard."
 date: 2026-07-15
 author: "Matthew Jackson"

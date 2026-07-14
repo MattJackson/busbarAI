@@ -1,5 +1,6 @@
 ---
 title: "Busbar 1.2: more than chat"
+ogImage: "/og/busbar-1-2-more-than-chat.png"
 description: "Embeddings, moderations, image generation, and audio (transcription and speech) now run through Busbar, and every one is cross-protocol. A Gemini client can call embeddings on Bedrock, an OpenAI client can route images and audio to Gemini, and every answer comes back in the caller's own dialect. Lossless, both ways."
 date: 2026-07-10
 author: "Matthew Jackson"

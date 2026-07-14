@@ -1,5 +1,6 @@
 ---
 title: "Valuable before the second provider exists"
+ogImage: "/og/valuable-before-the-second-provider.png"
 description: "Why a control plane earns its keep with one provider: key custody, hard caps, and real metrics on day one, plus an option you can exercise mid-incident."
 date: 2026-07-09
 author: "Matthew Jackson"

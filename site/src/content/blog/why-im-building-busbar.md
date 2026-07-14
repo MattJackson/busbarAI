@@ -1,5 +1,6 @@
 ---
 title: "Why I'm building Busbar"
+ogImage: "/og/why-im-building-busbar.png"
 description: "As teams go multi-model, the control plane becomes critical infrastructure, and 'flatten everything to OpenAI and retry on failure' isn't enough. Before I write a line of code, here's what I'm setting out to build."
 date: 2026-05-01
 author: "Matthew Jackson"

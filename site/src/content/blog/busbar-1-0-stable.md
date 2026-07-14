@@ -1,5 +1,6 @@
 ---
 title: "Busbar 1.0 is stable"
+ogImage: "/og/busbar-1-0-stable.png"
 description: "The HTTP API, config schema, and six wire-protocol contracts are now frozen under Semantic Versioning, hardened across a multi-round security and correctness audit. It's production-ready."
 date: 2026-06-21
 author: "Matthew Jackson"

@@ -1,5 +1,6 @@
 ---
 title: "The smart router you want is a hook"
+ogImage: "/og/smart-routing-today.png"
 description: "Everyone asks for automatic model selection by task, latency, quality, and cost. It is not a product, it is a hook. Busbar runs yours two ways: a compiled Rust binary on a local socket that decides in about 8 microseconds, or a webhook in any language. Both wired to the same failover and fail-safe machinery."
 date: 2026-07-11
 author: "Matthew Jackson"
