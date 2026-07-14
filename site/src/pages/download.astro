@@ -11,6 +11,7 @@ import dockerMark from '../assets/docker.svg';
 import release from '../release.json';
 import Nav from '../components/Nav.astro';
 import Analytics from '../components/Analytics.astro';
+import DockerPullsLive from '../components/DockerPullsLive.astro';
 import { dockerCount } from '../lib/format';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
@@ -112,7 +113,7 @@ const groups = [
           </a>
           {dockerPullsLabel && (
             <a class="dl-pulls" href="https://hub.docker.com/r/getbusbar/busbar"
-               title="Docker Hub pulls">{dockerPullsLabel} pulls</a>
+               title="Docker Hub pulls" data-docker-repo="getbusbar/busbar"><span data-docker-count>{dockerPullsLabel}</span> pulls</a>
           )}
         </div>
         <div class="dl-cmd">
@@ -392,5 +393,6 @@ const groups = [
         .wrap { padding: 0 16px; }
       }
     </style>
+    <DockerPullsLive />
   </body>
 </html>

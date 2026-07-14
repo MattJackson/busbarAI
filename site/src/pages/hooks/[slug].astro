@@ -7,6 +7,7 @@ import PageLayout from '../../layouts/PageLayout.astro';
 import { hooks, kindLabel, type Hook } from '../../data/hooks';
 import { dockerCount } from '../../lib/format';
 import dockerMark from '../../assets/docker.svg';
+import DockerPullsLive from '../../components/DockerPullsLive.astro';
 
 export function getStaticPaths() {
   return hooks
@@ -64,9 +65,9 @@ const ICONS: Record<string, string> = {
         )}
         {hook.dockerRepo && (
           <a class="hook-action" href={`https://hub.docker.com/r/${hook.dockerRepo}`} target="_blank" rel="noopener"
-             title="Docker Hub" aria-label={dockerPullsLabel ? `Docker Hub — ${dockerPullsLabel} pulls` : 'Docker Hub'}>
+             title="Docker Hub" aria-label="Docker Hub pulls" data-docker-repo={hook.dockerRepo}>
             <img src={dockerMark.src} alt="" width="17" height="17" />
-            <span>{dockerPullsLabel ?? 'Docker'}</span>
+            <span data-docker-count>{dockerPullsLabel ?? 'Docker'}</span>
           </a>
         )}
         {hook.install && (
@@ -375,4 +376,5 @@ const ICONS: Record<string, string> = {
       pre.appendChild(btn);
     });
   </script>
+  <DockerPullsLive />
 </PageLayout>
