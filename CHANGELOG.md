@@ -12,8 +12,8 @@ appear as a bold **Migration** item under **Changed**.
 ## [1.3.0], 2026-07-13
 
 The API release. Everything you could only do by editing YAML and restarting, you can now do
-over an authenticated, audited API. And the routing hook grew into a hook system: gates,
-taps, and routes, on every request.
+over an authenticated, audited API. And the routing hook grew into a hook system: gates and
+taps, on every request.
 
 This release reshapes how hooks and policies are configured. Hooks are now defined once by
 name and referenced everywhere; the old inline `policy:` block and transport-named `route:`
