@@ -22,6 +22,8 @@ const CARDS = [
   { out: 'smart-routing-today',      hero: 'Smart routing',     sub: 'is a hook',                    tag: 'Route by cost, latency, live load.' },
   { out: 'valuable-before-the-second-provider', hero: 'Valuable before', heroSize: 82, sub: 'the second provider', tag: 'One provider is enough to win.' },
   { out: 'why-im-building-busbar',   hero: "Why I'm building",  sub: 'Busbar',                       tag: 'The seam belongs in the control plane.' },
+  // Hook detail pages (wired via PageLayout ogImage, not blog frontmatter).
+  { out: 'hooks-headroom',           hero: 'Headroom',          sub: 'compression, on the path',     tag: 'Sub-millisecond overhead. Every model.' },
 ];
 
 const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

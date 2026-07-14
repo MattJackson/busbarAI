@@ -29,6 +29,7 @@ const ICONS: Record<string, string> = {
 <PageLayout
   title={`${hook.name} — a Busbar hook`}
   description={hook.body.replace(/<[^>]+>/g, '')}
+  ogImage={`/og/hooks-${hook.slug}.png`}
 >
   <p class="kicker"><a href="/hooks/">Hook Store</a> · {kindLabel[hook.kind]}</p>
 

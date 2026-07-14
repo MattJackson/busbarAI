@@ -11,7 +11,10 @@ interface Props {
   description: string;
 }
 
-const { title, description } = Astro.props;
+// `ogImage` is an optional per-page social card (absolute path under /); defaults to the
+// generic site card when a page doesn't supply one.
+const { title, description, ogImage = '/og-card.png' } = Astro.props;
+const ogImageUrl = new URL(ogImage, 'https://getbusbar.com').href;
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const YEAR = new Date().getFullYear();
@@ -34,9 +37,9 @@ const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'B
     <link rel="canonical" href={new URL(Astro.url.pathname, "https://getbusbar.com")} />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
-    <meta property="og:image" content="https://getbusbar.com/og-card.png" />
+    <meta property="og:image" content={ogImageUrl} />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:image" content="https://getbusbar.com/og-card.png" />
+    <meta name="twitter:image" content={ogImageUrl} />
     <Analytics />
     <script type="application/ld+json" set:html={JSON.stringify(ORG)} />
     <script type="application/ld+json" set:html={JSON.stringify(WEBSITE)} />
