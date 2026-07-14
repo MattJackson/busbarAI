@@ -89,12 +89,12 @@ fn hook_plugins_compiled_in() -> Vec<&'static str> {
 /// `connect` (unix only); a webhook is not probed here (returns `None` with a note — webhooks lazy-
 /// connect per request, and a blind GET/HEAD could have side effects). Returns `(reachable, detail)`.
 async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
-    // Cap the probe so an unresponsive socket can never stall the admin read.
-    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
     match (&cfg.socket, &cfg.webhook) {
         (Some(path), _) => {
             #[cfg(unix)]
             {
+                // Cap the probe so an unresponsive socket can never stall the admin read.
+                const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
                 match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(path))
                     .await
                 {

@@ -1615,10 +1615,12 @@ async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
 
 /// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
 /// assert a particular `tracing::warn!` fired. Mirrors the helper used in eventstream/config
-/// tests; kept local to the auth test module.
+/// tests; kept local to the auth test module. Only the `auth-tokens`-gated test below uses it.
+#[cfg(feature = "auth-tokens")]
 #[derive(Clone, Default)]
 struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
+#[cfg(feature = "auth-tokens")]
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
     fn on_event(
         &self,

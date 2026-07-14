@@ -326,6 +326,8 @@ async fn test_fallback_openai_404_is_json_no_amzn_headers() {
 /// serves `/api/v1/admin/*` and a data router that does NOT — even for a request carrying a VALID
 /// admin token (the route is ABSENT, not merely auth-guarded), so the public data bind can never
 /// reach the management plane. Both planes keep an open, unauthenticated `/healthz`.
+// Exercises the admin-token auth link, so it only applies when that feature is compiled in.
+#[cfg(feature = "auth-admin-tokens")]
 #[tokio::test]
 async fn split_admin_listener_no_double_exposure() {
     use crate::governance::{GovState, SqliteStore};

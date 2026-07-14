@@ -248,6 +248,9 @@ impl GovState {
 
     /// SHA-256 hex digest of the configured admin token, pre-computed at construction.
     /// `Some` exactly when an admin token was supplied to `GovState::new` (the plaintext is hashed and discarded).
+    // Only read by the `auth-admin-tokens` chain link; without that feature the getter is unused
+    // (the field is still populated/validated, so keep the method rather than gate the field).
+    #[cfg_attr(not(feature = "auth-admin-tokens"), allow(dead_code))]
     pub(crate) fn admin_token_hash(&self) -> Option<&str> {
         self.admin_token_hash.as_deref()
     }

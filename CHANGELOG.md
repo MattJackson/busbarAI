@@ -9,6 +9,22 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
+## [Unreleased]
+
+### Fixed
+
+- Restored a clean CI matrix: config-specific dead code that only `-D warnings` rejects under
+  `--no-default-features` or on Windows now compiles cleanly. `PROBE_TIMEOUT` moved inside its
+  `#[cfg(unix)]` scope; the `admin_token_hash` getter and a `WarnCapture` test helper are gated to
+  the features that use them; the admin-listener split test is gated to `auth-admin-tokens`.
+
+### Added
+
+- `scripts/preflight.sh` — a pre-release gate that mirrors the full CI matrix locally (fmt,
+  structure-lint, clippy + build + test on both the default and `--no-default-features` feature
+  sets, and a best-effort Windows type-check). Run it before tagging so a release can never ship
+  red CI.
+
 ## [1.3.0], 2026-07-13
 
 The API release. Everything you could only do by editing YAML and restarting, you can now do
