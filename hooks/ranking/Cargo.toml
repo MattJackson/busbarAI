@@ -1,6 +1,7 @@
 [package]
 name = "busbar-hooks-ranking"
 version = "1.3.0"
+publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.87"
 description = "The built-in ranking hooks for busbar: cheapest / fastest / least_busy / usage order-gates over the routing-policy contract."

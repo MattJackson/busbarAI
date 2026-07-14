@@ -9,6 +9,24 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
+## [Unreleased]
+
+### Fixed
+
+- Finished greening the CI matrix that 1.3.1 began: three checks were still red and are now clean
+  with no change to the binary. **fmt** — committed the rustfmt reformatting of `render_histogram`
+  that had been applied locally but never committed. **Windows** — `PolicyOnError` is only used by
+  the unix-only socket-gate tests, so its import is now `#[cfg(unix)]`. **cargo-deny** — the
+  workspace's own member crates are versionless path deps; marking them `publish = false` (they
+  never go to crates.io) lets `allow-wildcard-paths` apply, so `bans` passes while external
+  wildcards stay denied.
+
+### Changed
+
+- `scripts/preflight.sh` now fails on an **uncommitted working tree** (CI tests the committed
+  state — an uncommitted `cargo fmt` is exactly how the fmt red slipped past 1.3.1) and runs
+  **cargo-deny** (the Security job) when installed.
+
 ## [1.3.1], 2026-07-14
 
 A maintenance release: no behavior change to the binary, a clean CI matrix, and a pre-release gate
