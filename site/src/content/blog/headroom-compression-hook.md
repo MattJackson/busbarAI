@@ -6,7 +6,7 @@ author: "Matthew Jackson"
 authorTitle: "Founder, Busbar"
 ---
 
-Compression tools like [Headroom](https://github.com/chopratejas/headroom) ("60–95% fewer tokens, same answers") and Microsoft's [LLMLingua](https://llmlingua.com/) prove the point: most of what you send an LLM is padding. Collapse it and you keep the answer, cut the bill. The usual way to run one is a proxy in front of your app with its own dashboard to watch the savings.
+[Headroom](https://github.com/headroomlabs-ai/headroom) ("60–95% fewer tokens, same answers") proves the point: most of what you send an LLM is padding. Collapse it and you keep the answer, cut the bill. The usual way to run one is a proxy in front of your app with its own dashboard to watch the savings.
 
 Busbar's position is that compression is not a separate box. It is a **rewrite gate** on the request path: Busbar hands your hook the flattened prompt text, your hook hands back a smaller body, and Busbar dispatches the compressed request — **before routing, before dispatch, persisting across failover**, with token accounting on the provider-reported usage of the rewritten body. The savings are real and measured, not estimated off to the side.
 
