@@ -136,18 +136,7 @@ Three entry types earn their keep. A **counter** or **gauge** carries a scalar `
 
 Every entry also carries display hints — `label`, `unit`, `viz`, `max` — so a dashboard renders each tile with no per-plugin code, and the hook's `describe` reply declares the matching widget layout, so **one** declaration drives both the config form and the dashboard. Busbar bounds and sanitizes everything (64 entries per reply, 8 labels per entry; a malformed entry is dropped whole, a malformed optional member individually), so a hook granted `prompt: rw` still cannot smuggle prompt content into a metric name, a label key, or a hint.
 
-The metric set uses **Headroom's own documented Prometheus names**, so a dashboard built against Headroom lights up unchanged:
-
-| Metric | Type | Meaning |
-|---|---|---|
-| `headroom_requests_total` | counter | Requests processed (labelled by `mode`). |
-| `headroom_tokens_saved_total` | counter | Tokens saved since start — Headroom's headline "tokens saved". |
-| `headroom_persistent_savings_tokens_saved_total` | counter | Durable lifetime tokens saved. |
-| `headroom_compression_ratio` | histogram (`le` buckets) | Compressed/original distribution; `histogram_quantile()` for the median. |
-| `headroom_latency_seconds` | histogram (`le` buckets) | Per-request compression latency; `histogram_quantile()` for p50/p95/p99. |
-| `dollars_saved` | gauge (estimated + CI) | Estimated input cost saved — Headroom's "Proxy $ saved" tile (busbar extra). |
-
-Every one is reported per pool.
+Those are **Headroom's own [documented Prometheus names](https://headroomlabs-ai.github.io/headroom/metrics/)** — `headroom_tokens_saved_total`, `headroom_compression_ratio`, `headroom_latency_seconds`, and the rest of the family — so a dashboard built against Headroom lights up unchanged. The one addition is `dollars_saved`: a busbar-native estimate (marked `estimated`, bounded by a CI) for the "Proxy $ saved" tile. Every metric is reported per pool.
 
 Because it is a normal Admin API read, you scrape it however you already do. Since `metrics` is an array, you select by name and label — here, total dollars saved on the `chat` pool:
 
