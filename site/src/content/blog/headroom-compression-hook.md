@@ -158,6 +158,12 @@ curl -s -H "x-admin-token: $TOK" \
 
 Or poll it on an interval and let your own dashboard accumulate the time series — that is the consumer's job by design; the hook reports point-in-time state, the scraper keeps the history. And `drift` tells you at a glance whether the hook is running what you pushed: a differing settings version, or a desired key missing or changed in the observed settings, flips it to `true` (it is `null` if the hook doesn't answer), so alerting diffs one field instead of comparing maps.
 
+## Run it
+
+The hook is a small binary you run alongside Busbar; it owns a Unix socket and Busbar connects to it. The easiest path is Docker — grab the [`docker-compose.yml`](https://github.com/GetBusbar/headroom-hook/blob/main/docker-compose.yml), drop your Busbar config next to it, and `docker compose up` brings both up together (the images are `getbusbar/headroom-hook` and `getbusbar/busbar`). Or grab a prebuilt binary from the [latest release](https://github.com/GetBusbar/headroom-hook/releases/latest) and run it on a socket. Then register it as a `prompt: rw` gate — [full steps on the hook page](/hooks/headroom).
+
+Source, benchmarks, and the wire it speaks: **[github.com/GetBusbar/headroom-hook](https://github.com/GetBusbar/headroom-hook)**.
+
 ## Why this shape
 
 The recurring theme of Busbar is that policy is yours and the control plane carries the seam and the guarantees. Compression is exactly that: **which** compressor and **how aggressive** is your judgment, so it stays a hook you own. But an operator still needs to configure it and watch it, and forcing a second dashboard for every plug is the wrong answer.
