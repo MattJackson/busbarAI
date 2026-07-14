@@ -160,7 +160,7 @@ Or poll it on an interval and let your own dashboard accumulate the time series 
 
 ## Run it
 
-The hook is a small binary you run alongside Busbar; it owns a Unix socket and Busbar connects to it. The easiest path is Docker — grab the [`docker-compose.yml`](https://github.com/GetBusbar/headroom-hook/blob/main/docker-compose.yml), drop your Busbar config next to it, and `docker compose up` brings both up together (the images are `getbusbar/headroom-hook` and `getbusbar/busbar`). Or grab a prebuilt binary from the [latest release](https://github.com/GetBusbar/headroom-hook/releases/latest) and run it on a socket. Then register it as a `prompt: rw` gate — [full steps on the hook page](/hooks/headroom).
+The hook is a small binary you run alongside Busbar over a Unix socket — Docker (`docker compose up`) or a prebuilt binary, then register it as a `prompt: rw` gate. **[Full install steps are on the hook page →](/hooks/headroom#install)**
 
 Source, benchmarks, and the wire it speaks: **[github.com/GetBusbar/headroom-hook](https://github.com/GetBusbar/headroom-hook)**.
 
