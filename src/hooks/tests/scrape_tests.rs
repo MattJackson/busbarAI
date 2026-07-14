@@ -11,6 +11,7 @@ fn metric(name: &str, kind: &str, value: f64) -> HookMetric {
         value,
         labels: None,
         quantiles: None,
+        buckets: None,
         estimated: None,
         ci_low: None,
         ci_high: None,
@@ -82,6 +83,46 @@ fn histogram_renders_as_summary() {
     // observation count from `value`
     assert!(
         text.contains("compress_latency_us_count{hook=\"headroom\",pool=\"chat\"} 1000\n"),
+        "{text}"
+    );
+}
+
+/// A histogram carrying native `buckets` renders as a Prometheus HISTOGRAM: cumulative
+/// `name_bucket{le="…"}` rows in ascending `le` order, a synthesized `+Inf` bucket equal to the
+/// total count when the hook omits it, and `name_count`. This is the shape `histogram_quantile()`
+/// needs — the reason the wire carries buckets, not just quantiles.
+#[test]
+fn histogram_with_buckets_renders_as_native_histogram() {
+    let mut bs = BTreeMap::new();
+    bs.insert("0.5".to_string(), 3.0);
+    bs.insert("1".to_string(), 7.0);
+    let m = HookMetric {
+        buckets: Some(bs),
+        labels: labels(&[("pool", "chat")]),
+        ..metric("headroom_compression_ratio", "histogram", 7.0)
+    };
+    let text = render_text(&[("headroom".to_string(), vec![m])]);
+    assert!(
+        text.contains("# TYPE headroom_compression_ratio histogram"),
+        "buckets => histogram, not summary: {text}"
+    );
+    // finite bounds ascending, cumulative counts, hook label first.
+    let lo = text
+        .find("headroom_compression_ratio_bucket{hook=\"headroom\",pool=\"chat\",le=\"0.5\"} 3\n")
+        .expect("0.5 bucket");
+    let hi = text
+        .find("headroom_compression_ratio_bucket{hook=\"headroom\",pool=\"chat\",le=\"1\"} 7\n")
+        .expect("1 bucket");
+    assert!(lo < hi, "buckets must be ascending by le: {text}");
+    // +Inf synthesized to the total count (hook omitted it), then the count line.
+    assert!(
+        text.contains(
+            "headroom_compression_ratio_bucket{hook=\"headroom\",pool=\"chat\",le=\"+Inf\"} 7\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("headroom_compression_ratio_count{hook=\"headroom\",pool=\"chat\"} 7\n"),
         "{text}"
     );
 }

@@ -268,10 +268,21 @@ pub(crate) struct HookMetric {
     /// sanitized ≤ 64 chars; ≤ [`MAX_METRIC_LABELS`] pairs (excess/invalid pairs dropped).
     #[serde(default)]
     pub(crate) labels: Option<std::collections::BTreeMap<String, String>>,
-    /// A DISTRIBUTION for `type: histogram` (p50/p95/p99 latency — what a mean hides). Keys are
-    /// quantiles in `[0,1]` as strings (`"0.95"`), values finite. Empty/invalid → dropped.
+    /// A `type: histogram` reported as a SUMMARY — precomputed quantiles (p50/p95/p99, what a mean
+    /// hides). Keys are quantiles in `[0,1]` as strings (`"0.95"`), values finite. The alternative,
+    /// for a hook that can bucket its samples, is `buckets` (a native Prometheus histogram). A hook
+    /// sends whichever it can produce; both render on the Prometheus scrape.
     #[serde(default)]
     pub(crate) quantiles: Option<std::collections::BTreeMap<String, f64>>,
+    /// A `type: histogram` reported as a native PROMETHEUS HISTOGRAM — keys are `le` upper bounds as
+    /// strings (`"0.5"`, `"0.01"`, `"+Inf"`), values are the CUMULATIVE observation count at or below
+    /// that bound (monotonic non-decreasing, the top bound holding `value`). Rendered as
+    /// `name_bucket{le="…"}` + `name_count`, so a consumer can `histogram_quantile()` over it exactly
+    /// as it would any Prometheus histogram — which is what lets a dashboard built for a hook's
+    /// upstream tool (e.g. a compression tool's own `*_bucket` panels) work unchanged against busbar.
+    /// Preferred over `quantiles` when both are present.
+    #[serde(default)]
+    pub(crate) buckets: Option<std::collections::BTreeMap<String, f64>>,
     /// PROVENANCE: `true` marks this value an ESTIMATE (e.g. Headroom's holdout-control savings)
     /// rather than a directly measured fact — a dashboard renders it distinctly.
     #[serde(default)]
@@ -399,6 +410,20 @@ pub(crate) fn parse_status_metrics(raw: &[serde_json::Value]) -> Vec<HookMetric>
                     .collect::<std::collections::BTreeMap<_, _>>()
             })
             .filter(|q| !q.is_empty());
+        // Buckets: keys are `le` bounds — a finite number or `"+Inf"` — values finite, non-negative
+        // cumulative counts. Cap the bucket count (a histogram with 64 le bounds is already generous).
+        // Drop the map if empty.
+        m.buckets = m
+            .buckets
+            .map(|b| {
+                b.into_iter()
+                    .filter(|(k, val)| {
+                        val.is_finite() && *val >= 0.0 && (k == "+Inf" || k.parse::<f64>().is_ok())
+                    })
+                    .take(MAX_METRIC_LABELS * 8)
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .filter(|b| !b.is_empty());
         // Confidence interval: both finite and ordered, else drop the pair entirely.
         match (m.ci_low, m.ci_high) {
             (Some(lo), Some(hi)) if lo.is_finite() && hi.is_finite() && lo <= hi => {}
@@ -779,6 +804,34 @@ mod tests {
         assert_eq!(by(3).estimated, Some(true));
         assert_eq!((by(3).ci_low, by(3).ci_high), (Some(27.7), Some(35.7)));
         assert_eq!((by(4).ci_low, by(4).ci_high), (None, None));
+    }
+
+    /// Native histogram `buckets` are validated like quantiles: a key must be `+Inf` or parse as a
+    /// finite `le` bound, a count must be finite and non-negative, and an all-bad map drops to
+    /// `None` (so the renderer never emits a malformed histogram).
+    #[test]
+    fn status_metrics_validates_native_buckets() {
+        let m = [
+            // Good bucket map: finite bounds + "+Inf" kept; NaN count, non-numeric key dropped.
+            serde_json::json!({"name":"headroom_compression_ratio","type":"histogram","value":7.0,
+                               "buckets":{"0.5":3.0,"1":7.0,"+Inf":7.0,
+                                          "abc":1.0,"2":-2.0}}),
+            // Every entry invalid => the whole buckets map drops to None.
+            serde_json::json!({"name":"all_bad","type":"histogram","value":1.0,
+                               "buckets":{"x":1.0,"y":-1.0}}),
+        ];
+        let parsed = super::parse_status_metrics(&m);
+        assert_eq!(parsed.len(), 2);
+        let good = parsed[0].buckets.as_ref().expect("valid buckets kept");
+        assert_eq!(good.len(), 3, "3 valid bounds; bad key & neg-count dropped");
+        assert_eq!(good["0.5"], 3.0);
+        assert_eq!(good["+Inf"], 7.0);
+        assert!(!good.contains_key("abc"), "non-numeric le key dropped");
+        assert!(!good.contains_key("2"), "negative count dropped");
+        assert!(
+            parsed[1].buckets.is_none(),
+            "all-invalid buckets map drops to None"
+        );
     }
 
     use super::*;

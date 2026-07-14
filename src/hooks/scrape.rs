@@ -169,6 +169,7 @@ fn render_text(hooks: &[(String, Vec<HookMetric>)]) -> String {
         out.push_str(&format!("# TYPE {name} {ptype}\n"));
         for (hook_name, m) in entries {
             match ptype.as_str() {
+                "histogram" => render_histogram(&mut out, name, hook_name, m),
                 "summary" => render_summary(&mut out, name, hook_name, m),
                 _ => {
                     let labels = render_labels(hook_name, m.labels.as_ref(), &[]);
@@ -180,15 +181,50 @@ fn render_text(hooks: &[(String, Vec<HookMetric>)]) -> String {
     out
 }
 
-/// Map a hook metric to its Prometheus type: a histogram (carries `quantiles`) renders as SUMMARY;
-/// everything else keeps its declared counter/gauge (unknown kinds fall back to `untyped`).
+/// Map a hook metric to its Prometheus type. A `histogram` carrying native `buckets` renders as a
+/// Prometheus HISTOGRAM (`_bucket`/`_count`, queryable via `histogram_quantile`); a `histogram`
+/// carrying precomputed `quantiles` renders as a SUMMARY. Counter/gauge pass through; anything else
+/// is `untyped`.
 fn prom_type_of(m: &HookMetric) -> &'static str {
     match m.kind.as_str() {
         "counter" => "counter",
         "gauge" => "gauge",
-        "histogram" => "summary", // Prometheus SUMMARY is the type that carries `quantile` series
+        "histogram" if m.buckets.is_some() => "histogram",
+        "histogram" => "summary",
         _ => "untyped",
     }
+}
+
+/// Render a native Prometheus histogram: one `name_bucket{le="…"}` line per bucket (cumulative
+/// counts, as the hook reported them; a `+Inf` bucket is emitted to close the histogram if the hook
+/// omitted it) plus `name_count` = the total observation count (`value`). This is the shape
+/// `histogram_quantile()` operates on, so a dashboard built against a `*_bucket` series works
+/// unchanged.
+fn render_histogram(out: &mut String, name: &str, hook: &str, m: &HookMetric) {
+    let mut saw_inf = false;
+    if let Some(buckets) = &m.buckets {
+        // Sort by le so the exposition is monotonic and stable (finite bounds ascending, +Inf last).
+        let mut rows: Vec<(&String, &f64)> = buckets.iter().collect();
+        rows.sort_by(|a, b| {
+            let pa = if a.0 == "+Inf" { f64::INFINITY } else { a.0.parse().unwrap_or(f64::INFINITY) };
+            let pb = if b.0 == "+Inf" { f64::INFINITY } else { b.0.parse().unwrap_or(f64::INFINITY) };
+            pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (le, count) in rows {
+            if le == "+Inf" {
+                saw_inf = true;
+            }
+            let labels = render_labels(hook, m.labels.as_ref(), &[("le", le)]);
+            out.push_str(&format!("{name}_bucket{labels} {}\n", fmt_f64(*count)));
+        }
+    }
+    // Prometheus requires a +Inf bucket equal to the total count; add it if the hook didn't.
+    if !saw_inf {
+        let labels = render_labels(hook, m.labels.as_ref(), &[("le", "+Inf")]);
+        out.push_str(&format!("{name}_bucket{labels} {}\n", fmt_f64(m.value)));
+    }
+    let count_labels = render_labels(hook, m.labels.as_ref(), &[]);
+    out.push_str(&format!("{name}_count{count_labels} {}\n", fmt_f64(m.value)));
 }
 
 /// Render a summary: one `name{...,quantile="q"}` line per quantile plus `name_count` = the
