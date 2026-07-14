@@ -26,6 +26,9 @@ appear as a bold **Migration** item under **Changed**.
 - `scripts/preflight.sh` now fails on an **uncommitted working tree** (CI tests the committed
   state — an uncommitted `cargo fmt` is exactly how the fmt red slipped past 1.3.1) and runs
   **cargo-deny** (the Security job) when installed.
+- Dependency bumps (Dependabot): `bytes` 1.12.0 → 1.12.1; CI/release actions `docker/build-push@7`,
+  `docker/setup-buildx@4`, `docker/metadata@6`, `docker/login@4`, `actions/upload-artifact@7`,
+  `actions/download-artifact@8`.
 
 ## [1.3.1], 2026-07-14
 
