@@ -9,7 +9,10 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Deprecated**, **Removed**, **Fixed**, **Security**. Migration steps for a breaking change
 appear as a bold **Migration** item under **Changed**.
 
-## [Unreleased]
+## [1.3.1], 2026-07-14
+
+A maintenance release: no behavior change to the binary, a clean CI matrix, and a pre-release gate
+so the config-specific breakage caught here can't recur.
 
 ### Fixed
 
