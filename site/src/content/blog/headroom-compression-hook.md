@@ -101,42 +101,41 @@ curl -s -H "x-admin-token: $TOK" \
   "as_of": "2026-07-13T17:04:11Z",
   "source": "socket",
   "metrics": [
-    // Headroom's OWN documented Prometheus names — one entry per pool, same
-    // name, different labels.pool
+    // Headroom's OWN Prometheus names — one entry per pool, same name,
+    // different labels.pool
     {"name":"headroom_tokens_saved_total","type":"counter","value":28927142,
      "labels":{"pool":"chat"},  "label":"Tokens saved","viz":"counter"},
     {"name":"headroom_tokens_saved_total","type":"counter","value":9044310,
      "labels":{"pool":"batch"}, "label":"Tokens saved","viz":"counter"},
 
     {"name":"headroom_requests_total","type":"counter","value":382104,
-     "labels":{"pool":"chat","mode":"optimize"},"label":"Requests","viz":"counter"},
+     "labels":{"pool":"chat"},"label":"Requests","viz":"counter"},
+    {"name":"headroom_tokens_input_total","type":"counter","value":71203991,
+     "labels":{"pool":"chat"},"label":"Input tokens","viz":"counter"},
 
-    // compression_ratio is a NATIVE histogram: le buckets (cumulative counts),
-    // so histogram_quantile() works on the scrape — value is the sample count
-    {"name":"headroom_compression_ratio","type":"histogram","value":289012,
-     "buckets":{"0.4":41210,"0.5":198400,"0.7":270100,"0.9":289012},
-     "labels":{"pool":"chat"},"label":"Compression ratio","viz":"histogram"},
+    // headroom_overhead_ms_* is Headroom's processing-overhead SUMMARY: two
+    // counters (_sum, _count) + two gauges (_min, _max), in milliseconds
+    {"name":"headroom_overhead_ms_sum","type":"counter","value":16512.4,
+     "labels":{"pool":"chat"},"label":"Overhead (sum)","unit":"ms","viz":"counter"},
+    {"name":"headroom_overhead_ms_count","type":"counter","value":382104,
+     "labels":{"pool":"chat"},"label":"Overhead (count)","viz":"counter"},
+    {"name":"headroom_overhead_ms_max","type":"gauge","value":1.91,
+     "labels":{"pool":"chat"},"label":"Overhead (max)","unit":"ms","viz":"number"},
 
     // dollars_saved is an ESTIMATE (priced off an assumed rate), so it is
     // marked estimated and bounded by a confidence interval
     {"name":"dollars_saved","type":"gauge","value":1446.35,"estimated":true,
      "ci_low":1229.40,"ci_high":1663.30,
-     "labels":{"pool":"chat"},"label":"Proxy $ saved","unit":"$","viz":"number"},
-
-    // latency is a NATIVE histogram in seconds: le buckets, queryable with
-    // histogram_quantile() for p50/p95/p99
-    {"name":"headroom_latency_seconds","type":"histogram","value":128401,
-     "buckets":{"0.001":9200,"0.005":121400,"0.01":128401},
-     "labels":{"pool":"chat"},"label":"Compression latency","unit":"s","viz":"histogram"}
+     "labels":{"pool":"chat"},"label":"Proxy $ saved","unit":"$","viz":"number"}
   ]
 }
 ```
 
-Three entry types earn their keep. A **counter** or **gauge** carries a scalar `value`. A **histogram** reports a distribution — `value` is the observation count and `buckets` are native Prometheus `le` buckets, so `histogram_quantile()` computes p50/p95/p99 on the scrape and a slow-tail pool shows up where a mean would hide it. And any value the hook *derived* rather than measured — here the dollars saved, priced off an assumed rate — carries `estimated: true` with a `ci_low`/`ci_high` interval, so a dashboard renders it as an estimate with error bars, not a hard fact.
+Three entry types earn their keep. A **counter** carries a monotonic total and a **gauge** a point-in-time scalar — Headroom reports overhead as a millisecond summary split across both (`_sum`/`_count` counters, `_min`/`_max` gauges), so a mean is `_sum / _count` and the tail rides `_max`. And any value the hook *derived* rather than measured — here the dollars saved, priced off an assumed rate — carries `estimated: true` with a `ci_low`/`ci_high` interval, so a dashboard renders it as an estimate with error bars, not a hard fact.
 
 Every entry also carries display hints — `label`, `unit`, `viz`, `max` — so a dashboard renders each tile with no per-plugin code, and the hook's `describe` reply declares the matching widget layout, so **one** declaration drives both the config form and the dashboard. Busbar bounds and sanitizes everything (64 entries per reply, 8 labels per entry; a malformed entry is dropped whole, a malformed optional member individually), so a hook granted `prompt: rw` still cannot smuggle prompt content into a metric name, a label key, or a hint.
 
-Those are **Headroom's own [documented Prometheus names](https://headroomlabs-ai.github.io/headroom/metrics/)** — `headroom_tokens_saved_total`, `headroom_compression_ratio`, `headroom_latency_seconds`, and the rest of the family — so a dashboard built against Headroom lights up unchanged. The one addition is `dollars_saved`: a busbar-native estimate (marked `estimated`, bounded by a CI) for the "Proxy $ saved" tile. Every metric is reported per pool.
+Those names are **Headroom's own** — `headroom_requests_total`, `headroom_tokens_saved_total`, `headroom_tokens_input_total`, `headroom_overhead_ms_*` — the exact series its [own proxy exposes on `/metrics`](https://headroomlabs-ai.github.io/headroom/metrics/#prometheus-metrics), so a dashboard built against Headroom reads them off Busbar unchanged. The one addition is `dollars_saved`: a busbar-native estimate (marked `estimated`, bounded by a CI) for the "Proxy $ saved" tile. Every metric is reported per pool.
 
 Because it is a normal Admin API read, you scrape it however you already do. Since `metrics` is an array, you select by name and label — here, total dollars saved on the `chat` pool:
 
