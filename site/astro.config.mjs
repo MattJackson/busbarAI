@@ -81,9 +81,10 @@ export default defineConfig({
             'Your AI Control Plane: self-hosted, in a single Rust binary. One endpoint accepts any of six wire protocols (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses), routes to weighted pools of backends, translates losslessly between protocols, and keeps serving through provider failures via fault-attributed circuit breaking and in-flight failover.',
         }),
       ],
+      // Order mirrors the main site header: Discord then GitHub.
       social: [
-        { icon: 'github', label: 'GitHub', href: 'https://github.com/MattJackson/busbarAI' },
         { icon: 'discord', label: 'Discord', href: 'https://discord.gg/f5XtWw4NT' },
+        { icon: 'github', label: 'GitHub', href: 'https://github.com/MattJackson/busbarAI' },
       ],
       sidebar: [
         {
