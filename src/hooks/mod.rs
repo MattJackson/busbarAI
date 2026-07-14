@@ -526,7 +526,11 @@ pub(crate) fn resolve_gate_hooks(
 /// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
 /// SWRR with a loud pointer at the webhook transport. The request is never stranded.
 #[cfg(not(unix))]
-fn gate_socket_transport(_hook: &crate::config::HookCfg) -> Option<Arc<dyn RoutingPolicy>> {
+fn gate_socket_transport(
+    _name: &str,
+    _hook: &crate::config::HookCfg,
+    _settings_version: u64,
+) -> Option<Arc<dyn RoutingPolicy>> {
     tracing::warn!(
         "a socket gate (Unix-domain-socket hook) is not available on this platform; falling back to \
          weighted. Use a `webhook:` hook for an out-of-process gate here."
