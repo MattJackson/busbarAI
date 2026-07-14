@@ -12,7 +12,7 @@ Busbar's position is that compression is not a separate box. It is a **rewrite g
 
 And there is no second dashboard, because the hook feeds its own configuration and its own operational data back through Busbar's frozen Admin API. This post shows the wire, then how to **configure it** and **read its metrics** over that API.
 
-The full example is in the repo under [`examples/compression-gate/`](https://github.com/MattJackson/busbarAI/tree/main/examples/compression-gate): a self-contained Rust binary, standard library plus serde.
+The hook is a small standalone Rust binary that speaks the wire below — nothing links against Busbar; it just answers the protocol over a Unix socket.
 
 ## The hook, on the wire
 
@@ -164,4 +164,4 @@ The recurring theme of Busbar is that policy is yours and the control plane carr
 
 So the hook feeds Busbar three things — its schema, its observed settings, its metrics — over the same frozen Admin API that manages every other resource. Configure it with a `PATCH`, read its savings with a `GET`, alert on `drift`. One control plane, and the plug's own numbers are in it.
 
-The full example — the Rust binary, its tests, and a README walking the wire — is in the repo under [`examples/compression-gate/`](https://github.com/MattJackson/busbarAI/tree/main/examples/compression-gate). The management-message contract is in the [hooks guide](/docs/hooks/), and the endpoints above are in the [Admin API guide](/docs/admin-api/).
+The management-message contract is in the [hooks guide](/docs/hooks/), and the endpoints above are in the [Admin API guide](/docs/admin-api/).
