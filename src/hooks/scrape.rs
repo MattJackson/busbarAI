@@ -255,9 +255,10 @@ fn fmt_f64(v: f64) -> String {
 }
 
 /// `GET /metrics/hooks` — the Prometheus scrape of hook-reported metrics. Standard text exposition,
-/// unauthenticated exactly like busbar's own `/metrics` (Prometheus scrape endpoints are network-
-/// secured, not token-gated; hook metrics are operational and the wire forbids prompt content in
-/// them). Stale-while-revalidate: renders the cache now, refreshes stale hooks in the background.
+/// governed by the auth chain exactly like busbar's own `/metrics` (both carry operational topology,
+/// so busbar does NOT exempt them — a scraper authenticates with a bearer token, which Prometheus and
+/// Grafana both support in scrape/datasource config). Stale-while-revalidate: renders the cache now,
+/// refreshes stale hooks in the background; never blocks on a hook socket.
 pub(crate) async fn handler(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
 ) -> axum::response::Response {
