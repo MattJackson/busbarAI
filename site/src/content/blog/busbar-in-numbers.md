@@ -8,11 +8,11 @@ authorTitle: "Founder, Busbar"
 
 I build **Busbar**: the reliability and fidelity layer for multi-model AI traffic. Point any SDK at one endpoint. Busbar routes across your providers, translates losslessly between six wire protocols, and keeps serving through provider failures, all as a single static Rust binary you run in your own network.
 
-There's a good conversation happening right now about what an AI gateway should cost you in memory, latency, and operational weight. Here are my answers, measured on the shipped binary rather than a roadmap.
+There's a good conversation happening right now about what an AI control plane should cost you in memory, latency, and operational weight. Here are my answers, measured on the shipped binary rather than a roadmap.
 
-## Why a compiled gateway, and why now?
+## Why a compiled control plane, and why now?
 
-Because a gateway sits in the hot path of every request, and an interpreted, garbage-collected process pays for that on every call. It pays in startup weight, in memory that climbs with concurrency, and in GC pauses that show up as tail latency exactly when you're busiest. A compiled, no-GC data plane removes all three. The industry agrees, which is why gateways are moving to Rust. I already did it: Busbar shipped as a single Rust binary in v1.0, and it's in production today. There's no migration to wait for.
+Because a control plane sits in the hot path of every request, and an interpreted, garbage-collected process pays for that on every call. It pays in startup weight, in memory that climbs with concurrency, and in GC pauses that show up as tail latency exactly when you're busiest. A compiled, no-GC data plane removes all three. The industry agrees, which is why gateways are moving to Rust. I already did it: Busbar shipped as a single Rust binary in v1.0, and it's in production today. There's no migration to wait for.
 
 ## How much memory does Busbar use?
 
@@ -48,7 +48,7 @@ Fair caveat: these are each side's own numbers on its own hardware, so treat the
 
 And both sets of numbers are meant to be reproducible. Mine is: the harness is checked in under `bench/`, and Busbar can report its own added latency in-band on every response (an opt-in header), so you can verify it on your own traffic instead of taking my word for it.
 
-I won't call Busbar "the fastest gateway in existence," because I haven't benchmarked every compiled gateway on one machine. What the numbers on the table say today is clear: lower overhead, far less memory, and it shipped.
+I won't call Busbar "the fastest control plane in existence," because I haven't benchmarked every compiled control plane on one machine. What the numbers on the table say today is clear: lower overhead, far less memory, and it shipped.
 
 ## Does it speak my API?
 
