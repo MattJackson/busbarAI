@@ -10,7 +10,10 @@ fn from_ranked_drops_unknown_and_dedups() {
 }
 
 /// Build a minimal `PoolCfg` with the given `route`/`policy` for resolve_policy tests.
-use crate::config::{HookCfg, HookKind, PolicyOnError, PoolPolicy, PromptAccess, UserAccess};
+use crate::config::{HookCfg, HookKind, PoolPolicy, PromptAccess, UserAccess};
+// PolicyOnError is only referenced by the socket-gate tests below, which are unix-only.
+#[cfg(unix)]
+use crate::config::PolicyOnError;
 use std::collections::HashMap;
 
 /// A pool with a native ranking strategy and no gate.

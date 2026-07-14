@@ -51,6 +51,10 @@ allow = ["Apache-2.0"]
 multiple-versions = "warn"
 # A crate pulled in via wildcard (`*`) version is unpinnable and a supply-chain risk.
 wildcards = "deny"
+# ...but the workspace's OWN member crates (busbar-api, busbar-auth-*, busbar-hooks-ranking) are
+# path dependencies with no version — that isn't a supply-chain wildcard, it's the workspace
+# referencing itself. Allow those; external wildcards are still denied.
+allow-wildcard-paths = true
 deny = []
 
 [sources]

@@ -206,8 +206,16 @@ fn render_histogram(out: &mut String, name: &str, hook: &str, m: &HookMetric) {
         // Sort by le so the exposition is monotonic and stable (finite bounds ascending, +Inf last).
         let mut rows: Vec<(&String, &f64)> = buckets.iter().collect();
         rows.sort_by(|a, b| {
-            let pa = if a.0 == "+Inf" { f64::INFINITY } else { a.0.parse().unwrap_or(f64::INFINITY) };
-            let pb = if b.0 == "+Inf" { f64::INFINITY } else { b.0.parse().unwrap_or(f64::INFINITY) };
+            let pa = if a.0 == "+Inf" {
+                f64::INFINITY
+            } else {
+                a.0.parse().unwrap_or(f64::INFINITY)
+            };
+            let pb = if b.0 == "+Inf" {
+                f64::INFINITY
+            } else {
+                b.0.parse().unwrap_or(f64::INFINITY)
+            };
             pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
         });
         for (le, count) in rows {
@@ -224,7 +232,10 @@ fn render_histogram(out: &mut String, name: &str, hook: &str, m: &HookMetric) {
         out.push_str(&format!("{name}_bucket{labels} {}\n", fmt_f64(m.value)));
     }
     let count_labels = render_labels(hook, m.labels.as_ref(), &[]);
-    out.push_str(&format!("{name}_count{count_labels} {}\n", fmt_f64(m.value)));
+    out.push_str(&format!(
+        "{name}_count{count_labels} {}\n",
+        fmt_f64(m.value)
+    ));
 }
 
 /// Render a summary: one `name{...,quantile="q"}` line per quantile plus `name_count` = the

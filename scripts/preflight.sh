@@ -17,6 +17,15 @@ step() { echo; echo "━━━ $1"; shift; if "$@"; then echo "  ✓"; else echo
 
 echo "▶ Pre-release gate — mirroring CI (RUSTFLAGS=$RUSTFLAGS)"
 
+# ── Working tree must be COMMITTED ──
+# CI checks the committed tree, not your working copy. A local `cargo fmt` that reformats a file
+# but is never committed passes this gate yet fails CI. Fail loudly if anything is uncommitted.
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  echo "  ✗ uncommitted changes — CI tests the COMMITTED tree, so commit first (a stray"
+  echo "    'cargo fmt' edit that is never committed is exactly how red CI slips through):"
+  git status --short | head; fail=1
+fi
+
 # ── Job 1: fmt · structure · clippy · build · test (default features) ──
 step "fmt --all --check"                 cargo fmt --all -- --check
 [ -x scripts/structure-lint.sh ] && step "structure-lint" ./scripts/structure-lint.sh
@@ -30,6 +39,17 @@ step "test (default)"                    cargo test --workspace --locked
 step "clippy (no-default, all-targets)"  cargo clippy --no-default-features --all-targets --locked -- -D warnings
 step "build (no-default)"                cargo build --no-default-features --locked
 step "test (no-default)"                 cargo test --no-default-features --locked
+
+# ── Security job: cargo-deny (advisories · licenses · sources · bans) ──
+echo; echo "━━━ cargo-deny"
+if command -v cargo-deny >/dev/null 2>&1; then
+  if cargo deny check >/tmp/preflight-deny.log 2>&1; then echo "  ✓"; else
+    echo "  ✗ cargo-deny failed:"; grep -iE "error|warning" /tmp/preflight-deny.log | head -6; fail=1
+  fi
+else
+  echo "  ⚠ cargo-deny not installed (cargo install cargo-deny) — the Security CI job is NOT"
+  echo "    covered locally; verify it green before tagging."
+fi
 
 # ── Job 3: windows build · test (best-effort locally) ──
 # Catches cfg(unix)-only items left dead on Windows (e.g. a const used only inside #[cfg(unix)]).
