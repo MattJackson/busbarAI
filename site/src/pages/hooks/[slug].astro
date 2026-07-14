@@ -5,6 +5,8 @@
 // is shared with the store index via src/data/hooks.ts.
 import PageLayout from '../../layouts/PageLayout.astro';
 import { hooks, kindLabel, type Hook } from '../../data/hooks';
+import { dockerCount } from '../../lib/format';
+import dockerMark from '../../assets/docker.svg';
 
 export function getStaticPaths() {
   return hooks
@@ -14,6 +16,21 @@ export function getStaticPaths() {
 
 interface Props { hook: Hook }
 const { hook } = Astro.props;
+
+// Live Docker Hub pull count for this hook's image, fetched ONCE at build time (no client JS) and
+// formatted Docker-Hub-style (2,034 -> "2.1K"). Fail-safe: any error leaves it null and the badge
+// falls back to a plain "Docker" label, so a Docker Hub hiccup never breaks the build.
+let dockerPulls: number | null = null;
+if (hook.dockerRepo) {
+  try {
+    const res = await fetch(`https://hub.docker.com/v2/repositories/${hook.dockerRepo}/`);
+    if (res.ok) {
+      const n = (await res.json())?.pull_count;
+      if (typeof n === 'number' && n > 0) dockerPulls = n;
+    }
+  } catch { /* offline / rate-limited build → plain label */ }
+}
+const dockerPullsLabel = dockerPulls != null ? dockerCount(dockerPulls) : null;
 const statusClass = `status-${hook.status.toLowerCase().replace(' ', '-')}`;
 
 // Inline logos for the spotlight link row (24x24 viewBox). Icon, not button.
@@ -43,6 +60,13 @@ const ICONS: Record<string, string> = {
           <a class="hook-action" href={hook.hookRepo} target="_blank" rel="noopener" title="Busbar on GitHub" aria-label="Busbar on GitHub">
             <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true" set:html={ICONS.github}></svg>
             <span>GitHub</span>
+          </a>
+        )}
+        {hook.dockerRepo && (
+          <a class="hook-action" href={`https://hub.docker.com/r/${hook.dockerRepo}`} target="_blank" rel="noopener"
+             title="Docker Hub" aria-label={dockerPullsLabel ? `Docker Hub — ${dockerPullsLabel} pulls` : 'Docker Hub'}>
+            <img src={dockerMark.src} alt="" width="17" height="17" />
+            <span>{dockerPullsLabel ?? 'Docker'}</span>
           </a>
         )}
         {hook.install && (

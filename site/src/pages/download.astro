@@ -11,6 +11,7 @@ import dockerMark from '../assets/docker.svg';
 import release from '../release.json';
 import Nav from '../components/Nav.astro';
 import Analytics from '../components/Analytics.astro';
+import { dockerCount } from '../lib/format';
 
 const GITHUB = 'https://github.com/MattJackson/busbarAI';
 const REL = `${GITHUB}/releases/latest/download`;
@@ -28,7 +29,8 @@ try {
     if (typeof n === 'number' && n > 0) dockerPulls = n;
   }
 } catch { /* offline / rate-limited build → no badge */ }
-const dockerPullsLabel = dockerPulls != null ? dockerPulls.toLocaleString('en-US') : null;
+// Docker-Hub-style: exact under 1,000, rounded up to 1 decimal (2,034 -> "2.1K") above.
+const dockerPullsLabel = dockerPulls != null ? dockerCount(dockerPulls) : null;
 
 const ORG = { '@context': 'https://schema.org', '@type': 'Organization', name: 'Busbar', url: 'https://getbusbar.com', logo: 'https://getbusbar.com/favicon.svg', sameAs: ['https://github.com/MattJackson/busbarAI'] };
 const WEBSITE = { '@context': 'https://schema.org', '@type': 'WebSite', name: 'Busbar', url: 'https://getbusbar.com' };
