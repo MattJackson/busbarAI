@@ -508,7 +508,7 @@ pub(crate) struct EffectiveConfigView {
 /// `price_per_1k_tokens_cents`) — and therefore every derived `spend_micros` — are denominated in.
 pub(crate) const USAGE_CURRENCY: &str = "USD";
 
-/// Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle (Matthew):
+/// Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle:
 /// busbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token
 /// SPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer
 /// with its own (special/negotiated) price catalog reconstructs cost independently; `spend_micros`

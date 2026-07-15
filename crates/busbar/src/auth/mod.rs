@@ -655,7 +655,7 @@ fn module_admin_scope_cap(
 /// `app`'s admin chain (chain verdict → group_map resolution → module ceiling), without serving
 /// anything. `None` = denied / no grant. `PUT /api/v1/admin/auth` runs the CALLER through the
 /// CANDIDATE chain with this before committing — a chain that would lock the caller out is
-/// rejected instead of applied (Matthew's D4 ruling; restart remains the backstop).
+/// rejected instead of applied (D4 ruling; restart remains the backstop).
 pub(crate) fn dry_run_admin_scope(
     app: &crate::state::App,
     bearer: Option<&str>,

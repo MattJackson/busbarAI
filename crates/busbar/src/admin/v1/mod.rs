@@ -3,7 +3,7 @@
 
 //! Admin API **v1** — the frozen, additive-only surface, as a self-contained version unit.
 //!
-//! Version-first layout (Matthew 7/11): everything that can differ between API versions lives under
+//! Version-first layout: everything that can differ between API versions lives under
 //! the version directory, so releasing v2 is a LAYER operation — copy `v1/` to `v2/`, change only what
 //! differs, and mount `/admin/v2/*` alongside. v1 never breaks.
 //!

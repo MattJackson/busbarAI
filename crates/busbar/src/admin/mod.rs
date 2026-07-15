@@ -170,7 +170,7 @@ fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
 
 // ── Admin API (the FROZEN surface — /api/v1/admin/*) ─────────────────────────────────────────────────
 //
-// Built engine + swappable layers (Matthew 7/11), VERSION-FIRST: each API version (`v1`, later `v2`)
+// Built engine + swappable layers, VERSION-FIRST: each API version (`v1`, later `v2`)
 // is a self-contained unit under its own directory holding that version's CONTRACT (typed views +
 // stable error codes), its SERVICE (typed operations over the shared engine), and its TRANSPORT wire
 // adapters (`json`, later `graphql`). The transport PORT (`AdminTransport` in `transport`) is shared
