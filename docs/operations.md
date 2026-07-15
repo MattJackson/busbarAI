@@ -19,7 +19,7 @@ variables.
 Startup is fail-loud: an unset `${VAR}`, an unknown provider reference, an unknown
 protocol or auth mode, or an invalid `on_exhausted` action stops the process with a
 diagnostic. A provider whose key env var is empty logs a warning and runs (its lane
-will fail auth on first use). `auth.mode: none` prints a loud open-relay warning.
+will fail auth on first use). `auth.chain: []` prints a loud open-relay warning.
 
 The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive connections per upstream host.
 

@@ -290,9 +290,9 @@ POST /model/{model_id}/converse-stream
 
 **Auth carrier (ingress):** AWS SDKs sign requests with SigV4 (`Authorization: AWS4-HMAC-SHA256 ...`). Busbar supports two tracks for Bedrock ingress depending on whether governance is enabled.
 
-**Track A: Without governance (`auth.mode: passthrough` or `none`):** Busbar does not verify the inbound SigV4 signature. Bearer-style carriers (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`) are the only tokens Busbar's auth middleware reads in these modes. The SigV4 header is forwarded upstream to the Bedrock backend (passthrough) or ignored entirely (none). Use this when you want AWS SDK clients to target Busbar as a transparent Bedrock proxy with pooling and failover but without per-key governance controls.
+**Track A: Without governance (`auth.chain: []`, with `upstream_credentials: passthrough` or without):** Busbar does not verify the inbound SigV4 signature. Bearer-style carriers (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`) are the only tokens Busbar's auth middleware reads in these modes. The SigV4 header is forwarded upstream to the Bedrock backend (`upstream_credentials: passthrough`) or ignored entirely (plain `chain: []`). Use this when you want AWS SDK clients to target Busbar as a transparent Bedrock proxy with pooling and failover but without per-key governance controls.
 
-**Track B: With governance (`auth.mode: token` + `governance.enabled: true`):** Busbar verifies the inbound SigV4 signature natively (`src/auth/mod.rs` `verify_bedrock_sigv4`). An operator mints a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response returns an `aws_access_key_id` + `aws_secret_access_key` alongside the usual bearer `secret` (both shown once, never again). The Bedrock SDK authenticates with that credential pair, Busbar verifies the signature and body integrity (`x-amz-content-sha256`), then attaches the same `GovCtx` a bearer request would, so budget / RPM / TPM / allowed-pools all apply. No passthrough is required; governance and Bedrock-ingress coexist.
+**Track B: With governance (`auth.chain: [tokens]` + `governance.enabled: true`):** Busbar verifies the inbound SigV4 signature natively (`src/auth/mod.rs` `verify_bedrock_sigv4`). An operator mints a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response returns an `aws_access_key_id` + `aws_secret_access_key` alongside the usual bearer `secret` (both shown once, never again). The Bedrock SDK authenticates with that credential pair, Busbar verifies the signature and body integrity (`x-amz-content-sha256`), then attaches the same `GovCtx` a bearer request would, so budget / RPM / TPM / allowed-pools all apply. No passthrough is required; governance and Bedrock-ingress coexist.
 
 **Auth header (egress to Bedrock backend):** Per-request AWS SigV4, computed by Busbar using the key from the lane's `api_key_env` environment variable. The key format is `ACCESS_KEY_ID:SECRET_ACCESS_KEY` (or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN` for temporary credentials): Busbar splits on up to three colon-separated parts. The region is parsed from the Bedrock `base_url` hostname.
 
@@ -539,7 +539,7 @@ On same-protocol routes, none of the above applies. The request body is forwarde
 listen: "0.0.0.0:8080"
 
 auth:
-  mode: token
+  chain: [tokens]
   client_tokens: ["${BUSBAR_TOKEN}"]
 
 providers:
@@ -747,4 +747,4 @@ A heterogeneous pool (members spanning more than one egress protocol) emits a wa
 | `responses` | `POST /v1/responses` | `http://busbar:8080` | `Authorization: Bearer` |
 | `cohere` | `POST /v2/chat` | `http://busbar:8080` | `Authorization: Bearer` |
 | `gemini` | `POST /v1[beta]/models/{model}:generateContent[Stream]` | `http://busbar:8080` (via `api_endpoint`) | `x-goog-api-key` |
-| `bedrock` | `POST /model/{model_id}/converse[-stream]` | `http://busbar:8080` (via `endpoint_url`) | SigV4, with governance: minted `aws_access_key_id`/`aws_secret_access_key` (verified by Busbar); without governance: `auth.mode: passthrough` or `none` |
+| `bedrock` | `POST /model/{model_id}/converse[-stream]` | `http://busbar:8080` (via `endpoint_url`) | SigV4, with governance: minted `aws_access_key_id`/`aws_secret_access_key` (verified by Busbar); without governance: `auth.chain: []` (+ `upstream_credentials: passthrough` to forward creds) |

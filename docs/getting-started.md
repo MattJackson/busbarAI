@@ -232,7 +232,7 @@ Once the single-provider setup is working, extend the config to introduce a pool
 ```yaml
 # config.yaml, two providers, two models, one pool, with client auth
 auth:
-  mode: token
+  chain: [tokens]
   client_tokens:
     - "${BUSBAR_CLIENT_TOKEN}"
 
@@ -310,7 +310,7 @@ curl -s http://localhost:8080/stats \
   -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" | jq .
 ```
 
-`/stats` goes through the auth middleware, so under `auth.mode: token` (or governance) it requires a valid token; under `mode: none` it is open. It returns a per-lane snapshot: `model`, `provider`, `max_concurrent`, `inflight`, `free_slots`, `ok`/`err`/`client_fault` counts, `usable`, `dead`, `dead_reason`, `cooldown_remaining_s`, `streak`, and `budget`. A governance key restricted to specific `allowed_pools` only sees the pools and lanes it can reach.
+`/stats` goes through the auth middleware, so under `auth.chain: [tokens]` (or governance) it requires a valid token; under `chain: []` it is open. It returns a per-lane snapshot: `model`, `provider`, `max_concurrent`, `inflight`, `free_slots`, `ok`/`err`/`client_fault` counts, `usable`, `dead`, `dead_reason`, `cooldown_remaining_s`, `streak`, and `budget`. A governance key restricted to specific `allowed_pools` only sees the pools and lanes it can reach.
 
 **Prometheus metrics** (`/metrics`):
 
@@ -327,13 +327,14 @@ Prometheus scrape exposition. Like `/stats`, `/metrics` is subject to the auth m
 
 ### auth: none (local dev, open relay)
 
-Omit the `auth` block entirely, or set `mode: none`. No `Authorization` header required. Do not use in production.
+Omit the `auth` block entirely, or set `chain: []`. No `Authorization` header required. Do not use in production.
 
 ### auth: passthrough (forward your own key)
 
 ```yaml
 auth:
-  mode: passthrough
+  chain: []
+  upstream_credentials: passthrough
 ```
 
 The caller's own token (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`) is forwarded directly to the upstream provider. Use this when each caller has their own provider key and you want Busbar purely for routing and protocol translation, not credential management.
@@ -363,8 +364,8 @@ Busbar signs each outbound request with SigV4 (region parsed from the host); you
 
 **Bedrock ingress** (acting as a Bedrock endpoint for native AWS SDK clients) has two tracks:
 
-- **Without governance** (`auth.mode: passthrough` or `none`): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (none).
-- **With governance** (`auth.mode: token` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **Without governance** (`auth.chain: []` with `upstream_credentials: passthrough`, or `chain: []` alone): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (plain `chain: []`).
+- **With governance** (`auth.chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 ### Injecting `max_tokens` for cross-protocol calls
 
@@ -386,7 +387,7 @@ A caller-supplied `max_tokens` is always preserved; this only applies when the f
 
 Before taking Busbar out of dev mode:
 
-- [ ] Set `auth.mode: token` with at least one `client_tokens` entry (or enable governance for per-key virtual tokens)
+- [ ] Set `auth.chain: [tokens]` with at least one `client_tokens` entry (or enable governance for per-key virtual tokens)
 - [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
 - [ ] Set `max_concurrent` on every model to a value your provider tier actually supports
 - [ ] Set `max_requests` to `-1` (unlimited lifetime budget) or a finite positive budget per model

@@ -27,7 +27,7 @@ The following config creates a production-like setup: a weighted primary pool wi
 listen: "0.0.0.0:8080"
 
 auth:
-  mode: token
+  chain: [tokens]
   client_tokens:
     - "${BUSBAR_CLIENT_TOKEN}"
 

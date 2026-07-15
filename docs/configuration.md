@@ -807,7 +807,7 @@ governance:
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
 - **Budget admission is a hard, atomic cap.** The budget check and the flat per-request charge are one atomic conditional UPSERT (`charge_within_budget`): a request whose fee would push the window's spend past `max_budget_cents` is rejected before it is forwarded, and a concurrent burst cannot race past the limit. The **token-priced component** (`price_per_1k_tokens_cents`) is accrued post-response, so spend from requests already in flight when the cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its flat fee refunded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed).
 
-**Incompatible combination:** `enabled: true` + `auth.mode: passthrough` is a startup error. Governance supersedes passthrough; the combination is unsupported.
+**Incompatible combination:** `enabled: true` + `auth.upstream_credentials: passthrough` is a startup error. Governance supersedes passthrough; the combination is unsupported.
 
 **Virtual key format:** `sk-bb-<32 hex characters>` (128-bit CSPRNG). Shown in plaintext exactly once at mint; stored as SHA-256 hash only. Key IDs have the form `vk_<16 hex characters>`.
 
@@ -870,7 +870,7 @@ models:
 **Routes available:**
 - `POST /claude/v1/messages`: Anthropic ingress, directly to the `claude` model.
 - `GET /healthz`, readiness check.
-- `GET /metrics`, Prometheus (admitted unconditionally under `mode: none`).
+- `GET /metrics`, Prometheus (admitted unconditionally under `chain: []`).
 
 `listen` defaults to `0.0.0.0:8080`. No auth gate. No pools.
 

@@ -146,6 +146,6 @@ pools:
 
 ### Cost-, latency-, and custom-based routing
 
-Choosing *which* member serves a request (cheapest, fastest, least busy, or your own webhook/Rhai logic) is a routing-policy concern, not a pool-shape one. Those recipes, with full worked examples, live in the [Routing guide](routing.md#full-examples).
+Choosing *which* member serves a request (cheapest, fastest, least busy, or your own webhook/socket gate hook returning an `order`) is a routing concern, not a pool-shape one — a pool names its selection strategy plus any gates in one `hooks: [...]` list. Those recipes, with full worked examples, live in the [Routing guide](routing.md#full-examples).
 
-See the [Routing guide](routing.md) for the full policy contract and the signals each policy receives, and [Circuit breaker](/docs/circuit-breaker/) / [In-flight failover](/docs/failover/) for how the breaker and failover behave once a policy has chosen an order.
+See the [Routing guide](routing.md) for the full ordering-hook contract and the signals each strategy and gate hook receives, and [Circuit breaker](/docs/circuit-breaker/) / [In-flight failover](/docs/failover/) for how the breaker and failover behave once a strategy or gate hook has chosen an order.
