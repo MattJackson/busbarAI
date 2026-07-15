@@ -32,6 +32,82 @@ async fn forward(
 }
 use std::sync::Arc;
 
+/// Pre-release latency capture (opt-in). Drives N in-process requests through the full forward path
+/// against an instant mock upstream and reports the request-handling-time distribution — a
+/// reproducible latency regression metric that runs in the normal test build (no cert, no key, no
+/// external mock). It's a no-op unless `BUSBAR_CAPTURE_METRICS` is set, so it costs nothing in CI.
+///
+/// For release-representative numbers, build under `--release`:
+///   BUSBAR_CAPTURE_METRICS=1 cargo test --release -p busbar capture_latency_metrics -- --nocapture
+/// Emits a line the site metrics harness parses:  `BUSBAR_METRICS busbar.latency.inproc_handle_us ...`
+#[tokio::test]
+async fn capture_latency_metrics() {
+    if std::env::var("BUSBAR_CAPTURE_METRICS").is_err() {
+        return; // opt-in only — normal test runs skip this.
+    }
+    let n: usize = std::env::var("BUSBAR_CAPTURE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+    let warmup = 2_000usize;
+
+    let state = Arc::new(MockServerState::new());
+    let server = MockServer::new(state.clone()).await;
+    let app = TestApp::new()
+        .lane(LaneSpec::new(
+            "m",
+            crate::proto::Protocol::anthropic(),
+            &server.base_url(),
+        ))
+        .pool("p", &[(0, 1)])
+        .build();
+    let body = bytes::Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16
+        }))
+        .unwrap(),
+    );
+    let cands = || {
+        vec![crate::state::WeightedLane {
+            reasoning: None,
+            idx: 0,
+            weight: 1,
+            attempt_timeout_ms: None,
+        }]
+    };
+    let ok = || MockResponse::Ok {
+        status: StatusCode::OK,
+        body: json!({"content": [{"type": "text", "text": "ok"}]}),
+    };
+
+    for _ in 0..warmup {
+        state.push(ok());
+        let _ = forward(app.clone(), cands(), body.clone(), None, None).await;
+    }
+    let mut ns: Vec<u64> = Vec::with_capacity(n);
+    for _ in 0..n {
+        state.push(ok());
+        let t = std::time::Instant::now();
+        let _ = forward(app.clone(), cands(), body.clone(), None, None).await;
+        ns.push(t.elapsed().as_nanos() as u64);
+    }
+    ns.sort_unstable();
+    let pct = |p: f64| -> f64 {
+        let i = (((ns.len() - 1) as f64) * p).round() as usize;
+        ns[i] as f64 / 1000.0
+    };
+    eprintln!(
+        "BUSBAR_METRICS busbar.latency.inproc_handle_us n={} p50={:.2} p90={:.2} p99={:.2}",
+        n,
+        pct(0.50),
+        pct(0.90),
+        pct(0.99)
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn test_mock_server_ok_response() {
     let state = Arc::new(MockServerState::new());
