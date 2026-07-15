@@ -304,11 +304,15 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             if applied {
                 match crate::json::to_vec(parsed) {
                     Ok(bytes) => body = Bytes::from(bytes),
-                    // Serialization of a Value we just built cannot realistically fail; if it
-                    // somehow does, keep the original bytes (the pre-rewrite request is still a
-                    // valid request — fail-safe, never a corrupted body).
+                    // A `prompt: rw` rewrite is a TRUSTED, possibly security-critical transform. If it
+                    // cannot be serialized into the retained bytes, the first hop carries it but every
+                    // FAILOVER hop (which re-parses `body`) would forward the ORIGINAL un-rewritten
+                    // request — fail-OPEN on the rewrite guarantee. Fail CLOSED: reject rather than
+                    // leak the un-rewritten body to a fallback lane. (Not realistically reachable;
+                    // defense-in-depth for the rewrite invariant.)
                     Err(e) => {
-                        tracing::warn!(error = %e, "re-serializing rewritten body failed; keeping the original bytes");
+                        tracing::error!(error = %e, "re-serializing a committed rewrite failed; rejecting to avoid forwarding the un-rewritten request on failover");
+                        return reject(500, "request rewrite could not be applied".to_string());
                     }
                 }
             }
@@ -2108,7 +2112,9 @@ fn fire_global_taps(
         if let Some(proj) = proj {
             let policy = hook.clone();
             let budget = *timeout;
-            tokio::spawn(async move { policy.notify(&proj, budget).await });
+            crate::proxy::hooks::spawn_bounded_tap(
+                async move { policy.notify(&proj, budget).await },
+            );
         }
     }
 }

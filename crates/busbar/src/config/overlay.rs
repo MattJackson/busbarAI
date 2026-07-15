@@ -35,8 +35,21 @@ pub(crate) fn persist(
     deleted_remove: Option<&str>,
 ) {
     if let Some(p) = path {
-        // Accumulate tombstones across applies (read the prior set, if any).
-        let mut deleted = read(p).map(|d| d.deleted).unwrap_or_default();
+        // Read-modify-WRITE, not the fail-soft boot read. `read()` collapses absent/unreadable/corrupt
+        // to None; starting empty then overwriting would PERMANENTLY drop accumulated deletions and
+        // silently resurrect an API-deleted hook on restart. Distinguish: absent -> start fresh;
+        // present-but-unreadable -> REFUSE to overwrite, preserving the existing overlay.
+        let mut deleted = match read_state(p) {
+            OverlayReadState::Absent => Vec::new(),
+            OverlayReadState::Loaded(d) => d.deleted,
+            OverlayReadState::Unreadable => {
+                tracing::error!(
+                    path = %p.display(),
+                    "config overlay exists but is unreadable/corrupt; REFUSING to overwrite it (would                      drop hook-deletion tombstones and could resurrect a deleted hook). This apply is                      NOT persisted — fix or remove the overlay file to restore durability."
+                );
+                return;
+            }
+        };
         if let Some(name) = deleted_add {
             if !deleted.iter().any(|n| n == name) {
                 deleted.push(name.to_string());
@@ -83,6 +96,26 @@ pub(crate) struct OverlayDoc {
 pub(crate) fn read(path: &Path) -> Option<OverlayDoc> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Classified overlay read for the read-modify-WRITE path (`persist`), which — unlike the fail-soft
+/// boot `read` — MUST tell "absent" (safe to start fresh) apart from "present but unreadable/corrupt"
+/// (must NOT overwrite, or accumulated tombstones are lost).
+pub(crate) enum OverlayReadState {
+    Absent,
+    Loaded(OverlayDoc),
+    Unreadable,
+}
+
+pub(crate) fn read_state(path: &Path) -> OverlayReadState {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OverlayReadState::Absent,
+        Err(_) => OverlayReadState::Unreadable,
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(doc) => OverlayReadState::Loaded(doc),
+            Err(_) => OverlayReadState::Unreadable,
+        },
+    }
 }
 
 /// Atomically write the overlay: serialize to a sibling `.tmp` then rename over `path`, so a reader
@@ -222,6 +255,32 @@ mod tests {
             "a tombstoned base hook is removed from the effective config"
         );
         assert!(!deploy.global_hooks.iter().any(|g| g == "base_hook"));
+    }
+
+    /// REGRESSION: `persist` must NOT overwrite a present-but-unreadable/corrupt overlay — that would
+    /// drop accumulated deletion tombstones and silently resurrect a deleted hook on restart.
+    #[test]
+    fn persist_refuses_to_overwrite_unreadable_overlay() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "busbar-overlay-corrupt-persist-{}.json",
+            std::process::id()
+        ));
+        let corrupt = b"{ this is not valid json and may hide tombstones";
+        std::fs::write(&path, corrupt).unwrap();
+        persist(
+            Some(&path),
+            &HashMap::from([("newhook".to_string(), gate())]),
+            &["newhook".to_string()],
+            Some("deleteme"),
+            None,
+        );
+        let raw = std::fs::read(&path).expect("file still present");
+        assert_eq!(
+            raw, corrupt,
+            "persist must preserve an unreadable overlay verbatim"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// REGRESSION (audit c1r5): a WHOLESALE registry write (config rollback passes both tombstone

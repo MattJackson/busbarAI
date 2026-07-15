@@ -95,6 +95,10 @@ pub(crate) const ROUTE_POLICY_REJECTIONS_TOTAL: &str = "busbar_route_policy_reje
 // alerts on a non-zero rate to detect "the webhook is overwhelmed and logs are being shed silently."
 pub(crate) const WEBHOOK_LOGS_DROPPED_TOTAL: &str = "busbar_webhook_logs_dropped_total"; // no labels
 
+// A fire-and-forget TAP notification dropped because the in-flight cap was reached (slow/unreachable
+// tap endpoint). Unlabeled global backpressure. Alert on a non-zero rate.
+pub(crate) const TAP_NOTIFICATIONS_DROPPED_TOTAL: &str = "busbar_tap_notifications_dropped_total";
+
 // Same-protocol non-stream responses whose billing-side buffer hit the translate-body cap before the
 // terminal `usage` block, so token usage could not be parsed and the request billed zero despite a
 // full 2xx reaching the client. Incremented once per truncated response. Unlabeled. An operator
