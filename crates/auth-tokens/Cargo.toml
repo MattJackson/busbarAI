@@ -8,4 +8,4 @@ description = "The built-in `tokens` auth plugin for busbar: a static client-tok
 license = "Apache-2.0"
 
 [dependencies]
-busbar-api = { path = "../../api" }
+busbar-api = { path = "../api" }

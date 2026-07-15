@@ -8,7 +8,7 @@ description = "The built-in ranking hooks for busbar: cheapest / fastest / least
 license = "Apache-2.0"
 
 [dependencies]
-busbar-api = { path = "../../api" }
+busbar-api = { path = "../api" }
 async-trait = "0.1"
 
 [dev-dependencies]

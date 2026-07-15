@@ -7,6 +7,29 @@ true by construction. Size reduction is a side effect of getting that right, not
 Four invariants, all mechanically enforced by `scripts/structure-lint.sh` (run in CI). If they hold,
 the tree cannot drift back into giant, inconsistent files.
 
+## 0. Workspace layout — all Rust lives under `crates/`
+
+The repo is a Cargo workspace. Every crate lives under `crates/`, and nothing else at the root is
+Rust — so "code vs not-code" is obvious at a glance:
+
+```
+crates/
+  busbar/            the engine + binary (src/main.rs, the request path, admin plane, protocols)
+  api/               the plugin CONTRACT crate — traits/types both the engine and every plugin build against
+  auth-tokens/       built-in `tokens` auth plugin        (default-on, removable feature)
+  auth-admin-tokens/ built-in `admin-tokens` admin plugin (default-on, removable feature)
+  hooks-ranking/     built-in cheapest/fastest/… policies (default-on, removable feature)
+```
+
+Dependency direction is one-way: `busbar` → `api` ← plugins. A plugin depends only on `api`, never on
+the engine — so a built-in is structured exactly like a third-party plugin would be (no privileged
+access). Each plugin is an `optional` dependency gated by a feature, so `--no-default-features` compiles
+it out entirely. Non-Rust lives at the root: `examples/`, `scripts/`, `docs/`, `bench/`, `config.yaml`,
+`providers.yaml`, `Dockerfile`. The `[profile.release]` and `[workspace]` table are in the root
+`Cargo.toml`; each crate's `[package]` is in its own `crates/<name>/Cargo.toml`.
+
+The invariants below govern module layout *within* each crate's `src/`.
+
 ## 1. A module is a file *or* a folder — never both
 
 `foo.rs` and `foo/` must not coexist. The moment a module needs a second file, the parent `foo.rs`

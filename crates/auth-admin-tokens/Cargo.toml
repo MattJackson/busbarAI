@@ -8,4 +8,4 @@ description = "The built-in `admin-tokens` admin-auth plugin for busbar: the sin
 license = "Apache-2.0"
 
 [dependencies]
-busbar-api = { path = "../../api" }
+busbar-api = { path = "../api" }
