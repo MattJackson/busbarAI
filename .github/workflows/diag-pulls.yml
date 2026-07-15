@@ -1,0 +1,19 @@
+name: diag-pulls
+on: { workflow_dispatch: {} }
+permissions: {}
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe
+        run: |
+          set -uo pipefail
+          echo "== runner egress IP =="
+          curl -s https://api.ipify.org; echo
+          echo "== Docker Hub busbar =="
+          curl -s "https://hub.docker.com/v2/repositories/getbusbar/busbar/" -o /tmp/dh.json -w "HTTP %{http_code}\n"
+          head -c 300 /tmp/dh.json; echo
+          echo "== Docker Hub headroom-hook =="
+          curl -s "https://hub.docker.com/v2/repositories/getbusbar/headroom-hook/" -o /dev/null -w "HTTP %{http_code}\n"
+          echo "== getbusbar POST (bogus auth) =="
+          curl -s -X POST "https://getbusbar.com/api/pulls" -H "authorization: Bearer BOGUS" -H "content-type: application/json" -d '{"repo":"getbusbar/busbar","pull_count":1}' -o /dev/null -w "HTTP %{http_code}\n"
