@@ -23,6 +23,28 @@ will fail auth on first use). `auth.chain: []` prints a loud open-relay warning.
 
 The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive connections per upstream host.
 
+### Validating configuration (`busbar --validate`)
+
+`busbar --validate` runs the exact load → resolve → validate pipeline the gateway runs at boot —
+then exits, **without** starting the server. It binds no port, writes no state file, spawns no
+tasks, opens no TLS material, and makes no network call, so it is safe to run anywhere, including
+in CI and against a config edited on a live host before you reload it.
+
+```sh
+BUSBAR_CONFIG=./config.yaml BUSBAR_PROVIDERS=./providers.yaml busbar --validate
+# ok: config valid — 2 provider(s), 2 model(s), 1 pool(s)
+#   note: 1 env var(s) referenced but unset here — required at runtime: BUSBAR_CLIENT_TOKEN
+```
+
+- **Exit `0`** = valid; **`1`** = errors (same diagnostics boot prints — invalid YAML, removed keys,
+  dangling pool/lane references, malformed auth chains, cert-file and `base_url`/`path` SSRF violations).
+  Use it as a CI gate: `busbar --validate && deploy`.
+- **Secrets are not required.** It checks *structure*, not upstream reachability, so a `${VAR}` unset
+  in your shell is reported in a `note:` ("required at runtime") rather than failing — you can validate
+  in CI without production secrets. (At real boot an unset `${VAR}` is still a hard error.)
+- Honors `BUSBAR_CONFIG`, `BUSBAR_PROVIDERS`, and `--safe-mode` exactly as boot does. Because it reuses
+  the boot path, a clean `--validate` means a clean boot.
+
 ## Inbound TLS & mutual-TLS (mTLS)
 
 Busbar terminates TLS natively for the client↔Busbar hop. Add an optional `tls`

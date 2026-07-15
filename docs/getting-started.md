@@ -391,6 +391,7 @@ Before taking Busbar out of dev mode:
 - [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
 - [ ] Set `max_concurrent` on every model to a value your provider tier actually supports
 - [ ] Set `max_requests` to `-1` (unlimited lifetime budget) or a finite positive budget per model
+- [ ] Run `busbar --validate` (in CI and before every deploy/reload): parses and validates both YAML files with no server, no network, and no secrets required — exit `0` = valid, `1` = errors. See [`operations.md#validating-configuration-busbar---validate`](operations.md#validating-configuration-busbar---validate)
 - [ ] Verify `/healthz` returns `200` and `/stats` shows all lanes `usable: true` before routing production traffic
 - [ ] Consider `health.mode: dead` on providers you care about (re-probes tripped lanes so they recover faster after an outage clears)
 - [ ] Set `RUST_LOG=info` (the default); increase to `debug` only temporarily for diagnostics
