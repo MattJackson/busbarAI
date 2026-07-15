@@ -23,30 +23,6 @@ impl ProtocolWriter for GeminiWriter {
         format!("{GEMINI_PATH_BASE}/{model}:generateContent")
     }
 
-    fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Validate the credential against the HTTP header-value byte rules (`HeaderValue::from_str`
-        // rejects ASCII control bytes such as a newline or NUL). A mis-encoded key — e.g. a stray
-        // newline injected by a config system — would otherwise be SILENTLY swallowed into an empty
-        // `x-goog-api-key` value, and every request to the lane would get a Google-side 401 with NO
-        // proxy-side signal
-        // (the operator cannot tell a bad credential from a bad encoding). Instead, surface a
-        // `tracing::warn!` and OMIT the header entirely (empty vec) — mirroring bedrock's
-        // misconfigured-credential path, which returns no signature rather than a meaningless empty
-        // one. The request is still sent (the trait can't refuse it here) and Google answers 401, but
-        // the warn line tells the operator the lane's credential bytes are invalid. The key itself is
-        // NEVER logged (it is the secret); only the fact that it is malformed.
-        match HeaderValue::from_str(key) {
-            Ok(value) => vec![(HeaderName::from_static("x-goog-api-key"), value)],
-            Err(_) => {
-                tracing::warn!(
-                    "gemini: x-goog-api-key credential contains invalid header bytes (ASCII \
-                     control character); omitting auth header — upstream will reject with 401"
-                );
-                Vec::new()
-            }
-        }
-    }
-
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
 

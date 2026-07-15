@@ -50,7 +50,6 @@ fn synth_response_id() -> String {
 fn test_bedrock_sigv4_sign_request_structure() {
     // SigV4 header assembly + scope/region derivation. (The signing crypto itself is
     // verified against AWS's published vector in sigv4::tests.)
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
         canonical_uri: crate::sigv4::uri_encode_path("/model/anthropic.claude:0/converse"),
@@ -58,7 +57,7 @@ fn test_bedrock_sigv4_sign_request_structure() {
         timestamp_epoch: 1_440_938_160, // 20150830T123600Z
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
-    let headers = writer.sign_request("AKIDEXAMPLE:SECRETKEY", &ctx);
+    let headers = crate::proto::bedrock::sigv4_sign_headers("AKIDEXAMPLE:SECRETKEY", &ctx);
 
     let get = |name: &str| {
         headers
@@ -85,7 +84,6 @@ fn test_bedrock_sigv4_sign_request_structure() {
 
 #[test]
 fn test_bedrock_sigv4_session_token() {
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "bedrock-runtime.eu-west-1.amazonaws.com".to_string(),
         canonical_uri: "/model/m/converse".to_string(),
@@ -93,7 +91,7 @@ fn test_bedrock_sigv4_session_token() {
         timestamp_epoch: 1_440_938_160,
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
-    let headers = writer.sign_request("AKID:SECRET:SESSIONTOKEN", &ctx);
+    let headers = crate::proto::bedrock::sigv4_sign_headers("AKID:SECRET:SESSIONTOKEN", &ctx);
     let tok = headers
         .iter()
         .find(|(k, _)| k.as_str() == "x-amz-security-token") // golden wire-contract literal (kept bare on purpose)
@@ -112,7 +110,6 @@ fn test_bedrock_sigv4_session_token() {
 #[test]
 fn test_bedrock_sigv4_misconfigured_key_no_signature() {
     // A key without ACCESS:SECRET shape yields no headers (AWS will 403 → surfaced as auth).
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
         canonical_uri: "/model/m/converse".to_string(),
@@ -120,7 +117,7 @@ fn test_bedrock_sigv4_misconfigured_key_no_signature() {
         timestamp_epoch: 1_440_938_160,
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
-    assert!(writer.sign_request("not-a-valid-key", &ctx).is_empty());
+    assert!(crate::proto::bedrock::sigv4_sign_headers("not-a-valid-key", &ctx).is_empty());
 }
 
 fn bedrock_rich_fixture() -> serde_json::Value {
@@ -677,7 +674,6 @@ fn test_write_response_event() {
 /// request goes out unsigned and AWS surfaces a 403 auth error instead of aborting the task.
 #[test]
 fn test_bedrock_sigv4_control_char_in_access_key_no_panic() {
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
         canonical_uri: "/model/m/converse".to_string(),
@@ -688,21 +684,21 @@ fn test_bedrock_sigv4_control_char_in_access_key_no_panic() {
     // CR/LF embedded in the access key id → invalid Authorization header value
     // (HeaderValue::from_str rejects ASCII control chars, including CR/LF). This is the
     // header-injection / misconfiguration vector the finding describes.
-    let headers = writer.sign_request("AKID\r\nINJECT:SECRET", &ctx);
+    let headers = crate::proto::bedrock::sigv4_sign_headers("AKID\r\nINJECT:SECRET", &ctx);
     assert!(
         headers.is_empty(),
         "control-char access key must yield no headers (graceful), not panic; got: {headers:?}"
     );
 
     // A bare NUL / control byte is likewise rejected gracefully rather than panicking.
-    let headers2 = writer.sign_request("AKID\u{0001}X:SECRET", &ctx);
+    let headers2 = crate::proto::bedrock::sigv4_sign_headers("AKID\u{0001}X:SECRET", &ctx);
     assert!(
         headers2.is_empty(),
         "control-char access key must yield no headers; got: {headers2:?}"
     );
 
     // Sanity: a well-formed key still produces the full signed header set.
-    let ok = writer.sign_request("AKIDEXAMPLE:SECRETKEY", &ctx);
+    let ok = crate::proto::bedrock::sigv4_sign_headers("AKIDEXAMPLE:SECRETKEY", &ctx);
     assert!(
         ok.iter().any(|(k, _)| k.as_str() == "authorization"),
         "valid key still signs"
@@ -1806,7 +1802,6 @@ fn test_stream_unrecognized_start_does_not_open_text() {
 /// empty-header path (unsigned request → AWS 403 as auth) — no panic, no divergence.
 #[test]
 fn test_bedrock_sigv4_unencodable_session_token_bails_gracefully() {
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "bedrock-runtime.us-east-1.amazonaws.com".to_string(),
         canonical_uri: "/model/m/converse".to_string(),
@@ -1815,7 +1810,7 @@ fn test_bedrock_sigv4_unencodable_session_token_bails_gracefully() {
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
     // Session token with an embedded control char → un-encodable HeaderValue.
-    let headers = writer.sign_request("AKID:SECRET:TOK\r\nEN", &ctx);
+    let headers = crate::proto::bedrock::sigv4_sign_headers("AKID:SECRET:TOK\r\nEN", &ctx);
     assert!(
         headers.is_empty(),
         "un-encodable session token must yield no headers (graceful), not a signed-but-absent \
@@ -1823,7 +1818,7 @@ fn test_bedrock_sigv4_unencodable_session_token_bails_gracefully() {
     );
     // A bare control byte (e.g. NUL / U+0001) likewise bails — `HeaderValue::from_str` rejects
     // ASCII control characters, the same vector as the misconfigured access-key path.
-    let headers2 = writer.sign_request("AKID:SECRET:TOK\u{0001}EN", &ctx);
+    let headers2 = crate::proto::bedrock::sigv4_sign_headers("AKID:SECRET:TOK\u{0001}EN", &ctx);
     assert!(
         headers2.is_empty(),
         "control-byte token must bail; got {headers2:?}"
@@ -1831,7 +1826,7 @@ fn test_bedrock_sigv4_unencodable_session_token_bails_gracefully() {
 
     // Sanity: a clean token still signs AND emits the token header, and the signed set commits
     // to it (so the two never diverge in the success case either).
-    let ok = writer.sign_request("AKID:SECRET:CLEANTOKEN", &ctx);
+    let ok = crate::proto::bedrock::sigv4_sign_headers("AKID:SECRET:CLEANTOKEN", &ctx);
     let auth = ok
         .iter()
         .find(|(k, _)| k.as_str() == "authorization")
@@ -2870,7 +2865,6 @@ fn test_derive_sigv4_region_shapes() {
 /// here we assert the derived scope region in the Authorization header.
 #[test]
 fn test_bedrock_sigv4_fips_host_derives_correct_region() {
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "bedrock-runtime-fips.eu-west-1.amazonaws.com".to_string(),
         canonical_uri: "/model/m/converse".to_string(),
@@ -2878,7 +2872,7 @@ fn test_bedrock_sigv4_fips_host_derives_correct_region() {
         timestamp_epoch: 1_440_938_160,
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
-    let headers = writer.sign_request("AKID:SECRET", &ctx);
+    let headers = crate::proto::bedrock::sigv4_sign_headers("AKID:SECRET", &ctx);
     let auth = headers
         .iter()
         .find(|(k, _)| k.as_str() == "authorization")
@@ -2899,7 +2893,6 @@ fn test_bedrock_sigv4_fips_host_derives_correct_region() {
 /// operator-visible signal, asserted indirectly via the resulting scope.
 #[test]
 fn test_bedrock_sigv4_undecodable_host_falls_back_to_us_east_1() {
-    let writer = BedrockWriter;
     let ctx = crate::proto::SigningContext {
         host: "my-cname-front.example.com".to_string(),
         canonical_uri: "/model/m/converse".to_string(),
@@ -2907,7 +2900,7 @@ fn test_bedrock_sigv4_undecodable_host_falls_back_to_us_east_1() {
         timestamp_epoch: 1_440_938_160,
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
-    let headers = writer.sign_request("AKID:SECRET", &ctx);
+    let headers = crate::proto::bedrock::sigv4_sign_headers("AKID:SECRET", &ctx);
     let auth = headers
         .iter()
         .find(|(k, _)| k.as_str() == "authorization")

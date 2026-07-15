@@ -16,22 +16,6 @@ impl ProtocolWriter for AnthropicWriter {
         Some(1)
     }
 
-    fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Mode-blind primitive (no signing context). An Ambiguous credential emits BOTH headers so
-        // neither the static-key nor the passthrough path silently drops. The live wire path uses
-        // `sign_request` below, which carries the auth mode and resolves Ambiguous to one header —
-        // so a real request never sends the dual-header upstream tell.
-        anthropic_auth_headers(key, None)
-    }
-
-    fn sign_request(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
-        // Wire path: the upstream-credential mode (set by proxy engine into the SigningContext) resolves
-        // an Ambiguous Anthropic credential to the SINGLE native header it implies — Passthrough
-        // forwards the caller's token as `authorization: Bearer`; Own presents the configured key as
-        // `x-api-key`. Clear ApiKey/OAuth credentials are unaffected (still single-header).
-        anthropic_auth_headers(key, Some(ctx.upstream_creds))
-    }
-
     fn requires_max_tokens(&self) -> bool {
         // Anthropic Messages 400s with `max_tokens: Field required` when absent.
         true

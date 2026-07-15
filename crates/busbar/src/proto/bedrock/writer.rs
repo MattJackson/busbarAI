@@ -1,5 +1,104 @@
 use super::*;
 
+/// AWS SigV4 signing for a Bedrock Converse request — the egress credential for `bedrock` lanes
+/// (dispatched via `crate::egress_auth`, and called by the Bedrock auth tests). Lane key encodes
+/// `ACCESS:SECRET[:SESSION]`; region parsed from the host; service=`bedrock`. A misconfigured key or
+/// un-encodable byte yields an empty header set (AWS 403, surfaced as auth) rather than panicking.
+pub(crate) fn sigv4_sign_headers(
+    key: &str,
+    ctx: &crate::proto::SigningContext,
+) -> Vec<(HeaderName, HeaderValue)> {
+    let mut parts = key.splitn(3, ':');
+    let (access, secret, token) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(s), tok) if !a.is_empty() && !s.is_empty() => (a, s, tok),
+        _ => return vec![],
+    };
+    let region = match derive_sigv4_region(&ctx.host) {
+        Some(r) => r,
+        None => {
+            tracing::warn!(host = %ctx.host, "could not derive AWS region from Bedrock endpoint host; defaulting SigV4 scope to us-east-1 (set a bedrock-runtime[-fips].<region>.amazonaws.com host)");
+            "us-east-1"
+        }
+    };
+    let service = "bedrock";
+    let (amzdate, datestamp) = crate::sigv4::format_amz_time(ctx.timestamp_epoch);
+    let payload_hash = crate::sigv4::sha256_hex(ctx.body);
+    let token_header = match token {
+        Some(t) => match HeaderValue::from_str(t) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!("Bedrock lane session token contains a byte rejected by HeaderValue; skipping signing to avoid a signed-but-absent x-amz-security-token header.");
+                return vec![];
+            }
+        },
+        None => None,
+    };
+    let mut signed = vec![
+        (
+            "content-type".to_string(),
+            crate::proxy::APPLICATION_JSON.to_string(),
+        ),
+        ("host".to_string(), ctx.host.clone()),
+        (
+            crate::sigv4::X_AMZ_CONTENT_SHA256.to_string(),
+            payload_hash.clone(),
+        ),
+        (crate::sigv4::X_AMZ_DATE.to_string(), amzdate.clone()),
+    ];
+    if let Some(t) = token {
+        signed.push((
+            crate::sigv4::X_AMZ_SECURITY_TOKEN.to_string(),
+            t.to_string(),
+        ));
+    }
+    let (signature, signed_headers) = crate::sigv4::sign_v4(
+        secret,
+        region,
+        service,
+        "POST",
+        &ctx.canonical_uri,
+        "",
+        &signed,
+        &payload_hash,
+        &amzdate,
+        &datestamp,
+    );
+    let authorization = {
+        use crate::sigv4::{SIGV4_ALGORITHM, SIGV4_TERMINATION};
+        format!(
+            "{SIGV4_ALGORITHM} Credential={access}/{datestamp}/{region}/{service}/{SIGV4_TERMINATION}, SignedHeaders={signed_headers}, Signature={signature}"
+        )
+    };
+    let (Ok(authorization_val), Ok(amzdate_val), Ok(payload_hash_val)) = (
+        HeaderValue::from_str(&authorization),
+        HeaderValue::from_str(&amzdate),
+        HeaderValue::from_str(&payload_hash),
+    ) else {
+        return vec![];
+    };
+    let mut out = vec![
+        (
+            HeaderName::from_static(crate::proto::HDR_AUTHORIZATION),
+            authorization_val,
+        ),
+        (
+            HeaderName::from_static(crate::sigv4::X_AMZ_DATE),
+            amzdate_val,
+        ),
+        (
+            HeaderName::from_static(crate::sigv4::X_AMZ_CONTENT_SHA256),
+            payload_hash_val,
+        ),
+    ];
+    if let Some(v) = token_header {
+        out.push((
+            HeaderName::from_static(crate::sigv4::X_AMZ_SECURITY_TOKEN),
+            v,
+        ));
+    }
+    out
+}
+
 impl ProtocolWriter for BedrockWriter {
     fn upstream_path(&self) -> &str {
         "/model"
@@ -24,151 +123,6 @@ impl ProtocolWriter for BedrockWriter {
         } else {
             format!("/model/{}/converse", model)
         }
-    }
-
-    fn auth_headers(&self, _key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Bedrock auth is per-request SigV4 — see `sign_request`. Static headers can't carry it.
-        vec![]
-    }
-
-    /// AWS SigV4 signing for the Converse request. The lane key encodes credentials as
-    /// `ACCESS_KEY_ID:SECRET_ACCESS_KEY` or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN`; the
-    /// region is parsed from the host (`bedrock-runtime.<region>.amazonaws.com`); service=`bedrock`.
-    fn sign_request(
-        &self,
-        key: &str,
-        ctx: &super::SigningContext,
-    ) -> Vec<(HeaderName, HeaderValue)> {
-        let mut parts = key.splitn(3, ':');
-        let (access, secret, token) = match (parts.next(), parts.next(), parts.next()) {
-            (Some(a), Some(s), tok) if !a.is_empty() && !s.is_empty() => (a, s, tok),
-            _ => return vec![], // misconfigured key → no signature (AWS will 403, surfaced as auth)
-        };
-        // Derive the SigV4 scope region from the endpoint host robustly (FIPS, VPC-interface, and
-        // control-plane labels — not just the vanilla `bedrock-runtime.<region>.` prefix). A region
-        // that cannot be derived no longer silently signs for `us-east-1`: we WARN (with the actual
-        // host) so a mis-derived region in a multi-region failover setup is diagnosable, then fall
-        // back to `us-east-1` (the historical default) so a genuinely region-less endpoint still
-        // attempts to sign rather than failing closed. The host is operator-config-derived (tracing
-        // it is fine; it is not a client-facing body).
-        let region = match derive_sigv4_region(&ctx.host) {
-            Some(r) => r,
-            None => {
-                tracing::warn!(
-                    host = %ctx.host,
-                    "could not derive AWS region from Bedrock endpoint host; defaulting SigV4 scope \
-                     to us-east-1 (signing may fail with SignatureDoesNotMatch if the endpoint is \
-                     in another region) — set the lane host to a \
-                     bedrock-runtime[-fips].<region>.amazonaws.com form"
-                );
-                "us-east-1"
-            }
-        };
-        let service = "bedrock";
-        let (amzdate, datestamp) = crate::sigv4::format_amz_time(ctx.timestamp_epoch);
-        let payload_hash = crate::sigv4::sha256_hex(ctx.body);
-
-        // Validate the session token as a wire HeaderValue BEFORE adding it to the SIGNED set, so
-        // the signed header set and the emitted header set can never diverge. If a session (STS)
-        // token contains a byte `HeaderValue::from_str` rejects (e.g. an ASCII control char),
-        // the previous code signed `x-amz-security-token` (committing the signature to it) but then
-        // silently dropped the header on the wire — yielding a request whose signature claims the
-        // token header is present while it is absent, which AWS rejects with SignatureDoesNotMatch
-        // (a confusing 403, not the intended graceful "misconfigured credential" path). Instead,
-        // bail to the same empty-header path used for a structurally-misconfigured key (request goes
-        // out unsigned → AWS 403 surfaced as auth), with a diagnostic so the operator can see why.
-        let token_header = match token {
-            Some(t) => match HeaderValue::from_str(t) {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    tracing::warn!(
-                        "Bedrock lane session token contains a byte rejected by HeaderValue \
-                         (e.g. a control char); skipping signing to avoid a signed-but-absent \
-                         x-amz-security-token header. Request goes out unsigned (AWS will 403)."
-                    );
-                    return vec![];
-                }
-            },
-            None => None,
-        };
-
-        let mut signed = vec![
-            (
-                "content-type".to_string(),
-                crate::proxy::APPLICATION_JSON.to_string(),
-            ),
-            ("host".to_string(), ctx.host.clone()),
-            (
-                crate::sigv4::X_AMZ_CONTENT_SHA256.to_string(),
-                payload_hash.clone(),
-            ),
-            (crate::sigv4::X_AMZ_DATE.to_string(), amzdate.clone()),
-        ];
-        if let Some(t) = token {
-            signed.push((
-                crate::sigv4::X_AMZ_SECURITY_TOKEN.to_string(),
-                t.to_string(),
-            ));
-        }
-
-        let (signature, signed_headers) = crate::sigv4::sign_v4(
-            secret,
-            region,
-            service,
-            "POST",
-            &ctx.canonical_uri,
-            "",
-            &signed,
-            &payload_hash,
-            &amzdate,
-            &datestamp,
-        );
-        let authorization = {
-            use crate::sigv4::{SIGV4_ALGORITHM, SIGV4_TERMINATION};
-            format!(
-                "{SIGV4_ALGORITHM} Credential={access}/{datestamp}/{region}/{service}/{SIGV4_TERMINATION}, \
-                 SignedHeaders={signed_headers}, Signature={signature}"
-            )
-        };
-
-        // Headers to ADD to the wire request (content-type + host are set elsewhere / by the client).
-        // The authorization value embeds `access` (the AWS access key id) taken directly from the
-        // lane key config. A key id containing a control character (CR/LF) or any byte >= 0x80
-        // makes `HeaderValue::from_str` fail. This runs on the request hot path, so we must NOT
-        // panic: a malformed credential takes the same graceful "misconfigured key" path as the
-        // parse failure above (return an empty header set → request goes out unsigned → AWS 403,
-        // surfaced upstream as an auth failure) rather than aborting the request-handling task.
-        let (Ok(authorization_val), Ok(amzdate_val), Ok(payload_hash_val)) = (
-            HeaderValue::from_str(&authorization),
-            HeaderValue::from_str(&amzdate),
-            HeaderValue::from_str(&payload_hash),
-        ) else {
-            return vec![];
-        };
-
-        let mut out = vec![
-            (
-                HeaderName::from_static(crate::proto::HDR_AUTHORIZATION),
-                authorization_val,
-            ),
-            (
-                HeaderName::from_static(crate::sigv4::X_AMZ_DATE),
-                amzdate_val,
-            ),
-            (
-                HeaderName::from_static(crate::sigv4::X_AMZ_CONTENT_SHA256),
-                payload_hash_val,
-            ),
-        ];
-        // Use the HeaderValue validated up front (above): the signed set and the wire set are now
-        // gated by the same check, so they can never diverge into a signed-but-absent token header.
-        if let Some(v) = token_header {
-            out.push((
-                HeaderName::from_static(crate::sigv4::X_AMZ_SECURITY_TOKEN),
-                v,
-            ));
-        }
-        out
     }
 
     // Bedrock carries the target model in the request URL, not the body, so this is a no-op and

@@ -5,13 +5,6 @@ impl ProtocolWriter for CohereWriter {
         PATH_UPSTREAM
     }
 
-    fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Shared warn+OMIT policy: a credential with bytes invalid for an HTTP header value is
-        // dropped (with a protocol-named warn, never the key bytes) rather than emitting an empty
-        // `Authorization:` tell. See `super::bearer_auth_headers`.
-        super::bearer_auth_headers("cohere", key)
-    }
-
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         // The reasoning carry has no Cohere shape in this pass; dropped observably (matching
         // the penalties/top_k convention) rather than silently.

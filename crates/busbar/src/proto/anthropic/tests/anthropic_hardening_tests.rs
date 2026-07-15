@@ -34,7 +34,7 @@ fn header_value(headers: &[(HeaderName, HeaderValue)], name: &str) -> Option<Str
 /// `anthropic-version` is always present.
 #[test]
 fn auth_headers_api_key_emits_only_x_api_key() {
-    let headers = AnthropicWriter.auth_headers("sk-ant-api03-secret-key");
+    let headers = crate::proto::anthropic::anthropic_auth_headers("sk-ant-api03-secret-key", None);
 
     assert_eq!(
         header_value(&headers, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
@@ -69,8 +69,8 @@ fn auth_headers_api_key_trims_leading_whitespace() {
         upstream_creds: crate::auth::UpstreamCreds::Own,
     };
     for headers in [
-        AnthropicWriter.auth_headers(raw),
-        AnthropicWriter.sign_request(raw, &ctx),
+        crate::proto::anthropic::anthropic_auth_headers(raw, None),
+        crate::proto::anthropic::anthropic_auth_headers(raw, Some(ctx.upstream_creds)),
     ] {
         assert_eq!(
             header_value(&headers, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
@@ -95,7 +95,7 @@ fn auth_headers_oauth_and_passthrough_preserve_leading_whitespace() {
     // OAuth (sk-ant-oat) keeps its raw Bearer value verbatim — note the leading space is kept
     // inside the value after the `Bearer ` prefix.
     let oat = "  sk-ant-oat01-caller-token";
-    let oauth_headers = AnthropicWriter.auth_headers(oat);
+    let oauth_headers = crate::proto::anthropic::anthropic_auth_headers(oat, None);
     assert_eq!(
         header_value(&oauth_headers, "authorization").as_deref(),
         Some("Bearer   sk-ant-oat01-caller-token"),
@@ -115,7 +115,7 @@ fn auth_headers_oauth_and_passthrough_preserve_leading_whitespace() {
         timestamp_epoch: 0,
         upstream_creds: crate::auth::UpstreamCreds::Passthrough,
     };
-    let pt = AnthropicWriter.sign_request(amb, &ctx);
+    let pt = crate::proto::anthropic::anthropic_auth_headers(amb, Some(ctx.upstream_creds));
     assert_eq!(
         header_value(&pt, "authorization").as_deref(),
         Some("Bearer   opaque-caller-token"),
@@ -129,7 +129,8 @@ fn auth_headers_oauth_and_passthrough_preserve_leading_whitespace() {
 /// Anthropic credentials never land here.
 #[test]
 fn auth_headers_unrecognized_credential_emits_both_headers() {
-    let headers = AnthropicWriter.auth_headers("caller-specific-token-abc123");
+    let headers =
+        crate::proto::anthropic::anthropic_auth_headers("caller-specific-token-abc123", None);
 
     assert_eq!(
         header_value(&headers, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
@@ -162,7 +163,10 @@ fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
     let amb = "caller-specific-token-abc123";
 
     // Passthrough: forward the caller's token as Bearer ONLY (no x-api-key tell).
-    let pt = AnthropicWriter.sign_request(amb, &ctx(crate::auth::UpstreamCreds::Passthrough));
+    let pt = crate::proto::anthropic::anthropic_auth_headers(
+        amb,
+        Some(ctx(crate::auth::UpstreamCreds::Passthrough).upstream_creds),
+    );
     assert_eq!(
         header_value(&pt, "authorization").as_deref(),
         Some("Bearer caller-specific-token-abc123")
@@ -173,7 +177,10 @@ fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
     );
 
     // Own (configured lane key): present the API-key shape ONLY (no Bearer tell).
-    let h = AnthropicWriter.sign_request(amb, &ctx(crate::auth::UpstreamCreds::Own));
+    let h = crate::proto::anthropic::anthropic_auth_headers(
+        amb,
+        Some(ctx(crate::auth::UpstreamCreds::Own).upstream_creds),
+    );
     assert_eq!(
         header_value(&h, "x-api-key").as_deref(), // golden wire-contract literal (kept bare on purpose)
         Some("caller-specific-token-abc123")
@@ -184,7 +191,10 @@ fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
     );
 
     // Clear API-key / OAuth credentials stay single-header on the wire path regardless of mode.
-    let api = AnthropicWriter.sign_request("sk-ant-api03-x", &ctx(crate::auth::UpstreamCreds::Own));
+    let api = crate::proto::anthropic::anthropic_auth_headers(
+        "sk-ant-api03-x",
+        Some(ctx(crate::auth::UpstreamCreds::Own).upstream_creds),
+    );
     assert!(
         header_value(&api, "x-api-key").is_some() // golden wire-contract literal (kept bare on purpose)
                 && header_value(&api, "authorization").is_none()
@@ -219,7 +229,8 @@ fn classify_credential_covers_each_family() {
 /// round-trips a caller's Bearer token to upstream.
 #[test]
 fn auth_headers_oauth_token_emits_only_authorization_bearer() {
-    let headers = AnthropicWriter.auth_headers("sk-ant-oat01-caller-token");
+    let headers =
+        crate::proto::anthropic::anthropic_auth_headers("sk-ant-oat01-caller-token", None);
 
     assert_eq!(
         header_value(&headers, "authorization").as_deref(),
@@ -239,7 +250,8 @@ fn auth_headers_oauth_token_emits_only_authorization_bearer() {
 /// misclassified as an API key.
 #[test]
 fn auth_headers_oauth_token_classification_trims_leading_whitespace() {
-    let headers = AnthropicWriter.auth_headers("  sk-ant-oat01-caller-token");
+    let headers =
+        crate::proto::anthropic::anthropic_auth_headers("  sk-ant-oat01-caller-token", None);
     // The header value itself is the verbatim (untrimmed) credential — only the
     // classification trims. Round-tripping the caller's exact token is the contract.
     assert_eq!(
@@ -258,7 +270,7 @@ fn auth_headers_oauth_token_classification_trims_leading_whitespace() {
 fn auth_headers_invalid_api_key_omits_credential_no_panic() {
     // A recognizable API key (so the single-header API-key path is exercised) whose bytes are
     // invalid for an HTTP header value.
-    let headers = AnthropicWriter.auth_headers("sk-ant-api03-bad\nkey");
+    let headers = crate::proto::anthropic::anthropic_auth_headers("sk-ant-api03-bad\nkey", None);
     assert!(
         header_value(&headers, "x-api-key").is_none(), // golden wire-contract literal (kept bare on purpose)
         "an invalid API key must OMIT x-api-key, not emit an empty value"
@@ -283,7 +295,7 @@ fn auth_headers_invalid_api_key_omits_credential_no_panic() {
 /// `authorization` header (and never emits `x-api-key`), keeping only `anthropic-version`.
 #[test]
 fn auth_headers_invalid_oauth_token_omits_credential_no_panic() {
-    let headers = AnthropicWriter.auth_headers("sk-ant-oat01-bad\ntoken");
+    let headers = crate::proto::anthropic::anthropic_auth_headers("sk-ant-oat01-bad\ntoken", None);
     assert!(
         header_value(&headers, "authorization").is_none(),
         "an invalid OAuth token must OMIT authorization, not emit an empty value"

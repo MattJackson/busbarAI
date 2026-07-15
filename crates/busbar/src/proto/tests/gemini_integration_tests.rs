@@ -30,6 +30,6 @@ fn test_gemini_registered_in_builtins() {
         "/v1beta/models/m:generateContent"
     );
     // x-goog-api-key auth header.
-    let headers = g.writer().auth_headers("k");
+    let headers = crate::egress_auth::api_key_headers("x-goog-api-key", "k");
     assert!(headers.iter().any(|(n, _)| n.as_str() == "x-goog-api-key"));
 }

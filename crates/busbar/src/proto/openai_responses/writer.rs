@@ -5,13 +5,6 @@ impl ProtocolWriter for ResponsesWriter {
         "/v1/responses"
     }
 
-    fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)> {
-        // Shared warn+OMIT policy: a credential with bytes invalid for an HTTP header value is
-        // dropped (with a protocol-named warn, never the key bytes) rather than emitting an empty
-        // `Authorization:` tell. See `super::bearer_auth_headers`.
-        super::bearer_auth_headers(VENDOR_NAME, key)
-    }
-
     fn write_request(&self, req: &crate::ir::IrRequest) -> serde_json::Value {
         let mut out = serde_json::Map::new();
 

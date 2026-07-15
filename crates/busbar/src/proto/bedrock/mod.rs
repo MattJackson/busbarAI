@@ -1125,3 +1125,4 @@ mod tests;
 
 mod reader;
 mod writer;
+pub(crate) use writer::sigv4_sign_headers;

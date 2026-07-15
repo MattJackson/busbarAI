@@ -822,8 +822,7 @@ fn test_synthesized_ids_are_unique() {
 /// A well-formed credential produces a single `Authorization: Bearer <key>` header.
 #[test]
 fn test_auth_headers_valid_key_emits_bearer() {
-    let writer = CohereWriter;
-    let headers = writer.auth_headers("valid-key-123");
+    let headers = crate::proto::bearer_auth_headers("cohere", "valid-key-123");
     assert_eq!(headers.len(), 1, "exactly one auth header");
     assert_eq!(headers[0].0.as_str(), "authorization");
     assert_eq!(
@@ -839,8 +838,7 @@ fn test_auth_headers_valid_key_emits_bearer() {
 /// `gemini.rs::test_auth_headers_invalid_key_omits_header_no_empty_value`.
 #[test]
 fn test_auth_headers_invalid_key_omits_header_no_empty_value() {
-    let writer = CohereWriter;
-    let headers = writer.auth_headers("bad\nkey");
+    let headers = crate::proto::bearer_auth_headers("cohere", "bad\nkey");
     assert!(
         headers.is_empty(),
         "an invalid credential must omit the auth header entirely, got {headers:?}"
@@ -851,8 +849,7 @@ fn test_auth_headers_invalid_key_omits_header_no_empty_value() {
 /// an empty value).
 #[test]
 fn test_auth_headers_control_byte_key_omits_header() {
-    let writer = CohereWriter;
-    let headers = writer.auth_headers("key\u{0000}bad");
+    let headers = crate::proto::bearer_auth_headers("cohere", "key\u{0000}bad");
     assert!(
         headers.is_empty(),
         "a control-byte credential must omit the auth header entirely, got {headers:?}"

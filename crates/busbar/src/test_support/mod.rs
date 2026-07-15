@@ -586,9 +586,15 @@ impl LaneSpec {
     }
 
     fn to_lane(&self) -> crate::state::Lane {
+        let auth = self.auth.as_deref().map(|a| match a {
+            "api-key" => crate::config::ProviderAuth::ApiKey,
+            "bearer" => crate::config::ProviderAuth::Bearer,
+            other => panic!("unexpected test auth style in LaneSpec: {other}"),
+        });
         crate::state::Lane {
             reasoning: false,
             prompt_caching: false,
+            credential: crate::egress_auth::resolve(self.protocol.name(), auth),
             model: self.model.clone(),
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
@@ -598,11 +604,6 @@ impl LaneSpec {
             error_map: std::sync::Arc::new(self.error_map.clone()),
             context_max: self.context_max,
             path: self.path.clone(),
-            auth: self.auth.as_deref().map(|a| match a {
-                "api-key" => crate::config::ProviderAuth::ApiKey,
-                "bearer" => crate::config::ProviderAuth::Bearer,
-                other => panic!("unexpected test auth style in LaneSpec: {other}"),
-            }),
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
             upstream_model: self.upstream_model.clone(),

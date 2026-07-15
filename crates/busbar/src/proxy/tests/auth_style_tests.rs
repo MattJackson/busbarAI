@@ -5,7 +5,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 fn lane_with_auth(auth: Option<&str>) -> Lane {
+    let resolved_auth = auth.map(|a| match a {
+        "api-key" => crate::config::ProviderAuth::ApiKey,
+        "bearer" => crate::config::ProviderAuth::Bearer,
+        other => panic!("unexpected test auth style: {other}"),
+    });
     Lane {
+        credential: crate::egress_auth::resolve("openai", resolved_auth),
         reasoning: false,
         prompt_caching: false,
         default_max_tokens: None,
@@ -20,11 +26,6 @@ fn lane_with_auth(auth: Option<&str>) -> Lane {
         path: Some(
             "/openai/deployments/gpt-4o/chat/completions?api-version=2024-06-01".to_string(),
         ),
-        auth: auth.map(|a| match a {
-            "api-key" => crate::config::ProviderAuth::ApiKey,
-            "bearer" => crate::config::ProviderAuth::Bearer,
-            other => panic!("unexpected test auth style: {other}"),
-        }),
         health: None,
         upstream_model: None,
         attempt_timeout_ms: None,

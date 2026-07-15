@@ -18,6 +18,9 @@ pub(crate) struct Lane {
     pub(crate) base_url: String,
     pub(crate) api_key: String,
     pub(crate) protocol: Arc<Protocol>,
+    /// Outbound credential — how this lane presents Busbar's identity to the upstream. Resolved once
+    /// at boot from (protocol, auth). See `crate::egress_auth`; the request path calls `headers_for`.
+    pub(crate) credential: Arc<dyn crate::egress_auth::CredentialProvider>,
     pub(crate) max: usize,
     // error_map cloned into each lane at startup for Stage 1b normalization
     pub(crate) error_map: Arc<std::collections::HashMap<String, String>>,
@@ -26,10 +29,6 @@ pub(crate) struct Lane {
     /// Optional upstream request-path override. When set, used verbatim instead of the protocol's
     /// default path (for providers that embed the API version in base_url and serve /chat/completions).
     pub(crate) path: Option<String>,
-    /// Optional auth-style override. `Some(ProviderAuth::ApiKey)` sends an `api-key: <key>` header
-    /// instead of the protocol's native auth (used by Azure OpenAI). `None` / `Some(Bearer)` use the
-    /// protocol's `sign_request` (bearer, x-goog-api-key, or SigV4).
-    pub(crate) auth: Option<crate::config::ProviderAuth>,
     /// Optional active health-probe settings (from the provider's `health:` block). `None` or
     /// `mode: none` means no background probing for this lane.
     pub(crate) health: Option<crate::config::HealthCfg>,

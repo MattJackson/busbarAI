@@ -44,6 +44,7 @@ mod billing;
 mod breaker;
 mod config;
 mod config_validate;
+mod egress_auth;
 mod endpoints;
 mod eventstream;
 mod governance;
@@ -1080,12 +1081,13 @@ pub(crate) fn build_app_from_config(
                 .get(&ld.provider)
                 .cloned()
                 .unwrap_or_default(),
+            // Resolve the outbound credential once, from the protocol + configured auth style.
+            credential: egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth),
             protocol,
             max: ld.max,
             error_map: Arc::new(provider_cfg.error_map.clone()),
             context_max: model_context_max.get(&ld.model).copied().flatten(),
             path: provider_cfg.path.clone(),
-            auth: provider_cfg.auth,
             health: provider_cfg.health.clone(),
             upstream_model: ld.upstream_model.clone(),
             attempt_timeout_ms: ld.attempt_timeout_ms,

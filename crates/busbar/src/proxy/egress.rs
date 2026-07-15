@@ -99,13 +99,7 @@ pub(crate) fn lane_auth_headers(
     key: &str,
     ctx: &crate::proto::SigningContext,
 ) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
-    match lane.auth {
-        Some(crate::config::ProviderAuth::ApiKey) => match axum::http::HeaderValue::from_str(key) {
-            Ok(v) => vec![(axum::http::HeaderName::from_static("api-key"), v)],
-            Err(_) => Vec::new(),
-        },
-        _ => lane.protocol.writer().sign_request(key, ctx),
-    }
+    lane.credential.headers_for(key, ctx)
 }
 
 // ─── EGRESS User-Agent strings — RELEASE-CHECKLIST AUDIT SURFACE ──────────────────────────────────

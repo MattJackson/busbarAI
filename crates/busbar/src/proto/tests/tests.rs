@@ -722,11 +722,7 @@ fn test_reader_classify_behavior() {
 
 #[test]
 fn test_writer_auth_headers() {
-    let registry = ProtocolRegistry::with_builtins();
-    let protocol = registry.get("anthropic").expect("anthropic should exist");
-    let writer = protocol.writer();
-
-    let headers = writer.auth_headers("k");
+    let headers = crate::proto::anthropic::anthropic_auth_headers("k", None);
     let header_names: Vec<&str> = headers.iter().map(|(name, _)| name.as_str()).collect();
 
     assert!(header_names.contains(&"x-api-key"));

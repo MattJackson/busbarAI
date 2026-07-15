@@ -334,15 +334,10 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         self.upstream_path_for(model)
     }
 
-    /// Returns auth headers given an API key.
-    fn auth_headers(&self, key: &str) -> Vec<(HeaderName, HeaderValue)>;
-
-    /// Per-request auth, given the signing context. Defaults to the static `auth_headers` (bearer /
-    /// api-key protocols ignore `ctx`). Bedrock overrides this to compute AWS SigV4 headers,
-    /// which depend on the method/host/path/body/timestamp.
-    fn sign_request(&self, key: &str, _ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
-        self.auth_headers(key)
-    }
+    // Outbound auth moved OFF the protocol writer (protocol is post-auth): a lane's credential is
+    // resolved by `crate::egress_auth` and called via `lane.credential.headers_for`. Per-scheme logic
+    // lives in `pub(crate)` free fns (`bearer_auth_headers`, `anthropic::anthropic_auth_headers`,
+    // `bedrock::sigv4_sign_headers`).
 
     /// Rewrites the model field in the request body, returning whether the body actually CHANGED.
     ///

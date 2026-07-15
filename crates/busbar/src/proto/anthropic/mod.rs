@@ -1120,7 +1120,7 @@ impl AnthropicWriter {
 /// credential header and keep `anthropic-version`. The worker never panics; the upstream returns a
 /// clean 401 the breaker classifies normally. Defense-in-depth; keys should be validated at config
 /// load.
-fn anthropic_auth_headers(
+pub(crate) fn anthropic_auth_headers(
     key: &str,
     creds: Option<crate::auth::UpstreamCreds>,
 ) -> Vec<(HeaderName, HeaderValue)> {

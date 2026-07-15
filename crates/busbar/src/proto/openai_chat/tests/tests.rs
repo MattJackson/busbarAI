@@ -3439,7 +3439,7 @@ fn header_value(headers: &[(HeaderName, HeaderValue)], name: &str) -> Option<Str
 
 #[test]
 fn auth_headers_valid_key_emits_bearer_authorization() {
-    let headers = OpenAiWriter.auth_headers("sk-openai-good-key");
+    let headers = crate::proto::bearer_auth_headers("openai", "sk-openai-good-key");
     assert_eq!(
         header_value(&headers, "authorization").as_deref(),
         Some("Bearer sk-openai-good-key")
@@ -3454,7 +3454,7 @@ fn auth_headers_invalid_key_omits_header_no_panic() {
     // header entirely (empty Vec) rather than emitting an empty `authorization` value — the empty
     // value was both a syntactically invalid header and a fingerprinting tell. A warn line (not
     // asserted here) tells the operator the lane credential bytes are invalid.
-    let headers = OpenAiWriter.auth_headers("sk-openai-bad\nkey");
+    let headers = crate::proto::bearer_auth_headers("openai", "sk-openai-bad\nkey");
     assert!(
         header_value(&headers, "authorization").is_none(),
         "invalid key must OMIT the authorization header, not emit an empty value"
