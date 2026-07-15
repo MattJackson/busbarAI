@@ -42,10 +42,31 @@ fn reject_yaml_unsafe_value(var_name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Expand ${VAR} tokens from environment. Unset var → error (fail loud). A substituted value that
-/// carries a YAML-structural control character is rejected (see `reject_yaml_unsafe_value`) so an
-/// env var cannot break out of the quoted scalar it lands in and inject extra YAML nodes.
+/// How [`interpolate_env_with`] treats a `${VAR}` whose environment variable is unset.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnvSubst {
+    /// Boot / reload: an unset variable is a hard error (fail loud — a real deployment must have its
+    /// secrets present before it serves traffic).
+    Strict,
+    /// `busbar --validate`: an unset variable is substituted with a placeholder (its own name) and
+    /// recorded, so config STRUCTURE can be validated without secrets present (CI, pre-reload dry runs).
+    Lenient,
+}
+
+/// Expand `${VAR}` tokens from the environment (see [`EnvSubst`] for unset-variable behavior). A
+/// substituted value carrying a YAML-structural control character is rejected (`reject_yaml_unsafe_value`)
+/// so an env var cannot break out of the quoted scalar it lands in and inject extra YAML nodes.
 pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
+    interpolate_env_with(s, EnvSubst::Strict, &mut Vec::new())
+}
+
+/// See [`interpolate_env`]. In [`EnvSubst::Lenient`] mode each unset variable name is pushed into
+/// `unset` (first-seen, deduped) and a placeholder substituted; in `Strict` mode `unset` is untouched.
+pub(crate) fn interpolate_env_with(
+    s: &str,
+    mode: EnvSubst,
+    unset: &mut Vec<String>,
+) -> Result<String, String> {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
@@ -73,8 +94,20 @@ pub(crate) fn interpolate_env(s: &str) -> Result<String, String> {
             if var_name.is_empty() {
                 return Err("empty variable name in ${}".into());
             }
-            let value = std::env::var(&var_name)
-                .map_err(|_| format!("unset environment variable: {}", var_name))?;
+            let value = match std::env::var(&var_name) {
+                Ok(v) => v,
+                Err(_) => match mode {
+                    EnvSubst::Strict => {
+                        return Err(format!("unset environment variable: {}", var_name));
+                    }
+                    EnvSubst::Lenient => {
+                        if !unset.contains(&var_name) {
+                            unset.push(var_name.clone());
+                        }
+                        var_name.clone() // placeholder: a non-empty, YAML-safe scalar
+                    }
+                },
+            };
             // Reject a structurally-unsafe value BEFORE splicing it in, so it cannot break out of
             // the surrounding YAML scalar and inject sibling nodes (e.g. extra client_tokens).
             reject_yaml_unsafe_value(&var_name, &value)?;

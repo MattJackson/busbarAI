@@ -655,6 +655,23 @@ fn test_interpolate_env_empty_var() {
     assert_eq!(result.unwrap_err(), "empty variable name in ${}");
 }
 
+/// `--validate` leniency: in Lenient mode an unset `${VAR}` substitutes a placeholder (its own name)
+/// and is recorded (deduped) instead of erroring; Strict still errors. Uses names guaranteed unset.
+#[test]
+fn test_interpolate_env_lenient_collects_unset() {
+    use crate::config::{interpolate_env_with, EnvSubst};
+    let input =
+        "a: \"${BB_LENIENT_UNSET_A}\"\nb: \"${BB_LENIENT_UNSET_A}\"\nc: \"${BB_LENIENT_UNSET_B}\"";
+    let mut unset = Vec::new();
+    let out = interpolate_env_with(input, EnvSubst::Lenient, &mut unset).unwrap();
+    assert!(out.contains("\"BB_LENIENT_UNSET_A\""));
+    assert!(out.contains("\"BB_LENIENT_UNSET_B\""));
+    assert_eq!(unset, vec!["BB_LENIENT_UNSET_A", "BB_LENIENT_UNSET_B"]);
+    let mut sink = Vec::new();
+    assert!(interpolate_env_with(input, EnvSubst::Strict, &mut sink).is_err());
+    assert!(sink.is_empty());
+}
+
 #[test]
 fn test_interpolate_env_no_vars() {
     let input = "plain-text-no-vars";

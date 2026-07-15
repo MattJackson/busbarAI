@@ -153,6 +153,7 @@ fn handle_cli_flags() -> Option<i32> {
             }
             Some(0)
         }
+        Some("--validate") => Some(validate_config_command()),
         Some("--help" | "-h") => {
             println!(
                 "busbar {ver} — native-protocol LLM gateway
@@ -161,6 +162,8 @@ USAGE:
     busbar              run the gateway (configured entirely via environment + YAML)
     busbar --help       print this help
     busbar --version    print the version
+    busbar --validate   parse + validate config.yaml/providers.yaml and exit (0 = valid, 1 = errors);
+                        no server, no network, no state — safe in CI and before a reload
     busbar --print-metadata-blocklist
                         print the effective cloud-metadata SSRF denylist and exit
 
@@ -197,6 +200,66 @@ Docs: https://getbusbar.com   ·   Source: https://github.com/MattJackson/busbar
             Some(2)
         }
     }
+}
+
+/// `--validate`: parse, resolve, and semantically validate the config WITHOUT booting. Runs the exact
+/// same load -> resolve -> validate the gateway runs at boot (so a clean `--validate` means a clean
+/// boot), but never binds a listener, writes state, spawns a task, opens TLS, or makes a network call,
+/// and does NOT require provider secrets (validation is STRUCTURE, not reachability — the nginx -t rule).
+/// Honors BUSBAR_CONFIG/BUSBAR_PROVIDERS/--safe-mode. Prints an OK summary + exits 0 when valid;
+/// prints every error (same text boot prints) + exits 1 when not.
+fn validate_config_command() -> i32 {
+    let providers_path = std::path::PathBuf::from(
+        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into()),
+    );
+    let config_path = std::path::PathBuf::from(
+        std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into()),
+    );
+    let safe_mode = std::env::args().any(|a| a == "--safe-mode");
+
+    let loaded = match load_config_from_disk(
+        &config_path,
+        &providers_path,
+        safe_mode,
+        config::EnvSubst::Lenient,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[error] {e}");
+            return 1;
+        }
+    };
+    let unset_env_vars = loaded.unset_env_vars.clone();
+    let cfg = match config::resolve(&loaded.deploy, &loaded.defs) {
+        Ok(c) => c,
+        Err(errs) => {
+            eprintln!("[error] config errors:\n  - {}", errs.join("\n  - "));
+            return 1;
+        }
+    };
+    if let Err(errs) = config_validate::validate(&cfg) {
+        eprintln!(
+            "[error] config validation failed:\n  - {}",
+            errs.join("\n  - ")
+        );
+        return 1;
+    }
+    println!(
+        "ok: config valid — {} provider(s), {} model(s), {} pool(s)\n  config:    {}\n  providers: {}",
+        cfg.providers.len(),
+        cfg.models.len(),
+        cfg.pools.len(),
+        config_path.display(),
+        providers_path.display(),
+    );
+    if !unset_env_vars.is_empty() {
+        println!(
+            "  note: {} env var(s) referenced but unset here — required at runtime: {}",
+            unset_env_vars.len(),
+            unset_env_vars.join(", "),
+        );
+    }
+    0
 }
 
 /// Print a clean startup error to stderr and exit non-zero. Used for misconfiguration and other
@@ -308,13 +371,19 @@ async fn run() {
         std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into()),
     );
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
-    let loaded =
-        load_config_from_disk(&config_path, &providers_path, safe_mode).unwrap_or_else(|e| die(e));
+    let loaded = load_config_from_disk(
+        &config_path,
+        &providers_path,
+        safe_mode,
+        config::EnvSubst::Strict,
+    )
+    .unwrap_or_else(|e| die(e));
     let LoadedConfig {
         deploy,
         defs,
         overlay_path,
         base_hook_names,
+        unset_env_vars: _,
     } = loaded;
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
@@ -778,6 +847,9 @@ pub(crate) struct LoadedConfig {
     pub(crate) defs: HashMap<String, config::ProviderDef>,
     pub(crate) overlay_path: Option<std::path::PathBuf>,
     pub(crate) base_hook_names: std::collections::HashSet<String>,
+    /// `${VAR}` refs that were UNSET during interpolation. Empty under Strict (boot/reload); populated
+    /// under Lenient (--validate), where it becomes the "set these at runtime" note.
+    pub(crate) unset_env_vars: Vec<String>,
 }
 
 /// The disk-load pipeline: read providers.yaml + config.yaml, env-interpolate (from the process's
@@ -788,7 +860,9 @@ pub(crate) fn load_config_from_disk(
     config_path: &std::path::Path,
     providers_path: &std::path::Path,
     safe_mode: bool,
+    env_mode: config::EnvSubst,
 ) -> Result<LoadedConfig, String> {
+    let mut unset_env_vars: Vec<String> = Vec::new();
     let raw_providers = std::fs::read_to_string(providers_path).map_err(|e| {
         format!(
             "cannot read providers file '{}': {e} (set {ENV_PROVIDERS})",
@@ -796,7 +870,8 @@ pub(crate) fn load_config_from_disk(
         )
     })?;
     let interpolated_providers =
-        config::interpolate_env(&raw_providers).map_err(|e| format!("providers.yaml: {e}"))?;
+        config::interpolate_env_with(&raw_providers, env_mode, &mut unset_env_vars)
+            .map_err(|e| format!("providers.yaml: {e}"))?;
     let defs: HashMap<String, config::ProviderDef> = serde_yaml::from_str(&interpolated_providers)
         .map_err(|e| format!("providers.yaml: invalid YAML: {e}"))?;
 
@@ -807,7 +882,8 @@ pub(crate) fn load_config_from_disk(
         )
     })?;
     let interpolated_config =
-        config::interpolate_env(&raw_config).map_err(|e| format!("config.yaml: {e}"))?;
+        config::interpolate_env_with(&raw_config, env_mode, &mut unset_env_vars)
+            .map_err(|e| format!("config.yaml: {e}"))?;
     let mut deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
         .map_err(|e| format!("config.yaml: invalid YAML: {e}"))?;
 
@@ -832,6 +908,7 @@ pub(crate) fn load_config_from_disk(
             defs,
             overlay_path,
             base_hook_names,
+            unset_env_vars,
         });
     }
     if let Some(ref p) = overlay_path {
@@ -849,6 +926,7 @@ pub(crate) fn load_config_from_disk(
         defs,
         overlay_path,
         base_hook_names,
+        unset_env_vars,
     })
 }
 
