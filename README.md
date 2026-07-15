@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="brand/png/busbar-primary-512.png" alt="Busbar" width="104" height="104">
+  <img src="assets/busbar-logo.png" alt="Busbar" width="104" height="104">
 </p>
 
 <h1 align="center">Busbar</h1>

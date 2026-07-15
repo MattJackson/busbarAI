@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Boot Busbar for the Claude-Code→Nova demo. Reads AWS creds from ~/.aws/credentials
-# and hands them to Busbar as AWS_BEDROCK_CREDS (ACCESS:SECRET). No secrets are printed.
+# Boot Busbar for the Claude-Code → Amazon Nova (Bedrock) example. Reads AWS creds from
+# ~/.aws/credentials and hands them to Busbar as AWS_BEDROCK_CREDS (ACCESS:SECRET[:SESSION]).
+# No secrets are printed. Build first: `cargo build --release`.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 
 AKID=$(aws configure get aws_access_key_id)
 SKEY=$(aws configure get aws_secret_access_key)
@@ -14,9 +16,9 @@ else
 fi
 
 export BUSBAR_CLIENT_TOKEN="${BUSBAR_CLIENT_TOKEN:-vk_demo_local}"
-export BUSBAR_CONFIG="$(pwd)/demo/config.yaml"
-export BUSBAR_PROVIDERS="$(pwd)/providers.yaml"
+export BUSBAR_CONFIG="$HERE/config.yaml"
+export BUSBAR_PROVIDERS="$ROOT/providers.yaml"
 export BUSBAR_STATE_FILE=""
 export RUST_LOG="${RUST_LOG:-warn}"
 
-exec ./target/release/busbar
+exec "$ROOT/target/release/busbar"
