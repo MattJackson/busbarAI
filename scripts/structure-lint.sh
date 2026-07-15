@@ -23,7 +23,7 @@ while IFS= read -r d; do
     note "HYBRID: ${base}.rs coexists with ${base}/ — fold ${base}.rs into ${base}/mod.rs"
     fail=1
   fi
-done < <(find src -type d)
+done < <(find crates -type d)
 [ "$fail" -eq 0 ] && note "ok"
 
 # ── Invariant 2: no monster impl files — split by area. Test files (under a tests/ dir) are exempt. ─
@@ -33,7 +33,7 @@ while IFS= read -r f; do
   case "$f" in */tests/*) continue ;; esac   # test files are name-navigated → exempt from the cap
   n=$(wc -l < "$f")
   if [ "$n" -gt "$MAX_LINES_IMPL" ]; then note "OVERSIZED: $f ($n lines)"; fail=1; big=1; fi
-done < <(find src -name '*.rs')
+done < <(find crates -name '*.rs')
 [ "$big" -eq 0 ] && note "ok"
 
 # ── Invariant 3: tests live in foo/tests/. The trigger is an inline test module BODY — a
@@ -59,7 +59,7 @@ while IFS= read -r f; do
     note "MULTI-TEST-MOD: $f has ${bodies} inline test bodies — give each its own tests/<name>.rs"
     fail=1; loc=1
   fi
-done < <(find src -name '*.rs')
+done < <(find crates -name '*.rs')
 [ "$loc" -eq 0 ] && note "ok"
 
 hdr "result"

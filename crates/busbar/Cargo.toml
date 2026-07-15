@@ -1,0 +1,163 @@
+[package]
+name = "busbar"
+version = "1.3.2"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+# Effective MSRV: governance.rs uses `u32::is_multiple_of` (stabilized in Rust 1.87), and clippy's
+# `manual_is_multiple_of` lint rewrites `% N == 0` back to it, so 1.87 is the genuine minimum. Declare
+# it so a build on an older toolchain fails fast with a clear message instead of a cryptic
+# "method not found", and so MSRV-aware tooling resolves compatible deps.
+rust-version = "1.87"
+description = "Native-protocol LLM gateway: lossless cross-protocol translation, weighted pools, per-(pool,lane) circuit breaking, and governance — in one static Rust binary."
+license = "Apache-2.0"
+
+[[bin]]
+name = "busbar"
+path = "src/main.rs"
+
+[dependencies]
+# The plugin CONTRACTS (auth-module trait, routing-policy trait, projections) — the one crate both
+# the engine and every plugin build against. See api/.
+busbar-api = { path = "../api" }
+# The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
+# so the matching feature (below) compiles each IN or OUT of the binary.
+busbar-auth-tokens = { path = "../auth-tokens", optional = true }
+busbar-auth-admin-tokens = { path = "../auth-admin-tokens", optional = true }
+busbar-hooks-ranking = { path = "../hooks-ranking", optional = true }
+axum = "0.8"
+# Already present transitively (axum's middleware stack). Pulled in directly ONLY for
+# `GlobalConcurrencyLimitLayer` — the OUTERMOST inbound-concurrency cap applied when the operator
+# sets `limits.max_inbound_concurrent > 0` (the `0` default adds NO layer). `limit` is the sole
+# feature needed.
+tower = { version = "0.5", features = ["limit"] }
+# Only the subsystems busbar actually touches: the multi-thread runtime (#[tokio::main],
+# spawn/JoinHandle), macros (main/test), net (TcpListener), time (sleep/interval), sync
+# (Semaphore/OwnedSemaphorePermit), and signal (graceful-shutdown ctrl_c/SIGTERM, so OTLP spans
+# flush on exit). The "full" meta-feature additionally pulls fs/process/io-util/io-std/test-util —
+# none referenced in src/ — so it is dropped to shrink the request-path binary's compile + attack
+# surface.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SIMD JSON (NEON on arm64, AVX2/SSE on x86): used for the hot request/response parse+serialize on
+# the translate path, where its SIMD escape-scanning is ~5× serde_json on the large string-heavy
+# bodies LLM traffic carries. `serde_json` is retained for the cold/config/error paths and as the
+# `Value` type; sonic-rs serializes/deserializes that same `serde_json::Value` at the hot boundaries.
+sonic-rs = "0.5"
+# `serde_yaml` (dtolnay) is archived/deprecated — the locked 0.9 is literally `0.9.34+deprecated`.
+# `serde_yaml_ng` is the maintained, API-compatible fork (still backed by `unsafe-libyaml`, but at a
+# maintained, patched version); the `package` rename keeps every `serde_yaml::from_str` call site unchanged.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+futures = "0.3"
+bytes = "1"
+http-body-util = "0.1"
+metrics = "0.24.6"
+# busbar uses this purely as an in-process recorder: `PrometheusBuilder::new().install_recorder()`
+# plus `handle.render()` (src/metrics.rs), serving the text exposition from its own axum /metrics
+# admin route. The crate's `default` feature enables `http-listener` and `push-gateway`, which drag
+# in hyper/hyper-rustls/hyper-util/rustls (an HTTP server + push client busbar never invokes) and a
+# second crypto backend (aws-lc-rs). Dropped for the same reason tokio/reqwest/otlp are hand-trimmed:
+# shrink the request-path binary's compile + attack surface.
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+opentelemetry = "0.32.0"
+opentelemetry_sdk = "0.32.1"
+# Pin OTLP to the HTTP/proto trace path busbar uses (`SpanExporter::builder().with_http()`). The
+# default bundled client is dropped; busbar injects its OWN HTTP client via `with_http_client` (see
+# observability::build_otlp) so trace export shares busbar's hyper/rustls stack and — critically —
+# does NOT follow redirects (a redirect-following exporter is a runtime SSRF vector: a validated OTLP
+# endpoint that 3xx-redirects to an internal/metadata target would be followed). Dropping default
+# features also removes `reqwest-blocking-client` and the OTLP metrics/logs paths (busbar exports
+# metrics via Prometheus, not OTLP).
+#
+# SINGLE CLIENT STACK: by dropping the `reqwest-rustls` feature and supplying a hyper-based
+# `opentelemetry_http::HyperClient` over a hyper-rustls connector (all already in the graph for the
+# axum server), the SECOND reqwest major (0.13) that the bundled OTLP client used to pull is gone —
+# `cargo tree -d` no longer lists a duplicate reqwest. The request path's reqwest 0.12 is the only
+# reqwest major.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
+    "trace",
+    "http-proto",
+] }
+opentelemetry-http = { version = "0.32.0", default-features = false, features = [
+    "hyper",
+] }
+# HTTPS connector for the OTLP HyperClient (rustls, http/1.1). Already in the graph via the server
+# stack; named directly so build_otlp can construct a redirect-free TLS client.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "http1",
+    "ring",
+    "webpki-tokio",
+] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tracing-opentelemetry = "0.33.0"
+sha2 = "0.11.0"
+hmac = "0.13.0"
+hex = "0.4.3"
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+getrandom = "0.4"
+# CRC32 for the AWS `application/vnd.amazon.eventstream` encoder (Bedrock ingress streaming): AWS
+# SDK clients validate both the prelude and message CRC32 on every frame, so the encoder needs a
+# correct, fast CRC32. `crc32fast` is small, dependency-light, and the de-facto standard.
+crc32fast = "1"
+# The pluggable routing-policy contract (`RoutingPolicy`) is an async trait so the webhook transport
+# can do I/O; native/socket policies return immediately. `async-trait` is the standard, zero-runtime
+# (compile-time desugar to boxed futures) way to express object-safe async traits on stable Rust. It
+# is only ever entered for NON-default pools — a `route: weighted` (default) pool never constructs a
+# `RoutingPolicy` and never touches this boxing, preserving the zero-cost default.
+async-trait = "0.1"
+# Native inbound TLS termination (+ optional mTLS). `tokio-rustls` wraps the accepted TcpStream in a
+# rustls server handshake; it pins the `ring` crypto provider (already the only provider in the graph
+# via reqwest/hyper-rustls), so the process holds exactly one CryptoProvider — no aws-lc-rs.
+# `rustls-pki-types`' built-in PEM API parses the operator's PEM cert chain + private key
+# (PKCS#8 / PKCS#1 / SEC1). It's already in the graph via rustls/tokio-rustls; named here as a direct
+# dep so src/tls.rs can call its `PemObject` API (replacing the unmaintained `rustls-pemfile`).
+# axum 0.7's `serve` is hardwired to a `TcpListener` (the generic `Listener` trait only landed in
+# axum 0.8). To terminate TLS without bumping axum — which would churn the routing hot path's
+# Router/Service types this feature must NOT touch — the TLS branch drives hyper directly: it accepts
+# on the TcpListener, runs the rustls handshake, then serves each connection with hyper-util's
+# auto::Builder, mirroring exactly what `axum::serve` does internally. `GracefulShutdown` reproduces
+# `.with_graceful_shutdown(...)`'s drain semantics. Both crates are already in the graph (axum/server
+# stack); they're named here only to pull the `server-auto`/`server-graceful` surface directly.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "server-auto",
+    "server-graceful",
+    "service",
+    "tokio",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# `ServerConfig`/`WebPkiClientVerifier`/`crypto::ring` are referenced directly in src/tls.rs. Pinned
+# to the version already resolved in the graph (server stack) with only the `ring` provider feature,
+# so no second crypto backend is introduced.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
+
+[features]
+# The built-in `tokens` auth plugin is a DEFAULT-ON, REMOVABLE feature — compliance by compilation.
+# A `--no-default-features` build contains NO client-token auth code at all (the module, its
+# constant-time fold, and the allowlist are absent from the binary, provable by attestation +
+# symbols). `auth.chain: [tokens]` then BOOT-ERRORS instead of silently opening. A regulated
+# deployment ships tokens OUT and wires its own auth module (SAML/AD/OIDC) in the private repo.
+default = ["auth-tokens", "auth-admin-tokens", "hooks-ranking"]
+auth-tokens = ["dep:busbar-auth-tokens"]
+# The built-in `admin-tokens` ADMIN auth plugin (the single operator admin token) — same
+# default-on, removable, compliance-by-compilation stance. Removed, `admin_auth: [admin-tokens]`
+# (the default) boot-errors and an external admin module must be wired.
+auth-admin-tokens = ["dep:busbar-auth-admin-tokens"]
+# The built-in RANKING hooks (cheapest/fastest/least_busy/usage) are also a default-on, removable
+# feature. `--no-default-features` drops them; `weighted` stays (it's the engine's inline SWRR floor,
+# not a plugin). A pool `policy: cheapest` (etc.) is then a boot error.
+hooks-ranking = ["dep:busbar-hooks-ranking"]
+
+[dev-dependencies]
+# In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+axum = { version = "0.8", features = ["http1"] }
+http-body-util = "0.1"
+futures = "0.3"
+bytes = "1"
+# Generates self-signed server certs + a CA/leaf pair at test runtime so the TLS/mTLS integration
+# tests exercise a real rustls handshake without checked-in key material.
+rcgen = "0.14"

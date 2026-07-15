@@ -303,12 +303,13 @@ fn test_shipped_example_config_resolves() {
     std::env::set_var("BUSBAR_CLIENT_TOKEN", "example-token");
     std::env::remove_var("BUSBAR_ADMIN_TOKEN");
     let providers_raw =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/providers.yaml")).unwrap();
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers.yaml"))
+            .unwrap();
     let defs: HashMap<String, ProviderDef> =
         serde_yaml::from_str(&providers_raw).expect("parse providers.yaml");
 
     let config_raw =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml")).unwrap();
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.yaml")).unwrap();
     let expanded = interpolate_env(&config_raw).expect("expand ${ENV} in example config.yaml");
     let deploy: DeployCfg = serde_yaml::from_str(&expanded).expect("parse example config.yaml");
 
@@ -341,7 +342,7 @@ fn test_default_config_boots_without_admin_token_env() {
     std::env::remove_var("BUSBAR_ADMIN_TOKEN");
 
     let config_raw =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/config.yaml")).unwrap();
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.yaml")).unwrap();
 
     // No active OR commented `${...}` token in the shipped config may reference an admin token:
     // the only legitimate brace-form interpolation is the active client-tokens entry.
@@ -591,7 +592,7 @@ fn test_budget_on_store_error_parses() {
 /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.
 #[test]
 fn test_shipped_providers_catalog_valid() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/providers.yaml");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers.yaml");
     let raw = std::fs::read_to_string(path).expect("read providers.yaml");
     let defs: HashMap<String, ProviderDef> =
         serde_yaml::from_str(&raw).expect("parse providers.yaml");
