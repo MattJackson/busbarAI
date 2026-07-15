@@ -30,8 +30,15 @@ pub(crate) fn host_from_base(base: &str) -> String {
     // `Host` that DESYNCS from the host actually contacted (SigV4 signs one host, the TCP/TLS layer
     // dials another). Folding `\`→`/` first makes the authority boundary — and the returned signed
     // host — match what reqwest dials, byte-for-byte.
-    let no_scheme = no_scheme.replace('\\', "/");
-    let no_scheme = no_scheme.as_str();
+    // Only ALLOCATE the backslash-normalized copy when a backslash is actually present (rare
+    // misconfiguration / attack shape). A well-formed base_url has none, so the common request path
+    // borrows the input and skips this per-request heap allocation.
+    let no_scheme: std::borrow::Cow<str> = if no_scheme.contains('\\') {
+        std::borrow::Cow::Owned(no_scheme.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(no_scheme)
+    };
+    let no_scheme = no_scheme.as_ref();
     // The authority ends at the first `/`, `?`, or `#`; userinfo (if any) precedes the LAST `@`
     // within that authority. Split on the authority boundary first so an `@` appearing later in a
     // path/query (not userinfo) is never mistaken for a userinfo delimiter. Only the authority is

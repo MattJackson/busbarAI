@@ -90,6 +90,14 @@ impl GovState {
                 .token_spend_carry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Bound the carry map: a key seen once (leaving a <1c remainder) then never again would
+            // keep its entry forever — slow unbounded growth under key churn. Past a threshold, prune
+            // stale-window entries (mirrors the rate map's sweep); the dropped sub-cent remainder is
+            // the documented acceptable loss. Threshold keeps the O(n) scan rare (amortized O(1)).
+            const TOKEN_SPEND_CARRY_SWEEP_THRESHOLD: usize = 4096;
+            if carry.len() > TOKEN_SPEND_CARRY_SWEEP_THRESHOLD {
+                carry.retain(|_, &mut (w, _)| w == window);
+            }
             let entry = carry.entry(key_id.to_string()).or_insert((window, 0));
             // Reset the remainder when the budget window rolls over, so a sub-cent remainder is
             // attributed to the window it was generated in rather than leaking into the next window's

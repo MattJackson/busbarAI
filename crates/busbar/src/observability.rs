@@ -295,12 +295,20 @@ const METADATA_HOSTS: &[&str] = &["metadata.google.internal", "metadata.internal
 /// IPv4-mapped-IPv6 arm so the two stay identical. Covers loopback, link-local (incl. the
 /// `169.254.169.254` IMDS endpoint), RFC1918 private, RFC6598 CGNAT, unspecified, and broadcast.
 fn is_internal_v4(v4: &std::net::Ipv4Addr) -> bool {
+    // Azure WireServer (168.63.129.16) and OCI IMDS (192.0.0.192) are cloud-metadata endpoints on
+    // PUBLIC / IETF-reserved addresses OUTSIDE every private/link-local range, so the range predicates
+    // miss them. They must never receive a hook payload or telemetry POST. Mirrors the same two
+    // literals in `config_validate::ssrf_blocked_host` (the provider-base_url guard).
+    const AZURE_WIRESERVER: std::net::Ipv4Addr = std::net::Ipv4Addr::new(168, 63, 129, 16);
+    const OCI_IMDS: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 0, 192);
     v4.is_loopback()
         || v4.is_link_local()
         || v4.is_private()
         || is_cgnat_shared_v4(v4)
         || v4.is_unspecified()
         || v4.is_broadcast()
+        || *v4 == AZURE_WIRESERVER
+        || *v4 == OCI_IMDS
 }
 
 /// True if the URL's host is an address busbar must not POST telemetry to: a literal loopback,

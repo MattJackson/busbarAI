@@ -262,13 +262,36 @@ fn resolve_model_context_max(
     Ok(resolved)
 }
 
-#[tokio::main]
-async fn main() {
-    // CLI flags first — these must work without a configured deployment (no env/file access).
+fn main() {
+    // CLI flags first — BEFORE building any runtime. They must work without a configured deployment,
+    // and `--version` / `--validate` should never spin up a thread pool.
     if let Some(code) = handle_cli_flags() {
         std::process::exit(code);
     }
+    // Worker-thread count is a HARD, operator-owned value (`BUSBAR_WORKER_THREADS`), NOT tokio's
+    // default of one worker per core — which over-provisions an I/O-bound gateway (e.g. 18 worker
+    // threads on an 18-core host) and inflates idle RSS: every worker carries a stack AND, on glibc,
+    // its own malloc arena. Default: min(cores, 4) — enough parallelism for the JSON-translate CPU
+    // work, small footprint by default; raise it (or lower it to 1) for a specific deployment.
+    let worker_threads = std::env::var("BUSBAR_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                .min(4)
+        });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build the tokio runtime")
+        .block_on(run());
+}
 
+async fn run() {
     // Install the Prometheus recorder on a background thread. Its one-time clock calibration
     // (quanta's TSC calibration, ~200ms) would otherwise block the listener; deferring it lets
     // busbar bind and serve (incl. /healthz) in tens of ms. `/metrics` renders empty until the
