@@ -44,6 +44,24 @@ openai:
     insufficient_quota: billing
     rate_limit_exceeded: rate_limit
 
+# Oracle OCI Generative AI, the OpenAI-compatible surface (/openai/v1/chat/completions), serving
+# OCI's hosted catalog (OpenAI, Meta Llama, xAI, Google, and Cohere models). Since Jan 2026 OCI
+# issues plain API keys (Bearer), so NO OCI request-signing is needed - set api_key_env to an env var
+# holding the key. REGIONAL: the region is in the host - set it to yours (`us-chicago-1` /
+# `us-ashburn-1` carry the broadest model set). Throttling is HTTP 429 (classified by the breaker);
+# OCI can also return a 400 carrying `TooManyRequests`/`QuotaExceeded`/`LimitExceeded`, and the
+# OpenAI-compat layer may emit OpenAI-style codes - both are mapped. (An OCI Responses transport also
+# exists at /openai/v1/responses; add a `protocol: responses` entry if you want it.)
+oci-genai:
+  protocol: openai
+  base_url: https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/openai
+  error_map:
+    TooManyRequests: rate_limit
+    QuotaExceeded: billing
+    LimitExceeded: billing
+    rate_limit_exceeded: rate_limit
+    insufficient_quota: billing
+
 groq:
   protocol: openai
   base_url: https://api.groq.com/openai
