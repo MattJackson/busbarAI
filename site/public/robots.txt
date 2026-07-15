@@ -1,6 +1,0 @@
-# https://getbusbar.com/robots.txt
-# Allow all crawlers; point them at the sitemap index.
-User-agent: *
-Allow: /
-
-Sitemap: https://getbusbar.com/sitemap-index.xml
