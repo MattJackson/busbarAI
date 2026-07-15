@@ -303,7 +303,8 @@ fn test_shipped_example_config_resolves() {
     std::env::set_var("BUSBAR_CLIENT_TOKEN", "example-token");
     std::env::remove_var("BUSBAR_ADMIN_TOKEN");
     let providers_raw =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers.yaml")).unwrap();
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../providers.yaml"))
+            .unwrap();
     let defs: HashMap<String, ProviderDef> =
         serde_yaml::from_str(&providers_raw).expect("parse providers.yaml");
 
