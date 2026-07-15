@@ -282,8 +282,11 @@ impl RoutingPolicy for SocketPolicy {
         super::wire::transform_outcome(parsed)
     }
 
-    /// TAP: write-only fire-and-forget send of the pre-serialized projection. No reply is read.
-    /// Bounded by `budget`; any error is swallowed — a tap never affects the served request.
+    /// Push a `configure` control message to the hook and REQUIRE it to ack the exact
+    /// `settings_version`. Serializes a `ConfigureMsg`, `exchange`s it (write + read a reply) within
+    /// `budget`, then parses the `ConfigureAck`: `Ok` only on a matching-version ack; `Err` on a
+    /// transport/parse failure, a wrong-version ack, or a missing ack. NOT a tap — this is a
+    /// request/response exchange whose result gates the caller.
     async fn configure(
         &self,
         hook_name: &str,
@@ -334,6 +337,8 @@ impl RoutingPolicy for SocketPolicy {
         parsed.status.map(Into::into)
     }
 
+    /// TAP: write-only fire-and-forget send of the pre-serialized projection. No reply is read.
+    /// Bounded by `budget`; any error is swallowed — a tap never affects the served request.
     async fn notify(&self, projection: &[u8], budget: Duration) {
         let mut line = Vec::with_capacity(projection.len() + 1);
         line.extend_from_slice(projection);

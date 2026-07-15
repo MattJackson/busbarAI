@@ -386,21 +386,6 @@ impl GovState {
         self.refresh()
     }
 
-    /// Apply a partial update to an existing key: enable/disable it, or adjust its rate/budget caps.
-    /// `key_hash`/`name`/`allowed_pools`/`budget_period`/`created_at` are preserved (the secret is
-    /// never re-minted). Returns `Ok(None)` when the key does not exist (so the caller can 404),
-    /// `Ok(Some(updated_metadata))` otherwise. Validation (non-negative budget, non-zero rate caps on
-    /// a *present* value) is the caller's responsibility, mirroring `create_key`'s ingress.
-    ///
-    /// THREE-STATE caps. The three cap fields (`rpm_limit`/`tpm_limit`/`max_budget_cents`) are
-    /// `Option<Option<T>>` so the API can distinguish all three intents the JSON allows:
-    ///   - `None`: field absent from the request body -> leave the stored value unchanged.
-    ///   - `Some(None)`: field present as JSON `null` -> CLEAR the cap to unlimited (None).
-    ///   - `Some(Some)`: field present with a value -> SET the cap to that value.
-    ///
-    /// The old single-`Option` shape conflated absent and present-null, so a cap could never be
-    /// cleared back to unlimited once set — only widened/narrowed. `enabled` stays a plain `Option`
-    /// (a bool has no "unlimited"/clear state; absent vs present is its only distinction).
     /// ROTATE a key's bearer secret in place: a fresh secret is minted, its hash replaces the
     /// stored `key_hash`, and the OLD secret stops resolving immediately (cache refresh). The key
     /// `id` stays STABLE — budgets, rate windows, usage history, and audit attribution carry over.
@@ -420,6 +405,21 @@ impl GovState {
         Ok(Some((key, secret)))
     }
 
+    /// Apply a partial update to an existing key: enable/disable it, or adjust its rate/budget caps.
+    /// `key_hash`/`name`/`allowed_pools`/`budget_period`/`created_at` are preserved (the secret is
+    /// never re-minted). Returns `Ok(None)` when the key does not exist (so the caller can 404),
+    /// `Ok(Some(updated_metadata))` otherwise. Validation (non-negative budget, non-zero rate caps on
+    /// a *present* value) is the caller's responsibility, mirroring `create_key`'s ingress.
+    ///
+    /// THREE-STATE caps. The three cap fields (`rpm_limit`/`tpm_limit`/`max_budget_cents`) are
+    /// `Option<Option<T>>` so the API can distinguish all three intents the JSON allows:
+    ///   - `None`: field absent from the request body -> leave the stored value unchanged.
+    ///   - `Some(None)`: field present as JSON `null` -> CLEAR the cap to unlimited (None).
+    ///   - `Some(Some)`: field present with a value -> SET the cap to that value.
+    ///
+    /// The old single-`Option` shape conflated absent and present-null, so a cap could never be
+    /// cleared back to unlimited once set — only widened/narrowed. `enabled` stays a plain `Option`
+    /// (a bool has no "unlimited"/clear state; absent vs present is its only distinction).
     pub(crate) fn update_key(
         &self,
         id: &str,

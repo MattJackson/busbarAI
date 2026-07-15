@@ -391,9 +391,11 @@ impl ProtocolReader for BedrockReader {
                         } else if let Some(image) = content_val.get("image") {
                             // Decode both `source.bytes` (base64) AND `source.s3Location` (an S3
                             // URI) — the two members of the Converse `ImageSource` union. An
-                            // S3-referenced image is stashed under the `image_s3` sentinel so the
-                            // writer re-emits `source.s3Location` on same-protocol egress instead of
-                            // dropping it (the old reader only read `bytes`, silently losing it).
+                            // S3-referenced image is carried on the typed
+                            // `IrImageSource::Vendor { vendor: "bedrock", value: {format, s3Location} }`
+                            // escape (see mod.rs) so the writer re-emits `source.s3Location` on
+                            // same-protocol egress instead of dropping it (the old reader only read
+                            // `bytes`, silently losing it).
                             if let Some(block) = read_bedrock_image_block(image) {
                                 msg_content.push(block);
                             }
@@ -1077,8 +1079,9 @@ impl ProtocolReader for BedrockReader {
                     // image output / tool-rendered image). Mirror the request-side readers
                     // (`read_request` content loop + the `toolResult` inner loop), which both decode
                     // `image` via `read_bedrock_image_block` — handling both `source.bytes` (base64)
-                    // and `source.s3Location` (stashed under the `image_s3` sentinel for faithful
-                    // re-emit). Without this arm the response loop silently DROPPED the image,
+                    // and `source.s3Location` (carried on the typed
+                    // `IrImageSource::Vendor { vendor: "bedrock" }` variant for faithful re-emit).
+                    // Without this arm the response loop silently DROPPED the image,
                     // diverging from a direct AWS call. A block with neither source yields `None`
                     // (no empty-bytes block injected).
                     if let Some(block) = read_bedrock_image_block(image) {

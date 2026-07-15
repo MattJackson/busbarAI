@@ -471,12 +471,6 @@ fn responses_block(block_val: &serde_json::Value) -> Result<crate::ir::IrBlock, 
     }
 }
 
-/// Sentinel `media_type` marking an IR `Image` block that carries a Responses `file_id` reference
-/// (L5) rather than inline image bytes or a URL. The `image_url` sentinel is already taken by
-/// `parse_image_url` for verbatim URL strings, so a DISTINCT sentinel is needed to round-trip a
-/// `file_id` image without an `image_url`: the writer keys on this value to re-emit
-/// `{type:"input_image","file_id":<data>}` instead of an `image_url`. A real image MIME type
-/// (`image/png`, …) and a non-data URL can never equal this literal, so the dispatch is unambiguous.
 /// Build an IR `Image` block from a Responses `input_image` content object (L5). Prefers an inline
 /// `image_url` (parsed via the shared `parse_image_url` into a `Base64`/`Url` source). Otherwise, an
 /// uploaded-file reference becomes the typed `FileId` source so the writer reconstructs the native

@@ -1131,7 +1131,7 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
 /// requirement (the admin surface is inert anyway).
 ///
 /// `auth` is the deployment's auth block (read separately, like governance, so neither lands on
-/// `RootCfg`). `governance.enabled` combined with `auth.mode=passthrough` is a self-contradictory
+/// `RootCfg`). `governance.enabled` combined with `upstream_credentials: passthrough` is a self-contradictory
 /// deployment: governance requires every request to resolve to an enabled virtual key, which
 /// supersedes passthrough's "accept any caller credential and forward it upstream" intent — so a
 /// server an operator believes is in passthrough silently rejects every caller lacking a virtual
@@ -1286,9 +1286,9 @@ fn percent_decode_host(host: &str) -> String {
 /// Extract the connect host from a `base_url`, normalized the SAME way the connecting stack
 /// (reqwest's `url` crate + glibc getaddrinfo) sees it: scheme stripped, backslashes folded to
 /// forward slashes, authority isolated, userinfo dropped, port removed (IPv6 brackets handled),
-/// percent-decoded, and a single trailing FQDN-root dot removed. Returns the lowercased-comparison
-/// is left to the caller; the returned string preserves original case but with the above
-/// normalizations applied. `None` when the scheme is not http/https or the host is empty.
+/// percent-decoded, and a single trailing FQDN-root dot removed. Lowercasing for comparison is left
+/// to the caller; the returned string preserves original case but with the above normalizations
+/// applied. `None` when the scheme is not http/https or the host is empty.
 ///
 /// Centralizing this means the SSRF metadata check and the private/loopback scheme classifier both
 /// reason over the EXACT host the connecting stack will, so neither can be bypassed by an authority
@@ -1507,6 +1507,7 @@ fn host_matches_any(host: &str, entries: &[String]) -> bool {
 ///     (nothing legitimate runs on link-local);
 ///   * `100.100.100.200` (Alibaba Cloud ECS, inside the otherwise-allowed CGNAT /10);
 ///   * `168.63.129.16` (Azure WireServer / platform);
+///   * `192.0.0.192` (Oracle Cloud / OCI IMDS — globally-routable-shaped, so it needs an explicit literal);
 ///   * the EC2 IMDSv6 `fd00:ec2::254`;
 ///   * the metadata hostnames in `METADATA_HOSTS`.
 ///

@@ -492,8 +492,8 @@ pub(crate) enum IrBlock {
     Json(Value),
 }
 
-/// Typed source for an [`IrBlock::Image`] — replaces a `media_type: String` overloaded with the
-/// `image_url` / `image_s3` / `file_id` magic sentinels (the stringly-typed smell).
+/// Typed source for an [`IrBlock::Image`] — replaces a `media_type: String` overloaded with
+/// `image_url` / `file_id` / s3-location magic strings (the stringly-typed smell).
 ///
 /// `Base64` and `Url` are PROTOCOL-NEUTRAL (any protocol can carry inline bytes or a URL). A
 /// vendor-scoped reference that has NO neutral form (a Bedrock `s3Location`, a Responses

@@ -966,7 +966,7 @@ pub(crate) async fn auth_middleware(
     // x-goog-api-key) — `client_token` already encodes that precedence. When governance is
     // disabled, the configured auth chain (empty = open, [tokens] = validated) applies unchanged.
     if let Some(gov) = &app.governance {
-        // governance enabled + `auth.mode: passthrough` is a self-contradictory deployment: the
+        // governance enabled + `upstream_credentials: passthrough` is a self-contradictory deployment: the
         // governance branch below requires every request to present a valid enabled busbar virtual
         // key (superseding passthrough's "accept any caller credential and forward it upstream"
         // intent), so a server an operator believes is in passthrough silently rejects every caller
@@ -985,8 +985,8 @@ pub(crate) async fn auth_middleware(
                 );
             });
         }
-        // Same class of silent contradiction for `auth.mode=none`: none is an open relay (the static
-        // path admits every request unconditionally), but the governance branch below requires a
+        // Same class of silent contradiction for an empty `auth.chain` (open relay): the open front
+        // door (the static path) admits every request unconditionally, but the governance branch below requires a
         // valid enabled virtual key on EVERY request, so a server an operator believes is open
         // silently rejects every caller without a key. `validate_governance` accepts the pairing (it
         // is a supported combination — governance simply wins), so there is no boot-time error;
@@ -1002,11 +1002,11 @@ pub(crate) async fn auth_middleware(
                 );
             });
         }
-        // Same class of silent override for `auth.mode=token` WITH a non-empty static client_tokens
+        // Same class of silent override for `auth.chain: [tokens]` WITH a non-empty static client_tokens
         // allowlist: the governance branch resolves every request against the virtual-key store, so
         // the static allowlist is NEVER consulted — its configured entries have ZERO enforcement
         // effect (governance supersedes them, exactly as it supersedes passthrough/none above). An
-        // operator who set `auth.mode=token` + `client_tokens: [...]` AND enabled governance in the
+        // operator who set `auth.chain: [tokens]` + `client_tokens: [...]` AND enabled governance in the
         // belief the static list still gates access is running a config that reads as doubly-secured
         // but whose static tokens are inert. `validate_governance` accepts the pairing (governance
         // simply wins), so there is no boot-time error; mirror the passthrough/none advisories with a

@@ -1137,9 +1137,9 @@ pub(crate) fn build_app_from_config(
         );
     }
 
-    // Loud warning for auth.mode=none (open relay). Not fatal — busbar still starts (useful for
+    // Loud warning for an empty `auth.chain` (open relay). Not fatal — busbar still starts (useful for
     // local dev) — but operators must not run this in production. NOTE: an ABSENT `auth:` block
-    // serde-defaults to mode=none too (`AuthCfg::default_none`), so a config that merely omits
+    // serde-defaults to an empty chain too (`AuthCfg::default_none`), so a config that merely omits
     // `auth:` silently becomes an open relay. Surface this at ERROR level (not warn — a warn is
     // suppressed under RUST_LOG=error, the very level an operator most likely runs in production)
     // AND unconditionally on stderr, so the open-relay state cannot be masked by log configuration.

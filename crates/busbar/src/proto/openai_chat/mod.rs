@@ -211,34 +211,6 @@ const COMPLETION_ID_TOKEN_LEN: usize = 24;
 /// [`synth_completion_id`].
 const BASE62: &[u8; 62] = crate::proto::BASE62_ALPHABET;
 
-/// Synthesize a protocol-correct OpenAI completion id (`"chatcmpl-<24 base62 chars>"`) for
-/// cross-protocol responses where the backend supplied none. Native OpenAI chat-completion ids are
-/// `chatcmpl-` plus a fixed-width 24-char base62 token (33 chars total); the official SDKs treat
-/// `id` as opaque, but tooling that length-checks or regex-validates the id immediately fingerprints
-/// a too-short or wrong-alphabet value as non-native. The previous base-36 form produced a
-/// variable-width ~7-char little-endian suffix (~16 chars total) — both too short and non-canonical.
-///
-/// The 24-char suffix is filled ENTIRELY from the OS CSPRNG (mirroring `synth_anthropic_request_id`
-/// in `proto::anthropic` / `synth_amzn_request_id` in `proto::bedrock`), giving native-looking
-/// entropy at EVERY position. A
-/// 24-char base62 token is ~142 bits of entropy; the birthday bound on a collision is ~2^71 draws,
-/// so pure CSPRNG output is collision-free in practice and needs no monotonic-counter backstop. We
-/// deliberately do NOT overlay a process counter: a counter overlaid into any fixed region of the
-/// token makes those characters predictable/low-entropy (the counter stays small, so its high
-/// base62 digits are constant '0'), which is itself a structural fingerprint a native vendor id —
-/// which is fully random across all positions — never carries. Native vendor ids ARE fully random,
-/// so we are too. Never panics on the request path: on the near-impossible `getrandom` failure the
-/// buffer stays the base62 zero char rather than `?`-ing out.
-///
-/// Mapping CSPRNG bytes into base62 uses REJECTION SAMPLING, not `byte % 62`. A raw modulo is biased
-/// because 256 is not a multiple of 62 (256 = 4*62 + 8): the eight residues 0..=7 each receive one
-/// extra source byte (5/256 probability vs 4/256 for residues 8..=61), so the first eight alphabet
-/// characters ('0'..='7') would appear ~25% more often than the rest. A native vendor id is uniform
-/// over the alphabet, so a skewed character histogram is itself a statistical fingerprint. We accept
-/// only bytes below 248 (= 4*62, the largest multiple of 62 that fits in a byte) and discard the rest,
-/// which yields an exactly-uniform draw over 0..62. Discards are rare (8/256 ≈ 3.1%), so we refill the
-/// entropy buffer on demand rather than over-allocating up front; on a `getrandom` failure the loop
-/// stops and the remaining slots keep their '0' fill, preserving the panic-free contract.
 /// OpenAI's `logprobs` object (`{content: [{token, logprob, bytes, top_logprobs[]}]}`) → the
 /// neutral IR entries. `bytes` is preserved verbatim when present (a token can be a partial UTF-8
 /// fragment, so the byte array is the only faithful carrier).
@@ -319,6 +291,34 @@ pub(crate) fn write_openai_logprobs(lps: &[crate::ir::IrTokenLogprob]) -> serde_
     serde_json::json!({ "content": content })
 }
 
+/// Synthesize a protocol-correct OpenAI completion id (`"chatcmpl-<24 base62 chars>"`) for
+/// cross-protocol responses where the backend supplied none. Native OpenAI chat-completion ids are
+/// `chatcmpl-` plus a fixed-width 24-char base62 token (33 chars total); the official SDKs treat
+/// `id` as opaque, but tooling that length-checks or regex-validates the id immediately fingerprints
+/// a too-short or wrong-alphabet value as non-native. The previous base-36 form produced a
+/// variable-width ~7-char little-endian suffix (~16 chars total) — both too short and non-canonical.
+///
+/// The 24-char suffix is filled ENTIRELY from the OS CSPRNG (mirroring `synth_anthropic_request_id`
+/// in `proto::anthropic` / `synth_amzn_request_id` in `proto::bedrock`), giving native-looking
+/// entropy at EVERY position. A
+/// 24-char base62 token is ~142 bits of entropy; the birthday bound on a collision is ~2^71 draws,
+/// so pure CSPRNG output is collision-free in practice and needs no monotonic-counter backstop. We
+/// deliberately do NOT overlay a process counter: a counter overlaid into any fixed region of the
+/// token makes those characters predictable/low-entropy (the counter stays small, so its high
+/// base62 digits are constant '0'), which is itself a structural fingerprint a native vendor id —
+/// which is fully random across all positions — never carries. Native vendor ids ARE fully random,
+/// so we are too. Never panics on the request path: on the near-impossible `getrandom` failure the
+/// buffer stays the base62 zero char rather than `?`-ing out.
+///
+/// Mapping CSPRNG bytes into base62 uses REJECTION SAMPLING, not `byte % 62`. A raw modulo is biased
+/// because 256 is not a multiple of 62 (256 = 4*62 + 8): the eight residues 0..=7 each receive one
+/// extra source byte (5/256 probability vs 4/256 for residues 8..=61), so the first eight alphabet
+/// characters ('0'..='7') would appear ~25% more often than the rest. A native vendor id is uniform
+/// over the alphabet, so a skewed character histogram is itself a statistical fingerprint. We accept
+/// only bytes below 248 (= 4*62, the largest multiple of 62 that fits in a byte) and discard the rest,
+/// which yields an exactly-uniform draw over 0..62. Discards are rare (8/256 ≈ 3.1%), so we refill the
+/// entropy buffer on demand rather than over-allocating up front; on a `getrandom` failure the loop
+/// stops and the remaining slots keep their '0' fill, preserving the panic-free contract.
 fn synth_completion_id() -> String {
     // Largest multiple of 62 that fits in a u8; bytes >= this are rejected to keep the draw uniform.
     const BASE62_REJECT_FLOOR: u8 = crate::proto::BASE62_REJECT_THRESHOLD; // 4 * 62

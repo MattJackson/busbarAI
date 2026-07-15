@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Virtual-key management API. Admin CRUD over `/admin/keys`, guarded by the
+//! Virtual-key management API. Admin CRUD over `/api/v1/admin/keys`, guarded by the
 //! configured admin token (enforced in `auth_middleware`, not here). Mutations refresh the
 //! `GovState` cache. Responses never include a key's `key_hash`; the plaintext secret is returned
 //! exactly once, on creation.
@@ -274,7 +274,7 @@ fn disabled_read() -> Response {
     )
 }
 
-/// Bound a path `id` (the virtual-key id from `/admin/keys/{id}`). Admin-gated, but an unbounded id
+/// Bound a path `id` (the virtual-key id from `/api/v1/admin/keys/{id}`). Admin-gated, but an unbounded id
 /// flows into a store lookup / log lines — cap it as defense-in-depth (DB/log-bloat guard). A real
 /// minted id is `vk_` + 16 hex chars (19 chars), so [`MAX_KEY_ID_LEN`] is generous headroom. Returns
 /// a 400 response when too long, `None` when acceptable.
@@ -337,7 +337,7 @@ impl Drop for IdemReservation {
     }
 }
 
-/// POST /admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
+/// POST /api/v1/admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
 pub(crate) async fn create_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
@@ -598,7 +598,7 @@ struct UpdateKeyReq {
     max_budget_cents: Option<Option<i64>>,
 }
 
-/// PATCH /admin/keys/:id — enable/disable a key or adjust its rate/budget caps. The `enabled` field
+/// PATCH /api/v1/admin/keys/{id} — enable/disable a key or adjust its rate/budget caps. The `enabled` field
 /// is the primary use (disabling a key WITHOUT destroying its usage history, which `DELETE` would).
 /// Admin-gated by the auth middleware (every `/admin/*` path requires the admin token). Validation
 /// is kept at create-parity: a negative budget or a zero rate cap is a 400, exactly as `create_key`
@@ -738,7 +738,7 @@ pub(crate) async fn update_key(
     }
 }
 
-/// GET /admin/keys — list key metadata (no secrets/hashes). Optional filters (design-admin-api-v1
+/// GET /api/v1/admin/keys — list key metadata (no secrets/hashes). Optional filters (design-admin-api-v1
 /// §2.1): `?enabled=true|false` (by enabled state), `?prefix=vk_ab` (by key-id prefix).
 pub(crate) async fn list_keys(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
@@ -930,7 +930,7 @@ pub(crate) async fn rotate_key(
     }
 }
 
-/// GET /admin/keys/:id — one key's metadata (id/name/pools/budgets/limits/enabled; never the
+/// GET /api/v1/admin/keys/{id} — one key's metadata (id/name/pools/budgets/limits/enabled; never the
 /// secret or key_hash). 404 when no key with `id` exists. Fills the single-key read gap in the key
 /// surface (design-admin-api-v1 §2.1); it stays on the legacy `{type}` envelope + `key_meta` shape so
 /// it is consistent with the sibling key routes (the full `{code}`-envelope migration is a follow-up).
@@ -1036,7 +1036,7 @@ pub(crate) async fn key_usage(
     }
 }
 
-/// DELETE /admin/keys/:id — revoke a key. Returns 404 when no key with `id` exists (REST/OpenAPI
+/// DELETE /api/v1/admin/keys/{id} — revoke a key. Returns 404 when no key with `id` exists (REST/OpenAPI
 /// contract), so a typo'd or already-deleted id is distinguishable from an actual revocation rather
 /// than masquerading as a spurious 200.
 pub(crate) async fn delete_key(

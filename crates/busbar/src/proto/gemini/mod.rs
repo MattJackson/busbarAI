@@ -526,14 +526,17 @@ fn prompt_block_reason(data: &serde_json::Value) -> Option<&str> {
 /// (the model emitted an UNPARSEABLE tool call — generation FAILED, there is NO valid call to run)
 /// → `error`, NOT `tool_use`: `tool_use` would tell the client to execute and continue a tool call
 /// that does not exist, so it would search for a tool_use block, find none/garbage and break; `OTHER`,
-/// `LANGUAGE`, and any unknown future reason → `end_turn` (a benign natural stop) — were previously
-/// passed through `to_lowercase()` VERBATIM, producing values (`recitation`, `malformed_function_call`,
-/// `spii`, …) that NO downstream SDK enum recognizes. Mapping them to the canonical IR set the
-/// Anthropic/OpenAI writers already translate (`safety`→Anthropic `safety`/OpenAI `content_filter`;
-/// `error`/`end_turn`→`end_turn`/`stop`) keeps the translation lossless instead of leaking an
-/// unrecognized Gemini token to a non-Gemini client. A Gemini→Gemini round-trip is unaffected: the
-/// writer's reverse map turns `end_turn` back into `STOP` and `safety` back into `SAFETY` (the
-/// dominant cases), and these stops are terminal — the body is not replayed.
+/// `LANGUAGE`, and any unknown future reason → the canonical `Other` variant (`_ => S::Other`) — were
+/// previously passed through `to_lowercase()` VERBATIM, producing values (`recitation`,
+/// `malformed_function_call`, `spii`, …) that NO downstream SDK enum recognizes. Mapping them to the
+/// canonical IR set the Anthropic/OpenAI writers already translate (`safety`→Anthropic `safety`/OpenAI
+/// `content_filter`; `error`→`end_turn`/`stop`; `Other`→each writer's natural-stop default) keeps the
+/// translation lossless instead of leaking an unrecognized Gemini token to a non-Gemini client. A
+/// Gemini→Gemini round-trip is unaffected: the writer emits `Other` back as the native `OTHER`
+/// finishReason (`write_gemini_stop_reason`: `Other => GEMINI_FINISH_OTHER`) and `safety` back as
+/// `SAFETY`, so a Gemini `OTHER` stop round-trips OTHER→Other→OTHER unchanged; these stops are terminal
+/// — the body is not replayed. (Do NOT "simplify" the `_ => S::Other` arm to `S::EndTurn`: that would
+/// silently convert a Gemini→Gemini `OTHER` stop into `STOP`.)
 fn map_gemini_finish_reason(finish_reason: &str) -> crate::ir::IrStopReason {
     use crate::ir::IrStopReason as S;
     match finish_reason {

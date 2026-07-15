@@ -614,10 +614,11 @@ impl<'de> Deserialize<'de> for PoolCfg {
     }
 }
 
-/// A pool's native ranking STRATEGY — the `policy:` key. `weighted` (default / absent) is today's
-/// smooth-weighted-round-robin: ZERO added cost, no policy object constructed, the byte-identical hot
-/// path. The others resolve a Busbar-native ordering policy that runs once before the failover loop.
-/// This is the pool's ranking FLOOR; an optional `hook:` gate can override it per-request.
+/// A pool's native ranking STRATEGY — the base ordering strategy named in a pool's `hooks:` list
+/// (the retired `policy:` key). `weighted` (default / absent) is today's smooth-weighted-round-robin:
+/// ZERO added cost, no policy object constructed, the byte-identical hot path. The others resolve a
+/// Busbar-native ordering policy that runs once before the failover loop. This is the pool's ranking
+/// FLOOR; a gate named in the pool's `hooks:` list can override it per-request.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PoolPolicy {
@@ -648,7 +649,8 @@ impl PoolPolicy {
 
 /// A hook's MODE — the `kind:` key. A hook is one thing; `tap`/`gate` just say whether busbar waits
 /// for a reply. `tap` = fire-and-forget (watch). `gate` = fire-and-wait (decide: nothing / reject /
-/// restrict / order / rewrite). Only a gate can influence dispatch; a pool's `hook:` must name a gate.
+/// restrict / order / rewrite). Only a gate can influence dispatch; a gate named in a pool's `hooks:`
+/// list must be `kind: gate`.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HookKind {
