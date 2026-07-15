@@ -51,19 +51,18 @@ Pools are optional: you can route directly to a single model. But the moment you
 
 By default a pool uses **smooth weighted round-robin (SWRR)** over the healthy members: each request goes to the next member by weight, and a tripped, dead, or capacity-exhausted member is skipped with its share redistributed to the rest. If the chosen lane fails before the client has seen a byte, Busbar fails over to the next member, even mid-stream. That is the whole reliability story: weighting for the happy path, automatic failover for the bad one.
 
-Set `route:` to something other than `weighted` and a **routing policy** decides the order instead. The policy runs once per request, before the failover loop:
+Name a **selection strategy** in the pool's `hooks:` list and it decides the order instead. The strategy runs once per request, before the failover loop:
 
-| Route | Picks the member with... |
+| Strategy (named in `hooks:`) | Picks the member with... |
 |---|---|
-| `weighted` (default) | the next weighted turn (SWRR). Zero overhead. |
+| `weighted` (default) | the next weighted turn (SWRR). Zero overhead — identical to naming no strategy. |
 | `cheapest` | the lowest `cost_per_mtok`. |
 | `fastest` | the lowest measured latency (rolling EWMA). |
 | `least_busy` | the most free concurrency. |
 | `usage` | the most rate-limit headroom. |
-| `webhook` | the order your HTTP sidecar returns. |
-| `script` | the order your Rhai script returns. |
+| an **ordering gate hook** | the order your own compiled socket hook or HTTPS webhook returns (a `kind: gate` replying with the `order` arm). |
 
-Every policy is documented in full, with worked examples, in the [Routing guide](routing.md). The rest of this page is about pool *structure*: members, weights, failover, and affinity.
+A pool names at most one strategy plus any number of gates in one `hooks: [...]` list — e.g. `hooks: [cheapest, pii-guard]`. External ordering logic is a hook, not a pool key: the pre-1.3 `route:` / `policy:` / `route: script` (embedded Rhai) keys were **removed** and are now hard startup errors — see [Migrating to 1.3](migration-1.3.md). Every strategy and the ordering-hook contract live in the [Routing guide](routing.md) and the [Hooks guide](/docs/hooks/). The rest of this page is about pool *structure*: members, weights, failover, and affinity.
 
 ## Config reference
 
@@ -72,11 +71,10 @@ Every policy is documented in full, with worked examples, in the [Routing guide]
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `members` | list | required | The lanes in this pool (see below). |
-| `route` | enum | `weighted` | `weighted`, `cheapest`, `fastest`, `least_busy`, `usage`, `webhook`, `script`. |
-| `policy` | object | none | Transport config; required for `webhook`/`script`. `url`, `script`/`script_file`, `timeout_ms`, `on_error` (`weighted`/`reject`/`first`). |
+| `hooks` | list | `[]` | This pool's ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage` — at most one) plus any gates, referenced by name from the top-level `hooks:` registry. |
 | `affinity` | object | none | `mode: session` pins a session to a lane by `header_name` (default `x-session-id`). |
 
-See the [Routing guide](routing.md) for the `route`/`policy` details and every native policy, and [Circuit breaker](/docs/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/docs/failover/) for `failover` and `on_exhausted`.
+See the [Routing guide](routing.md) for every selection strategy and the ordering-hook contract, the [Hooks guide](/docs/hooks/) for the full hook model, [Circuit breaker](/docs/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/docs/failover/) for `failover` and `on_exhausted`.
 
 **Member fields**
 
@@ -87,9 +85,9 @@ See the [Routing guide](routing.md) for the `route`/`policy` details and every n
 | `context_max` | integer | none | This lane's context window; requests larger than it fail over to a bigger lane. |
 | `tier` | string | none | Routing tier label (e.g. `primary`, `overflow`); read by policies. |
 | `cost_per_mtok` | float | none | Cost per million tokens; drives the `cheapest` policy. |
-| `tags` | list | `[]` | Free-form labels read by webhook/script policies. |
+| `tags` | list | `[]` | Free-form labels read by ordering/gate hooks. |
 
-`tier`, `cost_per_mtok`, and `tags` are consumed by routing policies; see [Routing](routing.md#the-routing-signals) for the full signal set each policy receives.
+`tier`, `cost_per_mtok`, and `tags` are consumed by the selection strategies and ordering hooks; see [Routing](routing.md#the-routing-signals) for the full signal set each receives.
 
 ## Multi-protocol pools
 

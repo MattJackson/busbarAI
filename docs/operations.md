@@ -106,14 +106,14 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_upstream_attempts_total` | counter | `pool`, `lane` | Real upstream calls (re-counted per failover hop). |
 | `busbar_upstream_failures_total` | counter | `pool`, `lane`, `disposition` | `disposition` is `transient_upstream` / `hard_down` / `context_length`. Concentration on one lane points at a sick backend. |
 | `busbar_breaker_trips_total` | counter | `pool`, `lane` | Each hard-down/trip. Spikes = a backend going down. |
-| `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout` / `connect` / `transient_upstream` / `hard_down`. |
+| `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout` / `connect` / `transient_upstream` / `hard_down` / `context_length`. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency. |
 | `busbar_key_spend_cents` | gauge | `key` | Per-virtual-key spend in cents for the current budget window. Only emitted when governance is enabled. |
 | `busbar_key_budget_remaining_cents` | gauge | `key` | Max budget minus current spend for capped keys. Enables Prometheus burn-rate alerting. Only emitted for keys with a `max_budget_cents` cap. |
 | `busbar_key_tokens_total` | gauge | `key` | Tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
 | `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
-| `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy (webhook/script/native) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
+| `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a selection strategy (a native strategy or a gate hook) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
 | `busbar_route_policy_rejections_total` | counter | `pool`, `policy`, `status` | Requests deliberately rejected by a routing hook's `reject` verb (a 4xx to the caller, no upstream dispatched). A guardrail saying no, not a failure. |
 | `busbar_webhook_logs_dropped_total` | counter | n/a | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped, scale the endpoint or alert. |
 | `busbar_billing_truncated_total` | counter | n/a | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |

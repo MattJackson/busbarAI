@@ -889,7 +889,7 @@ listen: "0.0.0.0:8080"
 # supersede static tokens once governance is active.
 # ---------------------------------------------------------------------------
 auth:
-  mode: token
+  chain: [tokens]
   client_tokens:
     - "${BUSBAR_CLIENT_TOKEN}"
 
@@ -1008,7 +1008,7 @@ observability:
 
 # ---------------------------------------------------------------------------
 # Governance: virtual keys, budgets, rate limits.
-# Note: mode: passthrough is incompatible with governance.enabled: true.
+# Note: upstream_credentials: passthrough is incompatible with governance.enabled: true.
 # ---------------------------------------------------------------------------
 governance:
   enabled: true
@@ -1034,7 +1034,6 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `base_url` plaintext | `base_url` uses `http://` with a public (non-private, non-loopback) host: plain HTTP to a public host would expose the API key on the wire |
 | `error_map` value unknown | A value in `error_map` is not one of the nine canonical disposition classes |
 | `auth` value unknown | `auth` field value not `bearer` or `api-key` |
-| `auth.mode` value unknown | `auth.mode` not one of `token`, `passthrough`, `none` (case-insensitive) |
 | `affinity.mode` value unknown | `affinity.mode` not `session` (the only supported value) |
 | Removed `token` field set | The 1.0.0-removed `auth.token` field is present, rejected at parse as an unknown field (`unknown field \`token\``); move its value into `client_tokens` |
 | `path` malformed | `path` does not begin with `/` |
@@ -1069,7 +1068,7 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `auth.chain` names an unknown module | Every chain entry must be a compiled-in auth module |
 | `auth.mode` present | Removed in 1.3 — write `chain:` + `upstream_credentials:` |
 | `governance.enabled: true` + no `admin_token` | Admin API silently inaccessible |
-| `governance.enabled: true` + `auth.mode: passthrough` | Unsupported combination |
+| `governance.enabled: true` + `upstream_credentials: passthrough` | Unsupported combination |
 | `${VAR}` unset in config | Unresolvable interpolation reference |
 | `${}` or unclosed `${` | Malformed interpolation syntax |
 
@@ -1077,9 +1076,9 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 
 | Condition |
 |---|
-| `auth.mode: none` with non-empty `client_tokens` (allowlist has no effect) |
-| `auth.mode: passthrough` with a provider whose API key env var is non-empty (credential-leak risk) |
+| `chain: []` (open front door) with non-empty `client_tokens` (allowlist has no effect) |
+| `upstream_credentials: passthrough` with a provider whose API key env var is non-empty (credential-leak risk) |
 | Heterogeneous pool (members span more than one backend protocol, cross-protocol translation applies) |
 | `api_key_env` names an env var that is unset or empty at boot (lane will fail auth) |
 | `allowed_pools` on a virtual key (admin API) names a pool not currently configured |
-| `auth.mode: token` or `auth.mode: none` with governance enabled (static auth is superseded; effective mode is governance virtual keys) |
+| `chain: [tokens]` or `chain: []` with governance enabled (static auth is superseded; effective mode is governance virtual keys) |

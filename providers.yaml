@@ -14,8 +14,8 @@
 #
 # Auth is a per-protocol seam, not a single scheme: most providers use `Authorization: Bearer <key>`,
 # gemini uses the `x-goog-api-key` header, and bedrock signs each request with AWS SigV4 (see below).
-# Future enterprise backends (Azure OpenAI, Google Vertex AI) plug into this same seam as auth
-# adapters - see docs/roadmap.md. HTTP-status errors (429/5xx/401/...) are classified by the circuit
+# Azure OpenAI is supported today via the `auth: api-key` override (a fill-in template is below);
+# Google Vertex AI is a future auth adapter on this same seam - see docs/roadmap.md. HTTP-status errors (429/5xx/401/...) are classified by the circuit
 # breaker without an error_map; error_map is only for provider-specific JSON codes.
 
 # -- Anthropic protocol (/v1/messages) -----------------------------------------------------------

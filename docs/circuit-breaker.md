@@ -129,7 +129,8 @@ Choose `error_rate` when you want the breaker to absorb a few errors without tri
 Cooldown grows exponentially with the consecutive failure streak:
 
 ```
-cooldown = min(base_cooldown_secs × 2^streak, max_cooldown_secs) ± 10% jitter
+target   = min(base_cooldown_secs × 2^streak, max_cooldown_secs)
+cooldown = clamp(target ± 10% jitter, max(target / 2, 1s), max_cooldown_secs)
 ```
 
 Jitter is seeded by a hash of the current time, the cell's memory address, and the streak: so simultaneously tripped lanes desynchronize their recovery probes rather than flooding a recovering backend together.
