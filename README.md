@@ -9,16 +9,17 @@
 [![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/status-1.2.0-brightgreen)
+[![Docker image size](https://img.shields.io/docker/image-size/getbusbar/busbar?sort=semver&label=image)](https://hub.docker.com/r/getbusbar/busbar)
 
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
-🐳 **Docker:** [`getbusbar/busbar`](https://hub.docker.com/r/getbusbar/busbar) — `FROM scratch`, ~4.3 MB compressed (v1.3.2), multi-arch, cosign-signed  
+🐳 **Docker:** [`getbusbar/busbar`](https://hub.docker.com/r/getbusbar/busbar) — `FROM scratch`, multi-arch, cosign-signed  
+📊 **Footprint** (measured, v1.3.2): ~4.3 MB image · ~5.6 MB idle RSS · added latency in µs → [benchmark](https://getbusbar.com/docs/benchmark/)  
 🤖 **Agent-readable:** [getbusbar.com/llms.txt](https://getbusbar.com/llms.txt)
 
 Busbar sits between your application and every AI provider. Point any SDK at one URL (OpenAI, Anthropic, Gemini, Bedrock, Cohere, or the Responses API) and Busbar routes each request to the backends you chose, translating losslessly between protocols where they differ: chat, embeddings, images, audio, and moderations. When a provider fails, it keeps serving.
 
-> **Status: 1.2.0, stable.** API, config schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships an SBOM and a build-provenance attestation. Apache-2.0.
+> **Stable.** The API, config schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships an SBOM and a build-provenance attestation. Apache-2.0. (Current version: the Release badge above — never hand-written, so it can't go stale.)
 
 ---
 
