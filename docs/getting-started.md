@@ -66,7 +66,7 @@ chmod +x busbar
 ./busbar --version
 ```
 
-**Or use Docker**: a `FROM scratch` image (the static binary plus the provider catalog, ~5 MB compressed, amd64 + arm64), cosign-signed with build provenance:
+**Or use Docker**: a `FROM scratch` image (the static binary plus the provider catalog, ~4.3 MB compressed as of v1.3.2, amd64 + arm64), cosign-signed with build provenance:
 
 ```bash
 docker run -d -p 8080:8080 \
