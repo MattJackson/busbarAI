@@ -116,6 +116,16 @@ gemini-vertex:
   api_key_env: VERTEX_SA_KEY
   error_map:
     RESOURCE_EXHAUSTED: rate_limit
+
+# Claude-on-Vertex is the same shape on the anthropic protocol (publishers/anthropic). busbar moves
+# the model into the URL (:rawPredict) and adds the required anthropic_version body field for you:
+claude-vertex:
+  protocol: anthropic
+  base_url: https://us-central1-aiplatform.googleapis.com
+  path_base: /v1/projects/YOUR_PROJECT/locations/us-central1/publishers/anthropic/models
+  auth: jwt-bearer
+  api_key_env: VERTEX_SA_KEY
+  error_map: {}
 ```
 
 See the [configuration reference](/docs/configuration/) for every field and default.

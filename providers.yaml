@@ -816,6 +816,18 @@ gemini:
 #     api_key_env: VERTEX_SA_KEY                       # SA JSON (inline) or a path to the key file
 #     error_map:
 #       RESOURCE_EXHAUSTED: rate_limit
+#
+# Claude-on-Vertex is the SAME shape on the `anthropic` protocol: busbar moves the model into the URL
+# (`:rawPredict`) and adds the required `anthropic_version` body field automatically. Just point
+# path_base at the `anthropic` publisher:
+#
+#   claude-vertex:
+#     protocol: anthropic
+#     base_url: https://us-central1-aiplatform.googleapis.com
+#     path_base: /v1/projects/YOUR_PROJECT/locations/us-central1/publishers/anthropic/models
+#     auth: jwt-bearer
+#     api_key_env: VERTEX_SA_KEY
+#     error_map: {}
 
 # -- AWS Bedrock protocol (Converse / ConverseStream) ---------------------------------------------
 # Auth is native AWS SigV4: set this provider's api_key_env to the AWS credentials as

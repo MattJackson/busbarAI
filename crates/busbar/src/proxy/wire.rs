@@ -455,6 +455,23 @@ pub(crate) fn translate_request_cross_protocol(
         .protocol
         .writer()
         .rewrite_model_if_needed(&mut body, app.lanes[i].wire_model()); // invalidator #3
+                                                                        // Claude-on-Vertex: an Anthropic-protocol lane at a Vertex `path_base` carries the model in the URL
+                                                                        // (`:rawPredict`, see the anthropic handler), so the body must OMIT `model` and instead carry
+                                                                        // `anthropic_version` (Vertex's required discriminator). Applied here, where the lane and its
+                                                                        // `path_base` are in scope. It necessarily mutates the body, so a same-protocol passthrough to a
+                                                                        // Vertex Anthropic lane is (correctly) no longer pristine.
+    if app.lanes[i].path_base.is_some()
+        && app.lanes[i].protocol.name() == crate::proto::PROTO_ANTHROPIC
+    {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("model");
+            obj.insert(
+                "anthropic_version".to_string(),
+                serde_json::json!("vertex-2023-10-16"),
+            );
+            pristine = false;
+        }
+    }
     if ingress_protocol == egress_name {
         pristine &= !strip_same_protocol_model_shim(&mut body, ingress_protocol);
         // invalidator #4
