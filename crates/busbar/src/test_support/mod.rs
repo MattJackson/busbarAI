@@ -604,6 +604,7 @@ impl LaneSpec {
             error_map: std::sync::Arc::new(self.error_map.clone()),
             context_max: self.context_max,
             path: self.path.clone(),
+            path_base: None,
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
             upstream_model: self.upstream_model.clone(),

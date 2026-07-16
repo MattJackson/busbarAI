@@ -21,6 +21,7 @@ fn anthropic_lane(default_max_tokens: Option<u32>) -> Lane {
         error_map: Arc::new(HashMap::new()),
         context_max: None,
         path: None,
+        path_base: None,
         health: None,
         upstream_model: None,
         attempt_timeout_ms: None,

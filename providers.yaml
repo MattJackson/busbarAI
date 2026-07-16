@@ -14,9 +14,10 @@
 #
 # Auth is a per-protocol seam, not a single scheme: most providers use `Authorization: Bearer <key>`,
 # gemini uses the `x-goog-api-key` header, and bedrock signs each request with AWS SigV4 (see below).
-# Azure OpenAI is supported today via the `auth: api-key` override (a fill-in template is below);
-# Google Vertex AI is a future auth adapter on this same seam - see docs/roadmap.md. HTTP-status errors (429/5xx/401/...) are classified by the circuit
-# breaker without an error_map; error_map is only for provider-specific JSON codes.
+# Azure OpenAI is supported today via the `auth: api-key` override (a fill-in template is below); Google
+# Vertex AI via the `auth: jwt-bearer` OAuth adapter (a fill-in template is below the gemini entry).
+# HTTP-status errors (429/5xx/401/...) are classified by the circuit breaker without an error_map;
+# error_map is only for provider-specific JSON codes.
 
 # -- Anthropic protocol (/v1/messages) -----------------------------------------------------------
 anthropic:
@@ -799,6 +800,22 @@ gemini:
   base_url: https://generativelanguage.googleapis.com
   error_map:
     RESOURCE_EXHAUSTED: rate_limit
+
+# Google Vertex AI (Gemini) speaks the SAME gemini protocol, but at a project/location-scoped URL and
+# with OAuth (`auth: jwt-bearer` — a signed service-account JWT exchanged for an auto-refreshed bearer)
+# instead of an API key. project + location are per-account, so it is not shipped as a live entry -
+# copy this template into your config.yaml providers map and fill in your values. `api_key_env` holds
+# the service-account JSON (inline) OR a path to the key file. Vertex returns Google's `google.rpc`
+# error codes (same `status` tokens as native gemini), so the error_map mirrors gemini's.
+#
+#   gemini-vertex:
+#     protocol: gemini
+#     base_url: https://us-central1-aiplatform.googleapis.com
+#     path_base: /v1/projects/YOUR_PROJECT/locations/us-central1/publishers/google/models
+#     auth: jwt-bearer
+#     api_key_env: VERTEX_SA_KEY                       # SA JSON (inline) or a path to the key file
+#     error_map:
+#       RESOURCE_EXHAUSTED: rate_limit
 
 # -- AWS Bedrock protocol (Converse / ConverseStream) ---------------------------------------------
 # Auth is native AWS SigV4: set this provider's api_key_env to the AWS credentials as

@@ -282,6 +282,10 @@ pub(crate) struct ProviderCfg {
     /// Optional upstream request-path override (see ProviderDef::path).
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Optional path-BASE override (see ProviderDef::path_base) — replaces a URL-model protocol's
+    /// hardcoded base segment so the per-request `/{model}:verb` suffix is appended to it (Vertex AI).
+    #[serde(default)]
+    pub(crate) path_base: Option<String>,
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<ProviderAuth>,
@@ -317,6 +321,7 @@ impl fmt::Debug for ProviderCfg {
             .field("health", &self.health)
             .field("error_map", &self.error_map)
             .field("path", &self.path)
+            .field("path_base", &self.path_base)
             .field("auth", &self.auth)
             .field("allow_metadata_hosts", &self.allow_metadata_hosts)
             .field(
@@ -349,6 +354,12 @@ pub(crate) enum ProviderAuth {
     Bearer,
     #[serde(rename = "api-key")]
     ApiKey,
+    /// OAuth 2.0 JWT-bearer grant (RFC 7523): the provider's credential is a signing key (delivered as
+    /// a Google service-account JSON in `api_key_env`), which busbar uses to mint + auto-refresh a
+    /// short-lived bearer token per lane. Generic — Vertex AI is the first provider to select it. The
+    /// token minting/refresh lives in `crate::egress_auth::jwt_bearer`; this is only the selector.
+    #[serde(rename = "jwt-bearer")]
+    JwtBearer,
 }
 
 /// Active health-probe mode for a provider's lanes.
@@ -1221,6 +1232,13 @@ pub(crate) struct ProviderDef {
     /// `path: /chat/completions`.
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Optional path-BASE override for URL-model protocols (Gemini): replaces the protocol's
+    /// hardcoded base segment (`/v1beta/models`) so the per-request `/{model}:verb` suffix is appended
+    /// to a different layout. Unlike `path` (a static full path that ignores the model), `path_base`
+    /// keeps the model in the URL — e.g. Vertex AI: `path_base:
+    /// /v1/projects/{project}/locations/{location}/publishers/google/models`.
+    #[serde(default)]
+    pub(crate) path_base: Option<String>,
     /// Optional auth-style override. Defaults to the protocol's native auth (bearer for
     /// openai/anthropic/responses, `x-goog-api-key` for gemini, SigV4 for bedrock). Set to
     /// `api-key` for backends that authenticate with an `api-key: <key>` header instead of a
@@ -1249,6 +1267,10 @@ pub(crate) struct ProviderDeploy {
     /// Optional upstream request-path override (see ProviderDef::path).
     #[serde(default)]
     pub(crate) path: Option<String>,
+    /// Optional path-BASE override (see ProviderDef::path_base) — replaces a URL-model protocol's
+    /// hardcoded base segment so the per-request `/{model}:verb` suffix is appended to it (Vertex AI).
+    #[serde(default)]
+    pub(crate) path_base: Option<String>,
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<ProviderAuth>,
@@ -1280,6 +1302,7 @@ impl fmt::Debug for ProviderDeploy {
             .field("base_url", &self.base_url)
             .field("error_map", &self.error_map)
             .field("path", &self.path)
+            .field("path_base", &self.path_base)
             .field("auth", &self.auth)
             .field("allow_metadata_hosts", &self.allow_metadata_hosts)
             .field("health", &self.health)
@@ -1914,6 +1937,10 @@ pub(crate) fn resolve(
                 error_map,
                 // deployment override wins over the catalog default
                 path: deploy_cfg.path.clone().or_else(|| def.path.clone()),
+                path_base: deploy_cfg
+                    .path_base
+                    .clone()
+                    .or_else(|| def.path_base.clone()),
                 auth: deploy_cfg.auth.or(def.auth),
                 // deployment override (Some) replaces the catalog default
                 allow_metadata_hosts: deploy_cfg

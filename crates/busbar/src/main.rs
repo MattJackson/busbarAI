@@ -1071,23 +1071,33 @@ pub(crate) fn build_app_from_config(
                 ld.provider, provider_cfg.protocol
             ));
         };
+        // Reuse the single env read captured in the lanes_data loop above (same source of truth as
+        // the empty-key warning); no second read of the secret-bearing env var.
+        let api_key = provider_api_keys
+            .get(&ld.provider)
+            .cloned()
+            .unwrap_or_default();
+        // Resolve the outbound credential once. Most auth styles are a simple sync lookup; `jwt-bearer`
+        // parses its service-account key here (failing loud on a bad key) and starts a background token
+        // minter/refresher. `api_key` carries the signing material (inline SA JSON or a key-file path).
+        let credential = if matches!(provider_cfg.auth, Some(config::ProviderAuth::JwtBearer)) {
+            egress_auth::jwt_bearer::build(&api_key, None)
+                .map_err(|e| format!("provider '{}' (jwt-bearer auth): {e}", ld.provider))?
+        } else {
+            egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth)
+        };
         lanes.push(Lane {
             model: ld.model.clone(),
             provider: ld.provider.clone(),
             base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
-            // Reuse the single env read captured in the lanes_data loop above (same source of truth
-            // as the empty-key warning); no second read of the secret-bearing env var.
-            api_key: provider_api_keys
-                .get(&ld.provider)
-                .cloned()
-                .unwrap_or_default(),
-            // Resolve the outbound credential once, from the protocol + configured auth style.
-            credential: egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth),
+            api_key,
+            credential,
             protocol,
             max: ld.max,
             error_map: Arc::new(provider_cfg.error_map.clone()),
             context_max: model_context_max.get(&ld.model).copied().flatten(),
             path: provider_cfg.path.clone(),
+            path_base: provider_cfg.path_base.clone(),
             health: provider_cfg.health.clone(),
             upstream_model: ld.upstream_model.clone(),
             attempt_timeout_ms: ld.attempt_timeout_ms,

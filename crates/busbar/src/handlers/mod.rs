@@ -116,6 +116,12 @@ pub(crate) struct EgressCtx<'a> {
     pub(crate) model: &'a str,
     /// Whether the caller asked to stream (chat/audio path variants); `false` for the JSON ops.
     pub(crate) stream: bool,
+    /// Optional per-provider path-BASE override (the lane's `path_base`). For URL-model protocols
+    /// (Gemini) it replaces the protocol's hardcoded base segment (e.g. `/v1beta/models`) so a
+    /// provider can be pointed at a different layout — e.g. Vertex AI's
+    /// `/v1/projects/{p}/locations/{l}/publishers/google/models`. `None` uses the protocol default.
+    /// Distinct from the full-path `path` override, which is static and ignores the per-request model.
+    pub(crate) path_base: Option<&'a str>,
 }
 
 /// A pure per-(protocol × operation) codec. Feed it wire, assert the IR; feed it IR, assert the wire.
@@ -297,6 +303,7 @@ impl OpDispatch {
                 operation: self.operation,
                 model: lane.wire_model(),
                 stream: wants_stream,
+                path_base: lane.path_base.as_deref(),
             })
         })
     }

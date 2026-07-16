@@ -42,9 +42,13 @@ impl RequestHandler for GeminiRequestHandler {
     }
     fn upstream_path(&self, ctx: &EgressCtx) -> String {
         let m = ctx.model;
+        // The base segment before `/{model}:verb`. Native Gemini is `/v1beta/models`; a provider may
+        // override it via `path_base` (e.g. Vertex AI's `/v1/projects/{p}/locations/{l}/publishers/
+        // google/models`). The `:verb` suffix and streaming selection are unchanged.
+        let base = ctx.path_base.unwrap_or("/v1beta/models");
         match ctx.operation {
-            Operation::Embeddings => format!("/v1beta/models/{m}:embedContent"),
-            Operation::Image => format!("/v1beta/models/{m}:predict"),
+            Operation::Embeddings => format!("{base}/{m}:embedContent"),
+            Operation::Image => format!("{base}/{m}:predict"),
             // Chat + audio understanding/TTS all ride generateContent (stream-aware for chat/audio).
             Operation::Chat | Operation::Transcription | Operation::Speech => {
                 let verb = if ctx.stream {
@@ -52,12 +56,12 @@ impl RequestHandler for GeminiRequestHandler {
                 } else {
                     "generateContent"
                 };
-                format!("/v1beta/models/{m}:{verb}")
+                format!("{base}/{m}:{verb}")
             }
             // Unreachable in practice: gemini has no moderation/rerank handler (operation_handler
             // returns None), so these never reach egress path resolution.
-            Operation::Moderation => format!("/v1beta/models/{m}:generateContent"),
-            Operation::Rerank => format!("/v1beta/models/{m}:generateContent"),
+            Operation::Moderation => format!("{base}/{m}:generateContent"),
+            Operation::Rerank => format!("{base}/{m}:generateContent"),
         }
     }
     fn resolve_operation(&self, path: &str, body: &[u8]) -> Option<Operation> {
@@ -615,6 +619,40 @@ impl OperationHandler for GeminiEmbeddings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_base_reshapes_the_gemini_url_for_vertex() {
+        let h = GeminiRequestHandler;
+        let model = "gemini-2.0-flash";
+        let ctx = |path_base| EgressCtx {
+            operation: Operation::Chat,
+            model,
+            stream: false,
+            path_base,
+        };
+        // Default (no override): the native Generative Language layout is unchanged.
+        assert_eq!(
+            h.upstream_path(&ctx(None)),
+            "/v1beta/models/gemini-2.0-flash:generateContent"
+        );
+        // With a Vertex path_base: the base segment is replaced; the `/{model}:verb` suffix survives,
+        // so a `gemini`-protocol provider reaches the Vertex URL by config alone.
+        let vbase = "/v1/projects/my-proj/locations/us-central1/publishers/google/models";
+        assert_eq!(
+            h.upstream_path(&ctx(Some(vbase))),
+            "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent"
+        );
+        // Embeddings keep their verb on the overridden base too.
+        assert_eq!(
+            h.upstream_path(&EgressCtx {
+                operation: Operation::Embeddings,
+                model,
+                stream: false,
+                path_base: Some(vbase),
+            }),
+            "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-2.0-flash:embedContent"
+        );
+    }
 
     #[test]
     fn transcription_read_request_captures_inline_audio() {

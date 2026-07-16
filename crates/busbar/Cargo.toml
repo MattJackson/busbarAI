@@ -40,6 +40,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# RS256 JWT signing for the `jwt-bearer` egress auth (OAuth 2.0 JWT-bearer grant, RFC 7523 — Vertex et
+# al.). Both crates are ALREADY in the graph (ring is reqwest's rustls crypto backend; base64 rides in
+# transitively), so promoting them to direct deps adds NO new external crate to the tree. `ring` does
+# the RS256 signature (`RsaKeyPair::from_pkcs8` + `RSA_PKCS1_SHA256`); `base64` does the PEM→DER decode
+# of the service-account private key and the JWT base64url segments.
+ring = "0.17"
+base64 = "0.22"
 # SIMD JSON (NEON on arm64, AVX2/SSE on x86): used for the hot request/response parse+serialize on
 # the translate path, where its SIMD escape-scanning is ~5× serde_json on the large string-heavy
 # bodies LLM traffic carries. `serde_json` is retained for the cold/config/error paths and as the

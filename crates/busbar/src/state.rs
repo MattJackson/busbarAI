@@ -29,6 +29,9 @@ pub(crate) struct Lane {
     /// Optional upstream request-path override. When set, used verbatim instead of the protocol's
     /// default path (for providers that embed the API version in base_url and serve /chat/completions).
     pub(crate) path: Option<String>,
+    /// Optional path-BASE override for URL-model protocols (Gemini): replaces the hardcoded base
+    /// segment while keeping the per-request `/{model}:verb` suffix (Vertex AI). See `EgressCtx`.
+    pub(crate) path_base: Option<String>,
     /// Optional active health-probe settings (from the provider's `health:` block). `None` or
     /// `mode: none` means no background probing for this lane.
     pub(crate) health: Option<crate::config::HealthCfg>,

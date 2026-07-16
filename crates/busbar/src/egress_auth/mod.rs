@@ -18,6 +18,8 @@ use crate::proto::SigningContext;
 use axum::http::{HeaderName, HeaderValue};
 use std::sync::Arc;
 
+pub(crate) mod jwt_bearer;
+
 /// Produces the outbound auth headers for a single upstream request.
 ///
 /// `key` is the per-request credential the caller resolved — the lane's configured key for
@@ -37,6 +39,13 @@ pub(crate) fn resolve(
     if matches!(auth, Some(crate::config::ProviderAuth::ApiKey)) {
         return Arc::new(ApiKeyHeader { header: "api-key" });
     }
+    if matches!(auth, Some(crate::config::ProviderAuth::JwtBearer)) {
+        // `jwt-bearer` mints its token asynchronously at boot (see `jwt_bearer::build`), so the boot
+        // path special-cases it and never routes it through this sync resolver. Reaching here means
+        // that wiring was bypassed — fail closed with a credential that emits no auth header (upstream
+        // 401) rather than silently sending the raw service-account JSON as a bearer.
+        return Arc::new(NoCredential);
+    }
     match protocol_name {
         "gemini" => Arc::new(ApiKeyHeader {
             header: "x-goog-api-key",
@@ -47,6 +56,16 @@ pub(crate) fn resolve(
         "cohere" => Arc::new(StaticBearer { proto: "cohere" }),
         "responses" => Arc::new(StaticBearer { proto: "responses" }),
         _ => Arc::new(StaticBearer { proto: "openai" }),
+    }
+}
+
+/// Fail-closed credential: emits no auth header. Used only as a defensive fallback if an
+/// async-constructed credential (e.g. `jwt-bearer`) reaches the sync resolver — the upstream then
+/// rejects with 401 rather than receiving a wrong or raw-secret header.
+struct NoCredential;
+impl CredentialProvider for NoCredential {
+    fn headers_for(&self, _key: &str, _ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
+        Vec::new()
     }
 }
 

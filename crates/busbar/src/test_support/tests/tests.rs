@@ -3220,6 +3220,7 @@ mod disposition_matrix_tests {
                     health: None,
                     error_map,
                     path: None,
+                    path_base: None,
                     auth: None,
                     _legacy_api_key: None,
                     allow_metadata_hosts: Vec::new(),

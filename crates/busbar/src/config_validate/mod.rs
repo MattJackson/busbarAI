@@ -346,6 +346,30 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 }
             }
         }
+        // Same guards for `path_base` (the URL-model base override, e.g. Vertex): it is prepended to
+        // the per-request `/{model}:verb` and appended to base_url, so it must begin with '/' and the
+        // composed host must not be a blocked metadata endpoint.
+        if let Some(path_base) = &provider_cfg.path_base {
+            if !path_base.starts_with('/') {
+                errors.push(format!(
+                    "provider '{}' path_base '{}' must begin with '/': it is appended to base_url verbatim, so a value that does not start with '/' fuses into the host and can redirect signed traffic to an attacker-controlled host",
+                    provider_name, path_base
+                ));
+            } else if scheme_ok {
+                let composed = format!("{}{}", provider_cfg.base_url, path_base);
+                if let Some(host) = ssrf_blocked_host(
+                    &composed,
+                    &allow_overrides,
+                    cfg.allow_all_metadata,
+                    &cfg.blocked_metadata_hosts,
+                ) {
+                    errors.push(format!(
+                        "provider '{}' base_url+path_base '{}' targets a blocked cloud-metadata host '{}' (cloud-metadata/IMDS endpoints are denied; to override add the host to this provider's allow_metadata_hosts, or security.allow_metadata_hosts, or set security.allow_all_metadata: true)",
+                        provider_name, composed, host
+                    ));
+                }
+            }
+        }
     }
 
     // Rule 2 & 3: Validate each pool's members
