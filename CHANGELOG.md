@@ -9,6 +9,43 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Removed**, **Fixed**, **Security**. Migration steps for a breaking change appear as a bold **Migration**
 item under **Changed**.
 
+## [1.3.3], 2026-07-16
+
+### Added
+
+- `busbar --validate` — validate a config file without booting or binding a socket (the `nginx -t`
+  workflow). Reports structural/reference errors and, in lenient env mode, records unset `${VARS}` as
+  placeholders (structure, not secrets) so a config can be checked in CI without the runtime environment.
+
+### Changed
+
+- Egress auth is now fully separated from the protocol writers: a `CredentialProvider` owned by the lane
+  (resolved once at boot from protocol + auth style) produces each request's outbound auth headers via
+  `lane.credential.headers_for(...)`, replacing per-writer `auth_headers`/`sign_request`. Behavior-preserving
+  — every protocol emits byte-identical auth — and it sets up a self-minting (OAuth/Vertex) credential later.
+- Release profile is `opt-level = 3` (was 2). New `BUSBAR_WORKER_THREADS` env knob hard-caps the Tokio
+  worker pool (default `min(cores, 4)`, ~5% lower RSS on many-core hosts). Deduped `getrandom` to a single
+  0.3 line (dropped the 0.4 copy).
+- All workspace crates are now versioned in lockstep at `1.3.3`. The internal `publish = false` support
+  crates (`busbar-api`, `busbar-auth-tokens`, `busbar-auth-admin-tokens`, `busbar-hooks-ranking`) had
+  lagged at 1.3.0 across the last few releases; they now track the binary's version.
+
+### Fixed
+
+- Tap (fire-and-forget hook) spawns are now bounded by a semaphore (cap 1024) so a slow hook can't grow
+  unbounded in-flight tasks; over-cap taps are dropped and counted (`tap_notifications_dropped_total`).
+- Config overlay no longer risks tombstone-loss: an unreadable overlay file is refused rather than
+  overwritten (which previously could silently drop persisted admin state).
+- Request rewrite-on-failover now fails **closed** — if a queued rewrite can't be re-applied to the retried
+  upstream, the request is rejected (500) instead of silently forwarding the un-rewritten body.
+
+### Security
+
+- SSRF egress guard extended to block Azure WireServer (`168.63.129.16`) and Oracle Cloud IMDS
+  (`192.0.0.192`) alongside the existing cloud metadata ranges. `host_from_base` strips userinfo,
+  folds backslashes, and drops any path before deriving the SigV4-signed host, so the signed host can
+  never desync from the host actually dialed.
+
 ## [1.3.2], 2026-07-14
 
 ### Fixed
