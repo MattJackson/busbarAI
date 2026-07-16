@@ -11,8 +11,9 @@ Providers live in `providers.yaml` as a map of name → definition. The shipped 
 | `protocol` | **yes** | The wire protocol the provider speaks: `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, or `cohere`. |
 | `base_url` | **yes** | Scheme + host (+ optional path prefix). Must be `https://` for external endpoints. |
 | `error_map` | no | Provider-specific **JSON** error codes → a canonical disposition: one of `auth`, `billing`, `rate_limit`, `context_length`, `overloaded`, `server_error`, `timeout`, `network`, or `client_error` (the shipped catalog mostly uses `billing`/`rate_limit`). HTTP-status errors (429/5xx/401/…) are classified automatically without this. |
-| `path` | no | Override the upstream request path appended to `base_url`: for providers that embed an API version in `base_url`. |
-| `auth` | no | `bearer` (default) or `api-key` (header style), when a backend doesn't use its protocol's native auth. |
+| `path` | no | Override the upstream request path appended to `base_url`: for providers that embed an API version in `base_url`. Static — ignores the per-request model. |
+| `path_base` | no | For URL-model protocols (Gemini): override the hardcoded base segment (`/v1beta/models`) while keeping the per-request `/{model}:verb` suffix — e.g. to reach Google Vertex AI's project/location-scoped layout. |
+| `auth` | no | The egress auth mechanism, when a backend doesn't use its protocol's native auth. One of: `bearer` (default) · `api-key` (header style) · `jwt-bearer` (OAuth 2.0 JWT-bearer grant, RFC 7523 — mints and auto-refreshes a token from a service-account key; e.g. Google Vertex AI). |
 | `health` | no | Optional health-probe configuration. |
 
 The API key is **not** in this file. `config.yaml` supplies it by naming the environment variable that holds it (`api_key_env`), so secrets never live in config.
@@ -103,6 +104,18 @@ my-azure:
   base_url: https://my-resource.openai.azure.com/openai/deployments/gpt-4o
   path: /chat/completions?api-version=2024-02-01
   auth: api-key
+
+# Google Vertex AI (Gemini): the same gemini protocol at a project/location-scoped URL, authed with a
+# self-minting OAuth token instead of an API key. `path_base` reshapes the URL; `auth: jwt-bearer`
+# mints + auto-refreshes a bearer from the service-account key in `api_key_env` (inline JSON or a path).
+gemini-vertex:
+  protocol: gemini
+  base_url: https://us-central1-aiplatform.googleapis.com
+  path_base: /v1/projects/YOUR_PROJECT/locations/us-central1/publishers/google/models
+  auth: jwt-bearer
+  api_key_env: VERTEX_SA_KEY
+  error_map:
+    RESOURCE_EXHAUSTED: rate_limit
 ```
 
 See the [configuration reference](/docs/configuration/) for every field and default.

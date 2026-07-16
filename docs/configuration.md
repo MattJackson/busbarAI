@@ -97,8 +97,9 @@ A map of provider name → `ProviderDef`. The shipped catalog is a curated set o
 | `protocol` | string | no | `anthropic` | One of the six supported wire protocols: `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, `cohere`. An unknown protocol is a startup error. |
 | `base_url` | string | **yes** | n/a | Scheme + host (+ optional path prefix). Must start with `https://` for external endpoints. An `http://` URL in the catalog is not blocked at parse time but will be rejected by the SSRF guard on deployment use. Trailing slash is trimmed. |
 | `error_map` | map<string, string> | no | `{}` | Maps a provider-specific error **code string** (from the JSON error body) to a canonical disposition class. Valid values: `rate_limit`, `overloaded`, `server_error`, `timeout`, `network`, `auth`, `billing`, `client_error`, `context_length`. An unrecognized class value is a startup error. HTTP-status classification (401→auth, 429→rate_limit, 5xx→server_error, etc.) applies automatically without an `error_map`; this field is only for provider-specific JSON codes. |
-| `path` | string | no | Protocol's standard path | Overrides the upstream request path appended to `base_url`. Must begin with `/`. Use when the API version is in `base_url` and the endpoint path differs from the protocol default (e.g. `/chat/completions` without `/v1`). |
-| `auth` | string | no | Protocol's native auth | `bearer` (sends `Authorization: Bearer <key>`) or `api-key` (sends `api-key: <key>`, for Azure OpenAI). When unset, each protocol uses its native scheme: bearer for anthropic/openai/responses/cohere, `x-goog-api-key` for gemini, AWS SigV4 for bedrock. Setting `auth: api-key` forces the `api-key:` header regardless of protocol (rarely useful outside Azure OpenAI). |
+| `path` | string | no | Protocol's standard path | Overrides the upstream request path appended to `base_url`. Must begin with `/`. Static — ignores the per-request model. Use when the API version is in `base_url` and the endpoint path differs from the protocol default (e.g. `/chat/completions` without `/v1`). |
+| `path_base` | string | no | Protocol's default base | For URL-model protocols (Gemini): overrides the hardcoded base segment (`/v1beta/models`) while the per-request `/{model}:verb` suffix is still appended. Must begin with `/`. Reaches Google Vertex AI's `/v1/projects/{project}/locations/{location}/publishers/google/models` layout by config. |
+| `auth` | string | no | Protocol's native auth | The egress auth mechanism. `bearer` (sends `Authorization: Bearer <key>`) · `api-key` (sends `api-key: <key>`, for Azure OpenAI) · `jwt-bearer` (OAuth 2.0 JWT-bearer grant, RFC 7523 — mints and auto-refreshes a bearer from a service-account key in `api_key_env`; e.g. Google Vertex AI). When unset, each protocol uses its native scheme: bearer for anthropic/openai/responses/cohere, `x-goog-api-key` for gemini, AWS SigV4 for bedrock. |
 | `health` | object | no | none | Active health-probe config. See [Health probing](#health-probing). |
 
 Example entries:
@@ -125,7 +126,7 @@ zai-api:
 
 ### Per-provider deployment overrides
 
-In `config.yaml`, a provider entry may selectively override the catalog's `protocol`, `base_url`, `error_map` (merged: deployment entries win per code), `path`, `auth`, and `health`. The only always-required field in the deployment entry is `api_key_env`.
+In `config.yaml`, a provider entry may selectively override the catalog's `protocol`, `base_url`, `error_map` (merged: deployment entries win per code), `path`, `path_base`, `auth`, and `health`. The only always-required field in the deployment entry is `api_key_env`.
 
 ### Health probing
 
@@ -294,7 +295,8 @@ Declares which catalog providers this deployment uses and supplies the env var h
 | `base_url` | string | no | Catalog value | Override the upstream base URL. Must use `https://` for public/external hosts. Plain `http://` is permitted only for private or loopback hosts (e.g. a local Ollama or vLLM instance). Cloud-metadata hosts are blocked regardless of scheme (see SSRF guard). |
 | `error_map` | map<string, string> | no | `{}` merged onto catalog | Merged with the catalog's `error_map`; deployment entries win per code. |
 | `path` | string | no | Catalog value | Override the upstream path. Must begin with `/`. |
-| `auth` | string | no | Catalog value | `bearer` or `api-key`. |
+| `path_base` | string | no | Catalog value | Override the URL-model base segment (Gemini), keeping the `/{model}:verb` suffix. Must begin with `/`. For Vertex AI. |
+| `auth` | string | no | Catalog value | `bearer`, `api-key`, or `jwt-bearer` (OAuth service-account, e.g. Vertex AI). |
 | `health` | object | no | Catalog value | Override the catalog's health probe config. |
 | `allow_metadata_hosts` | list<string> | no | `[]` | Per-provider surgical exception: hosts/IPs to unblock from the cloud-metadata SSRF denylist for **this provider only**. See [Security: Provider upstreams & SSRF](/docs/security/#the-control-matrix). |
 
