@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `jwt-bearer` egress auth — OAuth 2.0 JWT-bearer grant (RFC 7523), busbar's 5th auth mechanism.
+//! `jwt-bearer` egress auth — OAuth 2.0 JWT-bearer grant (RFC 7523), one of busbar's OAuth auth
+//! mechanisms.
 //!
 //! GENERIC, not Google-specific: the flow is the standard `urn:ietf:params:oauth:grant-type:jwt-bearer`
 //! grant — sign a JWT with a private key, POST the assertion to a token endpoint, receive a short-lived
@@ -7,37 +8,18 @@
 //! (`client_email` → JWT `iss`, `private_key` → the RS256 key, `token_uri` → JWT `aud`); the scope
 //! defaults to `cloud-platform`. Vertex AI is the first provider to select `auth: jwt-bearer`.
 //!
-//! Because [`CredentialProvider::headers_for`] is SYNCHRONOUS and runs inline on the hot path, minting
-//! (an async HTTP round-trip) cannot happen there. Instead the initial token is minted once at boot
-//! (async, so a bad key fails boot loudly — the `--validate` ethos), then a background task refreshes
-//! it a few minutes before expiry into an `RwLock<Arc<CachedToken>>`; `headers_for` only reads the
-//! current token. The refresh task holds a `Weak` to the provider, so a config reload that drops the
-//! lane also stops its refresher (no task leak).
+//! This module owns only the JWT signing + token exchange (the `mint`); the token cache, `headers_for`
+//! read, and background refresh live in [`super::bearer_token`], shared with `oauth-client-credentials`.
 
-use super::CredentialProvider;
-use crate::proto::SigningContext;
-use axum::http::{HeaderName, HeaderValue};
+use super::bearer_token::{now_epoch, CachedToken, CredentialProviderArc, Minter};
 use base64::Engine as _;
-use std::sync::{Arc, RwLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 
 /// Default OAuth scope when the provider does not override it — the Vertex/GCP common case.
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
-/// Refresh this many seconds BEFORE the token's stated expiry, so a request never races an expired
-/// token across the refresh boundary.
-const REFRESH_SKEW_SECS: u64 = 300;
-/// Floor on the refresh sleep so a short-lived / already-near-expiry token can't spin the loop hot,
-/// and the retry delay after a mint failure.
-const MIN_SLEEP_SECS: u64 = 30;
 
-/// A minted access token and the wall-clock epoch second it expires at.
-struct CachedToken {
-    token: String,
-    expires_at: u64,
-}
-
-/// The signing + exchange material for one lane. Held in an `Arc` shared by the provider's initial
-/// mint and the background refresh task. Immutable after construction.
+/// The signing + exchange material for one lane. Held in an `Arc` shared by the refresh task's mint
+/// calls. Immutable after construction.
 struct Signer {
     key_pair: ring::signature::RsaKeyPair,
     rng: ring::rand::SystemRandom,
@@ -49,50 +31,17 @@ struct Signer {
     http: reqwest::Client,
 }
 
-/// The `jwt-bearer` credential provider. `headers_for` reads the cached bearer; a background task
-/// keeps it fresh.
-pub(crate) struct JwtBearer {
-    token: RwLock<Arc<CachedToken>>,
-}
-
-impl CredentialProvider for JwtBearer {
-    fn headers_for(&self, _key: &str, _ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)> {
-        // A self-minting credential ignores the per-request `key`. Read the current cached token; if
-        // it is empty or somehow un-encodable, emit NO auth header (upstream 401 — same fail-closed
-        // shape as an un-encodable static key), rather than sending a malformed one.
-        let cached = self
-            .token
-            .read()
-            .expect("jwt-bearer token lock poisoned")
-            .clone();
-        if cached.token.is_empty() {
-            return Vec::new();
-        }
-        match HeaderValue::from_str(&format!("Bearer {}", cached.token)) {
-            Ok(v) => vec![(HeaderName::from_static("authorization"), v)],
-            Err(_) => {
-                tracing::warn!(
-                    "jwt-bearer minted a token with bytes invalid for an HTTP header value; omitting \
-                     the auth header — upstream will reject with 401"
-                );
-                Vec::new()
-            }
-        }
-    }
-}
-
 /// Build a `jwt-bearer` credential. SYNCHRONOUS by design — it runs on the shared
 /// `build_app_from_config` path (boot AND admin config-reload/dry-run), so it must not block on the
 /// network. It PARSES the key material (failing loud on a malformed service-account JSON / PKCS#8 key,
-/// the common misconfig) and then spawns a background task that mints the first token immediately and
-/// refreshes it thereafter. This keeps a transient token-endpoint outage from blocking boot or a
-/// reload; the brief window before the first token lands emits no auth header (upstream 401), the same
-/// fail-closed shape as any missing credential. `credential` is the SA JSON — inline (starts with `{`)
-/// or a path to a key file. `scope_override` replaces the default `cloud-platform` scope when set.
+/// the common misconfig) and hands a `mint` closure to [`super::bearer_token::spawn`], which mints the
+/// first token in the background and refreshes it thereafter. `credential` is the SA JSON — inline
+/// (starts with `{`) or a path to a key file. `scope_override` replaces the default `cloud-platform`
+/// scope when set.
 pub(crate) fn build(
     credential: &str,
     scope_override: Option<&str>,
-) -> Result<Arc<JwtBearer>, String> {
+) -> Result<CredentialProviderArc, String> {
     let sa_json = read_credential(credential)?;
     let sa: ServiceAccount = serde_json::from_str(&sa_json)
         .map_err(|e| format!("service-account JSON is invalid: {e}"))?;
@@ -108,56 +57,12 @@ pub(crate) fn build(
         scope: scope_override.unwrap_or(DEFAULT_SCOPE).to_string(),
         http: reqwest::Client::new(),
     });
-    // Start empty; the refresher mints immediately.
-    let provider = Arc::new(JwtBearer {
-        token: RwLock::new(Arc::new(CachedToken {
-            token: String::new(),
-            expires_at: 0,
-        })),
+
+    let minter: Minter = Arc::new(move || {
+        let signer = signer.clone();
+        Box::pin(async move { signer.mint().await })
     });
-
-    // Spawn the refresher when inside a tokio runtime (boot + admin reload always are). Without one
-    // (e.g. a sync construction test) skip it — the credential simply holds no token.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let weak = Arc::downgrade(&provider);
-        handle.spawn(async move { refresh_loop(signer, weak).await });
-    }
-
-    Ok(provider)
-}
-
-/// The background refresh loop: mint (immediately on entry), store, then sleep until shortly before
-/// expiry and repeat. Exits when the provider is dropped (config reload) so the task never outlives
-/// its lane.
-async fn refresh_loop(signer: Arc<Signer>, weak: Weak<JwtBearer>) {
-    loop {
-        match signer.mint().await {
-            Ok(fresh) => {
-                let expires_at = fresh.expires_at;
-                match weak.upgrade() {
-                    Some(p) => {
-                        *p.token.write().expect("jwt-bearer token lock poisoned") = Arc::new(fresh)
-                    }
-                    None => return, // provider dropped — stop refreshing
-                }
-                let sleep_secs = expires_at
-                    .saturating_sub(now_epoch())
-                    .saturating_sub(REFRESH_SKEW_SECS)
-                    .max(MIN_SLEEP_SECS);
-                tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-            }
-            Err(e) => {
-                // Keep serving whatever token is current; retry soon. If retries keep failing past
-                // expiry, `headers_for` emits a stale/empty token → upstream 401, classified like any
-                // auth failure by the breaker.
-                tracing::warn!(error = %e, "jwt-bearer token mint failed; will retry");
-                if weak.upgrade().is_none() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(MIN_SLEEP_SECS)).await;
-            }
-        }
-    }
+    Ok(super::bearer_token::spawn(minter))
 }
 
 impl Signer {
@@ -251,13 +156,6 @@ fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[derive(serde::Deserialize)]
 struct ServiceAccount {
     client_email: String,
@@ -279,49 +177,6 @@ struct TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    impl JwtBearer {
-        fn with_token(token: &str) -> Self {
-            JwtBearer {
-                token: RwLock::new(Arc::new(CachedToken {
-                    token: token.to_string(),
-                    expires_at: 0,
-                })),
-            }
-        }
-    }
-
-    fn ctx() -> SigningContext<'static> {
-        SigningContext {
-            host: "us-central1-aiplatform.googleapis.com".to_string(),
-            canonical_uri:
-                "/v1/projects/p/locations/us-central1/publishers/google/models/x:generateContent"
-                    .to_string(),
-            body: b"{}",
-            timestamp_epoch: 0,
-            upstream_creds: crate::auth::UpstreamCreds::Own,
-        }
-    }
-
-    #[test]
-    fn headers_for_emits_bearer_and_ignores_per_request_key() {
-        let cred = JwtBearer::with_token("ya29.some-access-token");
-        let headers = cred.headers_for("ignored-per-request-key", &ctx());
-        assert_eq!(headers.len(), 1);
-        assert_eq!(headers[0].0.as_str(), "authorization");
-        assert_eq!(
-            headers[0].1.to_str().unwrap(),
-            "Bearer ya29.some-access-token"
-        );
-    }
-
-    #[test]
-    fn headers_for_emits_nothing_before_a_token_is_minted() {
-        // Empty token (the boot window before the first mint) → NO auth header (upstream 401), never
-        // a malformed one.
-        let cred = JwtBearer::with_token("");
-        assert!(cred.headers_for("k", &ctx()).is_empty());
-    }
 
     #[test]
     fn pem_to_pkcs8_der_strips_armor_and_decodes() {
@@ -352,7 +207,6 @@ mod tests {
     fn read_credential_passes_inline_json_through() {
         let json = r#"{"client_email":"x@y.iam.gserviceaccount.com"}"#;
         assert_eq!(read_credential(json).unwrap(), json);
-        // A leading-whitespace inline JSON is still recognized as inline (not a path).
         assert_eq!(read_credential("  {\"a\":1}").unwrap(), "  {\"a\":1}");
     }
 }

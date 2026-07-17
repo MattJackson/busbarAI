@@ -370,6 +370,37 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                 }
             }
         }
+        // `oauth-client-credentials` needs a token endpoint + scope to run the exchange; without them
+        // a lane would boot but never mint a token (every request 401s). Fail at validate time. The
+        // token_url carries the client_secret, so it must be https for a public host (loopback/private
+        // may use http, mirroring base_url).
+        if matches!(
+            provider_cfg.auth,
+            Some(crate::config::ProviderAuth::OAuthClientCredentials)
+        ) {
+            if provider_cfg.token_url.as_deref().unwrap_or("").is_empty() {
+                errors.push(format!(
+                    "provider '{}' uses auth: oauth-client-credentials but has no `token_url` (the OAuth token endpoint the client credentials are POSTed to)",
+                    provider_name
+                ));
+            } else if let Some(tu) = &provider_cfg.token_url {
+                let host_private = extract_normalized_host(tu)
+                    .map(|h| host_is_private_or_loopback(&h))
+                    .unwrap_or(false);
+                if tu.starts_with("http://") && !host_private {
+                    errors.push(format!(
+                        "provider '{}' token_url '{}' must be https:// (it carries the client secret)",
+                        provider_name, tu
+                    ));
+                }
+            }
+            if provider_cfg.scope.as_deref().unwrap_or("").is_empty() {
+                errors.push(format!(
+                    "provider '{}' uses auth: oauth-client-credentials but has no `scope`",
+                    provider_name
+                ));
+            }
+        }
     }
 
     // Rule 2 & 3: Validate each pool's members

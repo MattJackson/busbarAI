@@ -286,6 +286,12 @@ pub(crate) struct ProviderCfg {
     /// hardcoded base segment so the per-request `/{model}:verb` suffix is appended to it (Vertex AI).
     #[serde(default)]
     pub(crate) path_base: Option<String>,
+    /// OAuth token endpoint for `auth: oauth-client-credentials` (see ProviderDef::token_url).
+    #[serde(default)]
+    pub(crate) token_url: Option<String>,
+    /// OAuth scope for `auth: oauth-client-credentials` (see ProviderDef::scope).
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<ProviderAuth>,
@@ -322,6 +328,8 @@ impl fmt::Debug for ProviderCfg {
             .field("error_map", &self.error_map)
             .field("path", &self.path)
             .field("path_base", &self.path_base)
+            .field("token_url", &self.token_url)
+            .field("scope", &self.scope)
             .field("auth", &self.auth)
             .field("allow_metadata_hosts", &self.allow_metadata_hosts)
             .field(
@@ -360,6 +368,12 @@ pub(crate) enum ProviderAuth {
     /// token minting/refresh lives in `crate::egress_auth::jwt_bearer`; this is only the selector.
     #[serde(rename = "jwt-bearer")]
     JwtBearer,
+    /// OAuth 2.0 client-credentials grant (RFC 6749 §4.4): `api_key_env` carries
+    /// `client_id:client_secret`, and the provider's `token_url` + `scope` complete the exchange for
+    /// an auto-refreshed bearer. Generic — Azure OpenAI via Microsoft Entra ID is the first consumer.
+    /// The token minting/refresh lives in `crate::egress_auth::oauth_client_credentials`.
+    #[serde(rename = "oauth-client-credentials")]
+    OAuthClientCredentials,
 }
 
 /// Active health-probe mode for a provider's lanes.
@@ -1239,6 +1253,15 @@ pub(crate) struct ProviderDef {
     /// /v1/projects/{project}/locations/{location}/publishers/google/models`.
     #[serde(default)]
     pub(crate) path_base: Option<String>,
+    /// OAuth token endpoint for `auth: oauth-client-credentials` — the URL busbar POSTs the client
+    /// credentials to for a bearer. Required for that auth style; ignored otherwise. E.g. Azure Entra:
+    /// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`.
+    #[serde(default)]
+    pub(crate) token_url: Option<String>,
+    /// OAuth scope for `auth: oauth-client-credentials`. Required for that auth style; ignored
+    /// otherwise. E.g. Azure OpenAI: `https://cognitiveservices.azure.com/.default`.
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
     /// Optional auth-style override. Defaults to the protocol's native auth (bearer for
     /// openai/anthropic/responses, `x-goog-api-key` for gemini, SigV4 for bedrock). Set to
     /// `api-key` for backends that authenticate with an `api-key: <key>` header instead of a
@@ -1271,6 +1294,12 @@ pub(crate) struct ProviderDeploy {
     /// hardcoded base segment so the per-request `/{model}:verb` suffix is appended to it (Vertex AI).
     #[serde(default)]
     pub(crate) path_base: Option<String>,
+    /// OAuth token endpoint for `auth: oauth-client-credentials` (see ProviderDef::token_url).
+    #[serde(default)]
+    pub(crate) token_url: Option<String>,
+    /// OAuth scope for `auth: oauth-client-credentials` (see ProviderDef::scope).
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
     /// Optional auth-style override (see ProviderDef::auth).
     #[serde(default)]
     pub(crate) auth: Option<ProviderAuth>,
@@ -1303,6 +1332,8 @@ impl fmt::Debug for ProviderDeploy {
             .field("error_map", &self.error_map)
             .field("path", &self.path)
             .field("path_base", &self.path_base)
+            .field("token_url", &self.token_url)
+            .field("scope", &self.scope)
             .field("auth", &self.auth)
             .field("allow_metadata_hosts", &self.allow_metadata_hosts)
             .field("health", &self.health)
@@ -1941,6 +1972,11 @@ pub(crate) fn resolve(
                     .path_base
                     .clone()
                     .or_else(|| def.path_base.clone()),
+                token_url: deploy_cfg
+                    .token_url
+                    .clone()
+                    .or_else(|| def.token_url.clone()),
+                scope: deploy_cfg.scope.clone().or_else(|| def.scope.clone()),
                 auth: deploy_cfg.auth.or(def.auth),
                 // deployment override (Some) replaces the catalog default
                 allow_metadata_hosts: deploy_cfg

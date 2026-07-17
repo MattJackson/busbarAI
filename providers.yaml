@@ -282,6 +282,21 @@ wandb:
 #     path: /openai/deployments/YOUR-DEPLOYMENT/chat/completions?api-version=2024-06-01
 #     error_map: {}
 #     api_key_env: AZURE_OPENAI_KEY
+#
+# Azure OpenAI via Microsoft Entra ID (AAD) instead of an API key: same OpenAI protocol + deployment
+# path, but authed with `auth: oauth-client-credentials` — busbar exchanges an app registration's
+# client_id:client_secret at the tenant token endpoint for an auto-refreshed bearer. Tenant + app are
+# per-account, so it is a fill-in template. `api_key_env` holds `client_id:client_secret`:
+#
+#   azure-entra:
+#     protocol: openai
+#     base_url: https://YOUR-RESOURCE.openai.azure.com
+#     path: /openai/deployments/YOUR-DEPLOYMENT/chat/completions?api-version=2024-06-01
+#     auth: oauth-client-credentials
+#     token_url: https://login.microsoftonline.com/YOUR-TENANT/oauth2/v2.0/token
+#     scope: https://cognitiveservices.azure.com/.default
+#     error_map: {}
+#     api_key_env: AZURE_ENTRA_CREDS                 # value = "client_id:client_secret"
 
 
 # --- Added 2026-07-09: docs-verified against each provider's own API documentation ---------------

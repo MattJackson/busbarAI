@@ -18,7 +18,9 @@ use crate::proto::SigningContext;
 use axum::http::{HeaderName, HeaderValue};
 use std::sync::Arc;
 
+pub(crate) mod bearer_token;
 pub(crate) mod jwt_bearer;
+pub(crate) mod oauth_client_credentials;
 
 /// Produces the outbound auth headers for a single upstream request.
 ///
@@ -39,11 +41,16 @@ pub(crate) fn resolve(
     if matches!(auth, Some(crate::config::ProviderAuth::ApiKey)) {
         return Arc::new(ApiKeyHeader { header: "api-key" });
     }
-    if matches!(auth, Some(crate::config::ProviderAuth::JwtBearer)) {
-        // `jwt-bearer` mints its token asynchronously at boot (see `jwt_bearer::build`), so the boot
-        // path special-cases it and never routes it through this sync resolver. Reaching here means
-        // that wiring was bypassed — fail closed with a credential that emits no auth header (upstream
-        // 401) rather than silently sending the raw service-account JSON as a bearer.
+    if matches!(
+        auth,
+        Some(crate::config::ProviderAuth::JwtBearer)
+            | Some(crate::config::ProviderAuth::OAuthClientCredentials)
+    ) {
+        // The OAuth styles mint their token asynchronously at boot (see `jwt_bearer::build` /
+        // `oauth_client_credentials::build`), so the boot path special-cases them and never routes
+        // them through this sync resolver. Reaching here means that wiring was bypassed — fail closed
+        // with a credential that emits no auth header (upstream 401) rather than sending raw secret
+        // material as a bearer.
         return Arc::new(NoCredential);
     }
     match protocol_name {

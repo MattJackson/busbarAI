@@ -3221,6 +3221,8 @@ mod disposition_matrix_tests {
                     error_map,
                     path: None,
                     path_base: None,
+                    token_url: None,
+                    scope: None,
                     auth: None,
                     _legacy_api_key: None,
                     allow_metadata_hosts: Vec::new(),

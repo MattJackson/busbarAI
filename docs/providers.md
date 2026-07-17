@@ -13,7 +13,9 @@ Providers live in `providers.yaml` as a map of name → definition. The shipped 
 | `error_map` | no | Provider-specific **JSON** error codes → a canonical disposition: one of `auth`, `billing`, `rate_limit`, `context_length`, `overloaded`, `server_error`, `timeout`, `network`, or `client_error` (the shipped catalog mostly uses `billing`/`rate_limit`). HTTP-status errors (429/5xx/401/…) are classified automatically without this. |
 | `path` | no | Override the upstream request path appended to `base_url`: for providers that embed an API version in `base_url`. Static — ignores the per-request model. |
 | `path_base` | no | For URL-model protocols (Gemini): override the hardcoded base segment (`/v1beta/models`) while keeping the per-request `/{model}:verb` suffix — e.g. to reach Google Vertex AI's project/location-scoped layout. |
-| `auth` | no | The egress auth mechanism, when a backend doesn't use its protocol's native auth. One of: `bearer` (default) · `api-key` (header style) · `jwt-bearer` (OAuth 2.0 JWT-bearer grant, RFC 7523 — mints and auto-refreshes a token from a service-account key; e.g. Google Vertex AI). |
+| `auth` | no | The egress auth mechanism, when a backend doesn't use its protocol's native auth. One of: `bearer` (default) · `api-key` (header style) · `jwt-bearer` (OAuth 2.0 JWT-bearer, RFC 7523 — mints + auto-refreshes a token from a service-account key; e.g. Google Vertex AI) · `oauth-client-credentials` (OAuth 2.0 client-credentials, RFC 6749 §4.4 — `api_key_env` holds `client_id:client_secret`; e.g. Azure OpenAI via Entra ID). |
+| `token_url` | no | OAuth token endpoint for `auth: oauth-client-credentials`. Required for that auth style. |
+| `scope` | no | OAuth scope for `auth: oauth-client-credentials`. Required for that auth style. |
 | `health` | no | Optional health-probe configuration. |
 
 The API key is **not** in this file. `config.yaml` supplies it by naming the environment variable that holds it (`api_key_env`), so secrets never live in config.
@@ -104,6 +106,17 @@ my-azure:
   base_url: https://my-resource.openai.azure.com/openai/deployments/gpt-4o
   path: /chat/completions?api-version=2024-02-01
   auth: api-key
+
+# Azure OpenAI via Entra ID (AAD): OpenAI protocol, but a bearer minted from an app registration's
+# client_id:client_secret at the tenant token endpoint (auto-refreshed) instead of an api-key.
+azure-entra:
+  protocol: openai
+  base_url: https://my-resource.openai.azure.com
+  path: /openai/deployments/gpt-4o/chat/completions?api-version=2024-06-01
+  auth: oauth-client-credentials
+  token_url: https://login.microsoftonline.com/MY-TENANT/oauth2/v2.0/token
+  scope: https://cognitiveservices.azure.com/.default
+  api_key_env: AZURE_ENTRA_CREDS      # value = "client_id:client_secret"
 
 # Google Vertex AI (Gemini): the same gemini protocol at a project/location-scoped URL, authed with a
 # self-minting OAuth token instead of an API key. `path_base` reshapes the URL; `auth: jwt-bearer`

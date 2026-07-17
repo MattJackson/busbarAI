@@ -1077,14 +1077,38 @@ pub(crate) fn build_app_from_config(
             .get(&ld.provider)
             .cloned()
             .unwrap_or_default();
-        // Resolve the outbound credential once. Most auth styles are a simple sync lookup; `jwt-bearer`
-        // parses its service-account key here (failing loud on a bad key) and starts a background token
-        // minter/refresher. `api_key` carries the signing material (inline SA JSON or a key-file path).
-        let credential = if matches!(provider_cfg.auth, Some(config::ProviderAuth::JwtBearer)) {
-            egress_auth::jwt_bearer::build(&api_key, None)
-                .map_err(|e| format!("provider '{}' (jwt-bearer auth): {e}", ld.provider))?
-        } else {
-            egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth)
+        // Resolve the outbound credential once. Most auth styles are a simple sync lookup; the OAuth
+        // styles parse their credential material here (failing loud on a bad key) and start a
+        // background token minter/refresher. `api_key` carries that material.
+        let credential = match provider_cfg.auth {
+            // `jwt-bearer`: `api_key` is the service-account JSON (inline) or a key-file path.
+            Some(config::ProviderAuth::JwtBearer) => egress_auth::jwt_bearer::build(&api_key, None)
+                .map_err(|e| format!("provider '{}' (jwt-bearer auth): {e}", ld.provider))?,
+            // `oauth-client-credentials`: `api_key` is `client_id:client_secret`; `token_url`+`scope`
+            // come from the provider config (required — the config validator also rejects them absent).
+            Some(config::ProviderAuth::OAuthClientCredentials) => {
+                let token_url = provider_cfg.token_url.as_deref().ok_or_else(|| {
+                    format!(
+                        "provider '{}' (oauth-client-credentials auth) requires `token_url`",
+                        ld.provider
+                    )
+                })?;
+                let scope = provider_cfg.scope.as_deref().ok_or_else(|| {
+                    format!(
+                        "provider '{}' (oauth-client-credentials auth) requires `scope`",
+                        ld.provider
+                    )
+                })?;
+                egress_auth::oauth_client_credentials::build(&api_key, token_url, scope).map_err(
+                    |e| {
+                        format!(
+                            "provider '{}' (oauth-client-credentials auth): {e}",
+                            ld.provider
+                        )
+                    },
+                )?
+            }
+            _ => egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth),
         };
         lanes.push(Lane {
             model: ld.model.clone(),
