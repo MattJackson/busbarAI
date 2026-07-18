@@ -95,8 +95,10 @@ impl ProtocolWriter for ResponsesWriter {
                             crate::ir::IrBlock::ToolUse {
                                 id, name, input, ..
                             } => {
-                                let args_str = crate::json::to_string(input)
-                                    .unwrap_or_else(|_| "{}".to_string());
+                                // Emit a raw `Value::String` (unparseable/streaming-partial args) verbatim
+                                // rather than JSON-encoding it a second time — same as the Chat writer.
+                                let args_str =
+                                    crate::proto::openai_chat::tool_arguments_to_string(input);
                                 tool_items.push(serde_json::json!({
                                     "type": ITEM_TYPE_FUNCTION_CALL,
                                     "call_id": id,
@@ -989,8 +991,8 @@ impl ProtocolWriter for ResponsesWriter {
                 crate::ir::IrBlock::ToolUse {
                     id, name, input, ..
                 } => {
-                    let args_str =
-                        crate::json::to_string(input).unwrap_or_else(|_| "{}".to_string());
+                    // Verbatim for a raw `Value::String` (avoid double-encoding), same as the Chat writer.
+                    let args_str = crate::proto::openai_chat::tool_arguments_to_string(input);
                     output_arr.push(serde_json::json!({
                         "type": ITEM_TYPE_FUNCTION_CALL,
                         // Native function_call items carry an item-level opaque `id` (`fc_…`) DISTINCT

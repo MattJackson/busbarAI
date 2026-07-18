@@ -1113,6 +1113,17 @@ impl ProtocolReader for GeminiReader {
             });
         }
 
+        // A client can legally request N>1 (Gemini `candidateCount`, promoted from `n` on the request
+        // side), but the IR/response shape carries a single candidate, so extras are truncated on a
+        // cross-protocol hop. Warn so the truncation is observable rather than silent (same-proto
+        // passthrough preserves all candidates and never reaches here).
+        if candidates.len() > 1 {
+            tracing::warn!(
+                candidates = candidates.len(),
+                "gemini response carried multiple candidates; only the first is translated cross-protocol (the rest are dropped)"
+            );
+        }
+
         let candidate = &candidates[0];
 
         // Parse content → IrResponse.content. `content` is ABSENT on a safety/recitation-filtered

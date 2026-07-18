@@ -562,7 +562,12 @@ fn map_gemini_finish_reason(finish_reason: &str) -> crate::ir::IrStopReason {
 fn prompt_block_stop_reason(block_reason: &str) -> crate::ir::IrStopReason {
     use crate::ir::IrStopReason as S;
     match block_reason {
-        GEMINI_FINISH_SAFETY | "BLOCKLIST" | GEMINI_FINISH_PROHIBITED_CONTENT => S::Safety,
+        // RECITATION maps to Safety at the candidate level (and per GEMINI_FINISH_RECITATION's own
+        // doc); classify a prompt-level RECITATION block the same way, not Other.
+        GEMINI_FINISH_SAFETY
+        | "BLOCKLIST"
+        | GEMINI_FINISH_PROHIBITED_CONTENT
+        | GEMINI_FINISH_RECITATION => S::Safety,
         _ => S::Other,
     }
 }

@@ -411,7 +411,7 @@ pub(crate) struct OpenAiReader;
 /// such a `Value::String` via `crate::json::to_string` would JSON-encode the string a second time —
 /// emitting an escaped, quoted blob on the wire (double-encoding). Emit a `Value::String` verbatim
 /// so the original argument text round-trips unchanged; any other `Value` is serialized normally.
-fn tool_arguments_to_string(input: &serde_json::Value) -> String {
+pub(crate) fn tool_arguments_to_string(input: &serde_json::Value) -> String {
     match input {
         serde_json::Value::String(s) => s.clone(),
         other => crate::json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
