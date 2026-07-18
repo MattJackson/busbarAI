@@ -629,6 +629,154 @@ async fn test_same_protocol_nonstream_multichunk_counts_usage() {
         );
 }
 
+/// audit H3 (CHARACTERIZATION, FULL PATH): terminal token usage MUST reach the client on a
+/// cross-protocol STREAM even when the egress reports usage in a SEPARATE trailing chunk (the OpenAI
+/// `include_usage` convention). This drives the REAL `FirstByteBody` translate → finish → json-array
+/// framer path for a gemini-ingress / openai-egress stream — the level the isolated translator tests
+/// never reached. It is the test that was MISSING: it goes red both for the zero-usage bug (the
+/// trailing usage chunk is dropped) AND for any "fix" that emits the terminal frame from a discarded
+/// `finish()` (the gemini json-array close throws finish() away). The client's gemini json-array body
+/// must carry `usageMetadata.promptTokenCount == 600` (the real value), not 0/absent.
+#[tokio::test]
+async fn test_cross_protocol_stream_delivers_trailing_usage_gemini_json_array() {
+    use super::FirstByteBody;
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+    crate::metrics::init();
+
+    let app = TestApp::new()
+        .lane(LaneSpec::new(
+            "gpt-4o",
+            crate::proto::Protocol::openai(),
+            "http://127.0.0.1:1",
+        ))
+        .pool("pa", &[(0, 1)])
+        .build();
+
+    // OpenAI egress stream with include_usage: the finish chunk carries `usage: null`, and the REAL
+    // usage arrives in a separate choices-empty trailing chunk, then `[DONE]`.
+    let frames = [
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":600,\"completion_tokens\":400}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let inner = futures::stream::iter(
+        frames
+            .iter()
+            .map(|f| Ok::<Bytes, reqwest::Error>(Bytes::from(f.as_bytes().to_vec())))
+            .collect::<Vec<_>>(),
+    );
+
+    let translate = crate::proto::StreamTranslate::new("gemini", "openai").expect("translator");
+    let json_array: Box<dyn crate::proto::JsonArrayFramer> =
+        Box::new(crate::proto::gemini::GeminiJsonArrayFramer::new());
+    let fbb = FirstByteBody::new(
+        inner,
+        true, // is_sse: streaming
+        "gemini",
+        crate::handlers::CHAT,
+        (),
+        app.clone(),
+        0,
+        Arc::new(crate::store::BreakerCfg::default()),
+        "pa",
+        Some(translate),
+        Some(json_array),
+        None,  // usage_sink
+        false, // budget_spent
+    );
+    let out = fbb.into_body().collect().await.expect("drain").to_bytes();
+    let text = String::from_utf8_lossy(&out);
+    let arr: Value = serde_json::from_slice(&out).unwrap_or_else(|e| {
+        panic!("client output must be a valid gemini JSON array: {e}; body={text}")
+    });
+    let prompt_tokens = arr.as_array().and_then(|els| {
+        els.iter().find_map(|el| {
+            el.get("usageMetadata")
+                .and_then(|u| u.get("promptTokenCount"))
+                .and_then(|v| v.as_i64())
+        })
+    });
+    assert_eq!(
+        prompt_tokens,
+        Some(600),
+        "the client's terminal usageMetadata must report the real prompt tokens (600), not 0/absent — body: {text}"
+    );
+}
+
+/// audit H3 (CHARACTERIZATION, plain-SSE sibling): the terminal-usage fold must also deliver on the
+/// PLAIN SSE path (no json-array framer), not just gemini json-array — find-1-solve-6 across the two
+/// delivery paths. anthropic ingress / openai egress with include_usage: the client's terminal
+/// `message_delta` must carry the real `usage.output_tokens` (400), not 0.
+#[tokio::test]
+async fn test_cross_protocol_stream_delivers_trailing_usage_anthropic_sse() {
+    use super::FirstByteBody;
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+    crate::metrics::init();
+
+    let app = TestApp::new()
+        .lane(LaneSpec::new(
+            "gpt-4o",
+            crate::proto::Protocol::openai(),
+            "http://127.0.0.1:1",
+        ))
+        .pool("pa", &[(0, 1)])
+        .build();
+
+    let frames = [
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":600,\"completion_tokens\":400}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let inner = futures::stream::iter(
+        frames
+            .iter()
+            .map(|f| Ok::<Bytes, reqwest::Error>(Bytes::from(f.as_bytes().to_vec())))
+            .collect::<Vec<_>>(),
+    );
+
+    let translate = crate::proto::StreamTranslate::new("anthropic", "openai").expect("translator");
+    let fbb = FirstByteBody::new(
+        inner,
+        true,
+        "anthropic",
+        crate::handlers::CHAT,
+        (),
+        app.clone(),
+        0,
+        Arc::new(crate::store::BreakerCfg::default()),
+        "pa",
+        Some(translate),
+        None, // plain SSE — no json-array framer
+        None,
+        false,
+    );
+    let out = fbb.into_body().collect().await.expect("drain").to_bytes();
+    let text = String::from_utf8_lossy(&out);
+    // Find the terminal message_delta's usage.output_tokens in the anthropic SSE stream.
+    let output_tokens = text.split("\n\n").find_map(|frame| {
+        let data = frame.lines().find_map(|l| l.strip_prefix("data: "))?;
+        let v: Value = serde_json::from_str(data).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) == Some("message_delta") {
+            v.get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|n| n.as_i64())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        output_tokens,
+        Some(400),
+        "the anthropic terminal message_delta must report the real output_tokens (400), not 0 — body: {text}"
+    );
+}
+
 /// REGRESSION (LOW #15 SECURITY, proxy engine key selection): in `Passthrough` mode, a caller that
 /// presents NO credential must fall back to an EMPTY credential, NOT the lane operator's
 /// `api_key`. Borrowing the operator key would let an unauthenticated caller silently spend on the

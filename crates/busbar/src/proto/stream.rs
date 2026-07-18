@@ -95,6 +95,16 @@ pub(crate) struct StreamTranslate {
     /// signal the stream-end arm reads to distinguish a clean close from an aborted one. Holds the
     /// human message (`provider_signal`) for observability; `None` on a clean stream.
     terminal_error: Option<String>,
+    /// TERMINAL-USAGE FOLD (SSE ingress: anthropic/gemini/cohere/responses — see
+    /// `StreamFraming::folds_terminal_usage`). Holds the deferred terminal `MessageDelta`
+    /// `(stop_reason, stop_sequence, usage)` so a trailing usage-only chunk (OpenAI `include_usage`)
+    /// can be merged into it before it is flushed at `finish()`. `None` until the finish delta arrives
+    /// (and for the OpenAI/Bedrock ingresses, which opt out). `pending_stop` records that the paired
+    /// `MessageStop` was also deferred, so `finish()` re-emits it after the flushed delta. The response
+    /// body feeds `finish()`'s output through the json-array framer too, so this flush reaches the
+    /// client uniformly on both the SSE and gemini-json-array paths.
+    pending_terminal: Option<(crate::ir::IrStopReason, Option<String>, crate::ir::IrUsage)>,
+    pending_stop: bool,
 }
 
 impl StreamTranslate {
@@ -156,6 +166,8 @@ impl StreamTranslate {
             same_proto,
             last_usage: None,
             terminal_error: None,
+            pending_terminal: None,
+            pending_stop: false,
         })
     }
 
@@ -307,6 +319,43 @@ impl StreamTranslate {
                         self.emit_ir_event(emit, out);
                     }
                     continue;
+                }
+            }
+            // TERMINAL-USAGE FOLD (SSE ingress: anthropic/gemini/cohere/responses). These ingresses
+            // carry usage in their single terminal `message_delta`, but an egress like OpenAI under
+            // include_usage reports it in a SEPARATE trailing usage-only chunk that arrives AFTER the
+            // finish chunk — so the terminal frame would ship with zeros and the real usage would be
+            // dropped by the post-stop guard below. Defer the terminal delta + its MessageStop, merge
+            // any trailing usage, and flush at `finish()` (which the response body now feeds through the
+            // json-array framer too, so it reaches the client on every ingress). OpenAI/Bedrock opt out
+            // (folds_terminal_usage == false) — they re-emit/fold usage via their own framing seams
+            // above. Mutually exclusive with the Bedrock combined-stop path (which `continue`d). (H3.)
+            if self.framing.folds_terminal_usage() {
+                match &ev {
+                    crate::ir::IrStreamEvent::MessageDelta {
+                        stop_reason: Some(reason),
+                        usage,
+                        stop_sequence,
+                    } => {
+                        self.pending_terminal =
+                            Some((*reason, stop_sequence.clone(), usage.clone()));
+                        continue;
+                    }
+                    crate::ir::IrStreamEvent::MessageStop if self.pending_terminal.is_some() => {
+                        self.pending_stop = true;
+                        continue;
+                    }
+                    crate::ir::IrStreamEvent::MessageDelta {
+                        stop_reason: None,
+                        usage,
+                        ..
+                    } if self.pending_terminal.is_some() => {
+                        if let Some((_, _, acc)) = self.pending_terminal.as_mut() {
+                            merge_trailing_usage(acc, usage);
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
             }
             if let crate::ir::IrStreamEvent::MessageDelta {
@@ -775,9 +824,49 @@ impl StreamTranslate {
         if let Some(trailing) = self.framing.on_finish() {
             self.emit_ir_event(&trailing, &mut out);
         }
+        // TERMINAL-USAGE FOLD flush (SSE ingress): the terminal `message_delta` was deferred during
+        // `feed` so a trailing usage-only chunk could be merged into it (see `folds_terminal_usage`).
+        // Emit it now — with the merged usage — followed by its `MessageStop`. On a stream that never
+        // sent a trailing usage chunk this simply emits the terminal frame with the usage it already
+        // had, just deferred to end-of-stream (nothing follows a stop, so ordering is unchanged). The
+        // response body feeds this `finish()` output through the json-array framer too, so the terminal
+        // frame reaches the client on the gemini-json-array path as well as plain SSE.
+        if let Some((reason, stop_sequence, usage)) = self.pending_terminal.take() {
+            self.emit_ir_event(
+                &crate::ir::IrStreamEvent::MessageDelta {
+                    stop_reason: Some(reason),
+                    stop_sequence,
+                    usage,
+                },
+                &mut out,
+            );
+            if self.pending_stop {
+                self.emit_ir_event(&crate::ir::IrStreamEvent::MessageStop, &mut out);
+            }
+        }
         if self.emit_done {
             out.extend_from_slice(SSE_DONE_FRAME);
         }
         out
+    }
+}
+
+/// Merge a trailing usage-only chunk's token counts into the deferred terminal usage (SSE
+/// terminal-usage fold). Mirrors the `last_usage` accumulation rule: a non-zero/`Some` field in the
+/// trailing chunk overrides the (typically zero) terminal value; a zero/`None` trailing field leaves
+/// the terminal value intact, so a protocol that already carried usage on its terminal delta is never
+/// clobbered by an absent trailing chunk.
+fn merge_trailing_usage(acc: &mut crate::ir::IrUsage, trailing: &crate::ir::IrUsage) {
+    if trailing.input_tokens > 0 {
+        acc.input_tokens = trailing.input_tokens;
+    }
+    if trailing.output_tokens > 0 {
+        acc.output_tokens = trailing.output_tokens;
+    }
+    if trailing.cache_creation_input_tokens.is_some() {
+        acc.cache_creation_input_tokens = trailing.cache_creation_input_tokens;
+    }
+    if trailing.cache_read_input_tokens.is_some() {
+        acc.cache_read_input_tokens = trailing.cache_read_input_tokens;
     }
 }

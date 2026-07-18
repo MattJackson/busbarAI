@@ -589,6 +589,12 @@ impl super::StreamFraming for OpenAiStreamFraming {
         self.apply_chunk_identity(chunk);
         split_openai_trailing_usage(chunk)
     }
+
+    // OpenAI ingress UN-folds: the client expects the separate trailing usage chunk (re-emitted via
+    // on_egress_chunk), so the translator must NOT defer/fold the terminal usage.
+    fn folds_terminal_usage(&self) -> bool {
+        false
+    }
 }
 
 impl OpenAiStreamFraming {

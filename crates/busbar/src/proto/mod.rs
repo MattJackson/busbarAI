@@ -924,6 +924,24 @@ pub(crate) trait StreamFraming: Send {
     fn abort_exception_type(&self) -> Option<&'static str> {
         None
     }
+
+    /// TERMINAL-USAGE-FOLD seam (the plain SSE ingresses: Anthropic/Gemini/Cohere/Responses). These
+    /// protocols carry token usage IN their single terminal `message_delta` frame. When the EGRESS
+    /// reports usage in a SEPARATE trailing usage-only chunk that arrives AFTER the finish chunk (the
+    /// OpenAI `include_usage` convention), the terminal frame would otherwise ship with zeros and the
+    /// real usage would be dropped by the translator's post-stop ordering guard. Returning `true` tells
+    /// the translator to DEFER the terminal `MessageDelta`/`MessageStop`, merge any trailing usage into
+    /// it, and flush at end-of-stream — so the client's terminal frame reports the real token counts.
+    /// (This is delivered uniformly because the response body now feeds `finish()`'s content through the
+    /// json-array framer too, not only the SSE path — see `proxy::response_body`.)
+    ///
+    /// Default (`true`, via [`PassthroughFraming`]): the four SSE ingresses fold. OpenAI overrides to
+    /// `false` (it UN-folds — its client expects the separate usage chunk, re-emitted via
+    /// `on_egress_chunk`); Bedrock overrides to `false` (it carries usage in a separate `metadata`
+    /// frame handled by `on_combined_stop_delta`/`on_usage_only_delta`).
+    fn folds_terminal_usage(&self) -> bool {
+        true
+    }
 }
 
 /// Inert default [`StreamFraming`]: every method takes the trait's no-op default. Used by every

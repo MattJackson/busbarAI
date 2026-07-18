@@ -1095,7 +1095,12 @@ fn test_translate_bedrock_eventstream_egress_to_anthropic_ingress() {
         br#"{"usage":{"inputTokens":5,"outputTokens":2}}"#,
     ));
 
-    let out = String::from_utf8(st.feed(&bytes)).unwrap();
+    // A folding SSE ingress (anthropic) now flushes the terminal message_delta + message_stop at
+    // finish() (see StreamFraming::folds_terminal_usage), which the response body streams to the
+    // client after the feed() output — so collect both, exactly as the client receives them. The
+    // delta-before-stop ordering below is preserved: finish() emits the delta then the stop.
+    let mut out = String::from_utf8(st.feed(&bytes)).unwrap();
+    out.push_str(&String::from_utf8(st.finish()).unwrap());
     // Anthropic SSE framing with the translated content.
     assert!(out.contains("event: message_start"), "got:\n{out}");
     assert!(
@@ -1794,9 +1799,14 @@ fn test_translate_openai_egress_to_anthropic_ingress() {
         ] {
             out.push_str(&String::from_utf8(t.feed(frame.as_bytes())).unwrap());
         }
+    // The terminal message_delta + message_stop are now flushed at finish() for a folding SSE ingress
+    // (StreamFraming::folds_terminal_usage); the response body streams finish() output to the client,
+    // so collect it here too. Anthropic still emits NO [DONE] terminator (that's an OpenAI-ingress
+    // literal) — assert its absence rather than that finish() is wholly empty.
+    out.push_str(&String::from_utf8(t.finish()).unwrap());
     assert!(
-        t.finish().is_empty(),
-        "Anthropic ingress has no [DONE] terminator"
+        !out.contains("[DONE]"),
+        "Anthropic ingress must not emit a [DONE] terminator; got {out}"
     );
     assert!(
         out.contains("event: message_start"),

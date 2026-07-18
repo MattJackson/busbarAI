@@ -1327,8 +1327,10 @@ fn string_args_writers_emit_raw_tool_args_verbatim() {
         logprobs: Vec::new(),
     };
 
-    // Responses: output[].arguments
-    let resp = ResponsesWriter.write_response(&ir);
+    // Responses: output[].arguments (bind the const to a local before borrowing — the writer holds
+    // interior-mutable stream state, so a direct `Const.method()` trips clippy::borrow_interior_mutable_const).
+    let resp_w = ResponsesWriter;
+    let resp = resp_w.write_response(&ir);
     let resp_args = resp
         .get("output")
         .and_then(|o| o.as_array())
@@ -1343,8 +1345,9 @@ fn string_args_writers_emit_raw_tool_args_verbatim() {
         "Responses must emit raw string args verbatim"
     );
 
-    // Cohere: message.tool_calls[].function.arguments
-    let coh = CohereWriter.write_response(&ir);
+    // Cohere: message.tool_calls[].function.arguments (bind to a local, as above).
+    let coh_w = CohereWriter;
+    let coh = coh_w.write_response(&ir);
     let coh_args = coh
         .get("message")
         .and_then(|m| m.get("tool_calls"))

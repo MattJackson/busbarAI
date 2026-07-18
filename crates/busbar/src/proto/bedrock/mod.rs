@@ -782,6 +782,13 @@ struct BedrockStreamFraming {
 }
 
 impl super::StreamFraming for BedrockStreamFraming {
+    // Bedrock ingress carries usage in a SEPARATE `metadata` frame (handled by on_combined_stop_delta
+    // / on_usage_only_delta / on_finish), not folded into a terminal message_delta, so it must NOT use
+    // the generic terminal-usage deferral.
+    fn folds_terminal_usage(&self) -> bool {
+        false
+    }
+
     fn abort_exception_type(&self) -> Option<&'static str> {
         // A native ConverseStream that aborts emits a modeled exception frame; busbar uses
         // `InternalServerException` (the generic server-fault type) so the close is well-formed for the

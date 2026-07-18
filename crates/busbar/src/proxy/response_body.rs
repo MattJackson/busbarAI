@@ -418,30 +418,32 @@ where
                             }
                         }
                     }
-                    // emit the ingress terminator before close. For a gemini JSON-array stream the
-                    // terminator is the closing `]` from the framer; the SSE `translate.finish()`
-                    // terminator (e.g. OpenAI `data: [DONE]`) must NOT be emitted into a JSON-array
-                    // body — drain the translate buffer (so its decode side-effects run) but discard
-                    // its SSE terminator bytes, then append the framer close.
+                    // emit the ingress terminator before close. `finish()` can emit CONTENT frames — the
+                    // deferred terminal `message_delta` carrying the folded trailing usage (see
+                    // StreamTranslate::finish / `folds_terminal_usage`). Drain it ONCE here so both the
+                    // decode side-effects run and the bytes are available to deliver.
+                    let tail = this
+                        .translate
+                        .as_mut()
+                        .map(|t| t.finish())
+                        .unwrap_or_default();
+                    // For a gemini JSON-array stream the terminator is the closing `]` from the framer.
+                    // finish()'s content frames MUST still reach the client, so feed them THROUGH the
+                    // framer (wrapping them as array elements) rather than discarding them — the fix for
+                    // the non-uniform delivery contract where the SSE path delivered finish() but the
+                    // json-array path dropped it, silently losing the terminal usage. A json-array
+                    // ingress is always gemini, whose finish() never carries the SSE `[DONE]` literal
+                    // (emit_done is false), so nothing spurious is wrapped. The TRANSLATE-side abort flag
+                    // was hoisted above; `finish_for_translate(translate_aborted)` still surfaces a
+                    // NATIVE error element + `]` on an aborted stream, not a silently-truncated bare `]`.
+                    // For a plain SSE ingress `tail` is streamed as-is (the [DONE] literal, if any, is
+                    // an OpenAI-ingress terminator finish() itself appends).
                     let done = if let Some(framer) = this.json_array.as_mut() {
-                        // The TRANSLATE-side abort flag was hoisted at the top of this arm (BEFORE any
-                        // `finish()` drains the translate): a cross-protocol StreamTranslate that
-                        // overflowed `MAX_BUF` (or hit a malformed egress prelude) stopped feeding this
-                        // framer, and its SSE terminal-error frame cannot ride inside a JSON-array body,
-                        // so the framer's own `aborted` flag stays clear. Route the close through
-                        // `finish_for_translate(translate_aborted)` so an aborted gemini-json-array
-                        // stream surfaces a NATIVE error element + `]` instead of a bare `]` (a silent
-                        // truncation indistinguishable from a short success). Drain the translate's SSE
-                        // terminator for its decode side-effects but discard those bytes — the
-                        // JSON-array terminator is the framer close. Reuse the single hoisted read so
-                        // the breaker, billing, and byte-shaping gates can never diverge.
-                        let _ = this.translate.as_mut().map(|t| t.finish());
-                        framer.finish_for_translate(translate_aborted)
+                        let mut wrapped = framer.feed(&tail);
+                        wrapped.extend_from_slice(&framer.finish_for_translate(translate_aborted));
+                        wrapped
                     } else {
-                        this.translate
-                            .as_mut()
-                            .map(|t| t.finish())
-                            .unwrap_or_default()
+                        tail
                     };
                     // Bedrock ingress: `finish()` may emit a deferred terminal `metadata` frame (the
                     // default-OpenAI-streaming case carries usage there). Its usage is folded into the
