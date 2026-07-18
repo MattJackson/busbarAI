@@ -1295,16 +1295,19 @@ fn cohere_read_response_surfaces_tool_plan_as_leading_text() {
     );
 }
 
-/// audit LOW: an unparseable/streaming-partial tool arg is stored as `Value::String(raw)`; the
-/// Responses writer must emit it VERBATIM, not JSON-encode it a second time (double-encoding).
+/// audit LOW (find-1-solve-6): an unparseable/streaming-partial tool arg is stored as
+/// `Value::String(raw)`; EVERY string-args writer (OpenAI Chat, Responses, Cohere) must emit it
+/// VERBATIM, not JSON-encode it a second time. Covers Responses AND Cohere (the found sibling);
+/// OpenAI Chat already routed through the helper.
 #[test]
-fn responses_writer_emits_raw_string_tool_args_verbatim() {
+fn string_args_writers_emit_raw_tool_args_verbatim() {
+    let raw = "not valid json {";
     let ir = crate::ir::IrResponse {
         role: crate::ir::IrRole::Assistant,
         content: vec![crate::ir::IrBlock::ToolUse {
             id: "call_1".into(),
             name: "do_it".into(),
-            input: serde_json::Value::String("not valid json {".into()),
+            input: serde_json::Value::String(raw.into()),
             cache_control: None,
         }],
         stop_reason: Some(crate::ir::IrStopReason::ToolUse),
@@ -1321,8 +1324,10 @@ fn responses_writer_emits_raw_string_tool_args_verbatim() {
         stop_sequence: None,
         logprobs: Vec::new(),
     };
-    let wire = ResponsesWriter.write_response(&ir);
-    let args = wire
+
+    // Responses: output[].arguments
+    let resp = ResponsesWriter.write_response(&ir);
+    let resp_args = resp
         .get("output")
         .and_then(|o| o.as_array())
         .expect("output array")
@@ -1330,11 +1335,22 @@ fn responses_writer_emits_raw_string_tool_args_verbatim() {
         .find(|it| it.get("type").and_then(|t| t.as_str()) == Some("function_call"))
         .and_then(|it| it.get("arguments"))
         .and_then(|a| a.as_str())
-        .expect("function_call arguments");
-    assert_eq!(
-        args, "not valid json {",
-        "raw string tool args must be emitted verbatim, not double-encoded"
-    );
+        .expect("responses function_call arguments");
+    assert_eq!(resp_args, raw, "Responses must emit raw string args verbatim");
+
+    // Cohere: message.tool_calls[].function.arguments
+    let coh = CohereWriter.write_response(&ir);
+    let coh_args = coh
+        .get("message")
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(|t| t.as_array())
+        .expect("cohere tool_calls array")
+        .first()
+        .and_then(|tc| tc.get("function"))
+        .and_then(|f| f.get("arguments"))
+        .and_then(|a| a.as_str())
+        .expect("cohere function arguments");
+    assert_eq!(coh_args, raw, "Cohere must emit raw string args verbatim");
 }
 
 /// Regression: Cohere is a free-form-tool-id
