@@ -378,23 +378,56 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
             provider_cfg.auth,
             Some(crate::config::ProviderAuth::OAuthClientCredentials)
         ) {
-            if provider_cfg.token_url.as_deref().unwrap_or("").is_empty() {
+            if provider_cfg
+                .token_url
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
                 errors.push(format!(
                     "provider '{}' uses auth: oauth-client-credentials but has no `token_url` (the OAuth token endpoint the client credentials are POSTed to)",
                     provider_name
                 ));
             } else if let Some(tu) = &provider_cfg.token_url {
+                // token_url carries the client secret in the POST body, so it gets the SAME two guards
+                // as base_url — not a lone scheme check: (1) case-INSENSITIVE https requirement (http
+                // permitted only for a private/loopback token endpoint; a raw `starts_with("http://")`
+                // let `HTTPS://`/scheme-less/`FTP://` bypass it, the exact base_url bug from audit c2r5),
+                // and (2) the SSRF/metadata denylist — an operator typo/template pointing token_url at
+                // IMDS or metadata.google.internal would POST the client secret straight to it. (found:
+                // full audit.)
                 let host_private = extract_normalized_host(tu)
-                    .map(|h| host_is_private_or_loopback(&h))
+                    .as_deref()
+                    .map(host_is_private_or_loopback)
                     .unwrap_or(false);
-                if tu.starts_with("http://") && !host_private {
+                let tu_scheme_ok =
+                    scheme_is(tu, "https") || (host_private && scheme_is(tu, "http"));
+                if !tu_scheme_ok {
+                    errors.push(if scheme_is(tu, "http") {
+                        format!(
+                            "provider '{}' token_url must use https for a public host (got '{}'); it carries the client secret, so plaintext http is permitted only for a private/loopback token endpoint",
+                            provider_name, tu
+                        )
+                    } else {
+                        format!(
+                            "provider '{}' token_url must use http or https (got '{}')",
+                            provider_name, tu
+                        )
+                    });
+                } else if let Some(host) = ssrf_blocked_host(
+                    tu,
+                    &allow_overrides,
+                    cfg.allow_all_metadata,
+                    &cfg.blocked_metadata_hosts,
+                ) {
                     errors.push(format!(
-                        "provider '{}' token_url '{}' must be https:// (it carries the client secret)",
-                        provider_name, tu
+                        "provider '{}' token_url '{}' targets a blocked cloud-metadata host '{}' (the client secret is POSTed there; cloud-metadata/IMDS endpoints are denied — override via this provider's allow_metadata_hosts, security.allow_metadata_hosts, or security.allow_all_metadata)",
+                        provider_name, tu, host
                     ));
                 }
             }
-            if provider_cfg.scope.as_deref().unwrap_or("").is_empty() {
+            if provider_cfg.scope.as_deref().unwrap_or("").trim().is_empty() {
                 errors.push(format!(
                     "provider '{}' uses auth: oauth-client-credentials but has no `scope`",
                     provider_name

@@ -1081,9 +1081,12 @@ pub(crate) fn build_app_from_config(
         // styles parse their credential material here (failing loud on a bad key) and start a
         // background token minter/refresher. `api_key` carries that material.
         let credential = match provider_cfg.auth {
-            // `jwt-bearer`: `api_key` is the service-account JSON (inline) or a key-file path.
-            Some(config::ProviderAuth::JwtBearer) => egress_auth::jwt_bearer::build(&api_key, None)
-                .map_err(|e| format!("provider '{}' (jwt-bearer auth): {e}", ld.provider))?,
+            // `jwt-bearer`: `api_key` is the service-account JSON (inline) or a key-file path. A
+            // configured `scope:` overrides the default cloud-platform scope (else `None` → default).
+            Some(config::ProviderAuth::JwtBearer) => {
+                egress_auth::jwt_bearer::build(&api_key, provider_cfg.scope.as_deref())
+                    .map_err(|e| format!("provider '{}' (jwt-bearer auth): {e}", ld.provider))?
+            }
             // `oauth-client-credentials`: `api_key` is `client_id:client_secret`; `token_url`+`scope`
             // come from the provider config (required — the config validator also rejects them absent).
             Some(config::ProviderAuth::OAuthClientCredentials) => {

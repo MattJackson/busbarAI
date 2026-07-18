@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 //! Shared machinery for self-minting, auto-refreshing **bearer-token** egress credentials.
 //!
 //! Both OAuth mechanisms busbar ships — `jwt-bearer` (RFC 7523) and `oauth-client-credentials`

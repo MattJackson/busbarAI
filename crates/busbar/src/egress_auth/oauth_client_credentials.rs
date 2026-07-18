@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 //! `oauth-client-credentials` egress auth — OAuth 2.0 client-credentials grant (RFC 6749 §4.4).
 //!
 //! The simplest OAuth machine-to-machine flow: POST `client_id` + `client_secret` (+ `scope`) to a

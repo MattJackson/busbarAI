@@ -373,6 +373,75 @@ fn test_validate_rejects_unknown_member_ref() {
 }
 
 #[test]
+fn test_validate_token_url_ssrf_and_scheme() {
+    // token_url carries the client secret in the POST body, so it must clear BOTH the https
+    // requirement (case-INSENSITIVELY) and the SSRF/metadata denylist — same as base_url. (audit H1.)
+    let build = |token_url: &str| -> Vec<String> {
+        let mut error_map = std::collections::HashMap::new();
+        error_map.insert("400".to_string(), "client_error".to_string());
+        let mut providers = HashMap::new();
+        providers.insert(
+            "entra".to_string(),
+            config::ProviderCfg {
+                protocol: "openai".into(),
+                base_url: "https://myres.openai.azure.com".into(),
+                api_key_env: "API_KEY".into(),
+                health: None,
+                error_map,
+                path: None,
+                path_base: None,
+                token_url: Some(token_url.to_string()),
+                scope: Some("api://x/.default".into()),
+                auth: Some(config::ProviderAuth::OAuthClientCredentials),
+                _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert("m".to_string(), make_model("entra", 10));
+        let mut pools = HashMap::new();
+        pools.insert("p".to_string(), make_pool(vec![make_member("m")]));
+        let cfg = make_root_cfg(providers, models, pools);
+        validate(&cfg).err().unwrap_or_default()
+    };
+
+    // A legitimate Entra token endpoint validates clean.
+    assert!(
+        build("https://login.microsoftonline.com/TENANT/oauth2/v2.0/token").is_empty(),
+        "a valid https token_url must pass"
+    );
+    // Case-insensitive scheme: uppercase HTTPS must NOT trip the scheme guard.
+    let up = build("HTTPS://login.microsoftonline.com/t/token");
+    assert!(
+        !up.iter().any(|e| e.contains("token_url") && e.contains("must use")),
+        "uppercase HTTPS token_url must not trip the scheme guard; got: {up:?}"
+    );
+    // Public http:// is rejected (cleartext secret) — and uppercase HTTP:// cannot bypass it.
+    for scheme in ["http", "HTTP"] {
+        let errs = build(&format!("{scheme}://token.example.com/oauth"));
+        assert!(
+            errs.iter().any(|e| e.contains("token_url") && e.contains("https")),
+            "{scheme}:// public token_url must be rejected; got: {errs:?}"
+        );
+    }
+    // SSRF: an https token_url pointed at cloud metadata is blocked (would leak the client secret).
+    for host in ["169.254.169.254", "metadata.google.internal"] {
+        let errs = build(&format!("https://{host}/token"));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("token_url") && e.contains("metadata")),
+            "token_url at {host} must be SSRF-blocked; got: {errs:?}"
+        );
+    }
+    // Whitespace-only token_url is treated as absent (trimmed), not a valid endpoint.
+    let ws = build("   ");
+    assert!(
+        ws.iter().any(|e| e.contains("token_url")),
+        "whitespace-only token_url must be rejected as missing; got: {ws:?}"
+    );
+}
+
+#[test]
 fn test_validate_collects_all_errors() {
     let mut providers = HashMap::new();
     // Add minimal error_map to avoid extra validation error

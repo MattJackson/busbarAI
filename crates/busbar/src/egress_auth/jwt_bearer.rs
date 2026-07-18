@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 //! `jwt-bearer` egress auth — OAuth 2.0 JWT-bearer grant (RFC 7523), one of busbar's OAuth auth
 //! mechanisms.
 //!
@@ -71,16 +71,19 @@ impl Signer {
         let now = now_epoch();
         let exp = now + 3600; // 1h assertion; the returned token's own TTL governs refresh
         let header = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
-        let claims = b64url(
-            format!(
-                r#"{{"iss":"{iss}","scope":"{scope}","aud":"{aud}","iat":{iat},"exp":{exp}}}"#,
-                iss = self.issuer,
-                scope = self.scope,
-                aud = self.token_uri,
-                iat = now,
-            )
-            .as_bytes(),
-        );
+        // Build claims with a JSON serializer, not string interpolation: a `"`/`\` in `issuer`
+        // (client_email) or `scope` would otherwise produce malformed JSON or splice into the claim
+        // set. Values are operator-trusted today, but the serializer makes the seam injection-proof.
+        let claims_value = serde_json::json!({
+            "iss": self.issuer,
+            "scope": self.scope,
+            "aud": self.token_uri,
+            "iat": now,
+            "exp": exp,
+        });
+        let claims_json = serde_json::to_string(&claims_value)
+            .map_err(|e| format!("serializing JWT claims failed: {e}"))?;
+        let claims = b64url(claims_json.as_bytes());
         let signing_input = format!("{header}.{claims}");
 
         let mut sig = vec![0u8; self.key_pair.public().modulus_len()];
