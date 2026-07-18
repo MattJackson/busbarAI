@@ -965,8 +965,8 @@ fn test_split_usage_never_collapses() {
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cache_creation_input_tokens, Some(30));
         assert_eq!(usage.cache_read_input_tokens, Some(200));
-        // Verify they weren't collapsed: input_tokens != sum of cache tokens
-        assert_ne!(100, 30 + 200);
+        // input_tokens (100) is carried verbatim, NOT collapsed into the cache totals (30+200=230) —
+        // the `input_tokens == 100` assertion above already proves it (230 would fail there).
     } else {
         panic!("expected MessageDelta");
     }

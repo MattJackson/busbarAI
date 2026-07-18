@@ -50,10 +50,14 @@ impl CredentialProvider for BearerToken {
         // A self-minting credential ignores the per-request `key`. Read the current cached token; if
         // it is empty (the boot window before the first mint) or un-encodable, emit NO auth header
         // (upstream 401 — the same fail-closed shape as an un-encodable static key).
+        // Recover from a poisoned lock rather than panic: the guarded value is always a valid
+        // `Arc<CachedToken>`, and this runs inline on the request hot path — a panic here would 500 a
+        // request over a lock another thread poisoned. (The critical sections are a trivial Arc clone
+        // and an Arc assignment, neither of which can panic, so poisoning is effectively unreachable.)
         let cached = self
             .token
             .read()
-            .expect("bearer token lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         if cached.token.is_empty() {
             return Vec::new();
@@ -97,7 +101,7 @@ async fn refresh_loop(minter: Minter, weak: Weak<BearerToken>) {
                 let expires_at = fresh.expires_at;
                 match weak.upgrade() {
                     Some(p) => {
-                        *p.token.write().expect("bearer token lock poisoned") = Arc::new(fresh)
+                        *p.token.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(fresh)
                     }
                     None => return, // provider dropped — stop refreshing
                 }

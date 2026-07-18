@@ -228,14 +228,16 @@ pub(crate) struct GovCtx {
     pub(crate) key: Option<VirtualKey>,
 }
 
-/// Generate a virtual-key secret from 16 bytes of the OS CSPRNG (portable across Unix/Windows via
-/// getrandom). Fails closed: if the OS exposes no entropy source we refuse to mint a key rather
-/// than fall back to a guessable (time-derived) secret. getrandom failure is near-impossible on
-/// supported platforms; on failure we return the error so the caller (`create_key`) surfaces a 500
-/// instead of panicking the process — the server stays up.
+/// Generate a virtual-key secret from 32 bytes of the OS CSPRNG (portable across Unix/Windows via
+/// getrandom). 256 bits — parity with the AWS secret access key beside it, raised from the old 128-bit
+/// width (still brute-force-infeasible, but 128 was the one credential axis below the project's own
+/// bar). Fails closed: if the OS exposes no entropy source we refuse to mint a key rather than fall
+/// back to a guessable (time-derived) secret. getrandom failure is near-impossible on supported
+/// platforms; on failure we return the error so the caller (`create_key`) surfaces a 500 instead of
+/// panicking the process — the server stays up.
 fn generate_secret() -> Result<String, getrandom::Error> {
     // Portable OS CSPRNG via getrandom: /dev/urandom on Unix, BCryptGenRandom on Windows, etc.
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; 32];
     getrandom::fill(&mut buf)?;
     Ok(format!("{SK_SECRET_PREFIX}{}", hex::encode(buf)))
 }

@@ -702,11 +702,11 @@ fn test_create_key_with_aws_issues_and_resolves_credential() {
 /// fails HERE with a clear cause — instead of surfacing later as a confusing auth rejection.
 #[test]
 fn test_credential_generators_contract() {
-    // Bearer secret: `sk-bb-` prefix + 32 lowercase-hex chars (16 random bytes).
+    // Bearer secret: `sk-bb-` prefix + 64 lowercase-hex chars (32 random bytes = 256-bit secret).
     let s = generate_secret().expect("OS entropy available");
     assert!(s.starts_with(SK_SECRET_PREFIX), "bearer prefix: {s}");
     let hex_part = &s[SK_SECRET_PREFIX.len()..];
-    assert_eq!(hex_part.len(), 32, "16 random bytes -> 32 hex chars");
+    assert_eq!(hex_part.len(), 64, "32 random bytes -> 64 hex chars");
     assert!(
         hex_part
             .bytes()

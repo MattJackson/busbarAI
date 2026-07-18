@@ -1229,6 +1229,13 @@ pub(crate) fn build_app_from_config(
             .timeout(Duration::from_secs(
                 cfg.limits.upstream_request_timeout_secs,
             ))
+            // Bound the TCP connect separately from the coarse overall timeout: a stalled SYN would
+            // otherwise hang up to the streaming `.timeout()` (minutes) before failover kicks in.
+            .connect_timeout(Duration::from_secs(10))
+            // Keep idle upstream sockets alive so a middlebox silently dropping a long-idle
+            // keep-alive connection is detected proactively, not discovered as a spurious failure on
+            // the next request (added latency + a needless failover hop).
+            .tcp_keepalive(Duration::from_secs(60))
             .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
             // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
             // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
