@@ -1089,6 +1089,31 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
     // usize incl. 0, the unlimited default).
     validate_limits(&cfg.limits, &mut errors);
 
+    // A model maps to ONE lane, so its `context_max` must be single-valued across every pool that
+    // names it. `build_app_from_config` (boot) rejects a genuine conflict — mirror that here so a
+    // clean `--validate` truly implies a clean boot (a conflict would otherwise pass validation and
+    // then `die` at real boot). Only DIFFERING explicit values conflict; None/identical are fine.
+    {
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for pool_cfg in cfg.pools.values() {
+            for m in &pool_cfg.members {
+                if let Some(c) = m.context_max {
+                    match seen.get(m.target.as_str()) {
+                        Some(existing) if *existing != c => {
+                            errors.push(format!(
+                                "model '{}' has conflicting context_max across pools ({} vs {}); a model maps to one lane and must declare a single context_max",
+                                m.target, existing, c
+                            ));
+                        }
+                        _ => {
+                            seen.insert(m.target.as_str(), c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {

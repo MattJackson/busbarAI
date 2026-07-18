@@ -442,6 +442,64 @@ fn test_validate_token_url_ssrf_and_scheme() {
 }
 
 #[test]
+fn test_validate_conflicting_context_max_across_pools() {
+    // A model maps to one lane, so a DIFFERING context_max across pools must be a validate() error —
+    // not only a boot-time `die`. Else a clean --validate would still crash at real boot. (audit M7.)
+    let build = |ca: Option<usize>, cb: Option<usize>| -> Vec<String> {
+        let mut error_map = std::collections::HashMap::new();
+        error_map.insert("400".to_string(), "client_error".to_string());
+        let mut providers = HashMap::new();
+        providers.insert(
+            "p".to_string(),
+            config::ProviderCfg {
+                protocol: "openai".into(),
+                base_url: "https://api.example.com".into(),
+                api_key_env: "API_KEY".into(),
+                health: None,
+                error_map,
+                path: None,
+                path_base: None,
+                token_url: None,
+                scope: None,
+                auth: None,
+                _legacy_api_key: None,
+                allow_metadata_hosts: Vec::new(),
+            },
+        );
+        let mut models = HashMap::new();
+        models.insert("m".to_string(), make_model("p", 10));
+        let mut a = make_member("m");
+        a.context_max = ca;
+        let mut b = make_member("m");
+        b.context_max = cb;
+        let mut pools = HashMap::new();
+        pools.insert("poolA".to_string(), make_pool(vec![a]));
+        pools.insert("poolB".to_string(), make_pool(vec![b]));
+        validate(&make_root_cfg(providers, models, pools))
+            .err()
+            .unwrap_or_default()
+    };
+    assert!(
+        build(Some(128000), Some(200000))
+            .iter()
+            .any(|e| e.contains("conflicting context_max")),
+        "differing context_max across pools must be a validate() error"
+    );
+    assert!(
+        !build(Some(128000), Some(128000))
+            .iter()
+            .any(|e| e.contains("conflicting context_max")),
+        "identical context_max must not conflict"
+    );
+    assert!(
+        !build(Some(128000), None)
+            .iter()
+            .any(|e| e.contains("conflicting context_max")),
+        "None must not conflict with an explicit value"
+    );
+}
+
+#[test]
 fn test_validate_collects_all_errors() {
     let mut providers = HashMap::new();
     // Add minimal error_map to avoid extra validation error
