@@ -71,6 +71,13 @@ pub(crate) struct FirstByteBody<S, P> {
     /// Set once the stream has fully ended (after any translation terminator), so a later poll
     /// returns None instead of re-polling a finished inner stream.
     ended: bool,
+    /// Set when the stream failed via an upstream TRANSPORT error mid/pre-stream (`Poll::Ready(Some(
+    /// Err))`). Unlike a reader-emitted in-band `Error` (which sets `translate.terminal_error`) or a
+    /// translate buffer-overflow (`translate.aborted`), a raw transport error leaves both clear — so
+    /// without this flag the `Drop` billing gate would token-bill the PARTIAL usage accumulated before
+    /// the cut, asymmetric with every other failure path (which suppress/refund). Gates `Drop` billing
+    /// off, mirroring the terminal-error suppression.
+    stream_failed: bool,
     /// Bounded reassembly buffer for a SAME-PROTOCOL NON-STREAM (`!is_sse`, `translate == None`)
     /// `application/json` body that reqwest delivers across multiple transport frames. This is the
     /// non-stream analog of Change B's read-for-IR-emit-verbatim: the body is relayed to the client
@@ -126,6 +133,7 @@ where
             usage_sink,
             budget_spent,
             ended: false,
+            stream_failed: false,
             nonstream_buf: Vec::new(),
         }
     }
@@ -225,6 +233,10 @@ where
                     return Poll::Ready(Some(Ok(chunk)));
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // An upstream transport error delivered a broken/partial response — suppress
+                    // Drop-time token billing (both this SSE arm and the non-SSE arm below), symmetric
+                    // with the terminal-error / abort no-bill gates. (audit M3.)
+                    this.stream_failed = true;
                     let had_first = this.first_byte_sent.load(Ordering::Relaxed);
                     if had_first && this.is_sse {
                         // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
@@ -569,7 +581,8 @@ impl<S, P> Drop for FirstByteBody<S, P> {
         // contradicts the no-bill-on-failure policy (asserted by
         // `test_streaming_translate_abort_trips_breaker_and_skips_billing`).
         let translate = self.translate.as_ref();
-        if translate.and_then(|t| t.terminal_error()).is_some()
+        if self.stream_failed
+            || translate.and_then(|t| t.terminal_error()).is_some()
             || translate.map(|t| t.aborted()).unwrap_or(false)
         {
             return;

@@ -777,6 +777,112 @@ async fn test_cross_protocol_stream_delivers_trailing_usage_anthropic_sse() {
     );
 }
 
+/// audit M3: an upstream TRANSPORT error mid-stream must NOT token-bill the partial usage accumulated
+/// before the cut — symmetric with the terminal-error / translate-abort no-bill gates (every other
+/// failure path suppresses or refunds). Drives the real FirstByteBody: an anthropic egress stream that
+/// sets usage (100 input on message_start + 50 output on message_delta = 150 billable), then a real
+/// reqwest transport Error. After the drop the gov must have charged ZERO. Pre-fix (no `stream_failed`
+/// gate) the Drop billing site charged the 150 partial tokens = 15c.
+#[tokio::test]
+async fn test_mid_stream_transport_error_does_not_bill_partial_usage() {
+    use super::FirstByteBody;
+    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
+    crate::metrics::init();
+
+    let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+    let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov")); // 0c/req, 100c/1k tokens
+    let (key, _s) = gov
+        .create_key(
+            NewKeySpec {
+                name: "k".to_string(),
+                allowed_pools: vec![],
+                max_budget_cents: Some(1_000_000),
+                budget_period: "daily".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+            },
+            1_700_000_000,
+        )
+        .expect("key");
+    let charged_at: u64 = 1_700_000_000;
+    let sink = Some(UsageSink {
+        gov: gov.clone(),
+        key_id: key.id.clone(),
+        period: key.budget_period.clone(),
+        charged_at,
+    });
+
+    let app = TestApp::new()
+        .lane(LaneSpec::new(
+            "claude",
+            crate::proto::Protocol::anthropic(),
+            "http://127.0.0.1:1",
+        ))
+        .pool("pa", &[(0, 1)])
+        .build();
+
+    // A real reqwest transport error to inject AFTER the usage-bearing frames (mid-stream cut).
+    let transport_err = reqwest::Client::new()
+        .get("http://127.0.0.1:1/never")
+        .send()
+        .await
+        .expect_err("connect to a closed port must fail");
+
+    let frames: Vec<&str> = vec![
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":50}}\n\n",
+    ];
+    let mut items: Vec<Result<Bytes, reqwest::Error>> = frames
+        .iter()
+        .map(|f| Ok(Bytes::from(f.as_bytes().to_vec())))
+        .collect();
+    items.push(Err(transport_err));
+    let inner = Box::pin(futures::stream::iter(items));
+
+    let translate = crate::proto::StreamTranslate::new("openai", "anthropic").expect("translator");
+    let fbb = FirstByteBody::new(
+        inner,
+        true, // is_sse
+        "openai",
+        crate::handlers::CHAT,
+        (),
+        app.clone(),
+        0,
+        Arc::new(crate::store::BreakerCfg::default()),
+        "pa",
+        Some(translate),
+        None,
+        sink,
+        false,
+    );
+    // Drain (emits the mid-stream error frame then None), then the body drops → Drop billing gate runs.
+    let _ = fbb.into_body().collect().await;
+
+    // Poll briefly: a pre-fix Drop would offload record_tokens(150) to the blocking pool and spend
+    // becomes 15c; the fixed gate records nothing, so spend stays 0.
+    let mut spend = 0;
+    for _ in 0..150 {
+        tokio::task::yield_now().await;
+        spend = gov
+            .usage_for(&key.id, charged_at)
+            .expect("usage read")
+            .map(|u| u.spend_cents)
+            .unwrap_or(0);
+        if spend != 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        spend, 0,
+        "a mid-stream transport error must NOT bill the partial usage (pre-fix billed 150 tokens = 15c)"
+    );
+}
+
 /// REGRESSION (LOW #15 SECURITY, proxy engine key selection): in `Passthrough` mode, a caller that
 /// presents NO credential must fall back to an EMPTY credential, NOT the lane operator's
 /// `api_key`. Borrowing the operator key would let an unauthenticated caller silently spend on the
