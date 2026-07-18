@@ -463,6 +463,7 @@ pub(crate) struct LaneSpec {
     error_map: std::collections::HashMap<String, String>,
     context_max: Option<usize>,
     path: Option<String>,
+    path_base: Option<String>,
     auth: Option<String>,
     health: Option<crate::config::HealthCfg>,
     default_max_tokens: Option<u32>,
@@ -495,6 +496,7 @@ impl LaneSpec {
             error_map: std::collections::HashMap::new(),
             context_max: None,
             path: None,
+            path_base: None,
             auth: None,
             health: None,
             default_max_tokens: None,
@@ -533,6 +535,10 @@ impl LaneSpec {
     }
     pub(crate) fn path(mut self, p: &str) -> Self {
         self.path = Some(p.into());
+        self
+    }
+    pub(crate) fn path_base(mut self, p: &str) -> Self {
+        self.path_base = Some(p.into());
         self
     }
     pub(crate) fn auth(mut self, a: &str) -> Self {
@@ -604,7 +610,7 @@ impl LaneSpec {
             error_map: std::sync::Arc::new(self.error_map.clone()),
             context_max: self.context_max,
             path: self.path.clone(),
-            path_base: None,
+            path_base: self.path_base.clone(),
             health: self.health.clone(),
             default_max_tokens: self.default_max_tokens,
             upstream_model: self.upstream_model.clone(),

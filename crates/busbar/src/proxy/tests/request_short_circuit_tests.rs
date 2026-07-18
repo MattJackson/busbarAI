@@ -123,6 +123,54 @@ fn upstream_model_override_rewrites_body_and_url_model() {
         );
 }
 
+// Claude-on-Vertex: an anthropic lane with a Vertex `path_base` carries the model in the URL
+// (`:rawPredict`), so request finalization must DROP the body `model` and INJECT `anthropic_version`
+// (Vertex's required discriminator). This is the BODY half of the wrinkle — the harness proves the
+// URL/mint end-to-end, but a signature-blind mock can't assert the body transform, so it's pinned
+// here. A regression that stopped dropping `model` or stopped injecting the version would 400 on
+// real Vertex; this test catches it offline.
+#[test]
+fn claude_on_vertex_drops_model_and_injects_anthropic_version() {
+    let vbase = "/v1/projects/p/locations/us-central1/publishers/anthropic/models";
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "claude-3-5-sonnet",
+                Protocol::anthropic(),
+                "https://us-central1-aiplatform.googleapis.com",
+            )
+            .path_base(vbase),
+        )
+        .build();
+    let body = json!({"model":"claude-3-5-sonnet","max_tokens":7,"messages":[{"role":"user","content":"hi"}]});
+    let hop_bytes = crate::json::to_vec(&body).unwrap();
+    let out = translate_request_cross_protocol(
+        &app,
+        0,
+        "anthropic",
+        crate::handlers::chat("anthropic"),
+        Some(body),
+        crate::proxy::APPLICATION_JSON,
+        true,
+        &hop_bytes,
+    )
+    .expect("anthropic-vertex shaping is infallible for a valid body");
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(
+        v.get("model").is_none(),
+        "model must be dropped — it rides the :rawPredict URL, not the body: {v}"
+    );
+    assert_eq!(
+        v.get("anthropic_version").and_then(|x| x.as_str()),
+        Some("vertex-2023-10-16"),
+        "the anthropic_version discriminator must be injected: {v}"
+    );
+    assert!(
+        v.get("messages").is_some(),
+        "the rest of the request body must be preserved through the transform: {v}"
+    );
+}
+
 // MODEL-IN-URL protocols (gemini/bedrock): a pristine native request carries NO body `model`
 #[test]
 fn pristine_same_proto_is_byte_identical_url_model() {
