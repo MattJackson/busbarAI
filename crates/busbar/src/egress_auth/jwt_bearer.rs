@@ -71,18 +71,7 @@ impl Signer {
         let now = now_epoch();
         let exp = now + 3600; // 1h assertion; the returned token's own TTL governs refresh
         let header = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
-        // Build claims with a JSON serializer, not string interpolation: a `"`/`\` in `issuer`
-        // (client_email) or `scope` would otherwise produce malformed JSON or splice into the claim
-        // set. Values are operator-trusted today, but the serializer makes the seam injection-proof.
-        let claims_value = serde_json::json!({
-            "iss": self.issuer,
-            "scope": self.scope,
-            "aud": self.token_uri,
-            "iat": now,
-            "exp": exp,
-        });
-        let claims_json = serde_json::to_string(&claims_value)
-            .map_err(|e| format!("serializing JWT claims failed: {e}"))?;
+        let claims_json = jwt_claims_json(&self.issuer, &self.scope, &self.token_uri, now, exp)?;
         let claims = b64url(claims_json.as_bytes());
         let signing_input = format!("{header}.{claims}");
 
@@ -127,6 +116,29 @@ impl Signer {
             expires_at: now + tok.expires_in,
         })
     }
+}
+
+/// Serialize the JWT-bearer assertion claim set. Built with a JSON serializer, NOT string
+/// interpolation: a `"`/`\`/control char in `issuer` (the SA `client_email`) or `scope` would
+/// otherwise produce malformed JSON or splice into the claim set. `scope` is the value threaded from
+/// the provider's `scope:` config (or the cloud-platform default), so this is also where a configured
+/// scope lands in the assertion. Extracted as a pure fn so the escaping and scope-placement are unit-
+/// testable without a network round-trip.
+fn jwt_claims_json(
+    issuer: &str,
+    scope: &str,
+    aud: &str,
+    iat: u64,
+    exp: u64,
+) -> Result<String, String> {
+    let claims = serde_json::json!({
+        "iss": issuer,
+        "scope": scope,
+        "aud": aud,
+        "iat": iat,
+        "exp": exp,
+    });
+    serde_json::to_string(&claims).map_err(|e| format!("serializing JWT claims failed: {e}"))
 }
 
 /// SA-JSON credential material: inline JSON (`{...}`) or a filesystem path to a key file.
@@ -211,5 +223,48 @@ mod tests {
         let json = r#"{"client_email":"x@y.iam.gserviceaccount.com"}"#;
         assert_eq!(read_credential(json).unwrap(), json);
         assert_eq!(read_credential("  {\"a\":1}").unwrap(), "  {\"a\":1}");
+    }
+
+    /// M1: the `scope` threaded from provider config lands VERBATIM in the assertion claims (this is
+    /// the value `main.rs` now passes through as `scope_override` instead of a hardcoded `None`), and
+    /// iss/aud/iat/exp are placed correctly.
+    #[test]
+    fn jwt_claims_place_scope_and_fields() {
+        let json = jwt_claims_json(
+            "svc@proj.iam.gserviceaccount.com",
+            "https://www.googleapis.com/auth/cloud-platform.read-only",
+            "https://oauth2.googleapis.com/token",
+            1000,
+            4600,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["scope"], "https://www.googleapis.com/auth/cloud-platform.read-only",
+            "the configured scope must appear verbatim in the claims"
+        );
+        assert_eq!(v["iss"], "svc@proj.iam.gserviceaccount.com");
+        assert_eq!(v["aud"], "https://oauth2.googleapis.com/token");
+        assert_eq!(v["iat"], 1000);
+        assert_eq!(v["exp"], 4600);
+    }
+
+    /// M10: a quote/backslash/control char in an operator-controlled claim value is ESCAPED, not
+    /// spliced — the claims are always valid JSON and the value round-trips exactly. This is what the
+    /// serde serializer buys over string interpolation (which would emit malformed JSON / inject).
+    #[test]
+    fn jwt_claims_escape_hostile_values() {
+        let nasty = "a\"b\\c\nd\tsneaky\":\"injected";
+        let json = jwt_claims_json(nasty, nasty, "aud", 1, 2).unwrap();
+        // Parses as valid JSON (string interpolation would have produced a parse error here)...
+        let v: serde_json::Value = serde_json::from_str(&json).expect("claims must be valid JSON");
+        // ...and the value round-trips exactly, with no injected keys.
+        assert_eq!(v["iss"], nasty);
+        assert_eq!(v["scope"], nasty);
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            5,
+            "exactly iss/scope/aud/iat/exp — no injected claim: {v}"
+        );
     }
 }

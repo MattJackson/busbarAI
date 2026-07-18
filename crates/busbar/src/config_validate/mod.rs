@@ -427,7 +427,13 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     ));
                 }
             }
-            if provider_cfg.scope.as_deref().unwrap_or("").trim().is_empty() {
+            if provider_cfg
+                .scope
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
                 errors.push(format!(
                     "provider '{}' uses auth: oauth-client-credentials but has no `scope`",
                     provider_name

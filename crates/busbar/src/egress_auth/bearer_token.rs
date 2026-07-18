@@ -54,11 +54,7 @@ impl CredentialProvider for BearerToken {
         // `Arc<CachedToken>`, and this runs inline on the request hot path — a panic here would 500 a
         // request over a lock another thread poisoned. (The critical sections are a trivial Arc clone
         // and an Arc assignment, neither of which can panic, so poisoning is effectively unreachable.)
-        let cached = self
-            .token
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let cached = self.token.read().unwrap_or_else(|e| e.into_inner()).clone();
         if cached.token.is_empty() {
             return Vec::new();
         }
@@ -171,5 +167,28 @@ mod tests {
         assert!(BearerToken::with_token_for_test("")
             .headers_for("k", &ctx())
             .is_empty());
+    }
+
+    /// LOW: `headers_for` runs inline on the request hot path, so a POISONED lock must be recovered,
+    /// not panicked over (a panic there would 500 a request because some other thread poisoned the
+    /// lock). Poison the RwLock by panicking while holding the write guard, then assert `headers_for`
+    /// still returns the Bearer (via `into_inner`). Red-before: with `.expect(...)` instead of
+    /// `.unwrap_or_else(|e| e.into_inner())` this call panics on the poisoned lock.
+    #[test]
+    fn headers_for_recovers_from_poisoned_lock() {
+        let c = Arc::new(BearerToken::with_token_for_test("tok-poison"));
+        let c2 = c.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = c2.token.write().unwrap();
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(
+            c.token.read().is_err(),
+            "precondition: the write-guard panic must have poisoned the lock"
+        );
+        let h = c.headers_for("k", &ctx());
+        assert_eq!(h.len(), 1, "poisoned lock must still yield the auth header");
+        assert_eq!(h[0].1.to_str().unwrap(), "Bearer tok-poison");
     }
 }

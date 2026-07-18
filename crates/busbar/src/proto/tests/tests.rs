@@ -1281,7 +1281,9 @@ fn cohere_read_response_surfaces_tool_plan_as_leading_text() {
         },
         "finish_reason": "COMPLETE"
     });
-    let ir = CohereReader.read_response(&body).expect("cohere read_response");
+    let ir = CohereReader
+        .read_response(&body)
+        .expect("cohere read_response");
     assert!(
         matches!(ir.content.first(), Some(crate::ir::IrBlock::Text { text, .. }) if text == "First I will check the weather."),
         "tool_plan must be the leading Text block, got: {:?}",
@@ -1336,7 +1338,10 @@ fn string_args_writers_emit_raw_tool_args_verbatim() {
         .and_then(|it| it.get("arguments"))
         .and_then(|a| a.as_str())
         .expect("responses function_call arguments");
-    assert_eq!(resp_args, raw, "Responses must emit raw string args verbatim");
+    assert_eq!(
+        resp_args, raw,
+        "Responses must emit raw string args verbatim"
+    );
 
     // Cohere: message.tool_calls[].function.arguments
     let coh = CohereWriter.write_response(&ir);

@@ -413,14 +413,16 @@ fn test_validate_token_url_ssrf_and_scheme() {
     // Case-insensitive scheme: uppercase HTTPS must NOT trip the scheme guard.
     let up = build("HTTPS://login.microsoftonline.com/t/token");
     assert!(
-        !up.iter().any(|e| e.contains("token_url") && e.contains("must use")),
+        !up.iter()
+            .any(|e| e.contains("token_url") && e.contains("must use")),
         "uppercase HTTPS token_url must not trip the scheme guard; got: {up:?}"
     );
     // Public http:// is rejected (cleartext secret) — and uppercase HTTP:// cannot bypass it.
     for scheme in ["http", "HTTP"] {
         let errs = build(&format!("{scheme}://token.example.com/oauth"));
         assert!(
-            errs.iter().any(|e| e.contains("token_url") && e.contains("https")),
+            errs.iter()
+                .any(|e| e.contains("token_url") && e.contains("https")),
             "{scheme}:// public token_url must be rejected; got: {errs:?}"
         );
     }
