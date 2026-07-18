@@ -74,7 +74,10 @@ fi
 if [ "${1:-}" = "--full" ]; then
   H=../busbarAI-private/testing/harness
   if [ -x "$H/run.sh" ]; then
-    step "acceptance harness (tests.json)" bash -c "cargo build --release --locked && env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY -u COHERE_API_KEY $H/run.sh target/release/busbar >/dev/null 2>&1 && python3 -c 'import json;d=json.load(open(\"/tmp/kat.json\"));s=d[\"summary\"];exit(0 if s[\"fail\"]==0 else 1)'"
+    # NOTE: pass the binary as an ABSOLUTE path — run.sh cd's into its own dir before reading $1, so a
+    # path relative to this repo root (e.g. target/release/busbar) would resolve under the harness dir
+    # and the binary would never launch (a silent, always-red --full harness step).
+    step "acceptance harness (tests.json)" bash -c "cargo build --release --locked && env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY -u COHERE_API_KEY $H/run.sh \"\$PWD/target/release/busbar\" >/dev/null 2>&1 && python3 -c 'import json;d=json.load(open(\"/tmp/kat.json\"));s=d[\"summary\"];exit(0 if s[\"fail\"]==0 else 1)'"
   else
     echo; echo "  ⚠ acceptance harness not found at $H — skipping."
   fi
