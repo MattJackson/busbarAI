@@ -38,8 +38,17 @@ const PROBE_ERROR_BODY_CAP: usize = 64 * 1024;
 // override still wins (see `unwrap_or` below).
 
 /// Spawn one background prober task per lane that has a probing mode configured. A no-op for lanes
-/// with `mode: none` (or no `health:` block). Tasks live for the process lifetime.
-pub(crate) fn spawn_probers(app: Arc<App>) {
+/// with `mode: none` (or no `health:` block).
+///
+/// Each prober holds a `Weak<App>` to the snapshot it belongs to, NOT a strong `Arc`: on a config
+/// reload/apply a fresh `App` is built and `spawn_probers` is called again for it, while the old
+/// snapshot is swapped out of the `AppHandle`. Once the old snapshot's last in-flight request drops
+/// it, the old probers' `Weak::upgrade` returns `None` and they exit. This (a) re-establishes probing
+/// for lanes added/changed by the reload — a strong-`Arc` prober captured only the boot snapshot and
+/// never saw reloaded lanes — and (b) prevents the old generation from leaking forever (one task-set
+/// per reload) and writing outcomes into an orphaned store. Callers: boot (`main.rs`) and both admin
+/// swap paths (config reload + apply).
+pub(crate) fn spawn_probers(app: &Arc<App>) {
     for i in 0..app.lanes.len() {
         let Some(h) = app.lanes[i].health.clone() else {
             continue;
@@ -58,7 +67,7 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
                 .max(1),
         );
         let mode = h.mode;
-        let app = app.clone();
+        let weak = Arc::downgrade(app);
         let model = app.lanes[i].model.clone();
         tracing::info!(
             lane = %model,
@@ -74,6 +83,13 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                // Upgrade the Weak each tick (holding no strong ref across the sleep). `None` means
+                // this snapshot was replaced by a reload and fully released — this prober is now
+                // stale, so exit rather than probe an orphaned store forever.
+                let Some(app) = weak.upgrade() else {
+                    tracing::debug!(lane = %model, "health prober exiting: app snapshot replaced by reload");
+                    return;
+                };
                 let should = match mode {
                     HealthMode::Active => true,
                     // Re-probe a lane the breaker is suppressing in ANY cell — whether fully tripped
@@ -85,6 +101,7 @@ pub(crate) fn spawn_probers(app: Arc<App>) {
                 if should {
                     probe_lane(&app, i, timeout).await;
                 }
+                // `app` strong ref drops here, before the next tick wait — never held across the sleep.
             }
         });
     }
@@ -627,6 +644,29 @@ mod tests {
         // Body is empty for Bedrock (model lives in URL), but for body-model protocols probe_body
         // also passes upstream_model — indistinguishability from organic traffic requires the same
         // wire name everywhere.
+    }
+
+    /// REGRESSION (audit H2): `spawn_probers` must capture a `Weak<App>`, never a strong `Arc`, so a
+    /// config reload's old prober generation exits (and the old snapshot frees) instead of leaking one
+    /// task-set per reload forever. Deterministic: the closure holds only a `Weak` regardless of task
+    /// scheduling, so dropping the last strong ref must make `upgrade()` fail immediately.
+    #[tokio::test]
+    async fn test_spawn_probers_retains_no_strong_app_ref() {
+        let app = TestApp::new()
+            .lane(
+                LaneSpec::new("claude", Protocol::anthropic(), "http://127.0.0.1:1")
+                    .api_key("k")
+                    .health(health_active()),
+            )
+            .pool("p", &[(0, 1)])
+            .build();
+        let weak = Arc::downgrade(&app);
+        spawn_probers(&app);
+        drop(app);
+        assert!(
+            weak.upgrade().is_none(),
+            "spawn_probers must retain only a Weak<App>; a strong ref would leak the snapshot across reloads"
+        );
     }
 
     /// REGRESSION (R16 HIGH, SigV4 signed==sent): the active probe MUST sign the canonical URI from

@@ -485,8 +485,9 @@ async fn run() {
     );
 
     // Spawn the active health probers (one per lane with a probing mode). No-op when every lane is
-    // `mode: none` / has no `health:` block.
-    health::spawn_probers(app.clone());
+    // `mode: none` / has no `health:` block. Re-spawned on every config reload/apply (see the admin
+    // swap sites) so reloaded lanes get probed and the old generation exits.
+    health::spawn_probers(&app);
 
     // Build the two routers with the operator-configured ingress body cap + optional inbound-
     // concurrency layer (0 = unlimited / no layer, the default). The admin surface is built onto its
