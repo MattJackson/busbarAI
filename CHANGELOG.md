@@ -9,6 +9,39 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Removed**, **Fixed**, **Security**. Migration steps for a breaking change appear as a bold **Migration**
 item under **Changed**.
 
+## [1.3.4], 2026-07-18
+
+### Added
+
+- **`jwt-bearer` egress auth (OAuth 2.0 JWT-bearer grant, RFC 7523)** — the 5th auth mechanism. A provider
+  with `auth: jwt-bearer` self-mints a short-lived bearer by signing a JWT assertion (RS256) and posting it
+  to the token endpoint, then refreshes in the background ahead of expiry. A Google service-account JSON is a
+  recognized credential container (`client_email`→iss, `private_key`→signing key, `token_uri`→aud); `scope`
+  defaults to `cloud-platform` and is overridable. Any RFC 7523 provider works via config, no new code.
+- **`oauth-client-credentials` egress auth (OAuth 2.0 client-credentials grant, RFC 6749 §4.4)** — the 6th
+  auth mechanism. `auth: oauth-client-credentials` with `token_url` + `scope` exchanges a
+  `client_id:client_secret` for a bearer and refreshes it. This is what authenticates Azure OpenAI via Entra
+  ID (AAD). It shares the self-minting bearer-refresh machinery with `jwt-bearer` — the two differ only in the
+  mint call.
+- **`path_base` provider knob** — overrides a URL-model protocol's hardcoded base segment while keeping the
+  `/{model}:verb` suffix, so one config line can reach a non-standard base path (e.g. Vertex's
+  `/v1/projects/{project}/locations/{location}/publishers/{publisher}/models`).
+- **Google Vertex AI, delivered as configuration** — Gemini on Vertex (`protocol: gemini` + `path_base` +
+  `auth: jwt-bearer`) and Claude on Vertex (`protocol: anthropic` + `path_base` + `auth: jwt-bearer`; the
+  model moves into the `:rawPredict`/`:streamRawPredict` URL and the body carries `anthropic_version` in
+  place of `model`). No new protocol — Vertex speaks Gemini and Anthropic on the wire, so it is a config
+  entry, not code. Azure OpenAI via Entra ID lands the same way (`protocol: openai` +
+  `auth: oauth-client-credentials`).
+- **`token_url` and `scope` provider fields**, consumed by the OAuth auth mechanisms above.
+
+  The support surface is now **6 protocols × 6 auth mechanisms**: any endpoint speaking one of the six wire
+  protocols and one of the six auth styles is a `providers.yaml` entry, no code change.
+
+### Changed
+
+- `ring` and `base64` are now direct dependencies (both were already in the lockfile via rustls) — used for
+  the RS256 JWT signature and the PKCS#8/base64url handling in `jwt-bearer`. No new crates enter the tree.
+
 ## [1.3.3], 2026-07-16
 
 ### Added

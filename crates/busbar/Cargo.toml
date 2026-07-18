@@ -1,6 +1,6 @@
 [package]
 name = "busbar"
-version = "1.3.3"
+version = "1.3.4"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 # Effective MSRV: governance.rs uses `u32::is_multiple_of` (stabilized in Rust 1.87), and clippy's
