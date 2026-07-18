@@ -182,7 +182,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "busbar"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "busbar-api"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -238,21 +238,21 @@ dependencies = [
 
 [[package]]
 name = "busbar-auth-admin-tokens"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "busbar-api",
 ]
 
 [[package]]
 name = "busbar-auth-tokens"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "busbar-api",
 ]
 
 [[package]]
 name = "busbar-hooks-ranking"
-version = "1.3.4"
+version = "1.4.0"
 dependencies = [
  "async-trait",
  "busbar-api",

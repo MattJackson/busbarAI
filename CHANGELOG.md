@@ -9,7 +9,7 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Removed**, **Fixed**, **Security**. Migration steps for a breaking change appear as a bold **Migration**
 item under **Changed**.
 
-## [1.3.4], 2026-07-18
+## [1.4.0], 2026-07-18
 
 ### Added
 
@@ -41,6 +41,40 @@ item under **Changed**.
 
 - `ring` and `base64` are now direct dependencies (both were already in the lockfile via rustls) — used for
   the RS256 JWT signature and the PKCS#8/base64url handling in `jwt-bearer`. No new crates enter the tree.
+- Streaming: for a cross-protocol stream whose backend reports token usage in a SEPARATE trailing chunk
+  (the OpenAI `include_usage` convention), the terminal usage frame is now DEFERRED and the trailing usage
+  folded into it, so a non-OpenAI client (Anthropic/Gemini/Cohere/Responses) receives the real prompt/
+  completion counts on its terminal frame instead of zeros. Delivery is uniform across the SSE and
+  gemini-json-array paths (the response body now streams `finish()`'s content through the json-array framer,
+  which previously discarded it). Behavior-preserving for OpenAI ingress (which still receives the separate
+  usage chunk) and Bedrock ingress (which carries usage in its `metadata` frame).
+
+### Fixed
+
+- **Security — OAuth `token_url` SSRF/scheme:** the `token_url` a `oauth-client-credentials` provider POSTs
+  the client secret to now runs through the SAME SSRF/cloud-metadata denylist and case-insensitive https
+  requirement as `base_url`. Previously it had only a case-sensitive `http://` check (so `HTTPS://`,
+  scheme-less, or an uppercase scheme slipped past) and NO metadata guard, so a typo'd/templated `token_url`
+  pointing at IMDS or `metadata.google.internal` could leak the secret.
+- `jwt-bearer` now honors a configured `scope:` (it was dropped, so the default `cloud-platform` scope always
+  won). JWT claims are built with a JSON serializer instead of string interpolation (a `"`/`\` in
+  `client_email`/`scope` can no longer malform or inject into the claim set).
+- Health probers are re-spawned on config reload/apply and hold a `Weak<App>`: reloaded lanes are now probed,
+  and the previous generation exits instead of leaking one task-set per reload (which also pinned the orphaned
+  snapshot and wrote breaker outcomes into a store no longer serving traffic).
+- A mid-stream upstream **transport** error no longer token-bills the partial usage accumulated before the cut
+  — symmetric with the terminal-error / translate-abort no-bill gates.
+- Translation fidelity: the Cohere reader surfaces `message.tool_plan` (the assistant's pre-tool reasoning was
+  silently dropped on any Cohere→X hop); the Cohere and Responses writers emit a raw-string tool argument
+  verbatim instead of JSON-encoding it a second time; a prompt-level Gemini `RECITATION` block maps to `safety`
+  (consistent with the candidate-level mapping).
+- `busbar --validate` now catches a model whose `context_max` conflicts across pools (previously rejected only
+  at real boot, so a clean `--validate` could still `die` on start).
+- The shared upstream HTTP client sets a `connect_timeout` and TCP keepalive; the virtual-key secret is widened
+  to 256 bits; the self-minting bearer credential recovers from a poisoned lock on the request hot path rather
+  than panicking.
+- License hygiene: the three OAuth source files that were mislabeled `AGPL-3.0-or-later` are corrected to
+  `Apache-2.0` (the project license); a test now fails on any non-Apache SPDX header in first-party source.
 
 ## [1.3.3], 2026-07-16
 
