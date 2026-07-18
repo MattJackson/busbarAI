@@ -2185,6 +2185,25 @@ fn test_stream_prompt_block_emits_terminal_sequence() {
     );
 }
 
+/// audit LOW: a prompt-level RECITATION block must classify as `safety` (matching the candidate-level
+/// mapping and RECITATION's own doc), not `Other`. Same terminal shape as the SAFETY case above.
+#[test]
+fn test_stream_prompt_block_recitation_maps_to_safety() {
+    let events = collect_stream(&[serde_json::json!({
+        "promptFeedback": {"blockReason": GEMINI_FINISH_RECITATION},
+        "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 0}
+    })]);
+    let stop_reason = events.iter().find_map(|e| match e {
+        IrStreamEvent::MessageDelta { stop_reason, .. } => *stop_reason,
+        _ => None,
+    });
+    assert_eq!(
+        stop_reason,
+        Some(crate::ir::IrStopReason::Safety),
+        "a prompt-level RECITATION block must map to Safety, not Other: {events:?}"
+    );
+}
+
 /// Regression (LOW #10, bug): a MID-STREAM prompt-block arm must close any blocks opened by
 /// earlier chunks before emitting its terminal MessageDelta/MessageStop. A normal text chunk
 /// opens a content block (BlockStart{0}); a following `promptFeedback.blockReason` SAFETY chunk

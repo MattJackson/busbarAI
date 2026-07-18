@@ -524,7 +524,14 @@ impl ProtocolReader for CohereReader {
                         usage: None,
                         id,
                         created: None,
-                        model: None,
+                        // Populate the model when the frame carries one (forward-compat / compatible
+                        // backends) rather than hardcoding None so a cross-protocol ingress can surface
+                        // it; native Cohere omits it here, in which case this stays None.
+                        model: data
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from),
                     });
                 }
             }
@@ -805,6 +812,19 @@ impl ProtocolReader for CohereReader {
         })?;
 
         let mut content: Vec<crate::ir::IrBlock> = Vec::new();
+        // Cohere v2 carries the assistant's textual plan that PRECEDES its tool calls in
+        // `message.tool_plan` (a string, distinct from `content[]`). Without reading it, that reasoning
+        // vanishes on any Cohere→X cross-protocol hop. Emit it as a LEADING Text block so it keeps its
+        // native position ahead of the tool calls. (audit H4)
+        if let Some(plan) = message_val.get("tool_plan").and_then(|p| p.as_str()) {
+            if !plan.is_empty() {
+                content.push(crate::ir::IrBlock::Text {
+                    text: plan.to_string(),
+                    cache_control: None,
+                    citations: Vec::new(),
+                });
+            }
+        }
         if let Some(content_arr) = message_val.get("content").and_then(|c| c.as_array()) {
             for block_val in content_arr {
                 if let Some(block_obj) = block_val.as_object() {

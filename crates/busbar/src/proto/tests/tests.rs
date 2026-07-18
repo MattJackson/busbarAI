@@ -1270,6 +1270,73 @@ fn test_protocol_clone_works() {
     let _cloned_writer = openai_writer.clone();
 }
 
+/// audit H4: Cohere v2 carries the assistant's pre-tool reasoning in `message.tool_plan`. It must be
+/// read as a LEADING Text block (ahead of the tool call) or it vanishes on any Cohere→X hop.
+#[test]
+fn cohere_read_response_surfaces_tool_plan_as_leading_text() {
+    let body = serde_json::json!({
+        "message": {
+            "tool_plan": "First I will check the weather.",
+            "tool_calls": [{"id": "t1", "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}}]
+        },
+        "finish_reason": "COMPLETE"
+    });
+    let ir = CohereReader.read_response(&body).expect("cohere read_response");
+    assert!(
+        matches!(ir.content.first(), Some(crate::ir::IrBlock::Text { text, .. }) if text == "First I will check the weather."),
+        "tool_plan must be the leading Text block, got: {:?}",
+        ir.content
+    );
+    assert!(
+        ir.content
+            .iter()
+            .any(|b| matches!(b, crate::ir::IrBlock::ToolUse { .. })),
+        "the tool call must still follow the plan"
+    );
+}
+
+/// audit LOW: an unparseable/streaming-partial tool arg is stored as `Value::String(raw)`; the
+/// Responses writer must emit it VERBATIM, not JSON-encode it a second time (double-encoding).
+#[test]
+fn responses_writer_emits_raw_string_tool_args_verbatim() {
+    let ir = crate::ir::IrResponse {
+        role: crate::ir::IrRole::Assistant,
+        content: vec![crate::ir::IrBlock::ToolUse {
+            id: "call_1".into(),
+            name: "do_it".into(),
+            input: serde_json::Value::String("not valid json {".into()),
+            cache_control: None,
+        }],
+        stop_reason: Some(crate::ir::IrStopReason::ToolUse),
+        usage: crate::ir::IrUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        },
+        model: None,
+        id: None,
+        created: None,
+        system_fingerprint: None,
+        stop_sequence: None,
+        logprobs: Vec::new(),
+    };
+    let wire = ResponsesWriter.write_response(&ir);
+    let args = wire
+        .get("output")
+        .and_then(|o| o.as_array())
+        .expect("output array")
+        .iter()
+        .find(|it| it.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+        .and_then(|it| it.get("arguments"))
+        .and_then(|a| a.as_str())
+        .expect("function_call arguments");
+    assert_eq!(
+        args, "not valid json {",
+        "raw string tool args must be emitted verbatim, not double-encoded"
+    );
+}
+
 /// Regression: Cohere is a free-form-tool-id
 /// ingress with NO canonical prefix, so `native_tool_id_prefix("cohere")` must be `None` (like
 /// Gemini). An empty prefix would make the bare `bb1` marker the only distinguishing signal and
