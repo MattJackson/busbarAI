@@ -20,8 +20,8 @@ variables.
 **Worker threads and scaling.** Busbar's request path is CPU-bound (parse, translate, serialize), so
 throughput scales with worker threads. The default is **one worker per available core**
 (`available_parallelism`, which respects CPU affinity and the cgroup **cpuset** — but **not** the CFS
-`cpu.max` bandwidth quota, which it cannot see), which gives linear scaling: ~7,650 req/s per core,
-sub-millisecond, to ~122k on 16 cores in our [benchmark](https://getbusbar.com/performance). Each worker
+`cpu.max` bandwidth quota, which it cannot see), which gives linear scaling: ~9,750 req/s per core,
+sub-millisecond, to ~156k on 16 cores in our [benchmark](https://getbusbar.com/performance). Each worker
 carries a thread stack and, on glibc, its own malloc arena, so idle memory grows slowly with the count. For
 a **footprint-sensitive sidecar** set `BUSBAR_WORKER_THREADS=1` (or `2`). On a **CPU-quota-limited pod** (a
 k8s CPU *limit* on a many-core node) the default sizes to the node's full core count and oversubscribes the

@@ -54,8 +54,8 @@ item under **Changed**.
   core count. The default is now one
   worker per available core (`available_parallelism`, which respects CPU affinity and the cgroup **cpuset**
   — but **not** the CFS `cpu.max` bandwidth quota, which it cannot see), so **throughput scales linearly
-  with cores out of the box** — ~7,650 req/s per core, ~122k req/s on 16 cores at 100% success in the
-  [published benchmark](https://getbusbar.com/performance), with added latency flat at ~38 µs. On a
+  with cores out of the box** — ~9,750 req/s per core, ~156k req/s on 16 cores at 100% success in the
+  [published benchmark](https://getbusbar.com/performance), with added latency flat at ~33 µs. On a
   quota-limited orchestrator (e.g. a k8s pod with a CPU limit on a many-core node) this defaults to the
   node's core count and oversubscribes the quota — **pin `BUSBAR_WORKER_THREADS` to your CPU limit there.**
   Each worker carries a thread stack and its own allocator arena, so idle memory grows slowly with the
