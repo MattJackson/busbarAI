@@ -1263,9 +1263,11 @@ pub(crate) async fn hook_status(
 /// (no absolute path is hand-written anywhere — the `ap` helper derives them). Templated/POST
 /// routes are documented separately in `openapi_doc`. Adding a GET endpoint means adding it here so
 /// the doc + the drift guard both see it.
-// Consumed by `openapi_doc()` (feature `openapi-schema`) and the router-drift tests; unused in any
-// non-test build, so allow it dead there.
-#[cfg_attr(not(test), allow(dead_code))]
+// Consumed by `openapi_doc()` (feature `openapi-schema`) and the router-resolve drift tests (which
+// need the default auth features to build a router). In a `--no-default-features` build neither is
+// compiled, so the const is genuinely unused there — allow it dead in every config (a plain `allow`
+// never warns when it IS used, unlike `expect`).
+#[allow(dead_code)]
 pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
         "/info",

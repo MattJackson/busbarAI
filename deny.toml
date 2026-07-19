@@ -9,7 +9,14 @@
 # `yanked` deps are also flagged. Add specific advisory IDs to `ignore` ONLY with a
 # written justification and a tracking link — never blanket-ignore.
 version = 2
-ignore = []
+ignore = [
+    # RUSTSEC-2024-0436: `paste` is unmaintained (author archived the repo). It's pulled in
+    # transitively as a BUILD-TIME proc-macro via tikv-jemalloc-ctl (jemalloc) — no runtime
+    # code, no vulnerability, and there is no safe upgrade (jemalloc-ctl has not migrated off
+    # it). Advisory is "unmaintained", not a security hole. Re-evaluate when tikv-jemalloc-ctl
+    # drops paste. Tracking: https://github.com/tikv/jemallocator/issues
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # busbar is Apache-2.0; only allow licenses compatible with redistributing
