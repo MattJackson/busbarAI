@@ -14,7 +14,7 @@
 📖 **Docs:** [getbusbar.com](https://getbusbar.com)  
 ⚡ **Install:** `curl -fsSL https://getbusbar.com/install.sh | sh`  
 🐳 **Docker:** [`getbusbar/busbar`](https://hub.docker.com/r/getbusbar/busbar) — `FROM scratch`, multi-arch, cosign-signed  
-📊 **Footprint** (measured, v1.3.2): ~4.3 MB image · ~5.6 MB idle RSS · 36 / 40 / 53 µs request handling (p50 / p90 / p99, n=50k vs instant mock)  
+📊 **Footprint:** a tiny `FROM scratch` image (see the image-size badge above) · sub-millisecond request handling — [live benchmarks](https://getbusbar.com/performance) carry the current throughput, latency, and memory figures for this release  
 🤖 **Agent-readable:** [getbusbar.com/llms.txt](https://getbusbar.com/llms.txt)
 
 Busbar sits between your application and every AI provider. Point any SDK at one URL (OpenAI, Anthropic, Gemini, Bedrock, Cohere, or the Responses API) and Busbar routes each request to the backends you chose, translating losslessly between protocols where they differ: chat, embeddings, images, audio, and moderations. When a provider fails, it keeps serving.

@@ -153,6 +153,15 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         return;
     }
 
+    // No probe for an OAuth lane (jwt-bearer / oauth-client-credentials) whose first token has not
+    // minted yet: during that boot/reload window `credential.headers_for` emits no auth header, so the
+    // probe would send an unauthenticated request and the guaranteed 401 (classified HardDown) would
+    // park a HEALTHY lane dead. Skip until the token is live — the background minter fills it within a
+    // second, and organic traffic + passive half-open recovery cover the gap. (found: 1.4.0 audit.)
+    if !lane.credential.is_ready() {
+        return;
+    }
+
     let body = lane.protocol.writer().probe_body(lane.wire_model());
     let url_path = lane.path.clone().unwrap_or_else(|| {
         lane.protocol

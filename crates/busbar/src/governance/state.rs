@@ -20,6 +20,7 @@ impl GovState {
             rate: RwLock::new(HashMap::new()),
             token_spend_carry: std::sync::Mutex::new(HashMap::new()),
             rate_sweep_ticker: AtomicU32::new(0),
+            carry_sweep_ticker: AtomicU32::new(0),
             admin_token_hash: admin_token
                 .as_ref()
                 .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
@@ -93,14 +94,25 @@ impl GovState {
             // Bound the carry map: a key seen once (leaving a <1c remainder) then never again would
             // keep its entry forever — slow unbounded growth under key churn. Past a threshold, prune
             // DEFINITELY-stale entries; the dropped sub-cent remainder is the documented acceptable loss.
-            // Threshold keeps the O(n) scan rare (amortized O(1)). Staleness must be PERIOD-AGNOSTIC: a
-            // deployment can mix daily/monthly/total keys, so their `window` values differ from THIS
-            // request's `window` — the old `retain(w == window)` dropped valid CURRENT entries for keys on
-            // a different budget period (audit 1.4.0). Instead drop only entries older than the longest
-            // bounded window (monthly ≤ 31 d), so no still-current entry for ANY period is pruned; the
-            // all-time window (`w == 0`, `total`) never ages out.
+            // Staleness must be PERIOD-AGNOSTIC: a deployment can mix daily/monthly/total keys, so their
+            // `window` values differ from THIS request's `window` — the old `retain(w == window)` dropped
+            // valid CURRENT entries for keys on a different budget period (audit 1.4.0). Instead drop only
+            // entries older than the longest bounded window (monthly ≤ 31 d), so no still-current entry for
+            // ANY period is pruned; the all-time window (`w == 0`, `total`) never ages out.
+            //
+            // The O(n) retain is TICKER-GATED (like the `rate` sweep): gating on `len > THRESHOLD` alone
+            // is NOT amortized O(1) when the over-threshold size comes from many permanent `total`-period
+            // keys (`w == 0`) — those never age out, so the map stays above the threshold and the scan
+            // would run under-lock on EVERY flush while removing nothing. Firing the scan only every Nth
+            // over-threshold flush restores the amortized-O(1) hot path; churned ageable entries are still
+            // reclaimed within N flushes. (found: 1.4.0 audit, governance hot-path lock.)
             const TOKEN_SPEND_CARRY_SWEEP_THRESHOLD: usize = 4096;
-            if carry.len() > TOKEN_SPEND_CARRY_SWEEP_THRESHOLD {
+            let carry_sweep_needed = self
+                .carry_sweep_ticker
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+                .is_multiple_of(crate::limits::rate_sweep_interval());
+            if carry_sweep_needed && carry.len() > TOKEN_SPEND_CARRY_SWEEP_THRESHOLD {
                 let max_window = 31 * super::SECS_PER_DAY;
                 carry.retain(|_, &mut (w, _)| w == 0 || w.saturating_add(max_window) > now);
             }

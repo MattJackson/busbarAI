@@ -69,6 +69,17 @@ impl CredentialProvider for BearerToken {
             }
         }
     }
+
+    /// Ready once the first mint has populated a non-empty token. Before that (the boot/reload window)
+    /// `headers_for` emits no auth header, so the prober skips this lane rather than 401-parking it.
+    fn is_ready(&self) -> bool {
+        !self
+            .token
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .token
+            .is_empty()
+    }
 }
 
 /// Build a bearer credential from a [`Minter`]: start with an empty token and spawn the background
@@ -167,6 +178,15 @@ mod tests {
         assert!(BearerToken::with_token_for_test("")
             .headers_for("k", &ctx())
             .is_empty());
+    }
+
+    // 1.4.0 audit: the prober consults `is_ready` to SKIP an OAuth lane whose first token has not
+    // minted (empty token) — probing it would send no auth header and the guaranteed 401 could
+    // HardDown-park a healthy lane. Ready only once a non-empty token is present.
+    #[test]
+    fn is_ready_false_before_first_mint_true_after() {
+        assert!(!BearerToken::with_token_for_test("").is_ready());
+        assert!(BearerToken::with_token_for_test("tok").is_ready());
     }
 
     /// LOW: `headers_for` runs inline on the request hot path, so a POISONED lock must be recovered,

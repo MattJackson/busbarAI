@@ -76,6 +76,17 @@ where
 /// host / canonical-uri / body / timestamp a signer needs, plus the `Own | Passthrough` mode.
 pub(crate) trait CredentialProvider: Send + Sync {
     fn headers_for(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)>;
+
+    /// Whether this credential can currently produce a usable auth header. Static credentials
+    /// (api-key, bearer, sigv4, anthropic-native) are always ready. A self-minting credential (OAuth
+    /// jwt-bearer / client-credentials) is NOT ready during the boot/reload window before its first
+    /// mint completes — `headers_for` returns no header then, so an active health probe would send an
+    /// unauthenticated request and a guaranteed 401 could HardDown-park a healthy lane. The prober
+    /// consults this to skip a not-yet-minted lane until its token is live. Default: always ready.
+    /// (1.4.0 audit, egress-auth.)
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// Resolve a lane's egress credential at boot from its protocol name and auth style.

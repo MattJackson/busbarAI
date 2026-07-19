@@ -124,6 +124,12 @@ pub(crate) struct GovState {
     /// `RATE_SWEEP_INTERVAL`): every Nth `check_rate` call performs the full stale-entry retain,
     /// so the per-request hot path does not scan all active keys on every admission.
     rate_sweep_ticker: AtomicU32,
+    /// Admission counter that amortizes the bounded eviction sweep of `token_spend_carry`. The sweep is
+    /// only useful for churned, ageable (windowed) keys; a deployment with many long-lived `total`-period
+    /// keys (`window == 0`, never age out) keeps the map size permanently above the threshold, so gating
+    /// the O(n) retain solely on `len > THRESHOLD` would run it under-lock on EVERY flush. This ticker
+    /// makes the scan fire only every Nth over-threshold flush — restoring the amortized-O(1) hot path.
+    carry_sweep_ticker: AtomicU32,
     /// SHA-256 hex digest of the configured /admin bearer token, computed once at construction. The
     /// plaintext token is NOT retained — only its digest, which is all the constant-time compare on
     /// the /admin path needs (less plaintext secret held in memory). `None` = admin API disabled.

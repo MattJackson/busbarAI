@@ -33,6 +33,7 @@ pub(crate) fn build(
     scope: &str,
 ) -> Result<CredentialProviderArc, String> {
     let (client_id, client_secret) = split_credential(credential)?;
+    validate_token_url(token_url)?;
     let creds = Arc::new(ClientCreds {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -68,6 +69,34 @@ fn split_credential(credential: &str) -> Result<(&str, &str), String> {
 /// audit, egress-auth.)
 pub(crate) fn validate_credential(credential: &str) -> Result<(), String> {
     split_credential(credential).map(|_| ())
+}
+
+/// Vet the `token_url` (the POST target for `client_id`/`client_secret`) for SSRF/https the same way
+/// `jwt_bearer::validate_token_uri` vets the SA `token_uri`: https for a public host (http only for a
+/// loopback/private endpoint), never a cloud-metadata/IMDS host. Called from [`build`] as
+/// defense-in-depth so the check holds even if a future caller reaches `build` without config_validate
+/// running first (the minter client already refuses redirects; this closes the direct-target case).
+/// (found: 1.4.0 audit, egress-auth — parity with jwt-bearer, which validated its token endpoint but
+/// oauth-client-credentials did not.)
+fn validate_token_url(token_url: &str) -> Result<(), String> {
+    use crate::config_validate::{
+        extract_normalized_host, host_is_private_or_loopback, scheme_is, ssrf_blocked_host,
+    };
+    let host_private = extract_normalized_host(token_url)
+        .as_deref()
+        .map(host_is_private_or_loopback)
+        .unwrap_or(false);
+    if !(scheme_is(token_url, "https") || (host_private && scheme_is(token_url, "http"))) {
+        return Err(format!(
+            "oauth-client-credentials token_url must use https for a public host (got '{token_url}'); it receives the client_id/client_secret, so plaintext http is permitted only for a private/loopback endpoint"
+        ));
+    }
+    if let Some(host) = ssrf_blocked_host(token_url, &[], false, &[]) {
+        return Err(format!(
+            "oauth-client-credentials token_url '{token_url}' targets a blocked cloud-metadata host '{host}' (the client credentials would be POSTed there; cloud-metadata/IMDS endpoints are denied)"
+        ));
+    }
+    Ok(())
 }
 
 impl ClientCreds {
@@ -129,6 +158,16 @@ mod tests {
         assert!(build("no-colon-here", "https://t", "s").is_err());
         assert!(build(":secret-only", "https://t", "s").is_err());
         assert!(build("id-only:", "https://t", "s").is_err());
+    }
+
+    // 1.4.0 audit (egress-auth): build() re-validates token_url for SSRF/https as defense-in-depth
+    // (parity with jwt-bearer). A plaintext-http public token_url and a cloud-metadata/IMDS host are
+    // rejected even with a well-formed credential; loopback http is allowed (local dev IdP).
+    #[test]
+    fn build_rejects_unsafe_token_url() {
+        assert!(build("id:secret", "http://login.example.com/token", "s").is_err());
+        assert!(build("id:secret", "https://169.254.169.254/token", "s").is_err());
+        assert!(build("id:secret", "http://127.0.0.1:8080/token", "s").is_ok());
     }
 
     #[test]

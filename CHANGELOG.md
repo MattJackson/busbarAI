@@ -47,12 +47,15 @@ item under **Changed**.
   in 1.3.1–1.3.3 (1.3.0 used Tokio's all-cores default), which pinned the CPU-bound request path (parse,
   translate, serialize) to ~4 cores no matter how large the machine — throughput plateaued regardless of
   core count. The default is now one
-  worker per available core (`available_parallelism`, which respects CPU affinity and cgroup quota), so
-  **throughput scales linearly with cores out of the box** — ~7,650 req/s per core, ~122k req/s on 16 cores
-  at 100% success in the [published benchmark](https://getbusbar.com/performance), with added latency flat
-  at ~38 µs. Each worker carries a thread stack and its own allocator arena, so idle memory grows slowly
-  with the count; footprint-sensitive sidecars should set `BUSBAR_WORKER_THREADS=1` (or `2`). No config or
-  API change. The reproducible throughput/scaling harness and raw per-core data are checked in under
+  worker per available core (`available_parallelism`, which respects CPU affinity and the cgroup **cpuset**
+  — but **not** the CFS `cpu.max` bandwidth quota, which it cannot see), so **throughput scales linearly
+  with cores out of the box** — ~7,650 req/s per core, ~122k req/s on 16 cores at 100% success in the
+  [published benchmark](https://getbusbar.com/performance), with added latency flat at ~38 µs. On a
+  quota-limited orchestrator (e.g. a k8s pod with a CPU limit on a many-core node) this defaults to the
+  node's core count and oversubscribes the quota — **pin `BUSBAR_WORKER_THREADS` to your CPU limit there.**
+  Each worker carries a thread stack and its own allocator arena, so idle memory grows slowly with the
+  count; footprint-sensitive sidecars should set `BUSBAR_WORKER_THREADS=1` (or `2`). No config or API
+  change. The reproducible throughput/scaling harness and raw per-core data are checked in under
   `bench/scaling/`.
 - **Allocator: jemalloc with a background purge thread.** The request hot path holds a few copies of each
   request body while it is parsed and forwarded, so peak RSS tracks `peak concurrency × payload size`. The
@@ -62,7 +65,10 @@ item under **Changed**.
   short decay, so memory **plateaus** under sustained load and **falls back toward idle** when the load
   subsides (measured: a ~1.2 GB plateau under a 5-minute 150 KB-payload soak drops to ~250 MB within ~30 s of
   the load stopping). It remains bounded — a function of in-flight work, never unbounded growth. Cost: ~450 KB
-  of binary. Reproduction harness in `bench/memory/`.
+  of binary. Reproduction harness in `bench/memory/`. **Windows (`msvc` target) keeps the system allocator:**
+  jemalloc's C build is incompatible with the MSVC toolchain, so it is compiled in only for non-msvc targets
+  (Linux/macOS, incl. the published container and static musl builds) — Windows binaries build and run
+  unchanged on the system allocator and do not get the plateau/fall-back-to-idle behavior.
 - `ring` and `base64` are now direct dependencies (both were already in the lockfile via rustls) — used for
   the RS256 JWT signature and the PKCS#8/base64url handling in `jwt-bearer`. No new crates enter the tree.
 - Streaming: for a cross-protocol stream whose backend reports token usage in a SEPARATE trailing chunk
