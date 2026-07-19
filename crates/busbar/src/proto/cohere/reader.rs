@@ -742,6 +742,24 @@ impl ProtocolReader for CohereReader {
             // survives the stream and start/delta/end for a tool all resolve to the same IR index
             // regardless of wire-index ordering.
             ET_TOOL_CALL_START => {
+                // Close a still-open text block before opening the tool. Real Cohere v2 emits a
+                // `content-end` for a content text block BEFORE the first `tool-call-start`, so on the
+                // normal text-then-tool turn `text_block_open` is already false here and this is a
+                // no-op. But the `tool-plan-delta` path (above) opens a LEADING text block that Cohere
+                // NEVER closes with `content-end` — it goes straight from the plan tokens to
+                // `tool-call-start`, and `message-end` does not close a dangling text block. Left open,
+                // that block emits a `content_block_start` with NO matching `content_block_stop` on an
+                // Anthropic egress (an unbalanced stream / proxy-signature tell). Close it here — at the
+                // index it CLAIMED on first appearance (`state.text_index`, never a hardcoded 0, so a
+                // tool that took 0 ahead of the text is not mis-closed) — and clear the live flag.
+                // `state.text_index` stays recorded (mirroring `content-end`), so the persistent
+                // TEXT_BLOCK_SEEN_SENTINEL still offsets this and later tools past the text index; the
+                // tool BlockStart below therefore lands at the SAME index it did before.
+                if state.text_block_open {
+                    state.text_block_open = false;
+                    let ti = state.text_index.unwrap_or(0);
+                    out.push(IrStreamEvent::BlockStop { index: ti });
+                }
                 let frame_idx = clamp_frame_index(data);
                 let tc = data
                     .get("delta")

@@ -32,14 +32,7 @@ pub(crate) fn build(
     token_url: &str,
     scope: &str,
 ) -> Result<CredentialProviderArc, String> {
-    let (client_id, client_secret) = credential
-        .split_once(':')
-        .ok_or("oauth-client-credentials key must be `client_id:client_secret`")?;
-    if client_id.is_empty() || client_secret.is_empty() {
-        return Err(
-            "oauth-client-credentials key has an empty client_id or client_secret".to_string(),
-        );
-    }
+    let (client_id, client_secret) = split_credential(credential)?;
     let creds = Arc::new(ClientCreds {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -52,6 +45,29 @@ pub(crate) fn build(
         Box::pin(async move { creds.mint().await })
     });
     Ok(super::bearer_token::spawn(minter))
+}
+
+/// Split + check a `client_id:client_secret` credential (the first `:` splits, so a secret may contain
+/// `:`). Shared by [`build`] and [`validate_credential`] so the boot/apply path and the config
+/// `--validate` dry-run enforce identical checks with identical messages.
+fn split_credential(credential: &str) -> Result<(&str, &str), String> {
+    let (client_id, client_secret) = credential
+        .split_once(':')
+        .ok_or("oauth-client-credentials key must be `client_id:client_secret`")?;
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(
+            "oauth-client-credentials key has an empty client_id or client_secret".to_string(),
+        );
+    }
+    Ok((client_id, client_secret))
+}
+
+/// Validate an `oauth-client-credentials` credential WITHOUT constructing the provider — the config
+/// `--validate` dry-run entry point (mirrors `jwt_bearer::validate_credential`, so a malformed
+/// credential is caught at validate time for BOTH OAuth mechanisms, not only jwt-bearer). (found: 1.4.0
+/// audit, egress-auth.)
+pub(crate) fn validate_credential(credential: &str) -> Result<(), String> {
+    split_credential(credential).map(|_| ())
 }
 
 impl ClientCreds {

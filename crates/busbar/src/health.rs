@@ -142,6 +142,17 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
         return;
     }
 
+    // No active probe for a `path_base` lane (Claude/Gemini on Vertex). The probe builds its URL from
+    // the writer's default path and sends the native model-in-body form; it does NOT apply the lane's
+    // `path_base` (`{path_base}/{model}:rawPredict`) nor the Vertex wire transform (model-strip +
+    // `anthropic_version`) that organic forwarding does. Probing such a lane would hit the wrong URL with
+    // the wrong body, never 2xx, and bench a HEALTHY lane. Skip it — passive half-open breaker recovery
+    // on organic traffic still restores a tripped path_base lane. (found: 1.4.0 audit; active probing of
+    // path_base lanes needs the probe to route through the organic EgressCtx path — a follow-up.)
+    if lane.path_base.is_some() {
+        return;
+    }
+
     let body = lane.protocol.writer().probe_body(lane.wire_model());
     let url_path = lane.path.clone().unwrap_or_else(|| {
         lane.protocol

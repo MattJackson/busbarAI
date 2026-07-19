@@ -31,7 +31,7 @@ that's a maintenance treadmill that dilutes the vetting.
 
 A provider integration is two things: a **protocol** (request/response shape) and
 an **auth method**. Busbar separates them. The `ProtocolWriter` trait exposes two
-hooks (`src/proto/mod.rs`):
+hooks (`crates/busbar/src/proto/mod.rs`):
 
 - `auth_headers(key)`: static headers (bearer, api-key header, …).
 - `sign_request(key, ctx)`, per-request signing, given method/host/path/body/time.

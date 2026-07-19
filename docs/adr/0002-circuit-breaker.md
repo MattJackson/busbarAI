@@ -1,7 +1,7 @@
 # ADR-0002 — Circuit breaker: disposition taxonomy & recovery
 
 > Status: accepted (reconstructed from code). `ADR-0002` is referenced throughout
-> `src/breaker.rs`, `src/store/mod.rs`, `src/proxy/engine/mod.rs`, and `src/config/mod.rs`. The
+> `crates/busbar/src/breaker.rs`, `crates/busbar/src/store/mod.rs`, `crates/busbar/src/proxy/engine/mod.rs`, and `crates/busbar/src/config/mod.rs`. The
 > prose is reconstructed from the implementation.
 
 ## Context
@@ -45,7 +45,7 @@ is recognized as a built-in canonical code.
 | `ClientError` | `ClientFault` |
 | `ContextLength` | `ContextLength` |
 
-Outcome rules (applied in `src/proxy/engine/mod.rs`, written via `StateStore`):
+Outcome rules (applied in `crates/busbar/src/proxy/engine/mod.rs`, written via `StateStore`):
 
 - **`ClientFault`** — relay the upstream error verbatim to the caller; record
   *nothing* against the breaker (a separate `client_fault` counter tracks it for

@@ -462,6 +462,21 @@ pub(crate) fn validate_with_unset(
                     provider_name
                 ));
             }
+            // Dry-run credential-format check (parity with jwt-bearer below): the `client_id:client_secret`
+            // colon-split lives only in `build()`, which `--validate` never reaches, so a malformed
+            // credential otherwise passes validate and fails at boot/apply. Check it here when the env var
+            // resolves (an unset var can't be validated — caught at boot). (found: 1.4.0 audit, egress-auth.)
+            let cred = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
+            if !cred.trim().is_empty() {
+                if let Err(e) =
+                    crate::egress_auth::oauth_client_credentials::validate_credential(&cred)
+                {
+                    errors.push(format!(
+                        "provider '{provider_name}' oauth-client-credentials credential (from ${}) is invalid: {e}",
+                        provider_cfg.api_key_env
+                    ));
+                }
+            }
         }
 
         // jwt-bearer: dry-run key validation. `build()` (SA-JSON parse + PKCS#8 key check + token_uri

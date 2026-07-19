@@ -43,9 +43,10 @@ item under **Changed**.
 
 ### Changed
 
-- **Default worker-thread count now scales to the box.** The async worker pool previously defaulted to
-  `min(cores, 4)`, which pinned the CPU-bound request path (parse, translate, serialize) to ~4 cores no
-  matter how large the machine — throughput plateaued regardless of core count. The default is now one
+- **Default worker-thread count now scales to the box.** The async worker pool defaulted to `min(cores, 4)`
+  in 1.3.1–1.3.3 (1.3.0 used Tokio's all-cores default), which pinned the CPU-bound request path (parse,
+  translate, serialize) to ~4 cores no matter how large the machine — throughput plateaued regardless of
+  core count. The default is now one
   worker per available core (`available_parallelism`, which respects CPU affinity and cgroup quota), so
   **throughput scales linearly with cores out of the box** — ~7,650 req/s per core, ~122k req/s on 16 cores
   at 100% success in the [published benchmark](https://getbusbar.com/performance), with added latency flat

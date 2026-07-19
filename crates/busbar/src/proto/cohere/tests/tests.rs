@@ -1626,7 +1626,9 @@ fn test_stream_tool_before_text_no_index_collision() {
     );
 
     // And the canonical text-before-tool ordering still keeps text at 0 / tool at 1 on a fresh
-    // stream (the fix must not regress the common case).
+    // stream (the fix must not regress the common case). A text block still OPEN when the tool
+    // arrives (no intervening content-end — the tool-plan shape) is closed FIRST with a BlockStop at
+    // its index 0, then the tool opens at index 1, so the emitted stream stays balanced.
     let mut state2 = crate::ir::StreamDecodeState::default();
     let evs = reader.read_response_events(
         "",
@@ -1652,7 +1654,11 @@ fn test_stream_tool_before_text_no_index_collision() {
         }),
         &mut state2,
     );
-    match &evs[0] {
+    assert!(
+        matches!(&evs[0], crate::ir::IrStreamEvent::BlockStop { index: 0 }),
+        "the still-open text block must close at index 0 before the tool opens, got {evs:?}"
+    );
+    match &evs[1] {
         crate::ir::IrStreamEvent::BlockStart { index, .. } => assert_eq!(
             *index, 1,
             "text-before-tool: text keeps 0, tool takes 1 (no regression)"
@@ -2590,7 +2596,13 @@ fn test_stream_tool_indices_offset_by_open_text_block() {
             }),
             &mut state,
         );
-    let idx1 = match &evs[0] {
+    // The still-open text block (no intervening content-end) closes at index 0 first, then the
+    // tool opens at index 1 — the emitted stream stays balanced.
+    assert!(
+        matches!(&evs[0], crate::ir::IrStreamEvent::BlockStop { index: 0 }),
+        "the open text block must close at index 0 before the first tool opens, got {evs:?}"
+    );
+    let idx1 = match &evs[1] {
         crate::ir::IrStreamEvent::BlockStart { index, .. } => *index,
         other => panic!("expected BlockStart, got {other:?}"),
     };
@@ -4232,9 +4244,10 @@ fn test_stream_tool_plan_delta_becomes_leading_text_before_tool_call() {
         } if t == "check the weather."
     ));
 
-    // tool-call-start — the plan Text block stays open at index 0 (Cohere sends no content-end for
-    // a plan), so the tool offsets to index 1, exactly as a content Text at 0 pushes a following
-    // tool to 1. This mirrors the non-stream fold: the plan is the LEADING block, the tool follows.
+    // tool-call-start — Cohere sends NO content-end for the plan, so the tool-call-start must first
+    // CLOSE the leading plan Text block (BlockStop at index 0) — otherwise it would leak an
+    // unbalanced content_block_start on an Anthropic egress — then open the tool at index 1. This
+    // mirrors the non-stream fold: the plan is the LEADING block and the tool follows it.
     let evs = reader.read_response_events(
         "",
         &serde_json::json!({
@@ -4245,8 +4258,12 @@ fn test_stream_tool_plan_delta_becomes_leading_text_before_tool_call() {
         &mut state,
     );
     assert!(
+        matches!(&evs[0], crate::ir::IrStreamEvent::BlockStop { index: 0 }),
+        "the tool-call-start must close the open plan Text block at index 0 first, got {evs:?}"
+    );
+    assert!(
         matches!(
-            &evs[0],
+            &evs[1],
             crate::ir::IrStreamEvent::BlockStart {
                 index: 1,
                 block: crate::ir::IrBlockMeta::ToolUse { id, name }
@@ -4309,5 +4326,65 @@ fn test_write_response_reemits_folded_tool_plan_as_content_not_tool_plan() {
             .any(|b| b.get("text").and_then(|t| t.as_str())
                 == Some("First I will check the weather.")),
         "the reasoning text must survive as a content text block: {out}"
+    );
+}
+
+/// audit finding #7 follow-up (MAJOR, balanced-stream): drive a REAL Cohere v2 tool-plan stream
+/// (`message-start` → `tool-plan-delta`× → `tool-call-start`/`-delta`/`-end` → `message-end`)
+/// through the ANTHROPIC writer and assert every `content_block_start` has a matching
+/// `content_block_stop`. The `tool-plan-delta` arm opens a LEADING text block that Cohere never
+/// closes with `content-end`; without the `tool-call-start` auto-close it would emit a dangling
+/// `content_block_start(index 0)` on Anthropic egress (an unbalanced stream / proxy-signature tell).
+/// This is the first cross-writer coverage — the other cohere stream tests exercise reader internals
+/// only.
+#[test]
+fn test_stream_tool_plan_to_anthropic_writer_is_balanced() {
+    let reader = CohereReader;
+    let writer = crate::proto::anthropic::AnthropicWriter;
+    let mut state = crate::ir::StreamDecodeState::default();
+
+    // The native Cohere v2 tool-use stream frame sequence, in order.
+    let frames = vec![
+        serde_json::json!({"type": ET_MESSAGE_START, "delta": {"message": {"role": "assistant"}}}),
+        serde_json::json!({"type": ET_TOOL_PLAN_DELTA, "delta": {"message": {"tool_plan": "I will "}}}),
+        serde_json::json!({"type": ET_TOOL_PLAN_DELTA, "delta": {"message": {"tool_plan": "check the weather."}}}),
+        serde_json::json!({
+            "type": ET_TOOL_CALL_START,
+            "index": 0,
+            "delta": {"message": {"tool_calls": {"id": "t1", "type": "function", "function": {"name": "get_weather", "arguments": ""}}}}
+        }),
+        serde_json::json!({
+            "type": ET_TOOL_CALL_DELTA,
+            "index": 0,
+            "delta": {"message": {"tool_calls": {"function": {"arguments": "{\"city\":\"SF\"}"}}}}
+        }),
+        serde_json::json!({"type": ET_TOOL_CALL_END, "index": 0}),
+        serde_json::json!({"type": ET_MESSAGE_END, "delta": {"finish_reason": "COMPLETE"}}),
+    ];
+
+    let mut starts = 0usize;
+    let mut stops = 0usize;
+    for frame in &frames {
+        for ev in reader.read_response_events("", frame, &mut state) {
+            if let Some((event_type, _payload)) = writer.write_response_event(&ev) {
+                if event_type == "content_block_start" {
+                    starts += 1;
+                } else if event_type == "content_block_stop" {
+                    stops += 1;
+                }
+            }
+        }
+    }
+
+    // Two blocks open on Anthropic egress: the leading plan Text (index 0) and the tool_use (index
+    // 1). Both must close — a dangling text block was the defect.
+    assert_eq!(
+        starts, 2,
+        "expected two content_block_start frames (plan text + tool_use)"
+    );
+    assert_eq!(
+        starts, stops,
+        "every content_block_start must have a matching content_block_stop (balanced stream); \
+         got {starts} start(s) and {stops} stop(s)"
     );
 }

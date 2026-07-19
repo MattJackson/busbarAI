@@ -18,7 +18,7 @@ directory of integration binaries. Two patterns:
   with the `MockServer` mock-upstream and the bulk of the end-to-end forwarding
   tests.
 
-## The MockServer harness (`src/test_support/mod.rs`)
+## The MockServer harness (`crates/busbar/src/test_support/mod.rs`)
 
 `MockServer` is a real axum server bound to `127.0.0.1:0` (ephemeral port) that
 serves every upstream path through one handler: `/v1/messages` and
@@ -63,7 +63,7 @@ server.shutdown().await;                          // aborts the task
 ## Injecting time into the breaker FSM
 
 Breaker/cooldown tests must not depend on wall-clock. The breaker reads time via
-`store::now()` (the public crate function at `src/store/mod.rs:61`), which under
+`store::now()` (the public crate function at `crates/busbar/src/store/mod.rs:61`), which under
 `#[cfg(test)]` is shadowed inside `InMemoryStore` by a private `now_secs()` that
 delegates to `now_for_test()`:
 
@@ -187,7 +187,7 @@ Patterns this enables:
   that override is now optional (any path resolves to the same handler), since the
   same-protocol relay keys off the upstream Content-Type, not the URL. See
   `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`
-  in `src/ingress/mod.rs` for the full pattern.
+  in `crates/busbar/src/ingress/mod.rs` for the full pattern.
 - **on_exhausted**: populate `on_exhausted_cfgs` with `LeastBad` /
   `FallbackPool(..)` and pre-trip all members; assert the configured behavior
   (and loop-guarding for fallback chains).
