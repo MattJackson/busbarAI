@@ -238,5 +238,12 @@ mod tests {
         assert_eq!(s.expires_in, 7200);
         let absent: TokenResponse = serde_json::from_str(r#"{"access_token":"a"}"#).unwrap();
         assert_eq!(absent.expires_in, super::super::default_expires_in());
+        // 1.4.0 audit: also tolerate a JSON float and a decimal string (truncated toward zero).
+        let float: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"a","expires_in":3600.0}"#).unwrap();
+        assert_eq!(float.expires_in, 3600);
+        let decimal_str: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"a","expires_in":"3600.9"}"#).unwrap();
+        assert_eq!(decimal_str.expires_in, 3600);
     }
 }

@@ -131,6 +131,21 @@ fn next_refresh_secs(expires_at: u64, now: u64) -> u64 {
 async fn refresh_loop(minter: Minter, weak: Weak<BearerToken>) {
     loop {
         match minter().await {
+            // A 200 with an EMPTY access_token must be treated as a (retryable) failure, not stored:
+            // an empty token collides with the pre-first-mint sentinel, so `is_ready()` would stay false
+            // forever (the prober skips the lane permanently) AND `headers_for` would emit no auth header
+            // (organic traffic 401s forever) — a permanent wedge with no self-healing. Retry at
+            // MIN_SLEEP instead, exactly like a mint error. (1.4.0 audit, egress-auth.)
+            Ok(fresh) if fresh.token.is_empty() => {
+                tracing::warn!(
+                    "OAuth token endpoint returned a 200 with an empty access_token; treating as a \
+                     mint failure and will retry"
+                );
+                if weak.upgrade().is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(MIN_SLEEP_SECS)).await;
+            }
             Ok(fresh) => {
                 let expires_at = fresh.expires_at;
                 match weak.upgrade() {

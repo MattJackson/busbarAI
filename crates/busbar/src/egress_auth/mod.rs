@@ -50,7 +50,9 @@ pub(crate) fn default_expires_in() -> u64 {
 /// Deserialize an OAuth `expires_in` TOLERANTLY. RFC 6749 specifies a number of seconds, but real IdPs
 /// vary — ADFS and Azure AD v1 emit it as a JSON STRING (`"3600"`), and some omit it (handled by
 /// `#[serde(default = "default_expires_in")]` on the field). A strict `u64` field breaks token minting
-/// for those providers, silently downing the lane. Accept a number or a numeric string.
+/// for those providers, silently downing the lane. Accept an integer, a JSON float/decimal
+/// (`3600.0` / `"3600.5"`, truncated toward zero — a fractional second on a token TTL is noise), or a
+/// numeric string. A negative or non-finite value is rejected. (1.4.0 audit: float tolerance.)
 pub(crate) fn deserialize_expires_in<'de, D>(d: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -59,21 +61,39 @@ where
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum NumOrStr {
+        // Order matters for `untagged`: an integer matches `Num` first; `Float` only catches a
+        // non-integer JSON number; `Str` catches a quoted value.
         Num(u64),
+        Float(f64),
         Str(String),
+    }
+    fn float_to_secs<E: serde::de::Error>(f: f64) -> Result<u64, E> {
+        if f.is_finite() && f >= 0.0 {
+            Ok(f as u64)
+        } else {
+            Err(E::custom(format!(
+                "expires_in must be a non-negative number, got {f}"
+            )))
+        }
     }
     match NumOrStr::deserialize(d)? {
         NumOrStr::Num(n) => Ok(n),
-        NumOrStr::Str(s) => s.trim().parse::<u64>().map_err(serde::de::Error::custom),
+        NumOrStr::Float(f) => float_to_secs(f),
+        NumOrStr::Str(s) => {
+            let t = s.trim();
+            if let Ok(n) = t.parse::<u64>() {
+                Ok(n)
+            } else if let Ok(f) = t.parse::<f64>() {
+                float_to_secs(f)
+            } else {
+                Err(serde::de::Error::custom(format!(
+                    "expires_in {s:?} is not a number"
+                )))
+            }
+        }
     }
 }
 
-/// Produces the outbound auth headers for a single upstream request.
-///
-/// `key` is the per-request credential the caller resolved — the lane's configured key for
-/// [`crate::auth::UpstreamCreds::Own`], or the forwarded caller token for `Passthrough`. A
-/// self-minting credential (e.g. a future OAuth token provider) ignores `key`. `ctx` carries the
-/// host / canonical-uri / body / timestamp a signer needs, plus the `Own | Passthrough` mode.
 /// The operator's metadata-SSRF posture, threaded into a token-endpoint check so the boot/reload
 /// validation matches `config_validate`'s validate-time check EXACTLY (validate == apply). Its three
 /// fields are the SAME arguments `config_validate::ssrf_blocked_host` is called with: the union of the
@@ -87,6 +107,12 @@ pub(crate) struct MetadataSsrfPolicy<'a> {
     pub(crate) blocked_hosts: &'a [String],
 }
 
+/// Produces the outbound auth headers for a single upstream request.
+///
+/// `key` is the per-request credential the caller resolved — the lane's configured key for
+/// [`crate::auth::UpstreamCreds::Own`], or the forwarded caller token for `Passthrough`. A
+/// self-minting credential (e.g. a future OAuth token provider) ignores `key`. `ctx` carries the
+/// host / canonical-uri / body / timestamp a signer needs, plus the `Own | Passthrough` mode.
 pub(crate) trait CredentialProvider: Send + Sync {
     fn headers_for(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)>;
 
