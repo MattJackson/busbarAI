@@ -715,13 +715,15 @@ impl StreamTranslate {
     /// `feed` is a no-op.
     ///
     /// On the SSE-ingress path `finish()` already surfaces this abort as the ingress protocol's
-    /// native in-band error frame. But on the GEMINI JSON-ARRAY ingress path the caller discards the
-    /// translate's SSE `finish()` bytes (an SSE error frame cannot ride inside a JSON-array body) and
-    /// closes the array with [`GeminiJsonArrayFramer::finish`] instead — whose OWN `aborted` flag is
-    /// not set when the UPSTREAM translate aborted (the translate simply stopped feeding it bytes), so
-    /// the array would close with a bare `]` and the truncation would be silently swallowed. This
-    /// accessor lets that close path observe the translate-side abort and emit the framer error-close
-    /// instead, mirroring the SSE-ingress terminal-error behavior in `finish()`.
+    /// native in-band error frame. On the GEMINI JSON-ARRAY ingress path the close arm normally FEEDS
+    /// `finish()`'s tail THROUGH [`GeminiJsonArrayFramer::feed`] (so the terminal usage frame is
+    /// delivered as a trailing array element) and then closes with
+    /// [`GeminiJsonArrayFramer::finish_for_translate`]. But on an ABORT the SSE `finish()` bytes are an
+    /// error frame that cannot ride inside a JSON-array body, so the tail is NOT fed through; the
+    /// framer's OWN `aborted` flag is also unset (the translate simply stopped feeding it bytes), so a
+    /// bare `]` would silently swallow the truncation. This accessor lets that close path observe the
+    /// translate-side abort and emit the framer error-close instead, mirroring the SSE-ingress
+    /// terminal-error behavior in `finish()`.
     ///
     /// Production wiring lives in `proxy engine`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
     /// close arm reads `translate.aborted()` and passes it to

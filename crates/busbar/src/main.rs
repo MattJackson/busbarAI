@@ -391,21 +391,30 @@ fn main() {
     // (the ~5 MB-idle case) should set `BUSBAR_WORKER_THREADS=1` (or 2): each worker carries a stack and
     // its own allocator arena, so idle RSS grows with the count. Scale up by default, tune down (or to
     // your CPU quota) deliberately.
-    let worker_threads = std::env::var("BUSBAR_WORKER_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .or_else(|| {
-            // Back-compat: v1.3.0 ran under `#[tokio::main]`, whose runtime honors the standard
-            // `TOKIO_WORKER_THREADS`. 1.4.0 builds the runtime explicitly (to default the pool to all
-            // cores), which otherwise IGNORES that env var — so read it as a fallback when the
-            // busbar-native knob is unset, and an operator who pinned `TOKIO_WORKER_THREADS` on 1.3.0
-            // keeps the same pool size instead of silently jumping to one-per-core. (1.4.0 audit.)
-            std::env::var("TOKIO_WORKER_THREADS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .filter(|&n| n >= 1)
-        })
+    // Resolve the worker-thread override, warning on an EXPLICITLY-SET but invalid value rather than
+    // silently ignoring it. v1.3.0 ran under `#[tokio::main]`, which fail-fast panicked on a bad
+    // `TOKIO_WORKER_THREADS`; 1.4.0 builds the runtime explicitly and would otherwise fall through to
+    // all-cores on a `0`/garbage value — a silent footprint surprise. An UNSET var is not warned (it is
+    // the normal default path). `TOKIO_WORKER_THREADS` is read as a back-compat fallback so an operator
+    // who pinned it on 1.3.0 keeps the same pool size. (1.4.0 audit.) `eprintln!` because this runs
+    // before the tracing subscriber is installed.
+    fn worker_threads_from_env(name: &str) -> Option<usize> {
+        match std::env::var(name) {
+            Ok(v) => match v.trim().parse::<usize>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    eprintln!(
+                        "[warn] {name}={v:?} is not a positive integer; ignoring it and using the \
+                         default worker-thread count"
+                    );
+                    None
+                }
+            },
+            Err(_) => None, // unset — normal default path, no warning
+        }
+    }
+    let worker_threads = worker_threads_from_env("BUSBAR_WORKER_THREADS")
+        .or_else(|| worker_threads_from_env("TOKIO_WORKER_THREADS"))
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())

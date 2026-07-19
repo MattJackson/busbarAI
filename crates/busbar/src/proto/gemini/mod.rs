@@ -1001,19 +1001,20 @@ impl GeminiJsonArrayFramer {
     /// Close the array at end-of-stream when this framer sits DOWNSTREAM of a cross-protocol
     /// [`StreamTranslate`] (gemini ingress, non-gemini egress). Identical to [`finish`] except it ALSO
     /// surfaces an abort that happened on the TRANSLATE side: when the translate's reassembly buffer
-    /// overflowed `MAX_BUF` it stopped feeding this framer and its SSE terminal-error frame is
-    /// discarded by the caller (an SSE error cannot ride inside a JSON-array body), so this framer's
-    /// own `aborted` flag stays clear and a plain [`finish`] would emit a bare `]` — a SILENT
-    /// truncation indistinguishable from a successful short completion. Pass
-    /// `translate_aborted = StreamTranslate::aborted()`; when EITHER side aborted, emit the
-    /// Gemini-shaped error element + `]` (mirroring the SSE-ingress terminal-error path in
-    /// `StreamTranslate::finish`) instead of the bare close. Idempotent via the shared `finished` flag.
+    /// overflowed `MAX_BUF` it stopped feeding this framer and its SSE terminal-error frame is NOT fed
+    /// through (an SSE error cannot ride inside a JSON-array body), so this framer's own `aborted` flag
+    /// stays clear and a plain [`finish`] would emit a bare `]` — a SILENT truncation indistinguishable
+    /// from a successful short completion. Pass `translate_aborted = StreamTranslate::aborted()`; when
+    /// EITHER side aborted, emit the Gemini-shaped error element + `]` (mirroring the SSE-ingress
+    /// terminal-error path in `StreamTranslate::finish`) instead of the bare close. Idempotent via the
+    /// shared `finished` flag.
     ///
     /// [`finish`]: Self::finish
     ///
-    /// Production wiring lives in `proxy engine`: the `FirstByteBody` `Poll::Ready(None)` JSON-array
-    /// close arm calls this with `translate.aborted()` (captured before draining the translate's SSE
-    /// terminator) instead of discarding `translate.finish()` then calling plain `framer.finish()`.
+    /// Production wiring lives in `proxy engine`: on a NORMAL close the `FirstByteBody`
+    /// `Poll::Ready(None)` JSON-array arm FEEDS `translate.finish()`'s tail through [`Self::feed`] (so the
+    /// terminal usage frame becomes a trailing array element) and then calls this with
+    /// `translate.aborted()`; on an ABORT it skips feeding the tail and relies on this error-close.
     pub(crate) fn finish_for_translate(&mut self, translate_aborted: bool) -> Vec<u8> {
         if self.finished {
             return Vec::new();

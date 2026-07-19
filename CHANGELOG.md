@@ -60,7 +60,10 @@ item under **Changed**.
   node's core count and oversubscribes the quota — **pin `BUSBAR_WORKER_THREADS` to your CPU limit there.**
   Each worker carries a thread stack and its own allocator arena, so idle memory grows slowly with the
   count; footprint-sensitive sidecars should set `BUSBAR_WORKER_THREADS=1` (or `2`). No config or API
-  change. The reproducible throughput/scaling harness and raw per-core data are checked in under
+  change. For back-compat, an operator who pinned the standard `TOKIO_WORKER_THREADS` on 1.3.0 (honored
+  by 1.3.0's `#[tokio::main]` runtime) still gets that pool size — it is read as a fallback when
+  `BUSBAR_WORKER_THREADS` is unset; an explicitly-set-but-invalid value warns instead of being silently
+  ignored. The reproducible throughput/scaling harness and raw per-core data are checked in under
   `bench/scaling/`.
 - **Allocator: jemalloc with a background purge thread.** The request hot path holds a few copies of each
   request body while it is parsed and forwarded, so peak RSS tracks `peak concurrency × payload size`. The
@@ -70,7 +73,8 @@ item under **Changed**.
   short decay, so memory **plateaus** under sustained load and **falls back toward idle** when the load
   subsides (measured: a ~1.2 GB plateau under a 5-minute 150 KB-payload soak drops to ~250 MB within ~30 s of
   the load stopping). It remains bounded — a function of in-flight work, never unbounded growth. Cost: ~450 KB
-  of binary. Reproduction harness in `bench/memory/`. **Windows (`msvc` target) keeps the system allocator:**
+  of binary and four new dependency crates (`tikv-jemallocator` / `tikv-jemalloc-ctl` / `tikv-jemalloc-sys`
+  plus the `paste` build-macro dep), all vendored under the Apache-2.0/MIT compatible set. Reproduction harness in `bench/memory/`. **Windows (`msvc` target) keeps the system allocator:**
   jemalloc's C build is incompatible with the MSVC toolchain, so it is compiled in only for non-msvc targets
   (Linux/macOS, incl. the published container and static musl builds) — Windows binaries build and run
   unchanged on the system allocator and do not get the plateau/fall-back-to-idle behavior.
