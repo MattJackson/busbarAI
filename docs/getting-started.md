@@ -66,7 +66,7 @@ chmod +x busbar
 ./busbar --version
 ```
 
-**Or use Docker**: a `FROM scratch` image (the static binary plus the provider catalog, ~4.3 MB compressed as of v1.3.2, amd64 + arm64), cosign-signed with build provenance:
+**Or use Docker**: a tiny `FROM scratch` image (the static binary plus the provider catalog, amd64 + arm64 — see the image-size badge on the [repo](https://github.com/MattJackson/busbarAI) for the current compressed size), cosign-signed with build provenance:
 
 ```bash
 docker run -d -p 8080:8080 \

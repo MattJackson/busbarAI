@@ -99,6 +99,33 @@ pub(crate) fn spawn(minter: Minter) -> CredentialProviderArc {
     provider
 }
 
+/// Seconds to sleep before the next re-mint, given a token that expires at `expires_at` (epoch secs).
+///
+/// Refresh `REFRESH_SKEW_SECS` BEFORE expiry for a normally-lived token so a request never races the
+/// expiry boundary. But that skew cannot be honored for a SHORT-TTL token: the old
+/// `(ttl - SKEW).max(MIN_SLEEP)` floored the sleep back up to `MIN_SLEEP_SECS` (30s) even for a token
+/// that expired in, say, 10s — so `headers_for` served an EXPIRED bearer for ~20s and the upstream 401'd
+/// (1.4.0 audit, egress-auth). Instead:
+///   - `ttl == 0` (already expired / garbage `expires_in ≈ 0`): back off `MIN_SLEEP_SECS` so the mint
+///     loop cannot spin hot — nothing useful to serve, fail safe.
+///   - `ttl <= REFRESH_SKEW_SECS` (too short to refresh a full skew early): re-mint at ~half the
+///     remaining life, so the refresh always lands BEFORE expiry (never past `ttl`), and never below 1s.
+///   - otherwise: the normal `ttl - REFRESH_SKEW_SECS`, with `MIN_SLEEP_SECS` as a hot-loop floor near
+///     the skew boundary.
+///
+/// Guarantees: for any `ttl > 0` the next mint is scheduled strictly before expiry (no expired token is
+/// served); for `ttl == 0` the loop is rate-limited to `MIN_SLEEP_SECS`.
+fn next_refresh_secs(expires_at: u64, now: u64) -> u64 {
+    let ttl = expires_at.saturating_sub(now);
+    if ttl == 0 {
+        MIN_SLEEP_SECS
+    } else if ttl <= REFRESH_SKEW_SECS {
+        (ttl / 2).max(1)
+    } else {
+        (ttl - REFRESH_SKEW_SECS).max(MIN_SLEEP_SECS)
+    }
+}
+
 /// Mint (immediately on entry), store, then sleep until shortly before expiry and repeat. Exits when
 /// the provider is dropped (config reload) so the task never outlives its lane.
 async fn refresh_loop(minter: Minter, weak: Weak<BearerToken>) {
@@ -112,10 +139,7 @@ async fn refresh_loop(minter: Minter, weak: Weak<BearerToken>) {
                     }
                     None => return, // provider dropped — stop refreshing
                 }
-                let sleep_secs = expires_at
-                    .saturating_sub(now_epoch())
-                    .saturating_sub(REFRESH_SKEW_SECS)
-                    .max(MIN_SLEEP_SECS);
+                let sleep_secs = next_refresh_secs(expires_at, now_epoch());
                 tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
             }
             Err(e) => {
@@ -187,6 +211,26 @@ mod tests {
     fn is_ready_false_before_first_mint_true_after() {
         assert!(!BearerToken::with_token_for_test("").is_ready());
         assert!(BearerToken::with_token_for_test("tok").is_ready());
+    }
+
+    // 1.4.0 audit (egress-auth): a short-TTL token must be re-minted BEFORE it expires — the old
+    // `(ttl - SKEW).max(MIN_SLEEP)` floored the sleep to 30s even for a 10s token, serving it expired.
+    #[test]
+    fn next_refresh_never_sleeps_past_a_live_token_expiry() {
+        let now = 1_000_000;
+        // Long TTL: refresh REFRESH_SKEW early, floored at MIN_SLEEP.
+        assert_eq!(next_refresh_secs(now + 3600, now), 3600 - REFRESH_SKEW_SECS);
+        // Short TTL (< skew): refresh at ~half-life — strictly before expiry, NOT floored to 30s.
+        assert_eq!(next_refresh_secs(now + 10, now), 5);
+        assert!(
+            next_refresh_secs(now + 10, now) < 10,
+            "must land before the 10s expiry"
+        );
+        assert_eq!(next_refresh_secs(now + 60, now), 30);
+        assert_eq!(next_refresh_secs(now + 1, now), 1);
+        // Already-expired / garbage (ttl==0): back off MIN_SLEEP so the mint loop can't spin hot.
+        assert_eq!(next_refresh_secs(now, now), MIN_SLEEP_SECS);
+        assert_eq!(next_refresh_secs(now - 100, now), MIN_SLEEP_SECS);
     }
 
     /// LOW: `headers_for` runs inline on the request hot path, so a POISONED lock must be recovered,

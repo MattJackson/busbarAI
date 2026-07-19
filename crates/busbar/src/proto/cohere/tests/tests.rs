@@ -1744,6 +1744,53 @@ fn test_stream_text_not_reopened_after_close() {
     );
 }
 
+/// Regression (1.4.0 audit, translation): a stream that ends with the leading tool-plan text block
+/// still OPEN (no content-end, no tool-call-start — a truncated/adversarial upstream) must have that
+/// block force-closed at message-end, so the Anthropic egress never sees a dangling content_block_start
+/// with no matching stop.
+#[test]
+fn test_stream_message_end_closes_dangling_text_block() {
+    let reader = CohereReader;
+    let mut state = crate::ir::StreamDecodeState::default();
+
+    // tool-plan opens a text block at index 0 (BlockStart + BlockDelta), then the stream ends abruptly.
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({
+            "type": ET_TOOL_PLAN_DELTA,
+            "delta": {"message": {"tool_plan": "thinking"}}
+        }),
+        &mut state,
+    );
+    assert!(
+        matches!(
+            evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text
+            }
+        ),
+        "tool-plan opens the text block, got {evs:?}"
+    );
+
+    // message-end (no content-end, no tool-call-start) must emit BlockStop{0} BEFORE MessageStop.
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({"type": ET_MESSAGE_END, "delta": {"finish_reason": "COMPLETE"}}),
+        &mut state,
+    );
+    assert!(
+        matches!(evs[0], crate::ir::IrStreamEvent::BlockStop { index: 0 }),
+        "message-end must force-close the dangling text block first, got {evs:?}"
+    );
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, crate::ir::IrStreamEvent::MessageStop)),
+        "message-end still emits MessageStop, got {evs:?}"
+    );
+    // Balanced: exactly one Text BlockStart (from tool-plan) and one BlockStop across the stream.
+}
+
 /// An unknown Cohere stream event type is a documented no-op (no events, no panic) — the named
 /// fallthrough arm must not break the stream.
 #[test]

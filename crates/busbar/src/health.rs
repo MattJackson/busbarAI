@@ -46,8 +46,9 @@ const PROBE_ERROR_BODY_CAP: usize = 64 * 1024;
 /// it, the old probers' `Weak::upgrade` returns `None` and they exit. This (a) re-establishes probing
 /// for lanes added/changed by the reload — a strong-`Arc` prober captured only the boot snapshot and
 /// never saw reloaded lanes — and (b) prevents the old generation from leaking forever (one task-set
-/// per reload) and writing outcomes into an orphaned store. Callers: boot (`main.rs`) and both admin
-/// swap paths (config reload + apply).
+/// per reload) and writing outcomes into an orphaned store. Callers: boot (`main.rs`) and
+/// `AppHandle::swap` — which runs on EVERY config mutation (reload, apply, and each hook/auth swap), so
+/// no swap site can forget to re-attach probing.
 pub(crate) fn spawn_probers(app: &Arc<App>) {
     for i in 0..app.lanes.len() {
         let Some(h) = app.lanes[i].health.clone() else {

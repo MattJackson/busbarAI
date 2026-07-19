@@ -132,8 +132,9 @@ item under **Changed**.
   `lane.credential.headers_for(...)`, replacing per-writer `auth_headers`/`sign_request`. Behavior-preserving
   — every protocol emits byte-identical auth — and it sets up a self-minting (OAuth/Vertex) credential later.
 - Release profile is `opt-level = 3` (was `s`). New `BUSBAR_WORKER_THREADS` env knob hard-caps the Tokio
-  worker pool (default `min(cores, 4)`, ~5% lower RSS on many-core hosts). Deduped `getrandom` to a single
-  0.3 line (dropped the 0.4 copy).
+  worker pool (default `min(cores, 4)`, ~5% lower RSS on many-core hosts). Deduped busbar's own
+  `getrandom` usage onto 0.3 (dropped the 0.4 copy); `ring` still vendors its own 0.2 line, so two
+  `getrandom` majors remain in the tree.
 - All workspace crates are now versioned in lockstep at `1.3.3`. The internal `publish = false` support
   crates (`busbar-api`, `busbar-auth-tokens`, `busbar-auth-admin-tokens`, `busbar-hooks-ranking`) had
   lagged at 1.3.0 across the last few releases; they now track the binary's version.

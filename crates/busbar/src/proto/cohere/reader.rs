@@ -680,6 +680,18 @@ impl ProtocolReader for CohereReader {
                 }
             }
             ET_MESSAGE_END => {
+                // A stream that ends with the leading tool-plan / content text block still OPEN (no
+                // content-end and no tool-call-start closed it first — a truncated or adversarial
+                // upstream) would leave a dangling `content_block_start` with no matching stop on an
+                // Anthropic egress (an unbalanced stream / proxy-signature tell). Force-close it here,
+                // before the terminal frames, at the index it CLAIMED — so the egress stream is always
+                // balanced regardless of upstream truncation. (1.4.0 audit, translation.)
+                if state.text_block_open {
+                    state.text_block_open = false;
+                    state.text_block_closed = true;
+                    let ti = state.text_index.unwrap_or(0);
+                    out.push(IrStreamEvent::BlockStop { index: ti });
+                }
                 let raw_finish_reason = data
                     .get("delta")
                     .and_then(|d| d.get("finish_reason"))
