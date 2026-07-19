@@ -1228,6 +1228,22 @@ async fn test_governance_rate_limit_429() {
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/anypool/v1/messages");
 
+    // `check_rate` buckets by a 60s WALL-CLOCK window (`now / 60 * 60`), so if the three requests
+    // below straddle a minute boundary the per-window counter resets and the 3rd is admitted (404)
+    // instead of rate-limited (429) — a rare timing flake on a loaded CI runner. Deterministic fix:
+    // if we're in the last few seconds of the current window, wait for the next one to start so all
+    // three requests share a single window.
+    {
+        let into_window = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60;
+        if into_window >= 57 {
+            tokio::time::sleep(std::time::Duration::from_secs(60 - into_window + 1)).await;
+        }
+    }
+
     // RPM=2: first two pass the rate gate (then 404 — no such pool); the third is rate-limited.
     for i in 0..2 {
         let r = client
