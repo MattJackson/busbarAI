@@ -349,11 +349,33 @@ fn main() {
     }
     // Enable jemalloc's background purge thread: freed dirty/muzzy pages are returned to the OS after
     // a short idle decay, so RSS falls back to idle after a big-payload burst instead of ratcheting at
-    // the peak (the glibc behavior this replaces). Safe wrapper — no `unsafe`. Best-effort: a platform
-    // without background-thread support (e.g. macOS) simply keeps jemalloc's foreground purge. Skipped on
-    // windows-msvc, which uses the system allocator (jemalloc dep is target-gated off msvc; see above).
+    // the peak (the glibc behavior this replaces). Safe wrapper — no `unsafe`. Skipped on windows-msvc,
+    // which uses the system allocator (jemalloc dep is target-gated off msvc; see above).
+    //
+    // Best-effort and VERIFIED at runtime rather than assumed: some platforms/builds lack background-
+    // thread support (macOS keeps only foreground purge; jemalloc also flags it as potentially
+    // unavailable on musl — and the SHIPPED release is static musl). Read the flag back after writing and
+    // WARN if it did not enable, so the plateau-then-fall-back-to-idle behavior is an observed fact in the
+    // logs, not a silent assumption. Even when the background thread is absent, jemalloc's FOREGROUND
+    // decay purge still bounds RSS under load; only the proactive purge during full idle is lost.
     #[cfg(not(target_env = "msvc"))]
-    let _ = tikv_jemalloc_ctl::background_thread::write(true);
+    {
+        use tikv_jemalloc_ctl::background_thread;
+        match background_thread::write(true).and_then(|()| background_thread::read()) {
+            Ok(true) => {
+                tracing::debug!("jemalloc background purge thread enabled (RSS falls back to idle)")
+            }
+            Ok(false) => tracing::warn!(
+                "jemalloc background purge thread did NOT enable on this target (no background-thread \
+                 support); RSS is still bounded under load by foreground decay purge, but may not fall \
+                 back to idle as promptly when the process is fully idle"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not enable jemalloc background purge thread; falling back to foreground decay purge"
+            ),
+        }
+    }
     // Worker-thread count. `BUSBAR_WORKER_THREADS` is the operator override; the DEFAULT is one worker
     // per available core (`available_parallelism`, which respects CPU affinity and cgroup cpuset — but
     // NOT the CFS bandwidth quota `cpu.max`, which it cannot see). So on a quota-limited pod (e.g. 2 CPUs
