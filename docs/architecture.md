@@ -7,72 +7,102 @@ pipeline**.
 
 ## Request lifecycle
 
-```
-                client (any protocol)
-                        │
-                        ▼
-        ┌────────────────────────────────────────────────┐
-        │  HTTP router (axum)                              │
-        │  route fixes ingress protocol (one per proto):   │
-        │   /<...>/v1/messages          → anthropic        │
-        │   /v1/chat/completions        → openai           │
-        │   /v1/responses               → responses        │
-        │   /v2/chat                    → cohere           │
-        │   /v1/models/{model}:...      → gemini           │
-        │   /v1beta/models/{model}:...  → gemini           │
-        │   /model/{id}/converse[-stream] → bedrock        │
-        └───────────────┬──────────────────────────────────┘
-                        ▼
-        ┌───────────────────────────────────┐
-        │  auth middleware                   │
-        │   token | passthrough | none, OR   │
-        │   virtual-key lookup (governance)  │
-        └───────────────┬───────────────────┘
-                        ▼
-        ┌───────────────────────────────────┐
-        │  governance checks (if enabled)    │
-        │   allowed-pools (403)              │
-        │   budget       (429 / 400 bedrock)│
-        │   rate limit   (429 + Retry-After)│
-        └───────────────┬───────────────────┘
-                        ▼
-        ┌───────────────────────────────────┐
-        │  pool/lane selection               │
-        │   affinity preference → SWRR over  │
-        │   the healthy candidate subset     │
-        └───────────────┬───────────────────┘
-                        ▼
-        ┌───────────────────────────────────┐
-        │  per-attempt (up to failover cap): │
-        │   1. translate request (IR) if     │
-        │      ingress proto ≠ lane proto    │
-        │   2. rewrite model, inject creds   │
-        │      (bearer / api-key / SigV4)    │
-        │   3. POST upstream                 │
-        │   4. classify outcome → disposition│
-        │       ├─ 2xx        → stream/relay │
-        │       ├─ client 4xx → relay, no    │
-        │       │               penalty      │
-        │       ├─ transient  → trip-eval,   │
-        │       │               failover     │
-        │       ├─ hard-down  → dead lane    │
-        │       │   (auth → relay; billing → │
-        │       │    failover)               │
-        │       └─ context-len→ exclude small│
-        │                       lanes, retry │
-        └───────────────┬───────────────────┘
-                        ▼
-        ┌───────────────────────────────────┐
-        │  response                          │
-        │   same proto  → passthrough        │
-        │   cross proto → translate each SSE │
-        │     (or eventstream) frame to the  │
-        │     caller's protocol              │
-        │   tap usage → charge virtual key   │
-        └───────────────┬───────────────────┘
-                        ▼
-                     client
-```
+<svg viewBox="0 0 700 1140" role="img" aria-label="A request enters over any of six wire protocols and hits the axum HTTP router, whose route fixes the ingress protocol. Auth middleware applies token, passthrough or none, or a virtual-key lookup for governance. If governance is enabled it runs allowed-pools, budget and rate-limit checks, returning 403 or 429 on failure. Pool and lane selection uses affinity preference then smooth weighted round-robin over the healthy candidate subset. Each attempt, up to the failover cap, translates the request to the lane protocol via the intermediate representation, rewrites the model and injects credentials, POSTs upstream, and classifies the outcome into relay, failover or dead-lane. The response is passed through when the protocol matches or translated frame-by-frame when it differs, usage is tapped to charge the virtual key, and the reply returns to the client." style="width:100%;height:auto;max-width:700px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="rl-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="700" height="1140" fill="#ffffff"/>
+  <g stroke="#94a3b8" stroke-width="2" marker-end="url(#rl-arw)">
+    <line x1="350" y1="42"   x2="350" y2="62"/>
+    <line x1="350" y1="150"  x2="350" y2="170"/>
+    <line x1="350" y1="258"  x2="350" y2="298"/>
+    <line x1="350" y1="386"  x2="350" y2="426"/>
+    <line x1="350" y1="514"  x2="350" y2="554"/>
+    <line x1="350" y1="722"  x2="350" y2="742"/>
+    <line x1="350" y1="870"  x2="350" y2="890"/>
+    <line x1="350" y1="998"  x2="350" y2="1018"/>
+  </g>
+
+  <!-- Client pill (top) -->
+  <rect x="285" y="12" width="130" height="30" rx="15" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="350" y="31" text-anchor="middle" fill="#0f172a" font-size="12" font-weight="700">Client <tspan fill="#64748b" font-weight="400">· any protocol</tspan></text>
+
+  <!-- 1. HTTP router -->
+  <g>
+    <rect x="40" y="62" width="620" height="88" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="92" r="14" fill="#a3e635"/><text x="72" y="97" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">1</text>
+    <text x="100" y="90"  fill="#0f172a" font-size="14" font-weight="700">HTTP router <tspan fill="#64748b" font-weight="400" font-size="12">(axum)</tspan></text>
+    <text x="100" y="110" fill="#64748b" font-size="11">route fixes the ingress protocol</text>
+    <text x="100" y="130" fill="#4d7c0f" font-size="11" font-weight="700">anthropic · openai · responses · cohere · gemini · bedrock</text>
+  </g>
+
+  <!-- 2. Auth middleware -->
+  <g>
+    <rect x="40" y="170" width="620" height="88" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="200" r="14" fill="#a3e635"/><text x="72" y="205" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">2</text>
+    <text x="100" y="198" fill="#0f172a" font-size="14" font-weight="700">Auth middleware</text>
+    <text x="100" y="218" fill="#64748b" font-size="11">token · passthrough · none</text>
+    <text x="100" y="238" fill="#64748b" font-size="11">or virtual-key lookup <tspan fill="#4d7c0f" font-weight="700">(governance)</tspan></text>
+  </g>
+
+  <!-- 3. Governance checks -->
+  <g>
+    <rect x="40" y="298" width="620" height="88" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="328" r="14" fill="#a3e635"/><text x="72" y="333" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">3</text>
+    <text x="100" y="326" fill="#0f172a" font-size="14" font-weight="700">Governance checks <tspan fill="#64748b" font-weight="400" font-size="12">(if enabled)</tspan></text>
+    <text x="100" y="346" fill="#64748b" font-size="11">allowed-pools &#8594; 403 · budget &#8594; 429</text>
+    <text x="100" y="366" fill="#64748b" font-size="11">rate limit &#8594; 429 + Retry-After</text>
+  </g>
+
+  <!-- 4. Pool / lane selection -->
+  <g>
+    <rect x="40" y="426" width="620" height="88" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="456" r="14" fill="#a3e635"/><text x="72" y="461" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">4</text>
+    <text x="100" y="454" fill="#0f172a" font-size="14" font-weight="700">Pool / lane selection</text>
+    <text x="100" y="474" fill="#64748b" font-size="11">affinity preference &#8594; SWRR</text>
+    <text x="100" y="494" fill="#64748b" font-size="11">over the healthy candidate subset</text>
+  </g>
+
+  <!-- 5. Per attempt -->
+  <g>
+    <rect x="40" y="554" width="620" height="168" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="584" r="14" fill="#a3e635"/><text x="72" y="589" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">5</text>
+    <text x="100" y="582" fill="#0f172a" font-size="14" font-weight="700">Per attempt <tspan fill="#64748b" font-weight="400" font-size="12">(up to the failover cap)</tspan></text>
+    <text x="100" y="606" fill="#64748b" font-size="11">translate to lane protocol (IR)</text>
+    <text x="100" y="626" fill="#64748b" font-size="11">rewrite model + inject creds <tspan fill="#94a3b8">(bearer / api-key / SigV4)</tspan></text>
+    <text x="100" y="646" fill="#64748b" font-size="11">POST upstream</text>
+    <line x1="100" y1="662" x2="620" y2="662" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="100" y="682" fill="#4d7c0f" font-size="11" font-weight="700">classify &#8594;</text>
+    <text x="176" y="682" fill="#64748b" font-size="11">2xx relay · 4xx relay (no penalty)</text>
+    <text x="100" y="702" fill="#64748b" font-size="11">transient &#8594; failover · hard-down &#8594; dead lane</text>
+  </g>
+
+  <!-- 6. Response -->
+  <g>
+    <rect x="40" y="742" width="620" height="128" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="772" r="14" fill="#a3e635"/><text x="72" y="777" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">6</text>
+    <text x="100" y="770" fill="#0f172a" font-size="14" font-weight="700">Response</text>
+    <text x="100" y="790" fill="#64748b" font-size="11">same protocol &#8594; passthrough</text>
+    <text x="100" y="810" fill="#64748b" font-size="11">cross protocol &#8594; translate each SSE / eventstream frame</text>
+    <text x="100" y="836" fill="#4d7c0f" font-size="11" font-weight="700">tap usage &#8594; charge virtual key</text>
+  </g>
+
+  <!-- 7. Return to client -->
+  <g>
+    <rect x="40" y="890" width="620" height="108" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+    <circle cx="72" cy="920" r="14" fill="#a3e635"/><text x="72" y="925" text-anchor="middle" fill="#1a2e05" font-size="13" font-weight="700">7</text>
+    <text x="100" y="918" fill="#0f172a" font-size="14" font-weight="700">Reply delivered</text>
+    <text x="100" y="938" fill="#64748b" font-size="11">bytes stream back over the caller's ingress protocol</text>
+    <text x="100" y="958" fill="#64748b" font-size="11">circuit-breaker state updated from the final disposition</text>
+    <text x="100" y="982" fill="#4d7c0f" font-size="11" font-weight="700">&#8595; back to the client</text>
+  </g>
+
+  <!-- Client pill (bottom) -->
+  <rect x="285" y="1018" width="130" height="30" rx="15" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="350" y="1037" text-anchor="middle" fill="#0f172a" font-size="12" font-weight="700">Client</text>
+</svg>
 
 ### 1. Ingress & protocol detection
 
