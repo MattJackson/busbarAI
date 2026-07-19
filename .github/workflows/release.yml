@@ -70,9 +70,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Emit the OpenAPI document from the release code
+        # `openapi_doc()` (and the `emit_openapi_artifact` test) live behind the CI-ONLY
+        # `openapi-schema` feature — schemars is not in the shipped binary. The generated doc is the
+        # typed one; it equals the committed `openapi.json` the runtime serves (drift-locked by the
+        # `openapi_json_matches_committed_file` test in ci.yml).
         env:
           BUSBAR_EMIT_OPENAPI: busbar-openapi-${{ github.ref_name }}.json
-        run: cargo test -p busbar --bin busbar emit_openapi_artifact -- --nocapture
+        run: cargo test -p busbar --bin busbar --features openapi-schema emit_openapi_artifact -- --nocapture
       - name: Validate it is a well-formed OpenAPI 3.1 document
         run: |
           doc="busbar-openapi-${GITHUB_REF_NAME}.json"

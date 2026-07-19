@@ -1263,6 +1263,9 @@ pub(crate) async fn hook_status(
 /// (no absolute path is hand-written anywhere — the `ap` helper derives them). Templated/POST
 /// routes are documented separately in `openapi_doc`. Adding a GET endpoint means adding it here so
 /// the doc + the drift guard both see it.
+// Consumed by `openapi_doc()` (feature `openapi-schema`) and the router-drift tests; unused in any
+// non-test build, so allow it dead there.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (
         "/info",
@@ -1308,8 +1311,18 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
 
 /// Build the OpenAPI 3.1 document describing the v1 JSON-REST surface. Paths + methods + the stable
 /// error envelope are the machine-readable contract (tooling generates clients + branches on the error
-/// `code`). Response bodies are described loosely (not full struct schemas) today — the additive
-/// follow-up derives per-view schemas; paths/methods/error shape are the frozen part callers rely on.
+/// `code`). EVERY operation's success response (200/201) carries a typed body schema — a
+/// `$ref` into `components.schemas`, derived by schemars from the real Rust response VIEW types (see
+/// `contract` + `contract::schema`) so the schema always matches what serde actually serializes.
+///
+/// CI-ONLY (`#[cfg(feature = "openapi-schema")]`): schemars is not compiled into the shipped binary.
+/// The generated doc is committed as `json/openapi.json` and served verbatim by the live handler
+/// (`openapi()` via `include_str!`); the golden/drift test keeps the committed file byte-equal to
+/// this function's output, so the static file can never drift from the code.
+#[cfg(feature = "openapi-schema")]
+// Invoked from the openapi tests + the CI artifact/drift jobs (all test targets); a non-test
+// feature-on bin build has no caller, so allow it dead there.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn openapi_doc() -> serde_json::Value {
     let mut paths = serde_json::Map::new();
     for (path, summary) in V1_GET_PATHS {
@@ -1871,6 +1884,184 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         }
     }
 
+    // ── TYPED RESPONSE SCHEMAS ────────────────────────────────────────────────────────────────
+    // Attach a `$ref` body schema to every operation's success response, and collect the referenced
+    // component schemas from schemars — derived from the real Rust response VIEW types, so the doc's
+    // response shapes always match what serde serializes. Driven by a table keyed on
+    // (relative-path, method, status); `attach` resolves the type to a `#/components/schemas/<T>`
+    // ref, records it in `gen`, and writes the `content` block.
+    use crate::admin::v1::contract::schema as sview;
+    let mut gen = schemars::generate::SchemaSettings::draft2020_12()
+        .with(|s| {
+            // OpenAPI 3.1 keeps component schemas under `#/components/schemas`; strip the per-schema
+            // `$schema` meta (OpenAPI carries one document-level dialect, not one per component).
+            s.definitions_path = "/components/schemas".into();
+            s.meta_schema = None;
+        })
+        // The doc describes RESPONSES (what busbar SERIALIZES), so generate the serialize-contract
+        // schema — this is what makes `skip_serializing_if` fields non-required, matching the wire.
+        .for_serialize()
+        .into_generator();
+
+    /// Write `content: { application/json: { schema: <schema> } }` onto one operation's `<status>`
+    /// response object (creating the response entry if the op didn't already document that status).
+    fn set_content(op: &mut serde_json::Value, status: &str, schema: serde_json::Value) {
+        let Some(responses) = op.get_mut("responses").and_then(|r| r.as_object_mut()) else {
+            return;
+        };
+        let entry = responses
+            .entry(status.to_string())
+            .or_insert_with(|| json!({"description": "OK"}));
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "content".to_string(),
+                json!({"application/json": {"schema": schema}}),
+            );
+        }
+    }
+
+    // Resolve an operation object (by relative path + method) for schema attachment.
+    macro_rules! op {
+        ($rel:expr, $method:literal) => {
+            paths.get_mut(&ap($rel)).and_then(|p| p.get_mut($method))
+        };
+    }
+    // Attach the `$ref` schema of type `$t` to `<rel>.<method>.responses.<status>`.
+    macro_rules! typed {
+        ($rel:expr, $method:literal, $status:literal, $t:ty) => {{
+            let schema = gen.subschema_for::<$t>();
+            let schema = serde_json::to_value(schema).unwrap_or_else(|_| json!({}));
+            if let Some(op) = op!($rel, $method) {
+                set_content(op, $status, schema);
+            }
+        }};
+    }
+
+    use crate::admin::v1::contract::{
+        AdminAuthView, AuthView, ConfigValidateView, EffectiveConfigView, HookHealthView, HookView,
+        InfoView, ModelView, Page, PluginView, PoolDetailView, PoolView, ProviderView, UsageView,
+    };
+
+    // Info & topology.
+    typed!("/info", "get", "200", InfoView);
+    typed!("/pools", "get", "200", Page<PoolView>);
+    typed!("/pools/{name}", "get", "200", PoolDetailView);
+    typed!("/models", "get", "200", Page<ModelView>);
+    typed!("/providers", "get", "200", Page<ProviderView>);
+    // Hooks.
+    typed!(PATH_HOOKS, "get", "200", Page<HookView>);
+    typed!(PATH_HOOKS, "post", "201", HookView);
+    typed!(PATH_HOOKS, "post", "200", HookView);
+    typed!("/hooks/{name}", "get", "200", HookView);
+    typed!("/hooks/{name}", "put", "200", HookView);
+    typed!("/hooks/{name}/settings", "patch", "200", HookView);
+    typed!("/hooks/{name}/health", "get", "200", HookHealthView);
+    typed!("/hooks/{name}/schema", "get", "200", sview::HookSchemaView);
+    typed!("/hooks/{name}/status", "get", "200", sview::HookStatusView);
+    // Auth & credentials.
+    typed!("/auth", "get", "200", AuthView);
+    typed!(PATH_ADMIN_AUTH, "get", "200", AdminAuthView);
+    typed!(PATH_ADMIN_AUTH, "put", "200", sview::AdminAuthPutView);
+    typed!("/auth/cache/flush", "post", "200", sview::CacheFlushView);
+    // Plugins, usage, config.
+    typed!("/plugins", "get", "200", Page<PluginView>);
+    typed!("/usage", "get", "200", UsageView);
+    typed!("/config", "get", "200", EffectiveConfigView);
+    typed!(PATH_CONFIG_VALIDATE, "post", "200", ConfigValidateView);
+    typed!("/config/apply", "post", "200", sview::ConfigApplyView);
+    typed!("/config/reload", "post", "200", sview::ConfigReloadView);
+    typed!("/config/rollback", "post", "200", sview::ConfigRollbackView);
+    typed!("/config/diff", "get", "200", sview::ConfigDiffView);
+    typed!(
+        "/config/versions",
+        "get",
+        "200",
+        sview::ConfigVersionPageView
+    );
+    typed!(
+        "/config/versions/{v}",
+        "get",
+        "200",
+        sview::ConfigVersionDetailView
+    );
+    typed!("/audit", "get", "200", sview::AuditPageView);
+    // Virtual keys.
+    typed!("/keys", "get", "200", sview::KeyPageView);
+    typed!("/keys", "post", "201", sview::CreatedKeyView);
+    typed!("/keys/{id}", "get", "200", sview::KeyView);
+    typed!("/keys/{id}", "patch", "200", sview::KeyView);
+    typed!("/keys/{id}/usage", "get", "200", sview::KeyMeteringView);
+    typed!("/keys/{id}/rotate", "post", "200", sview::RotatedKeyView);
+
+    // The discovery endpoint returns THIS very OpenAPI 3.1 document — an arbitrary object. There is
+    // no named struct for "an OpenAPI document"; an inline permissive object schema is the honest
+    // description (fully modeling the OpenAPI meta-schema is out of scope + circular).
+    if let Some(op) = op!("/openapi.json", "get") {
+        set_content(
+            op,
+            "200",
+            json!({"type": "object", "description": "An OpenAPI 3.1 document (this document's shape)"}),
+        );
+    }
+
+    // The stable ERROR envelope. Reference it as the body of every documented ERROR status
+    // (4xx/5xx) so a generated client decodes errors with the same typed model it decodes successes.
+    // The `Error` component itself is the hand-written schema below (code enum + message), so the
+    // schemars `ErrorBody` is NOT registered — we point error responses at `#/components/schemas/Error`.
+    let error_ref = json!({"$ref": "#/components/schemas/Error"});
+    for methods in paths.values_mut() {
+        let Some(methods) = methods.as_object_mut() else {
+            continue;
+        };
+        for (method, op) in methods.iter_mut() {
+            if method.starts_with("x-") {
+                continue;
+            }
+            let Some(responses) = op.get_mut("responses").and_then(|r| r.as_object_mut()) else {
+                continue;
+            };
+            for (status, resp) in responses.iter_mut() {
+                // 2xx bodies are the typed views attached above; 204 has no body; error statuses
+                // (4xx/5xx) all speak the one envelope.
+                let is_error = status.starts_with('4') || status.starts_with('5');
+                if !is_error {
+                    continue;
+                }
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.entry("content".to_string()).or_insert_with(
+                        || json!({"application/json": {"schema": error_ref.clone()}}),
+                    );
+                }
+            }
+        }
+    }
+
+    // The generated component schemas (every `$ref`'d view type), merged with the hand-written
+    // `Error` schema. The `Error` schema stays hand-written so its `code` enum is the frozen
+    // AdminError taxonomy verbatim (the drift test `openapi_error_enum_matches_admin_error_codes`
+    // locks it); schemars fills in every other referenced view.
+    let mut schemas = gen.definitions().clone();
+    schemas.insert(
+        "Error".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string",
+                            "enum": ["not_found", "unauthorized", "method_not_allowed", "forbidden",
+                                     "invalid_request", "version_conflict", "conflict",
+                                     "rate_limited", "internal"]},
+                        "message": {"type": "string"}
+                    },
+                    "required": ["code", "message"]
+                }
+            },
+            "required": ["error"]
+        }),
+    );
+
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -1885,33 +2076,29 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
                 "bearerAuth": {"type": "http", "scheme": "bearer",
                                "description": "The same operator credential via Authorization: Bearer"}
             },
-            "schemas": {
-                "Error": {
-                    "type": "object",
-                    "properties": {
-                        "error": {
-                            "type": "object",
-                            "properties": {
-                                "code": {"type": "string",
-                                    "enum": ["not_found", "unauthorized", "method_not_allowed", "forbidden",
-                                             "invalid_request", "version_conflict", "conflict",
-                                             "rate_limited", "internal"]},
-                                "message": {"type": "string"}
-                            },
-                            "required": ["code", "message"]
-                        }
-                    },
-                    "required": ["error"]
-                }
-            }
+            "schemas": schemas
         },
         "paths": paths
     })
 }
 
+/// The committed, typed OpenAPI 3.1 document — generated from `openapi_doc()` (feature `openapi-schema`)
+/// and checked into the tree. The live handler serves THIS static string: schemars is a CI-only
+/// dependency, so the release binary cannot regenerate the doc at runtime, and it never needs to —
+/// the golden/drift test keeps this file byte-equal to `openapi_doc()`'s output, so serving the
+/// static copy is identical to serving a freshly-generated one, minus the schemars code + cost.
+pub(crate) const OPENAPI_JSON: &str = include_str!("openapi.json");
+
 /// `GET /api/v1/admin/openapi.json` — the OpenAPI 3.1 schema of the v1 surface (the discovery contract).
+/// Serves the committed, typed [`OPENAPI_JSON`] verbatim as `application/json` (no runtime generation —
+/// see the constant's doc). Same status/content-type/body shape the generated path always produced.
 pub(crate) async fn openapi() -> Response {
-    ok_json(StatusCode::OK, &openapi_doc())
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, crate::proxy::APPLICATION_JSON)],
+        OPENAPI_JSON,
+    )
+        .into_response()
 }
 
 /// The `POST /api/v1/admin/config/validate` request body: a full proposed config — the `config.yaml`

@@ -18,6 +18,7 @@ use serde::Serialize;
 /// altered/reordered/deleted entry (detection, not prevention — a compromised host can still rewrite
 /// the whole chain; prevention is shipping the log off-box to a SIEM).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct AuditEntry {
     /// Monotonic sequence number (1-based), unique within a process lifetime.
     pub(crate) seq: u64,

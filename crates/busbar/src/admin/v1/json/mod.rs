@@ -113,6 +113,9 @@ fn service(handle: &Arc<AppHandle>) -> AdminService {
 /// Absolute admin path from a RELATIVE one — `contract::ADMIN_PREFIX` + `rel`. The OpenAPI doc keys
 /// (which document the WIRE, so they must be absolute) are all built through this, so no absolute
 /// path is ever hand-written here and none can drift from the mount grammar.
+// Only `openapi_doc()` (feature `openapi-schema`) calls this; the function is compiled solely under
+// that feature, so `ap` is dead in every build without it — allow it there.
+#[cfg_attr(not(feature = "openapi-schema"), allow(dead_code))]
 fn ap(rel: &str) -> String {
     format!("{}{rel}", crate::admin::v1::contract::ADMIN_PREFIX)
 }

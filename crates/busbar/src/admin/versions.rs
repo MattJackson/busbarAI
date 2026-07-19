@@ -19,6 +19,7 @@ use std::collections::HashMap;
 /// snapshot rollback restores. Never contains a secret (hook definitions are operator config —
 /// transports, grants, deadlines).
 #[derive(Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct ConfigVersion {
     /// The `App.config_version` this snapshot corresponds to (monotonic per process).
     pub(crate) version: u64,

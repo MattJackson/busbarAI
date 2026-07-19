@@ -16,6 +16,13 @@
 
 use serde::Serialize;
 
+// SCHEMA-ONLY response views for the ad-hoc-`json!` endpoints (keys, config mutations, hook
+// schema/status, version detail/diff, list envelopes). Compiled ONLY under the CI-only
+// `openapi-schema` feature — never in the shipped binary — so `openapi_doc()` can emit a typed
+// `$ref` for every operation. See the module doc.
+#[cfg(feature = "openapi-schema")]
+pub(crate) mod schema;
+
 /// The root every busbar-NATIVE API surface mounts under (`/api/<version>/<area>/…`). The data
 /// plane (the six mimicked SDK wire protocols) is deliberately OUTSIDE this root — its paths are
 /// dictated by the upstream SDKs, not by busbar.
@@ -228,6 +235,7 @@ impl AdminError {
 /// the ACTUAL binary (feature-gated at compile time), not config, so `--no-default-features` shows a
 /// provably smaller surface. No LLM content, ever.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct InfoView {
     /// busbar semantic version (`CARGO_PKG_VERSION`).
     pub(crate) version: &'static str,
@@ -250,6 +258,7 @@ pub(crate) struct InfoView {
 
 /// The compiled-in feature proof (`InfoView.build`).
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct BuildInfo {
     /// Auth modules baked into this binary (e.g. `["tokens"]`; empty under `--no-default-features`).
     pub(crate) auth_modules: Vec<&'static str>,
@@ -261,6 +270,7 @@ pub(crate) struct BuildInfo {
 
 /// Pool/model/provider counts (`InfoView.topology`).
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct TopologyInfo {
     pub(crate) pools: usize,
     pub(crate) models: usize,
@@ -272,6 +282,7 @@ pub(crate) struct TopologyInfo {
 /// EWMA, budget/rate headroom — design-admin-api-v1 §6.9) is an additive follow-up; the field set
 /// only grows.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct PoolView {
     pub(crate) name: String,
     pub(crate) members: Vec<PoolMemberView>,
@@ -279,6 +290,7 @@ pub(crate) struct PoolView {
 
 /// One member of a pool: the model it targets and its SWRR weight.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct PoolMemberView {
     pub(crate) model: String,
     pub(crate) weight: u32,
@@ -289,6 +301,7 @@ pub(crate) struct PoolMemberView {
 /// count, latency EWMA, and success/error tallies, read from the SAME store signals the routing seam
 /// ranks on. No LLM content, no credentials.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct PoolDetailView {
     pub(crate) name: String,
     pub(crate) members: Vec<PoolMemberStatusView>,
@@ -298,6 +311,7 @@ pub(crate) struct PoolDetailView {
 /// `usable`/`cooldown_remaining_seconds` pair (a lane in breaker cooldown reports `usable: false` with the
 /// seconds remaining) — the same summary `/stats` surfaces.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct PoolMemberStatusView {
     pub(crate) model: String,
     pub(crate) weight: u32,
@@ -330,6 +344,7 @@ pub(crate) struct PoolMemberStatusView {
 /// A model lane in the topology read (`GET /api/v1/admin/models`): the config key + its upstream
 /// provider. No credentials, ever.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct ModelView {
     pub(crate) model: String,
     pub(crate) provider: String,
@@ -338,6 +353,7 @@ pub(crate) struct ModelView {
 /// A provider in the topology read (`GET /api/v1/admin/providers`): the provider name + how many model
 /// lanes route through it.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct ProviderView {
     pub(crate) provider: String,
     pub(crate) model_count: usize,
@@ -348,6 +364,7 @@ pub(crate) struct ProviderView {
 /// secret. `global` reports whether the hook fires on every request (named in `global_hooks:` or
 /// declared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct HookView {
     pub(crate) name: String,
     /// `"tap"` (fire-and-forget) or `"gate"` (fire-and-wait).
@@ -379,6 +396,7 @@ pub(crate) struct HookView {
 /// The transport half of a `HookView`: which wire the hook speaks and its target (socket path or
 /// webhook URL — operator config, not a secret). Exactly one of `socket`/`webhook` is set.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct HookTransportView {
     /// `"socket"` or `"webhook"` (or `"none"` for a misconfigured entry with neither).
     pub(crate) kind: &'static str,
@@ -391,6 +409,7 @@ pub(crate) struct HookTransportView {
 /// (or on a non-unix host) it is `None` (probed on demand, not here) with a `detail` note. Never fires
 /// the hook — just checks whether the endpoint accepts a connection. Additive-only.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct HookHealthView {
     pub(crate) name: String,
     pub(crate) transport: HookTransportView,
@@ -407,6 +426,7 @@ pub(crate) struct HookHealthView {
 /// activation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`
 /// where it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct PluginView {
     pub(crate) name: String,
     /// `"auth"` or `"hooks"` — the plugin TYPE (each a distinct engine contract).
@@ -424,6 +444,7 @@ pub(crate) struct PluginView {
 /// callers + the upstream-credential mode. Never a secret — module names and the mode are config
 /// identifiers, not credentials. An empty `chain` is the open front door (admits every request).
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct AuthView {
     /// Ordered auth-chain module names (`[]` = open front door).
     pub(crate) chain: Vec<&'static str>,
@@ -437,6 +458,11 @@ pub(crate) struct AuthView {
 /// A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
 /// (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
 #[derive(Debug, Clone, Serialize)]
+// The generic list envelope. `rename = "Page_{T}"` interpolates the item type into the schema
+// name so each instantiation (`Page_HookView`, `Page_ModelView`, …) is a DISTINCT
+// `#/components/schemas/` entry — otherwise every `Page<T>` would collide on the bare name `Page`.
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "openapi-schema", schemars(rename = "Page_{T}"))]
 pub(crate) struct Page<T> {
     pub(crate) items: Vec<T>,
     pub(crate) next_cursor: Option<String>,
@@ -491,6 +517,7 @@ mod cursor_tests;
 /// tokens, no provider keys, no hook payloads. Additive-only; the source-layer annotation (base vs
 /// overlay) lands with the config overlay substrate.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct EffectiveConfigView {
     /// The monotonic config version at the time of this read (see `InfoView.config_version`) — so a
     /// drift-detection read gets the config AND its version in one call.
@@ -529,6 +556,7 @@ pub(crate) const USAGE_CURRENCY: &str = "USD";
 /// read time from the operator's CURRENT prices, so a price change re-prices history. Never store
 /// it as a ledger charge; bill from the raw token split.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct UsageView {
     /// The UTC-day metering bucket this response aggregates: `[start, end)` epoch seconds.
     pub(crate) window: UsageWindow,
@@ -554,6 +582,7 @@ pub(crate) struct UsageView {
 
 /// A metering window: `[start, end)` epoch seconds.
 #[derive(Debug, Clone, Copy, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct UsageWindow {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -562,6 +591,7 @@ pub(crate) struct UsageWindow {
 /// The raw consumption counts + the derived spend estimate — the one shape shared by `total`,
 /// `by_model` rows, and `by_key` rows, so a consumer writes ONE aggregation reader.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct UsageBreakdown {
     /// Uncached input tokens (normalized additive-cache convention).
     pub(crate) tokens_input: u64,
@@ -577,6 +607,7 @@ pub(crate) struct UsageBreakdown {
 
 /// One (model, provider) row of the per-model aggregation.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct ModelUsageView {
     pub(crate) model: String,
     pub(crate) provider: String,
@@ -586,6 +617,7 @@ pub(crate) struct ModelUsageView {
 
 /// One key's row of the per-key aggregation: the key id/name (never the secret) + its counts.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct KeyUsageView {
     pub(crate) id: String,
     /// The key's display name; `None` when the key was deleted after metering accumulated (history
@@ -600,6 +632,7 @@ pub(crate) struct KeyUsageView {
 /// resource `PUT /api/v1/admin/admin-auth` writes), so a read-after-write is coherent. An empty chain is
 /// the open (anonymous, full-authority) dev posture — `configured: false`. Never a secret.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct AdminAuthView {
     /// Whether an admin credential chain is configured. `false` = the empty chain = open dev posture.
     pub(crate) configured: bool,
@@ -615,6 +648,7 @@ pub(crate) struct AdminAuthView {
 /// body is an `invalid_request`. Env-var interpolation is out of scope — this checks structure and
 /// cross-reference resolution, not runtime secret presence.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct ConfigValidateView {
     pub(crate) ok: bool,
     pub(crate) errors: Vec<String>,

@@ -39,6 +39,28 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --verbose
 
+  # OpenAPI schema gate (CI-ONLY `openapi-schema` feature). `openapi_doc()` derives typed response
+  # schemas via schemars — a dependency deliberately kept OUT of the shipped binary (the `check` job
+  # above builds/tests WITHOUT the feature, proving that). This job compiles the feature, lints it,
+  # and runs the openapi tests: the DRIFT GUARD (`openapi_json_matches_committed_file`) fails the PR
+  # if the committed `openapi.json` — the file the runtime serves via `include_str!` — no longer
+  # matches what the code generates, and the COVERAGE LOCK proves every operation has a typed body.
+  # Regenerate a stale file with:
+  #   UPDATE_OPENAPI=1 cargo test -p busbar --features openapi-schema openapi_json_matches_committed_file
+  openapi-schema:
+    name: openapi-schema clippy · drift · coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (--features openapi-schema)
+        run: cargo clippy -p busbar --all-targets --features openapi-schema --locked -- -D warnings
+      - name: OpenAPI tests (drift guard + coverage lock)
+        run: cargo test -p busbar --features openapi-schema --locked openapi -- --nocapture
+
   # Compliance-by-compilation gate: busbar must build + lint clean with the built-in `tokens` auth
   # plugin COMPILED OUT (`--no-default-features`), so a regulated deployment can ship a binary that
   # provably contains no client-token auth code. Build, clippy, AND the test suite all stay green on

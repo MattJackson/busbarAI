@@ -1,0 +1,4358 @@
+{
+  "components": {
+    "schemas": {
+      "AdminAuthPutView": {
+        "description": "`PUT /admin-auth` — the resource post-state (`{configured, modules}`, the same shape\n`GET /admin-auth` returns) plus apply metadata, so a client uses the PUT response as post-state.",
+        "properties": {
+          "applied": {
+            "type": "boolean"
+          },
+          "config_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "modules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "modules",
+          "applied",
+          "config_version",
+          "note"
+        ],
+        "type": "object"
+      },
+      "AdminAuthView": {
+        "description": "The admin-plane auth read (`GET /api/v1/admin/admin-auth`) — which modules guard the ADMIN surface\n(distinct from the ingress `auth` chain). `modules` is the live `admin_auth` chain (the SAME\nresource `PUT /api/v1/admin/admin-auth` writes), so a read-after-write is coherent. An empty chain is\nthe open (anonymous, full-authority) dev posture — `configured: false`. Never a secret.",
+        "properties": {
+          "configured": {
+            "description": "Whether an admin credential chain is configured. `false` = the empty chain = open dev posture.",
+            "type": "boolean"
+          },
+          "modules": {
+            "description": "The active admin-plane guard module names — the `admin_auth` chain verbatim (e.g.\n`[\"admin-tokens\"]`), reported in order. Empty when the admin plane is open.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "configured",
+          "modules"
+        ],
+        "type": "object"
+      },
+      "AuditEntry": {
+        "description": "One admin audit record. `outcome` is a stable token tooling can branch on. The record is\nHASH-CHAINED for tamper-EVIDENCE (§6.7): `hash = sha256(prev_hash | seq | ts | action | resource |\noutcome | principal)`, and `prev_hash` is the preceding entry's `hash`. Recomputing the chain detects any\naltered/reordered/deleted entry (detection, not prevention — a compromised host can still rewrite\nthe whole chain; prevention is shipping the log off-box to a SIEM).",
+        "properties": {
+          "action": {
+            "description": "The action, `noun.verb` (e.g. `hook.register`, `hook.delete`).",
+            "type": "string"
+          },
+          "hash": {
+            "description": "`sha256(prev_hash | seq | ts | action | resource | outcome | principal)` — the tamper-evidence digest.",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "Stable outcome token: `applied` (mutation committed) | `rejected` (validation/conflict, nothing\nchanged).",
+            "type": "string"
+          },
+          "prev_hash": {
+            "description": "The preceding entry's `hash` (empty for the first entry of the process, or the oldest retained\nentry whose predecessor was pruned).",
+            "type": "string"
+          },
+          "principal": {
+            "description": "WHO — the authenticated principal id that attempted the mutation (`admin` for the operator\ntoken; a virtual-key id or an external module's principal id otherwise; `anonymous` for the\nexplicit open admin posture). Attribution, never a credential.",
+            "type": "string"
+          },
+          "resource": {
+            "description": "The resource acted on (e.g. `hook:compress`). Never a secret.",
+            "type": "string"
+          },
+          "seq": {
+            "description": "Monotonic sequence number (1-based), unique within a process lifetime.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ts": {
+            "description": "Unix seconds when the mutation was attempted.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "seq",
+          "ts",
+          "action",
+          "resource",
+          "outcome",
+          "principal",
+          "prev_hash",
+          "hash"
+        ],
+        "type": "object"
+      },
+      "AuditPageView": {
+        "description": "`GET /audit` — the cursor-paginated audit-log envelope (`{items, next_cursor}`, hand-rolled in the\naudit handler).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "AuthView": {
+        "description": "The ingress auth chain read (`GET /api/v1/admin/auth`): the ordered module names that authenticate\ncallers + the upstream-credential mode. Never a secret — module names and the mode are config\nidentifiers, not credentials. An empty `chain` is the open front door (admits every request).",
+        "properties": {
+          "chain": {
+            "description": "Ordered auth-chain module names (`[]` = open front door).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "open": {
+            "description": "Whether the front door is open (empty chain admits unconditionally).",
+            "type": "boolean"
+          },
+          "upstream_credentials": {
+            "description": "`\"own\"` (busbar signs egress with its configured key) or `\"passthrough\"` (forward the caller's\ncredential upstream).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "chain",
+          "upstream_credentials",
+          "open"
+        ],
+        "type": "object"
+      },
+      "BuildInfo": {
+        "description": "The compiled-in feature proof (`InfoView.build`).",
+        "properties": {
+          "auth_modules": {
+            "description": "Auth modules baked into this binary (e.g. `[\"tokens\"]`; empty under `--no-default-features`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hook_plugins": {
+            "description": "Hook plugins baked into this binary (e.g. `[\"ranking\"]`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "weighted_floor": {
+            "description": "The inline SWRR floor — ALWAYS `true` (compiled in unconditionally, non-removable).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "auth_modules",
+          "hook_plugins",
+          "weighted_floor"
+        ],
+        "type": "object"
+      },
+      "CacheFlushView": {
+        "description": "`POST /auth/cache/flush` — number of cached credential-decision entries dropped.",
+        "properties": {
+          "flushed": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "flushed"
+        ],
+        "type": "object"
+      },
+      "ConfigApplyView": {
+        "description": "`POST /config/apply` — apply-a-full-config result. The change is live but not written to disk.",
+        "properties": {
+          "applied": {
+            "type": "boolean"
+          },
+          "config_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "applied",
+          "config_version",
+          "note"
+        ],
+        "type": "object"
+      },
+      "ConfigDiffGlobalHooks": {
+        "description": "The `global_hooks` delta of a `GET /config/diff` — present only when the global wiring changed.",
+        "properties": {
+          "from": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "to": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
+      "ConfigDiffHooks": {
+        "description": "The `hooks` object of a `GET /config/diff` — hook names added / removed / changed between the two\nversions.",
+        "properties": {
+          "added": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "changed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "added",
+          "removed",
+          "changed"
+        ],
+        "type": "object"
+      },
+      "ConfigDiffView": {
+        "description": "`GET /config/diff` — structured hook-surface diff between two retained versions. `global_hooks` is\npresent only when the global wiring differed between the two sides.",
+        "properties": {
+          "from": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "global_hooks": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigDiffGlobalHooks"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hooks": {
+            "$ref": "#/components/schemas/ConfigDiffHooks"
+          },
+          "to": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "hooks"
+        ],
+        "type": "object"
+      },
+      "ConfigReloadView": {
+        "description": "`POST /config/reload` — reload-from-disk result.",
+        "properties": {
+          "config_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reloaded": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reloaded",
+          "config_version"
+        ],
+        "type": "object"
+      },
+      "ConfigRollbackView": {
+        "description": "`POST /config/rollback` — restore-a-retained-version result (the restored version + the NEW\nconfig version the rollback produced).",
+        "properties": {
+          "config_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "restored_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "restored_version",
+          "config_version"
+        ],
+        "type": "object"
+      },
+      "ConfigValidateView": {
+        "description": "The result of `POST /api/v1/admin/config/validate` — a DRY-RUN: does a proposed config resolve +\nvalidate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution\nfailure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid\nrequest that describes an INVALID config is `ok: false`, not an HTTP error); only a MALFORMED request\nbody is an `invalid_request`. Env-var interpolation is out of scope — this checks structure and\ncross-reference resolution, not runtime secret presence.",
+        "properties": {
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "errors"
+        ],
+        "type": "object"
+      },
+      "ConfigVersion": {
+        "description": "One recorded config version: the metadata the versions LIST shows, plus the full hook-surface\nsnapshot rollback restores. Never contains a secret (hook definitions are operator config —\ntransports, grants, deadlines).",
+        "properties": {
+          "principal": {
+            "description": "The acting principal (audit attribution, same handle as the audit log).",
+            "type": "string"
+          },
+          "summary": {
+            "description": "Human summary of the mutation that produced this version (e.g. `hook.register hook:x`).",
+            "type": "string"
+          },
+          "ts": {
+            "description": "Unix seconds when the mutation committed.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "description": "The `App.config_version` this snapshot corresponds to (monotonic per process).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "ts",
+          "principal",
+          "summary"
+        ],
+        "type": "object"
+      },
+      "ConfigVersionDetailView": {
+        "description": "`GET /config/versions/{v}` — one retained config version WITH its full hook-surface snapshot\n(projected through the wire `HookView`, keyed by hook name) and the global wiring at that version.",
+        "properties": {
+          "global_hooks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hooks": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/HookView"
+            },
+            "type": "object"
+          },
+          "principal": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "ts",
+          "principal",
+          "summary",
+          "hooks",
+          "global_hooks"
+        ],
+        "type": "object"
+      },
+      "ConfigVersionPageView": {
+        "description": "`GET /config/versions` — the cursor-paginated version-history envelope (`{items, next_cursor}`).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigVersion"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "CreatedKeyView": {
+        "description": "`POST /keys` (mint) — the key metadata plus the ONCE-shown secret, and (when an AWS SigV4\ncredential was requested) the AccessKeyId + secret access key. The AWS fields are absent on a\nbearer-only mint.",
+        "properties": {
+          "allowed_pools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "aws_access_key_id": {
+            "description": "AWS AccessKeyId (present only when `issue_aws_credential` was set). Not secret.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "aws_secret_access_key": {
+            "description": "AWS SigV4 secret access key — shown once (present only with an AWS credential).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "budget_period": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_budget_cents": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "rpm_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "secret": {
+            "description": "The bearer secret — shown EXACTLY once, never returned by any read.",
+            "type": "string"
+          },
+          "tpm_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "allowed_pools",
+          "max_budget_cents",
+          "budget_period",
+          "rpm_limit",
+          "tpm_limit",
+          "enabled",
+          "created_at",
+          "secret"
+        ],
+        "type": "object"
+      },
+      "EffectiveConfigView": {
+        "description": "The EFFECTIVE config snapshot (`GET /api/v1/admin/config`) — the running configuration as busbar\nresolved it, for drift detection (compare against your desired config) and one-shot inspection.\nComposed from the same REDACTED reads as the individual endpoints (auth chain names, pool/model/\nprovider topology, hook definitions, global-hook wiring) — so it carries NO secret: no client\ntokens, no provider keys, no hook payloads. Additive-only; the source-layer annotation (base vs\noverlay) lands with the config overlay substrate.",
+        "properties": {
+          "auth": {
+            "$ref": "#/components/schemas/AuthView"
+          },
+          "global_hooks": {
+            "description": "Names fired on every request (`global_hooks:` + any inline `global: true`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hooks": {
+            "items": {
+              "$ref": "#/components/schemas/HookView"
+            },
+            "type": "array"
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelView"
+            },
+            "type": "array"
+          },
+          "pools": {
+            "items": {
+              "$ref": "#/components/schemas/PoolView"
+            },
+            "type": "array"
+          },
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderView"
+            },
+            "type": "array"
+          },
+          "version": {
+            "description": "The monotonic config version at the time of this read (see `InfoView.config_version`) — so a\ndrift-detection read gets the config AND its version in one call.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "auth",
+          "pools",
+          "models",
+          "providers",
+          "hooks",
+          "global_hooks"
+        ],
+        "type": "object"
+      },
+      "Error": {
+        "properties": {
+          "error": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "not_found",
+                  "unauthorized",
+                  "method_not_allowed",
+                  "forbidden",
+                  "invalid_request",
+                  "version_conflict",
+                  "conflict",
+                  "rate_limited",
+                  "internal"
+                ],
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "HookDesiredStatus": {
+        "description": "The DESIRED settings side of `hooks/{name}/status`: busbar's registry copy of the hook's settings\nand their version.",
+        "properties": {
+          "settings": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "settings_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "settings",
+          "settings_version"
+        ],
+        "type": "object"
+      },
+      "HookHealthView": {
+        "description": "The live health of one hook's transport (`GET /api/v1/admin/hooks/{name}/health`). BEST-EFFORT: for a\nsocket transport `reachable` is `Some(true/false)` from a short-timeout connect probe; for a webhook\n(or on a non-unix host) it is `None` (probed on demand, not here) with a `detail` note. Never fires\nthe hook — just checks whether the endpoint accepts a connection. Additive-only.",
+        "properties": {
+          "detail": {
+            "description": "A short human note on the probe (why `None`, or the connect error class). Never a secret.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "reachable": {
+            "description": "`Some(true)` = the transport accepted a connection; `Some(false)` = it did not; `None` = not\nprobed here (webhook / non-unix).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "transport": {
+            "$ref": "#/components/schemas/HookTransportView"
+          }
+        },
+        "required": [
+          "name",
+          "transport",
+          "reachable",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "HookReportedStatus": {
+        "description": "The REPORTED settings side of `hooks/{name}/status`: what the hook says it is actually running\n(present only when the hook answered `status`).",
+        "properties": {
+          "settings": {
+            "additionalProperties": true,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "settings_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "settings",
+          "settings_version"
+        ],
+        "type": "object"
+      },
+      "HookSchemaView": {
+        "description": "`GET /hooks/{name}/schema` — the hook's self-described settings JSON Schema (proxied over the\n`describe` wire message), or `null` when the hook/transport does not answer.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "schema": {
+            "description": "The hook's settings JSON Schema verbatim (an arbitrary JSON object), or `null`."
+          }
+        },
+        "required": [
+          "name",
+          "schema"
+        ],
+        "type": "object"
+      },
+      "HookStatusView": {
+        "description": "`GET /hooks/{name}/status` — the hook's OBSERVED state: desired vs reported settings with a\n`drift` verdict, plus the hook's self-reported metrics. `reported`/`drift` are `null` and `note`\nis present when the hook did not answer (fail-open); `metrics` is invariantly an array.",
+        "properties": {
+          "as_of": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "desired": {
+            "$ref": "#/components/schemas/HookDesiredStatus"
+          },
+          "drift": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "metrics": {
+            "description": "Validated + bounded self-reported metrics; each entry carries `{name, type, value}` and, when\nthe hook sent them, optional `labels`/`quantiles`/`estimated`/`ci_low`/`ci_high`/`help`/\n`label`/`unit`/`viz`/`max` members.",
+            "items": true,
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "note": {
+            "description": "A short human note present only on the fail-open (no-answer) branch.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HookReportedStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "description": "Always `\"live\"` (the read is a live transport query).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "desired",
+          "reported",
+          "drift",
+          "metrics",
+          "as_of",
+          "source"
+        ],
+        "type": "object"
+      },
+      "HookTransportView": {
+        "description": "The transport half of a `HookView`: which wire the hook speaks and its target (socket path or\nwebhook URL — operator config, not a secret). Exactly one of `socket`/`webhook` is set.",
+        "properties": {
+          "kind": {
+            "description": "`\"socket\"` or `\"webhook\"` (or `\"none\"` for a misconfigured entry with neither).",
+            "type": "string"
+          },
+          "target": {
+            "description": "The socket path or webhook URL. `None` only if the definition set neither transport.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "target"
+        ],
+        "type": "object"
+      },
+      "HookView": {
+        "description": "A hook definition in the registry read (`GET /api/v1/admin/hooks`, `GET /api/v1/admin/hooks/{name}`) — the\nplugin catalog read. Projects the DEFINITION (kind, transport, grants, ordering, stage), never a\nsecret. `global` reports whether the hook fires on every request (named in `global_hooks:` or\ndeclared `global: true`). Live connection status (`health`) is a separate endpoint. Additive-only.",
+        "properties": {
+          "at": {
+            "description": "TAP observation stage (`\"request\"`/`\"route\"`/`\"attempt\"`/`\"completion\"`), or `None` for a gate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "global": {
+            "description": "Whether this hook fires on every request (globally wired).",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "`\"tap\"` (fire-and-forget) or `\"gate\"` (fire-and-wait).",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "on_error": {
+            "description": "Gate fallback on timeout/error — a CLOSED, unambiguous string union (audit #8): one of the\nreserved terminals (`\"weighted\"` | `\"reject\"` | `\"first\"` | `\"nothing\"`) or the NAME of the\nfallback hook the chain continues through. Unambiguous by construction: the terminal words\nare ILLEGAL hook names on every write path (`config::RESERVED_HOOK_NAMES`), so a value in\nthe terminal set is always a terminal and anything else is always a hook reference.",
+            "type": "string"
+          },
+          "priority": {
+            "description": "Rewrite/reject ordering key (transform-chain order + reject tie-break).",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prompt": {
+            "description": "Prompt access grant: `\"no\"` | `\"ro\"` | `\"rw\"`.",
+            "type": "string"
+          },
+          "settings": {
+            "additionalProperties": true,
+            "description": "The hook's opaque settings map (operator/API-owned; pushed via the configure wire). Never\ninterpreted by busbar; never a secret by contract (hook settings are operator config).",
+            "type": "object"
+          },
+          "timeout_ms": {
+            "description": "Gate decision deadline in milliseconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "transport": {
+            "$ref": "#/components/schemas/HookTransportView"
+          },
+          "user": {
+            "description": "Caller-identity access grant: `\"no\"` | `\"ro\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "transport",
+          "prompt",
+          "user",
+          "priority",
+          "at",
+          "on_error",
+          "timeout_ms",
+          "settings",
+          "global"
+        ],
+        "type": "object"
+      },
+      "InfoView": {
+        "description": "The compiled-in plugin catalog + topology + uptime returned by `GET /api/v1/admin/info`. Powers\nversion negotiation for tooling AND the compliance-by-compilation proof: `auth_modules`/`hook_plugins` reflect\nthe ACTUAL binary (feature-gated at compile time), not config, so `--no-default-features` shows a\nprovably smaller surface. No LLM content, ever.",
+        "properties": {
+          "build": {
+            "$ref": "#/components/schemas/BuildInfo"
+          },
+          "config_persistence": {
+            "description": "Whether config-overlay persistence is enabled (`BUSBAR_CONFIG_OVERLAY` set): `true` = API-applied\nconfig changes are durable across restarts; `false` = live-only (lost on restart). Lets tooling\ntell an operator whether their runtime changes will survive a restart.",
+            "type": "boolean"
+          },
+          "config_version": {
+            "description": "Monotonic config version — `0` at boot, +1 per API config apply. Drift-detection: re-read and\ncompare to tell whether the running config changed. Process-local (resets on restart).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "started_at": {
+            "description": "Epoch seconds of process start — the BOOT EPOCH marker: `config_version` (and any\nprocess-local counter) resets on restart, so a consumer that sees `started_at` change knows\nto read a counter reset as \"new epoch\", never as \"reverted\" (audit minor #2 / #4).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "topology": {
+            "$ref": "#/components/schemas/TopologyInfo"
+          },
+          "uptime_seconds": {
+            "description": "Seconds since process start, or `None` if the start instant was never stamped.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "version": {
+            "description": "busbar semantic version (`CARGO_PKG_VERSION`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "build",
+          "uptime_seconds",
+          "started_at",
+          "topology",
+          "config_persistence",
+          "config_version"
+        ],
+        "type": "object"
+      },
+      "KeyMeteringView": {
+        "description": "`GET /keys/{id}/usage` — the current budget-window counters for one key, plus the fraction of the\ntightest RPM/TPM cap remaining (`null` = uncapped). `budget_period`/`window_start` are `null`\nwhen the key record could not be read.",
+        "properties": {
+          "as_of": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "budget_period": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "rate_headroom": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "requests": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "spend_cents": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "window_start": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "budget_period",
+          "window_start",
+          "as_of",
+          "spend_cents",
+          "tokens",
+          "requests",
+          "rate_headroom"
+        ],
+        "type": "object"
+      },
+      "KeyPageView": {
+        "description": "`GET /keys` — the cursor-paginated key list envelope (`{items, next_cursor}`, hand-rolled in the\nkeys handler rather than via `Page<T>`).",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/KeyView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "KeyUsageView": {
+        "description": "One key's row of the per-key aggregation: the key id/name (never the secret) + its counts.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "description": "The key's display name; `None` when the key was deleted after metering accumulated (history\noutlives the key — the id still attributes it).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requests": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "spend_micros": {
+            "description": "Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,\nsub-cent precise, no float drift), from the operator's configured global prices. A consumer\nwith its own per-model catalog recomputes from the raw token split instead.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "tokens_cache_creation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cache_read": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_input": {
+            "description": "Uncached input tokens (normalized additive-cache convention).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_output": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "tokens_input",
+          "tokens_output",
+          "tokens_cache_read",
+          "tokens_cache_creation",
+          "requests",
+          "spend_micros"
+        ],
+        "type": "object"
+      },
+      "KeyView": {
+        "description": "Virtual-key metadata — the `key_meta()` shape returned by `GET /keys/{id}`, `PATCH /keys/{id}`,\nand as each item of `GET /keys`. Never the secret or its hash.",
+        "properties": {
+          "allowed_pools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "budget_period": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_budget_cents": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "rpm_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tpm_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "allowed_pools",
+          "max_budget_cents",
+          "budget_period",
+          "rpm_limit",
+          "tpm_limit",
+          "enabled",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ModelUsageView": {
+        "description": "One (model, provider) row of the per-model aggregation.",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "requests": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "spend_micros": {
+            "description": "Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,\nsub-cent precise, no float drift), from the operator's configured global prices. A consumer\nwith its own per-model catalog recomputes from the raw token split instead.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "tokens_cache_creation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cache_read": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_input": {
+            "description": "Uncached input tokens (normalized additive-cache convention).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_output": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "provider",
+          "tokens_input",
+          "tokens_output",
+          "tokens_cache_read",
+          "tokens_cache_creation",
+          "requests",
+          "spend_micros"
+        ],
+        "type": "object"
+      },
+      "ModelView": {
+        "description": "A model lane in the topology read (`GET /api/v1/admin/models`): the config key + its upstream\nprovider. No credentials, ever.",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "provider"
+        ],
+        "type": "object"
+      },
+      "Page_HookView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/HookView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "Page_ModelView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ModelView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "Page_PluginView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PluginView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "Page_PoolView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PoolView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "Page_ProviderView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "type": "object"
+      },
+      "PluginView": {
+        "description": "One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either\nCOMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)\nor EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where\nactivation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`\nwhere it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.",
+        "properties": {
+          "active": {
+            "description": "Whether the plugin is currently active, where tracked; `None` when activation is not summarized\nat this level.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "loader": {
+            "description": "`\"compiled-in\"` or `\"external\"`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "target": {
+            "description": "For an external plugin, its transport target (socket path / webhook URL). `None` for compiled-in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "description": "`\"auth\"` or `\"hooks\"` — the plugin TYPE (each a distinct engine contract).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "loader",
+          "active",
+          "target"
+        ],
+        "type": "object"
+      },
+      "PoolDetailView": {
+        "description": "The LIVE per-pool detail read (`GET /api/v1/admin/pools/{name}`) — the reliability/capacity dashboard\ndata (design-admin-api-v1 §6.9): each member's breaker state, concurrency headroom, in-flight\ncount, latency EWMA, and success/error tallies, read from the SAME store signals the routing seam\nranks on. No LLM content, no credentials.",
+        "properties": {
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/PoolMemberStatusView"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "members"
+        ],
+        "type": "object"
+      },
+      "PoolMemberStatusView": {
+        "description": "One member's live status within a pool. The breaker signal is the release-exposed\n`usable`/`cooldown_remaining_seconds` pair (a lane in breaker cooldown reports `usable: false` with the\nseconds remaining) — the same summary `/stats` surfaces.",
+        "properties": {
+          "available_concurrency": {
+            "description": "Free concurrency slots on this lane right now (lane-global; permits are shared across pools).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cooldown_remaining_seconds": {
+            "description": "Seconds until a tripped breaker's cooldown elapses; `0` when not cooling down. (`_seconds`\nsuffix — the one unit-suffix spelling across the surface, like `uptime_seconds`.)",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dead": {
+            "description": "Whether the lane is hard-down/dead (distinct from a transiently-tripped breaker).",
+            "type": "boolean"
+          },
+          "err": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inflight": {
+            "description": "In-flight requests on this lane right now.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_trip_at": {
+            "description": "Epoch seconds of the most recent trip; `None` = never tripped.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "latency_ms": {
+            "description": "Latency EWMA in milliseconds, or `None` if no sample yet.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "ok": {
+            "description": "Successful and errored request tallies for this lane.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "trip_count": {
+            "description": "MONOTONIC count of Closed→Open breaker trips on this lane. Breaker episodes are transient\nand can open+close entirely between two polls — a consumer alerting on trips diffs this\ncount instead of trying to catch the live edge (audit #5). Carried across config apply and\nrestart with the rest of the learned health.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usable": {
+            "description": "Whether the lane can currently take dispatch (breaker closed / recovered). `false` while a\ntripped breaker cools down or the lane is dead.",
+            "type": "boolean"
+          },
+          "weight": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "weight",
+          "usable",
+          "cooldown_remaining_seconds",
+          "available_concurrency",
+          "inflight",
+          "latency_ms",
+          "ok",
+          "err",
+          "dead",
+          "trip_count",
+          "last_trip_at"
+        ],
+        "type": "object"
+      },
+      "PoolMemberView": {
+        "description": "One member of a pool: the model it targets and its SWRR weight.",
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "weight": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "weight"
+        ],
+        "type": "object"
+      },
+      "PoolView": {
+        "description": "A pool in the topology read (`GET /api/v1/admin/pools`). Summary shape today: name + the member\nmodels and their weights. LIVE per-member status (breaker state, available concurrency, latency\nEWMA, budget/rate headroom — design-admin-api-v1 §6.9) is an additive follow-up; the field set\nonly grows.",
+        "properties": {
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/PoolMemberView"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "members"
+        ],
+        "type": "object"
+      },
+      "ProviderView": {
+        "description": "A provider in the topology read (`GET /api/v1/admin/providers`): the provider name + how many model\nlanes route through it.",
+        "properties": {
+          "model_count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provider": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "model_count"
+        ],
+        "type": "object"
+      },
+      "RotatedKeyView": {
+        "description": "`POST /keys/{id}/rotate` — the key metadata plus the ONCE-shown fresh bearer secret.",
+        "properties": {
+          "allowed_pools": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "budget_period": {
+            "type": "string"
+          },
+          "created_at": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_budget_cents": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "rpm_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "secret": {
+            "description": "The fresh bearer secret — shown EXACTLY once.",
+            "type": "string"
+          },
+          "tpm_limit": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "allowed_pools",
+          "max_budget_cents",
+          "budget_period",
+          "rpm_limit",
+          "tpm_limit",
+          "enabled",
+          "created_at",
+          "secret"
+        ],
+        "type": "object"
+      },
+      "TopologyInfo": {
+        "description": "Pool/model/provider counts (`InfoView.topology`).",
+        "properties": {
+          "models": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pools": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "providers": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pools",
+          "models",
+          "providers"
+        ],
+        "type": "object"
+      },
+      "UsageBreakdown": {
+        "description": "The raw consumption counts + the derived spend estimate — the one shape shared by `total`,\n`by_model` rows, and `by_key` rows, so a consumer writes ONE aggregation reader.",
+        "properties": {
+          "requests": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "spend_micros": {
+            "description": "Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,\nsub-cent precise, no float drift), from the operator's configured global prices. A consumer\nwith its own per-model catalog recomputes from the raw token split instead.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "tokens_cache_creation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cache_read": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_input": {
+            "description": "Uncached input tokens (normalized additive-cache convention).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_output": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tokens_input",
+          "tokens_output",
+          "tokens_cache_read",
+          "tokens_cache_creation",
+          "requests",
+          "spend_micros"
+        ],
+        "type": "object"
+      },
+      "UsageView": {
+        "description": "Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle:\nbusbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token\nSPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer\nwith its own (special/negotiated) price catalog reconstructs cost independently; `spend_micros`\nis busbar's DERIVED estimate from the operator's configured global prices, computed at read time\n(raw counts are what's stored — a price change re-prices history consistently).\n\nTime base — THE PINNED SHAPE RULING (external review R3 #1): a usage response is ALWAYS exactly\nONE fixed UTC-day metering bucket (`window`). `?window=<bucket-start-epoch>` selects a PAST\nbucket (default: the current one); a multi-window series is the CLIENT fetching N buckets — or\na future additive `?from=&to=` returning an ARRAY OF THIS SAME PER-BUCKET SHAPE, never a\ndifferently-shaped merged view. Billing periods aggregate client-side from day buckets (raw\ncounts are stored, so the math is exact). Deliberately decoupled from per-key budget windows so\nper-model aggregation across keys is well-defined; budget ENFORCEMENT state lives on\n`GET /keys/{id}/usage`, not here. Empty aggregations when governance is disabled. No secrets —\nkey ids/names only, never a token.\n\nLEDGER RULE (one loud contract sentence): `spend_micros` is a MUTABLE ESTIMATE — derived at\nread time from the operator's CURRENT prices, so a price change re-prices history. Never store\nit as a ledger charge; bill from the raw token split.",
+        "properties": {
+          "as_of": {
+            "description": "Freshness marker: the epoch this read was computed at (counters accumulate live).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "by_key": {
+            "description": "Per-key aggregation (same raw-split shape). CAPPED at the top 1000 rows by spend (the\nFinOps-relevant ordering); `by_key_truncated` says the cap fired — never a silent cut.",
+            "items": {
+              "$ref": "#/components/schemas/KeyUsageView"
+            },
+            "type": "array"
+          },
+          "by_key_truncated": {
+            "description": "True when `by_key` was truncated to the cap (a deployment with more active keys than the\ncap). `by_model` is never capped (bounded by the configured model fleet).",
+            "type": "boolean"
+          },
+          "by_model": {
+            "description": "Per-(model, provider) aggregation — cost attribution by model (the FinOps unit).",
+            "items": {
+              "$ref": "#/components/schemas/ModelUsageView"
+            },
+            "type": "array"
+          },
+          "currency": {
+            "description": "The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`).",
+            "type": "string"
+          },
+          "others": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsageBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The summed remainder BEYOND the `by_key` cap — present exactly when `by_key_truncated`, so\nevery unit of consumption is attributable at least to \"others\" (FinOps completeness:\n`total == sum(by_key) + others`)."
+          },
+          "total": {
+            "$ref": "#/components/schemas/UsageBreakdown"
+          },
+          "window": {
+            "$ref": "#/components/schemas/UsageWindow",
+            "description": "The UTC-day metering bucket this response aggregates: `[start, end)` epoch seconds."
+          }
+        },
+        "required": [
+          "window",
+          "as_of",
+          "currency",
+          "total",
+          "by_model",
+          "by_key",
+          "by_key_truncated"
+        ],
+        "type": "object"
+      },
+      "UsageWindow": {
+        "description": "A metering window: `[start, end)` epoch seconds.",
+        "properties": {
+          "end": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "start": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "adminToken": {
+        "in": "header",
+        "name": "x-admin-token",
+        "type": "apiKey"
+      },
+      "bearerAuth": {
+        "description": "The same operator credential via Authorization: Bearer",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "The frozen, additive-only /api/v1/admin surface. Errors use the stable envelope {\"error\":{\"code\",\"message\"}}; tooling branches on `code`.",
+    "title": "Busbar Admin API",
+    "version": "1.4.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/admin/admin-auth": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAuthView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Admin-plane auth config (the admin surface guard)",
+        "x-busbar-required-scope": "read-only"
+      },
+      "put": {
+        "parameters": [
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAuthPutView"
+                }
+              }
+            },
+            "description": "The resource + apply metadata: `{configured, modules, applied, config_version, note}`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown module / malformed body (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` (`version_conflict`), or the new chain would lock the caller out (error code `conflict`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/audit": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Filter by exact action (e.g. `hook.register`)",
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by exact resource (e.g. `hook:x`)",
+            "in": "query",
+            "name": "resource",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 200, max 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque continuation cursor from `next_cursor`",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditPageView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Admin audit log — every mutation with its outcome (newest first). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/auth": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Ingress auth chain + upstream-credential mode",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/auth/cache/flush": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheFlushView"
+                }
+              }
+            },
+            "description": "`{flushed}` — entries dropped"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed body (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Flush the credential cache — one module's partition (`{module}`) or everything (empty body). Instant revocation of the cached-allow window",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/config": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectiveConfigView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Effective running config snapshot (redacted)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/config/apply": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigApplyView"
+                }
+              }
+            },
+            "description": "`{applied, config_version, note}`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid config (error code `invalid_request`); nothing changed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Apply a full config from the request body, atomically (live until next reload/restart; health preserved by lane identity)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/config/diff": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "from",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "to",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigDiffView"
+                }
+              }
+            },
+            "description": "The diff (hooks added/removed/changed + global-wiring delta)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/non-numeric `from` or `to` (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Either version pruned or never recorded (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Structured hook-surface diff between two retained versions",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/config/reload": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigReloadView"
+                }
+              }
+            },
+            "description": "`{reloaded, config_version}`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Disk config invalid or no config files (error code `invalid_request`); nothing changed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Re-read config.yaml/providers.yaml from disk and apply atomically (health state preserved by lane identity)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/config/rollback": {
+      "post": {
+        "parameters": [
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigRollbackView"
+                }
+              }
+            },
+            "description": "`{restored_version, config_version}`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Snapshot fails re-validation (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Target version not retained (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Restore a retained version's hook surface (re-validated; a NEW version)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/config/validate": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigValidateView"
+                }
+              }
+            },
+            "description": "Verdict `{ok, errors}` (even for an invalid config)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed request body (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Dry-run validate a proposed config",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/config/versions": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Page size (default 100, max 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque continuation cursor from `next_cursor`",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigVersionPageView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Config version history (newest first; id/ts/principal/summary). Page: ?limit=, ?cursor=; returns {items, next_cursor}",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/config/versions/{v}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "v",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigVersionDetailView"
+                }
+              }
+            },
+            "description": "The version (metadata + hooks + global_hooks)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Pruned or never recorded (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "One retained config version, with its hook-surface snapshot",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/hooks": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_HookView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Hook registry (definitions)",
+        "x-busbar-required-scope": "read-only"
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookView"
+                }
+              }
+            },
+            "description": "Replaced — the name existed (same-grant re-register; body is the hook definition)"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookView"
+                }
+              }
+            },
+            "description": "Registered — the name is NEW (body is the hook definition)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed body or invalid definition (`invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `If-Match` (`version_conflict`, §6.4)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Register (or replace) a hook at runtime — live immediately",
+        "x-busbar-required-scope": "hooks-register"
+      }
+    },
+    "/api/v1/admin/hooks/{name}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "A `hooks-register` principal may not delete a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Base-defined hook — read-only via the API; edit config.yaml (error code `conflict`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove a hook at runtime — live immediately",
+        "x-busbar-required-scope": "hooks-register"
+      },
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "One hook definition",
+        "x-busbar-required-scope": "read-only"
+      },
+      "put": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookView"
+                }
+              }
+            },
+            "description": "The replaced hook"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid definition (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "A `hooks-register` principal may not replace a hook into a content-seeing (`prompt`/`user`) or `global` form (error code `forbidden`, §6.3)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Base-defined hook, grant change (`conflict`), or stale `If-Match` (`version_conflict`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace an overlay hook definition — live immediately (grants immutable)",
+        "x-busbar-required-scope": "hooks-register"
+      }
+    },
+    "/api/v1/admin/hooks/{name}/health": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookHealthView"
+                }
+              }
+            },
+            "description": "OK (`reachable` may be null for webhook/non-unix)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Best-effort hook transport reachability",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/hooks/{name}/schema": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSchemaView"
+                }
+              }
+            },
+            "description": "`{name, schema}` (`schema` null when the hook doesn't answer describe)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "The hook's self-described settings JSON Schema (describe proxy)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/hooks/{name}/settings": {
+      "patch": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookView"
+                }
+              }
+            },
+            "description": "Acked + committed (the updated hook)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Hook did not acknowledge (error code `invalid_request`); nothing committed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "A `hooks-register` principal may not push settings to a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Base-defined hook (`conflict`) or stale `If-Match` (`version_conflict`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Push an opaque settings map to the running hook; COMMIT ON ACK",
+        "x-busbar-required-scope": "hooks-register"
+      }
+    },
+    "/api/v1/admin/hooks/{name}/status": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookStatusView"
+                }
+              }
+            },
+            "description": "`{name, desired, reported, drift, metrics, as_of, source}`"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown hook (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "The hook's OBSERVED state, live-queried: running settings + version (vs busbar's desired copy, with a drift verdict) and self-reported metrics. reported=null when the hook doesn't answer (fail-open)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/info": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InfoView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Version, compiled-in plugin proof, uptime, topology",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/keys": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Filter by enabled state (`true`|`false`)",
+            "in": "query",
+            "name": "enabled",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by key-id prefix",
+            "in": "query",
+            "name": "prefix",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (default 200, max 1000)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Opaque continuation cursor from `next_cursor`",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyPageView"
+                }
+              }
+            },
+            "description": "`{items, next_cursor}` — the cursor page envelope (next_cursor null at end)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed/foreign pagination cursor (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=. Paginate: ?limit=, ?cursor= (opaque)",
+        "x-busbar-required-scope": "read-only"
+      },
+      "post": {
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedKeyView"
+                }
+              }
+            },
+            "description": "Created (body includes the once-shown secret)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed body / invalid budget or rate (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An Idempotency-Key request is already in flight (error code `conflict`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Mint a virtual key. The secret is returned EXACTLY once. Honors an `Idempotency-Key` header (per-principal ~10min replay)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/keys/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked — No Content"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed `If-Match` (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown key (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` ETag (error code `version_conflict` — re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Revoke a key — it stops resolving immediately. Optional `If-Match` (the key's ETag)",
+        "x-busbar-required-scope": "full"
+      },
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyView"
+                }
+              }
+            },
+            "description": "Key metadata (+ `ETag` header)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown key (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "One key's metadata + `ETag` (never the secret/hash)",
+        "x-busbar-required-scope": "read-only"
+      },
+      "patch": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyView"
+                }
+              }
+            },
+            "description": "Updated metadata"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid budget/rate (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown key (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` ETag (error code `version_conflict` — re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update budget / rate / enabled. Optional `If-Match` for optimistic concurrency",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/keys/{id}/rotate": {
+      "post": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RotatedKeyView"
+                }
+              }
+            },
+            "description": "Rotated (body includes the once-shown new secret; an Idempotency-Key retry replays it verbatim)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown key (error code `not_found`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "An Idempotency-Key request is already in flight (error code `conflict`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Mint a fresh secret in place (same id, budgets, usage). The new secret is shown once; the old stops resolving. Honors an `Idempotency-Key` header (per-principal, op+id-scoped, ~10min replay)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/keys/{id}/usage": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyMeteringView"
+                }
+              }
+            },
+            "description": "Budget-window counters + `rate_headroom` (fraction of the tightest RPM/TPM cap left; null = uncapped)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown key (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Current-window usage for one key (spend / tokens / requests)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/models": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ModelView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Model lanes + upstream providers",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/openapi.json": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "An OpenAPI 3.1 document (this document's shape)",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "This OpenAPI 3.1 document",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/plugins": {
+      "get": {
+        "parameters": [
+          {
+            "description": "Plugin type: `auth` | `hooks` (required)",
+            "in": "query",
+            "name": "type",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_PluginView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Plugin catalog by type (compiled-in + external)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/pools": {
+      "get": {
+        "parameters": [
+          {
+            "description": "`true` inlines each member's live status (same row shape as /pools/{name})",
+            "in": "query",
+            "name": "detail",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_PoolView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Pool topology (members + weights). ?detail=true inlines live member status (one call, no N+1)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/pools/{name}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PoolDetailView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown pool (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Live per-member status of one pool (breaker/concurrency/latency)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/providers": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ProviderView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Distinct providers + lane counts",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/usage": {
+      "get": {
+        "parameters": [
+          {
+            "description": "A PAST UTC-day bucket start epoch (default: current bucket). The response is always ONE bucket; spend_micros is a read-time estimate — bill from the raw token split, never store spend_micros as a ledger charge",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Metering: current UTC-day bucket — {window, as_of, currency, total, by_model, by_key}, raw token split + derived spend_micros",
+        "x-busbar-required-scope": "read-only"
+      }
+    }
+  }
+}

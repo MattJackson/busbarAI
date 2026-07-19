@@ -45,6 +45,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# CI-ONLY, feature-gated (`openapi-schema`). Derives JSON Schema from the admin-API response VIEW
+# types so `openapi_doc()` can emit typed `$ref` response bodies. Never compiled into the shipped
+# release binary — the live `GET /openapi.json` handler serves a committed static `openapi.json`
+# (regenerated + drift-checked in CI under this feature), so schemars is absent from
+# `cargo build -p busbar --release` and from the runtime dependency graph. `optional = true` +
+# `dep:schemars` keep it out of the default build entirely.
+schemars = { version = "1", optional = true }
 # RS256 JWT signing for the `jwt-bearer` egress auth (OAuth 2.0 JWT-bearer grant, RFC 7523 — Vertex et
 # al.). Both crates are ALREADY in the graph (ring is reqwest's rustls crypto backend; base64 rides in
 # transitively), so promoting them to direct deps adds NO new external crate to the tree. `ring` does
@@ -178,6 +185,11 @@ auth-admin-tokens = ["dep:busbar-auth-admin-tokens"]
 # feature. `--no-default-features` drops them; `weighted` stays (it's the engine's inline SWRR floor,
 # not a plugin). A pool `policy: cheapest` (etc.) is then a boot error.
 hooks-ranking = ["dep:busbar-hooks-ranking"]
+# CI-ONLY schema generation for the admin OpenAPI doc. Enables schemars + compiles the
+# schema-generating path of `openapi_doc()` (typed `$ref` response bodies) and the golden/drift
+# test. NOT in `default` — a normal or `--release` build never pulls schemars, and the runtime
+# `GET /openapi.json` handler serves the committed static file regardless of this feature.
+openapi-schema = ["dep:schemars"]
 
 [dev-dependencies]
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
