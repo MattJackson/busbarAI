@@ -493,7 +493,14 @@ pub(crate) fn validate_with_unset(
         ) {
             let cred = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
             if !cred.trim().is_empty() {
-                if let Err(e) = crate::egress_auth::jwt_bearer::validate_credential(&cred) {
+                // Pass the SAME operator metadata posture the boot path threads into jwt_bearer::build,
+                // so the token_uri SSRF check is identical at validate and apply time (1.4.0 audit).
+                let ssrf = crate::egress_auth::MetadataSsrfPolicy {
+                    allow_overrides: &allow_overrides,
+                    allow_all: cfg.allow_all_metadata,
+                    blocked_hosts: &cfg.blocked_metadata_hosts,
+                };
+                if let Err(e) = crate::egress_auth::jwt_bearer::validate_credential(&cred, &ssrf) {
                     errors.push(format!(
                         "provider '{provider_name}' jwt-bearer credential (from ${}) is invalid: {e}",
                         provider_cfg.api_key_env

@@ -1,5 +1,40 @@
 use super::*;
 
+// 1.4.0 audit (config-compat): a 1.3.0 config using the removed `auth.mode:` key must fail with an
+// actionable migration hint, not just serde's bare "unknown field `mode`". Verify the hint is appended
+// for the mode error and that unrelated errors pass through verbatim; plus an end-to-end parse.
+#[test]
+fn augment_config_error_adds_auth_mode_migration_hint() {
+    let augmented =
+        crate::config::augment_config_error("unknown field `mode`, expected one of `chain`");
+    assert!(
+        augmented.contains("auth.mode:"),
+        "hint names the removed key: {augmented}"
+    );
+    assert!(
+        augmented.contains("auth.chain:"),
+        "hint points to the new key: {augmented}"
+    );
+    assert!(
+        augmented.contains("upstream_credentials"),
+        "hint covers the passthrough migration: {augmented}"
+    );
+    // Unrelated errors are returned unchanged.
+    assert_eq!(
+        crate::config::augment_config_error("some other yaml error"),
+        "some other yaml error"
+    );
+    // End-to-end: a legacy `auth.mode:` config surfaces the hint through the parse path.
+    let legacy = "providers: {}\nauth:\n  mode: none\n";
+    let err = serde_yaml::from_str::<crate::config::DeployCfg>(legacy)
+        .map_err(crate::config::augment_config_error)
+        .expect_err("legacy auth.mode must fail to parse");
+    assert!(
+        err.contains("auth.chain:"),
+        "end-to-end error carries the hint: {err}"
+    );
+}
+
 /// The hook config types are round-trippable (Deserialize + Serialize) — the foundation for the
 /// config-overlay persistence that will let a runtime-registered hook survive a restart. A
 /// `HookCfg` deserialized from JSON re-serializes + re-parses to an identical shape, exercising the

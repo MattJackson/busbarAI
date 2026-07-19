@@ -154,7 +154,7 @@ InMemoryStore {
 
 ## 3. The two-stage disposition pipeline (ADR-0002)
 
-The classification chain (see [breaker.rs](../src/breaker.rs) and the disposition
+The classification chain (see [breaker.rs](../crates/busbar/src/breaker.rs) and the disposition
 `match` in `proxy/engine/mod.rs`):
 
 ```

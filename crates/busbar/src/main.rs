@@ -370,6 +370,17 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
+        .or_else(|| {
+            // Back-compat: v1.3.0 ran under `#[tokio::main]`, whose runtime honors the standard
+            // `TOKIO_WORKER_THREADS`. 1.4.0 builds the runtime explicitly (to default the pool to all
+            // cores), which otherwise IGNORES that env var — so read it as a fallback when the
+            // busbar-native knob is unset, and an operator who pinned `TOKIO_WORKER_THREADS` on 1.3.0
+            // keeps the same pool size instead of silently jumping to one-per-core. (1.4.0 audit.)
+            std::env::var("TOKIO_WORKER_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+        })
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -914,8 +925,13 @@ pub(crate) fn load_config_from_disk(
     let interpolated_config =
         config::interpolate_env_with(&raw_config, env_mode, &mut unset_env_vars)
             .map_err(|e| format!("config.yaml: {e}"))?;
-    let mut deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config)
-        .map_err(|e| format!("config.yaml: invalid YAML: {e}"))?;
+    let mut deploy: config::DeployCfg =
+        serde_yaml::from_str(&interpolated_config).map_err(|e| {
+            format!(
+                "config.yaml: invalid YAML: {}",
+                config::augment_config_error(e)
+            )
+        })?;
 
     // Config-overlay persistence (opt-in via `BUSBAR_CONFIG_OVERLAY`): capture the BASE hook names
     // BEFORE the overlay merges in API-registered hooks (the admin API refuses to PUT-replace a
@@ -1109,11 +1125,31 @@ pub(crate) fn build_app_from_config(
         // Resolve the outbound credential once. Most auth styles are a simple sync lookup; the OAuth
         // styles parse their credential material here (failing loud on a bad key) and start a
         // background token minter/refresher. `api_key` carries that material.
+        //
+        // Both OAuth mechanisms vet their token endpoint (oauth `token_url`, jwt-bearer SA `token_uri`)
+        // for SSRF against the operator's REAL metadata posture so the boot-time check matches
+        // config_validate's validate-time check EXACTLY (validate == apply) and both mechanisms behave
+        // identically: the allow-override set is the SAME union config_validate builds (this provider's
+        // `allow_metadata_hosts` ∪ the global `security.allow_metadata_hosts`), plus the nuclear
+        // `allow_all_metadata` and the operator's extra `blocked_metadata_hosts`. Threading it into
+        // jwt-bearer too (1.4.0 audit) means a global `blocked_metadata_hosts` deny is enforced on a jwt
+        // `token_uri`, and `allow_all_metadata` uniformly disables the guard for both. (1.4.0 audit.)
+        let allow_overrides: Vec<String> = provider_cfg
+            .allow_metadata_hosts
+            .iter()
+            .chain(cfg.allow_metadata_hosts.iter())
+            .cloned()
+            .collect();
+        let ssrf = egress_auth::MetadataSsrfPolicy {
+            allow_overrides: &allow_overrides,
+            allow_all: cfg.allow_all_metadata,
+            blocked_hosts: &cfg.blocked_metadata_hosts,
+        };
         let credential = match provider_cfg.auth {
             // `jwt-bearer`: `api_key` is the service-account JSON (inline) or a key-file path. A
             // configured `scope:` overrides the default cloud-platform scope (else `None` → default).
             Some(config::ProviderAuth::JwtBearer) => {
-                egress_auth::jwt_bearer::build(&api_key, provider_cfg.scope.as_deref())
+                egress_auth::jwt_bearer::build(&api_key, provider_cfg.scope.as_deref(), &ssrf)
                     .map_err(|e| format!("provider '{}' (jwt-bearer auth): {e}", ld.provider))?
             }
             // `oauth-client-credentials`: `api_key` is `client_id:client_secret`; `token_url`+`scope`
@@ -1131,23 +1167,6 @@ pub(crate) fn build_app_from_config(
                         ld.provider
                     )
                 })?;
-                // Thread the operator's real metadata-SSRF posture so the boot-time token_url check
-                // matches config_validate's validate-time check EXACTLY (validate == apply). The
-                // allow-override set is the SAME union config_validate builds: this provider's
-                // `allow_metadata_hosts` ∪ the global `security.allow_metadata_hosts`. Without this, a
-                // token_url an operator deliberately allow-listed would pass `--validate` but die here.
-                // (1.4.0 audit, egress-auth.)
-                let allow_overrides: Vec<String> = provider_cfg
-                    .allow_metadata_hosts
-                    .iter()
-                    .chain(cfg.allow_metadata_hosts.iter())
-                    .cloned()
-                    .collect();
-                let ssrf = egress_auth::MetadataSsrfPolicy {
-                    allow_overrides: &allow_overrides,
-                    allow_all: cfg.allow_all_metadata,
-                    blocked_hosts: &cfg.blocked_metadata_hosts,
-                };
                 egress_auth::oauth_client_credentials::build(&api_key, token_url, scope, &ssrf)
                     .map_err(|e| {
                         format!(

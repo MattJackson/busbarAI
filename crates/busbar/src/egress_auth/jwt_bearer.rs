@@ -44,8 +44,9 @@ struct Signer {
 pub(crate) fn build(
     credential: &str,
     scope_override: Option<&str>,
+    ssrf: &super::MetadataSsrfPolicy,
 ) -> Result<CredentialProviderArc, String> {
-    let (sa, key_pair) = parse_service_account(credential)?;
+    let (sa, key_pair) = parse_service_account(credential, ssrf)?;
 
     let signer = Arc::new(Signer {
         key_pair,
@@ -69,15 +70,17 @@ pub(crate) fn build(
 /// path apply IDENTICAL checks with identical error messages — they can never diverge.
 fn parse_service_account(
     credential: &str,
+    ssrf: &super::MetadataSsrfPolicy,
 ) -> Result<(ServiceAccount, ring::signature::RsaKeyPair), String> {
     let sa_json = read_credential(credential)?;
     let sa: ServiceAccount = serde_json::from_str(&sa_json)
         .map_err(|e| format!("service-account JSON is invalid: {e}"))?;
     // Defense in depth: the SA JSON's token_uri is the POST target for the signed assertion. Vet it the
     // same way oauth-client-credentials' token_url is vetted — https for a public host (http only for
-    // loopback/private) and never a cloud-metadata/IMDS endpoint. The minter client already refuses
-    // redirects; this closes the direct-target case. (found: 1.4.0 audit, egress-auth.)
-    validate_token_uri(&sa.token_uri)?;
+    // loopback/private) and never a cloud-metadata/IMDS endpoint, honoring the operator's metadata
+    // posture. The minter client already refuses redirects; this closes the direct-target case. (found:
+    // 1.4.0 audit, egress-auth.)
+    validate_token_uri(&sa.token_uri, ssrf)?;
     let der = pem_to_pkcs8_der(&sa.private_key)?;
     let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
         .map_err(|e| format!("service-account private_key is not a valid PKCS#8 RSA key: {e}"))?;
@@ -88,16 +91,22 @@ fn parse_service_account(
 /// dry-run entry point (which does not build the app, so it otherwise never reaches [`build`], leaving
 /// malformed SA JSON / non-PKCS#8 keys to surface only at boot/apply). Runs the exact same checks as
 /// [`build`]. (found: 1.4.0 audit, egress-auth.)
-pub(crate) fn validate_credential(credential: &str) -> Result<(), String> {
-    parse_service_account(credential).map(|_| ())
+pub(crate) fn validate_credential(
+    credential: &str,
+    ssrf: &super::MetadataSsrfPolicy,
+) -> Result<(), String> {
+    parse_service_account(credential, ssrf).map(|_| ())
 }
 
 /// Vet the service-account `token_uri` (the POST target for the signed assertion) with the same two
 /// guards `oauth-client-credentials`' `token_url` gets: a case-insensitive https requirement (http only
-/// for a loopback/private endpoint) and the shared cloud-metadata/IMDS denylist. The token_uri comes from
-/// the SA JSON, not a config field, so there are no per-provider allow-overrides — the default denylist
-/// applies. Reuses `config_validate`'s SSRF primitives so this can never diverge from the config path.
-fn validate_token_uri(token_uri: &str) -> Result<(), String> {
+/// for a loopback/private endpoint) and the shared cloud-metadata/IMDS denylist, honoring the operator's
+/// metadata posture (`ssrf`). The token_uri is not a per-provider config field, but the DEPLOYMENT-global
+/// posture still applies — a global `blocked_metadata_hosts` deny is enforced here and `allow_all_metadata`
+/// uniformly disables the guard, matching oauth-client-credentials (1.4.0 audit: the two mechanisms were
+/// asymmetric — jwt ignored the global posture). Reuses `config_validate`'s SSRF primitives so this can
+/// never diverge from the config path (`config_validate` passes the identical `ssrf` at validate time).
+fn validate_token_uri(token_uri: &str, ssrf: &super::MetadataSsrfPolicy) -> Result<(), String> {
     use crate::config_validate::{
         extract_normalized_host, host_is_private_or_loopback, scheme_is, ssrf_blocked_host,
     };
@@ -110,9 +119,14 @@ fn validate_token_uri(token_uri: &str) -> Result<(), String> {
             "service-account token_uri must use https for a public host (got '{token_uri}'); it receives the signed JWT assertion, so plaintext http is permitted only for a private/loopback endpoint"
         ));
     }
-    if let Some(host) = ssrf_blocked_host(token_uri, &[], false, &[]) {
+    if let Some(host) = ssrf_blocked_host(
+        token_uri,
+        ssrf.allow_overrides,
+        ssrf.allow_all,
+        ssrf.blocked_hosts,
+    ) {
         return Err(format!(
-            "service-account token_uri '{token_uri}' targets a blocked cloud-metadata host '{host}' (the signed assertion would be POSTed there; cloud-metadata/IMDS endpoints are denied)"
+            "service-account token_uri '{token_uri}' targets a blocked cloud-metadata host '{host}' (the signed assertion would be POSTed there; cloud-metadata/IMDS endpoints are denied — override via this provider's allow_metadata_hosts, security.allow_metadata_hosts, or security.allow_all_metadata)"
         ));
     }
     Ok(())
@@ -284,28 +298,67 @@ mod tests {
         assert_eq!(read_credential("  {\"a\":1}").unwrap(), "  {\"a\":1}");
     }
 
+    /// The default (no operator carve-out) SSRF posture used by most tests.
+    fn deny() -> super::super::MetadataSsrfPolicy<'static> {
+        super::super::MetadataSsrfPolicy {
+            allow_overrides: &[],
+            allow_all: false,
+            blocked_hosts: &[],
+        }
+    }
+
     // 1.4.0 audit (egress-auth): the SA JSON's token_uri is the POST target for the signed assertion,
     // so it gets the same https + cloud-metadata guards as oauth-client-credentials' token_url.
     #[test]
     fn validate_token_uri_requires_https_for_public_and_blocks_metadata() {
-        assert!(validate_token_uri("https://oauth2.googleapis.com/token").is_ok());
+        assert!(validate_token_uri("https://oauth2.googleapis.com/token", &deny()).is_ok());
         // plaintext http to a public host would expose the assertion on the wire
-        assert!(validate_token_uri("http://oauth2.googleapis.com/token").is_err());
+        assert!(validate_token_uri("http://oauth2.googleapis.com/token", &deny()).is_err());
         // http to a loopback/private endpoint is permitted (a local token endpoint)
-        assert!(validate_token_uri("http://127.0.0.1:8080/token").is_ok());
+        assert!(validate_token_uri("http://127.0.0.1:8080/token", &deny()).is_ok());
         // cloud-metadata / IMDS is denied even over https (SSRF to the direct target)
-        assert!(validate_token_uri("https://metadata.google.internal/token").is_err());
-        assert!(validate_token_uri("https://169.254.169.254/token").is_err());
+        assert!(validate_token_uri("https://metadata.google.internal/token", &deny()).is_err());
+        assert!(validate_token_uri("https://169.254.169.254/token", &deny()).is_err());
+    }
+
+    // 1.4.0 audit (egress-auth): jwt-bearer must honor the operator's DEPLOYMENT-global metadata posture
+    // symmetrically with oauth-client-credentials — a global `blocked_metadata_hosts` deny is enforced on
+    // the token_uri, and `allow_all_metadata` / an allow-override unblocks an otherwise-denied host.
+    #[test]
+    fn validate_token_uri_honors_operator_metadata_posture() {
+        // allow_all disables the guard uniformly (IMDS token_uri now permitted).
+        let nuclear = super::super::MetadataSsrfPolicy {
+            allow_overrides: &[],
+            allow_all: true,
+            blocked_hosts: &[],
+        };
+        assert!(validate_token_uri("https://169.254.169.254/token", &nuclear).is_ok());
+        // An explicit allow-override unblocks just that host.
+        let allowed = ["169.254.169.254".to_string()];
+        let override_one = super::super::MetadataSsrfPolicy {
+            allow_overrides: &allowed,
+            allow_all: false,
+            blocked_hosts: &[],
+        };
+        assert!(validate_token_uri("https://169.254.169.254/token", &override_one).is_ok());
+        // A global extra-deny is now ENFORCED on the token_uri (was ignored before the fix).
+        let extra_block = ["evil.example.com".to_string()];
+        let blocked = super::super::MetadataSsrfPolicy {
+            allow_overrides: &[],
+            allow_all: false,
+            blocked_hosts: &extra_block,
+        };
+        assert!(validate_token_uri("https://evil.example.com/token", &blocked).is_err());
     }
 
     // 1.4.0 audit (egress-auth): validate_credential is the config `--validate` dry-run entry point; it
     // must catch a malformed SA JSON and an SSRF token_uri without constructing the provider.
     #[test]
     fn validate_credential_rejects_malformed_json_and_ssrf_token_uri() {
-        assert!(validate_credential("not json").is_err());
+        assert!(validate_credential("not json", &deny()).is_err());
         // Valid JSON, but token_uri targets IMDS → rejected before the key is even parsed.
         let imds = r#"{"client_email":"x@y.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nSGVsbG8=\n-----END PRIVATE KEY-----\n","token_uri":"https://169.254.169.254/token"}"#;
-        let e = validate_credential(imds).expect_err("IMDS token_uri must be rejected");
+        let e = validate_credential(imds, &deny()).expect_err("IMDS token_uri must be rejected");
         assert!(e.contains("metadata") || e.contains("169.254"), "got: {e}");
     }
 

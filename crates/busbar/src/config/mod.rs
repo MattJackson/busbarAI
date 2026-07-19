@@ -268,6 +268,24 @@ impl AuthCfg {
     }
 }
 
+/// Append a targeted migration hint to a config-deserialize error when it is the removed 1.3.0
+/// `auth.mode:` key (rejected by `AuthCfg`'s `deny_unknown_fields`), so an upgrading operator gets
+/// actionable guidance instead of serde's bare "unknown field `mode`, expected one of …". Additive:
+/// any other error is returned verbatim. (1.4.0 audit, config-compat — the key was renamed to
+/// `auth.chain:` / `auth.upstream_credentials:` but the failure gave no upgrade breadcrumb.)
+pub(crate) fn augment_config_error(err: impl std::fmt::Display) -> String {
+    let msg = err.to_string();
+    if msg.contains("unknown field `mode`") {
+        format!(
+            "{msg}\n  hint: the `auth.mode:` key was removed in favor of `auth.chain:` — `mode: none` \
+             maps to an empty/omitted chain, `mode: token` or `mode: apikey` to `chain: [tokens]`, and \
+             `mode: passthrough` to `auth.upstream_credentials: passthrough`"
+        )
+    } else {
+        msg
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct ProviderCfg {
     #[serde(default = "default_protocol")]
