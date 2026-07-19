@@ -132,6 +132,35 @@ directly exposed to untrusted networks is not recommended.
 `free_slots`, `ok`, `err`, `usable`, `dead`, `dead_reason`, `cooldown_remaining_s`,
 `streak`, and `budget`. It is the first place to look when a pool is degraded.
 
+## Running multiple instances (HA)
+
+Busbar is **stateless** (unless governance is enabled — see below), so the robust
+production shape is **N instances behind a load balancer**, each configured
+identically, each health-checked on `GET /healthz`. Any instance serves any request;
+lose one and the LB routes around it. On Kubernetes this is `replicaCount` + the
+Service/Ingress + a PodDisruptionBudget; on VMs it is N hosts behind an external LB
+(nginx, HAProxy, or a cloud L4/L7 balancer) probing `/healthz`.
+
+Three things are worth understanding before you scale out:
+
+- **Circuit-breaker and lane health are per-instance.** Each instance learns upstream
+  health independently from its own traffic. This is correct — a lane that's dead for
+  one instance is usually dead for all — and a new instance re-learns within seconds.
+  Nothing is shared or needs sharing.
+- **Session affinity is per-instance.** The `affinity` header pins a session to a lane
+  *within one instance*. Across instances, an LB that spreads a client's requests will
+  spread its affinity too. If you depend on affinity, enable **sticky sessions** at the
+  LB (e.g. by the affinity header / a cookie) so a session lands on the same instance.
+- **Governance is per-instance and not shared.** Budgets and rate limits live in each
+  instance's local SQLite store, so with N instances a "global" limit is enforced
+  **per instance** — effectively ×N. For strict global budget/rate enforcement, run a
+  **single instance** (scale vertically) until an external governance store is
+  available. The proxy path itself scales horizontally without this caveat; only
+  governance *enforcement* is bounded to one writer.
+
+So: for a stateless (no-governance) gateway, scale out freely behind an LB. With
+governance, keep enforcement on one instance and scale the box, not the count.
+
 ## Metrics to watch
 
 All metrics are Prometheus counters/histograms exposed at `/metrics`.
