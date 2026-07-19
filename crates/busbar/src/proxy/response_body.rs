@@ -451,7 +451,17 @@ where
                     // For a plain SSE ingress `tail` is streamed as-is (the [DONE] literal, if any, is
                     // an OpenAI-ingress terminator finish() itself appends).
                     let done = if let Some(framer) = this.json_array.as_mut() {
-                        let mut wrapped = framer.feed(&tail);
+                        // On a translate ABORT, `tail` IS the native error frame from finish(), and
+                        // `finish_for_translate(true)` already surfaces the canonical json-array error
+                        // element + `]`. Feeding `tail` too would wrap a SECOND (differently-worded)
+                        // error element — the 1.4.0 double-emit regression (1.3.0 discarded `tail`). So
+                        // feed `tail` ONLY on the non-aborted path, where it carries finish()'s content /
+                        // trailing-usage frames that must reach the client. (found: 1.4.0 audit, hot-path.)
+                        let mut wrapped = if translate_aborted {
+                            Vec::new()
+                        } else {
+                            framer.feed(&tail)
+                        };
                         wrapped.extend_from_slice(&framer.finish_for_translate(translate_aborted));
                         wrapped
                     } else {

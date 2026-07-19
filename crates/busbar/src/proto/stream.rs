@@ -337,8 +337,18 @@ impl StreamTranslate {
                         usage,
                         stop_sequence,
                     } => {
-                        self.pending_terminal =
-                            Some((*reason, stop_sequence.clone(), usage.clone()));
+                        match self.pending_terminal.as_mut() {
+                            // A DUPLICATE stop-bearing delta (some providers repeat the terminal
+                            // message_delta): keep the FIRST terminal's captured usage and merge any this
+                            // one carries (non-zero fields only), instead of overwriting the whole tuple —
+                            // a duplicate with empty usage would otherwise drop the real, client-visible
+                            // terminal usage. (found: 1.4.0 audit, streaming-billing.)
+                            Some((_, _, acc)) => merge_trailing_usage(acc, usage),
+                            None => {
+                                self.pending_terminal =
+                                    Some((*reason, stop_sequence.clone(), usage.clone()))
+                            }
+                        }
                         continue;
                     }
                     crate::ir::IrStreamEvent::MessageStop if self.pending_terminal.is_some() => {

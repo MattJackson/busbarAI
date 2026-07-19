@@ -32,9 +32,12 @@ struct Signer {
 }
 
 /// Build a `jwt-bearer` credential. SYNCHRONOUS by design — it runs on the shared
-/// `build_app_from_config` path (boot AND admin config-reload/dry-run), so it must not block on the
-/// network. It PARSES the key material (failing loud on a malformed service-account JSON / PKCS#8 key,
-/// the common misconfig) and hands a `mint` closure to [`super::bearer_token::spawn`], which mints the
+/// `build_app_from_config` path (boot AND admin config-reload apply), so it must not block on the
+/// network. Note: the config `--validate` / admin dry-run path does NOT construct the app, so it does
+/// not reach here; malformed key material is caught at boot/apply (and, best-effort, by
+/// `validate_credential` at validate time when the credential resolves). It PARSES the key material
+/// (failing loud on a malformed service-account JSON / PKCS#8 key, the common misconfig) and hands a
+/// `mint` closure to [`super::bearer_token::spawn`], which mints the
 /// first token in the background and refreshes it thereafter. `credential` is the SA JSON — inline
 /// (starts with `{`) or a path to a key file. `scope_override` replaces the default `cloud-platform`
 /// scope when set.
@@ -42,12 +45,7 @@ pub(crate) fn build(
     credential: &str,
     scope_override: Option<&str>,
 ) -> Result<CredentialProviderArc, String> {
-    let sa_json = read_credential(credential)?;
-    let sa: ServiceAccount = serde_json::from_str(&sa_json)
-        .map_err(|e| format!("service-account JSON is invalid: {e}"))?;
-    let der = pem_to_pkcs8_der(&sa.private_key)?;
-    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
-        .map_err(|e| format!("service-account private_key is not a valid PKCS#8 RSA key: {e}"))?;
+    let (sa, key_pair) = parse_service_account(credential)?;
 
     let signer = Arc::new(Signer {
         key_pair,
@@ -55,7 +53,7 @@ pub(crate) fn build(
         issuer: sa.client_email,
         token_uri: sa.token_uri,
         scope: scope_override.unwrap_or(DEFAULT_SCOPE).to_string(),
-        http: reqwest::Client::new(),
+        http: super::minter_client(),
     });
 
     let minter: Minter = Arc::new(move || {
@@ -63,6 +61,61 @@ pub(crate) fn build(
         Box::pin(async move { signer.mint().await })
     });
     Ok(super::bearer_token::spawn(minter))
+}
+
+/// Parse + fully validate a `jwt-bearer` credential: read the SA JSON (inline or `@file`), vet its
+/// `token_uri` (SSRF/https), and parse the PKCS#8 RSA key. Shared by [`build`] (which keeps the key) and
+/// [`validate_credential`] (which discards it), so the config `--validate` dry-run and the boot/apply
+/// path apply IDENTICAL checks with identical error messages — they can never diverge.
+fn parse_service_account(
+    credential: &str,
+) -> Result<(ServiceAccount, ring::signature::RsaKeyPair), String> {
+    let sa_json = read_credential(credential)?;
+    let sa: ServiceAccount = serde_json::from_str(&sa_json)
+        .map_err(|e| format!("service-account JSON is invalid: {e}"))?;
+    // Defense in depth: the SA JSON's token_uri is the POST target for the signed assertion. Vet it the
+    // same way oauth-client-credentials' token_url is vetted — https for a public host (http only for
+    // loopback/private) and never a cloud-metadata/IMDS endpoint. The minter client already refuses
+    // redirects; this closes the direct-target case. (found: 1.4.0 audit, egress-auth.)
+    validate_token_uri(&sa.token_uri)?;
+    let der = pem_to_pkcs8_der(&sa.private_key)?;
+    let key_pair = ring::signature::RsaKeyPair::from_pkcs8(&der)
+        .map_err(|e| format!("service-account private_key is not a valid PKCS#8 RSA key: {e}"))?;
+    Ok((sa, key_pair))
+}
+
+/// Validate a `jwt-bearer` credential WITHOUT constructing the provider — the config `--validate`
+/// dry-run entry point (which does not build the app, so it otherwise never reaches [`build`], leaving
+/// malformed SA JSON / non-PKCS#8 keys to surface only at boot/apply). Runs the exact same checks as
+/// [`build`]. (found: 1.4.0 audit, egress-auth.)
+pub(crate) fn validate_credential(credential: &str) -> Result<(), String> {
+    parse_service_account(credential).map(|_| ())
+}
+
+/// Vet the service-account `token_uri` (the POST target for the signed assertion) with the same two
+/// guards `oauth-client-credentials`' `token_url` gets: a case-insensitive https requirement (http only
+/// for a loopback/private endpoint) and the shared cloud-metadata/IMDS denylist. The token_uri comes from
+/// the SA JSON, not a config field, so there are no per-provider allow-overrides — the default denylist
+/// applies. Reuses `config_validate`'s SSRF primitives so this can never diverge from the config path.
+fn validate_token_uri(token_uri: &str) -> Result<(), String> {
+    use crate::config_validate::{
+        extract_normalized_host, host_is_private_or_loopback, scheme_is, ssrf_blocked_host,
+    };
+    let host_private = extract_normalized_host(token_uri)
+        .as_deref()
+        .map(host_is_private_or_loopback)
+        .unwrap_or(false);
+    if !(scheme_is(token_uri, "https") || (host_private && scheme_is(token_uri, "http"))) {
+        return Err(format!(
+            "service-account token_uri must use https for a public host (got '{token_uri}'); it receives the signed JWT assertion, so plaintext http is permitted only for a private/loopback endpoint"
+        ));
+    }
+    if let Some(host) = ssrf_blocked_host(token_uri, &[], false, &[]) {
+        return Err(format!(
+            "service-account token_uri '{token_uri}' targets a blocked cloud-metadata host '{host}' (the signed assertion would be POSTed there; cloud-metadata/IMDS endpoints are denied)"
+        ));
+    }
+    Ok(())
 }
 
 impl Signer {
@@ -186,6 +239,10 @@ fn default_token_uri() -> String {
 #[derive(serde::Deserialize)]
 struct TokenResponse {
     access_token: String,
+    #[serde(
+        default = "super::default_expires_in",
+        deserialize_with = "super::deserialize_expires_in"
+    )]
     expires_in: u64,
 }
 
@@ -223,6 +280,31 @@ mod tests {
         let json = r#"{"client_email":"x@y.iam.gserviceaccount.com"}"#;
         assert_eq!(read_credential(json).unwrap(), json);
         assert_eq!(read_credential("  {\"a\":1}").unwrap(), "  {\"a\":1}");
+    }
+
+    // 1.4.0 audit (egress-auth): the SA JSON's token_uri is the POST target for the signed assertion,
+    // so it gets the same https + cloud-metadata guards as oauth-client-credentials' token_url.
+    #[test]
+    fn validate_token_uri_requires_https_for_public_and_blocks_metadata() {
+        assert!(validate_token_uri("https://oauth2.googleapis.com/token").is_ok());
+        // plaintext http to a public host would expose the assertion on the wire
+        assert!(validate_token_uri("http://oauth2.googleapis.com/token").is_err());
+        // http to a loopback/private endpoint is permitted (a local token endpoint)
+        assert!(validate_token_uri("http://127.0.0.1:8080/token").is_ok());
+        // cloud-metadata / IMDS is denied even over https (SSRF to the direct target)
+        assert!(validate_token_uri("https://metadata.google.internal/token").is_err());
+        assert!(validate_token_uri("https://169.254.169.254/token").is_err());
+    }
+
+    // 1.4.0 audit (egress-auth): validate_credential is the config `--validate` dry-run entry point; it
+    // must catch a malformed SA JSON and an SSRF token_uri without constructing the provider.
+    #[test]
+    fn validate_credential_rejects_malformed_json_and_ssrf_token_uri() {
+        assert!(validate_credential("not json").is_err());
+        // Valid JSON, but token_uri targets IMDS → rejected before the key is even parsed.
+        let imds = r#"{"client_email":"x@y.iam.gserviceaccount.com","private_key":"-----BEGIN PRIVATE KEY-----\nSGVsbG8=\n-----END PRIVATE KEY-----\n","token_uri":"https://169.254.169.254/token"}"#;
+        let e = validate_credential(imds).expect_err("IMDS token_uri must be rejected");
+        assert!(e.contains("metadata") || e.contains("169.254"), "got: {e}");
     }
 
     /// M1: the `scope` threaded from provider config lands VERBATIM in the assertion claims (this is

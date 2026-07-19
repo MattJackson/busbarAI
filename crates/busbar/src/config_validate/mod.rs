@@ -18,6 +18,27 @@ use crate::net_guard::{
 /// Validate the loaded configuration and collect all errors at once.
 /// Returns Ok(()) if valid; Err(Vec<String>) with all validation failures otherwise.
 pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
+    validate_with_unset(cfg, &[])
+}
+
+/// As [`validate`], but told which env-var names were UNSET during a Lenient (`--validate` / admin
+/// dry-run) load. In Lenient mode an unset `${VAR}` is spliced in as the bare name `VAR` (see
+/// `config::EnvSubst::Lenient`), so a URL field that env-templates an unset variable resolves to a
+/// scheme-less placeholder and would false-positive the https / SSRF checks. Such a value is validated
+/// for real at boot (where an unset var is a hard error), so `--validate` skips the URL-format checks
+/// for it here. (found: 1.4.0 audit, config-reload.)
+pub(crate) fn validate_with_unset(
+    cfg: &RootCfg,
+    unset_env_vars: &[String],
+) -> Result<(), Vec<String>> {
+    // A URL value that contains an unset env-var NAME is a not-yet-resolved `${VAR}` placeholder in this
+    // Lenient load; env-var names are distinctive UPPER_SNAKE tokens, so a real (lowercase-host) URL
+    // won't collide. Empty list (the boot / default `validate` path) ⇒ this is always false.
+    let is_env_placeholder = |v: &str| {
+        unset_env_vars
+            .iter()
+            .any(|u| !u.is_empty() && v.contains(u.as_str()))
+    };
     let mut errors = Vec::new();
 
     // The metadata host-lists are matched by EXACT IP/hostname (see `host_matches_any`); a CIDR/slash
@@ -276,8 +297,9 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
         // Case-INSENSITIVE scheme check (RFC 3986 §3.1) — a raw `starts_with("https://")` rejected
         // the valid uppercase spelling reqwest would accept, and diverged from the webhook guard's
         // `scheme_is`. (found: audit c2r5.)
-        let scheme_ok =
-            scheme_is(base_url, "https") || (host_is_local && scheme_is(base_url, "http"));
+        let scheme_ok = is_env_placeholder(base_url)
+            || scheme_is(base_url, "https")
+            || (host_is_local && scheme_is(base_url, "http"));
         if !scheme_ok {
             errors.push(if scheme_is(base_url, "http") {
                 // An http:// scheme that failed the check ⇒ the host is public (or unparseable):
@@ -401,8 +423,9 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     .as_deref()
                     .map(host_is_private_or_loopback)
                     .unwrap_or(false);
-                let tu_scheme_ok =
-                    scheme_is(tu, "https") || (host_private && scheme_is(tu, "http"));
+                let tu_scheme_ok = is_env_placeholder(tu)
+                    || scheme_is(tu, "https")
+                    || (host_private && scheme_is(tu, "http"));
                 if !tu_scheme_ok {
                     errors.push(if scheme_is(tu, "http") {
                         format!(
@@ -438,6 +461,25 @@ pub(crate) fn validate(cfg: &RootCfg) -> Result<(), Vec<String>> {
                     "provider '{}' uses auth: oauth-client-credentials but has no `scope`",
                     provider_name
                 ));
+            }
+        }
+
+        // jwt-bearer: dry-run key validation. `build()` (SA-JSON parse + PKCS#8 key check + token_uri
+        // SSRF) does NOT run on the `--validate` path, so a malformed credential otherwise surfaces only
+        // at boot/apply. Validate it here IF the credential env var is actually set (an unset var can't
+        // be validated — it is checked at boot, where unset is a hard error). (found: 1.4.0 audit.)
+        if matches!(
+            provider_cfg.auth,
+            Some(crate::config::ProviderAuth::JwtBearer)
+        ) {
+            let cred = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
+            if !cred.trim().is_empty() {
+                if let Err(e) = crate::egress_auth::jwt_bearer::validate_credential(&cred) {
+                    errors.push(format!(
+                        "provider '{provider_name}' jwt-bearer credential (from ${}) is invalid: {e}",
+                        provider_cfg.api_key_env
+                    ));
+                }
             }
         }
     }
@@ -1417,7 +1459,7 @@ fn percent_decode_host(host: &str) -> String {
 /// `observability::scheme_is` uses for webhook URLs. A raw `starts_with("https://")` rejects the
 /// valid uppercase spelling `HTTPS://host/` that reqwest's `Url::parse` lowercases and accepts, so
 /// the provider base_url scheme check must match the webhook guard's case-insensitivity. (audit c2r5.)
-fn scheme_is(url: &str, scheme: &str) -> bool {
+pub(crate) fn scheme_is(url: &str, scheme: &str) -> bool {
     url.split_once("://")
         .is_some_and(|(s, _)| s.eq_ignore_ascii_case(scheme))
 }
@@ -1428,7 +1470,7 @@ fn strip_scheme(url: &str) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")).then_some(rest)
 }
 
-fn extract_normalized_host(url: &str) -> Option<String> {
+pub(crate) fn extract_normalized_host(url: &str) -> Option<String> {
     // Strip the scheme (case-insensitively — see `scheme_is`). The host extraction is
     // scheme-agnostic; accept either prefix so an `http://` upstream is still metadata-checked.
     let rest = strip_scheme(url)?;
@@ -1493,7 +1535,7 @@ fn extract_normalized_host(url: &str) -> Option<String> {
 /// off-box wiretap), while a PUBLIC host must use `https://` (cleartext would leak the API key on the
 /// wire). This is NOT the SSRF decision — under the metadata-denylist model these hosts are ALLOWED
 /// as upstreams; this predicate only governs whether plaintext is acceptable for the hop.
-fn host_is_private_or_loopback(host: &str) -> bool {
+pub(crate) fn host_is_private_or_loopback(host: &str) -> bool {
     use std::net::IpAddr;
 
     let host_lc = host.to_ascii_lowercase();
@@ -1647,7 +1689,7 @@ fn host_matches_any(host: &str, entries: &[String]) -> bool {
 ///   decimal-int, IPv4-mapped/compatible IPv6, trailing-dot — mirroring how a block entry blocks
 ///   all spellings; a hostname entry matches case-insensitively, trailing dot stripped). Allow
 ///   always wins: a host on the denylist that ALSO appears in `allow_overrides` is permitted.
-fn ssrf_blocked_host(
+pub(crate) fn ssrf_blocked_host(
     url: &str,
     allow_overrides: &[String],
     allow_all: bool,

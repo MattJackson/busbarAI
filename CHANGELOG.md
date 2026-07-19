@@ -9,7 +9,7 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Removed**, **Fixed**, **Security**. Migration steps for a breaking change appear as a bold **Migration**
 item under **Changed**.
 
-## [1.4.0], 2026-07-18
+## [1.4.0], 2026-07-19
 
 ### Added
 
@@ -34,11 +34,34 @@ item under **Changed**.
   `auth: oauth-client-credentials`).
 - **`token_url` and `scope` provider fields**, consumed by the OAuth auth mechanisms above.
 
-  The support surface is now **6 protocols × 6 auth mechanisms**: any endpoint speaking one of the six wire
-  protocols and one of the six auth styles is a `providers.yaml` entry, no code change.
+  The support surface is now **6 protocols × 6 auth mechanisms**. To be clear on direction: these are
+  **egress** auth mechanisms — how Busbar authenticates OUTWARD to each upstream AI provider (Busbar →
+  provider), configured per provider in `providers.yaml`. They are unrelated to how clients authenticate
+  INWARD to Busbar (client → Busbar), which is the separate `auth:` client-token / virtual-key layer. Any
+  upstream speaking one of the six wire protocols and one of the six egress auth styles is a config entry,
+  no code change.
 
 ### Changed
 
+- **Default worker-thread count now scales to the box.** The async worker pool previously defaulted to
+  `min(cores, 4)`, which pinned the CPU-bound request path (parse, translate, serialize) to ~4 cores no
+  matter how large the machine — throughput plateaued regardless of core count. The default is now one
+  worker per available core (`available_parallelism`, which respects CPU affinity and cgroup quota), so
+  **throughput scales linearly with cores out of the box** — ~7,650 req/s per core, ~122k req/s on 16 cores
+  at 100% success in the [published benchmark](https://getbusbar.com/performance), with added latency flat
+  at ~38 µs. Each worker carries a thread stack and its own allocator arena, so idle memory grows slowly
+  with the count; footprint-sensitive sidecars should set `BUSBAR_WORKER_THREADS=1` (or `2`). No config or
+  API change. The reproducible throughput/scaling harness and raw per-core data are checked in under
+  `bench/scaling/`.
+- **Allocator: jemalloc with a background purge thread.** The request hot path holds a few copies of each
+  request body while it is parsed and forwarded, so peak RSS tracks `peak concurrency × payload size`. The
+  system allocator (glibc) almost never returns freed pages to the OS, so after a big-payload burst RSS
+  stayed pinned at the peak indefinitely — memory read as a one-way ratchet even though the live set had
+  collapsed. Busbar now uses jemalloc with `background_thread` enabled: freed pages return to the OS after a
+  short decay, so memory **plateaus** under sustained load and **falls back toward idle** when the load
+  subsides (measured: a ~1.2 GB plateau under a 5-minute 150 KB-payload soak drops to ~250 MB within ~30 s of
+  the load stopping). It remains bounded — a function of in-flight work, never unbounded growth. Cost: ~450 KB
+  of binary. Reproduction harness in `bench/memory/`.
 - `ring` and `base64` are now direct dependencies (both were already in the lockfile via rustls) — used for
   the RS256 JWT signature and the PKCS#8/base64url handling in `jwt-bearer`. No new crates enter the tree.
 - Streaming: for a cross-protocol stream whose backend reports token usage in a SEPARATE trailing chunk
@@ -51,11 +74,22 @@ item under **Changed**.
 
 ### Fixed
 
-- **Security — OAuth `token_url` SSRF/scheme:** the `token_url` a `oauth-client-credentials` provider POSTs
-  the client secret to now runs through the SAME SSRF/cloud-metadata denylist and case-insensitive https
-  requirement as `base_url`. Previously it had only a case-sensitive `http://` check (so `HTTPS://`,
-  scheme-less, or an uppercase scheme slipped past) and NO metadata guard, so a typo'd/templated `token_url`
-  pointing at IMDS or `metadata.google.internal` could leak the secret.
+- **Security — OAuth egress SSRF hardening (config-time AND runtime):** the `token_url` a
+  `oauth-client-credentials` provider POSTs the client secret to now runs through the SAME SSRF/cloud-metadata
+  denylist and case-insensitive https requirement as `base_url` (previously only a case-sensitive `http://`
+  check with NO metadata guard, so a typo'd/templated `token_url` pointing at IMDS or
+  `metadata.google.internal` could leak the secret). Additionally: (a) both self-minting OAuth clients
+  (`jwt-bearer`, `oauth-client-credentials`) now **refuse HTTP redirects and carry connect/overall timeouts**
+  — the credential rides in the POST body, so a 307/308 from a compromised token endpoint would otherwise
+  re-POST the plaintext `client_secret` / signed assertion to a redirect target the boot-time URL check never
+  saw; (b) the `jwt-bearer` service-account `token_uri` now gets the same https + metadata denylist vetting as
+  `token_url`; and (c) `busbar --validate` now dry-run-validates a `jwt-bearer` credential's SA JSON + PKCS#8
+  key (when the env var is set), instead of surfacing malformed key material only at boot/apply.
+- An aborted cross-protocol **gemini JSON-array** stream now emits exactly ONE trailing error element (a
+  mid-cycle change had it wrap the native error frame AND append a second one). `busbar --validate` no longer
+  reports false errors on a config that env-templates its `base_url` / `token_url` (`${VAR}`) when the variable
+  is unset (a Lenient-mode placeholder was failing the URL/https checks it will pass at boot). Streaming
+  Cohere→X hops now preserve `message.tool_plan` (the pre-tool-call reasoning), matching the non-stream path.
 - `jwt-bearer` now honors a configured `scope:` (it was dropped, so the default `cloud-platform` scope always
   won). JWT claims are built with a JSON serializer instead of string interpolation (a `"`/`\` in
   `client_email`/`scope` can no longer malform or inject into the claim set).
@@ -90,7 +124,7 @@ item under **Changed**.
   (resolved once at boot from protocol + auth style) produces each request's outbound auth headers via
   `lane.credential.headers_for(...)`, replacing per-writer `auth_headers`/`sign_request`. Behavior-preserving
   — every protocol emits byte-identical auth — and it sets up a self-minting (OAuth/Vertex) credential later.
-- Release profile is `opt-level = 3` (was 2). New `BUSBAR_WORKER_THREADS` env knob hard-caps the Tokio
+- Release profile is `opt-level = 3` (was `s`). New `BUSBAR_WORKER_THREADS` env knob hard-caps the Tokio
   worker pool (default `min(cores, 4)`, ~5% lower RSS on many-core hosts). Deduped `getrandom` to a single
   0.3 line (dropped the 0.4 copy).
 - All workspace crates are now versioned in lockstep at `1.3.3`. The internal `publish = false` support

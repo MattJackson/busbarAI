@@ -1039,7 +1039,7 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `base_url` SSRF | `base_url` resolves to a cloud-metadata/IMDS host (e.g. `169.254.169.254`, `100.100.100.200`, `metadata.google.internal`) or uses an alternate IP encoding (decimal-int, hex, octal, IPv4-mapped IPv6) that decodes to a metadata address |
 | `base_url` plaintext | `base_url` uses `http://` with a public (non-private, non-loopback) host: plain HTTP to a public host would expose the API key on the wire |
 | `error_map` value unknown | A value in `error_map` is not one of the nine canonical disposition classes |
-| `auth` value unknown | `auth` field value not `bearer` or `api-key` |
+| `auth` value unknown | `auth` field value not `bearer`, `api-key`, `jwt-bearer`, or `oauth-client-credentials` |
 | `affinity.mode` value unknown | `affinity.mode` not `session` (the only supported value) |
 | Removed `token` field set | The 1.0.0-removed `auth.token` field is present, rejected at parse as an unknown field (`unknown field \`token\``); move its value into `client_tokens` |
 | `path` malformed | `path` does not begin with `/` |

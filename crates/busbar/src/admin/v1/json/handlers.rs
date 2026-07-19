@@ -892,10 +892,7 @@ pub(crate) async fn reload_config(
     match outcome {
         Ok(next) => {
             let installed = Arc::new(next);
-            handle.swap(installed.clone());
-            // Re-establish active health probing for the NEW snapshot (reloaded lanes were otherwise
-            // never probed); the prior generation's probers exit once the old snapshot is released.
-            crate::health::spawn_probers(&installed);
+            handle.swap(installed.clone()); // swap re-spawns health probers for the new snapshot
             audit::AUDIT.record_by(
                 "config.reload",
                 "config:disk",
@@ -995,9 +992,7 @@ pub(crate) async fn apply_config(
     match outcome {
         Ok(next) => {
             let installed = Arc::new(next);
-            handle.swap(installed.clone());
-            // Re-establish active health probing for the NEW snapshot (see config.reload above).
-            crate::health::spawn_probers(&installed);
+            handle.swap(installed.clone()); // swap re-spawns health probers for the new snapshot
             audit::AUDIT.record_by(
                 "config.apply",
                 "config:body",

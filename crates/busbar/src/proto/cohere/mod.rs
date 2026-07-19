@@ -64,6 +64,11 @@ const ET_MESSAGE_END: &str = "message-end";
 const ET_CONTENT_START: &str = "content-start";
 /// Cohere v2 stream `type` field value for the content-delta event.
 const ET_CONTENT_DELTA: &str = "content-delta";
+/// Cohere v2 stream `type` field value for the tool-plan-delta event — the streamed counterpart of
+/// the non-stream `message.tool_plan` (the assistant's pre-tool-call reasoning). Emitted, one token
+/// per frame, ahead of the `tool-call-start` frames; the token text rides at
+/// `delta.message.tool_plan`.
+const ET_TOOL_PLAN_DELTA: &str = "tool-plan-delta";
 /// Cohere v2 stream `type` field value for the content-end event.
 const ET_CONTENT_END: &str = "content-end";
 /// Cohere v2 stream `type` field value for the tool-call-start event.

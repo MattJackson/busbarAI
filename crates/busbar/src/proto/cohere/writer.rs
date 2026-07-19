@@ -609,6 +609,17 @@ impl ProtocolWriter for CohereWriter {
         for block in &resp.content {
             match block {
                 crate::ir::IrBlock::Text { text, .. } => {
+                    // KNOWN LIMITATION (audit finding #7): Cohere's `message.tool_plan` (the
+                    // assistant's pre-tool-call reasoning) is READ into a plain leading `IrBlock::Text`
+                    // by both cohere readers (non-stream `read_response`, streaming
+                    // `tool-plan-delta`). The IR has NO flag distinguishing that Text FROM an ordinary
+                    // content Text, so on an X→Cohere hop we cannot reliably tell which leading Text
+                    // was a `tool_plan` and reshape it back into the native `tool_plan` slot — a
+                    // heuristic ("the leading Text when tool_calls follow") would misclassify a genuine
+                    // leading assistant message as reasoning. The reasoning is therefore re-emitted as
+                    // `content` (lossless in text, but reshaped from `tool_plan` to `content`).
+                    // Faithful `tool_plan` round-tripping would require a first-class IR marker; until
+                    // one exists, preserving the text as content is the correct, non-lossy choice.
                     content_arr.push(serde_json::json!({ "type": "text", "text": text }));
                 }
                 crate::ir::IrBlock::ToolUse {

@@ -305,11 +305,16 @@ impl AppHandle {
             .clone()
     }
 
-    /// Atomically replace the current snapshot (the admin `apply` seam). RESERVED: the config-apply
-    /// mutation path is the only caller; wired when apply lands.
-    #[allow(dead_code)]
+    /// Atomically replace the current snapshot (the admin config-mutation seam: reload, apply, and every
+    /// hook/auth mutation). Re-spawns the health probers against `next`: probers hold a `Weak<App>` and
+    /// exit once the App they were spawned against drops (audit H2), so EVERY swap must re-attach them —
+    /// otherwise the first admin mutation replaces the boot App, the boot App drops as in-flight requests
+    /// drain, its probers exit, and active/dead health probing silently STOPS even though lanes/health are
+    /// unchanged (audit 1.4.0: only reload/apply re-spawned; the six hook/auth-mutation swaps did not).
+    /// Doing it in `swap` itself makes it impossible for a future swap site to forget.
     pub(crate) fn swap(&self, next: Arc<App>) {
-        *self.current.write().unwrap_or_else(|e| e.into_inner()) = next;
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = next.clone();
+        crate::health::spawn_probers(&next);
     }
 }
 

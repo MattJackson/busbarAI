@@ -92,11 +92,17 @@ impl GovState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Bound the carry map: a key seen once (leaving a <1c remainder) then never again would
             // keep its entry forever — slow unbounded growth under key churn. Past a threshold, prune
-            // stale-window entries (mirrors the rate map's sweep); the dropped sub-cent remainder is
-            // the documented acceptable loss. Threshold keeps the O(n) scan rare (amortized O(1)).
+            // DEFINITELY-stale entries; the dropped sub-cent remainder is the documented acceptable loss.
+            // Threshold keeps the O(n) scan rare (amortized O(1)). Staleness must be PERIOD-AGNOSTIC: a
+            // deployment can mix daily/monthly/total keys, so their `window` values differ from THIS
+            // request's `window` — the old `retain(w == window)` dropped valid CURRENT entries for keys on
+            // a different budget period (audit 1.4.0). Instead drop only entries older than the longest
+            // bounded window (monthly ≤ 31 d), so no still-current entry for ANY period is pruned; the
+            // all-time window (`w == 0`, `total`) never ages out.
             const TOKEN_SPEND_CARRY_SWEEP_THRESHOLD: usize = 4096;
             if carry.len() > TOKEN_SPEND_CARRY_SWEEP_THRESHOLD {
-                carry.retain(|_, &mut (w, _)| w == window);
+                let max_window = 31 * super::SECS_PER_DAY;
+                carry.retain(|_, &mut (w, _)| w == 0 || w.saturating_add(max_window) > now);
             }
             let entry = carry.entry(key_id.to_string()).or_insert((window, 0));
             // Reset the remainder when the budget window rolls over, so a sub-cent remainder is

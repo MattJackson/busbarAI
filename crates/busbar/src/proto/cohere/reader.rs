@@ -622,6 +622,40 @@ impl ProtocolReader for CohereReader {
                     }
                 }
             }
+            // Cohere v2 streams the assistant's pre-tool-call reasoning as `tool-plan-delta`
+            // frames (one token each at `delta.message.tool_plan`) that PRECEDE the
+            // `tool-call-start` frames — the streamed counterpart of the non-stream reader's
+            // `message.tool_plan` fold (audit H4). Without reading it here, a STREAMING Cohere→X hop
+            // still lost that reasoning while the non-stream hop preserved it (audit finding #7).
+            // Map the plan onto the SAME leading Text block a `content-delta` would open (via the
+            // dynamic `cohere_text_ir_index` seam): it claims IR index 0 by first appearance, and the
+            // following `tool-call-start` offsets to 1+, mirroring the non-stream case where the plan
+            // is a leading Text ahead of the tool calls. Like a normal streamed Text this Text carries
+            // no marker distinguishing it FROM a plain content Text — the IR has no tool_plan flag — so
+            // a downstream Cohere writer re-emits it as `content`, not `tool_plan` (documented in the
+            // writer; the reasoning survives, its native `tool_plan` slot does not).
+            ET_TOOL_PLAN_DELTA => {
+                let text_idx = cohere_text_ir_index(state);
+                if !state.text_block_open {
+                    state.text_block_open = true;
+                    out.push(IrStreamEvent::BlockStart {
+                        index: text_idx,
+                        block: crate::ir::IrBlockMeta::Text,
+                    });
+                }
+                if let Some(text) = data
+                    .get("delta")
+                    .and_then(|d| d.get("message"))
+                    .and_then(|m| m.get("tool_plan"))
+                    .and_then(|p| p.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push(IrStreamEvent::BlockDelta {
+                        index: text_idx,
+                        delta: crate::ir::IrDelta::TextDelta(text.to_string()),
+                    });
+                }
+            }
             ET_CONTENT_END => {
                 // content-end closes the text content block at the IR index it actually CLAIMED on
                 // first appearance (`state.text_index`), NOT a hardcoded 0 — a tool may have taken 0

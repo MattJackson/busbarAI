@@ -45,7 +45,7 @@ pub(crate) fn build(
         client_secret: client_secret.to_string(),
         token_url: token_url.to_string(),
         scope: scope.to_string(),
-        http: reqwest::Client::new(),
+        http: super::minter_client(),
     });
     let minter: Minter = Arc::new(move || {
         let creds = creds.clone();
@@ -95,6 +95,10 @@ impl ClientCreds {
 #[derive(serde::Deserialize)]
 struct TokenResponse {
     access_token: String,
+    #[serde(
+        default = "super::default_expires_in",
+        deserialize_with = "super::deserialize_expires_in"
+    )]
     expires_in: u64,
 }
 
@@ -114,5 +118,19 @@ mod tests {
         // Only the FIRST colon splits id:secret, so a secret with colons is preserved. Constructed
         // outside a runtime, so no mint is spawned — this just checks the credential parse.
         assert!(build("client-abc:secret:with:colons", "https://t", "s").is_ok());
+    }
+
+    // 1.4.0 audit (egress-auth): `expires_in` must tolerate a JSON number, a numeric string (ADFS /
+    // Azure AD v1), and absence (defaulting to 1 h) — a strict u64 breaks minting for those IdPs.
+    #[test]
+    fn token_response_tolerates_expires_in_as_number_string_or_absent() {
+        let num: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"a","expires_in":3600}"#).unwrap();
+        assert_eq!(num.expires_in, 3600);
+        let s: TokenResponse =
+            serde_json::from_str(r#"{"access_token":"a","expires_in":"7200"}"#).unwrap();
+        assert_eq!(s.expires_in, 7200);
+        let absent: TokenResponse = serde_json::from_str(r#"{"access_token":"a"}"#).unwrap();
+        assert_eq!(absent.expires_in, super::super::default_expires_in());
     }
 }

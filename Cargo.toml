@@ -11,8 +11,9 @@ members = [
 [profile.release]
 # Tuned for the shipped "deploy-and-done" binary: max optimization and smallest size,
 # at the cost of slower release compiles (fine — releases are built in CI, not in the loop).
-opt-level = 3        # opt-3 for latency (CPU-bound in-proc work); ~+2.5MiB binary vs "s": ~24% smaller binary (10.9->8.3MB stripped) vs opt-3. Busbar is
-                     # I/O-bound (provider round-trip dwarfs translation CPU), so the size win is ~free on traffic.
+opt-level = 3        # opt-3 for the CPU-bound in-process work (parse/translate/serialize on the hot
+                     # path). Larger than opt-level "s", but the stripped binary is still small (~11 MB)
+                     # and the extra size is negligible in production, where provider round-trips dwarf it.
 lto = "fat"          # whole-program inlining across crates: faster hot path + smaller binary
 codegen-units = 1    # let LTO optimize across the whole crate graph (best codegen, smaller output)
 strip = true         # strip symbols from the shipped binary (much smaller; set RUST_BACKTRACE aside)

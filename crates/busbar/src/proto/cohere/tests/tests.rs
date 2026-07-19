@@ -4173,3 +4173,141 @@ fn n_candidate_count_never_emitted_on_cohere() {
     let ir = CohereReader.read_request(&body).expect("read_request");
     assert_eq!(ir.n, None, "the Cohere reader must never populate n");
 }
+
+/// audit finding #7 (streaming symmetry): the STREAMING Cohere reader must preserve
+/// `tool-plan-delta` the same way the non-stream `read_response` folds `message.tool_plan` — as a
+/// LEADING Text block ahead of the tool call. Without it a STREAMING Cohere→X hop lost the
+/// assistant's pre-tool-call reasoning while the non-stream hop preserved it.
+#[test]
+fn test_stream_tool_plan_delta_becomes_leading_text_before_tool_call() {
+    let mut state = crate::ir::StreamDecodeState::default();
+    let reader = CohereReader;
+
+    // message-start
+    reader.read_response_events(
+        "",
+        &serde_json::json!({"type": ET_MESSAGE_START, "delta": {"message": {"role": "assistant"}}}),
+        &mut state,
+    );
+
+    // tool-plan-delta x2 — opens the leading Text block at index 0 on first appearance, then a
+    // TextDelta per token.
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({"type": ET_TOOL_PLAN_DELTA, "delta": {"message": {"tool_plan": "I will "}}}),
+        &mut state,
+    );
+    assert!(
+        matches!(
+            &evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text
+            }
+        ),
+        "first tool-plan-delta must open a leading Text block at index 0, got {evs:?}"
+    );
+    assert!(
+        matches!(
+            &evs[1],
+            crate::ir::IrStreamEvent::BlockDelta {
+                index: 0,
+                delta: crate::ir::IrDelta::TextDelta(t)
+            } if t == "I will "
+        ),
+        "the plan token must be a TextDelta, got {evs:?}"
+    );
+
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({"type": ET_TOOL_PLAN_DELTA, "delta": {"message": {"tool_plan": "check the weather."}}}),
+        &mut state,
+    );
+    assert_eq!(evs.len(), 1, "a subsequent token emits only a TextDelta");
+    assert!(matches!(
+        &evs[0],
+        crate::ir::IrStreamEvent::BlockDelta {
+            index: 0,
+            delta: crate::ir::IrDelta::TextDelta(t)
+        } if t == "check the weather."
+    ));
+
+    // tool-call-start — the plan Text block stays open at index 0 (Cohere sends no content-end for
+    // a plan), so the tool offsets to index 1, exactly as a content Text at 0 pushes a following
+    // tool to 1. This mirrors the non-stream fold: the plan is the LEADING block, the tool follows.
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({
+            "type": ET_TOOL_CALL_START,
+            "index": 0,
+            "delta": {"message": {"tool_calls": {"id": "t1", "type": "function", "function": {"name": "get_weather", "arguments": ""}}}}
+        }),
+        &mut state,
+    );
+    assert!(
+        matches!(
+            &evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 1,
+                block: crate::ir::IrBlockMeta::ToolUse { id, name }
+            } if id == "t1" && name == "get_weather"
+        ),
+        "the tool must open at index 1, after the leading plan Text at index 0, got {evs:?}"
+    );
+}
+
+/// audit finding #7 (known writer limitation): the IR carries a folded `tool_plan` as a plain
+/// leading `IrBlock::Text` with no distinguishing flag, so an X→Cohere hop re-emits it as `content`,
+/// NOT as the native `tool_plan` slot. This test pins that documented, non-lossy behavior (the text
+/// survives; only its native slot is reshaped) so a future accidental change is caught.
+#[test]
+fn test_write_response_reemits_folded_tool_plan_as_content_not_tool_plan() {
+    let writer = CohereWriter;
+    let resp = crate::ir::IrResponse {
+        role: crate::ir::IrRole::Assistant,
+        content: vec![
+            crate::ir::IrBlock::Text {
+                text: "First I will check the weather.".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            },
+            crate::ir::IrBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "get_weather".to_string(),
+                input: serde_json::json!({"city": "SF"}),
+                cache_control: None,
+            },
+        ],
+        stop_reason: None,
+        usage: crate::ir::IrUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        },
+        model: None,
+        id: None,
+        created: None,
+        system_fingerprint: None,
+        stop_sequence: None,
+        logprobs: Vec::new(),
+    };
+    let out = writer.write_response(&resp);
+    let message = out.get("message").expect("message");
+    assert!(
+        message.get("tool_plan").is_none(),
+        "the IR cannot distinguish a folded tool_plan from a plain leading Text, so it is NOT \
+         re-emitted as tool_plan: {out}"
+    );
+    let content = message
+        .get("content")
+        .and_then(|c| c.as_array())
+        .expect("content array");
+    assert!(
+        content
+            .iter()
+            .any(|b| b.get("text").and_then(|t| t.as_str())
+                == Some("First I will check the weather.")),
+        "the reasoning text must survive as a content text block: {out}"
+    );
+}

@@ -22,6 +22,52 @@ pub(crate) mod bearer_token;
 pub(crate) mod jwt_bearer;
 pub(crate) mod oauth_client_credentials;
 
+/// HTTP client used by the self-minting OAuth credentials (`jwt-bearer`, `oauth-client-credentials`)
+/// to POST to a token endpoint. Hardened like the data-path upstream client (see `main.rs`):
+///   * `redirect: none` — the credential (a signed assertion, or `client_secret`) rides in the POST
+///     BODY, so reqwest's cross-host Authorization-stripping does not protect it; a 307/308 from a
+///     compromised or typo'd token endpoint would re-POST the plaintext secret to the redirect target
+///     (169.254.169.254 / localhost / RFC1918). The boot-time SSRF check only vets the configured URL
+///     string, never a runtime redirect target, so following redirects reopens that exfil vector.
+///   * bounded connect + overall timeouts — a stalled token endpoint must not hang the mint/refresh
+///     future forever (the refresh loop only retries on `Err`, so a hang would silently freeze the
+///     lane's token and serve an empty bearer → upstream 401).
+pub(crate) fn minter_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build OAuth token-minter HTTP client")
+}
+
+/// Default token TTL when a token endpoint omits `expires_in` (RFC 6749 §5.1 makes it RECOMMENDED, not
+/// required): a conservative 1 h so the token still refreshes on schedule.
+pub(crate) fn default_expires_in() -> u64 {
+    3600
+}
+
+/// Deserialize an OAuth `expires_in` TOLERANTLY. RFC 6749 specifies a number of seconds, but real IdPs
+/// vary — ADFS and Azure AD v1 emit it as a JSON STRING (`"3600"`), and some omit it (handled by
+/// `#[serde(default = "default_expires_in")]` on the field). A strict `u64` field breaks token minting
+/// for those providers, silently downing the lane. Accept a number or a numeric string.
+pub(crate) fn deserialize_expires_in<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(u64),
+        Str(String),
+    }
+    match NumOrStr::deserialize(d)? {
+        NumOrStr::Num(n) => Ok(n),
+        NumOrStr::Str(s) => s.trim().parse::<u64>().map_err(serde::de::Error::custom),
+    }
+}
+
 /// Produces the outbound auth headers for a single upstream request.
 ///
 /// `key` is the per-request credential the caller resolved — the lane's configured key for
