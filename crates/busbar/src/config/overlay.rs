@@ -45,7 +45,9 @@ pub(crate) fn persist(
             OverlayReadState::Unreadable => {
                 tracing::error!(
                     path = %p.display(),
-                    "config overlay exists but is unreadable/corrupt; REFUSING to overwrite it (would                      drop hook-deletion tombstones and could resurrect a deleted hook). This apply is                      NOT persisted — fix or remove the overlay file to restore durability."
+                    "config overlay exists but is unreadable/corrupt; REFUSING to overwrite it (would \
+                     drop hook-deletion tombstones and could resurrect a deleted hook). This apply is \
+                     NOT persisted — fix or remove the overlay file to restore durability."
                 );
                 return;
             }

@@ -33,6 +33,11 @@ item under **Changed**.
   entry, not code. Azure OpenAI via Entra ID lands the same way (`protocol: openai` +
   `auth: oauth-client-credentials`).
 - **`token_url` and `scope` provider fields**, consumed by the OAuth auth mechanisms above.
+- **Oracle OCI Generative AI, delivered as configuration** — the `oci-genai` catalog entry targets OCI's
+  OpenAI-compatible surface (`/openai/v1/chat/completions`, serving OCI's hosted OpenAI/Llama/xAI/Google/
+  Cohere models). Since Jan 2026 OCI issues plain API keys (`Bearer`), so no OCI request-signing is needed —
+  `protocol: openai` + `auth: bearer` with the OCI regional `base_url`. No new protocol or code; its
+  `TooManyRequests`/`QuotaExceeded`/`LimitExceeded`-in-a-400 quirk is handled by the catalog `error_map`.
 
   The support surface is now **6 protocols × 6 auth mechanisms**. To be clear on direction: these are
   **egress** auth mechanisms — how Busbar authenticates OUTWARD to each upstream AI provider (Busbar →
