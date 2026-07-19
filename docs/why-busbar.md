@@ -1,6 +1,6 @@
 # Why Busbar
 
-Busbar is the **reliability layer for your LLM traffic**: the breaker-and-failover control plane that sits between your application and every provider it calls. This page is for the person deciding whether to adopt it: the specific problems it solves, what it *enables* that you would otherwise have to build yourself, and an honest comparison with the tools you are probably weighing it against.
+Busbar is the **reliability layer for your AI traffic**: the breaker-and-failover control plane that sits between your application and every provider it calls. This page is for the person deciding whether to adopt it: the specific problems it solves, what it *enables* that you would otherwise have to build yourself, and an honest comparison with the tools you are probably weighing it against.
 
 It shares an arena with multi-provider proxies and hosted routers, but the priorities are different. Where those forward requests and list models, Busbar is built reliability-first. It knows whose fault a failure is. It fails over inside the request, before your user sees a byte. And it translates losslessly across six wire protocols, so you never trade away a provider's native features to get portability.
 
@@ -38,7 +38,7 @@ Busbar holds provider keys in one place: the process that reads the config file 
 
 Busbar is valuable before the second provider exists. Run it as a straight same-protocol passthrough in front of your one provider, no features enabled, and your posture improves the same day: the provider key moves out of every app deployment and into one process, so a leaked app credential is no longer a leaked provider account, and rotating the key is a restart, not a deployment sweep. `max_concurrent` caps a runaway loop at your ceiling instead of your bill. Every request becomes visible in `/metrics` and `/stats` where direct SDK calls are invisible. The request path is hardened whether you asked for it or not: SSRF-guarded upstreams, constant-time token checks, body caps, secrets never logged. And the cost of the extra hop is tens of microseconds, measurable per-request on your own traffic via the opt-in `Server-Timing` header.
 
-Then the constraint moves. A team whose compliance posture locks them to one provider today (a BAA that covers AWS Bedrock but not yet Anthropic, say) points their existing SDK at Busbar and changes nothing else. The day the second provider becomes possible (a better price, a better model, a signed BAA, a bad outage), it's a new lane in `config.yaml`. The application code never changes and never learns which backend answered. Without the control plane already in place, that same day starts with rewriting every LLM call site you own. The endpoint swap is a one-line change; the option it buys is the point.
+Then the constraint moves. A team whose compliance posture locks them to one provider today (a BAA that covers AWS Bedrock but not yet Anthropic, say) points their existing SDK at Busbar and changes nothing else. The day the second provider becomes possible (a better price, a better model, a signed BAA, a bad outage), it's a new lane in `config.yaml`. The application code never changes and never learns which backend answered. Without the control plane already in place, that same day starts with rewriting every AI call site you own. The endpoint swap is a one-line change; the option it buys is the point.
 
 ---
 
@@ -74,7 +74,7 @@ One auth note for Bedrock: Busbar signs outbound Bedrock requests with AWS SigV4
 
 **Busbar is a good fit if:**
 
-- You run your own infrastructure and want to own the full request path to LLM providers.
+- You run your own infrastructure and want to own the full request path to AI providers.
 - You use more than one provider and want failover, load distribution, or the ability to swap providers without code changes.
 - You need per-team or per-application cost control enforced at the control plane, before the request runs.
 - Your existing applications use different provider SDKs (OpenAI, Anthropic, Gemini, Bedrock, Cohere) and you want to standardize the routing layer without rewriting call sites.

@@ -89,7 +89,7 @@ Full field reference: [configuration.md](configuration.md).
 A protocol is the unit of busbar's scope (the count to grow is **6**, not the
 provider count). To add one:
 
-1. **Implement `ProtocolReader`** (`src/proto/mod.rs` defines the trait):
+1. **Implement `ProtocolReader`** (`crates/busbar/src/proto/mod.rs` defines the trait):
    - `read_request(body) -> IrRequest`: wire JSON → IR (ADR-0005 contract: model
      every field you can; stash adjacent fields in `IrRequest.extra`; hold
      `temperature` as the f64 it already is).
@@ -112,7 +112,7 @@ provider count). To add one:
      one-token IR request through your own `write_request`, so active health
      probing works with no extra code.
    - `clone_box`.
-3. **Register it** in `src/proto/mod.rs`: add a `Protocol::<name>()` constructor,
+3. **Register it** in `crates/busbar/src/proto/mod.rs`: add a `Protocol::<name>()` constructor,
    a `protocol_for` arm, and an entry in `ProtocolRegistry::with_builtins`. Add the
    `StreamTranslate::new` flags if it has a non-SSE wire (like Bedrock's binary
    eventstream) or a special terminator.
@@ -120,10 +120,10 @@ provider count). To add one:
    kind the IR can't represent, extend the `IrBlock` / event enums: and then every
    other writer must handle the new variant (the exhaustive matches will tell you).
 5. **Test it** through the `MockServer` harness and the cross-protocol round-trip
-   tests in `src/proto/mod.rs` (`test_probe_body_valid_for_all_protocols` already
+   tests in `crates/busbar/src/proto/mod.rs` (`test_probe_body_valid_for_all_protocols` already
    asserts every protocol produces a valid probe body).
 
-The `Reader`/`Writer` files (`src/proto/<name>.rs`) are the only per-protocol code;
+The `Reader`/`Writer` files (`crates/busbar/src/proto/<name>.rs`) are the only per-protocol code;
 the registry + IR + forward path are protocol-agnostic.
 
 ---
@@ -177,7 +177,7 @@ Notes on the seams:
   token mint), the seam to extend is `ProtocolWriter::sign_request`, the same hook
   Bedrock uses for SigV4: see the roadmap in [roadmap.md](roadmap.md).
 
-`resolve()` (`src/config/mod.rs`) merges the deployment over the catalog def; a
+`resolve()` (`crates/busbar/src/config/mod.rs`) merges the deployment over the catalog def; a
 `config.yaml` provider name not present in `providers.yaml` is a fail-loud startup
 error.
 
@@ -188,7 +188,7 @@ error.
 These are conventions visible in the code; treat the [CONTRIBUTING.md](../CONTRIBUTING.md)
 checklist as authoritative.
 
-- **SPDX header.** Every `src/*.rs` and `src/proto/*.rs` file starts with
+- **SPDX header.** Every `src/*.rs` and `crates/busbar/src/proto/*.rs` file starts with
   `// SPDX-License-Identifier: Apache-2.0` + `// Copyright (C) 2026 Busbar Inc and contributors`.
 - **No `_ =>` catch-all in the disposition/breaker matches.** The exhaustive match
   on `StatusClass`/`Disposition` is how the compiler enforces that every failure

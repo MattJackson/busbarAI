@@ -32,12 +32,16 @@ pub(crate) fn validate_with_unset(
     unset_env_vars: &[String],
 ) -> Result<(), Vec<String>> {
     // A URL value that contains an unset env-var NAME is a not-yet-resolved `${VAR}` placeholder in this
-    // Lenient load; env-var names are distinctive UPPER_SNAKE tokens, so a real (lowercase-host) URL
-    // won't collide. Empty list (the boot / default `validate` path) ⇒ this is always false.
+    // Lenient load (unset `${VAR}` is spliced in as the bare name, which has NO url scheme). Require the
+    // value to LACK a `://` scheme before treating a var-name substring match as a placeholder, so a REAL
+    // URL that merely contains an unset var name as a substring is still fully https/SSRF-checked and never
+    // over-suppressed (tightened per 1.4.0 audit; boot/reload use Strict subst, so this affects --validate
+    // only). Empty list (the boot / default `validate` path) ⇒ this is always false.
     let is_env_placeholder = |v: &str| {
-        unset_env_vars
-            .iter()
-            .any(|u| !u.is_empty() && v.contains(u.as_str()))
+        !v.contains("://")
+            && unset_env_vars
+                .iter()
+                .any(|u| !u.is_empty() && v.contains(u.as_str()))
     };
     let mut errors = Vec::new();
 

@@ -45,7 +45,10 @@
 // dirty/muzzy pages after a short decay, so busbar PLATEAUS under sustained load and falls back to
 // idle when the load subsides. `#[global_allocator]` on a static needs no `unsafe`; the background
 // purge thread is enabled at startup in `main()` via a safe runtime call (`tikv_jemalloc_ctl::
-// background_thread`), so operators get it with zero configuration.
+// background_thread`), so operators get it with zero configuration. NOT on windows-msvc: tikv-jemalloc-sys's
+// C build does not compile under native `cl.exe`, so MSVC (a shipped release target + CI gate) falls back
+// to the system allocator — the dep is target-gated in Cargo.toml and these two sites match.
+#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -347,7 +350,9 @@ fn main() {
     // Enable jemalloc's background purge thread: freed dirty/muzzy pages are returned to the OS after
     // a short idle decay, so RSS falls back to idle after a big-payload burst instead of ratcheting at
     // the peak (the glibc behavior this replaces). Safe wrapper — no `unsafe`. Best-effort: a platform
-    // without background-thread support (e.g. macOS) simply keeps jemalloc's foreground purge.
+    // without background-thread support (e.g. macOS) simply keeps jemalloc's foreground purge. Skipped on
+    // windows-msvc, which uses the system allocator (jemalloc dep is target-gated off msvc; see above).
+    #[cfg(not(target_env = "msvc"))]
     let _ = tikv_jemalloc_ctl::background_thread::write(true);
     // Worker-thread count. `BUSBAR_WORKER_THREADS` is the operator override; the DEFAULT is one worker
     // per available core (`available_parallelism`, which respects CPU affinity / cgroup quota — so it is

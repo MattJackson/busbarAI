@@ -16,16 +16,11 @@ name = "busbar"
 path = "src/main.rs"
 
 [dependencies]
-# Global allocator. The request hot path is allocation-heavy under load — each in-flight request
-# briefly holds a few copies of its body (raw bytes → parsed JSON Value → re-serialized outbound),
-# so peak RSS tracks (concurrency × payload). The system allocator (glibc) rarely returns freed
-# pages to the OS, so after a big-payload burst RSS stays pinned at the peak indefinitely. jemalloc
-# with a background purge thread (configured in main.rs) returns dirty pages after a short decay, so
-# memory PLATEAUS under load and falls back to idle when load subsides — bounded, not a ratchet.
-tikv-jemallocator = "0.6"
-# Sibling ctl crate: enable jemalloc's background purge thread at startup via a SAFE wrapper (main.rs),
-# so no `unsafe`/`export_name` is needed under this crate's `#![forbid(unsafe_code)]`.
-tikv-jemalloc-ctl = "0.6"
+# NOTE: the jemalloc global allocator is a TARGET-SPECIFIC dependency (see the
+# `[target.'cfg(not(target_env = "msvc"))'.dependencies]` block below) — NOT unconditional. tikv-jemalloc-sys's
+# C build (`sh ./configure` + make) does not build under native windows-msvc `cl.exe`, so MSVC (a shipped
+# release target + CI gate) falls back to the system allocator; the `#[global_allocator]` and ctl call in
+# main.rs are cfg-gated to match.
 # The plugin CONTRACTS (auth-module trait, routing-policy trait, projections) — the one crate both
 # the engine and every plugin build against. See api/.
 busbar-api = { path = "../api" }
@@ -151,10 +146,19 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 
-# On the SHIPPED static-musl (`FROM scratch`) binary, enable jemalloc's `disable_initial_exec_tls`:
-# jemalloc's default initial-exec TLS access model is unreliable on musl static builds and can fault
-# at startup. This feature unions with the base `tikv-jemallocator` dep above, so only musl targets
-# carry it (glibc / dev builds are unaffected). See tikv-jemallocator docs (musl guidance).
+# Global allocator: jemalloc on EVERY target EXCEPT windows-msvc. The request hot path holds a few copies
+# of each in-flight body, so peak RSS tracks (concurrency × payload); glibc never returns those pages, so
+# RSS ratcheted at the peak. jemalloc + a background purge thread (enabled via the ctl crate in main.rs,
+# a safe wrapper — no unsafe under this crate's forbid(unsafe_code)) returns dirty pages after a short
+# decay, so memory PLATEAUS under load and falls back to idle. Gated off msvc because tikv-jemalloc-sys's
+# C build does not compile under native `cl.exe`; MSVC uses the system allocator (main.rs cfg matches).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
+
+# On the SHIPPED static-musl (`FROM scratch`) binary, ALSO enable jemalloc's `disable_initial_exec_tls`:
+# jemalloc's default initial-exec TLS access model is unreliable on musl static builds and can fault at
+# startup. Unions with the not-msvc dep above, so only musl carries it (glibc / dev builds are unaffected).
 [target.'cfg(target_env = "musl")'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
 
