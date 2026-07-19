@@ -86,7 +86,10 @@ item under **Changed**.
   completion counts on its terminal frame instead of zeros. Delivery is uniform across the SSE and
   gemini-json-array paths (the response body now streams `finish()`'s content through the json-array framer,
   which previously discarded it). Behavior-preserving for OpenAI ingress (which still receives the separate
-  usage chunk) and Bedrock ingress (which carries usage in its `metadata` frame).
+  usage chunk) and Bedrock ingress (which carries usage in its `metadata` frame). **Wire-shape note:** a
+  Gemini JSON-array (non-SSE) client on a cross-protocol stream now receives one ADDITIONAL trailing array
+  element carrying the terminal `usageMetadata` that 1.3.0 silently dropped — spec-correct for native Gemini
+  streaming, but a client that counted or hashed raw array elements will see N+1 elements.
 - **Upgrade hint for the removed `auth.mode:` key.** A config that still carries the pre-`auth.chain`
   `auth.mode:` key now fails to boot with a targeted migration hint (`mode: none` → an empty/omitted
   `chain:`; `mode: token`/`apikey` → `chain: [tokens]`; `mode: passthrough` →

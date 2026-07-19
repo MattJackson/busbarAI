@@ -2071,6 +2071,15 @@ fn test_translate_openai_include_usage_to_anthropic_ingress_no_post_stop_message
     raw.extend_from_slice(&t.finish());
     let wire = String::from_utf8_lossy(&raw);
 
+    // The deferred terminal `message_delta` must carry the MERGED usage from the trailing include_usage
+    // chunk (prompt 7 / completion 11), NOT the pre-merge zeros — an ordering-only check would pass a
+    // regression that flushed the fold with zero usage, silently zeroing token accounting. (1.4.0 audit:
+    // tighten the fold assertion beyond frame ordering.)
+    assert!(
+        wire.contains("\"usage\":{\"input_tokens\":7,\"output_tokens\":11}"),
+        "the folded terminal message_delta must carry the merged usage (7 in / 11 out); wire:\n{wire}"
+    );
+
     // The SSE event sequence must end the message with `message_stop`; NO `message_delta` may
     // appear after it. Find the byte offsets of the last message_stop and any later message_delta.
     let stop_at = wire

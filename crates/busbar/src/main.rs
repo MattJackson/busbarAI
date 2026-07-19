@@ -416,9 +416,11 @@ fn main() {
     let worker_threads = worker_threads_from_env("BUSBAR_WORKER_THREADS")
         .or_else(|| worker_threads_from_env("TOKIO_WORKER_THREADS"))
         .unwrap_or_else(|| {
+            // Fall back to 1 (not 2) when core detection fails, matching v1.3.0's `#[tokio::main]`
+            // behavior exactly. Only reachable on an exotic host where `available_parallelism` errors.
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(2)
+                .unwrap_or(1)
         });
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
