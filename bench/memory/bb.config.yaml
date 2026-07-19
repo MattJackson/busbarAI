@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Busbar Inc and contributors
+#
+# Busbar deployment for the memory benchmark: one provider (the local mock), one model, a token
+# client so the load generator can authenticate. Governance OFF — we measure the proxy hot path.
+listen: "127.0.0.1:8080"
+
+auth:
+  chain: [tokens]
+  upstream_credentials: own
+  client_tokens:
+    - "bench-token"
+
+providers:
+  mock:
+    api_key_env: BENCH_MOCK_KEY   # any value; the mock ignores it. Set BENCH_MOCK_KEY=x in env.
+
+models:
+  gpt-4o-mini:
+    provider: mock
+    max_concurrent: 4000          # high enough not to be the bottleneck at bench concurrency
+    max_requests: -1
+
+pools:
+  bench-pool:
+    members:
+      - target: gpt-4o-mini

@@ -1,0 +1,9 @@
+{
+  "providers": {
+    "openai": {
+      "keys": [{ "value": "sk-dummy", "models": ["gpt-4o-mini"], "weight": 1 }],
+      "network_config": { "base_url": "http://localhost:8000" },
+      "concurrency_and_buffer_size": { "initial_pool_size": 15000, "buffer_size": 20000 }
+    }
+  }
+}

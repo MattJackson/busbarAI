@@ -37,6 +37,18 @@
 // introduces an `unsafe` block fails to build rather than slipping in unreviewed.
 #![forbid(unsafe_code)]
 
+// Global allocator: jemalloc. The request hot path allocates and frees the request body a few times
+// per request (raw bytes → parsed JSON → re-serialized outbound), so RSS under load tracks
+// (peak concurrency × payload size). glibc's allocator almost never returns freed pages to the OS,
+// so after a big-payload burst the process stays pinned at its peak forever — memory reads as a
+// ratchet even though the live set has collapsed. jemalloc plus a background purge thread returns
+// dirty/muzzy pages after a short decay, so busbar PLATEAUS under sustained load and falls back to
+// idle when the load subsides. `#[global_allocator]` on a static needs no `unsafe`; the background
+// purge thread is enabled at startup in `main()` via a safe runtime call (`tikv_jemalloc_ctl::
+// background_thread`), so operators get it with zero configuration.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod admin;
 mod auth;
 mod auth_cache;
@@ -238,7 +250,7 @@ fn validate_config_command() -> i32 {
             return 1;
         }
     };
-    if let Err(errs) = config_validate::validate(&cfg) {
+    if let Err(errs) = config_validate::validate_with_unset(&cfg, &unset_env_vars) {
         eprintln!(
             "[error] config validation failed:\n  - {}",
             errs.join("\n  - ")
@@ -332,11 +344,19 @@ fn main() {
     if let Some(code) = handle_cli_flags() {
         std::process::exit(code);
     }
-    // Worker-thread count is a HARD, operator-owned value (`BUSBAR_WORKER_THREADS`), NOT tokio's
-    // default of one worker per core — which over-provisions an I/O-bound gateway (e.g. 18 worker
-    // threads on an 18-core host) and inflates idle RSS: every worker carries a stack AND, on glibc,
-    // its own malloc arena. Default: min(cores, 4) — enough parallelism for the JSON-translate CPU
-    // work, small footprint by default; raise it (or lower it to 1) for a specific deployment.
+    // Enable jemalloc's background purge thread: freed dirty/muzzy pages are returned to the OS after
+    // a short idle decay, so RSS falls back to idle after a big-payload burst instead of ratcheting at
+    // the peak (the glibc behavior this replaces). Safe wrapper — no `unsafe`. Best-effort: a platform
+    // without background-thread support (e.g. macOS) simply keeps jemalloc's foreground purge.
+    let _ = tikv_jemalloc_ctl::background_thread::write(true);
+    // Worker-thread count. `BUSBAR_WORKER_THREADS` is the operator override; the DEFAULT is one worker
+    // per available core (`available_parallelism`, which respects CPU affinity / cgroup quota — so it is
+    // "whatever the box allows", not the raw host core count). This is what lets throughput scale with
+    // cores: capping it low (the pre-1.4 `min(cores, 4)`) pinned the data plane to ~4 cores and made
+    // throughput plateau no matter how big the box — the request path is CPU-bound on JSON translate, so
+    // it genuinely uses the cores. Footprint-sensitive sidecars (the ~5 MB-idle case) should set
+    // `BUSBAR_WORKER_THREADS=1` (or 2): each worker carries a stack and its own allocator arena, so
+    // idle RSS grows with the count. Scale up by default, tune down deliberately.
     let worker_threads = std::env::var("BUSBAR_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -345,7 +365,6 @@ fn main() {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(2)
-                .min(4)
         });
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
