@@ -120,6 +120,18 @@ jobs:
           CC: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # jemalloc-sys (new in 1.4.0) runs jemalloc's autoconf `configure`, which sees the
+          # gnu-build / musl-host triplet mismatch and believes it is CROSS-COMPILING — so its
+          # RUN-based atomics probes default to "no" and the C build dies with
+          # `atomic.h: #error "Don't have atomics implemented on this platform"`. It is NOT a real
+          # failure: every atomics backend compiles+links fine under musl-gcc (verified). Seed the
+          # autoconf cache vars with the correct answers so configure uses them instead of the
+          # cross-compile default. (Without this the FROM-scratch musl image cannot build with jemalloc.)
+          je_cv_c11_atomics: "yes"
+          je_cv_gcc_atomic_atomics: "yes"
+          je_cv_gcc_u8_atomic_atomics: "yes"
+          je_cv_gcc_sync_atomics: "yes"
+          je_cv_gcc_u8_sync_atomics: "yes"
         run: |
           cargo build --release --target ${{ matrix.target }}
           file "target/${{ matrix.target }}/release/busbar"
