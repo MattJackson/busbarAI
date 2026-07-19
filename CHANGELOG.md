@@ -9,7 +9,7 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Removed**, **Fixed**, **Security**. Migration steps for a breaking change appear as a bold **Migration**
 item under **Changed**.
 
-## [1.4.0], 2026-07-19
+## [1.4.0], 2026-07-18
 
 ### Added
 

@@ -104,6 +104,14 @@ A map of provider name → `ProviderDef`. The shipped catalog is a curated set o
 | `scope` | string | no | none | OAuth scope for `auth: oauth-client-credentials`. Required for that auth. |
 | `health` | object | no | none | Active health-probe config. See [Health probing](#health-probing). |
 
+> **OAuth self-minting (`jwt-bearer` / `oauth-client-credentials`) — boot window.** These lanes mint
+> their first bearer token in the background at startup and on every config reload. For the brief window
+> before that first mint completes, the lane has no token and requests routed to it fail auth (upstream
+> 401); a burst can trip the lane's breaker, which then recovers automatically once the token lands (the
+> active health prober skips the lane until it is ready, so probing never parks it). This self-heals in
+> well under a second — but if you route heavy traffic to a freshly-booted OAuth lane, expect a few 401s
+> until the first token mints. Static-key lanes (`bearer` / `api-key` / SigV4) have no such window.
+
 Example entries:
 
 ```yaml

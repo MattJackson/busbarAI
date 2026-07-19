@@ -1131,14 +1131,30 @@ pub(crate) fn build_app_from_config(
                         ld.provider
                     )
                 })?;
-                egress_auth::oauth_client_credentials::build(&api_key, token_url, scope).map_err(
-                    |e| {
+                // Thread the operator's real metadata-SSRF posture so the boot-time token_url check
+                // matches config_validate's validate-time check EXACTLY (validate == apply). The
+                // allow-override set is the SAME union config_validate builds: this provider's
+                // `allow_metadata_hosts` ∪ the global `security.allow_metadata_hosts`. Without this, a
+                // token_url an operator deliberately allow-listed would pass `--validate` but die here.
+                // (1.4.0 audit, egress-auth.)
+                let allow_overrides: Vec<String> = provider_cfg
+                    .allow_metadata_hosts
+                    .iter()
+                    .chain(cfg.allow_metadata_hosts.iter())
+                    .cloned()
+                    .collect();
+                let ssrf = egress_auth::MetadataSsrfPolicy {
+                    allow_overrides: &allow_overrides,
+                    allow_all: cfg.allow_all_metadata,
+                    blocked_hosts: &cfg.blocked_metadata_hosts,
+                };
+                egress_auth::oauth_client_credentials::build(&api_key, token_url, scope, &ssrf)
+                    .map_err(|e| {
                         format!(
                             "provider '{}' (oauth-client-credentials auth): {e}",
                             ld.provider
                         )
-                    },
-                )?
+                    })?
             }
             _ => egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth),
         };

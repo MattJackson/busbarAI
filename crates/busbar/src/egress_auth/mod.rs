@@ -74,6 +74,19 @@ where
 /// [`crate::auth::UpstreamCreds::Own`], or the forwarded caller token for `Passthrough`. A
 /// self-minting credential (e.g. a future OAuth token provider) ignores `key`. `ctx` carries the
 /// host / canonical-uri / body / timestamp a signer needs, plus the `Own | Passthrough` mode.
+/// The operator's metadata-SSRF posture, threaded into a token-endpoint check so the boot/reload
+/// validation matches `config_validate`'s validate-time check EXACTLY (validate == apply). Its three
+/// fields are the SAME arguments `config_validate::ssrf_blocked_host` is called with: the union of the
+/// provider's and global `allow_metadata_hosts` carve-outs, the nuclear `allow_all_metadata`, and the
+/// operator's extra `blocked_metadata_hosts`. Without threading these, a token endpoint an operator
+/// deliberately allow-listed passes `--validate` but dies at boot — the reverse of the safety guarantee.
+/// (found: 1.4.0 audit, egress-auth.)
+pub(crate) struct MetadataSsrfPolicy<'a> {
+    pub(crate) allow_overrides: &'a [String],
+    pub(crate) allow_all: bool,
+    pub(crate) blocked_hosts: &'a [String],
+}
+
 pub(crate) trait CredentialProvider: Send + Sync {
     fn headers_for(&self, key: &str, ctx: &SigningContext) -> Vec<(HeaderName, HeaderValue)>;
 

@@ -31,9 +31,10 @@ pub(crate) fn build(
     credential: &str,
     token_url: &str,
     scope: &str,
+    ssrf: &super::MetadataSsrfPolicy,
 ) -> Result<CredentialProviderArc, String> {
     let (client_id, client_secret) = split_credential(credential)?;
-    validate_token_url(token_url)?;
+    validate_token_url(token_url, ssrf)?;
     let creds = Arc::new(ClientCreds {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -73,12 +74,15 @@ pub(crate) fn validate_credential(credential: &str) -> Result<(), String> {
 
 /// Vet the `token_url` (the POST target for `client_id`/`client_secret`) for SSRF/https the same way
 /// `jwt_bearer::validate_token_uri` vets the SA `token_uri`: https for a public host (http only for a
-/// loopback/private endpoint), never a cloud-metadata/IMDS host. Called from [`build`] as
-/// defense-in-depth so the check holds even if a future caller reaches `build` without config_validate
-/// running first (the minter client already refuses redirects; this closes the direct-target case).
-/// (found: 1.4.0 audit, egress-auth — parity with jwt-bearer, which validated its token endpoint but
-/// oauth-client-credentials did not.)
-fn validate_token_url(token_url: &str) -> Result<(), String> {
+/// loopback/private endpoint), never a cloud-metadata/IMDS host UNLESS the operator allow-listed it.
+/// Called from [`build`] as defense-in-depth so the check holds even if a future caller reaches `build`
+/// without config_validate running first (the minter client already refuses redirects; this closes the
+/// direct-target case). The `ssrf` posture MUST be the operator's real one (provider+global
+/// `allow_metadata_hosts`, `allow_all_metadata`, `blocked_metadata_hosts`) so this boot/reload check
+/// matches config_validate's validate-time check EXACTLY — else a token_url an operator legitimately
+/// allow-listed passes `--validate` but dies here at boot. (found: 1.4.0 audit, egress-auth — parity
+/// with jwt-bearer plus validate==apply parity for the operator override surface.)
+fn validate_token_url(token_url: &str, ssrf: &super::MetadataSsrfPolicy) -> Result<(), String> {
     use crate::config_validate::{
         extract_normalized_host, host_is_private_or_loopback, scheme_is, ssrf_blocked_host,
     };
@@ -91,9 +95,14 @@ fn validate_token_url(token_url: &str) -> Result<(), String> {
             "oauth-client-credentials token_url must use https for a public host (got '{token_url}'); it receives the client_id/client_secret, so plaintext http is permitted only for a private/loopback endpoint"
         ));
     }
-    if let Some(host) = ssrf_blocked_host(token_url, &[], false, &[]) {
+    if let Some(host) = ssrf_blocked_host(
+        token_url,
+        ssrf.allow_overrides,
+        ssrf.allow_all,
+        ssrf.blocked_hosts,
+    ) {
         return Err(format!(
-            "oauth-client-credentials token_url '{token_url}' targets a blocked cloud-metadata host '{host}' (the client credentials would be POSTed there; cloud-metadata/IMDS endpoints are denied)"
+            "oauth-client-credentials token_url '{token_url}' targets a blocked cloud-metadata host '{host}' (the client credentials would be POSTed there; cloud-metadata/IMDS endpoints are denied — override via this provider's allow_metadata_hosts, security.allow_metadata_hosts, or security.allow_all_metadata)"
         ));
     }
     Ok(())
@@ -153,11 +162,20 @@ struct TokenResponse {
 mod tests {
     use super::*;
 
+    /// The default (no operator carve-out) SSRF posture used by most tests.
+    fn deny() -> super::super::MetadataSsrfPolicy<'static> {
+        super::super::MetadataSsrfPolicy {
+            allow_overrides: &[],
+            allow_all: false,
+            blocked_hosts: &[],
+        }
+    }
+
     #[test]
     fn build_rejects_a_credential_without_a_colon() {
-        assert!(build("no-colon-here", "https://t", "s").is_err());
-        assert!(build(":secret-only", "https://t", "s").is_err());
-        assert!(build("id-only:", "https://t", "s").is_err());
+        assert!(build("no-colon-here", "https://t", "s", &deny()).is_err());
+        assert!(build(":secret-only", "https://t", "s", &deny()).is_err());
+        assert!(build("id-only:", "https://t", "s", &deny()).is_err());
     }
 
     // 1.4.0 audit (egress-auth): build() re-validates token_url for SSRF/https as defense-in-depth
@@ -165,16 +183,47 @@ mod tests {
     // rejected even with a well-formed credential; loopback http is allowed (local dev IdP).
     #[test]
     fn build_rejects_unsafe_token_url() {
-        assert!(build("id:secret", "http://login.example.com/token", "s").is_err());
-        assert!(build("id:secret", "https://169.254.169.254/token", "s").is_err());
-        assert!(build("id:secret", "http://127.0.0.1:8080/token", "s").is_ok());
+        assert!(build("id:secret", "http://login.example.com/token", "s", &deny()).is_err());
+        assert!(build("id:secret", "https://169.254.169.254/token", "s", &deny()).is_err());
+        assert!(build("id:secret", "http://127.0.0.1:8080/token", "s", &deny()).is_ok());
+    }
+
+    // 1.4.0 audit (egress-auth, MAJOR): the boot-time token_url check MUST honor the operator's
+    // metadata-host allow-overrides the SAME way config_validate does — else a config that
+    // allow-lists a metadata host as its token endpoint passes `--validate` but dies at boot
+    // (validate != apply). With the host allow-listed (or `allow_all`), build() must accept it.
+    #[test]
+    fn build_honors_metadata_allow_override_matching_validate() {
+        // Denied by default...
+        assert!(build("id:secret", "https://169.254.169.254/token", "s", &deny()).is_err());
+        // ...permitted when the operator allow-lists that exact host (per-provider or global union).
+        let allowed = ["169.254.169.254".to_string()];
+        let overridden = super::super::MetadataSsrfPolicy {
+            allow_overrides: &allowed,
+            allow_all: false,
+            blocked_hosts: &[],
+        };
+        assert!(build(
+            "id:secret",
+            "https://169.254.169.254/token",
+            "s",
+            &overridden
+        )
+        .is_ok());
+        // ...and permitted under the nuclear allow_all_metadata.
+        let nuclear = super::super::MetadataSsrfPolicy {
+            allow_overrides: &[],
+            allow_all: true,
+            blocked_hosts: &[],
+        };
+        assert!(build("id:secret", "https://169.254.169.254/token", "s", &nuclear).is_ok());
     }
 
     #[test]
     fn build_accepts_a_secret_containing_a_colon() {
         // Only the FIRST colon splits id:secret, so a secret with colons is preserved. Constructed
         // outside a runtime, so no mint is spawned — this just checks the credential parse.
-        assert!(build("client-abc:secret:with:colons", "https://t", "s").is_ok());
+        assert!(build("client-abc:secret:with:colons", "https://t", "s", &deny()).is_ok());
     }
 
     // 1.4.0 audit (egress-auth): `expires_in` must tolerate a JSON number, a numeric string (ADFS /
