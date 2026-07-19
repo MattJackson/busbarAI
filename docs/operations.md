@@ -178,17 +178,46 @@ A successful active health probe (it tests the shared upstream) clears the break
 
 ### States
 
-```
-        success (probe)
-   ┌──────────────────────────────┐
-   │                              │
-   ▼                              │
- Closed ──trip condition──▶ Open ──cooldown expires──▶ HalfOpen
-   ▲                                                      │
-   │                              ┌──── probe fails ──────┘ (→ Open, longer cooldown)
-   └──────────────────────────────┘
-              probe succeeds
-```
+<svg viewBox="0 0 700 260" role="img" aria-label="Circuit-breaker state machine. Closed serves traffic and trips to Open when the trip condition is met. Open is skipped during selection until the cooldown expires, which moves the lane to HalfOpen. HalfOpen admits exactly one probe: a successful probe returns the lane to Closed, while a failed probe returns it to Open with a longer cooldown." style="width:100%;height:auto;max-width:700px;font-family:ui-sans-serif,system-ui,sans-serif;">
+  <defs>
+    <marker id="cb-arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="700" height="260" fill="#ffffff"/>
+
+  <!-- Return arc: HalfOpen &#8594; Closed (recovery, over the top) -->
+  <path d="M600,110 C600,40 100,40 100,110" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#cb-arw)"/>
+  <text x="350" y="34" text-anchor="middle" fill="#64748b" font-size="11">probe succeeds &#8594; back to Closed</text>
+
+  <!-- Return arc: HalfOpen &#8594; Open (below) -->
+  <path d="M600,166 C600,232 350,232 350,166" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#cb-arw)"/>
+  <text x="480" y="248" text-anchor="middle" fill="#64748b" font-size="11">probe fails (longer cooldown)</text>
+
+  <!-- Forward arrows -->
+  <g stroke="#94a3b8" stroke-width="2" marker-end="url(#cb-arw)">
+    <line x1="162" y1="138" x2="248" y2="138"/>
+    <line x1="422" y1="138" x2="518" y2="138"/>
+  </g>
+  <text x="205" y="130" text-anchor="middle" fill="#64748b" font-size="11">trip condition</text>
+  <text x="470" y="130" text-anchor="middle" fill="#64748b" font-size="11">cooldown expires</text>
+
+  <!-- Closed -->
+  <rect x="40" y="116" width="122" height="44" rx="22" fill="#ecfccb" stroke="#d9f99d"/>
+  <text x="101" y="143" text-anchor="middle" fill="#35510b" font-size="14" font-weight="700">Closed</text>
+
+  <!-- Open -->
+  <rect x="248" y="116" width="122" height="44" rx="22" fill="#fee2e2" stroke="#fecaca"/>
+  <text x="309" y="143" text-anchor="middle" fill="#b91c1c" font-size="14" font-weight="700">Open</text>
+
+  <!-- HalfOpen -->
+  <rect x="518" y="116" width="122" height="44" rx="22" fill="#fef9c3" stroke="#fde68a"/>
+  <text x="579" y="143" text-anchor="middle" fill="#a16207" font-size="14" font-weight="700">HalfOpen</text>
+
+  <!-- Subtle self-note near Closed -->
+  <text x="101" y="182" text-anchor="middle" fill="#94a3b8" font-size="10">single sub-threshold failure</text>
+  <text x="101" y="195" text-anchor="middle" fill="#94a3b8" font-size="10">&#8594; brief skip, stays Closed</text>
+</svg>
 
 - **Closed**: the lane serves traffic. A single upstream failure that does **not**
   meet the trip condition still arms a short cooldown (the lane is briefly skipped),

@@ -87,7 +87,7 @@ Guarded mutations: `POST /hooks`, `PUT|DELETE /hooks/{name}`, `PATCH /hooks/{nam
 GET /api/v1/admin/openapi.json
 ```
 
-The OpenAPI 3.1 schema of the whole surface — generate a client, or point tooling at it. Every path it lists resolves; its error-code enum matches the envelope above exactly; every operation is annotated with `x-busbar-required-scope` from the same matrix the middleware enforces (all three are test-locked).
+The OpenAPI 3.1 schema of the whole surface — generate a client, or point tooling at it. Every path it lists resolves; its error-code enum matches the envelope above exactly; every operation is annotated with `x-busbar-required-scope` from the same matrix the middleware enforces (all three are test-locked). Browse it rendered, endpoint by endpoint, in the [API reference](https://getbusbar.com/docs/api/).
 
 ### Pinning a released schema
 
