@@ -355,24 +355,27 @@ fn main() {
     // Best-effort and VERIFIED at runtime rather than assumed: some platforms/builds lack background-
     // thread support (macOS keeps only foreground purge; jemalloc also flags it as potentially
     // unavailable on musl — and the SHIPPED release is static musl). Read the flag back after writing and
-    // WARN if it did not enable, so the plateau-then-fall-back-to-idle behavior is an observed fact in the
-    // logs, not a silent assumption. Even when the background thread is absent, jemalloc's FOREGROUND
-    // decay purge still bounds RSS under load; only the proactive purge during full idle is lost.
+    // WARN if it did not enable, so the plateau-then-fall-back-to-idle behavior is an observed fact, not a
+    // silent assumption. Even when the background thread is absent, jemalloc's FOREGROUND decay purge
+    // still bounds RSS under load; only the proactive purge during full idle is lost.
+    //
+    // This runs in `main()` BEFORE the tracing subscriber is installed (that happens in `run()` after the
+    // runtime is built), so the diagnostic goes to STDERR via `eprintln!` — the same channel the other
+    // pre-subscriber boot messages use — rather than `tracing`, which would silently drop it. Silent on
+    // success; only the problem cases (did-not-enable / error) print.
     #[cfg(not(target_env = "msvc"))]
     {
         use tikv_jemalloc_ctl::background_thread;
         match background_thread::write(true).and_then(|()| background_thread::read()) {
-            Ok(true) => {
-                tracing::debug!("jemalloc background purge thread enabled (RSS falls back to idle)")
-            }
-            Ok(false) => tracing::warn!(
-                "jemalloc background purge thread did NOT enable on this target (no background-thread \
-                 support); RSS is still bounded under load by foreground decay purge, but may not fall \
-                 back to idle as promptly when the process is fully idle"
+            Ok(true) => {} // enabled — RSS falls back to idle; nothing to report
+            Ok(false) => eprintln!(
+                "[warn] jemalloc background purge thread did NOT enable on this target (no \
+                 background-thread support); RSS is still bounded under load by foreground decay purge, \
+                 but may not fall back to idle as promptly when the process is fully idle"
             ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "could not enable jemalloc background purge thread; falling back to foreground decay purge"
+            Err(e) => eprintln!(
+                "[warn] could not enable jemalloc background purge thread ({e}); falling back to \
+                 foreground decay purge"
             ),
         }
     }

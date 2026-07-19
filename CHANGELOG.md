@@ -83,6 +83,10 @@ item under **Changed**.
   gemini-json-array paths (the response body now streams `finish()`'s content through the json-array framer,
   which previously discarded it). Behavior-preserving for OpenAI ingress (which still receives the separate
   usage chunk) and Bedrock ingress (which carries usage in its `metadata` frame).
+- **Upgrade hint for the removed `auth.mode:` key.** A config that still carries the pre-`auth.chain`
+  `auth.mode:` key now fails to boot with a targeted migration hint (`mode: none` → an empty/omitted
+  `chain:`; `mode: token`/`apikey` → `chain: [tokens]`; `mode: passthrough` →
+  `auth.upstream_credentials: passthrough`) instead of a bare serde "unknown field" error. Still fail-closed.
 
 ### Fixed
 
