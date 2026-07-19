@@ -9,6 +9,15 @@ Every release uses the same section headings, in this order: **Added**, **Change
 **Removed**, **Fixed**, **Security**. Migration steps for a breaking change appear as a bold **Migration**
 item under **Changed**.
 
+## [Unreleased]
+
+### Added
+
+- **Published OpenAPI schema per release** — every tagged release now attaches the admin API's OpenAPI 3.1
+  document as a release asset (`busbar-openapi-<tag>.json`), emitted in CI from the same `openapi_doc()` that
+  serves `GET /api/v1/admin/openapi.json` and stamped with the release version. Downstream tooling can
+  generate a client or diff the API surface across releases without running the gateway.
+
 ## [1.4.0], 2026-07-19
 
 ### Added

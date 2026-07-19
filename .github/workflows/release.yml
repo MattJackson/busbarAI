@@ -55,6 +55,37 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" "$sbom" \
             --repo "${GITHUB_REPOSITORY}" --clobber
 
+  # Publish the admin API's OpenAPI 3.1 document as a release asset. The gateway generates this doc
+  # from its typed route contract (and serves it live at GET /api/v1/admin/openapi.json), but that
+  # needs a running, authenticated instance. Attaching a static, version-stamped copy to the Release
+  # lets anyone generate a client (busbarctl, the Terraform provider, SDKs) or diff the API surface
+  # release-over-release WITHOUT running busbar. The document is emitted by the `emit_openapi_artifact`
+  # test — the same `openapi_doc()` the gateway serves — so publishing needs no user-facing CLI flag.
+  openapi:
+    needs: create-release
+    name: openapi (3.1 document)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Emit the OpenAPI document from the release code
+        env:
+          BUSBAR_EMIT_OPENAPI: busbar-openapi-${{ github.ref_name }}.json
+        run: cargo test -p busbar --bin busbar emit_openapi_artifact -- --nocapture
+      - name: Validate it is a well-formed OpenAPI 3.1 document
+        run: |
+          doc="busbar-openapi-${GITHUB_REF_NAME}.json"
+          test -s "$doc" || { echo "OpenAPI doc is empty"; exit 1; }
+          jq -e '.openapi | startswith("3.1")' "$doc" > /dev/null \
+            || { echo "not an OpenAPI 3.1 document"; exit 1; }
+      - name: Attach OpenAPI document to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" "busbar-openapi-${GITHUB_REF_NAME}.json" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
   upload-assets:
     needs: create-release
     name: ${{ matrix.target }}

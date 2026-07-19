@@ -86,6 +86,29 @@ fn openapi_doc_is_31_and_v1_prefixed() {
     }
 }
 
+/// Release tooling, not a behavioral assertion. Publishing the OpenAPI schema is a release chore
+/// WE do — an operator gets the doc from the live `GET /openapi.json` endpoint or the release
+/// asset, so it earns no user-facing CLI surface. This test is the build-time handle CI uses to
+/// capture the artifact straight from the same `openapi_doc()` the gateway serves, guaranteeing the
+/// published file matches the shipped binary. A normal `cargo test` (no env var) just re-asserts
+/// the doc is well-formed; the release workflow sets `BUSBAR_EMIT_OPENAPI=<path>` to also write the
+/// pretty-printed document there, then uploads it to the GitHub Release.
+#[test]
+fn emit_openapi_artifact() {
+    let doc = openapi_doc();
+    assert!(
+        doc["openapi"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("3.1"),
+        "OpenAPI document must be 3.1"
+    );
+    if let Ok(path) = std::env::var("BUSBAR_EMIT_OPENAPI") {
+        let json = serde_json::to_string_pretty(&doc).expect("serialize OpenAPI document");
+        std::fs::write(&path, json).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    }
+}
+
 /// CONTRACT LOCK: every openapi path+method is annotated with `x-busbar-required-scope`, and
 /// the annotation matches the enforced `required_scope` matrix exactly (one source of truth —
 /// this test guards against a future hand-written path entry forgetting or contradicting it).
