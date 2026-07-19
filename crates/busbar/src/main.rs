@@ -355,13 +355,17 @@ fn main() {
     #[cfg(not(target_env = "msvc"))]
     let _ = tikv_jemalloc_ctl::background_thread::write(true);
     // Worker-thread count. `BUSBAR_WORKER_THREADS` is the operator override; the DEFAULT is one worker
-    // per available core (`available_parallelism`, which respects CPU affinity / cgroup quota — so it is
-    // "whatever the box allows", not the raw host core count). This is what lets throughput scale with
-    // cores: capping it low (the pre-1.4 `min(cores, 4)`) pinned the data plane to ~4 cores and made
-    // throughput plateau no matter how big the box — the request path is CPU-bound on JSON translate, so
-    // it genuinely uses the cores. Footprint-sensitive sidecars (the ~5 MB-idle case) should set
-    // `BUSBAR_WORKER_THREADS=1` (or 2): each worker carries a stack and its own allocator arena, so
-    // idle RSS grows with the count. Scale up by default, tune down deliberately.
+    // per available core (`available_parallelism`, which respects CPU affinity and cgroup cpuset — but
+    // NOT the CFS bandwidth quota `cpu.max`, which it cannot see). So on a quota-limited pod (e.g. 2 CPUs
+    // of quota on a 64-core node) this defaults to the NODE's core count, oversubscribing the quota;
+    // such deployments should pin `BUSBAR_WORKER_THREADS` to their CPU limit. Uncapped-by-default is
+    // what lets throughput scale with cores: v1.3.1–1.3.3 capped the pool at `min(cores, 4)`, which
+    // pinned the data plane to ~4 cores and made throughput plateau no matter how big the box (v1.3.0
+    // itself was uncapped via `#[tokio::main]`; 1.4.0 restores that default explicitly). The request
+    // path is CPU-bound on JSON translate, so it genuinely uses the cores. Footprint-sensitive sidecars
+    // (the ~5 MB-idle case) should set `BUSBAR_WORKER_THREADS=1` (or 2): each worker carries a stack and
+    // its own allocator arena, so idle RSS grows with the count. Scale up by default, tune down (or to
+    // your CPU quota) deliberately.
     let worker_threads = std::env::var("BUSBAR_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

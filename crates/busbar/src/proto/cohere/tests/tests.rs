@@ -1667,6 +1667,83 @@ fn test_stream_tool_before_text_no_index_collision() {
     }
 }
 
+/// Regression (1.4.0 audit, translation): once the leading tool-plan text block is CLOSED by the
+/// first `tool-call-start`, an out-of-spec upstream that resumes text (another `tool-plan-delta` or a
+/// `content-delta`) must NOT reopen it. Reopening would emit a second `content_block_start`/delta at
+/// the already-stopped index — an unbalanced stream on an Anthropic egress. The `text_block_closed`
+/// latch drops the stray frames instead.
+#[test]
+fn test_stream_text_not_reopened_after_close() {
+    let reader = CohereReader;
+    let mut state = crate::ir::StreamDecodeState::default();
+
+    // Leading tool-plan opens a text block at index 0 (BlockStart + BlockDelta).
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({
+            "type": ET_TOOL_PLAN_DELTA,
+            "delta": {"message": {"tool_plan": "think"}}
+        }),
+        &mut state,
+    );
+    assert!(
+        matches!(
+            evs[0],
+            crate::ir::IrStreamEvent::BlockStart {
+                index: 0,
+                block: crate::ir::IrBlockMeta::Text
+            }
+        ),
+        "tool-plan opens the leading text block at index 0, got {evs:?}"
+    );
+
+    // tool-call-start closes the still-open text block (BlockStop{0}) and opens the tool at index 1.
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({
+            "type": ET_TOOL_CALL_START,
+            "index": 0,
+            "delta": {"message": {"tool_calls": {
+                "id": "c1", "type": "function",
+                "function": {"name": "f", "arguments": ""}
+            }}}
+        }),
+        &mut state,
+    );
+    assert!(
+        matches!(&evs[0], crate::ir::IrStreamEvent::BlockStop { index: 0 }),
+        "tool-call-start closes the plan text block at index 0, got {evs:?}"
+    );
+
+    // A resumed tool-plan-delta AFTER the close is dropped — no reopen, no delta into a stopped index.
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({
+            "type": ET_TOOL_PLAN_DELTA,
+            "delta": {"message": {"tool_plan": "more"}}
+        }),
+        &mut state,
+    );
+    assert!(
+        evs.is_empty(),
+        "a tool-plan-delta after the text block closed must be dropped, got {evs:?}"
+    );
+
+    // Likewise a content-delta after the close is dropped (would otherwise be an unbalanced start/delta).
+    let evs = reader.read_response_events(
+        "",
+        &serde_json::json!({
+            "type": ET_CONTENT_DELTA,
+            "delta": {"message": {"content": "resumed"}}
+        }),
+        &mut state,
+    );
+    assert!(
+        evs.is_empty(),
+        "a content-delta after the text block closed must be dropped, got {evs:?}"
+    );
+}
+
 /// An unknown Cohere stream event type is a documented no-op (no events, no panic) — the named
 /// fallthrough arm must not break the stream.
 #[test]

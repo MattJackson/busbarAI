@@ -712,6 +712,14 @@ pub(crate) struct StreamDecodeState {
     /// before text takes 0 and text takes the next slot). `None` until the text block opens. Gemini
     /// reader only; other readers leave it `None`.
     pub(crate) text_index: Option<usize>,
+    /// One-way latch: set true once the text content block has been CLOSED (via `content-end` or, for a
+    /// leading tool-plan block, the first `tool-call-start`). A closed text block must never be reopened
+    /// — a second `content-start`/`content-delta`/`tool-plan-delta` after the close would otherwise emit
+    /// a duplicate `BlockStart` at the same claimed index, an unbalanced stream (two `content_block_start`
+    /// for one index) on an Anthropic egress. The open sites gate on `!text_block_closed` so an
+    /// out-of-spec upstream that resumes text after tools is dropped rather than un-balancing the stream.
+    /// Cohere reader only; other readers leave it false. (1.4.0 audit, translation.)
+    pub(crate) text_block_closed: bool,
     pub(crate) open_tools: std::collections::BTreeSet<usize>,
     /// Set once a reasoning (chain-of-thought) delta is seen on the stream. When true, the
     /// thinking block occupies IR index 0 and the text/tool block indices shift up by one so the

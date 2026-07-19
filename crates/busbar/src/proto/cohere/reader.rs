@@ -535,7 +535,11 @@ impl ProtocolReader for CohereReader {
                     });
                 }
             }
-            ET_CONTENT_START => {
+            // Guard on `!text_block_closed`: once the text block has been closed (content-end or a
+            // leading tool-plan's tool-call-start), a later text frame must NOT reopen it. A failed
+            // guard falls through to the `other` no-op arm and is dropped, keeping the egress balanced
+            // (no second content_block_start / delta into a stopped index). (1.4.0 audit, translation.)
+            ET_CONTENT_START if !state.text_block_closed => {
                 // The text content block claims a DYNAMIC IR index by order of first appearance
                 // (`cohere_text_ir_index`), NOT a hardcoded 0: a `tool-call-start` that arrived
                 // before any content frame already took 0, and forcing text to 0 here produced two
@@ -553,7 +557,7 @@ impl ProtocolReader for CohereReader {
                     });
                 }
             }
-            ET_CONTENT_DELTA => {
+            ET_CONTENT_DELTA if !state.text_block_closed => {
                 // The text content block claims a DYNAMIC IR index by order of first appearance
                 // (`cohere_text_ir_index`) — see content-start — NOT a hardcoded 0, so a tool that
                 // opened ahead of the first content frame (and took 0) does not collide with the
@@ -634,7 +638,7 @@ impl ProtocolReader for CohereReader {
             // no marker distinguishing it FROM a plain content Text — the IR has no tool_plan flag — so
             // a downstream Cohere writer re-emits it as `content`, not `tool_plan` (documented in the
             // writer; the reasoning survives, its native `tool_plan` slot does not).
-            ET_TOOL_PLAN_DELTA => {
+            ET_TOOL_PLAN_DELTA if !state.text_block_closed => {
                 let text_idx = cohere_text_ir_index(state);
                 if !state.text_block_open {
                     state.text_block_open = true;
@@ -664,12 +668,13 @@ impl ProtocolReader for CohereReader {
                 // forwarded. Only emit the stop if a text block is actually open, so a stray
                 // content-end never produces an unbalanced BlockStop. `state.text_index` is NOT
                 // cleared (mirroring how the tool entries stay recorded in `open_tools` for the
-                // stream's lifetime): keeping the claimed index immutable means a re-opened text
-                // block resolves to the SAME slot and a tool opened after content-end still derives
-                // its base off the persistent TEXT_BLOCK_SEEN_SENTINEL, so neither can collide with
-                // the text index.
+                // stream's lifetime): keeping the claimed index immutable means a tool opened after
+                // content-end still derives its base off the persistent TEXT_BLOCK_SEEN_SENTINEL, so it
+                // cannot collide with the text index. `text_block_closed` latches here so a stray text
+                // frame after the close is dropped rather than reopening the (now stopped) index.
                 if state.text_block_open {
                     state.text_block_open = false;
+                    state.text_block_closed = true;
                     let ti = state.text_index.unwrap_or(0);
                     out.push(IrStreamEvent::BlockStop { index: ti });
                 }
@@ -757,6 +762,7 @@ impl ProtocolReader for CohereReader {
                 // tool BlockStart below therefore lands at the SAME index it did before.
                 if state.text_block_open {
                     state.text_block_open = false;
+                    state.text_block_closed = true;
                     let ti = state.text_index.unwrap_or(0);
                     out.push(IrStreamEvent::BlockStop { index: ti });
                 }

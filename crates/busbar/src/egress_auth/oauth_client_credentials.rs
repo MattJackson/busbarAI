@@ -103,7 +103,9 @@ impl ClientCreds {
             serde_json::from_str(&body).map_err(|e| format!("token response JSON invalid: {e}"))?;
         Ok(CachedToken {
             token: tok.access_token,
-            expires_at: now + tok.expires_in,
+            // saturating_add: `expires_in` is attacker-influenced (comes off the token endpoint), so a
+            // huge value must clamp to u64::MAX rather than wrap/panic (1.4.0 audit, egress-auth).
+            expires_at: now.saturating_add(tok.expires_in),
         })
     }
 }
