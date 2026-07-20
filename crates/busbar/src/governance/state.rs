@@ -329,7 +329,7 @@ impl GovState {
     ) -> StoreResult<(VirtualKey, String)> {
         // `?` converts a getrandom failure into a StoreError (see `From<getrandom::Error>`), so the
         // admin handler returns a 500 via its existing error_response path instead of panicking.
-        let secret = generate_secret()?;
+        let secret = generate_secret().store()?;
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
         // `id` is a 64-bit prefix of the 256-bit secret hash, while `key_hash` is the full hash with
         // a UNIQUE constraint. Two distinct secrets sharing the same 64-bit prefix would produce the
@@ -382,12 +382,12 @@ impl GovState {
     ) -> StoreResult<(VirtualKey, String, String, String)> {
         // `?` converts any getrandom failure into a StoreError (see `From<getrandom::Error>`), so the
         // admin handler returns a 500 via its existing error_response path instead of panicking.
-        let secret = generate_secret()?;
+        let secret = generate_secret().store()?;
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
         let id = format!("{VK_ID_PREFIX}{}", &hash[..VK_ID_HASH_PREFIX_LEN]);
         self.ensure_id_free_for_hash(&id, &hash)?;
-        let access_key_id = generate_aws_access_key_id()?;
-        let secret_access_key = generate_aws_secret_access_key()?;
+        let access_key_id = generate_aws_access_key_id().store()?;
+        let secret_access_key = generate_aws_secret_access_key().store()?;
         let key = VirtualKey {
             id: id.clone(),
             key_hash: hash,
@@ -455,7 +455,7 @@ impl GovState {
         let Some(mut key) = self.store.get_key(id)? else {
             return Ok(None);
         };
-        let secret = generate_secret()?;
+        let secret = generate_secret().store()?;
         key.key_hash = crate::sigv4::sha256_hex(secret.as_bytes());
         self.store.put_key(&key)?;
         self.refresh()?;

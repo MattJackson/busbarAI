@@ -384,7 +384,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 pub(crate) use busbar_api::{
-    AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Usage, VirtualKey,
+    AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
+    VirtualKey,
 };
 
 /// Seconds in a metering day bucket. Metering is a TIME SERIES in fixed UTC-day buckets —
@@ -397,106 +398,22 @@ pub(crate) fn metering_bucket(now: u64) -> u64 {
     now - (now % METERING_BUCKET_SECS)
 }
 
-pub(crate) type StoreResult<T> = Result<T, StoreError>;
-
-#[derive(Debug)]
-pub(crate) struct StoreError(pub(crate) String);
-
-impl std::fmt::Display for StoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "store error: {}", self.0)
+// The durable-store contract (the `Store` trait, its records, and `StoreError`) now lives in the
+// `busbar-api` contract crate, re-exported above so the rest of the engine names them unchanged.
+// rusqlite/getrandom errors convert into the api's backend-agnostic `StoreError` HERE via a local
+// extension trait: the contract crate must stay free of any storage dependency, so the `From` impls
+// that used to power `?` cannot live there. Replace `<rusqlite call>?` with `<call>.store()?`.
+trait IntoStoreResult<T> {
+    fn store(self) -> StoreResult<T>;
+}
+impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
+    fn store(self) -> StoreResult<T> {
+        self.map_err(|e| StoreError(e.to_string()))
     }
 }
-impl std::error::Error for StoreError {}
-impl From<rusqlite::Error> for StoreError {
-    fn from(e: rusqlite::Error) -> Self {
-        StoreError(e.to_string())
-    }
-}
-impl From<getrandom::Error> for StoreError {
-    fn from(e: getrandom::Error) -> Self {
-        StoreError(format!("OS CSPRNG (getrandom) unavailable: {e}"))
-    }
-}
-
-/// The durable governance store seam. Swappable: `SqliteStore` today, `PostgresStore`
-/// later behind the same trait.
-///
-/// DUAL FLAVOR (sync + async). The per-request accounting methods come in two flavors: the original
-/// SYNCHRONOUS form (called directly under the governance/admin locks and in tests — e.g. the gated
-/// `EXISTENCE_GATE` compound ops, the batched metrics scrape) and an ASYNC form (`*_async`) used on
-/// the per-request hot path. The per-request offload is now OWNED BY THE BACKEND: each backend
-/// decides how to satisfy the async flavor. The `SqliteStore` impl fulfills it by offloading the
-/// synchronous SQL onto the blocking pool (`spawn_blocking`); a future `PostgresStore` would await a
-/// real async driver natively. The DEFAULT trait impls simply call the matching sync method inline
-/// — correct for lightweight test doubles, where no real offload is needed.
-#[async_trait::async_trait]
-pub(crate) trait Store: Send + Sync + 'static {
-    fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
-    fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
-    fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
-    fn delete_key(&self, id: &str) -> StoreResult<()>;
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
-
-    /// Write-behind ABSOLUTE set of a key's window counter (memory is authoritative). SETS (not adds)
-    /// spend/tokens/requests to the given values. Used only by the budget flusher.
-    fn put_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
-    ) -> StoreResult<()>;
-
-    /// Accumulate one completed response's RAW consumption into the per-(key, bucket, model,
-    /// provider) metering row (UPSERT/add; +1 request). Metering is observability — best-effort,
-    /// never consulted for enforcement (budgets stay on `add_usage`/`charge_within_budget`).
-    fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()>;
-
-    /// Every metering row accumulated in `bucket` (a [`metering_bucket`] day start), for the usage
-    /// read's by-model / by-key aggregations.
-    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>>;
-
-    /// Persist an AWS-style credential (the MinIO/S3-compatible model) for inbound SigV4 verification.
-    /// UPSERTs on the `access_key_id` PRIMARY KEY. The `secret_access_key` is the symmetric SigV4
-    /// signing secret stored in plaintext (HMAC verification needs the same value the client signs
-    /// with); callers must never log it.
-    ///
-    /// DEFAULTED so the (many) lightweight test-double `Store` impls scattered across the crate need
-    /// not implement the AWS surface — only the real `SqliteStore` does. The default is a no-op-shaped
-    /// error so a misconfigured store that silently dropped a credential cannot pass as success.
-    fn put_aws_credential(&self, _cred: &AwsCredential) -> StoreResult<()> {
-        Err(StoreError(
-            "this Store does not support AWS credentials".to_string(),
-        ))
-    }
-
-    /// ATOMIC key+credential mint. Persist the bearer `VirtualKey` row AND its paired `AwsCredential`
-    /// row together or not at all. Under SQLite autocommit, `put_key` then `put_aws_credential` are two
-    /// independent commits: a storage error (I/O, disk full, constraint) after the first leaves an
-    /// inert key row with no resolvable AccessKeyId — an orphan that `create_key_with_aws` would then
-    /// surface as a failure while the half-written row lingers. A real transactional store overrides
-    /// this to wrap both writes in one `conn.transaction()` (mirroring `delete_key`).
-    ///
-    /// DEFAULT fallback: test-double stores that don't expose a transaction simply do the two writes in
-    /// sequence — they have no durability boundary to violate, and this keeps the (many) lightweight
-    /// `Store` impls from needing to implement the transactional path.
-    fn put_key_with_aws_credential(
-        &self,
-        key: &VirtualKey,
-        cred: &AwsCredential,
-    ) -> StoreResult<()> {
-        self.put_key(key)?;
-        self.put_aws_credential(cred)?;
-        Ok(())
-    }
-
-    /// All AWS credentials (used to rebuild the in-memory AccessKeyId index at boot / on refresh).
-    /// DEFAULTED to an empty list (see `put_aws_credential`): a store with no AWS-credential support
-    /// simply has none to index, so SigV4 ingress is unavailable — never an auth bypass.
-    fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
-        Ok(Vec::new())
+impl<T> IntoStoreResult<T> for Result<T, getrandom::Error> {
+    fn store(self) -> StoreResult<T> {
+        self.map_err(|e| StoreError(format!("OS CSPRNG (getrandom) unavailable: {e}")))
     }
 }
 
@@ -563,7 +480,7 @@ pub(crate) struct SqliteStore {
 
 impl SqliteStore {
     pub(crate) fn open(path: &str) -> StoreResult<Self> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path).store()?;
         // Harden the on-disk DB against `SQLITE_BUSY` from a second connection or an external tool
         // (backup/inspection): WAL lets readers and a writer proceed concurrently, and a 5s busy
         // timeout makes a transient lock contention retry-then-succeed rather than fail instantly.
@@ -573,12 +490,13 @@ impl SqliteStore {
             // `journal_mode` returns the resulting mode as a row, so use `pragma_update`/query rather
             // than `execute` (which rejects a statement that yields rows). `busy_timeout` is a plain
             // setter and is safe via `execute_batch`.
-            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "journal_mode", "WAL").store()?;
             conn.pragma_update(
                 None,
                 "busy_timeout",
                 crate::limits::sqlite_busy_timeout_ms(),
-            )?;
+            )
+            .store()?;
         }
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -591,7 +509,7 @@ impl SqliteStore {
     #[cfg(test)]
     pub(crate) fn open_in_memory() -> StoreResult<Self> {
         let store = Self {
-            conn: Arc::new(Mutex::new(Connection::open_in_memory()?)),
+            conn: Arc::new(Mutex::new(Connection::open_in_memory().store()?)),
         };
         store.migrate()?;
         Ok(store)
@@ -622,7 +540,7 @@ impl SqliteStore {
         // idempotent and backward-compatible: an existing on-disk DB keeps its `virtual_keys` rows
         // untouched and simply gains the `aws_credentials` table (a NEW table, so no `ALTER`/column-add
         // dance and no risk to existing rows). A bearer-only DB from an older build upgrades cleanly.
-        self.lock_conn().execute_batch(SCHEMA)?;
+        self.lock_conn().execute_batch(SCHEMA).store()?;
         Ok(())
     }
 
@@ -658,7 +576,8 @@ impl SqliteStore {
                 i64::try_from(tokens).unwrap_or(i64::MAX),
                 req_delta
             ],
-        )?;
+        )
+        .store()?;
         Ok(())
     }
 
@@ -689,7 +608,8 @@ impl SqliteStore {
                 i64::try_from(tokens).unwrap_or(i64::MAX),
                 i64::try_from(requests).unwrap_or(i64::MAX)
             ],
-        )?;
+        )
+        .store()?;
         Ok(())
     }
 
@@ -715,17 +635,20 @@ impl SqliteStore {
                 i64::try_from(d.tokens_cache_read).unwrap_or(i64::MAX),
                 i64::try_from(d.tokens_cache_creation).unwrap_or(i64::MAX),
             ],
-        )?;
+        )
+        .store()?;
         Ok(())
     }
 
     fn list_metering_inner(conn: &Mutex<Connection>, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
         let conn = Self::lock_conn_raw(conn);
-        let mut stmt = conn.prepare(
-            "SELECT key_id, model, provider,
+        let mut stmt = conn
+            .prepare(
+                "SELECT key_id, model, provider,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests
              FROM usage_metering WHERE bucket = ?1",
-        )?;
+            )
+            .store()?;
         let rows = stmt
             .query_map(params![bucket as i64], |r| {
                 // DI-3 posture (matches get_usage): clamp a corrupt negative stored counter to 0
@@ -741,8 +664,10 @@ impl SqliteStore {
                     tokens_cache_creation: u(r.get(6)?),
                     requests: u(r.get(7)?),
                 })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
         Ok(rows)
     }
 
@@ -787,7 +712,8 @@ impl SqliteStore {
                 params![key_id, window_start as i64, cost_cents, max_cents],
                 |r| r.get::<_, i64>(0),
             )
-            .optional()?;
+            .optional()
+            .store()?;
         Ok(charged.is_some())
     }
 
@@ -809,7 +735,8 @@ impl SqliteStore {
                  requests    = MAX(0, requests - 1)
              WHERE key_id = ?1 AND window_start = ?2",
             params![key_id, window_start as i64, cost_cents],
-        )?;
+        )
+        .store()?;
         Ok(())
     }
 
@@ -833,7 +760,7 @@ impl SqliteStore {
                     })
                 },
             )
-            .optional()?;
+            .optional().store()?;
         Ok(row.unwrap_or_default())
     }
 }
@@ -896,7 +823,7 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey) -> StoreResult<(
             key.enabled as i64,
             key.created_at as i64,
         ],
-    )?;
+    ).store()?;
     Ok(())
 }
 
@@ -907,11 +834,11 @@ fn put_aws_credential_inner(conn: &rusqlite::Connection, cred: &AwsCredential) -
              ON CONFLICT(access_key_id) DO UPDATE SET
                 key_id=excluded.key_id, secret_access_key=excluded.secret_access_key",
         params![cred.access_key_id, cred.key_id, cred.secret_access_key],
-    )?;
+    )
+    .store()?;
     Ok(())
 }
 
-#[async_trait::async_trait]
 impl Store for SqliteStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         put_key_inner(&self.lock_conn(), key)
@@ -926,7 +853,7 @@ impl Store for SqliteStore {
                 params![id],
                 row_to_key,
             )
-            .optional()?;
+            .optional().store()?;
         Ok(row)
     }
 
@@ -935,11 +862,11 @@ impl Store for SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
              FROM virtual_keys ORDER BY created_at",
-        )?;
-        let rows = stmt.query_map([], row_to_key)?;
+        ).store()?;
+        let rows = stmt.query_map([], row_to_key).store()?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            out.push(r.store()?);
         }
         Ok(out)
     }
@@ -952,17 +879,20 @@ impl Store for SqliteStore {
         // so they commit together or not at all. The Mutex already serializes us against other
         // writers, so the transaction cannot deadlock against a concurrent busbar caller.
         let mut conn = self.lock_conn();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])?;
-        tx.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])?;
+        let tx = conn.transaction().store()?;
+        tx.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])
+            .store()?;
+        tx.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])
+            .store()?;
         // Remove any AWS credential rows tied to this key in the SAME transaction: a revoked key's
         // SigV4 credential must NOT outlive the key, or a Bedrock-SDK client signing with that
         // AccessKeyId could keep authenticating after revocation (an auth-bypass). The in-memory
         // AccessKeyId index is rebuilt on the post-delete `refresh`, and even before that rebuild the
         // index already skips a credential whose key row is gone (see `load_by_access_key_id`), so the
         // revocation is effective immediately and durably.
-        tx.execute("DELETE FROM aws_credentials WHERE key_id=?1", params![id])?;
-        tx.commit()?;
+        tx.execute("DELETE FROM aws_credentials WHERE key_id=?1", params![id])
+            .store()?;
+        tx.commit().store()?;
         Ok(())
     }
 
@@ -981,29 +911,32 @@ impl Store for SqliteStore {
         // `delete_key`. The connection Mutex already serializes us against any other writer, so the
         // transaction cannot deadlock against a concurrent busbar caller.
         let mut conn = self.lock_conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction().store()?;
         // `&tx` coerces to `&Connection` via `Transaction`'s Deref, so both writes share the exact same
         // SQL bodies as the autocommit `put_key`/`put_aws_credential` — they can never drift.
         put_key_inner(&tx, key)?;
         put_aws_credential_inner(&tx, cred)?;
-        tx.commit()?;
+        tx.commit().store()?;
         Ok(())
     }
 
     fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
         let conn = self.lock_conn();
-        let mut stmt =
-            conn.prepare("SELECT access_key_id, key_id, secret_access_key FROM aws_credentials")?;
-        let rows = stmt.query_map([], |r| {
-            Ok(AwsCredential {
-                access_key_id: r.get(0)?,
-                key_id: r.get(1)?,
-                secret_access_key: r.get(2)?,
+        let mut stmt = conn
+            .prepare("SELECT access_key_id, key_id, secret_access_key FROM aws_credentials")
+            .store()?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AwsCredential {
+                    access_key_id: r.get(0)?,
+                    key_id: r.get(1)?,
+                    secret_access_key: r.get(2)?,
+                })
             })
-        })?;
+            .store()?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?);
+            out.push(r.store()?);
         }
         Ok(out)
     }
@@ -1055,7 +988,7 @@ impl SqliteStore {
                 params![key_hash],
                 row_to_key,
             )
-            .optional()?;
+            .optional().store()?;
         Ok(row)
     }
 

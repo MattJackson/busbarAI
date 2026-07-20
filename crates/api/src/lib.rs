@@ -26,4 +26,7 @@ pub use hooks::{
     CallerIdentity, Candidate, HookStatus, PolicyError, PolicyResult, PromptProjection,
     RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest, TransformOutcome,
 };
-pub use store::{AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Usage, VirtualKey};
+pub use store::{
+    AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
+    VirtualKey,
+};
