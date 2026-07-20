@@ -1739,7 +1739,7 @@
   "info": {
     "description": "The frozen, additive-only /api/v1/admin surface. Errors use the stable envelope {\"error\":{\"code\",\"message\"}}; tooling branches on `code`.",
     "title": "Busbar Admin API",
-    "version": "1.4.0"
+    "version": "1.4.1"
   },
   "openapi": "3.1.0",
   "paths": {
