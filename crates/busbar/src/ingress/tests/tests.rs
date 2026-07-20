@@ -187,29 +187,26 @@ fn key_spend(app: &Arc<App>, key_id: &str) -> i64 {
 /// outcome (so the net effect remains "bill 2xx only"). A 2xx `finish` keeps the charge; each
 /// non-2xx `finish` (503 / 5xx / 4xx) refunds exactly one flat fee. `finish_rejected` (governance
 /// rejection, never charged) refunds nothing.
-// No-runtime `#[test]` so the offloaded refund (`offload_store_write`) runs INLINE and is
-// observable synchronously — the atomic charge is seeded via the SYNC store path for the same
-// reason. `at` is the fixed budget window `key_spend` reads.
+// No-runtime `#[test]`: `refund_request` now decrements the AUTHORITATIVE in-memory cell (no store
+// offload), so it is observable synchronously. The admission charge is seeded via the in-memory
+// `record_request` (the flat-fee analog of `budget_check`'s admission charge) so the charge, the
+// refund, and the `usage_for` read all target the SAME authoritative cell. `at` is the fixed budget
+// window `key_spend` reads.
 #[test]
 fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
-    use crate::governance::Store;
     crate::metrics::init();
     let (app, key) = governed_app_with_key();
     let gov = crate::governance::GovCtx {
         key: Some(key.clone()),
     };
-    let store = app.governance.as_ref().unwrap().store();
+    let govstate = app.governance.as_ref().unwrap().clone();
     let at = 1_700_000_000u64;
-    // governed_app_with_key uses the "total" period → window 0; key_spend reads the same window.
-    let window = crate::governance::budget_window("total", at);
 
-    // Seed the admission charge synchronously (30c flat fee), like budget_check's atomic UPSERT.
-    let charge = |store: &std::sync::Arc<dyn Store>| {
-        assert!(store
-            .charge_within_budget(&key.id, window, 30, Some(100_000))
-            .unwrap());
+    // Seed the admission charge in memory (30c flat fee), mirroring budget_check's admission charge.
+    let charge = || {
+        govstate.record_request(&key, at, 0);
     };
-    charge(&store);
+    charge();
     assert_eq!(
         key_spend(&app, &key.id),
         30,
@@ -231,7 +228,7 @@ fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
         StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_REQUEST,
     ] {
-        charge(&store);
+        charge();
         assert_eq!(
             key_spend(&app, &key.id),
             60,
@@ -272,13 +269,12 @@ fn test_pre_routing_failure_does_not_refund_prior_charge() {
     let gov = crate::governance::GovCtx {
         key: Some(key.clone()),
     };
-    let store = app.governance.as_ref().unwrap().store();
-    let window = crate::governance::budget_window("total", 1_700_000_000);
+    let govstate = app.governance.as_ref().unwrap().clone();
 
-    // A prior, legitimately-charged request: seed one flat fee (30c) of spend in the window.
-    assert!(store
-        .charge_within_budget(&key.id, window, 30, Some(100_000))
-        .unwrap());
+    // A prior, legitimately-charged request: seed one flat fee (30c) of spend in the (in-memory,
+    // authoritative) window via the admission analog `record_request`. `key_spend`/`usage_for` and
+    // any (buggy) `refund_request` all target this same cell.
+    govstate.record_request(&key, 1_700_000_000, 0);
     assert_eq!(key_spend(&app, &key.id), 30, "prior charge seeded");
 
     // A malformed-JSON request on the SAME key fails pre-routing (model never resolved) → 400.
@@ -338,7 +334,7 @@ fn test_finish_outcome_mapping_503_is_exhausted() {
 // admission charge is seeded via the SYNC store path into the charged_at window.
 #[test]
 fn test_flat_fee_charge_and_refund_use_charged_at_window() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore, Store, SECS_PER_DAY};
+    use crate::governance::{GovState, NewKeySpec, SqliteStore, SECS_PER_DAY};
     crate::metrics::init();
 
     let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -370,10 +366,9 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
         "test precondition: charged_at must be a different day than now"
     );
 
-    // Admission charge into the charged_at day window (sync store path = budget_check's UPSERT).
-    assert!(store
-        .charge_within_budget(&key.id, day_window, 30, Some(1_000_000))
-        .unwrap());
+    // Admission charge into the charged_at day window via the in-memory admission analog
+    // (`record_request` charges the flat fee into `budget_window("daily", charged_at)` = day_window).
+    gov.record_request(&key, charged_at, 0);
     assert_eq!(
         gov.usage_for(&key.id, charged_at)
             .unwrap()
@@ -426,7 +421,7 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
 /// unconditionally and so would have admitted a request that the charge then overshot the cap.
 #[tokio::test]
 async fn test_budget_check_uses_charged_at_window_not_clock() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore, Store, SECS_PER_DAY};
+    use crate::governance::{GovState, NewKeySpec, SqliteStore, SECS_PER_DAY};
     crate::metrics::init();
 
     let past_day: u64 = 1_700_000_000; // a fixed past day
@@ -437,9 +432,10 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
         "test precondition: charged_at must be a different day than now"
     );
 
-    // Seed 30c of spend directly into the PAST day window BEFORE wrapping the store in GovState,
-    // so the precondition is deterministic — `charge_within_budget_async` offloads its write to the blocking
-    // pool under a Tokio runtime (fire-and-forget, not awaited), which would race this test.
+    // Seed 30c of spend into the PAST day window through the AUTHORITATIVE in-memory path
+    // (`record_request` charges the flat fee into `budget_window("daily", past_day)` = past_window),
+    // so the deterministic precondition matches what the in-memory admission gate reads. (Enforcement
+    // is now in-memory: seeding via the store alone would be invisible to `budget_check`.)
     let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
     let gov = std::sync::Arc::new(GovState::new(store.clone(), 30, 0, None).unwrap()); // 30c/req
     let (key, _secret) = gov
@@ -455,9 +451,7 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
             1_700_000_000,
         )
         .unwrap();
-    store
-        .add_usage(&key.id, past_window, 30, 0, true)
-        .expect("seed spend into the past day window");
+    gov.record_request(&key, past_day, 0);
 
     let mut app = minimal_app();
     Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
@@ -495,139 +489,14 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     );
 }
 
-/// A `Store` whose atomic budget charge always ERRORS, to exercise the fix-2b fail-mode knob.
-struct ErrChargeStore(crate::governance::SqliteStore);
-impl crate::governance::Store for ErrChargeStore {
-    fn put_key(&self, k: &crate::governance::VirtualKey) -> crate::governance::StoreResult<()> {
-        self.0.put_key(k)
-    }
-    fn get_key(
-        &self,
-        id: &str,
-    ) -> crate::governance::StoreResult<Option<crate::governance::VirtualKey>> {
-        self.0.get_key(id)
-    }
-    fn get_key_by_hash(
-        &self,
-        h: &str,
-    ) -> crate::governance::StoreResult<Option<crate::governance::VirtualKey>> {
-        self.0.get_key_by_hash(h)
-    }
-    fn list_keys(&self) -> crate::governance::StoreResult<Vec<crate::governance::VirtualKey>> {
-        self.0.list_keys()
-    }
-    fn delete_key(&self, id: &str) -> crate::governance::StoreResult<()> {
-        self.0.delete_key(id)
-    }
-    fn add_usage(
-        &self,
-        k: &str,
-        w: u64,
-        s: i64,
-        t: u64,
-        c: bool,
-    ) -> crate::governance::StoreResult<()> {
-        self.0.add_usage(k, w, s, t, c)
-    }
-    fn get_usage(
-        &self,
-        k: &str,
-        w: u64,
-    ) -> crate::governance::StoreResult<crate::governance::Usage> {
-        self.0.get_usage(k, w)
-    }
-    fn add_metering(
-        &self,
-        d: &crate::governance::MeteringDelta,
-    ) -> crate::governance::StoreResult<()> {
-        self.0.add_metering(d)
-    }
-    fn list_metering(
-        &self,
-        b: u64,
-    ) -> crate::governance::StoreResult<Vec<crate::governance::MeteringRow>> {
-        self.0.list_metering(b)
-    }
-    fn charge_within_budget(
-        &self,
-        _k: &str,
-        _w: u64,
-        _c: i64,
-        _m: Option<i64>,
-    ) -> crate::governance::StoreResult<bool> {
-        Err(crate::governance::StoreError(
-            "injected charge error".into(),
-        ))
-    }
-    fn refund_request(&self, k: &str, w: u64, c: i64) -> crate::governance::StoreResult<()> {
-        self.0.refund_request(k, w, c)
-    }
-}
-
-fn govctx_for(gov: &Arc<crate::governance::GovState>) -> (Arc<App>, crate::governance::GovCtx) {
-    use crate::governance::NewKeySpec;
-    let (key, _s) = gov
-        .create_key(
-            NewKeySpec {
-                name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1000),
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-            },
-            1_700_000_000,
-        )
-        .unwrap();
-    let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
-    (app, crate::governance::GovCtx { key: Some(key) })
-}
-
-/// fix 2b: on a budget-store ERROR, the `allow` (default) fail-mode PROCEEDS (availability) and
-/// `deny` REJECTS (hard guarantee). Same injected error, opposite outcome by config.
-#[tokio::test]
-async fn test_budget_store_error_respects_fail_mode_knob() {
-    use crate::config::BudgetOnStoreError;
-    use crate::governance::{GovState, SqliteStore};
-    crate::metrics::init();
-
-    // allow (default): store error → PROCEED, but reporting `Ok(false)` = admitted WITHOUT a
-    // charge, so a later non-2xx must NOT refund (the c2r1 fix; a blind refund would erode
-    // another request's spend).
-    let store = Arc::new(ErrChargeStore(SqliteStore::open_in_memory().unwrap()));
-    let gov = Arc::new(
-        GovState::new(store, 1, 0, None)
-            .unwrap()
-            .with_budget_on_store_error(BudgetOnStoreError::Allow),
-    );
-    let (app, govctx) = govctx_for(&gov);
-    assert!(
-        matches!(
-            budget_check(&app, &govctx, "openai", 1_700_000_000).await,
-            Ok(false)
-        ),
-        "allow fail-mode must PROCEED WITHOUT charge (Ok(false)) on a store error"
-    );
-
-    // deny: same store error → reject (429 on openai).
-    let store = Arc::new(ErrChargeStore(SqliteStore::open_in_memory().unwrap()));
-    let gov = Arc::new(
-        GovState::new(store, 1, 0, None)
-            .unwrap()
-            .with_budget_on_store_error(BudgetOnStoreError::Deny),
-    );
-    let (app, govctx) = govctx_for(&gov);
-    let rejected = budget_check(&app, &govctx, "openai", 1_700_000_000).await;
-    assert!(
-        rejected.is_err(),
-        "deny fail-mode must REJECT on a store error"
-    );
-    assert_eq!(
-        rejected.unwrap_err().status(),
-        StatusCode::TOO_MANY_REQUESTS
-    );
-}
+// REMOVED: `test_budget_store_error_respects_fail_mode_knob` (and its `ErrChargeStore` double).
+// The admission path (`try_charge_request_within_budget` → `charge_budget_mem`) is now an
+// infallible IN-MEMORY hard-cap check-and-charge: budget enforcement no longer round-trips the
+// store, so there is no admission-time store error for a fail-mode to consult. The whole
+// `budget_on_store_error` knob was therefore REMOVED (config field + enum + GovState plumbing) — its
+// guarantee ("hard cap even if the store errors") is now unconditional by construction, so the
+// behavior this test verified no longer exists. The write-behind flusher's own store-error handling
+// (re-mark dirty + retry) is covered by the governance flush tests.
 
 // ---- universal-ingress routing tests (cohere/responses/gemini/bedrock) ----
 //
@@ -3219,10 +3088,7 @@ async fn finish_admitted_does_not_refund_an_uncharged_admit() {
     let at = 1_700_000_000;
     // A PRIOR legitimate request charges the flat fee (price=30) into this window.
     let g = app.governance.as_ref().unwrap();
-    assert!(matches!(
-        g.try_charge_request_within_budget(&key, at).await,
-        Ok(true)
-    ));
+    assert!(g.try_charge_request_within_budget(&key, at));
     let charged_spend = key_spend(&app, &key.id);
     assert_eq!(charged_spend, 30, "prior request charged the flat fee");
 

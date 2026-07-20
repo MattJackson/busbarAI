@@ -157,59 +157,35 @@ async fn budget_check(
         // outcome is REFUNDED in `finish` to preserve the "bill 2xx only" flat-fee policy. This guard
         // runs LAST in `governance_guard` (after pool/rate), so no later guard can reject an
         // already-charged request.
-        match g.try_charge_request_within_budget(key, charged_at).await {
-            Ok(true) => Ok(true), // charged + admitted — a non-2xx refunds this flat fee
-            Ok(false) => {
-                // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the OpenAI
-                // writer passes it through verbatim as a real type; the Responses writer maps it
-                // explicitly). The older `billing_error` token was not in either vocabulary, so it
-                // leaked verbatim as a non-canonical `error.type` that an SDK's typed-exception mapping
-                // did not recognize — a router-side tell on a 402.
-                //
-                // The client-facing message carries only vendor-plausible quota copy — never the
-                // internal key id or governance vocabulary. The key id is recorded server-side.
-                tracing::info!(key_id = %key.id, "governance: key over budget");
-                // Native quota status differs by vendor (Bedrock's `ServiceQuotaExceededException` is
-                // 400; every other vendor surfaces over-quota as 429). The writer owns that mapping via
-                // `quota_exceeded_status()`, so this agnostic guard never branches on the protocol
-                // name. The body `kind` (`insufficient_quota`) drives the per-protocol error vocabulary.
-                let status = crate::proto::protocol_for(proto)
-                    .map(|p| p.writer().quota_exceeded_status())
-                    .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-                Err(ingress_error(
-                    proto,
-                    status,
-                    crate::proxy::KIND_INSUFFICIENT_QUOTA,
-                    "You have exceeded your current quota. Please check your plan and billing details.",
-                ))
-            }
-            Err(e) => {
-                // fix 2b: store error on the budget charge → consult the configured fail-mode.
-                // `Allow` (default) fails OPEN (proceed → availability, today's behavior); `Deny`
-                // fails CLOSED (reject → hard guarantee). The flat fee is NOT charged on this path
-                // (the atomic UPSERT did not commit), so an allowed request is simply un-billed for
-                // its flat fee this time — acceptable on a telemetry-store hiccup.
-                match g.budget_on_store_error() {
-                    crate::config::BudgetOnStoreError::Allow => {
-                        tracing::warn!(key_id = %key.id, error = %e, "budget charge store error; failing open (allow)");
-                        // Admitted, but the atomic UPSERT did NOT commit — nothing was charged, so a
-                        // later non-2xx must NOT refund (that would decrement OTHER requests' spend).
-                        Ok(false)
-                    }
-                    crate::config::BudgetOnStoreError::Deny => {
-                        tracing::warn!(key_id = %key.id, error = %e, "budget charge store error; failing closed (deny)");
-                        let status = crate::proto::protocol_for(proto)
-                            .map(|p| p.writer().quota_exceeded_status())
-                            .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-                        Err(ingress_error(
-                            proto,
-                            status,
-                            crate::proxy::KIND_INSUFFICIENT_QUOTA,
-                            "You have exceeded your current quota. Please check your plan and billing details.",
-                        ))
-                    }
-                }
-            }
+        // In-memory hard cap: `try_charge_request_within_budget` is now an infallible in-memory
+        // check-and-charge (SQLite is write-behind), so there is no store-error branch — admission
+        // never blocks on or fails from the durable store. `true` = charged + admitted (a non-2xx
+        // refunds this flat fee); `false` = over budget → reject.
+        if g.try_charge_request_within_budget(key, charged_at) {
+            Ok(true)
+        } else {
+            // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the OpenAI
+            // writer passes it through verbatim as a real type; the Responses writer maps it
+            // explicitly). The older `billing_error` token was not in either vocabulary, so it
+            // leaked verbatim as a non-canonical `error.type` that an SDK's typed-exception mapping
+            // did not recognize — a router-side tell on a 402.
+            //
+            // The client-facing message carries only vendor-plausible quota copy — never the
+            // internal key id or governance vocabulary. The key id is recorded server-side.
+            tracing::info!(key_id = %key.id, "governance: key over budget");
+            // Native quota status differs by vendor (Bedrock's `ServiceQuotaExceededException` is
+            // 400; every other vendor surfaces over-quota as 429). The writer owns that mapping via
+            // `quota_exceeded_status()`, so this agnostic guard never branches on the protocol
+            // name. The body `kind` (`insufficient_quota`) drives the per-protocol error vocabulary.
+            let status = crate::proto::protocol_for(proto)
+                .map(|p| p.writer().quota_exceeded_status())
+                .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+            Err(ingress_error(
+                proto,
+                status,
+                crate::proxy::KIND_INSUFFICIENT_QUOTA,
+                "You have exceeded your current quota. Please check your plan and billing details.",
+            ))
         }
     } else {
         // Governance off or no resolved key → no charge landed; nothing to refund on a non-2xx.

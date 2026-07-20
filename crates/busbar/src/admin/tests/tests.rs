@@ -4542,6 +4542,17 @@ impl crate::governance::Store for BarrierStore {
     ) -> crate::governance::StoreResult<crate::governance::Usage> {
         self.inner.get_usage(key_id, window_start)
     }
+    fn put_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        requests: u64,
+    ) -> crate::governance::StoreResult<()> {
+        self.inner
+            .put_usage(key_id, window_start, spend_cents, tokens, requests)
+    }
     fn add_metering(
         &self,
         delta: &crate::governance::MeteringDelta,

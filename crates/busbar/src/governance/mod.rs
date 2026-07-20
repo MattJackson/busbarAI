@@ -77,6 +77,18 @@ struct RateState {
     tokens: u64,
 }
 
+/// In-memory budget counter for a key's CURRENT window — the AUTHORITATIVE hot-path enforcement
+/// state. SQLite is a write-behind durability layer flushed off the request path. One cell per key
+/// (current window only; reset on rollover), so growth is key-count-bounded like the rate map.
+#[derive(Clone, Copy)]
+struct BudgetCell {
+    window_start: u64,
+    spend_cents: i64,
+    tokens: u64,
+    requests: u64,
+    dirty: bool,
+}
+
 /// The two auth-path key caches, held together under `GovState::caches`'s single `RwLock` so
 /// `refresh` can swap both in one critical section. `by_hash` is the hashed-secret → key index; it
 /// backs `lookup`. `by_access_key_id` is the AWS AccessKeyId → resolved-credential index for inbound
@@ -134,11 +146,22 @@ pub(crate) struct GovState {
     /// plaintext token is NOT retained — only its digest, which is all the constant-time compare on
     /// the /admin path needs (less plaintext secret held in memory). `None` = admin API disabled.
     admin_token_hash: Option<String>,
-    /// Fail-mode for the atomic budget check-and-charge on a STORE ERROR. `Allow` (default) fails
-    /// open (proceed → availability); `Deny` fails closed (reject → hard guarantee). Only the
-    /// store-error path consults this; a definitive over-budget result always rejects. Set from
-    /// `GovernanceCfg::budget_on_store_error` via `with_budget_on_store_error` at construction.
-    budget_on_store_error: crate::config::BudgetOnStoreError,
+    /// AUTHORITATIVE in-memory budget counters — the hard-cap admission state consulted (and charged)
+    /// on the request hot path with NO await and NO store round-trip. One `BudgetCell` per key for its
+    /// CURRENT window (reset on rollover), so the map is key-count-bounded exactly like `rate`. SQLite
+    /// is a WRITE-BEHIND durability layer: the flusher (`flush_budgets`) periodically SETS the durable
+    /// counter to a dirty cell's absolute values off the request path, and boot `hydrate_budgets`
+    /// re-loads accrued spend so a restart forgets nothing. The atomic check-and-charge under this
+    /// single `RwLock` gives the SAME hard-cap guarantee the SQL UPSERT gave, now in memory (single
+    /// node) — and, being in-memory, it can never fail with a store error, so there is no admission
+    /// fail-mode to configure.
+    budget: RwLock<HashMap<String, BudgetCell>>,
+    /// Admission counter that amortizes the bounded eviction sweep of `budget` (mirrors
+    /// `rate_sweep_ticker`): every Nth `charge_budget_mem` call performs the full stale-cell retain,
+    /// so the per-request hot path does not scan all active keys on every admission. Per-key
+    /// correctness does not depend on the sweep (a looked-up cell is reset in place when its window is
+    /// stale); the sweep purely bounds the map by evicting cells for keys that have gone silent.
+    budget_sweep_ticker: AtomicU32,
 }
 
 /// Parameters for minting a new virtual key (from the management API).
@@ -577,6 +600,11 @@ pub(crate) trait Store: Send + Sync + 'static {
     /// `count_request` increments the request counter by one — true for the per-request fee, false
     /// when only accruing token spend for an already-counted request (so requests aren't double
     /// counted when both the flat fee and token usage are recorded for one request).
+    // Superseded by the in-memory budget cells + write-behind `put_usage`: production no longer
+    // ACCUMULATES through the store (memory is authoritative), so this additive UPSERT is now only
+    // exercised by direct-store unit tests. `#[cfg(test)]` (compiled out of the release binary) rather
+    // than a dead-code allow — same hygiene as `get_usage_async`/`get_key_by_hash`.
+    #[cfg(test)]
     fn add_usage(
         &self,
         key_id: &str,
@@ -586,6 +614,17 @@ pub(crate) trait Store: Send + Sync + 'static {
         count_request: bool,
     ) -> StoreResult<()>;
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
+
+    /// Write-behind ABSOLUTE set of a key's window counter (memory is authoritative). SETS (not adds)
+    /// spend/tokens/requests to the given values. Used only by the budget flusher.
+    fn put_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        requests: u64,
+    ) -> StoreResult<()>;
 
     /// Accumulate one completed response's RAW consumption into the per-(key, bucket, model,
     /// provider) metering row (UPSERT/add; +1 request). Metering is observability — best-effort,
@@ -607,6 +646,11 @@ pub(crate) trait Store: Send + Sync + 'static {
     /// HARD cap for the flat fee. (Token cost is still reconciled post-response, so a single in-flight
     /// request's own tokens can push spend marginally over — bounded to ONE request, not N. See the
     /// call site in `ingress`.)
+    // Superseded on the admission path by the in-memory hard-cap (`GovState::charge_budget_mem`):
+    // enforcement no longer round-trips the store, so this SQL primitive is now exercised ONLY by the
+    // direct-store unit tests that pin its UPSERT/boundary semantics. `#[cfg(test)]` (compiled out of
+    // the release binary) rather than a dead-code allow.
+    #[cfg(test)]
     fn charge_within_budget(
         &self,
         key_id: &str,
@@ -621,25 +665,21 @@ pub(crate) trait Store: Send + Sync + 'static {
     /// stays "charge successful requests only" — matching the pre-fix behavior where `finish` only
     /// billed 2xx. Decrements spend by `cost_cents` and requests by one, both floored at 0 so a
     /// refund can never drive a counter negative. Best-effort (called off the request path).
+    // Superseded by the in-memory refund (`GovState::refund_request` decrements the authoritative
+    // cell; the write-behind flusher persists it): production no longer reverses a charge through the
+    // store, so this SQL primitive is now exercised ONLY by direct-store unit tests. `#[cfg(test)]`
+    // (compiled out of the release binary) rather than a dead-code allow.
+    #[cfg(test)]
     fn refund_request(&self, key_id: &str, window_start: u64, cost_cents: i64) -> StoreResult<()>;
 
     // ── ASYNC flavor of the per-request accounting methods ───────────────────────────────────────
-    // The per-request offload is owned by the backend (see the trait-level doc). These mirror the
-    // four hot-path accounting methods above; the request path (`GovState`) calls THESE instead of
-    // hand-rolling a `spawn_blocking` around the sync forms. The DEFAULT impl calls the sync method
-    // inline (correct for test doubles); `SqliteStore` overrides each to offload onto the blocking
-    // pool so a slow rusqlite call never stalls a Tokio worker.
-
-    /// Async flavor of [`Store::charge_within_budget`]. Default: calls the sync form inline.
-    async fn charge_within_budget_async(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-        max_cents: Option<i64>,
-    ) -> StoreResult<bool> {
-        self.charge_within_budget(key_id, window_start, cost_cents, max_cents)
-    }
+    // Historically the per-request offload was owned by the backend here (a `*_async` flavor that
+    // ran the blocking SQL on the Tokio blocking pool). Budget enforcement is now an AUTHORITATIVE
+    // IN-MEMORY hard-cap on the request hot path (see `GovState::charge_budget_mem`) with SQLite
+    // demoted to a write-behind durability layer, so the request path no longer awaits ANY store
+    // charge — the `charge_within_budget_async` flavor is gone entirely (its sync form survives, as
+    // `#[cfg(test)]`, only to pin the SQL primitive's semantics in direct-store unit tests). The one
+    // remaining async flavor is `get_usage_async`, used solely by the test-only `is_over_budget_async`.
 
     /// Async flavor of [`Store::get_usage`]. Default: calls the sync form inline.
     // Superseded on the request path by the atomic charge primitive; its only remaining caller is the
@@ -825,6 +865,7 @@ impl SqliteStore {
     // No `&self`, so the offload closure need not borrow the store. The SQL is byte-for-byte the
     // original — sync and async share one body, so they can never drift.
 
+    #[cfg(test)]
     fn add_usage_inner(
         conn: &Mutex<Connection>,
         key_id: &str,
@@ -848,6 +889,37 @@ impl SqliteStore {
                 spend_cents,
                 i64::try_from(tokens).unwrap_or(i64::MAX),
                 req_delta
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn put_usage_inner(
+        conn: &Mutex<Connection>,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        requests: u64,
+    ) -> StoreResult<()> {
+        // ABSOLUTE overwrite (memory is authoritative): mirrors `add_usage_inner`'s UPSERT shape but
+        // the DO UPDATE SETs (not adds) each counter to the flusher's snapshot of the in-memory cell,
+        // so a re-flush of the same cell is idempotent and never double-counts. Clamp the u64 counts
+        // into i64 like the other inners (a value above i64::MAX pins to i64::MAX, never wraps).
+        let conn = Self::lock_conn_raw(conn);
+        conn.execute(
+            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(key_id, window_start) DO UPDATE SET
+                spend_cents = excluded.spend_cents,
+                tokens      = excluded.tokens,
+                requests    = excluded.requests",
+            params![
+                key_id,
+                window_start as i64,
+                spend_cents,
+                i64::try_from(tokens).unwrap_or(i64::MAX),
+                i64::try_from(requests).unwrap_or(i64::MAX)
             ],
         )?;
         Ok(())
@@ -906,6 +978,7 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    #[cfg(test)]
     fn charge_within_budget_inner(
         conn: &Mutex<Connection>,
         key_id: &str,
@@ -950,6 +1023,7 @@ impl SqliteStore {
         Ok(charged.is_some())
     }
 
+    #[cfg(test)]
     fn refund_request_inner(
         conn: &Mutex<Connection>,
         key_id: &str,
@@ -1180,6 +1254,7 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn add_usage(
         &self,
         key_id: &str,
@@ -1198,6 +1273,24 @@ impl Store for SqliteStore {
         )
     }
 
+    fn put_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        requests: u64,
+    ) -> StoreResult<()> {
+        Self::put_usage_inner(
+            &self.conn,
+            key_id,
+            window_start,
+            spend_cents,
+            tokens,
+            requests,
+        )
+    }
+
     fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
         Self::add_metering_inner(&self.conn, delta)
     }
@@ -1206,6 +1299,7 @@ impl Store for SqliteStore {
         Self::list_metering_inner(&self.conn, bucket)
     }
 
+    #[cfg(test)]
     fn charge_within_budget(
         &self,
         key_id: &str,
@@ -1216,6 +1310,7 @@ impl Store for SqliteStore {
         Self::charge_within_budget_inner(&self.conn, key_id, window_start, cost_cents, max_cents)
     }
 
+    #[cfg(test)]
     fn refund_request(&self, key_id: &str, window_start: u64, cost_cents: i64) -> StoreResult<()> {
         Self::refund_request_inner(&self.conn, key_id, window_start, cost_cents)
     }
@@ -1224,40 +1319,14 @@ impl Store for SqliteStore {
         Self::get_usage_inner(&self.conn, key_id, window_start)
     }
 
-    // ── ASYNC flavor overrides — the per-request offload, now OWNED BY THIS BACKEND ──────────────
-    // Each offloads the synchronous `*_inner` SQL onto the Tokio blocking pool (`spawn_blocking`) so
-    // a slow rusqlite call — fsync / WAL checkpoint / lock contention — never stalls a Tokio worker.
-    // This is where the per-request offload now LIVES (relocated out of `GovState`'s hand-rolled
-    // `spawn_blocking`s). Args are owned into the `'static` closure; the connection handle is a cheap
-    // `Arc` clone of the SAME mutex the sync path locks (so sync and async serialize on one DB). A
-    // panic inside the blocking closure is re-raised faithfully via `resume_unwind`; a non-panic join
-    // failure (the blocking pool shut down mid-flight) maps to the crate's `StoreError` convention.
-
-    async fn charge_within_budget_async(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-        max_cents: Option<i64>,
-    ) -> StoreResult<bool> {
-        // No runtime (unit tests calling the accounting methods directly): run the SQL inline so
-        // behaviour is observable synchronously — `spawn_blocking` requires a Tokio reactor.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Self::charge_within_budget_inner(
-                &self.conn,
-                key_id,
-                window_start,
-                cost_cents,
-                max_cents,
-            );
-        }
-        let conn = self.conn.clone();
-        let key_id = key_id.to_owned();
-        join_offload(tokio::task::spawn_blocking(move || {
-            Self::charge_within_budget_inner(&conn, &key_id, window_start, cost_cents, max_cents)
-        }))
-        .await
-    }
+    // ── ASYNC flavor override — the write-behind read offload ────────────────────────────────────
+    // Only `get_usage_async` survives here (used solely by the test-only `is_over_budget_async`); the
+    // budget CHARGE is now an in-memory hard-cap that never round-trips the store, so its async
+    // offload was removed. This override runs the synchronous `get_usage_inner` on the Tokio blocking
+    // pool (`spawn_blocking`) so a slow rusqlite read never stalls a Tokio worker; the connection
+    // handle is a cheap `Arc` clone of the SAME mutex the sync path locks (sync and async serialize on
+    // one DB). A panic inside the blocking closure is re-raised faithfully via `resume_unwind`; a
+    // non-panic join failure (blocking pool shut down mid-flight) maps to the crate's `StoreError`.
 
     #[cfg(test)]
     async fn get_usage_async(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
@@ -1280,6 +1349,7 @@ impl Store for SqliteStore {
 /// store error. A NON-panic join failure (the blocking pool was shut down mid-flight, e.g. on
 /// runtime teardown) is mapped to the crate's `StoreError` convention so the caller's fail-open /
 /// fail-closed knob applies, exactly as the old `GovState` offload did.
+#[cfg(test)]
 async fn join_offload<T>(handle: tokio::task::JoinHandle<StoreResult<T>>) -> StoreResult<T> {
     match handle.await {
         Ok(res) => res,
@@ -1308,6 +1378,35 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         enabled: r.get::<_, i64>(8)? != 0,
         created_at: r.get::<_, i64>(9)? as u64,
     })
+}
+
+/// The write-behind budget flusher: on a fixed cadence (and once more on graceful shutdown) push the
+/// dirty in-memory budget cells to the durable store off the request hot path. Mirrors the D3
+/// `state_persist::spawn_snapshotter` shape — a spawned loop that ticks, does the durable write, and
+/// runs one FINAL flush on the shutdown signal so a graceful stop loses nothing. The in-memory cells
+/// stay AUTHORITATIVE for enforcement; this only keeps SQLite eventually-consistent for restart
+/// crash-recovery (`hydrate_budgets`) and the historical/telemetry reads. `flush_budgets` is
+/// best-effort and re-marks a cell dirty on a store error, so a transient write failure is retried on
+/// the next tick rather than lost.
+pub(crate) fn spawn_budget_flusher(
+    gov: std::sync::Arc<GovState>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    let interval = std::time::Duration::from_millis(crate::limits::usage_flush_interval_ms());
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    gov.flush_budgets();
+                }
+                _ = shutdown.recv() => {
+                    // Graceful shutdown: one FINAL flush so no accrued spend/requests is lost, then exit.
+                    gov.flush_budgets();
+                    break;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

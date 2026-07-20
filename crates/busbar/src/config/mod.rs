@@ -1486,13 +1486,6 @@ pub(crate) struct GovernanceCfg {
     /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,
-    /// Behavior when the budget store errors during the atomic admission check-and-charge.
-    /// `allow` (default) fails OPEN — the request proceeds, preserving availability on a telemetry-
-    /// store hiccup (today's behavior). `deny` fails CLOSED — the request is rejected, the strict
-    /// stance for security/regulated deployments that want a hard budget guarantee. Only the store-
-    /// ERROR path is affected; a definitive over-budget result always rejects regardless.
-    #[serde(default)]
-    pub(crate) budget_on_store_error: BudgetOnStoreError,
     /// SQLite `busy_timeout` (ms) applied to each governance connection (default 5000).
     #[serde(default = "default_sqlite_busy_timeout_ms")]
     pub(crate) sqlite_busy_timeout_ms: i64,
@@ -1500,6 +1493,11 @@ pub(crate) struct GovernanceCfg {
     /// full retain (default 256).
     #[serde(default = "default_rate_sweep_interval")]
     pub(crate) rate_sweep_interval: u32,
+    /// Write-behind flush cadence (ms) for the in-memory governance usage/budget counters. On an
+    /// UNGRACEFUL crash (kill -9 / power loss) at most this many ms of accrued spend/requests can be
+    /// lost; a graceful shutdown flushes fully. Default 100.
+    #[serde(default = "default_usage_flush_interval_ms")]
+    pub(crate) usage_flush_interval_ms: u64,
 }
 
 impl Default for GovernanceCfg {
@@ -1512,23 +1510,11 @@ impl Default for GovernanceCfg {
             price_per_request_cents: default_price_per_request_cents(),
             price_per_1k_tokens_cents: 0,
             admin_token: None,
-            budget_on_store_error: BudgetOnStoreError::default(),
             sqlite_busy_timeout_ms: default_sqlite_busy_timeout_ms(),
             rate_sweep_interval: default_rate_sweep_interval(),
+            usage_flush_interval_ms: default_usage_flush_interval_ms(),
         }
     }
-}
-
-/// Fail-mode for the budget check on a store error. Default `allow` (fail-open) preserves
-/// today's availability-first behavior.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BudgetOnStoreError {
-    /// Fail OPEN: on a store error during the budget check, proceed (availability). Today's behavior.
-    #[default]
-    Allow,
-    /// Fail CLOSED: on a store error during the budget check, reject (hard budget guarantee).
-    Deny,
 }
 
 // MANUAL Debug that REDACTS the admin bearer token. A derived `Debug` would print `admin_token` in
@@ -1549,7 +1535,6 @@ impl fmt::Debug for GovernanceCfg {
                     "<absent>"
                 },
             )
-            .field("budget_on_store_error", &self.budget_on_store_error)
             .finish()
     }
 }
@@ -1656,6 +1641,9 @@ pub(crate) const DEFAULT_KEY_GAUGE_LIMIT: usize = 2000;
 pub(crate) const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: i64 = 5_000;
 /// Default rate-sweep amortization interval. Mirrors `governance.rs`.
 pub(crate) const DEFAULT_RATE_SWEEP_INTERVAL: u32 = 256;
+/// Default write-behind flush cadence (ms) for the in-memory governance usage/budget counters.
+/// Mirrors `governance.rs`.
+pub(crate) const DEFAULT_USAGE_FLUSH_INTERVAL_MS: u64 = 100;
 /// Default active-probe interval (seconds) — the process-wide fallback for the per-lane override.
 pub(crate) const DEFAULT_PROBE_INTERVAL_SECS: u64 = 30;
 /// Default active-probe timeout (seconds) — the process-wide fallback for the per-lane override.
@@ -1702,6 +1690,9 @@ fn default_sqlite_busy_timeout_ms() -> i64 {
 }
 fn default_rate_sweep_interval() -> u32 {
     DEFAULT_RATE_SWEEP_INTERVAL
+}
+fn default_usage_flush_interval_ms() -> u64 {
+    DEFAULT_USAGE_FLUSH_INTERVAL_MS
 }
 fn default_probe_interval_secs() -> u64 {
     DEFAULT_PROBE_INTERVAL_SECS
@@ -1872,6 +1863,7 @@ pub(crate) struct LimitsResolved {
     pub(crate) key_gauge_limit: usize,
     pub(crate) sqlite_busy_timeout_ms: i64,
     pub(crate) rate_sweep_interval: u32,
+    pub(crate) usage_flush_interval_ms: u64,
     pub(crate) default_probe_interval_secs: u64,
     pub(crate) default_probe_timeout_secs: u64,
     pub(crate) default_policy_timeout_ms: u64,
@@ -1915,6 +1907,7 @@ impl LimitsResolved {
             key_gauge_limit: metrics.key_gauge_limit,
             sqlite_busy_timeout_ms: gov.sqlite_busy_timeout_ms,
             rate_sweep_interval: gov.rate_sweep_interval,
+            usage_flush_interval_ms: gov.usage_flush_interval_ms,
             default_probe_interval_secs: health.default_probe_interval_secs,
             default_probe_timeout_secs: health.default_probe_timeout_secs,
             default_policy_timeout_ms: routing.default_policy_timeout_ms,

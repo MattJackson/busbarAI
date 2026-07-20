@@ -1407,9 +1407,9 @@ fn test_validate_governance_requires_admin_token_when_enabled() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: missing.clone(),
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
         let errs = validate_governance(&gov, None)
             .expect_err("enabled governance without admin_token must fail");
@@ -1438,9 +1438,9 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some(blank.to_string()),
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
         let errs = validate_governance(&gov, None).unwrap_err_or_default(format!(
             "a whitespace-only admin_token {blank:?} must fail validation"
@@ -1460,9 +1460,9 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("  real-secret  ".to_string()),
-        budget_on_store_error: Default::default(),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
         validate_governance(&gov, None).is_ok(),
@@ -1497,9 +1497,9 @@ fn test_validate_governance_ok_when_enabled_with_admin_token() {
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("an-operator-secret".to_string()),
-        budget_on_store_error: Default::default(),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
         validate_governance(&gov, None).is_ok(),
@@ -1517,9 +1517,9 @@ fn test_validate_governance_rejects_zero_rate_sweep_interval() {
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("an-operator-secret".to_string()),
-        budget_on_store_error: Default::default(),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         rate_sweep_interval: 0,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     let err = validate_governance(&gov, None)
         .expect_err("rate_sweep_interval: 0 must be rejected at validation");
@@ -1538,9 +1538,9 @@ fn test_validate_governance_disabled_carries_no_requirement() {
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: None,
-        budget_on_store_error: Default::default(),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
         validate_governance(&gov, None).is_ok(),
@@ -1578,9 +1578,9 @@ fn test_validate_governance_rejects_passthrough_combination() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("an-operator-secret".to_string()),
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
         let errs = validate_governance(&gov, Some(&auth_cfg(mode)))
             .expect_err("governance + passthrough must be rejected at boot");
@@ -1606,9 +1606,9 @@ fn test_validate_governance_allows_token_and_none_modes() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("an-operator-secret".to_string()),
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
         assert!(
             validate_governance(&gov, Some(&auth_cfg(mode))).is_ok(),
@@ -1627,9 +1627,9 @@ fn test_validate_governance_passthrough_ignored_when_disabled() {
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: None,
-        budget_on_store_error: Default::default(),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
         validate_governance(&gov, Some(&auth_cfg("passthrough"))).is_ok(),

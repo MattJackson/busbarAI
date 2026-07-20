@@ -226,8 +226,6 @@ async fn test_concurrent_govstate_admission_respects_cap() {
         let key = key.clone();
         handles.push(tokio::spawn(async move {
             gov.try_charge_request_within_budget(&key, at)
-                .await
-                .unwrap()
         }));
     }
     let mut admitted = 0u32;
@@ -240,10 +238,13 @@ async fn test_concurrent_govstate_admission_respects_cap() {
         admitted, 5,
         "exactly 5 of 20 concurrent GovState admissions fit under a 5c/1c cap"
     );
+    // The hard cap is enforced by the AUTHORITATIVE in-memory cell; flush it to the durable store
+    // before asserting the persisted spend.
+    gov.flush_budgets();
     assert_eq!(
         store.get_usage(&key.id, 0).unwrap().spend_cents,
         5,
-        "final spend must be EXACTLY 5 — the async admission path holds the hard cap, no overshoot"
+        "final spend must be EXACTLY 5 — the in-memory admission path holds the hard cap, no overshoot"
     );
 }
 
@@ -271,16 +272,12 @@ async fn test_charge_refund_readmit_cycle() {
     let at = 1_700_000_000u64;
     // Charge to the cap.
     assert!(
-        gov.try_charge_request_within_budget(&key, at)
-            .await
-            .unwrap(),
+        gov.try_charge_request_within_budget(&key, at),
         "1st (1c) admitted, spends the whole 1c cap"
     );
     // At cap → next request rejected.
     assert!(
-        !gov.try_charge_request_within_budget(&key, at)
-            .await
-            .unwrap(),
+        !gov.try_charge_request_within_budget(&key, at),
         "2nd rejected: budget is exhausted at the cap"
     );
     // Refund the charge (fire-and-forget offloaded write), then drain the blocking pool.
@@ -297,9 +294,7 @@ async fn test_charge_refund_readmit_cycle() {
     assert_eq!(spend, 0, "refund must reverse the charge back to 0 spend");
     // Budget is free again → a new request is re-admitted.
     assert!(
-        gov.try_charge_request_within_budget(&key, at)
-            .await
-            .unwrap(),
+        gov.try_charge_request_within_budget(&key, at),
         "post-refund request re-admitted: the refunded fee freed the budget"
     );
 }
@@ -359,21 +354,15 @@ async fn test_try_charge_request_within_budget_rejects_at_cap() {
         .unwrap();
     let at = 1_700_000_000u64;
     assert!(
-        gov.try_charge_request_within_budget(&key, at)
-            .await
-            .unwrap(),
+        gov.try_charge_request_within_budget(&key, at),
         "1st (1c) admitted"
     );
     assert!(
-        gov.try_charge_request_within_budget(&key, at)
-            .await
-            .unwrap(),
+        gov.try_charge_request_within_budget(&key, at),
         "2nd (2c) admitted"
     );
     assert!(
-        !gov.try_charge_request_within_budget(&key, at)
-            .await
-            .unwrap(),
+        !gov.try_charge_request_within_budget(&key, at),
         "3rd (would be 3c > 2c cap) rejected atomically"
     );
 }
@@ -957,12 +946,16 @@ fn legacy_test_is_over_budget_and_record() {
     store.put_key(&k).unwrap();
     let gov = GovState::new(store, 30, 0, None).unwrap(); // 30 cents/request
 
+    // `record_request` now charges the AUTHORITATIVE in-memory cell (write-behind); `is_over_budget`
+    // reads the DURABLE store, so flush the cell before each read to reflect the accrued spend.
     assert!(!gov.is_over_budget(&k, 1_700_000_000));
     for _ in 0..3 {
         gov.record_request(&k, 1_700_000_000, 0); // 90c < 100c
     }
+    gov.flush_budgets();
     assert!(!gov.is_over_budget(&k, 1_700_000_000));
     gov.record_request(&k, 1_700_000_000, 0); // 120c ≥ 100c
+    gov.flush_budgets();
     assert!(gov.is_over_budget(&k, 1_700_000_000));
 
     let mut unlimited = k.clone();
@@ -976,6 +969,9 @@ fn test_record_tokens_cost() {
     // 50 cents per 1000 tokens, no per-request fee.
     let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 2000); // 2000 * 50 / 1000 = 100 cents
+                                                                       // record_tokens now accrues to the AUTHORITATIVE in-memory cell (write-behind); flush it to the
+                                                                       // durable store before asserting the persisted counter.
+    gov.flush_budgets();
     let u = store.get_usage("k1", 0).unwrap();
     assert_eq!(u.spend_cents, 100);
     assert_eq!(u.tokens, 2000);
@@ -991,6 +987,7 @@ fn test_record_tokens_sub_cent_carry_accumulates() {
     let gov = GovState::new(store.clone(), 0, 1, None).unwrap(); // 1¢ per 1000 tokens
 
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 500); // 0.5¢ → carried, flush 0
+    gov.flush_budgets(); // drain the write-behind cell to the durable store before asserting
     let u1 = store.get_usage("k1", 0).unwrap();
     assert_eq!(
         u1.spend_cents, 0,
@@ -999,6 +996,7 @@ fn test_record_tokens_sub_cent_carry_accumulates() {
     assert_eq!(u1.tokens, 500, "but the token COUNT is still recorded");
 
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 500); // +0.5¢ → 1.0¢ crosses, flush 1
+    gov.flush_budgets();
     let u2 = store.get_usage("k1", 0).unwrap();
     assert_eq!(
         u2.spend_cents, 1,
@@ -1025,9 +1023,11 @@ fn test_sub_cent_carry_does_not_leak_across_budget_windows() {
     );
 
     gov.record_tokens("k1", BUDGET_PERIOD_DAILY, day1, 500); // 0.5¢ in window 1 → carried, flush 0
+    gov.flush_budgets(); // persist the day-1 cell before it rolls over to day 2
     assert_eq!(store.get_usage("k1", w1).unwrap().spend_cents, 0);
 
     gov.record_tokens("k1", BUDGET_PERIOD_DAILY, day2, 500); // 0.5¢ in window 2: the day-1 remainder is reset
+    gov.flush_budgets(); // persist the (rolled-over) day-2 cell
     assert_eq!(
         store.get_usage("k1", w2).unwrap().spend_cents,
         0,
@@ -1036,38 +1036,29 @@ fn test_sub_cent_carry_does_not_leak_across_budget_windows() {
     assert_eq!(store.get_usage("k1", w2).unwrap().tokens, 500);
 }
 
-/// Token-charge offload UNDER a real Tokio runtime: `test_record_tokens_cost` runs with no runtime
-/// and so exercises only the INLINE branch of `offload_store_write`. This one calls `record_tokens`
-/// from inside a multi-thread runtime, where `offload_store_write` takes the `spawn_blocking` branch
-/// — the fire-and-forget SYNC `add_usage` write lands on the blocking pool, asynchronously. We then
-/// DRAIN that write (bounded poll on `get_usage`, mirroring `test_charge_refund_readmit_cycle`'s
-/// drain) and assert the token cost is reflected. Pins the
-/// `record_tokens → offload_store_write → spawn_blocking → add_usage` path.
+/// Token-charge write-behind UNDER a real Tokio runtime: `record_tokens` now accrues to the
+/// AUTHORITATIVE in-memory cell (no store round-trip), and the durable counter is updated by the
+/// write-behind flusher. This runs `record_tokens` inside a multi-thread runtime, then invokes
+/// `flush_budgets` (the flusher's per-tick body) and asserts the persisted counter reflects the
+/// token cost. Pins the `record_tokens → in-memory cell → flush_budgets → put_usage` path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_record_tokens_offload_under_runtime() {
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     // 50 cents per 1000 tokens, no per-request fee.
     let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
-    // 2000 tokens * 50c / 1000 = 100c. Fire-and-forget; the SQLite write is offloaded to the
-    // blocking pool, so the charge is NOT yet visible synchronously after this returns.
+    // 2000 tokens * 50c / 1000 = 100c. Accrued in memory; not yet persisted.
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 2000);
-    // Drain the offloaded write with a bounded poll (NOT a fixed sleep): yield to let the blocking
-    // task be scheduled, then re-read until the charge lands or the retry budget is exhausted.
-    let mut usage = None;
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-        let u = store.get_usage("k1", 0).unwrap();
-        if u.spend_cents == 100 {
-            usage = Some(u);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
-    let u =
-        usage.expect("token charge must land after draining the offloaded spawn_blocking write");
+    assert_eq!(
+        store.get_usage("k1", 0).unwrap().spend_cents,
+        0,
+        "write-behind: the durable counter is untouched until a flush"
+    );
+    // Flush the dirty cell to the durable store (the flusher's per-tick body).
+    assert_eq!(gov.flush_budgets(), 1, "one dirty cell flushed");
+    let u = store.get_usage("k1", 0).unwrap();
     assert_eq!(
         u.spend_cents, 100,
-        "2000 tokens at 50c/1k must spend exactly 100c"
+        "2000 tokens at 50c/1k must spend exactly 100c after the flush"
     );
     assert_eq!(
         u.tokens, 2000,
@@ -1448,8 +1439,9 @@ fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
 
 #[tokio::test]
 async fn test_record_request_offloaded_charges_under_runtime() {
-    // Inside a Tokio runtime, record_request offloads the SQLite write to the blocking pool.
-    // The charge must still land (we await the blocking pool draining via a yield + poll).
+    // Inside a Tokio runtime, record_request now charges the AUTHORITATIVE in-memory cell (no store
+    // round-trip); the write-behind flusher persists it. The charge must land in memory immediately
+    // and reach the durable store after a flush.
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let mut k = sample_key("k1", "h1");
     k.max_budget_cents = Some(1000);
@@ -1457,22 +1449,19 @@ async fn test_record_request_offloaded_charges_under_runtime() {
     let gov = GovState::new(store.clone(), 30, 0, None).unwrap();
 
     gov.record_request(&k, 1_700_000_000, 0);
-    // Drain the spawn_blocking write: poll until the usage row appears (bounded retries).
-    let mut spend = 0;
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-        spend = store.get_usage("k1", 0).unwrap().spend_cents;
-        if spend == 30 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
     assert_eq!(
-        spend, 30,
-        "offloaded record_request must charge the per-request fee"
+        store.get_usage("k1", 0).unwrap().spend_cents,
+        0,
+        "write-behind: durable counter untouched until a flush"
+    );
+    assert_eq!(gov.flush_budgets(), 1, "one dirty cell flushed");
+    assert_eq!(
+        store.get_usage("k1", 0).unwrap().spend_cents,
+        30,
+        "record_request must charge the per-request fee (visible after flush)"
     );
 
-    // And the async budget gate observes it.
+    // And the async budget gate observes it (30 < 1000 → not over).
     assert!(!gov.is_over_budget_async(&k, 1_700_000_000).await);
 }
 
@@ -1490,6 +1479,7 @@ fn test_record_request_clamps_negative_per_request_price() {
     for _ in 0..5 {
         gov.record_request(&k, 1_700_000_000, 0);
     }
+    gov.flush_budgets(); // persist the write-behind cell before asserting the durable counter
     let u = store.get_usage("k1", 0).unwrap();
     assert_eq!(
         u.spend_cents, 0,
@@ -1506,6 +1496,7 @@ fn test_record_tokens_clamps_negative_per_1k_price() {
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());
     let gov = GovState::new(store.clone(), 0, -100, None).unwrap();
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 5000);
+    gov.flush_budgets(); // persist the write-behind cell before asserting the durable counter
     let u = store.get_usage("k1", 0).unwrap();
     assert_eq!(u.spend_cents, 0, "negative token price must clamp to 0");
     assert_eq!(u.tokens, 5000, "tokens are still counted");

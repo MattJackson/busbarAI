@@ -11,6 +11,31 @@ item under **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **`governance.usage_flush_interval_ms` (default 100)** — write-behind flush cadence (ms) for the
+  in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this
+  window of accrued spend/requests can be lost; a graceful shutdown flushes fully.
+
+### Changed
+
+- **Governance budget enforcement is now in-memory on the request path** — the per-request budget
+  check-and-charge is an atomic in-memory hard cap (mirroring the existing rate limiter); SQLite became a
+  write-behind durability layer (boot-hydrate, a background flush every `usage_flush_interval_ms`, and a
+  final flush on graceful shutdown). Admission no longer performs — or awaits — a SQLite write, removing the
+  per-request fsync from the hot path (on local SSD this lifts the single-node governed-throughput ceiling by
+  ~5.6×). The flat-fee cap remains a hard cap; token cost is still reconciled post-response, bounded to one
+  in-flight request.
+- **Migration** — the `governance.budget_on_store_error` key has been **removed** and the governance config
+  rejects unknown fields, so a config that still sets it will fail to start. Delete the key. The guarantee it
+  offered (a hard cap even when the store errors) is now unconditional, because admission never touches the
+  store.
+
+### Removed
+
+- **`governance.budget_on_store_error`** — obsolete (see **Migration** under **Changed**): in-memory
+  admission cannot incur a store error, so the fail-open/closed knob no longer has a failure to govern.
+
 ## [1.4.1], 2026-07-20
 
 ### Added

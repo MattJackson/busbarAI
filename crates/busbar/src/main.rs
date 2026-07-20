@@ -596,6 +596,16 @@ async fn run() {
         });
     }
 
+    // WRITE-BEHIND BUDGET FLUSHER: the in-memory budget counters are authoritative on the request hot
+    // path (no SQLite await on admission); this background task periodically flushes accrued
+    // spend/requests to the durable store and runs one FINAL flush when the shutdown signal fires, so
+    // a graceful stop loses nothing (an ungraceful crash can lose at most one flush interval). Spawned
+    // once here (not on config apply/reload — the reused `Arc<GovState>` keeps its live cells and its
+    // already-running flusher). No-op when governance is disabled.
+    if let Some(gov) = app_handle.load().governance.clone() {
+        crate::governance::spawn_budget_flusher(gov, shutdown_tx.subscribe());
+    }
+
     // Data plane on `listen`, admin plane on its own `admin_listen`, served concurrently — each with
     // its own TLS/mTLS. `tokio::join!` returns only once BOTH have drained.
     let data_listener = bind_listener(&listen).await;
@@ -616,6 +626,15 @@ async fn run() {
             recv_shutdown(shutdown_tx.subscribe()),
         ),
     );
+    // BUDGET WRITE-BEHIND: one FINAL, SYNCHRONOUS flush after the graceful drain, so a graceful stop
+    // persists the freshest accrued spend/requests before the process exits. The background flusher's
+    // shutdown arm also flushes, but it is a fire-and-forget task that could lose the race with process
+    // exit; flushing inline here on the run task guarantees durability (this call blocks briefly under
+    // the budget lock, off any request path — the listeners have already drained).
+    if let Some(gov) = app_handle.load().governance.clone() {
+        let n = gov.flush_budgets();
+        tracing::info!(flushed = n, "budget counters flushed on shutdown");
+    }
     // D3: one FINAL state snapshot after the graceful drain, so the freshest health picture is
     // what the next boot restores (the periodic 30s tick could be up to 30s stale).
     if let Some(ref sf) = state_file {
@@ -1446,10 +1465,15 @@ pub(crate) fn build_app_from_config(
                         g.admin_token.clone(),
                     ) {
                         Ok(gs) => {
-                            // Thread the budget store-error fail-mode (allow|deny) onto GovState.
-                            let gs = gs.with_budget_on_store_error(g.budget_on_store_error);
+                            let gs = Arc::new(gs);
+                            // BOOT-ONLY crash-recovery: hydrate the authoritative in-memory budget cells
+                            // from the durable store so a restart resumes enforcement from the persisted
+                            // accrued spend instead of a zeroed budget. This runs ONLY in the fresh
+                            // construction path (never the prior-reuse branch above, which keeps the same
+                            // `Arc<GovState>` and its already-live cells across a config apply/reload).
+                            gs.hydrate_budgets(crate::store::now());
                             eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
-                            Some(Arc::new(gs))
+                            Some(gs)
                         }
                         Err(e) => return Err(format!("governance init failed: {e}")),
                     }

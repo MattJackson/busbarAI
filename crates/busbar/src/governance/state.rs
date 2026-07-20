@@ -24,24 +24,9 @@ impl GovState {
             admin_token_hash: admin_token
                 .as_ref()
                 .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
-            // Default fail-open; main.rs overrides from config via the setter.
-            budget_on_store_error: crate::config::BudgetOnStoreError::Allow,
+            budget: RwLock::new(HashMap::new()),
+            budget_sweep_ticker: AtomicU32::new(0),
         })
-    }
-
-    /// Set the budget store-error fail-mode. Builder-style so `GovState::new`'s signature is
-    /// unchanged (its many call sites stay intact); main.rs chains this from `GovernanceCfg`.
-    pub(crate) fn with_budget_on_store_error(
-        mut self,
-        mode: crate::config::BudgetOnStoreError,
-    ) -> Self {
-        self.budget_on_store_error = mode;
-        self
-    }
-
-    /// The configured budget store-error fail-mode. Consulted by the ingress admission site.
-    pub(crate) fn budget_on_store_error(&self) -> crate::config::BudgetOnStoreError {
-        self.budget_on_store_error
     }
 
     /// Run a best-effort, FIRE-AND-FORGET store write WITHOUT blocking the async executor thread.
@@ -74,8 +59,8 @@ impl GovState {
 
     /// Accrue token-based usage from a completed response to a key's current budget window: adds
     /// `tokens/1000 * price_per_1k_tokens_cents` to spend, plus the raw tokens (for TPM). Called
-    /// once per request at stream end from the response usage tap. Best-effort (store errors logged).
-    /// The SQLite write is offloaded to the blocking pool so it never stalls the async executor;
+    /// once per request at stream end from the response usage tap. Spend is added to the AUTHORITATIVE
+    /// in-memory `budget` cell (marked dirty for the write-behind flusher) — NO store round-trip here;
     /// the in-memory TPM counter is updated inline (it is cheap and must reflect the write order).
     pub(crate) fn record_tokens(&self, key_id: &str, budget_period: &str, now: u64, tokens: u64) {
         if tokens == 0 {
@@ -132,13 +117,52 @@ impl GovState {
         // on a value > i64::MAX wraps NEGATIVE and would DECREMENT the stored counter (defeating the
         // budget cap). Unreachable from real token counts, but the clamp makes it impossible.
         let spend = whole_cents.min(i64::MAX as u64) as i64;
-        let key_owned = key_id.to_string();
-        // count_request = false: this accrues token spend for a request already counted at admission
-        // (production: the atomic `charge_within_budget`; tests: `record_request`), so it must not
-        // increment the request counter again.
-        self.offload_store_write("token usage record failed", key_id, move |s| {
-            s.add_usage(&key_owned, window, spend, tokens, false)
-        });
+        // Add the accrued spend + raw tokens to the AUTHORITATIVE in-memory cell (write-behind: the
+        // flusher persists it later). No request-count bump here: this accrues token spend for a
+        // request already counted at admission (production: `charge_budget_mem`; tests:
+        // `record_request`), so it must not increment `requests` again.
+        //
+        // STRADDLE CASE (mirrors `add_rate_tokens`): `now` here is the request's pinned `charged_at`
+        // (the window the request STARTED in), NOT a fresh clock. A request that straddles a budget
+        // window boundary is admitted in its start window W0, but by the time its response completes a
+        // LATER admission for the same key may have rolled the live cell forward to W1 — so `window`
+        // (from `charged_at`) can be OLDER than the cell's live window. We must NOT rewind the cell to
+        // W0 and zero it (that would wipe W1's accrued spend/requests → budget under-count → overspend,
+        // the exact bug `add_rate_tokens` documents avoiding). Resolution:
+        //   - `window > cell.window_start` → the cell is genuinely stale (an older window the sweep
+        //     hasn't evicted): reset it to `window` (zeroed), then add.
+        //   - `window <= cell.window_start` → same window OR the straddle: credit IN PLACE on the live
+        //     cell (do not rewind, do not zero). Accepted imprecision: a straddling request's token
+        //     spend is attributed to the live (newer) window rather than dropped — bounded to one
+        //     in-flight request, and never lost.
+        //   - no cell → insert a fresh one for `window` (defensive: post-admission it should exist, but
+        //     an uncapped key or a token-only test path may reach here with none).
+        {
+            let mut map = self.budget_write();
+            let cell = match map.get_mut(key_id) {
+                Some(c) if window > c.window_start => {
+                    *c = BudgetCell {
+                        window_start: window,
+                        spend_cents: 0,
+                        tokens: 0,
+                        requests: 0,
+                        dirty: false,
+                    };
+                    c
+                }
+                Some(c) => c, // same window or straddle (cell newer-or-equal) → credit in place
+                None => map.entry(key_id.to_string()).or_insert(BudgetCell {
+                    window_start: window,
+                    spend_cents: 0,
+                    tokens: 0,
+                    requests: 0,
+                    dirty: false,
+                }),
+            };
+            cell.spend_cents = cell.spend_cents.saturating_add(spend);
+            cell.tokens = cell.tokens.saturating_add(tokens);
+            cell.dirty = true;
+        }
         // Feed the TPM counter. `add_rate_tokens` is UPDATE-only: it credits an existing entry
         // (created by `check_rate` for a capped key) but never materialises one — an uncapped key has
         // no entry and must not gain one here, otherwise the rate map grows unboundedly for caps-free
@@ -208,6 +232,21 @@ impl GovState {
     /// identity projection) to compute the per-lane `usage` routing signal.
     fn rate_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, RateState>> {
         self.rate.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Acquire the AUTHORITATIVE `budget` map for writing, recovering from a poisoned lock rather than
+    /// panicking (mirrors `rate_write`). This lock is on the request hot path (`charge_budget_mem`,
+    /// `record_tokens`, `refund_request`) and the project rule is no panic on the request path; the
+    /// map's invariants are re-established per call (a stale cell is reset in place for the current
+    /// window), so continuing with the recovered guard is safe.
+    fn budget_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, BudgetCell>> {
+        self.budget.write().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Acquire the `budget` map for reading (poison-recovering, same rationale as `budget_write`).
+    /// Read by `usage_for`, which treats a present current-window cell as authoritative.
+    fn budget_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, BudgetCell>> {
+        self.budget.read().unwrap_or_else(|p| p.into_inner())
     }
 
     /// READ-ONLY rate-limit headroom for a key: the fraction `[0.0, 1.0]` of the most-constrained
@@ -472,11 +511,65 @@ impl GovState {
         Ok(Some(key))
     }
 
-    /// Current-window usage for a key (`None` if the key does not exist).
+    /// BOOT-ONLY crash-recovery of accrued budget spend into the authoritative in-memory cells. For
+    /// each key, read the durable counter for its CURRENT window and, if non-zero, seed a NON-dirty
+    /// `BudgetCell` (non-dirty: the store already holds these values, so the first flush must not
+    /// re-write them). This runs OFF the hot path exactly once per fresh `GovState` (never on a config
+    /// reload/apply — the prior `Arc<GovState>` keeps its live cells), so a restart resumes enforcement
+    /// from the persisted spend instead of a zeroed budget. Best-effort: a store error on any key logs
+    /// and continues (never panics) — a key that fails to hydrate simply starts this run at zero spend,
+    /// the same fail-open posture the old store-error budget path took.
+    pub(crate) fn hydrate_budgets(&self, now: u64) {
+        let keys = match self.store.list_keys() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(error = %e, "budget hydration: list_keys failed; starting with empty budget cells");
+                return;
+            }
+        };
+        let mut map = self.budget_write();
+        for key in keys {
+            let window = budget_window(&key.budget_period, now);
+            match self.store.get_usage(&key.id, window) {
+                Ok(u) => {
+                    if u.spend_cents != 0 || u.tokens != 0 || u.requests != 0 {
+                        map.insert(
+                            key.id,
+                            BudgetCell {
+                                window_start: window,
+                                spend_cents: u.spend_cents,
+                                tokens: u.tokens,
+                                requests: u.requests,
+                                dirty: false,
+                            },
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(key = %key.id, error = %e, "budget hydration: get_usage failed; key starts at zero spend");
+                }
+            }
+        }
+    }
+
+    /// Current-window usage for a key (`None` if the key does not exist). The AUTHORITATIVE in-memory
+    /// cell wins for the CURRENT window (it reflects hot-path charges the write-behind flusher may not
+    /// have persisted yet); we fall back to the durable store for historical windows or a key whose
+    /// cell was never materialised (uncapped key with no spend, or a not-yet-touched window).
     pub(crate) fn usage_for(&self, id: &str, now: u64) -> StoreResult<Option<Usage>> {
         match self.store.get_key(id)? {
             Some(key) => {
                 let window = budget_window(&key.budget_period, now);
+                // Cell-authoritative for the current window.
+                if let Some(cell) = self.budget_read().get(id) {
+                    if cell.window_start == window {
+                        return Ok(Some(Usage {
+                            spend_cents: cell.spend_cents,
+                            tokens: cell.tokens,
+                            requests: cell.requests,
+                        }));
+                    }
+                }
                 Ok(Some(self.store.get_usage(id, window)?))
             }
             None => Ok(None),
@@ -704,79 +797,170 @@ impl GovState {
 
     /// ATOMIC budget check-and-charge for the admission path — the HARD-cap primitive.
     ///
-    /// In ONE indivisible store round-trip, charge the flat per-request fee + one request to the key's
-    /// current budget window IFF it stays within `max_budget_cents`. Replaces the old non-atomic
-    /// `is_over_budget_async` (read) → later `record_request` (write) pair, which let N concurrent
-    /// requests for one key each read "under budget" and all charge → overshoot by up to
-    /// concurrency × per-req cost. With a single conditional UPSERT, the flat fee is a HARD cap: a
-    /// request is admitted only if its charge fits.
+    /// Charge the flat per-request fee + one request to the key's current budget window IFF it stays
+    /// within `max_budget_cents`. The counter is now the AUTHORITATIVE in-memory `budget` cell (SQLite
+    /// is a write-behind durability layer), so this runs entirely under the `budget_write` lock with
+    /// NO await and NO store round-trip — the request hot path never blocks on SQLite. The check and
+    /// the charge are one indivisible critical section, so N concurrent requests for one key can NO
+    /// LONGER each read "under budget" and all charge: the flat fee is a HARD cap (the same guarantee
+    /// the SQL UPSERT gave, now single-node in memory). Replaces the old non-atomic
+    /// `is_over_budget_async` (read) → later `record_request` (write) pair.
     ///
     /// Residual (documented honestly): token cost is reconciled post-response (`record_tokens`), so a
     /// single ADMITTED request's own tokens can push spend marginally past the cap — bounded to ONE
     /// in-flight request, NOT N. The flat-fee overshoot (the N-way race) is gone.
     ///
-    /// Runs the (blocking) SQLite write on the blocking pool so it never stalls a Tokio worker.
-    /// Returns:
-    ///   * `Ok(true)`  — charged and admitted (or uncapped key: always charged),
-    ///   * `Ok(false)` — would exceed the cap → reject,
-    ///   * `Err(_)`    — store/join error → the caller applies the configured fail-open/closed knob.
+    /// SYNCHRONOUS and INFALLIBLE: the counter is an in-memory cell, so there is no store round-trip
+    /// to await and no store error to surface — the method is a plain `fn -> bool` (it was `async ->
+    /// StoreResult<bool>` while budget still round-tripped SQLite; that fallibility, and the
+    /// `budget_on_store_error` fail-mode it fed, are gone). Returns:
+    ///   * `true`  — charged and admitted (or uncapped key: always charged),
+    ///   * `false` — would exceed the cap → reject.
     ///
     /// The flat fee is charged HERE (atomically), so the caller must NOT also charge it in `finish`;
     /// `finish` emits metrics, fires the request-log webhook, and (on a non-2xx outcome) refunds the
     /// flat fee for an admitted request.
-    pub(crate) async fn try_charge_request_within_budget(
-        &self,
-        key: &VirtualKey,
-        now: u64,
-    ) -> StoreResult<bool> {
+    pub(crate) fn try_charge_request_within_budget(&self, key: &VirtualKey, now: u64) -> bool {
+        self.charge_budget_mem(key, now)
+    }
+
+    /// The in-memory hard-cap check-and-charge (the core of `try_charge_request_within_budget`).
+    /// Runs the amortized stale-cell sweep and the per-key check/charge under ONE `budget_write` guard
+    /// — exactly the shape `check_rate` uses for the rate map — so the whole operation is atomic on
+    /// this single node. Returns `true` when the flat fee was charged (request admitted), `false` when
+    /// charging it would exceed `max_budget_cents` (rejected WITHOUT charging).
+    fn charge_budget_mem(&self, key: &VirtualKey, now: u64) -> bool {
         let window = budget_window(&key.budget_period, now);
         // Clamp the per-request fee >= 0 (symmetric with record_tokens / the old record_request): a
         // negative misconfigured fee must never DECREMENT accrued spend and defeat the cap.
         let fee = self.price_per_request_cents.max(0);
         let max = key.max_budget_cents;
-        // The per-request offload now lives in the backend's `charge_within_budget_async` (the SQLite
-        // impl runs the atomic UPSERT on the blocking pool); no hand-rolled `spawn_blocking` here.
-        // Outside a runtime (unit tests calling directly) the default async impl runs the charge
-        // inline, so behaviour stays synchronous and observable.
-        self.store
-            .charge_within_budget_async(&key.id, window, fee, max)
-            .await
+        // FIRST-REQUEST GUARD (mirrors `charge_within_budget_inner`): a single flat fee that ALONE
+        // exceeds the whole cap can never be admitted, even into a fresh (empty) window. Reject up
+        // front before touching the cell.
+        if let Some(m) = max {
+            if fee > m {
+                return false;
+            }
+        }
+        // Amortized bounded eviction of stale cells, coalesced with the per-key work under ONE guard —
+        // identical to `check_rate` (see its extended note): the ticker fires the O(active-key) retain
+        // only every Nth admission (POST-increment semantics via `wrapping_add(1)` so the first call
+        // and the u32 wrap boundary are handled correctly), and per-key correctness is independent of
+        // the sweep because the resolution below resets a stale cell in place for `window`.
+        let sweep_needed = self
+            .budget_sweep_ticker
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            .is_multiple_of(crate::limits::rate_sweep_interval());
+        let mut map = self.budget_write();
+        if sweep_needed {
+            map.retain(|_, c| c.window_start == window);
+        }
+        // Resolve this key's cell for the CURRENT window (three cases mirror `check_rate`):
+        //  - present & current-window -> mutate in place.
+        //  - present but STALE        -> reset in place to the current window (counters back to zero).
+        //  - absent                   -> insert a fresh zeroed cell.
+        let cell = match map.get_mut(&key.id) {
+            Some(c) if c.window_start == window => c,
+            Some(c) => {
+                *c = BudgetCell {
+                    window_start: window,
+                    spend_cents: 0,
+                    tokens: 0,
+                    requests: 0,
+                    dirty: false,
+                };
+                c
+            }
+            None => map.entry(key.id.clone()).or_insert(BudgetCell {
+                window_start: window,
+                spend_cents: 0,
+                tokens: 0,
+                requests: 0,
+                dirty: false,
+            }),
+        };
+        // CAP CHECK: reject WITHOUT charging if the post-charge spend would exceed the cap. Saturating
+        // add so a near-i64::MAX accrued spend can never wrap negative and sneak a charge past the cap.
+        if let Some(m) = max {
+            if cell.spend_cents.saturating_add(fee) > m {
+                return false;
+            }
+        }
+        cell.spend_cents = cell.spend_cents.saturating_add(fee);
+        cell.requests = cell.requests.saturating_add(1);
+        cell.dirty = true;
+        true
     }
 
     /// Refund the flat per-request fee + request count charged at admission, for a request that
     /// produced no usable upstream result (non-2xx). Keeps the flat-fee policy "bill 2xx only" intact
-    /// even though the hard-cap charge bills every admitted request up front. Best-effort, offloaded.
+    /// even though the hard-cap charge bills every admitted request up front. Decrements the
+    /// AUTHORITATIVE in-memory cell (write-behind: the flusher persists it later) — NO store call.
     /// `now` MUST be the same `charged_at` epoch the admission charge used, so the refund lands in the
-    /// SAME budget window the charge did (the request could straddle a window boundary).
+    /// SAME budget window the charge did (the request could straddle a window boundary): if the cell's
+    /// window has already rolled past `now`, there is nothing in THIS window to refund (a no-op, never
+    /// a negative counter). Spend/requests are floored at 0 so a refund can never drive them negative.
     pub(crate) fn refund_request(&self, key: &VirtualKey, now: u64) {
         let window = budget_window(&key.budget_period, now);
         let fee = self.price_per_request_cents.max(0);
-        let key_id = key.id.clone();
-        self.offload_store_write("budget refund failed", &key.id, move |s| {
-            s.refund_request(&key_id, window, fee)
-        });
+        let mut map = self.budget_write();
+        if let Some(cell) = map.get_mut(&key.id) {
+            if cell.window_start == window {
+                cell.spend_cents = (cell.spend_cents - fee).max(0);
+                cell.requests = cell.requests.saturating_sub(1);
+                cell.dirty = true;
+            }
+        }
     }
 
-    /// Charge one request (flat per-request cost + token count) to the key's current window.
-    /// Best-effort: a store error is logged-and-dropped (telemetry must not break serving). The
-    /// SQLite write is offloaded to the blocking pool so it never stalls the async executor; the
-    /// in-memory TPM counter is updated inline.
-    // Retained ONLY for direct-call governance tests (production charges via the atomic UPSERT), so
-    // `#[cfg(test)]` — compiled out of the release binary — rather than a dead-code allow.
+    /// Charge one request (flat per-request cost + token count) to the key's current window. Now
+    /// writes to the AUTHORITATIVE in-memory `budget` cell (marked dirty for the write-behind flusher)
+    /// so it mirrors the production admission path; the in-memory TPM counter is updated inline. Tests
+    /// that assert DURABLE store state should call `flush_budgets()` first (or read the authoritative
+    /// value via `usage_for`).
+    // Retained ONLY for direct-call governance tests (production charges via the atomic in-memory
+    // hard-cap), so `#[cfg(test)]` — compiled out of the release binary — rather than a dead-code allow.
     #[cfg(test)]
     pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
         let window = budget_window(&key.budget_period, now);
-        let key_id = key.id.clone();
         // Clamp the per-request fee at >= 0, symmetric with `record_tokens` (which already clamps the
         // per-1k-token price). A negative `price_per_request_cents` (operator/hostile-admin
         // misconfiguration; the field is a plain signed i64 with no range check at config load) would
         // otherwise DECREMENT a key's accrued spend on every successful request, driving spend below
         // zero and defeating the budget cap (`is_over_budget` compares `spend_cents >= limit`).
         let fee = self.price_per_request_cents.max(0);
-        // count_request = true: this is the once-per-request accounting call.
-        self.offload_store_write("usage record failed", &key.id, move |s| {
-            s.add_usage(&key_id, window, fee, tokens, true)
-        });
+        // Charge the cell: +fee spend, +1 request, +tokens (count_request semantics = a fresh request).
+        // Straddle-safe resolution matching `record_tokens` (`now` is `charged_at`, so the live cell may
+        // be NEWER than `window`): reset only a genuinely-stale (older) cell; otherwise credit in place.
+        {
+            let mut map = self.budget_write();
+            let cell = match map.get_mut(&key.id) {
+                Some(c) if window > c.window_start => {
+                    *c = BudgetCell {
+                        window_start: window,
+                        spend_cents: 0,
+                        tokens: 0,
+                        requests: 0,
+                        dirty: false,
+                    };
+                    c
+                }
+                Some(c) => c, // same window or straddle (cell newer-or-equal) → credit in place
+                None => map.entry(key.id.clone()).or_insert(BudgetCell {
+                    window_start: window,
+                    spend_cents: 0,
+                    tokens: 0,
+                    requests: 0,
+                    dirty: false,
+                }),
+            };
+            cell.spend_cents = cell.spend_cents.saturating_add(fee);
+            cell.requests = cell.requests.saturating_add(1);
+            cell.tokens = cell.tokens.saturating_add(tokens);
+            cell.dirty = true;
+        }
         // Feed the rate window's TPM counter. `add_rate_tokens` is UPDATE-only, so this is a no-op for
         // an uncapped key (which has no entry — `check_rate` early-returns and never creates one for
         // it) and credits a capped key's existing entry otherwise. No cap check is needed here because
@@ -784,6 +968,53 @@ impl GovState {
         // credit. (Production always passes `tokens = 0` — the per-request fee carries no tokens — so
         // this returns at the `tokens == 0` guard; the token fee feeds TPM via `record_tokens`.)
         self.add_rate_tokens(&key.id, now, tokens);
+    }
+
+    /// WRITE-BEHIND flush of the dirty in-memory budget cells to the durable store. Runs OFF the
+    /// request hot path (the periodic flusher + the graceful-shutdown arm). Under `budget_write`, snap
+    /// each dirty cell's absolute values and clear its dirty flag; then OFF the lock, `put_usage`
+    /// (ABSOLUTE set, idempotent) each snapshot. On a store error, log and RE-MARK that cell dirty (if
+    /// it still holds the same window) so the accrued increment is retried on the next flush rather
+    /// than lost. Snapshotting under the lock but writing off it keeps the hot-path lock hold O(dirty)
+    /// and never blocks a charge on SQLite. Returns the number of cells flushed.
+    pub(crate) fn flush_budgets(&self) -> usize {
+        // Snapshot dirty cells and clear their flags under one short critical section.
+        let dirty: Vec<(String, u64, i64, u64, u64)> = {
+            let mut map = self.budget_write();
+            let mut out = Vec::new();
+            for (id, cell) in map.iter_mut() {
+                if cell.dirty {
+                    out.push((
+                        id.clone(),
+                        cell.window_start,
+                        cell.spend_cents,
+                        cell.tokens,
+                        cell.requests,
+                    ));
+                    cell.dirty = false;
+                }
+            }
+            out
+        };
+        let mut flushed = 0usize;
+        for (id, window, spend, tokens, requests) in dirty {
+            match self.store.put_usage(&id, window, spend, tokens, requests) {
+                Ok(()) => flushed += 1,
+                Err(e) => {
+                    tracing::warn!(key = %id, error = %e, "budget flush failed; will retry next tick");
+                    // RE-MARK dirty so the increment is not lost — only if the cell still exists for the
+                    // SAME window (a rollover since the snapshot means those values are already stale and
+                    // must not resurrect an old window's spend).
+                    let mut map = self.budget_write();
+                    if let Some(cell) = map.get_mut(&id) {
+                        if cell.window_start == window {
+                            cell.dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        flushed
     }
 
     pub(crate) fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {

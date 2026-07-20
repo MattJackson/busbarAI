@@ -22,7 +22,7 @@ use crate::config::{
     LimitsResolved, DEFAULT_KEY_GAUGE_LIMIT, DEFAULT_POLICY_TIMEOUT_MS,
     DEFAULT_PROBE_INTERVAL_SECS, DEFAULT_PROBE_TIMEOUT_SECS, DEFAULT_RATE_SWEEP_INTERVAL,
     DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-    DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS,
+    DEFAULT_USAGE_FLUSH_INTERVAL_MS, DEFAULT_WEBHOOK_DELIVERY_TIMEOUT_SECS,
 };
 
 /// The installed limits. `None` until `install` runs; `None` means "use the historical default",
@@ -102,6 +102,15 @@ pub(crate) fn rate_sweep_interval() -> u32 {
     get()
         .map(|l| l.rate_sweep_interval)
         .unwrap_or(DEFAULT_RATE_SWEEP_INTERVAL)
+}
+
+/// Write-behind flush cadence (ms) for the in-memory governance usage/budget counters. On an
+/// UNGRACEFUL crash (kill -9 / power loss) at most this many ms of accrued spend/requests can be
+/// lost; a graceful shutdown flushes fully (the flusher's shutdown arm). Default 100.
+pub(crate) fn usage_flush_interval_ms() -> u64 {
+    get()
+        .map(|l| l.usage_flush_interval_ms)
+        .unwrap_or(DEFAULT_USAGE_FLUSH_INTERVAL_MS)
 }
 
 /// Process-wide active-probe interval fallback (seconds). Per-lane `health.interval_secs` overrides.

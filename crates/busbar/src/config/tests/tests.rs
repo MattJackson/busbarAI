@@ -610,32 +610,6 @@ fn test_hook_access_grants_parse() {
     assert!(!bare.prompt.sends_prompt());
 }
 
-/// `governance.budget_on_store_error` parses `allow`/`deny`, defaults to `allow` (fail-
-/// open, today's behavior), and rejects an unknown value (typed enum, not a free string).
-#[test]
-fn test_budget_on_store_error_parses() {
-    use crate::config::BudgetOnStoreError;
-    // Default (field absent) is Allow.
-    let g: GovernanceCfg = serde_yaml::from_str("enabled: true\n").expect("parse");
-    assert_eq!(
-        g.budget_on_store_error,
-        BudgetOnStoreError::Allow,
-        "default is allow"
-    );
-    // Explicit allow / deny.
-    let g: GovernanceCfg =
-        serde_yaml::from_str("budget_on_store_error: allow\n").expect("parse allow");
-    assert_eq!(g.budget_on_store_error, BudgetOnStoreError::Allow);
-    let g: GovernanceCfg =
-        serde_yaml::from_str("budget_on_store_error: deny\n").expect("parse deny");
-    assert_eq!(g.budget_on_store_error, BudgetOnStoreError::Deny);
-    // Unknown value is a parse error (no silent degrade).
-    assert!(
-        serde_yaml::from_str::<GovernanceCfg>("budget_on_store_error: maybe\n").is_err(),
-        "unknown budget_on_store_error must fail to parse"
-    );
-}
-
 /// The shipped providers.yaml catalog must parse, name only known protocols, and use HTTPS.
 #[test]
 fn test_shipped_providers_catalog_valid() {
@@ -985,9 +959,9 @@ fn test_resolve_rejects_enabled_governance_without_admin_token() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: None,
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         }),
         security: None,
         limits: LimitsCfg::default(),
@@ -1029,9 +1003,9 @@ fn test_resolve_accepts_enabled_governance_with_admin_token() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("operator-secret".to_string()),
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         }),
         security: None,
         limits: LimitsCfg::default(),
@@ -1385,9 +1359,9 @@ fn test_debug_redacts_all_config_secrets() {
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("SECRET-admin-bearer-token-qqq".to_string()),
-        budget_on_store_error: Default::default(),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     let dbg = format!("{gov:?}");
     assert!(
@@ -1482,9 +1456,9 @@ fn test_debug_redacts_secrets_transitively_through_deploycfg() {
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("SECRET-embedded-admin-token".to_string()),
-            budget_on_store_error: Default::default(),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         }),
         security: None,
         limits: LimitsCfg::default(),
