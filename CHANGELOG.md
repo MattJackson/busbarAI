@@ -42,6 +42,11 @@ item under **Changed**.
   compile a backend straight in — no `cfg` sprawl.
 - **`governance.plugins_dir` (default `plugins`)** — the directory busbar loads store plugins from. A
   `store` other than `memory` is a library dropped here.
+- **Postgres store plugin — `governance.store: postgres`** — the shared, multi-node durable store:
+  one Postgres behind a fleet of busbar nodes, so virtual keys, budgets, and usage are shared across
+  the cluster. Drop in the Postgres store plugin (`libbusbar_store_postgres_plugin.{so,dll,dylib}`) and
+  set `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite — drop-in
+  interchangeable.
 - **Migration** — if you set `governance.store: sqlite`, install the SQLite store plugin into
   `governance.plugins_dir` (drop `libbusbar_store_sqlite_plugin` there), or busbar fails to start with a
   message naming the expected file. The default `store: memory` needs no plugin.

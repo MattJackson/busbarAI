@@ -1469,14 +1469,17 @@ pub(crate) struct SecurityCfg {
 // loud startup error, not a silent default (which would leave the admin API unreachable / a budget
 // unset). Mirrors the same guard on AuthCfg.
 /// The governance durable-store backend. Governance is ALWAYS available; this only chooses where its
-/// (bounded) keys + counters live. `memory` (default) is RAM — ephemeral, zero-setup; `sqlite`
-/// persists to `db_path`. Postgres and other backends arrive as plugins behind the same `Store` seam.
+/// (bounded) keys + counters live. `memory` (default) is RAM — ephemeral, zero-setup. `sqlite`
+/// (single-node durable) and `postgres` (shared across a cluster) are dynamic-library plugins loaded
+/// from `plugins_dir`; both read their connection target from `db_path` (a file path for sqlite, a
+/// libpq URL for postgres).
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum GovernanceStore {
     #[default]
     Memory,
     Sqlite,
+    Postgres,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1487,7 +1490,9 @@ pub(crate) struct GovernanceCfg {
     /// admin token is set and virtual keys are minted.
     #[serde(default)]
     pub(crate) store: GovernanceStore,
-    /// SQLite database path for the durable governance store (used when `store: sqlite`). Defaults to `busbar-governance.db`.
+    /// Connection target for a durable governance store: a SQLite file path when `store: sqlite`
+    /// (default `busbar-governance.db`), or a Postgres libpq URL (`postgres://user:pass@host/db`)
+    /// when `store: postgres`. Unused for the default `store: memory`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
     /// Flat cents charged per request for budget accounting. Defaults to 1.

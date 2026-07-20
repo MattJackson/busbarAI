@@ -1484,6 +1484,26 @@ pub(crate) fn build_app_from_config(
                     }
                 }
             }
+            crate::config::GovernanceStore::Postgres => {
+                // Postgres is the shared, multi-node store — also a plugin. `db_path` carries the
+                // libpq connection URL here (see config), passed to the plugin as its `url`.
+                let libname =
+                    busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
+                let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
+                let cfg_json = serde_json::json!({ "url": g.db_path }).to_string();
+                match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
+                    Ok(s) => Arc::from(s),
+                    Err(e) => {
+                        return Err(format!(
+                            "governance store 'postgres' plugin load failed: {e}. Install the \
+                             Postgres store plugin ({libname}) into the plugins directory ({}), set \
+                             governance.db_path to your postgres:// URL, or set governance.store: \
+                             memory.",
+                            g.plugins_dir
+                        ))
+                    }
+                }
+            }
             crate::config::GovernanceStore::Memory => {
                 tracing::warn!(
                     "governance store: in-memory (ephemeral) — keys, budgets, and usage reset on \

@@ -11,6 +11,8 @@ members = [
     "crates/hooks-ranking",
     "crates/store-sqlite",
     "crates/store-sqlite-plugin",
+    "crates/store-postgres",
+    "crates/store-postgres-plugin",
     "crates/store-memory",
 ]
 

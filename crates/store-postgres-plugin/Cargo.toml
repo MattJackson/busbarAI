@@ -1,0 +1,17 @@
+[package]
+name = "busbar-store-postgres-plugin"
+version = "1.5.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "The Postgres store packaged as a droppable busbar plugin: a cdylib exporting the store C ABI. Drop the built library into the plugins folder and set governance.store: postgres."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+busbar-api = { path = "../api" }
+busbar-store-postgres = { path = "../store-postgres" }
+busbar-plugin-sdk = { path = "../plugin-sdk" }
+serde_json = "1"
