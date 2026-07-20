@@ -9,7 +9,7 @@ use busbar_api::{
     AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage, VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 // rusqlite error -> the api's backend-agnostic `StoreError` (the contract crate stays storage-free,
 // so the `From` impl that powers `?` cannot live there). Replace `<rusqlite call>?` with `<call>.store()?`.
@@ -72,15 +72,13 @@ CREATE TABLE IF NOT EXISTS usage_metering (
 );
 ";
 
-/// Embedded SQLite store (the default `Store`). The single `Connection` is mutex-guarded; the
-/// governance surface is low-frequency (key CRUD) or batched (usage), so this is not on the hot path.
+/// Embedded SQLite `Store` backend (durable; opt-in via `governance.store: sqlite`). The single
+/// `Connection` is mutex-guarded; the governance surface is low-frequency (key CRUD) or batched
+/// (usage), so it is never on the request hot path.
 pub struct SqliteStore {
-    // `Arc<Mutex<…>>` (not a bare `Mutex`): the async accounting flavor offloads the synchronous SQL
-    // onto the blocking pool, which needs an owned handle to the connection mutex it can move into the
-    // `spawn_blocking` closure. The `Arc` lets each offload clone a cheap shared handle while
-    // `lock_conn()` (and every synchronous method) still locks the SAME single connection — the Arc
-    // derefs to the inner `Mutex`, so serialization across sync and async callers is preserved.
-    conn: Arc<Mutex<Connection>>,
+    // A single mutex-guarded connection. Governance is off the request hot path (key CRUD, batched
+    // usage, the write-behind flush), so serializing all access on one connection is fine.
+    conn: Mutex<Connection>,
 }
 
 impl SqliteStore {
@@ -100,7 +98,7 @@ impl SqliteStore {
                 .store()?;
         }
         let store = Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Mutex::new(conn),
         };
         store.migrate()?;
         Ok(store)
@@ -109,7 +107,7 @@ impl SqliteStore {
     /// In-memory SQLite store, for unit tests.
     pub fn open_in_memory() -> StoreResult<Self> {
         let store = Self {
-            conn: Arc::new(Mutex::new(Connection::open_in_memory().store()?)),
+            conn: Mutex::new(Connection::open_in_memory().store()?),
         };
         store.migrate()?;
         Ok(store)
@@ -128,9 +126,7 @@ impl SqliteStore {
     }
 
     /// Poison-recovering lock of a raw `&Mutex<Connection>` — same rationale as [`Self::lock_conn`],
-    /// but takes the mutex by reference so the shared `*_inner` SQL bodies (called from BOTH the sync
-    /// trait methods, holding `&self.conn`, AND the async offloads, holding a cloned `Arc`) can lock
-    /// it without needing `&self`.
+    /// but takes the mutex by reference so the shared `*_inner` SQL bodies can lock it without `&self`.
     fn lock_conn_raw(conn: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
         conn.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -144,12 +140,9 @@ impl SqliteStore {
         Ok(())
     }
 
-    // ── Shared SQL bodies for the dual-flavor accounting methods ─────────────────────────────────
-    // Each `*_inner` holds the EXACT SQL of its accounting method, locking the passed connection
-    // mutex (poison-recovering) so it can run from EITHER the synchronous trait method (`&self.conn`)
-    // OR an async offload (a cloned `Arc<Mutex<Connection>>` moved into a `spawn_blocking` closure).
-    // No `&self`, so the offload closure need not borrow the store. The SQL is byte-for-byte the
-    // original — sync and async share one body, so they can never drift.
+    // ── Shared SQL bodies for the accounting methods ─────────────────────────────────────────────
+    // Each `*_inner` holds the EXACT SQL of its accounting method, locking the passed connection mutex
+    // (poison-recovering). Takes no `&self`, so it is shared without borrowing the store.
 
     fn add_usage_inner(
         conn: &Mutex<Connection>,

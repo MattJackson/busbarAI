@@ -4,9 +4,9 @@
 //! Governance persistence. A durable `Store` seam — SEPARATE from the hot in-memory `StateStore`
 //! (breaker/lane health) — holding only bounded ENFORCEMENT state: virtual keys + config, and
 //! per-key usage counters (spend/tokens/requests) per budget window. Historical request logs are
-//! NOT stored here (they go to the observability pipeline). The default impl is `SqliteStore`
-//! (embedded, single file, statically linked — preserves the single-binary story); a
-//! `PostgresStore` could implement the same trait later for multi-node.
+//! NOT stored here (they go to the observability pipeline). The `Store` CONTRACT lives in
+//! `busbar-api`; the DEFAULT backend is the in-memory `MemoryStore` (ephemeral, zero-setup), with
+//! `SqliteStore` (durable) and future backends as swappable plugin crates chosen by `governance.store`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -105,7 +105,8 @@ struct GovCaches {
 
 /// Per-instance governance runtime: the durable `Store` plus an in-memory key cache (hashed-secret
 /// → key) so validation on the hot path is a map lookup, not a DB round-trip. Held in `App`
-/// (`Option`: `None` = governance disabled) — NOT a process-global, so tests stay isolated.
+/// (always `Some` in a running engine — governance is always constructed; `None` only in tests that
+/// omit it) — NOT a process-global, so tests stay isolated.
 pub(crate) struct GovState {
     store: Arc<dyn Store>,
     /// Both auth-path caches under ONE lock so `refresh` swaps them atomically — a reader can never
