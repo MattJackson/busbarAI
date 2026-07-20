@@ -75,11 +75,11 @@ jobs:
         # typed one; it equals the committed `openapi.json` the runtime serves (drift-locked by the
         # `openapi_json_matches_committed_file` test in ci.yml).
         env:
-          BUSBAR_EMIT_OPENAPI: busbar-openapi-${{ github.ref_name }}.json
+          BUSBAR_EMIT_OPENAPI: ${{ github.workspace }}/busbar-openapi-${{ github.ref_name }}.json
         run: cargo test -p busbar --bin busbar --features openapi-schema emit_openapi_artifact -- --nocapture
       - name: Validate it is a well-formed OpenAPI 3.1 document
         run: |
-          doc="busbar-openapi-${GITHUB_REF_NAME}.json"
+          doc="${GITHUB_WORKSPACE}/busbar-openapi-${GITHUB_REF_NAME}.json"
           test -s "$doc" || { echo "OpenAPI doc is empty"; exit 1; }
           jq -e '.openapi | startswith("3.1")' "$doc" > /dev/null \
             || { echo "not an OpenAPI 3.1 document"; exit 1; }
@@ -87,7 +87,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${GITHUB_REF_NAME}" "busbar-openapi-${GITHUB_REF_NAME}.json" \
+          gh release upload "${GITHUB_REF_NAME}" "${GITHUB_WORKSPACE}/busbar-openapi-${GITHUB_REF_NAME}.json" \
             --repo "${GITHUB_REPOSITORY}" --clobber
 
   upload-assets:
