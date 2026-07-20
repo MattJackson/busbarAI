@@ -25,6 +25,7 @@ path = "src/main.rs"
 # the engine and every plugin build against. See api/.
 busbar-api = { path = "../api" }
 busbar-store-sqlite = { path = "../store-sqlite" }
+busbar-store-memory = { path = "../store-memory" }
 # The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
 # so the matching feature (below) compiles each IN or OUT of the binary.
 busbar-auth-tokens = { path = "../auth-tokens", optional = true }
@@ -192,7 +193,6 @@ hooks-ranking = ["dep:busbar-hooks-ranking"]
 openapi-schema = ["dep:schemars"]
 
 [dev-dependencies]
-busbar-store-memory = { path = "../store-memory" }
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 axum = { version = "0.8", features = ["http1"] }

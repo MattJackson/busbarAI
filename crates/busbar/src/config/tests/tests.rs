@@ -932,51 +932,6 @@ models: {}
     assert_eq!(cfg.providers["myprov"].api_key_env, "MYPROV_KEY");
 }
 
-#[test]
-fn test_resolve_rejects_enabled_governance_without_admin_token() {
-    // resolve() is the boot-time fail-loud channel for the governance block (which never lands
-    // on RootCfg, so config_validate::validate cannot see it). An enabled governance block with
-    // no admin_token silently locks the /admin API — resolve must reject it.
-    let defs = HashMap::new();
-    let deploy = DeployCfg {
-        listen: DEFAULT_LISTEN_ADDR.into(),
-        tls: None,
-        admin_listen: DEFAULT_ADMIN_LISTEN_ADDR.into(),
-        admin_tls: None,
-        admin_insecure: false,
-        auth: None,
-        providers: HashMap::new(),
-        models: HashMap::new(),
-        pools: HashMap::new(),
-        hooks: HashMap::new(),
-        admin_auth: vec!["admin-tokens".to_string()],
-        group_map: HashMap::new(),
-        global_hooks: Vec::new(),
-        observability: None,
-        governance: Some(GovernanceCfg {
-            enabled: true,
-            db_path: DEFAULT_GOVERNANCE_DB.to_string(),
-            price_per_request_cents: 1,
-            price_per_1k_tokens_cents: 0,
-            admin_token: None,
-            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-        }),
-        security: None,
-        limits: LimitsCfg::default(),
-        metrics: MetricsCfg::default(),
-        health: HealthDefaultsCfg::default(),
-        routing: RoutingCfg::default(),
-    };
-    let errs = resolve(&deploy, &defs)
-        .expect_err("enabled governance without admin_token must fail resolution");
-    assert!(
-        errs.iter().any(|e| e.contains("governance.admin_token")),
-        "expected an admin-token lockout error; got: {errs:?}"
-    );
-}
-
 // Admin-token behavior — requires the compile-removable `admin-tokens` module.
 #[cfg(feature = "auth-admin-tokens")]
 #[test]
@@ -998,7 +953,7 @@ fn test_resolve_accepts_enabled_governance_with_admin_token() {
         global_hooks: Vec::new(),
         observability: None,
         governance: Some(GovernanceCfg {
-            enabled: true,
+            store: crate::config::GovernanceStore::Memory,
             db_path: DEFAULT_GOVERNANCE_DB.to_string(),
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
@@ -1354,7 +1309,7 @@ fn test_debug_redacts_all_config_secrets() {
 
     // GovernanceCfg: admin_token.
     let gov = GovernanceCfg {
-        enabled: true,
+        store: crate::config::GovernanceStore::Memory,
         db_path: "x.db".to_string(),
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
@@ -1451,7 +1406,7 @@ fn test_debug_redacts_secrets_transitively_through_deploycfg() {
         global_hooks: Vec::new(),
         observability: None,
         governance: Some(GovernanceCfg {
-            enabled: true,
+            store: crate::config::GovernanceStore::Memory,
             db_path: "x.db".to_string(),
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,

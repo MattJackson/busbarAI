@@ -1452,39 +1452,44 @@ pub(crate) fn build_app_from_config(
 
     // open the governance store + load the virtual-key cache when enabled.
     let governance = if let Some(p) = prior {
-        // REUSED across applies: the key DB + spend/rate state must survive config changes.
+        // REUSED across applies: the keys + spend/rate state must survive config changes.
         p.governance.clone()
     } else {
-        match governance_cfg {
-            Some(g) if g.enabled => {
+        // Governance is ALWAYS available (it is inert until an admin token is set and virtual keys are
+        // minted). Only the STORE backend is a choice: ephemeral RAM by default, or a durable store the
+        // operator configures. An absent `governance:` section is the RAM default.
+        let g = governance_cfg.unwrap_or_default();
+        let store: Arc<dyn governance::Store> = match g.store {
+            crate::config::GovernanceStore::Sqlite => {
                 match governance::SqliteStore::open(&g.db_path, g.sqlite_busy_timeout_ms) {
-                    Ok(store) => {
-                        match governance::GovState::new(
-                            Arc::new(store),
-                            g.price_per_request_cents,
-                            g.price_per_1k_tokens_cents,
-                            g.admin_token.clone(),
-                        ) {
-                            Ok(gs) => {
-                                let gs = Arc::new(gs);
-                                // BOOT-ONLY crash-recovery: hydrate the authoritative in-memory budget cells
-                                // from the durable store so a restart resumes enforcement from the persisted
-                                // accrued spend instead of a zeroed budget. This runs ONLY in the fresh
-                                // construction path (never the prior-reuse branch above, which keeps the same
-                                // `Arc<GovState>` and its already-live cells across a config apply/reload).
-                                gs.hydrate_budgets(crate::store::now());
-                                eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
-                                Some(gs)
-                            }
-                            Err(e) => return Err(format!("governance init failed: {e}")),
-                        }
-                    }
+                    Ok(s) => Arc::new(s),
                     Err(e) => {
                         return Err(format!("governance db open failed ({}): {e}", g.db_path))
                     }
                 }
             }
-            _ => None,
+            crate::config::GovernanceStore::Memory => {
+                tracing::warn!(
+                    "governance store: in-memory (ephemeral) — keys, budgets, and usage reset on \
+                     restart; configure a durable store for persistence"
+                );
+                Arc::new(governance::MemoryStore::new())
+            }
+        };
+        match governance::GovState::new(
+            store,
+            g.price_per_request_cents,
+            g.price_per_1k_tokens_cents,
+            g.admin_token.clone(),
+        ) {
+            Ok(gs) => {
+                let gs = Arc::new(gs);
+                // BOOT-ONLY crash-recovery: hydrate the in-memory budget cells from the durable store
+                // so a restart resumes enforcement from persisted spend. A no-op for the empty RAM store.
+                gs.hydrate_budgets(crate::store::now());
+                Some(gs)
+            }
+            Err(e) => return Err(format!("governance init failed: {e}")),
         }
     };
 

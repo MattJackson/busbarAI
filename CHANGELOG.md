@@ -11,6 +11,20 @@ item under **Changed**.
 
 ## [Unreleased]
 
+### Changed
+
+- **Governance is now always available; `governance.enabled` is removed.** Governance no longer has an
+  on/off switch — it is always present and simply INERT until an admin token is set and virtual keys are
+  minted (a default deploy with no admin token behaves exactly as "off" did, with identical RAM). The
+  durable-store backend is now the choice, via **`governance.store`**: `memory` (default — ephemeral RAM,
+  zero-setup) or `sqlite` (persists to `db_path`). The engine names storage only through the `Store`
+  contract; SQLite and the RAM store are swappable plugin crates (`busbar-store-sqlite`,
+  `busbar-store-memory`).
+- **Migration** — a config that sets `governance.enabled` will fail to start (unknown field). Remove it.
+  **If you relied on SQLite persistence, you must now set `governance.store: sqlite`** — otherwise
+  governance defaults to the ephemeral in-memory store and keys/budgets reset on restart. On the RAM
+  default, busbar logs a startup warning to that effect.
+
 ### Added
 
 - **`governance.usage_flush_interval_ms` (default 100)** — write-behind flush cadence (ms) for the

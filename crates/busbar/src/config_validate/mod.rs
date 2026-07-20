@@ -1345,28 +1345,27 @@ pub(crate) fn validate_governance(
                 .to_string(),
         );
     }
-    if governance.enabled
-        && governance
-            .admin_token
-            .as_deref()
-            // A WHITESPACE-ONLY admin_token (e.g. " " or "\t") passes a bare `is_empty()` guard but is
-            // functionally unusable: it is a degenerate secret an operator cannot reasonably present,
-            // and `${BUSBAR_ADMIN_TOKEN}` expanding to an all-blanks value would silently lock the
-            // /admin API exactly as an unset token does. Reject blank-only here too (trim then test)
-            // so the boot diagnostic fires for the whitespace case, not just the truly-empty one.
-            .is_none_or(|t| t.trim().is_empty())
+    // A whitespace-only admin_token is a degenerate, unusable secret: `${BUSBAR_ADMIN_TOKEN}`
+    // expanding to all blanks silently locks /admin exactly as an unset token does. Reject it fail-loud
+    // whenever a token is PRESENT. (An UNSET admin_token is the valid default — governance is always
+    // available but inert, and the /admin API is simply off until a real token is set.)
+    if governance
+        .admin_token
+        .as_deref()
+        .is_some_and(|tok| tok.trim().is_empty())
     {
         errors.push(
-            "governance.enabled is true but no governance.admin_token is configured; the /api/v1/admin management API is unreachable (every admin call returns 401). Set governance.admin_token (e.g. admin_token: ${BUSBAR_ADMIN_TOKEN})".to_string(),
+            "governance.admin_token is set but blank/whitespace-only; the /api/v1/admin management API is unreachable (every admin call returns 401). Set a real governance.admin_token (e.g. ${BUSBAR_ADMIN_TOKEN}) or omit it.".to_string(),
         );
     }
+
     // WARN (not a hard error): with `price_per_request_cents == 0`, a request that consumes no
     // tokens (or a key priced solely on a flat fee) accrues a ZERO charge, so the per-request
     // budget admission gate never closes — a key with `max_budget_cents` set is admitted without
     // bound on request COUNT (only token-priced spend counts). Request-count admission control
     // therefore requires a non-zero flat fee when a budget is in play. This is a deliberate
     // configuration (a deployment may price purely by tokens), so we warn rather than reject.
-    if governance.enabled && governance.price_per_request_cents == 0 {
+    if governance.admin_token.is_some() && governance.price_per_request_cents == 0 {
         tracing::warn!(
             "governance.price_per_request_cents is 0: a zero flat fee means a request can accrue a \
              zero charge, so per-request COUNT-based budget admission never closes — a virtual key \
@@ -1375,11 +1374,11 @@ pub(crate) fn validate_governance(
              price_per_request_cents."
         );
     }
-    if governance.enabled
+    if governance.admin_token.is_some()
         && auth.is_some_and(|a| a.upstream_credentials == crate::auth::UpstreamCreds::Passthrough)
     {
         errors.push(
-            "governance.enabled is true together with upstream_credentials: passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; use upstream_credentials: own (with an auth chain, or omit the auth block) alongside governance.".to_string(),
+            "governance is in use (admin_token set) together with upstream_credentials: passthrough; governance supersedes passthrough (every request must resolve to an enabled virtual key), so passthrough's accept-and-forward-caller-credential semantics are NOT honoured and every caller without a virtual key is silently rejected. This combination is unsupported; use upstream_credentials: own (with an auth chain, or omit the auth block) alongside governance.".to_string(),
         );
     }
     // A 0 sweep interval would disable the rate-map's idle-entry eviction sweep entirely — it rides on

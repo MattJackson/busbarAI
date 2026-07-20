@@ -411,9 +411,7 @@ impl<T> IntoStoreResult<T> for Result<T, getrandom::Error> {
     }
 }
 
-// The RAM store is the universal test double today; it becomes the always-on DEFAULT backend when
-// governance is wired to construct it (dropping this `#[cfg(test)]` at that step).
-#[cfg(test)]
+// The RAM store is the always-on DEFAULT governance backend (and the universal test double).
 pub(crate) use busbar_store_memory::MemoryStore;
 pub(crate) use busbar_store_sqlite::SqliteStore;
 

@@ -1468,12 +1468,26 @@ pub(crate) struct SecurityCfg {
 // deny_unknown_fields: a typo in a security-relevant governance key (e.g. `admin_tokn:`) must be a
 // loud startup error, not a silent default (which would leave the admin API unreachable / a budget
 // unset). Mirrors the same guard on AuthCfg.
+/// The governance durable-store backend. Governance is ALWAYS available; this only chooses where its
+/// (bounded) keys + counters live. `memory` (default) is RAM — ephemeral, zero-setup; `sqlite`
+/// persists to `db_path`. Postgres and other backends arrive as plugins behind the same `Store` seam.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GovernanceStore {
+    #[default]
+    Memory,
+    Sqlite,
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GovernanceCfg {
+    /// Governance store backend. `memory` (default) is ephemeral RAM (keys/budgets reset on restart);
+    /// `sqlite` persists to `db_path`. Governance itself is always on — it is simply inert until an
+    /// admin token is set and virtual keys are minted.
     #[serde(default)]
-    pub(crate) enabled: bool,
-    /// SQLite database path for the durable governance store. Defaults to `busbar-governance.db`.
+    pub(crate) store: GovernanceStore,
+    /// SQLite database path for the durable governance store (used when `store: sqlite`). Defaults to `busbar-governance.db`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
     /// Flat cents charged per request for budget accounting. Defaults to 1.
@@ -1502,10 +1516,10 @@ pub(crate) struct GovernanceCfg {
 
 impl Default for GovernanceCfg {
     fn default() -> Self {
-        // Route the limit fields through the serde-default fns; the non-limit fields keep their
-        // historical zero/disabled defaults (governance is off unless `enabled` is set).
+        // Route the limit fields through the serde-default fns. Governance is always available;
+        // the default store is ephemeral RAM (inert until an admin token + keys exist).
         Self {
-            enabled: false,
+            store: GovernanceStore::Memory,
             db_path: default_gov_db_path(),
             price_per_request_cents: default_price_per_request_cents(),
             price_per_1k_tokens_cents: 0,
@@ -1523,7 +1537,7 @@ impl Default for GovernanceCfg {
 impl fmt::Debug for GovernanceCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GovernanceCfg")
-            .field("enabled", &self.enabled)
+            .field("store", &self.store)
             .field("db_path", &self.db_path)
             .field("price_per_request_cents", &self.price_per_request_cents)
             .field("price_per_1k_tokens_cents", &self.price_per_1k_tokens_cents)
