@@ -1,0 +1,13 @@
+[package]
+name = "busbar-store-sqlite"
+version = "1.4.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "The built-in SQLite backend for busbar's durable governance store (the default `db` plugin)."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../api" }
+rusqlite = { version = "0.40.0", features = ["bundled"] }
+serde_json = "1"

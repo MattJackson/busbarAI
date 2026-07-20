@@ -3559,7 +3559,7 @@ async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_re
 #[tokio::test]
 async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
     // Exercises the create_key / list_keys / key_usage handlers end-to-end after they were moved
-    // onto spawn_blocking: a slow rusqlite call must not block a Tokio worker, and the offloaded
+    // onto spawn_blocking: a slow store call must not block a Tokio worker, and the offloaded
     // handlers must still return the same responses (no secret/hash leak; usage resolves).
     crate::metrics::init();
     let store = Arc::new(SqliteStore::open_in_memory().unwrap());

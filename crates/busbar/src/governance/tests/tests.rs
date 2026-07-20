@@ -398,63 +398,6 @@ fn test_refund_request_reverses_charge_floored_at_zero() {
     );
 }
 
-/// DI-2: a direct-DB `rpm_limit`/`tpm_limit` above `u32::MAX` must SATURATE to `u32::MAX` on read,
-/// not wrap to a wrong (lower) cap via `as u32`. The admin API bounds these on write; this covers
-/// the direct-DB hole.
-#[test]
-fn test_rpm_tpm_above_u32max_saturate_on_read() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    // Seed a key the normal way to satisfy NOT NULL / schema, then poke oversized limits directly.
-    let k = sample_key("kbig", "hashBIG");
-    s.put_key(&k).unwrap();
-    let huge: i64 = i64::from(u32::MAX) + 1_000; // > u32::MAX, fits i64
-    {
-        let conn = s.lock_conn();
-        conn.execute(
-            "UPDATE virtual_keys SET rpm_limit=?1, tpm_limit=?2 WHERE id='kbig'",
-            params![huge, huge],
-        )
-        .unwrap();
-    }
-    let got = s.get_key("kbig").unwrap().unwrap();
-    assert_eq!(
-        got.rpm_limit,
-        Some(u32::MAX),
-        "an oversized rpm_limit must saturate, not wrap"
-    );
-    assert_eq!(
-        got.tpm_limit,
-        Some(u32::MAX),
-        "an oversized tpm_limit must saturate, not wrap"
-    );
-}
-
-/// DI-3: a direct-DB NEGATIVE stored token/request counter must clamp to 0 on read, not wrap to a
-/// huge u64 via `as u64`.
-#[test]
-fn test_negative_usage_counters_clamp_to_zero_on_read() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let window_start: i64 = 1_700_000_000;
-    {
-        let conn = s.lock_conn();
-        conn.execute(
-            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-                 VALUES ('kneg', ?1, 0, -5, -3)",
-            params![window_start],
-        )
-        .unwrap();
-    }
-    let u = s.get_usage("kneg", window_start as u64).unwrap();
-    assert_eq!(
-        u.tokens, 0,
-        "a negative stored token counter must clamp to 0"
-    );
-    assert_eq!(
-        u.requests, 0,
-        "a negative stored request counter must clamp to 0"
-    );
-}
-
 /// The metering series: `add_metering` UPSERTs per (key, bucket, model, provider) with the raw
 /// token SPLIT preserved and +1 request per call; `list_metering` reads exactly one bucket; a
 /// second bucket never bleeds in.
@@ -539,36 +482,6 @@ fn test_record_metering_from_ir_usage_and_flat() {
     );
 }
 
-/// DI-3 parity with `get_usage`: a direct-DB negative metering counter clamps to 0 on read.
-#[test]
-fn test_negative_metering_counters_clamp_to_zero_on_read() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    {
-        let conn = s.lock_conn();
-        conn.execute(
-                "INSERT INTO usage_metering (key_id, bucket, model, provider,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation, requests)
-                 VALUES ('kneg', 0, 'm', 'p', -5, -1, -2, -3, -4)",
-                [],
-            )
-            .unwrap();
-    }
-    let rows = s.list_metering(0).unwrap();
-    assert_eq!(rows.len(), 1);
-    let r = &rows[0];
-    assert_eq!(
-        (
-            r.tokens_input,
-            r.tokens_output,
-            r.tokens_cache_read,
-            r.tokens_cache_creation,
-            r.requests
-        ),
-        (0, 0, 0, 0, 0),
-        "negative stored metering counters clamp to 0"
-    );
-}
-
 #[test]
 fn test_virtualkey_debug_redacts_key_hash() {
     // LOW #17 (SECURITY): VirtualKey's Debug must NOT print `key_hash` (the stored authenticator
@@ -605,50 +518,6 @@ fn test_virtualkey_debug_redacts_key_hash() {
         dbg_empty.contains("<absent>"),
         "empty key_hash should read as absent: {dbg_empty}"
     );
-}
-
-/// A pool name CONTAINING a comma must survive a persist/read round-trip as ONE pool, not be
-/// split into fragments. The old comma-delimited CSV storage corrupted such names (a key for
-/// `"prod,special"` round-tripped as `["prod", "special"]`, an implicit privilege expansion that
-/// also failed to match its own compound name). JSON-array storage is delimiter-safe.
-#[test]
-fn test_comma_bearing_pool_name_roundtrips_as_single_pool() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let mut k = sample_key("kc", "hashCOMMA");
-    k.allowed_pools = vec!["prod,special".to_string(), "plain".to_string()];
-    s.put_key(&k).unwrap();
-
-    let got = s.get_key("kc").unwrap().unwrap();
-    assert_eq!(
-        got.allowed_pools,
-        vec!["prod,special".to_string(), "plain".to_string()],
-        "comma-bearing pool name must not be split on read"
-    );
-    // The compound name matches; neither split fragment is authorized on its own.
-    assert!(pool_allowed(&got, "prod,special"));
-    assert!(!pool_allowed(&got, "prod"));
-    assert!(!pool_allowed(&got, "special"));
-}
-
-/// `pools_from_storage` must still read a LEGACY bare comma-delimited row (written before the
-/// JSON migration) so an existing on-disk DB keeps working without a migration step.
-#[test]
-fn test_pools_from_storage_reads_legacy_csv() {
-    // New JSON format.
-    assert_eq!(
-        pools_from_storage("[\"a\",\"b\"]"),
-        vec!["a".to_string(), "b".to_string()]
-    );
-    // Legacy comma-delimited format (not valid JSON) falls back to the comma split.
-    assert_eq!(
-        pools_from_storage("a,b"),
-        vec!["a".to_string(), "b".to_string()]
-    );
-    // A single legacy comma-free value.
-    assert_eq!(pools_from_storage("solo"), vec!["solo".to_string()]);
-    // Empty stays empty (= no restriction).
-    assert!(pools_from_storage("").is_empty());
-    assert!(pools_from_storage("[]").is_empty());
 }
 
 #[test]
@@ -1928,46 +1797,5 @@ fn test_delete_key_does_not_inherit_stale_usage_on_recreate() {
         s.get_usage("vk_reuse", 100).unwrap(),
         Usage::default(),
         "re-created key must not inherit the deleted key's usage"
-    );
-}
-
-#[test]
-fn test_poisoned_conn_lock_recovers_not_panics() {
-    // Regression: a panic while the SqliteStore `conn` Mutex is held poisons it. Every `Store`
-    // method acquires the connection via `lock_conn`, which must RECOVER (via into_inner)
-    // rather than `.unwrap()`-panic on every subsequent call — otherwise one transient panic
-    // permanently disables governance persistence (and, via spawn_blocking join, silently fails
-    // budget enforcement OPEN). We deliberately poison the lock, then assert the durable
-    // read/write path still functions.
-    use std::sync::Arc;
-
-    let s = Arc::new(SqliteStore::open_in_memory().unwrap());
-    s.add_usage("k_poison", 100, 10, 50, true).unwrap();
-
-    // Poison the connection Mutex: panic while holding the guard.
-    let s2 = Arc::clone(&s);
-    let _ = std::thread::spawn(move || {
-        let _guard = s2.conn.lock().unwrap();
-        panic!("intentional poison");
-    })
-    .join();
-    assert!(
-        s.conn.is_poisoned(),
-        "conn lock must be poisoned for the test"
-    );
-
-    // Despite the poison, durable access keeps working (no panic): reads recover the guard,
-    // and writes continue to accrue correctly on the recovered (still-consistent) connection.
-    assert_eq!(
-        s.get_usage("k_poison", 100).unwrap().requests,
-        1,
-        "get_usage must recover the poisoned conn lock instead of panicking"
-    );
-    s.add_usage("k_poison", 100, 5, 25, true).unwrap();
-    let u = s.get_usage("k_poison", 100).unwrap();
-    assert_eq!(
-        (u.requests, u.spend_cents, u.tokens),
-        (2, 15, 75),
-        "writes must keep accruing on a recovered (poisoned) conn lock"
     );
 }

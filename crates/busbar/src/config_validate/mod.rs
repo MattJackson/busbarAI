@@ -1279,7 +1279,7 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
                 .to_string(),
         );
     }
-    // SQLite busy_timeout must be >= 0 (rusqlite rejects negative). 0 means "fail immediately on lock"
+    // SQLite busy_timeout must be >= 0 (the SQLite backend rejects negative). 0 means "fail immediately on lock"
     // — degraded but not broken, so only reject a negative value.
     if limits.sqlite_busy_timeout_ms < 0 {
         errors.push(format!(

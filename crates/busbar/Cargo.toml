@@ -24,6 +24,7 @@ path = "src/main.rs"
 # The plugin CONTRACTS (auth-module trait, routing-policy trait, projections) — the one crate both
 # the engine and every plugin build against. See api/.
 busbar-api = { path = "../api" }
+busbar-store-sqlite = { path = "../store-sqlite" }
 # The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
 # so the matching feature (below) compiles each IN or OUT of the binary.
 busbar-auth-tokens = { path = "../auth-tokens", optional = true }
@@ -114,7 +115,6 @@ tracing-opentelemetry = "0.33.0"
 sha2 = "0.11.0"
 hmac = "0.13.0"
 hex = "0.4.3"
-rusqlite = { version = "0.40.0", features = ["bundled"] }
 getrandom = "0.3"
 # CRC32 for the AWS `application/vnd.amazon.eventstream` encoder (Bedrock ingress streaming): AWS
 # SDK clients validate both the prelude and message CRC32 on every frame, so the encoder needs a

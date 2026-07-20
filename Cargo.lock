@@ -191,6 +191,7 @@ dependencies = [
  "busbar-auth-admin-tokens",
  "busbar-auth-tokens",
  "busbar-hooks-ranking",
+ "busbar-store-sqlite",
  "bytes",
  "crc32fast",
  "futures",
@@ -210,7 +211,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "ring",
- "rusqlite",
  "rustls",
  "rustls-pki-types",
  "schemars",
@@ -260,6 +260,15 @@ dependencies = [
  "async-trait",
  "busbar-api",
  "tokio",
+]
+
+[[package]]
+name = "busbar-store-sqlite"
+version = "1.4.0"
+dependencies = [
+ "busbar-api",
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

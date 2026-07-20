@@ -1456,30 +1456,34 @@ pub(crate) fn build_app_from_config(
         p.governance.clone()
     } else {
         match governance_cfg {
-            Some(g) if g.enabled => match governance::SqliteStore::open(&g.db_path) {
-                Ok(store) => {
-                    match governance::GovState::new(
-                        Arc::new(store),
-                        g.price_per_request_cents,
-                        g.price_per_1k_tokens_cents,
-                        g.admin_token.clone(),
-                    ) {
-                        Ok(gs) => {
-                            let gs = Arc::new(gs);
-                            // BOOT-ONLY crash-recovery: hydrate the authoritative in-memory budget cells
-                            // from the durable store so a restart resumes enforcement from the persisted
-                            // accrued spend instead of a zeroed budget. This runs ONLY in the fresh
-                            // construction path (never the prior-reuse branch above, which keeps the same
-                            // `Arc<GovState>` and its already-live cells across a config apply/reload).
-                            gs.hydrate_budgets(crate::store::now());
-                            eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
-                            Some(gs)
+            Some(g) if g.enabled => {
+                match governance::SqliteStore::open(&g.db_path, g.sqlite_busy_timeout_ms) {
+                    Ok(store) => {
+                        match governance::GovState::new(
+                            Arc::new(store),
+                            g.price_per_request_cents,
+                            g.price_per_1k_tokens_cents,
+                            g.admin_token.clone(),
+                        ) {
+                            Ok(gs) => {
+                                let gs = Arc::new(gs);
+                                // BOOT-ONLY crash-recovery: hydrate the authoritative in-memory budget cells
+                                // from the durable store so a restart resumes enforcement from the persisted
+                                // accrued spend instead of a zeroed budget. This runs ONLY in the fresh
+                                // construction path (never the prior-reuse branch above, which keeps the same
+                                // `Arc<GovState>` and its already-live cells across a config apply/reload).
+                                gs.hydrate_budgets(crate::store::now());
+                                eprintln!("busbar: governance enabled (sqlite {})", g.db_path);
+                                Some(gs)
+                            }
+                            Err(e) => return Err(format!("governance init failed: {e}")),
                         }
-                        Err(e) => return Err(format!("governance init failed: {e}")),
+                    }
+                    Err(e) => {
+                        return Err(format!("governance db open failed ({}): {e}", g.db_path))
                     }
                 }
-                Err(e) => return Err(format!("governance db open failed ({}): {e}", g.db_path)),
-            },
+            }
             _ => None,
         }
     };

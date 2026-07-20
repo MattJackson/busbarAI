@@ -156,7 +156,7 @@ fn error_response(status: StatusCode, error_type: &str, message: impl Into<Strin
 }
 
 /// 500 for an internal store/DB failure. The detailed error (which may embed raw SQL fragments,
-/// column/table names, or file paths from rusqlite) is logged server-side via `tracing::error!`;
+/// column/table names, or paths from the store backend) is logged server-side via `tracing::error!`;
 /// the HTTP body carries only a generic message so internal storage details are never disclosed to
 /// the client (even an authenticated admin). `op` names the operation for log correlation.
 fn internal_error(op: &str, e: &crate::governance::StoreError) -> Response {
@@ -505,7 +505,7 @@ pub(crate) async fn create_key(
         rpm_limit: req.rpm_limit,
         tpm_limit: req.tpm_limit,
     };
-    // Offload the blocking rusqlite write off the Tokio worker thread (matches the request-path
+    // Offload the blocking store write off the Tokio worker thread (matches the request-path
     // discipline in governance::charge_within_budget_async / offload_store_write).
     let gov = gov.clone();
     let now = crate::store::now();
