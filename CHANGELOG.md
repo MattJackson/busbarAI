@@ -11,6 +11,8 @@ item under **Changed**.
 
 ## [Unreleased]
 
+## [1.5.0], 2026-07-20
+
 ### Changed
 
 - **Governance is now always available; `governance.enabled` is removed.** Governance no longer has an
