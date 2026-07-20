@@ -10,6 +10,8 @@
 //!   plus the constant-time credential primitives every module compares with.
 //! - **hooks** — the [`RoutingPolicy`] trait (decide/transform/notify + configure/describe) and
 //!   the read-only projections it is invoked with.
+//! - **store** — the durable-store records ([`VirtualKey`], [`Usage`], [`AwsCredential`], …) a `db`
+//!   plugin reads and writes (the `Store` trait itself joins them in a following step).
 //!
 //! Everything here is a CONTRACT, not machinery: no I/O, no engine state, no transport. A
 //! third-party plugin crate that depends only on `busbar-api` is architecturally identical to a
@@ -17,9 +19,11 @@
 
 mod auth;
 mod hooks;
+mod store;
 
 pub use auth::{constant_time_eq, sha256_hex, AuthModule, AuthOutcome, Principal};
 pub use hooks::{
     CallerIdentity, Candidate, HookStatus, PolicyError, PolicyResult, PromptProjection,
     RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest, TransformOutcome,
 };
+pub use store::{AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Usage, VirtualKey};
