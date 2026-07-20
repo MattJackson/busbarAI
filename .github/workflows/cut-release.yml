@@ -1,0 +1,69 @@
+name: Cut release
+
+# ONE-CLICK RELEASE. Dispatch this with a version (e.g. 1.4.2) and it does every chore
+# that used to be manual + error-prone, then tags — which triggers release.yml (binaries,
+# SBOM, OpenAPI asset, attestation) and docker.yml (Docker Hub + GHCR + cosign).
+#
+# What it automates (each of these bit us at least once):
+#   1. Bump crates/busbar/Cargo.toml + Cargo.lock.
+#   2. Regenerate the committed OpenAPI schema (UPDATE_OPENAPI=1) — the CI drift gate that
+#      failed the 1.4.1 release when done by hand.
+#   3. Promote CHANGELOG [Unreleased] -> [version] with today's date.
+#   4. Commit, tag vX.Y.Z, push both.
+#
+# You still write release notes under CHANGELOG's [Unreleased] before dispatching (that's the
+# one human step); everything downstream is automatic. Cutting the tag is your sign-off.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New version, e.g. 1.4.2 (no leading v)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Validate version + not already released
+        run: |
+          V='${{ inputs.version }}'
+          echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::'$V' is not X.Y.Z"; exit 1; }
+          if git rev-parse "v$V" >/dev/null 2>&1; then echo "::error::tag v$V already exists"; exit 1; fi
+          echo "V=$V" >> "$GITHUB_ENV"
+
+      - name: Bump Cargo version + lock
+        run: |
+          sed -i -E '0,/^version = "[0-9.]+"/s//version = "'"$V"'"/' crates/busbar/Cargo.toml
+          cargo update -p busbar --precise "$V"
+          grep -E '^version' crates/busbar/Cargo.toml | head -1
+
+      - name: Regenerate committed OpenAPI schema
+        run: UPDATE_OPENAPI=1 cargo test -p busbar --features openapi-schema openapi_json_matches_committed_file
+
+      - name: Roll the CHANGELOG
+        run: python3 .github/scripts/roll_changelog.py "$V" CHANGELOG.md
+
+      - name: Sanity — build + the drift/emit gates pass before we tag
+        run: |
+          cargo build -p busbar --quiet
+          cargo test -p busbar --features openapi-schema openapi_json_matches_committed_file --quiet
+
+      - name: Commit, tag, push
+        run: |
+          git config user.name "Matthew Jackson"
+          git config user.email "matthew@pq.io"
+          git add -A
+          git commit -m "$V: release"
+          git tag -a "v$V" -m "v$V"
+          git push origin HEAD
+          git push origin "v$V"
+          echo "::notice::Tagged v$V — release.yml + docker.yml are now building the artifacts."
