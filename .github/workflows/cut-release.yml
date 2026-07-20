@@ -42,9 +42,8 @@ jobs:
 
       - name: Bump Cargo version + lock
         run: |
-          sed -i -E '0,/^version = "[0-9.]+"/s//version = "'"$V"'"/' crates/busbar/Cargo.toml
+          python3 .github/scripts/bump_cargo.py "$V" crates/busbar/Cargo.toml
           cargo update -p busbar --precise "$V"
-          grep -E '^version' crates/busbar/Cargo.toml | head -1
 
       - name: Regenerate committed OpenAPI schema
         run: UPDATE_OPENAPI=1 cargo test -p busbar --features openapi-schema openapi_json_matches_committed_file
