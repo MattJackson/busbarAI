@@ -7,6 +7,7 @@ members = [
     "crates/auth-admin-tokens",
     "crates/hooks-ranking",
     "crates/store-sqlite",
+    "crates/store-memory",
 ]
 
 [profile.release]

@@ -1,0 +1,11 @@
+[package]
+name = "busbar-store-memory"
+version = "1.4.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "The default in-memory (RAM) backend for busbar's durable governance store — ephemeral, zero-setup."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../api" }

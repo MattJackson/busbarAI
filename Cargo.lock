@@ -263,6 +263,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-store-memory"
+version = "1.4.0"
+dependencies = [
+ "busbar-api",
+]
+
+[[package]]
 name = "busbar-store-sqlite"
 version = "1.4.0"
 dependencies = [
