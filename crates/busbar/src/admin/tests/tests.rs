@@ -4512,28 +4512,11 @@ impl crate::governance::Store for BarrierStore {
     ) -> crate::governance::StoreResult<Option<crate::governance::VirtualKey>> {
         self.inner.get_key(id)
     }
-    fn get_key_by_hash(
-        &self,
-        key_hash: &str,
-    ) -> crate::governance::StoreResult<Option<crate::governance::VirtualKey>> {
-        self.inner.get_key_by_hash(key_hash)
-    }
     fn list_keys(&self) -> crate::governance::StoreResult<Vec<crate::governance::VirtualKey>> {
         self.inner.list_keys()
     }
     fn delete_key(&self, id: &str) -> crate::governance::StoreResult<()> {
         self.inner.delete_key(id)
-    }
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        count_request: bool,
-    ) -> crate::governance::StoreResult<()> {
-        self.inner
-            .add_usage(key_id, window_start, spend_cents, tokens, count_request)
     }
     fn get_usage(
         &self,
@@ -4564,24 +4547,6 @@ impl crate::governance::Store for BarrierStore {
         bucket: u64,
     ) -> crate::governance::StoreResult<Vec<crate::governance::MeteringRow>> {
         self.inner.list_metering(bucket)
-    }
-    fn charge_within_budget(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-        max_cents: Option<i64>,
-    ) -> crate::governance::StoreResult<bool> {
-        self.inner
-            .charge_within_budget(key_id, window_start, cost_cents, max_cents)
-    }
-    fn refund_request(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-    ) -> crate::governance::StoreResult<()> {
-        self.inner.refund_request(key_id, window_start, cost_cents)
     }
 }
 

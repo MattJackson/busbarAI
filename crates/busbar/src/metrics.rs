@@ -481,7 +481,7 @@ mod tests {
         // Use a price of 0 (set in `gov_with_key`), so spend stays 0 unless we seed it directly.
         // Seed spend via the store directly for a deterministic test.
         let usage_store = gov.store();
-        usage_store.add_usage(&key.id, 0, 200, 5000, false).unwrap();
+        usage_store.put_usage(&key.id, 0, 200, 5000, 0).unwrap();
 
         // Build a minimal App with governance.
         let app = TestApp::new()

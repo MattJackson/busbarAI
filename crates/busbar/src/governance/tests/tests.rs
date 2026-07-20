@@ -171,7 +171,7 @@ fn test_charge_within_budget_first_request_and_uncapped() {
 /// read-then-charge allowed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_charges_cannot_overshoot_cap() {
-    let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store: Arc<SqliteStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
     let mut handles = Vec::new();
     for _ in 0..50 {
         let s = store.clone();

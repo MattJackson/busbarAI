@@ -786,7 +786,9 @@ impl GovState {
         }
         let limit = key.max_budget_cents.expect("guarded is_some above");
         let window = budget_window(&key.budget_period, now);
-        match self.store.get_usage_async(&key.id, window).await {
+        // `get_usage` is a sync read; the former `get_usage_async` blocking-pool offload was removed
+        // with the memory-only budget path (it left the plugin `Store` contract as read-only + flush).
+        match self.store.get_usage(&key.id, window) {
             Ok(u) => u.spend_cents >= limit,
             Err(e) => {
                 tracing::warn!(key = %key.id, error = %e, "budget read failed; failing open");

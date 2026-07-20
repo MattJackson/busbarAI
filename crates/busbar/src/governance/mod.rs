@@ -434,30 +434,8 @@ impl From<getrandom::Error> for StoreError {
 pub(crate) trait Store: Send + Sync + 'static {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()>;
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
-    // Lookup by key hash — exercised only by unit tests that probe the DB directly; the hot-path
-    // key resolution uses the in-memory `by_hash` cache and never calls through the trait. Gated to
-    // test builds so it (and its `SqliteStore` impl) leaves no dead surface in the release binary.
-    #[cfg(test)]
-    fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>>;
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
-    /// Add usage to a key's counter for the given budget-window start (UPSERT/accumulate).
-    /// `count_request` increments the request counter by one — true for the per-request fee, false
-    /// when only accruing token spend for an already-counted request (so requests aren't double
-    /// counted when both the flat fee and token usage are recorded for one request).
-    // Superseded by the in-memory budget cells + write-behind `put_usage`: production no longer
-    // ACCUMULATES through the store (memory is authoritative), so this additive UPSERT is now only
-    // exercised by direct-store unit tests. `#[cfg(test)]` (compiled out of the release binary) rather
-    // than a dead-code allow — same hygiene as `get_usage_async`/`get_key_by_hash`.
-    #[cfg(test)]
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        count_request: bool,
-    ) -> StoreResult<()>;
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
 
     /// Write-behind ABSOLUTE set of a key's window counter (memory is authoritative). SETS (not adds)
@@ -479,61 +457,6 @@ pub(crate) trait Store: Send + Sync + 'static {
     /// Every metering row accumulated in `bucket` (a [`metering_bucket`] day start), for the usage
     /// read's by-model / by-key aggregations.
     fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>>;
-
-    /// ATOMIC budget check-and-charge (the HARD-cap primitive). In a SINGLE store round-trip, charge
-    /// `cost_cents` (the flat per-request fee) + one request to the key's `window_start` counter IFF
-    /// the post-charge spend stays within `max_cents` (`None` = uncapped → always charges). Returns
-    /// `true` when the charge landed (request admitted), `false` when it would exceed the cap (reject).
-    ///
-    /// This replaces the non-atomic `is_over_budget` (read) + `record_request` (write) pair on the
-    /// admission path: because the check and the charge are one indivisible UPSERT, N concurrent
-    /// requests for the same key can NO LONGER each read "under budget" and all charge — the cap is a
-    /// HARD cap for the flat fee. (Token cost is still reconciled post-response, so a single in-flight
-    /// request's own tokens can push spend marginally over — bounded to ONE request, not N. See the
-    /// call site in `ingress`.)
-    // Superseded on the admission path by the in-memory hard-cap (`GovState::charge_budget_mem`):
-    // enforcement no longer round-trips the store, so this SQL primitive is now exercised ONLY by the
-    // direct-store unit tests that pin its UPSERT/boundary semantics. `#[cfg(test)]` (compiled out of
-    // the release binary) rather than a dead-code allow.
-    #[cfg(test)]
-    fn charge_within_budget(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-        max_cents: Option<i64>,
-    ) -> StoreResult<bool>;
-
-    /// REFUND a previously-charged flat per-request fee + its request count. The
-    /// atomic admission charge bills EVERY admitted request up front (hard cap); a request that then
-    /// produced no usable upstream result (non-2xx) must be refunded so the flat-fee billing policy
-    /// stays "charge successful requests only" — matching the pre-fix behavior where `finish` only
-    /// billed 2xx. Decrements spend by `cost_cents` and requests by one, both floored at 0 so a
-    /// refund can never drive a counter negative. Best-effort (called off the request path).
-    // Superseded by the in-memory refund (`GovState::refund_request` decrements the authoritative
-    // cell; the write-behind flusher persists it): production no longer reverses a charge through the
-    // store, so this SQL primitive is now exercised ONLY by direct-store unit tests. `#[cfg(test)]`
-    // (compiled out of the release binary) rather than a dead-code allow.
-    #[cfg(test)]
-    fn refund_request(&self, key_id: &str, window_start: u64, cost_cents: i64) -> StoreResult<()>;
-
-    // ── ASYNC flavor of the per-request accounting methods ───────────────────────────────────────
-    // Historically the per-request offload was owned by the backend here (a `*_async` flavor that
-    // ran the blocking SQL on the Tokio blocking pool). Budget enforcement is now an AUTHORITATIVE
-    // IN-MEMORY hard-cap on the request hot path (see `GovState::charge_budget_mem`) with SQLite
-    // demoted to a write-behind durability layer, so the request path no longer awaits ANY store
-    // charge — the `charge_within_budget_async` flavor is gone entirely (its sync form survives, as
-    // `#[cfg(test)]`, only to pin the SQL primitive's semantics in direct-store unit tests). The one
-    // remaining async flavor is `get_usage_async`, used solely by the test-only `is_over_budget_async`.
-
-    /// Async flavor of [`Store::get_usage`]. Default: calls the sync form inline.
-    // Superseded on the request path by the atomic charge primitive; its only remaining caller is the
-    // test-only `is_over_budget_async`, so `#[cfg(test)]` (compiled out of the release binary) rather
-    // than a dead-code allow — mirrors the `is_over_budget_async` hygiene in the same module.
-    #[cfg(test)]
-    async fn get_usage_async(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        self.get_usage(key_id, window_start)
-    }
 
     /// Persist an AWS-style credential (the MinIO/S3-compatible model) for inbound SigV4 verification.
     /// UPSERTs on the `access_key_id` PRIMARY KEY. The `secret_access_key` is the symmetric SigV4
@@ -1007,20 +930,6 @@ impl Store for SqliteStore {
         Ok(row)
     }
 
-    #[cfg(test)]
-    fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>> {
-        let conn = self.lock_conn();
-        let row = conn
-            .query_row(
-                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
-                 FROM virtual_keys WHERE key_hash=?1",
-                params![key_hash],
-                row_to_key,
-            )
-            .optional()?;
-        Ok(row)
-    }
-
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
@@ -1099,25 +1008,6 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    #[cfg(test)]
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        count_request: bool,
-    ) -> StoreResult<()> {
-        Self::add_usage_inner(
-            &self.conn,
-            key_id,
-            window_start,
-            spend_cents,
-            tokens,
-            count_request,
-        )
-    }
-
     fn put_usage(
         &self,
         key_id: &str,
@@ -1144,8 +1034,50 @@ impl Store for SqliteStore {
         Self::list_metering_inner(&self.conn, bucket)
     }
 
-    #[cfg(test)]
-    fn charge_within_budget(
+    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+        Self::get_usage_inner(&self.conn, key_id, window_start)
+    }
+}
+
+// Direct-store SQL primitives retained ONLY for the governance unit tests that pin their
+// UPSERT/boundary and hash-lookup semantics. Production enforcement is the in-memory hard-cap in
+// `GovState` (SQLite is a write-behind durability layer), so these are inherent `#[cfg(test)]`
+// methods on the concrete `SqliteStore` — NOT part of the swappable `Store` plugin contract a `db`
+// plugin (Postgres, …) must implement.
+#[cfg(test)]
+impl SqliteStore {
+    pub(crate) fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>> {
+        let conn = self.lock_conn();
+        let row = conn
+            .query_row(
+                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
+                 FROM virtual_keys WHERE key_hash=?1",
+                params![key_hash],
+                row_to_key,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub(crate) fn add_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        count_request: bool,
+    ) -> StoreResult<()> {
+        Self::add_usage_inner(
+            &self.conn,
+            key_id,
+            window_start,
+            spend_cents,
+            tokens,
+            count_request,
+        )
+    }
+
+    pub(crate) fn charge_within_budget(
         &self,
         key_id: &str,
         window_start: u64,
@@ -1155,51 +1087,13 @@ impl Store for SqliteStore {
         Self::charge_within_budget_inner(&self.conn, key_id, window_start, cost_cents, max_cents)
     }
 
-    #[cfg(test)]
-    fn refund_request(&self, key_id: &str, window_start: u64, cost_cents: i64) -> StoreResult<()> {
+    pub(crate) fn refund_request(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        cost_cents: i64,
+    ) -> StoreResult<()> {
         Self::refund_request_inner(&self.conn, key_id, window_start, cost_cents)
-    }
-
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        Self::get_usage_inner(&self.conn, key_id, window_start)
-    }
-
-    // ── ASYNC flavor override — the write-behind read offload ────────────────────────────────────
-    // Only `get_usage_async` survives here (used solely by the test-only `is_over_budget_async`); the
-    // budget CHARGE is now an in-memory hard-cap that never round-trips the store, so its async
-    // offload was removed. This override runs the synchronous `get_usage_inner` on the Tokio blocking
-    // pool (`spawn_blocking`) so a slow rusqlite read never stalls a Tokio worker; the connection
-    // handle is a cheap `Arc` clone of the SAME mutex the sync path locks (sync and async serialize on
-    // one DB). A panic inside the blocking closure is re-raised faithfully via `resume_unwind`; a
-    // non-panic join failure (blocking pool shut down mid-flight) maps to the crate's `StoreError`.
-
-    #[cfg(test)]
-    async fn get_usage_async(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Self::get_usage_inner(&self.conn, key_id, window_start);
-        }
-        let conn = self.conn.clone();
-        let key_id = key_id.to_owned();
-        join_offload(tokio::task::spawn_blocking(move || {
-            Self::get_usage_inner(&conn, &key_id, window_start)
-        }))
-        .await
-    }
-}
-
-/// Await a `spawn_blocking` handle wrapping a `StoreResult`, flattening the `JoinError`.
-///
-/// On a PANIC inside the blocking closure, re-raise it faithfully (`resume_unwind`) so a bug in the
-/// SQL body surfaces identically to a direct call rather than being silently swallowed into a generic
-/// store error. A NON-panic join failure (the blocking pool was shut down mid-flight, e.g. on
-/// runtime teardown) is mapped to the crate's `StoreError` convention so the caller's fail-open /
-/// fail-closed knob applies, exactly as the old `GovState` offload did.
-#[cfg(test)]
-async fn join_offload<T>(handle: tokio::task::JoinHandle<StoreResult<T>>) -> StoreResult<T> {
-    match handle.await {
-        Ok(res) => res,
-        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-        Err(e) => Err(StoreError(format!("store offload task failed: {e}"))),
     }
 }
 
