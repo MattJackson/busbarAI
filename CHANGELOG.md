@@ -29,6 +29,22 @@ item under **Changed**.
 
 ### Added
 
+- **Store plugins — durable backends load from a dynamic library, and the default binary is lean.** The
+  SQLite store is no longer compiled into the engine; it ships as a droppable plugin
+  (`libbusbar_store_sqlite_plugin.{so,dll,dylib}`) that busbar loads in-process at boot over a stable,
+  versioned **store C ABI** when `governance.store: sqlite`. That drops the bundled ~4.7 MB SQLite C
+  amalgamation from the default build — **release binary ~14 MB → ~9.4 MB**. New workspace crates:
+  `busbar-plugin-abi` (the frozen ABI — five extern-C symbols carrying JSON `StoreRequest`/`Response`),
+  `busbar-plugin-sdk` (`export_store_plugin!` to author a store in Rust and build it as a `cdylib`), and
+  `busbar-plugin-loader` (the `libloading` loader — all FFI `unsafe` is isolated here, so the engine keeps
+  its `forbid(unsafe_code)` guarantee). A store call is JSON over the C ABI, off the request hot path
+  (write-behind), so it never touches latency. The same store crate also links statically, so a build can
+  compile a backend straight in — no `cfg` sprawl.
+- **`governance.plugins_dir` (default `plugins`)** — the directory busbar loads store plugins from. A
+  `store` other than `memory` is a library dropped here.
+- **Migration** — if you set `governance.store: sqlite`, install the SQLite store plugin into
+  `governance.plugins_dir` (drop `libbusbar_store_sqlite_plugin` there), or busbar fails to start with a
+  message naming the expected file. The default `store: memory` needs no plugin.
 - **`governance.usage_flush_interval_ms` (default 100)** — write-behind flush cadence (ms) for the
   in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this
   window of accrued spend/requests can be lost; a graceful shutdown flushes fully.

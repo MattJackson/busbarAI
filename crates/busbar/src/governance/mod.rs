@@ -412,9 +412,10 @@ impl<T> IntoStoreResult<T> for Result<T, getrandom::Error> {
     }
 }
 
-// The RAM store is the always-on DEFAULT governance backend (and the universal test double).
+// The RAM store is the always-on DEFAULT governance backend (and the universal test double). The
+// SQLite backend is no longer compiled in — it is a dynamic-library plugin loaded at boot (see
+// crate::main's store selection + busbar-plugin-loader).
 pub(crate) use busbar_store_memory::MemoryStore;
-pub(crate) use busbar_store_sqlite::SqliteStore;
 
 /// The write-behind budget flusher: on a fixed cadence (and once more on graceful shutdown) push the
 /// dirty in-memory budget cells to the durable store off the request hot path. Mirrors the D3

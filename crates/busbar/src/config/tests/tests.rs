@@ -959,6 +959,7 @@ fn test_resolve_accepts_enabled_governance_with_admin_token() {
             price_per_1k_tokens_cents: 0,
             admin_token: Some("operator-secret".to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            plugins_dir: "plugins".to_string(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         }),
@@ -1315,6 +1316,7 @@ fn test_debug_redacts_all_config_secrets() {
         price_per_1k_tokens_cents: 0,
         admin_token: Some("SECRET-admin-bearer-token-qqq".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+        plugins_dir: "plugins".to_string(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1412,6 +1414,7 @@ fn test_debug_redacts_secrets_transitively_through_deploycfg() {
             price_per_1k_tokens_cents: 0,
             admin_token: Some("SECRET-embedded-admin-token".to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+            plugins_dir: "plugins".to_string(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         }),

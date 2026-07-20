@@ -24,8 +24,12 @@ path = "src/main.rs"
 # The plugin CONTRACTS (auth-module trait, routing-policy trait, projections) — the one crate both
 # the engine and every plugin build against. See api/.
 busbar-api = { path = "../api" }
-busbar-store-sqlite = { path = "../store-sqlite" }
 busbar-store-memory = { path = "../store-memory" }
+# The durable SQLite store is NO LONGER compiled in — it is a dynamic-library plugin loaded at boot
+# from the plugins directory (see busbar-plugin-loader). Dropping the bundled rusqlite `bundled`
+# amalgamation (~4.7 MB of C) is what makes the default binary lean; `store: memory` needs nothing,
+# `store: sqlite` loads the dropped-in plugin.
+busbar-plugin-loader = { path = "../plugin-loader" }
 # The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
 # so the matching feature (below) compiles each IN or OUT of the binary.
 busbar-auth-tokens = { path = "../auth-tokens", optional = true }

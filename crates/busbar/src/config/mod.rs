@@ -1503,6 +1503,11 @@ pub(crate) struct GovernanceCfg {
     /// SQLite `busy_timeout` (ms) applied to each governance connection (default 5000).
     #[serde(default = "default_sqlite_busy_timeout_ms")]
     pub(crate) sqlite_busy_timeout_ms: i64,
+    /// Directory the engine loads store (and other) plugins from. A durable `store` other than
+    /// `memory` is a plugin library dropped here — e.g. `store: sqlite` loads the SQLite store
+    /// plugin from this directory. Default `plugins` (relative to the working directory).
+    #[serde(default = "default_plugins_dir")]
+    pub(crate) plugins_dir: String,
     /// Amortization interval for the rate-limiter stale-entry sweep: every Nth `check_rate` pays the
     /// full retain (default 256).
     #[serde(default = "default_rate_sweep_interval")]
@@ -1525,6 +1530,7 @@ impl Default for GovernanceCfg {
             price_per_1k_tokens_cents: 0,
             admin_token: None,
             sqlite_busy_timeout_ms: default_sqlite_busy_timeout_ms(),
+            plugins_dir: default_plugins_dir(),
             rate_sweep_interval: default_rate_sweep_interval(),
             usage_flush_interval_ms: default_usage_flush_interval_ms(),
         }
@@ -1701,6 +1707,9 @@ fn default_key_gauge_limit() -> usize {
 }
 fn default_sqlite_busy_timeout_ms() -> i64 {
     DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+}
+fn default_plugins_dir() -> String {
+    "plugins".to_string()
 }
 fn default_rate_sweep_interval() -> u32 {
     DEFAULT_RATE_SWEEP_INTERVAL

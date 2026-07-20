@@ -1461,10 +1461,26 @@ pub(crate) fn build_app_from_config(
         let g = governance_cfg.unwrap_or_default();
         let store: Arc<dyn governance::Store> = match g.store {
             crate::config::GovernanceStore::Sqlite => {
-                match governance::SqliteStore::open(&g.db_path, g.sqlite_busy_timeout_ms) {
-                    Ok(s) => Arc::new(s),
+                // The SQLite store is a dynamic-library plugin loaded from the plugins directory (no
+                // longer compiled in). Resolve the platform-native library name, pass the store's
+                // config as JSON, and load it over the C ABI.
+                let libname =
+                    busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+                let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
+                let cfg_json = serde_json::json!({
+                    "db_path": g.db_path,
+                    "busy_timeout_ms": g.sqlite_busy_timeout_ms,
+                })
+                .to_string();
+                match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
+                    Ok(s) => Arc::from(s),
                     Err(e) => {
-                        return Err(format!("governance db open failed ({}): {e}", g.db_path))
+                        return Err(format!(
+                            "governance store 'sqlite' plugin load failed: {e}. Install the SQLite \
+                             store plugin ({libname}) into the plugins directory ({}), or set \
+                             governance.store: memory.",
+                            g.plugins_dir
+                        ))
                     }
                 }
             }
