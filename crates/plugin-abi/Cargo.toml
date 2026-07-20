@@ -1,0 +1,15 @@
+[package]
+name = "busbar-plugin-abi"
+version = "1.5.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "The busbar store-plugin C ABI: the frozen, versioned wire (JSON over a tiny extern-C surface) between the engine and a dynamically-loaded or statically-linked Store backend."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../api" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

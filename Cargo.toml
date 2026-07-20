@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/busbar",
     "crates/api",
+    "crates/plugin-abi",
+    "crates/plugin-sdk",
     "crates/auth-tokens",
     "crates/auth-admin-tokens",
     "crates/hooks-ranking",

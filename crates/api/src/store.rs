@@ -11,7 +11,7 @@
 
 /// A virtual key issued by busbar (distinct from upstream provider keys). Maps a caller to the
 /// pools they may use plus their budget/rate-limit policy.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VirtualKey {
     pub id: String,
     /// SHA-256 hex of the presented secret (the secret itself is never stored).
@@ -67,7 +67,7 @@ impl std::fmt::Debug for VirtualKey {
 /// `VirtualKey` row so the key's shape is unchanged. The `secret_access_key` is the SYMMETRIC SigV4
 /// signing secret (stored plaintext because HMAC verification needs the same value the client signs
 /// with), so this type carries a manual redacting `Debug`.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AwsCredential {
     /// The plaintext AccessKeyId carried in the inbound SigV4 `Authorization` header (not secret).
     pub access_key_id: String,
@@ -101,7 +101,7 @@ impl std::fmt::Debug for AwsCredential {
 /// A resolved AWS-credential cache entry: the owning `VirtualKey` plus the secret access key needed to
 /// verify the inbound SigV4 signature. Returned by `GovState::lookup_by_access_key_id`. Carries a
 /// manual redacting `Debug` for the same reason as `AwsCredential` — the secret must never reach a log.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AwsKeyEntry {
     pub key: VirtualKey,
     /// The symmetric SigV4 secret access key — SECRET-EQUIVALENT (never log it).
@@ -125,7 +125,7 @@ impl std::fmt::Debug for AwsKeyEntry {
 }
 
 /// Accumulated usage for a key within a budget window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     pub spend_cents: i64,
     pub tokens: u64,
@@ -137,7 +137,7 @@ pub struct Usage {
 /// third party with its own (special/negotiated) price catalog reconstructs cost from these counts:
 /// input, output, cache-read, and cache-creation tokens all price differently, so each is carried
 /// separately (design: expose the inputs of the cost computation, not just busbar's own result).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MeteringDelta {
     pub key_id: String,
     /// The UTC-day bucket this response is attributed to; derived from the request's pinned
@@ -156,7 +156,7 @@ pub struct MeteringDelta {
 
 /// One accumulated metering row read back for a bucket (the raw material of `GET usage` by_model /
 /// by_key aggregations — the service aggregates in memory; buckets are bounded by (keys × models)).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MeteringRow {
     pub key_id: String,
     pub model: String,
