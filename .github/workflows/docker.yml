@@ -10,12 +10,12 @@ name: Docker
 #
 # Supply chain: both registries carry a GitHub build-provenance attestation
 # (stored by GitHub — no extra tags on the repo). Verify with:
-#   gh attestation verify oci://index.docker.io/getbusbar/busbar:<tag> --repo MattJackson/busbarAI
+#   gh attestation verify oci://index.docker.io/getbusbar/busbar:<tag> --repo GetBusbar/busbar
 # Cosign signatures are additionally pushed for the GHCR image only — cosign
 # stores signatures as sha256-*.sig tags, which we keep off the Docker Hub tag
 # list deliberately (clean public page; GHCR carries them for cosign users):
-#   cosign verify ghcr.io/mattjackson/busbar:<tag> \
-#     --certificate-identity-regexp 'https://github.com/MattJackson/busbarAI/\.github/workflows/docker\.yml@.*' \
+#   cosign verify ghcr.io/getbusbar/busbar:<tag> \
+#     --certificate-identity-regexp 'https://github.com/GetBusbar/busbar/\.github/workflows/docker\.yml@.*' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 on:
@@ -41,7 +41,7 @@ on:
 
 env:
   DOCKERHUB_IMAGE: getbusbar/busbar
-  GHCR_IMAGE: ghcr.io/mattjackson/busbar
+  GHCR_IMAGE: ghcr.io/getbusbar/busbar
 
 permissions:
   contents: read

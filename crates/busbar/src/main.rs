@@ -206,7 +206,7 @@ ENDPOINTS (once running, listen address from config.yaml `listen`):
     GET  /v1/models  /v1beta/models        list models (answers in the caller's dialect)
     GET  /stats  /healthz  /metrics
 
-Docs: https://getbusbar.com   ·   Source: https://github.com/MattJackson/busbarAI",
+Docs: https://getbusbar.com   ·   Source: https://github.com/GetBusbar/busbar",
                 ver = env!("CARGO_PKG_VERSION")
             );
             Some(0)

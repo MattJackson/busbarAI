@@ -58,7 +58,7 @@ curl -fsSL https://getbusbar.com/install.sh | sh
 
 Drops `busbar` and `providers.yaml` where you run it (no sudo). To install onto your PATH instead: `BUSBAR_INSTALL_DIR=/usr/local/bin curl -fsSL https://getbusbar.com/install.sh | sh`.
 
-**Or download manually**: grab the archive for your platform from the [latest release](https://github.com/MattJackson/busbarAI/releases/latest) (Linux `x86_64`/`aarch64`, macOS Intel/Apple Silicon, Windows `x86_64`), plus the provider catalog from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml). The binary is self-contained (no runtime, no virtualenv, no dependencies):
+**Or download manually**: grab the archive for your platform from the [latest release](https://github.com/GetBusbar/busbar/releases/latest) (Linux `x86_64`/`aarch64`, macOS Intel/Apple Silicon, Windows `x86_64`), plus the provider catalog from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml). The binary is self-contained (no runtime, no virtualenv, no dependencies):
 
 ```bash
 tar -xzf busbar-*.tar.gz   # extracts the `busbar` binary
@@ -66,7 +66,7 @@ chmod +x busbar
 ./busbar --version
 ```
 
-**Or use Docker**: a tiny `FROM scratch` image (the static binary plus the provider catalog, amd64 + arm64 — see the image-size badge on the [repo](https://github.com/MattJackson/busbarAI) for the current compressed size), cosign-signed with build provenance:
+**Or use Docker**: a tiny `FROM scratch` image (the static binary plus the provider catalog, amd64 + arm64 — see the image-size badge on the [repo](https://github.com/GetBusbar/busbar) for the current compressed size), cosign-signed with build provenance:
 
 ```bash
 docker run -d -p 8080:8080 \

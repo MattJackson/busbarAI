@@ -8,7 +8,7 @@ requests, or discussions.**
 Instead, report privately through either channel:
 
 - Email **security@getbusbar.com**, or
-- GitHub's [private vulnerability reporting](https://github.com/MattJackson/busbarAI/security/advisories/new)
+- GitHub's [private vulnerability reporting](https://github.com/GetBusbar/busbar/security/advisories/new)
   (the **Security** tab on the repository).
 
 Please include:
@@ -20,7 +20,7 @@ Please include:
 
 We aim to **acknowledge your report within 48 hours**, work with you on a fix, and
 coordinate disclosure timing. Confirmed vulnerabilities are published as
-[GitHub Security Advisories](https://github.com/MattJackson/busbarAI/security/advisories),
+[GitHub Security Advisories](https://github.com/GetBusbar/busbar/security/advisories),
 through which we request and issue **CVE** identifiers. We credit reporters who wish to be
 credited once a fix is released.
 

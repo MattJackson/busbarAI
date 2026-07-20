@@ -6,8 +6,8 @@
 
 <p align="center"><strong>Your AI Control Plane.</strong> Self-hosted, in a single Rust binary: one endpoint speaks every major SDK; fault-aware circuit breaking and in-flight failover keep your app serving when your providers aren't.</p>
 
-[![CI](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml/badge.svg)](https://github.com/MattJackson/busbarAI/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/MattJackson/busbarAI?include_prereleases)](https://github.com/MattJackson/busbarAI/releases)
+[![CI](https://github.com/GetBusbar/busbar/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/GetBusbar/busbar?include_prereleases)](https://github.com/GetBusbar/busbar/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Docker image size](https://img.shields.io/docker/image-size/getbusbar/busbar?sort=semver&label=image)](https://hub.docker.com/r/getbusbar/busbar)
 
