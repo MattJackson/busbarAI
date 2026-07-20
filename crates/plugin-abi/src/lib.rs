@@ -38,18 +38,19 @@ use std::os::raw::c_void;
 pub const ABI_VERSION: u32 = 1;
 
 /// The exported-symbol names the engine resolves after `dlopen`/`LoadLibrary`. A store plugin MUST
-/// export all five with these exact names and the signatures in the `*Fn` type aliases below.
+/// export all five with these exact names and the signatures in the `*Fn` type aliases below. The
+/// constants are NUL-terminated so they pass straight to `libloading`'s C-string symbol lookup.
 pub mod symbol {
     /// `busbar_store_abi_version() -> u32` — the ABI handshake.
-    pub const ABI_VERSION: &[u8] = b"busbar_store_abi_version";
+    pub const ABI_VERSION: &[u8] = b"busbar_store_abi_version\0";
     /// `busbar_store_open(cfg, cfg_len, out_handle, out_err, out_err_len) -> i32`.
-    pub const OPEN: &[u8] = b"busbar_store_open";
+    pub const OPEN: &[u8] = b"busbar_store_open\0";
     /// `busbar_store_call(handle, req, req_len, out, out_len) -> i32`.
-    pub const CALL: &[u8] = b"busbar_store_call";
+    pub const CALL: &[u8] = b"busbar_store_call\0";
     /// `busbar_store_free(ptr, len)` — free a buffer the plugin allocated for the engine.
-    pub const FREE: &[u8] = b"busbar_store_free";
+    pub const FREE: &[u8] = b"busbar_store_free\0";
     /// `busbar_store_close(handle)` — drop the store instance.
-    pub const CLOSE: &[u8] = b"busbar_store_close";
+    pub const CLOSE: &[u8] = b"busbar_store_close\0";
 }
 
 /// Status returned by `open`/`call`. `OK`: the out buffer holds the success payload. `ERR`: the out

@@ -5,6 +5,7 @@ members = [
     "crates/api",
     "crates/plugin-abi",
     "crates/plugin-sdk",
+    "crates/plugin-loader",
     "crates/auth-tokens",
     "crates/auth-admin-tokens",
     "crates/hooks-ranking",
