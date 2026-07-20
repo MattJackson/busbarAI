@@ -1330,8 +1330,8 @@ async fn max_tokens_saturates_not_wraps() {
 /// the projection.
 #[tokio::test]
 async fn send_user_projects_governance_key_identity() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = std::sync::Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = std::sync::Arc::new(MemoryStore::new());
     let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).expect("gov state"));
     let (key, secret) = gov
         .create_key(

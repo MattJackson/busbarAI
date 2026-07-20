@@ -404,7 +404,7 @@ pub(crate) async fn handler(crate::state::CurrentApp(app): crate::state::Current
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, TestApp};
     use std::sync::Arc;
 
@@ -447,7 +447,7 @@ mod tests {
 
     /// Helper: build a minimal `GovState` backed by an in-memory SQLite store.
     fn gov_with_key(key: VirtualKey) -> Arc<GovState> {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let store = Arc::new(MemoryStore::new());
         store.put_key(&key).unwrap();
         Arc::new(GovState::new(store, 0, 0, None).unwrap())
     }
@@ -636,7 +636,7 @@ mod tests {
         // The default key-gauge limit is 2000 (no limits installed in this test ⇒ the historical
         // default). We use the same value here to keep the test self-consistent.
         const LIMIT: usize = crate::config::DEFAULT_KEY_GAUGE_LIMIT;
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let store = Arc::new(MemoryStore::new());
 
         // Insert LIMIT + 1 keys so the truncation branch fires.
         for i in 0..=(LIMIT) {
@@ -656,7 +656,7 @@ mod tests {
             store.put_key(&key).unwrap();
             // Seed minimal usage so the key has a row in usage_counters and the spend gauge is
             // actually emitted (keys with zero usage_for results are skipped).
-            store.add_usage(&id, 0, 1, 10, false).unwrap();
+            store.put_usage(&id, 0, 1, 10, 0).unwrap();
         }
 
         let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());

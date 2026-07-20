@@ -1290,7 +1290,7 @@ async fn test_admin_prefix_is_boundary_safe() {
 /// dropped the `if key.enabled` guard would otherwise pass CI — an authz bypass).
 #[tokio::test]
 async fn test_disabled_virtual_key_is_rejected_401() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
@@ -1312,7 +1312,7 @@ async fn test_disabled_virtual_key_is_rejected_401() {
 
     let disabled_secret = "sk-vk-disabled";
     let enabled_secret = "sk-vk-enabled";
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let mk = |id: &str, secret: &str, enabled: bool| VirtualKey {
         id: id.to_string(),
         key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
@@ -1407,7 +1407,7 @@ async fn test_disabled_virtual_key_is_rejected_401() {
 /// silently re-open the relay.
 #[tokio::test]
 async fn test_none_mode_with_governance_still_requires_virtual_key() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
@@ -1426,7 +1426,7 @@ async fn test_none_mode_with_governance_still_requires_virtual_key() {
     let server = MockServer::new(state).await;
 
     let secret = "sk-vk-ok";
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "k".to_string(),
@@ -1511,7 +1511,7 @@ async fn test_none_mode_with_governance_still_requires_virtual_key() {
 ///   - a valid enabled virtual key → admitted past auth (governance is what is honoured)
 #[tokio::test]
 async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
@@ -1530,7 +1530,7 @@ async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
     let server = MockServer::new(state).await;
 
     let secret = "sk-vk-pt-ok";
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "k".to_string(),
@@ -1666,7 +1666,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
 #[cfg(feature = "auth-tokens")]
 #[test]
 fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
@@ -1701,7 +1701,7 @@ fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
 
                 // The virtual key the request actually authenticates with under governance.
                 let vk_secret = "sk-vk-token-gov";
-                let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+                let store = Arc::new(MemoryStore::new());
                 store
                     .put_key(&VirtualKey {
                         id: "k".to_string(),
@@ -1820,13 +1820,13 @@ fn test_extract_admin_header_token_empty_filtered() {
 #[cfg(feature = "auth-admin-tokens")]
 #[tokio::test]
 async fn test_admin_blank_header_token_rejected() {
-    use crate::governance::{GovState, SqliteStore};
+    use crate::governance::{GovState, MemoryStore};
     use crate::test_support::TestApp;
     use std::sync::Arc;
 
     crate::metrics::init();
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1880,13 +1880,13 @@ async fn test_admin_blank_header_token_rejected() {
 #[cfg(feature = "auth-admin-tokens")]
 #[tokio::test]
 async fn test_admin_token_both_carriers_or_fold_no_short_circuit() {
-    use crate::governance::{GovState, SqliteStore};
+    use crate::governance::{GovState, MemoryStore};
     use crate::test_support::TestApp;
     use std::sync::Arc;
 
     crate::metrics::init();
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1959,13 +1959,13 @@ async fn test_admin_token_both_carriers_or_fold_no_short_circuit() {
 #[cfg(feature = "auth-admin-tokens")]
 #[tokio::test]
 async fn test_admin_token_not_acceptable_via_vendor_carriers() {
-    use crate::governance::{GovState, SqliteStore};
+    use crate::governance::{GovState, MemoryStore};
     use crate::test_support::TestApp;
     use std::sync::Arc;
 
     crate::metrics::init();
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2045,7 +2045,7 @@ async fn test_admin_token_not_acceptable_via_vendor_carriers() {
 /// regression that stopped threading those carriers into `gov.lookup` would otherwise pass CI.
 #[tokio::test]
 async fn test_governance_accepts_vendor_carriers_and_native_401() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
@@ -2071,7 +2071,7 @@ async fn test_governance_accepts_vendor_carriers_and_native_401() {
     let server = MockServer::new(state).await;
 
     let secret = "sk-vk-carrier";
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "kc".to_string(),
@@ -2176,7 +2176,7 @@ async fn test_governance_accepts_vendor_carriers_and_native_401() {
 /// would call `gov.lookup("")`, match this enabled key, and be admitted unauthenticated.
 #[tokio::test]
 async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
@@ -2187,7 +2187,7 @@ async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
     let state = Arc::new(MockServerState::new());
     let server = MockServer::new(state).await;
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     // The pathological key: its hash is sha256("") — what an empty-token lookup would compute.
     store
         .put_key(&VirtualKey {
@@ -2374,8 +2374,8 @@ fn bedrock_request(path: &str, auth: &str, headers: &[(String, String)]) -> Requ
 }
 
 fn gov_with_aws_key() -> (std::sync::Arc<crate::governance::GovState>, String, String) {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = std::sync::Arc::new(MemoryStore::new());
     let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).unwrap());
     let (_key, _bearer, akid, secret) = gov
         .create_key_with_aws(
@@ -2506,8 +2506,8 @@ fn test_verify_bedrock_sigv4_missing_authorization_rejected() {
 #[test]
 fn test_verify_bedrock_sigv4_disabled_key_rejected() {
     crate::metrics::init();
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = std::sync::Arc::new(MemoryStore::new());
     let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).unwrap());
     let (key, _b, akid, secret) = gov
         .create_key_with_aws(

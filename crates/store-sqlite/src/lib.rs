@@ -653,6 +653,7 @@ mod tests {
     use super::*;
     use busbar_api::{Store, VirtualKey};
     use rusqlite::params;
+    use std::sync::Arc;
 
     fn sample_key(id: &str, hash: &str) -> VirtualKey {
         VirtualKey {
@@ -836,6 +837,279 @@ mod tests {
             (u.requests, u.spend_cents, u.tokens),
             (2, 15, 75),
             "writes must keep accruing on a recovered (poisoned) conn lock"
+        );
+    }
+
+    #[test]
+    fn test_key_crud_roundtrip() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let k = sample_key("k1", "hashAAA");
+        s.put_key(&k).unwrap();
+
+        assert_eq!(s.get_key("k1").unwrap().as_ref(), Some(&k));
+        assert_eq!(s.get_key_by_hash("hashAAA").unwrap().as_ref(), Some(&k));
+        assert_eq!(s.get_key("missing").unwrap(), None);
+        assert_eq!(s.list_keys().unwrap(), vec![k.clone()]);
+
+        // Update via UPSERT on id.
+        let mut k2 = k.clone();
+        k2.enabled = false;
+        k2.allowed_pools = vec![]; // empty = all
+        s.put_key(&k2).unwrap();
+        let got = s.get_key("k1").unwrap().unwrap();
+        assert!(!got.enabled);
+        assert!(got.allowed_pools.is_empty());
+
+        s.delete_key("k1").unwrap();
+        assert_eq!(s.get_key("k1").unwrap(), None);
+    }
+
+    /// fix 2a: the atomic check-and-charge is a HARD cap. A budget of 100c with a 30c flat fee admits
+    /// exactly 3 requests (90c); the 4th would reach 120c > 100c and is REJECTED atomically. The first
+    /// request in a window inserts; subsequent ones take the conditional UPSERT path.
+    #[test]
+    fn test_charge_within_budget_is_a_hard_cap() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let w = 0u64;
+        // 3 charges fit (30, 60, 90), the 4th (would be 120) is rejected.
+        assert!(
+            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "1st 30c admitted"
+        );
+        assert!(
+            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "2nd 60c admitted"
+        );
+        assert!(
+            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "3rd 90c admitted"
+        );
+        assert!(
+            !s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
+            "4th 120c REJECTED"
+        );
+        // The rejected charge did NOT mutate spend — it stays at 90.
+        assert_eq!(
+            s.get_usage("k", w).unwrap().spend_cents,
+            90,
+            "rejected charge must not bill"
+        );
+        assert_eq!(
+            s.get_usage("k", w).unwrap().requests,
+            3,
+            "only admitted requests counted"
+        );
+    }
+
+    /// fix 2a: a single request whose flat fee ALONE exceeds the cap is rejected even as the FIRST
+    /// request in the window (the INSERT-branch guard), and an UNCAPPED key always charges.
+    #[test]
+    fn test_charge_within_budget_first_request_and_uncapped() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // First-request fee > cap → rejected, no row created.
+        assert!(!s.charge_within_budget("big", 0, 200, Some(100)).unwrap());
+        assert_eq!(
+            s.get_usage("big", 0).unwrap().requests,
+            0,
+            "rejected first request creates no charge"
+        );
+        // Uncapped (None) always charges.
+        assert!(s.charge_within_budget("free", 0, 999_999, None).unwrap());
+        assert_eq!(s.get_usage("free", 0).unwrap().spend_cents, 999_999);
+    }
+
+    /// fix 2a (the headline): CONCURRENT atomic charges cannot overshoot the cap. 50 tasks each try to
+    /// charge 30c against a 100c cap on ONE shared store; exactly 3 may succeed (90c), the rest are
+    /// rejected, and final spend is EXACTLY 90 — never the N×30 overshoot the old non-atomic
+    /// read-then-charge allowed.
+    #[test]
+    fn test_concurrent_charges_cannot_overshoot_cap() {
+        let store: Arc<SqliteStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let s = store.clone();
+            handles.push(std::thread::spawn(move || {
+                s.charge_within_budget("k", 0, 30, Some(100)).unwrap()
+            }));
+        }
+        let mut admitted = 0u32;
+        for h in handles {
+            if h.join().unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 3,
+            "exactly 3 of 50 concurrent charges fit under a 100c/30c cap"
+        );
+        assert_eq!(
+            store.get_usage("k", 0).unwrap().spend_cents,
+            90,
+            "final spend must be EXACTLY 90 — no concurrency overshoot (the hard-cap guarantee)"
+        );
+    }
+
+    /// M9: cap BOUNDARY semantics through `Store::charge_within_budget` (the admission primitive).
+    /// (a) a FIRST request whose `cost_cents == max_cents` must ADMIT (post-charge spend equals, not
+    /// exceeds, the cap). (b) a window PRE-SEEDED with `spend_cents >= max_cents` must REJECT the next
+    /// charge. These pin the `>`-vs-`>=` boundary the hard cap turns on.
+    #[test]
+    fn test_charge_within_budget_cap_boundaries() {
+        // (a) cost == cap on a fresh window → admit.
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            s.charge_within_budget("k", 0, 100, Some(100)).unwrap(),
+            "first request with cost_cents == max_cents must admit (spend lands exactly at the cap)"
+        );
+        assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 100);
+        // A further charge now that spend == cap must reject.
+        assert!(
+            !s.charge_within_budget("k", 0, 1, Some(100)).unwrap(),
+            "once spend == cap, any further charge is rejected"
+        );
+
+        // (b) window pre-seeded at/above the cap → reject the next charge outright.
+        let s2 = SqliteStore::open_in_memory().unwrap();
+        // Seed spend >= max via an uncapped accounting write, then probe with a capped charge.
+        s2.add_usage("k2", 0, 250, 0, true).unwrap();
+        assert!(
+            !s2.charge_within_budget("k2", 0, 1, Some(200)).unwrap(),
+            "a window pre-seeded with spend_cents >= max_cents must reject"
+        );
+        assert_eq!(
+            s2.get_usage("k2", 0).unwrap().spend_cents,
+            250,
+            "the rejected charge must not mutate spend"
+        );
+    }
+
+    /// fix 2a companion: `refund_request` reverses exactly one flat charge, floored at 0 (a refund
+    /// can never drive a counter negative).
+    #[test]
+    fn test_refund_request_reverses_charge_floored_at_zero() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
+        assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
+        assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 60);
+        assert_eq!(s.get_usage("k", 0).unwrap().requests, 2);
+        s.refund_request("k", 0, 30).unwrap();
+        assert_eq!(
+            s.get_usage("k", 0).unwrap().spend_cents,
+            30,
+            "one refund reverses one charge"
+        );
+        assert_eq!(s.get_usage("k", 0).unwrap().requests, 1);
+        // Over-refunding floors at 0, never negative.
+        s.refund_request("k", 0, 30).unwrap();
+        s.refund_request("k", 0, 30).unwrap();
+        assert_eq!(
+            s.get_usage("k", 0).unwrap().spend_cents,
+            0,
+            "refund floors spend at 0"
+        );
+        assert_eq!(
+            s.get_usage("k", 0).unwrap().requests,
+            0,
+            "refund floors requests at 0"
+        );
+    }
+
+    #[test]
+    fn test_usage_accumulates() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.add_usage("k1", 100, 25, 1000, true).unwrap();
+        s.add_usage("k1", 100, 30, 500, true).unwrap();
+        let u = s.get_usage("k1", 100).unwrap();
+        assert_eq!(u.spend_cents, 55);
+        assert_eq!(u.tokens, 1500);
+        assert_eq!(u.requests, 2);
+        // A token-accrual call (count_request = false) adds spend/tokens but NOT a request — so the
+        // per-request fee + token usage for one request don't double-count it.
+        s.add_usage("k1", 100, 7, 250, false).unwrap();
+        let u2 = s.get_usage("k1", 100).unwrap();
+        assert_eq!(u2.spend_cents, 62);
+        assert_eq!(u2.tokens, 1750);
+        assert_eq!(
+            u2.requests, 2,
+            "count_request=false must not increment requests"
+        );
+        // Different window is independent; unknown = zero.
+        assert_eq!(s.get_usage("k1", 200).unwrap(), Usage::default());
+    }
+
+    #[test]
+    fn test_delete_key_removes_key_and_usage_atomically() {
+        // Regression: `delete_key` deletes from both `virtual_keys` and `usage_counters`. The two
+        // DELETEs are now wrapped in one transaction so they commit together — leaving no orphaned
+        // usage rows that would (a) accumulate forever and (b) poison a future key re-created with
+        // the same id with stale usage. Here we assert the post-condition: after delete, both the
+        // key row AND all of its usage rows across windows are gone.
+        let s = SqliteStore::open_in_memory().unwrap();
+        let key = VirtualKey {
+            id: "vk_delete_me".into(),
+            key_hash: "hash_delete_me".into(),
+            name: "victim".into(),
+            allowed_pools: vec!["p1".into()],
+            max_budget_cents: Some(1000),
+            budget_period: "total".into(),
+            rpm_limit: Some(60),
+            tpm_limit: Some(1000),
+            enabled: true,
+            created_at: 0,
+        };
+        s.put_key(&key).unwrap();
+        s.add_usage("vk_delete_me", 100, 25, 1000, true).unwrap();
+        s.add_usage("vk_delete_me", 200, 5, 50, true).unwrap();
+        // Precondition: key + usage present.
+        assert!(s.get_key("vk_delete_me").unwrap().is_some());
+        assert_eq!(s.get_usage("vk_delete_me", 100).unwrap().requests, 1);
+
+        s.delete_key("vk_delete_me").unwrap();
+
+        // Key row gone.
+        assert!(
+            s.get_key("vk_delete_me").unwrap().is_none(),
+            "key row must be deleted"
+        );
+        // No orphaned usage rows in ANY window.
+        assert_eq!(
+            s.get_usage("vk_delete_me", 100).unwrap(),
+            Usage::default(),
+            "usage row in window 100 must be deleted alongside the key"
+        );
+        assert_eq!(
+            s.get_usage("vk_delete_me", 200).unwrap(),
+            Usage::default(),
+            "usage row in window 200 must be deleted alongside the key"
+        );
+    }
+
+    #[test]
+    fn test_delete_key_does_not_inherit_stale_usage_on_recreate() {
+        // The orphaned-usage hazard manifests as a re-created key inheriting prior usage. With the
+        // atomic delete, re-minting the same id starts from zero usage.
+        let s = SqliteStore::open_in_memory().unwrap();
+        let mk = |id: &str| VirtualKey {
+            id: id.into(),
+            key_hash: format!("hash_{id}"),
+            name: "k".into(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".into(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        };
+        s.put_key(&mk("vk_reuse")).unwrap();
+        s.add_usage("vk_reuse", 100, 99, 9999, true).unwrap();
+        s.delete_key("vk_reuse").unwrap();
+        // Re-create with the same id; the prior window's usage must NOT bleed through.
+        s.put_key(&mk("vk_reuse")).unwrap();
+        assert_eq!(
+            s.get_usage("vk_reuse", 100).unwrap(),
+            Usage::default(),
+            "re-created key must not inherit the deleted key's usage"
         );
     }
 }

@@ -192,6 +192,7 @@ hooks-ranking = ["dep:busbar-hooks-ranking"]
 openapi-schema = ["dep:schemars"]
 
 [dev-dependencies]
+busbar-store-memory = { path = "../store-memory" }
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 axum = { version = "0.8", features = ["http1"] }

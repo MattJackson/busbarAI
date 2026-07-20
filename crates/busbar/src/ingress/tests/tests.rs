@@ -151,8 +151,8 @@ fn test_affinity_header_session_mode_without_name_uses_default() {
 /// Build a governance-enabled App with a single budgeted key, plus return the key so the test
 /// can pass a matching GovCtx to `finish`. Just assembles the App + key; it performs no charge.
 fn governed_app_with_key() -> (Arc<App>, crate::governance::VirtualKey) {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
     // 30 cents flat per request, no per-token fee.
     let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
     let (key, _secret) = gov
@@ -334,10 +334,10 @@ fn test_finish_outcome_mapping_503_is_exhausted() {
 // admission charge is seeded via the SYNC store path into the charged_at window.
 #[test]
 fn test_flat_fee_charge_and_refund_use_charged_at_window() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore, SECS_PER_DAY};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec, SECS_PER_DAY};
     crate::metrics::init();
 
-    let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = std::sync::Arc::new(MemoryStore::new());
     let gov = std::sync::Arc::new(GovState::new(store.clone(), 30, 0, None).unwrap()); // 30c/request
     let (key, _secret) = gov
         .create_key(
@@ -421,7 +421,7 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
 /// unconditionally and so would have admitted a request that the charge then overshot the cap.
 #[tokio::test]
 async fn test_budget_check_uses_charged_at_window_not_clock() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore, SECS_PER_DAY};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec, SECS_PER_DAY};
     crate::metrics::init();
 
     let past_day: u64 = 1_700_000_000; // a fixed past day
@@ -436,7 +436,7 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     // (`record_request` charges the flat fee into `budget_window("daily", past_day)` = past_window),
     // so the deterministic precondition matches what the in-memory admission gate reads. (Enforcement
     // is now in-memory: seeding via the store alone would be invisible to `budget_check`.)
-    let store = std::sync::Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = std::sync::Arc::new(MemoryStore::new());
     let gov = std::sync::Arc::new(GovState::new(store.clone(), 30, 0, None).unwrap()); // 30c/req
     let (key, _secret) = gov
         .create_key(
@@ -1942,7 +1942,7 @@ async fn test_served_request_increments_hot_path_metrics() {
 /// key uses.
 #[tokio::test]
 async fn test_group_mapped_principal_governed_like_a_virtual_key() {
-    use crate::governance::{GovState, SqliteStore};
+    use crate::governance::{GovState, MemoryStore};
     crate::metrics::init();
     let state = StdArc::new(MockServerState::new());
     for _ in 0..3 {
@@ -1952,7 +1952,7 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
         });
     }
     let server = MockServer::new(state.clone()).await;
-    let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+    let store = StdArc::new(MemoryStore::new());
     let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
     let auth_cfg = crate::config::AuthCfg {
         chain: vec!["test-groups-module".to_string()],
@@ -2977,8 +2977,8 @@ async fn test_unknown_model_404_uses_canonical_openai_type() {
 /// Build a governance-enabled App whose only key is allowed ONLY on pool `allowed-only` (so a
 /// request to any other pool is pool-rejected with 403). Returns the key for the GovCtx.
 fn governed_app_pool_restricted() -> (Arc<App>, crate::governance::VirtualKey) {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -3219,8 +3219,8 @@ fn assert_leak_free(body: &str, key_id: &str, pool: &str) {
 
 /// Governance-enabled App whose only key has a zero budget cap, so it is immediately over budget.
 fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -3242,8 +3242,8 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
 
 /// Governance-enabled App whose only key has `rpm_limit = 0`, so the first request is rate-limited.
 fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -4453,11 +4453,11 @@ async fn governed_pool_acl_router(
     tokio::task::JoinHandle<()>,
     &'static str,
 ) {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     // The lane needs a base_url, but the pool-ACL 403 short-circuits before any forward, so an
     // unreachable upstream is fine.
     const SECRET: &str = "sk-vk-acl-denied";
-    let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+    let store = StdArc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "kacl".to_string(),
@@ -4701,7 +4701,7 @@ async fn test_governance_pool_acl_403_bedrock_native_envelope() {
 /// is reachable from A on exhaustion and the key may not use B.
 #[tokio::test]
 async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     crate::metrics::init();
 
     // Pool A's backend would succeed (200) if the request ever reached it — proving the 403 is
@@ -4715,7 +4715,7 @@ async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
     let a_url = server.base_url();
 
     const SECRET: &str = "sk-vk-fallback-acl";
-    let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+    let store = StdArc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "kfb".to_string(),
@@ -4789,7 +4789,7 @@ async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
 /// fix over-rejecting legitimate fallback configurations.
 #[tokio::test]
 async fn test_fallback_pool_acl_allows_key_permitted_on_both_pools() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     crate::metrics::init();
 
     let state = StdArc::new(MockServerState::new());
@@ -4801,7 +4801,7 @@ async fn test_fallback_pool_acl_allows_key_permitted_on_both_pools() {
     let a_url = server.base_url();
 
     const SECRET: &str = "sk-vk-fallback-ok";
-    let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+    let store = StdArc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "kfb2".to_string(),
@@ -4969,10 +4969,10 @@ async fn test_adhoc_provider_mismatch_400_anthropic_envelope_via_router() {
 /// which passes a default no-key GovCtx).
 #[tokio::test]
 async fn test_adhoc_governance_pool_acl_403_via_router() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     crate::metrics::init();
     const SECRET: &str = "sk-vk-adhoc-acl";
-    let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+    let store = StdArc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "kadhoc".to_string(),
@@ -5287,9 +5287,9 @@ async fn governed_limit_router(
     tokio::task::JoinHandle<()>,
     &'static str,
 ) {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     const SECRET: &str = "sk-vk-limit-route";
-    let store = StdArc::new(SqliteStore::open_in_memory().unwrap());
+    let store = StdArc::new(MemoryStore::new());
     store
         .put_key(&VirtualKey {
             id: "klimit".to_string(),

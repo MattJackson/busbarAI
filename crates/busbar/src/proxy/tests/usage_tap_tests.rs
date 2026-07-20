@@ -208,9 +208,9 @@ async fn apply_global_rewrites_chains_in_order() {
 // the spend lands in THAT day's window regardless of the real wall clock (which is always later).
 #[test]
 fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore, SECS_PER_DAY};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec, SECS_PER_DAY};
 
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     // 0c per request, 100c per 1k tokens → a 1000-token response costs 100c.
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
     let (key, _secret) = gov
@@ -283,9 +283,9 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
 /// clamps to `u64::MAX` and `record_ir_usage` returns without panicking.
 #[test]
 fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
 
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     // 0c/request, 0c/1k tokens → the gov spend math can't overflow, isolating the SUM under test.
     let gov = Arc::new(GovState::new(store, 0, 0, None).expect("gov"));
     let (key, _secret) = gov

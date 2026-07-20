@@ -191,6 +191,7 @@ dependencies = [
  "busbar-auth-admin-tokens",
  "busbar-auth-tokens",
  "busbar-hooks-ranking",
+ "busbar-store-memory",
  "busbar-store-sqlite",
  "bytes",
  "crc32fast",

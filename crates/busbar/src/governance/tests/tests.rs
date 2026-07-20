@@ -87,115 +87,6 @@ fn sample_key(id: &str, hash: &str) -> VirtualKey {
     }
 }
 
-#[test]
-fn test_key_crud_roundtrip() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let k = sample_key("k1", "hashAAA");
-    s.put_key(&k).unwrap();
-
-    assert_eq!(s.get_key("k1").unwrap().as_ref(), Some(&k));
-    assert_eq!(s.get_key_by_hash("hashAAA").unwrap().as_ref(), Some(&k));
-    assert_eq!(s.get_key("missing").unwrap(), None);
-    assert_eq!(s.list_keys().unwrap(), vec![k.clone()]);
-
-    // Update via UPSERT on id.
-    let mut k2 = k.clone();
-    k2.enabled = false;
-    k2.allowed_pools = vec![]; // empty = all
-    s.put_key(&k2).unwrap();
-    let got = s.get_key("k1").unwrap().unwrap();
-    assert!(!got.enabled);
-    assert!(got.allowed_pools.is_empty());
-
-    s.delete_key("k1").unwrap();
-    assert_eq!(s.get_key("k1").unwrap(), None);
-}
-
-/// fix 2a: the atomic check-and-charge is a HARD cap. A budget of 100c with a 30c flat fee admits
-/// exactly 3 requests (90c); the 4th would reach 120c > 100c and is REJECTED atomically. The first
-/// request in a window inserts; subsequent ones take the conditional UPSERT path.
-#[test]
-fn test_charge_within_budget_is_a_hard_cap() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    let w = 0u64;
-    // 3 charges fit (30, 60, 90), the 4th (would be 120) is rejected.
-    assert!(
-        s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-        "1st 30c admitted"
-    );
-    assert!(
-        s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-        "2nd 60c admitted"
-    );
-    assert!(
-        s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-        "3rd 90c admitted"
-    );
-    assert!(
-        !s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-        "4th 120c REJECTED"
-    );
-    // The rejected charge did NOT mutate spend — it stays at 90.
-    assert_eq!(
-        s.get_usage("k", w).unwrap().spend_cents,
-        90,
-        "rejected charge must not bill"
-    );
-    assert_eq!(
-        s.get_usage("k", w).unwrap().requests,
-        3,
-        "only admitted requests counted"
-    );
-}
-
-/// fix 2a: a single request whose flat fee ALONE exceeds the cap is rejected even as the FIRST
-/// request in the window (the INSERT-branch guard), and an UNCAPPED key always charges.
-#[test]
-fn test_charge_within_budget_first_request_and_uncapped() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    // First-request fee > cap → rejected, no row created.
-    assert!(!s.charge_within_budget("big", 0, 200, Some(100)).unwrap());
-    assert_eq!(
-        s.get_usage("big", 0).unwrap().requests,
-        0,
-        "rejected first request creates no charge"
-    );
-    // Uncapped (None) always charges.
-    assert!(s.charge_within_budget("free", 0, 999_999, None).unwrap());
-    assert_eq!(s.get_usage("free", 0).unwrap().spend_cents, 999_999);
-}
-
-/// fix 2a (the headline): CONCURRENT atomic charges cannot overshoot the cap. 50 tasks each try to
-/// charge 30c against a 100c cap on ONE shared store; exactly 3 may succeed (90c), the rest are
-/// rejected, and final spend is EXACTLY 90 — never the N×30 overshoot the old non-atomic
-/// read-then-charge allowed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_concurrent_charges_cannot_overshoot_cap() {
-    let store: Arc<SqliteStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-    let mut handles = Vec::new();
-    for _ in 0..50 {
-        let s = store.clone();
-        handles.push(tokio::task::spawn_blocking(move || {
-            s.charge_within_budget("k", 0, 30, Some(100)).unwrap()
-        }));
-    }
-    let mut admitted = 0u32;
-    for h in handles {
-        if h.await.unwrap() {
-            admitted += 1;
-        }
-    }
-    assert_eq!(
-        admitted, 3,
-        "exactly 3 of 50 concurrent charges fit under a 100c/30c cap"
-    );
-    assert_eq!(
-        store.get_usage("k", 0).unwrap().spend_cents,
-        90,
-        "final spend must be EXACTLY 90 — no concurrency overshoot (the hard-cap guarantee)"
-    );
-}
-
 /// H1: CONCURRENCY through the REAL admission wrapper. Unlike
 /// `test_concurrent_charges_cannot_overshoot_cap` (which hits `Store::charge_within_budget`
 /// directly and bypasses the `spawn_blocking` offload), this fires N concurrent tasks through
@@ -204,7 +95,7 @@ async fn test_concurrent_charges_cannot_overshoot_cap() {
 /// concurrent admissions may land and final spend must be EXACTLY 5 (cap-respecting, no overshoot).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_govstate_admission_respects_cap() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store.clone(), 1, 0, None).unwrap()); // 1c flat fee
     let (key, _s) = gov
         .create_key(
@@ -254,7 +145,7 @@ async fn test_concurrent_govstate_admission_respects_cap() {
 /// genuinely frees budget on the live admission path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_charge_refund_readmit_cycle() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store.clone(), 1, 0, None).unwrap()); // 1c flat fee
     let (key, _s) = gov
         .create_key(
@@ -299,45 +190,11 @@ async fn test_charge_refund_readmit_cycle() {
     );
 }
 
-/// M9: cap BOUNDARY semantics through `Store::charge_within_budget` (the admission primitive).
-/// (a) a FIRST request whose `cost_cents == max_cents` must ADMIT (post-charge spend equals, not
-/// exceeds, the cap). (b) a window PRE-SEEDED with `spend_cents >= max_cents` must REJECT the next
-/// charge. These pin the `>`-vs-`>=` boundary the hard cap turns on.
-#[test]
-fn test_charge_within_budget_cap_boundaries() {
-    // (a) cost == cap on a fresh window → admit.
-    let s = SqliteStore::open_in_memory().unwrap();
-    assert!(
-        s.charge_within_budget("k", 0, 100, Some(100)).unwrap(),
-        "first request with cost_cents == max_cents must admit (spend lands exactly at the cap)"
-    );
-    assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 100);
-    // A further charge now that spend == cap must reject.
-    assert!(
-        !s.charge_within_budget("k", 0, 1, Some(100)).unwrap(),
-        "once spend == cap, any further charge is rejected"
-    );
-
-    // (b) window pre-seeded at/above the cap → reject the next charge outright.
-    let s2 = SqliteStore::open_in_memory().unwrap();
-    // Seed spend >= max via an uncapped accounting write, then probe with a capped charge.
-    s2.add_usage("k2", 0, 250, 0, true).unwrap();
-    assert!(
-        !s2.charge_within_budget("k2", 0, 1, Some(200)).unwrap(),
-        "a window pre-seeded with spend_cents >= max_cents must reject"
-    );
-    assert_eq!(
-        s2.get_usage("k2", 0).unwrap().spend_cents,
-        250,
-        "the rejected charge must not mutate spend"
-    );
-}
-
 /// fix 2a wrapper: `try_charge_request_within_budget` charges the flat fee and rejects atomically
 /// at the cap. 1c/request flat fee, 2c cap → 2 admitted, 3rd rejected.
 #[tokio::test]
 async fn test_try_charge_request_within_budget_rejects_at_cap() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 1, 0, None).unwrap(); // 1c flat fee
     let (key, _s) = gov
         .create_key(
@@ -367,43 +224,12 @@ async fn test_try_charge_request_within_budget_rejects_at_cap() {
     );
 }
 
-/// fix 2a companion: `refund_request` reverses exactly one flat charge, floored at 0 (a refund
-/// can never drive a counter negative).
-#[test]
-fn test_refund_request_reverses_charge_floored_at_zero() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
-    assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
-    assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 60);
-    assert_eq!(s.get_usage("k", 0).unwrap().requests, 2);
-    s.refund_request("k", 0, 30).unwrap();
-    assert_eq!(
-        s.get_usage("k", 0).unwrap().spend_cents,
-        30,
-        "one refund reverses one charge"
-    );
-    assert_eq!(s.get_usage("k", 0).unwrap().requests, 1);
-    // Over-refunding floors at 0, never negative.
-    s.refund_request("k", 0, 30).unwrap();
-    s.refund_request("k", 0, 30).unwrap();
-    assert_eq!(
-        s.get_usage("k", 0).unwrap().spend_cents,
-        0,
-        "refund floors spend at 0"
-    );
-    assert_eq!(
-        s.get_usage("k", 0).unwrap().requests,
-        0,
-        "refund floors requests at 0"
-    );
-}
-
 /// The metering series: `add_metering` UPSERTs per (key, bucket, model, provider) with the raw
 /// token SPLIT preserved and +1 request per call; `list_metering` reads exactly one bucket; a
 /// second bucket never bleeds in.
 #[test]
 fn test_metering_accumulates_split_per_key_model_and_bucket() {
-    let s = SqliteStore::open_in_memory().unwrap();
+    let s = MemoryStore::new();
     let day = metering_bucket(1_700_000_123); // mid-day epoch floors to its bucket start
     assert_eq!(day % METERING_BUCKET_SECS, 0);
     let d = |model: &str, input: u64, output: u64| MeteringDelta {
@@ -451,7 +277,7 @@ fn test_metering_accumulates_split_per_key_model_and_bucket() {
 /// still counts the request.
 #[test]
 fn test_record_metering_from_ir_usage_and_flat() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let now = 1_700_000_500;
     let usage = crate::ir::IrUsage {
@@ -522,7 +348,7 @@ fn test_virtualkey_debug_redacts_key_hash() {
 
 #[test]
 fn test_create_key_with_aws_issues_and_resolves_credential() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let (key, _bearer, akid, secret) = gov
         .create_key_with_aws(
@@ -602,7 +428,7 @@ fn test_credential_generators_contract() {
 fn test_aws_credential_persists_across_reload() {
     // A credential minted in one GovState must be visible to a fresh GovState over the same store
     // (durable + rebuilt into the AccessKeyId index at construction).
-    let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let akid = {
         let gov = GovState::new(store.clone(), 0, 0, None).unwrap();
         let (_k, _b, akid, _s) = gov
@@ -630,7 +456,7 @@ fn test_aws_credential_persists_across_reload() {
 #[test]
 fn test_delete_key_removes_aws_credential() {
     // Revoking a key must remove its AWS credential so it can no longer authenticate via SigV4.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let (key, _b, akid, _s) = gov
         .create_key_with_aws(
@@ -662,7 +488,7 @@ fn test_refresh_updates_both_indices_atomically() {
     // and a `delete_key` (which calls `refresh`) clears it from BOTH in the same swap. This pins
     // the single-lock atomic refresh against a future split-lock regression where one index could
     // be updated without the other.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let (key, bearer, akid, _secret) = gov
         .create_key_with_aws(
@@ -734,7 +560,7 @@ fn test_aws_credential_debug_redacts_secret() {
 #[test]
 fn test_generated_aws_credentials_are_distinct() {
     // Two mints must produce distinct AccessKeyIds and secrets (CSPRNG-sourced, not constant).
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mk = |gov: &GovState, n: &str| {
         gov.create_key_with_aws(
@@ -758,7 +584,7 @@ fn test_generated_aws_credentials_are_distinct() {
 
 #[test]
 fn test_govstate_lookup_pool_allowed_refresh() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-abc";
     let mut k = sample_key("k1", &crate::sigv4::sha256_hex(secret.as_bytes()));
     k.allowed_pools = vec!["prod".to_string()];
@@ -808,7 +634,7 @@ fn test_budget_window_periods() {
 /// path is covered. Renamed with a `legacy_` prefix to make that explicit.
 #[test]
 fn legacy_test_is_over_budget_and_record() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let mut k = sample_key("k1", "h1");
     k.max_budget_cents = Some(100);
     k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
@@ -834,7 +660,7 @@ fn legacy_test_is_over_budget_and_record() {
 
 #[test]
 fn test_record_tokens_cost() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     // 50 cents per 1000 tokens, no per-request fee.
     let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 2000); // 2000 * 50 / 1000 = 100 cents
@@ -852,7 +678,7 @@ fn test_record_tokens_cost() {
 /// accumulate to a whole cent. (No runtime → `offload_store_write` runs the write inline.)
 #[test]
 fn test_record_tokens_sub_cent_carry_accumulates() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 0, 1, None).unwrap(); // 1¢ per 1000 tokens
 
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 500); // 0.5¢ → carried, flush 0
@@ -880,7 +706,7 @@ fn test_record_tokens_sub_cent_carry_accumulates() {
 /// same per-key carry and the day-2 request would flush 1¢ that belonged to day 1.
 #[test]
 fn test_sub_cent_carry_does_not_leak_across_budget_windows() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 0, 1, None).unwrap(); // 1¢ per 1000 tokens
     let day1 = 1_700_000_000;
     let day2 = day1 + 86_400; // one day later → a different "daily" window
@@ -912,7 +738,7 @@ fn test_sub_cent_carry_does_not_leak_across_budget_windows() {
 /// token cost. Pins the `record_tokens → in-memory cell → flush_budgets → put_usage` path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_record_tokens_offload_under_runtime() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     // 50 cents per 1000 tokens, no per-request fee.
     let gov = GovState::new(store.clone(), 0, 50, None).unwrap();
     // 2000 tokens * 50c / 1000 = 100c. Accrued in memory; not yet persisted.
@@ -937,7 +763,7 @@ async fn test_record_tokens_offload_under_runtime() {
 
 #[test]
 fn test_check_rate_rpm_window() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 1, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(2);
@@ -968,7 +794,7 @@ fn test_check_rate_rpm_window() {
 /// the window; clamps an over-budget window to `0.0`; takes the MIN of RPM/TPM when both are set.
 #[test]
 fn test_rate_headroom_reports_fraction_remaining() {
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let now = 1_700_000_040; // mid-window
 
@@ -1023,7 +849,7 @@ fn test_rate_headroom_reports_fraction_remaining() {
 #[test]
 fn test_tpm_enforced_against_accrued_tokens_same_window() {
     // TPM is enforced against tokens from completed requests in the current window.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = None;
@@ -1057,7 +883,7 @@ fn test_add_rate_tokens_straddling_request_credits_live_window_not_dropped() {
     // reinitialised the entry back to W0 — wiping the live W1 counter. Either way the straddling
     // request escaped TPM. The fix credits the entry's LIVE (W1) window in place, so the tokens
     // count against the key's currently-live TPM budget.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(10);
@@ -1086,7 +912,7 @@ fn test_add_rate_tokens_reinitialises_a_genuinely_stale_entry() {
     // the entry's window, the entry is genuinely stale (an old window the amortized sweep has not
     // yet evicted). It must be reinitialised to the new window before crediting, so a stale entry
     // never carries its old counts forward.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(10);
@@ -1122,7 +948,7 @@ fn test_add_rate_tokens_reinitialises_a_genuinely_stale_entry() {
 fn test_check_rate_fast_path_reuses_entry_no_double_reset() {
     // The get_mut fast path must not reset an existing current-window entry (which would drop
     // the request count and break RPM). Two requests in the same window must both count.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(2);
@@ -1143,7 +969,7 @@ fn test_check_rate_resets_stale_entry_without_eager_sweep() {
     // not run this call. Previously the per-call `retain` guaranteed a fresh entry; now the
     // per-key reset in `check_rate` must do it. We exhaust RPM in W0, then advance a full window
     // and confirm the key is admitted again (stale W0 counts must not carry forward).
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(1);
@@ -1186,7 +1012,7 @@ fn test_check_rate_sweep_evicts_silent_keys_to_bound_map() {
     // The amortized sweep must still evict entries for keys that have gone silent in older
     // windows, so the map stays bounded. We seed many distinct keys in W0, then trigger a sweep
     // on a later window and confirm the stale entries are gone.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let w0 = 1_700_000_040 / 60 * 60;
 
@@ -1232,7 +1058,7 @@ fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
     //  - The u32 wrap boundary must NOT skip a cycle: when the pre-increment value is 0xFFFFFFFF
     //    (not a multiple of N), the post-increment value wraps to 0 (a multiple of N) and the
     //    sweep still fires.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(1_000_000);
@@ -1311,7 +1137,7 @@ async fn test_record_request_offloaded_charges_under_runtime() {
     // Inside a Tokio runtime, record_request now charges the AUTHORITATIVE in-memory cell (no store
     // round-trip); the write-behind flusher persists it. The charge must land in memory immediately
     // and reach the durable store after a flush.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let mut k = sample_key("k1", "h1");
     k.max_budget_cents = Some(1000);
     k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
@@ -1339,7 +1165,7 @@ fn test_record_request_clamps_negative_per_request_price() {
     // A negative per-request price must NOT decrement accrued spend (which would drive spend
     // below zero and defeat the budget cap). The fee is clamped at >= 0, symmetric with the
     // per-1k-token price clamp in record_tokens.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let mut k = sample_key("k1", "h1");
     k.max_budget_cents = Some(100);
     k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
@@ -1362,7 +1188,7 @@ fn test_record_request_clamps_negative_per_request_price() {
 #[test]
 fn test_record_tokens_clamps_negative_per_1k_price() {
     // Mirror assertion for the token-price path (already clamped pre-fix; lock it in).
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 0, -100, None).unwrap();
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, 1_700_000_000, 5000);
     gov.flush_budgets(); // persist the write-behind cell before asserting the durable counter
@@ -1374,7 +1200,7 @@ fn test_record_tokens_clamps_negative_per_1k_price() {
 #[test]
 fn test_create_key_minted_id_is_free_so_mint_succeeds() {
     // A normal mint derives a fresh id and the collision guard does not fire (the id is free).
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
     let spec = NewKeySpec {
         name: "first".to_string(),
@@ -1394,7 +1220,7 @@ fn test_create_key_minted_id_is_free_so_mint_succeeds() {
 fn test_update_key_toggles_enabled_and_limits_in_place() {
     // PATCH /admin/keys/:id (#28): a key can be disabled WITHOUT destroying it, and its caps
     // adjusted, with the secret/hash preserved. A missing field leaves its value unchanged.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
     let (key, secret) = gov
         .create_key(
@@ -1444,7 +1270,7 @@ fn test_update_key_clears_caps_to_unlimited_with_inner_none() {
     // THREE-STATE caps (LOW #16/#19): `Some(None)` CLEARS a cap back to unlimited; `None` (outer)
     // leaves it unchanged; `Some(Some(v))` sets it. The old single-Option shape could only set or
     // leave-unchanged, never clear. Verify all three transitions on every cap field.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
     let (key, _secret) = gov
         .create_key(
@@ -1517,7 +1343,7 @@ fn test_unlimited_key_does_not_grow_rate_map() {
     // `record_tokens`) must skip the map for an uncapped key — otherwise every request leaks one
     // entry per uncapped key forever. Drive many requests for an uncapped key and assert the map
     // stays empty; then a capped key DOES get an entry (the feed still works where it should).
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 5, 7, None).unwrap();
 
     let mut uncapped = sample_key("uncapped", "h_unl");
@@ -1565,7 +1391,7 @@ fn test_add_rate_tokens_is_update_only_never_materialises_entry() {
     // any create path, and the token fee flows through `record_tokens` (update-only). Old code
     // with the recovery branch would have materialised an entry here from `record_request` with
     // non-zero tokens; the corrected update-only code must not.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 5, 7, None).unwrap();
 
     // A CAPPED key with NO prior `check_rate` admission -> it has no rate-map entry yet.
@@ -1617,7 +1443,7 @@ fn test_ensure_id_free_for_hash_guards_silent_overwrite() {
     // secret's id atop an unrelated key. The guard must REFUSE when the id already holds a
     // DIFFERENT key_hash (rather than let put_key UPSERT-overwrite and invalidate the incumbent),
     // while allowing a free id or an idempotent same-hash re-mint.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), 1, 0, None).unwrap();
 
     // A free id is allowed.
@@ -1653,7 +1479,7 @@ fn test_poisoned_rate_lock_recovers_not_panics() {
     // RECOVER (via into_inner) rather than `.unwrap()`-panic on every subsequent call, which
     // would cascade a single transient fault into a full governance outage. We deliberately
     // poison the lock, then assert check_rate/add_rate_tokens still function.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
     let mut k = sample_key("k1", "h1");
     k.rpm_limit = Some(2);
@@ -1681,7 +1507,7 @@ fn test_poisoned_rate_lock_recovers_not_panics() {
 fn test_poisoned_by_hash_lock_recovers_not_panics() {
     // The auth-path key cache lock has the same hazard: a poisoned `by_hash` must not make every
     // subsequent `lookup` panic. Poison it, then confirm lookup still resolves a cached key.
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-abc";
     let k = sample_key("k1", &crate::sigv4::sha256_hex(secret.as_bytes()));
     store.put_key(&k).unwrap();
@@ -1699,103 +1525,4 @@ fn test_poisoned_by_hash_lock_recovers_not_panics() {
     gov.refresh()
         .expect("refresh recovers the poisoned cache lock");
     assert_eq!(gov.lookup(secret).unwrap().id, "k1");
-}
-
-#[test]
-fn test_usage_accumulates() {
-    let s = SqliteStore::open_in_memory().unwrap();
-    s.add_usage("k1", 100, 25, 1000, true).unwrap();
-    s.add_usage("k1", 100, 30, 500, true).unwrap();
-    let u = s.get_usage("k1", 100).unwrap();
-    assert_eq!(u.spend_cents, 55);
-    assert_eq!(u.tokens, 1500);
-    assert_eq!(u.requests, 2);
-    // A token-accrual call (count_request = false) adds spend/tokens but NOT a request — so the
-    // per-request fee + token usage for one request don't double-count it.
-    s.add_usage("k1", 100, 7, 250, false).unwrap();
-    let u2 = s.get_usage("k1", 100).unwrap();
-    assert_eq!(u2.spend_cents, 62);
-    assert_eq!(u2.tokens, 1750);
-    assert_eq!(
-        u2.requests, 2,
-        "count_request=false must not increment requests"
-    );
-    // Different window is independent; unknown = zero.
-    assert_eq!(s.get_usage("k1", 200).unwrap(), Usage::default());
-}
-
-#[test]
-fn test_delete_key_removes_key_and_usage_atomically() {
-    // Regression: `delete_key` deletes from both `virtual_keys` and `usage_counters`. The two
-    // DELETEs are now wrapped in one transaction so they commit together — leaving no orphaned
-    // usage rows that would (a) accumulate forever and (b) poison a future key re-created with
-    // the same id with stale usage. Here we assert the post-condition: after delete, both the
-    // key row AND all of its usage rows across windows are gone.
-    let s = SqliteStore::open_in_memory().unwrap();
-    let key = VirtualKey {
-        id: "vk_delete_me".into(),
-        key_hash: "hash_delete_me".into(),
-        name: "victim".into(),
-        allowed_pools: vec!["p1".into()],
-        max_budget_cents: Some(1000),
-        budget_period: BUDGET_PERIOD_TOTAL.into(),
-        rpm_limit: Some(60),
-        tpm_limit: Some(1000),
-        enabled: true,
-        created_at: 0,
-    };
-    s.put_key(&key).unwrap();
-    s.add_usage("vk_delete_me", 100, 25, 1000, true).unwrap();
-    s.add_usage("vk_delete_me", 200, 5, 50, true).unwrap();
-    // Precondition: key + usage present.
-    assert!(s.get_key("vk_delete_me").unwrap().is_some());
-    assert_eq!(s.get_usage("vk_delete_me", 100).unwrap().requests, 1);
-
-    s.delete_key("vk_delete_me").unwrap();
-
-    // Key row gone.
-    assert!(
-        s.get_key("vk_delete_me").unwrap().is_none(),
-        "key row must be deleted"
-    );
-    // No orphaned usage rows in ANY window.
-    assert_eq!(
-        s.get_usage("vk_delete_me", 100).unwrap(),
-        Usage::default(),
-        "usage row in window 100 must be deleted alongside the key"
-    );
-    assert_eq!(
-        s.get_usage("vk_delete_me", 200).unwrap(),
-        Usage::default(),
-        "usage row in window 200 must be deleted alongside the key"
-    );
-}
-
-#[test]
-fn test_delete_key_does_not_inherit_stale_usage_on_recreate() {
-    // The orphaned-usage hazard manifests as a re-created key inheriting prior usage. With the
-    // atomic delete, re-minting the same id starts from zero usage.
-    let s = SqliteStore::open_in_memory().unwrap();
-    let mk = |id: &str| VirtualKey {
-        id: id.into(),
-        key_hash: format!("hash_{id}"),
-        name: "k".into(),
-        allowed_pools: vec![],
-        max_budget_cents: None,
-        budget_period: BUDGET_PERIOD_TOTAL.into(),
-        rpm_limit: None,
-        tpm_limit: None,
-        enabled: true,
-        created_at: 0,
-    };
-    s.put_key(&mk("vk_reuse")).unwrap();
-    s.add_usage("vk_reuse", 100, 99, 9999, true).unwrap();
-    s.delete_key("vk_reuse").unwrap();
-    // Re-create with the same id; the prior window's usage must NOT bleed through.
-    s.put_key(&mk("vk_reuse")).unwrap();
-    assert_eq!(
-        s.get_usage("vk_reuse", 100).unwrap(),
-        Usage::default(),
-        "re-created key must not inherit the deleted key's usage"
-    );
 }

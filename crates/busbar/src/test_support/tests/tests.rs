@@ -317,7 +317,7 @@ async fn test_cross_protocol_nonstream_preserves_model() {
 /// TPM never tripped. After recording, a second request in the same window is rejected (429).
 #[tokio::test]
 async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     crate::metrics::init();
 
     let state = Arc::new(MockServerState::new());
@@ -333,7 +333,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
     }
     let server = MockServer::new(state.clone()).await;
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-tpm";
     store
         .put_key(&VirtualKey {
@@ -419,7 +419,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
 /// stream fully drains (160 tokens charged), a second request in the same window is rejected (429).
 #[tokio::test]
 async fn test_cross_protocol_stream_records_tokens_for_tpm() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     crate::metrics::init();
 
     // OpenAI-protocol SSE stream whose final chunk carries usage totalling 160 tokens
@@ -442,7 +442,7 @@ async fn test_cross_protocol_stream_records_tokens_for_tpm() {
     }
     let server = MockServer::new(state.clone()).await;
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-tpm-stream";
     store
         .put_key(&VirtualKey {
@@ -843,10 +843,10 @@ async fn test_metrics_requires_auth_in_token_mode() {
 /// governance-enabled router enforces virtual-key auth + allowed-pools over real HTTP.
 #[tokio::test]
 async fn test_governance_vkey_auth_and_pool_acl() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
 
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-allowed";
     store
         .put_key(&VirtualKey {
@@ -916,10 +916,10 @@ async fn test_governance_vkey_auth_and_pool_acl() {
 /// a virtual key over its budget is rejected (429 for body/Anthropic ingress) before forwarding.
 #[tokio::test]
 async fn test_governance_budget_over_quota() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
 
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-broke";
     store
         .put_key(&VirtualKey {
@@ -936,7 +936,7 @@ async fn test_governance_budget_over_quota() {
         })
         .unwrap();
     // Pre-seed usage past the 100c budget (window 0 = "total") in the DURABLE store.
-    store.add_usage("kb", 0, 250, 0, true).unwrap();
+    store.put_usage("kb", 0, 250, 0, 1).unwrap();
     let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
     // Enforcement is now IN-MEMORY (authoritative): hydrate the budget cells from the store — exactly
     // as boot does — so the admission gate sees the pre-seeded over-budget spend. (Without this the
@@ -1001,9 +1001,9 @@ async fn over_budget_router() -> (
     tokio::task::JoinHandle<()>,
     &'static str,
 ) {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-broke-multi";
     store
         .put_key(&VirtualKey {
@@ -1019,7 +1019,7 @@ async fn over_budget_router() -> (
             created_at: 0,
         })
         .unwrap();
-    store.add_usage("kbm", 0, 250, 0, true).unwrap();
+    store.put_usage("kbm", 0, 250, 0, 1).unwrap();
     let gov = Arc::new(GovState::new(store, 1, 0, None).unwrap());
     // Enforcement is IN-MEMORY (authoritative): hydrate the budget cells from the durable store — as
     // boot does — so the pre-seeded over-budget spend is visible to the admission gate.
@@ -1205,10 +1205,10 @@ async fn test_budget_over_quota_bedrock_envelope() {
 /// a virtual key over its RPM is rejected with 429 + Retry-After.
 #[tokio::test]
 async fn test_governance_rate_limit_429() {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
 
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-rl";
     store
         .put_key(&VirtualKey {
@@ -1295,9 +1295,9 @@ async fn over_rpm_router() -> (
     tokio::task::JoinHandle<()>,
     &'static str,
 ) {
-    use crate::governance::{GovState, SqliteStore, Store, VirtualKey};
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let secret = "sk-vk-rl-multi";
     store
         .put_key(&VirtualKey {
@@ -1510,10 +1510,10 @@ async fn test_rate_limit_429_bedrock_native_envelope() {
 #[cfg(feature = "auth-admin-tokens")]
 #[tokio::test]
 async fn test_governance_admin_api() {
-    use crate::governance::{GovState, SqliteStore};
+    use crate::governance::{GovState, MemoryStore};
 
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new().governance(gov).build();

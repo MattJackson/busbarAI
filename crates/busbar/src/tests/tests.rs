@@ -330,12 +330,12 @@ async fn test_fallback_openai_404_is_json_no_amzn_headers() {
 #[cfg(feature = "auth-admin-tokens")]
 #[tokio::test]
 async fn split_admin_listener_no_double_exposure() {
-    use crate::governance::{GovState, SqliteStore};
+    use crate::governance::{GovState, MemoryStore};
     use crate::test_support::{LaneSpec, TestApp};
     use std::sync::Arc;
     crate::metrics::init();
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     // One configured lane so `/healthz` reports ready (200) rather than "no usable lanes" (503) —
     // the probe URL is never actually dialed here; the test only exercises routing/auth.

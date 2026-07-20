@@ -1,4 +1,4 @@
-use crate::governance::{GovState, NewKeySpec, SqliteStore};
+use crate::governance::{GovState, MemoryStore, NewKeySpec};
 use crate::test_support::TestApp;
 use std::sync::Arc;
 
@@ -73,7 +73,7 @@ async fn serve_with_gov(gov: Arc<GovState>) -> (std::net::SocketAddr, tokio::tas
 #[tokio::test]
 async fn test_admin_v1_info_reports_version_features_and_topology() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -136,7 +136,7 @@ async fn test_admin_v1_info_reports_version_features_and_topology() {
 async fn test_admin_v1_topology_reads_pools_models_providers() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
@@ -218,7 +218,7 @@ async fn test_admin_v1_topology_reads_pools_models_providers() {
 #[tokio::test]
 async fn test_api_root_unmatched_paths_speak_the_admin_envelope() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -326,7 +326,7 @@ async fn test_keys_surface_governance_disabled_semantics() {
 async fn test_admin_v1_pool_detail_live_status() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new()
         .governance(gov)
@@ -414,7 +414,7 @@ async fn test_admin_v1_pool_detail_live_status() {
 #[tokio::test]
 async fn test_admin_v1_admin_auth_read() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -449,7 +449,7 @@ async fn test_admin_v1_admin_auth_read() {
 async fn test_admin_v1_get_single_key() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (minted, minted_secret) = gov
         .create_key(
@@ -509,7 +509,7 @@ async fn test_admin_v1_get_single_key() {
 async fn test_admin_v1_usage_meters_by_model_and_key() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     // Prices: 1¢/request + 50¢/1k tokens — the derivation inputs the assertions replay.
     let gov = Arc::new(GovState::new(store, 1, 50, Some("admintok".to_string())).unwrap());
     let now = crate::store::now();
@@ -662,7 +662,7 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
         }
     });
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -761,7 +761,7 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
 #[tokio::test]
 async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
@@ -894,7 +894,7 @@ pools:
     )
     .unwrap();
 
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
@@ -1016,7 +1016,7 @@ providers: {}
 #[tokio::test]
 async fn test_admin_v1_mutation_rate_limit_config_class() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1065,7 +1065,7 @@ async fn test_admin_v1_mutation_rate_limit_config_class() {
 #[tokio::test]
 async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
@@ -1263,7 +1263,7 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
 #[tokio::test]
 async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
@@ -1412,7 +1412,7 @@ async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
 #[tokio::test]
 async fn test_admin_v1_idempotency_key_is_principal_scoped() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
@@ -1477,7 +1477,7 @@ async fn test_admin_v1_idempotency_key_is_principal_scoped() {
 #[tokio::test]
 async fn test_admin_v1_credential_cache_and_flush_endpoint() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
@@ -1574,7 +1574,7 @@ async fn test_admin_v1_credential_cache_and_flush_endpoint() {
 #[tokio::test]
 async fn test_admin_v1_put_auth_dry_run_guard() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
@@ -1723,7 +1723,7 @@ async fn test_admin_v1_put_auth_dry_run_guard() {
 #[tokio::test]
 async fn test_admin_v1_key_idempotent_mint_and_if_match() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1804,7 +1804,7 @@ async fn test_admin_v1_key_idempotent_mint_and_if_match() {
 #[tokio::test]
 async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1845,7 +1845,7 @@ async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
 #[tokio::test]
 async fn test_admin_v1_key_rotate_and_pagination() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov.clone()).build();
     let router = crate::build_router(app);
@@ -1964,7 +1964,7 @@ async fn test_admin_v1_key_rotate_and_pagination() {
 #[tokio::test]
 async fn test_admin_v1_put_hook_replaces_live_with_guards() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2081,7 +2081,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
 #[tokio::test]
 async fn test_admin_v1_config_versions_rollback_and_diff() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2183,7 +2183,7 @@ async fn test_admin_v1_config_versions_rollback_and_diff() {
 #[tokio::test]
 async fn test_admin_v1_register_hook_takes_effect_live() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2355,7 +2355,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
 #[tokio::test]
 async fn test_admin_v1_audit_records_mutations() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2441,7 +2441,7 @@ async fn test_admin_v1_audit_records_mutations() {
 #[tokio::test]
 async fn test_admin_v1_hook_mutation_404_is_audited() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2518,7 +2518,7 @@ async fn test_admin_v1_hook_mutation_404_is_audited() {
 async fn test_admin_v1_list_keys_filters() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (minted, _secret) = gov
         .create_key(
@@ -2582,7 +2582,7 @@ async fn test_admin_v1_list_keys_filters() {
 #[tokio::test]
 async fn test_admin_v1_config_plane_golden_path() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("t".to_string())).unwrap());
     let overlay = std::env::temp_dir().join(format!(
         "busbar-golden-{}-{}.json",
@@ -2696,7 +2696,7 @@ async fn test_admin_v1_config_plane_golden_path() {
 #[tokio::test]
 async fn test_admin_v1_hook_register_persists_to_overlay() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let overlay = std::env::temp_dir().join(format!(
         "busbar-persist-test-{}-{}.json",
@@ -2754,7 +2754,7 @@ async fn test_admin_v1_hook_register_persists_to_overlay() {
 #[tokio::test]
 async fn test_admin_v1_audit_records_key_mutations() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2805,7 +2805,7 @@ async fn test_admin_v1_audit_records_key_mutations() {
 #[tokio::test]
 async fn test_admin_v1_base_hook_is_read_only_via_api() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let base: crate::config::HookCfg = serde_json::from_value(serde_json::json!({
         "kind": "gate", "webhook": "http://127.0.0.1:9990/", "prompt": "no", "global": true
@@ -2876,7 +2876,7 @@ async fn test_admin_v1_base_hook_is_read_only_via_api() {
 #[tokio::test]
 async fn test_admin_v1_delete_hook_takes_effect_live() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -2942,7 +2942,7 @@ async fn test_admin_v1_delete_hook_takes_effect_live() {
 #[tokio::test]
 async fn test_admin_v1_hooks_read_surface() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let gate = crate::config::HookCfg {
@@ -3026,7 +3026,7 @@ async fn test_admin_v1_hooks_read_surface() {
 #[tokio::test]
 async fn test_admin_v1_hook_health_best_effort() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let mk = |socket: Option<&str>, webhook: Option<&str>| crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
@@ -3099,7 +3099,7 @@ async fn test_admin_v1_hook_health_best_effort() {
 #[tokio::test]
 async fn test_admin_v1_plugins_catalog_by_type() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
@@ -3184,7 +3184,7 @@ async fn test_admin_v1_plugins_catalog_by_type() {
 #[tokio::test]
 async fn test_admin_v1_auth_read() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -3217,7 +3217,7 @@ async fn test_admin_v1_auth_read() {
 #[tokio::test]
 async fn test_admin_v1_config_validate_dry_run() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -3279,7 +3279,7 @@ async fn test_admin_v1_config_validate_dry_run() {
 async fn test_admin_v1_config_effective_snapshot_no_secrets() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
@@ -3370,7 +3370,7 @@ async fn test_admin_v1_config_effective_snapshot_no_secrets() {
 #[tokio::test]
 async fn test_admin_v1_openapi_paths_all_resolve() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -3440,7 +3440,7 @@ async fn test_admin_v1_openapi_paths_all_resolve() {
 #[tokio::test]
 async fn test_admin_v1_all_reads_require_admin_token() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -3491,7 +3491,7 @@ async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_re
     // Minting with `issue_aws_credential: true` returns the AccessKeyId AND the secret access key
     // ONCE at creation; neither the AWS secret nor the key_hash is ever returned by a later read.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -3562,7 +3562,7 @@ async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
     // onto spawn_blocking: a slow store call must not block a Tokio worker, and the offloaded
     // handlers must still return the same responses (no secret/hash leak; usage resolves).
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -3646,7 +3646,7 @@ async fn test_create_key_rejects_unknown_budget_period() {
     // with 400, NOT accepted at 201 and silently enforced as the all-time `"total"` window. A
     // valid period (and the default when omitted) must still create the key.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -3728,7 +3728,7 @@ async fn test_create_key_rejects_unknown_budget_period() {
 #[tokio::test]
 async fn test_admin_malformed_body_returns_generic_400_no_input_fragment() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -3791,7 +3791,7 @@ async fn test_create_key_rejects_negative_max_budget_cents() {
     // rejected with 400 and no key minted; `0` (a hard no-spend cap) and a positive value, and an
     // omitted field (unlimited), must all still create the key.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -3868,7 +3868,7 @@ async fn test_patch_key_enables_disables_and_validates_at_create_parity() {
     // #28: PATCH /admin/keys/:id can disable a key (without DELETE destroying its history) and
     // adjust caps; it is admin-gated and rejects the same invalid values create() does.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -3946,7 +3946,7 @@ async fn test_create_key_rejects_zero_rate_limits() {
     // key reject every request from creation — a permanently-dead key minted with 201 and no
     // diagnostic. Both fields must 400; a positive value, and omission (unlimited), must create it.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -4021,7 +4021,7 @@ async fn test_patch_key_clears_caps_to_unlimited_via_null() {
     // (clear to unlimited), and a value (set). A single Option<T> conflated absent with null, so a
     // cap could never be cleared once set. Verify the full matrix end-to-end through the handler.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -4147,7 +4147,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     // App has exactly one configured pool, "smart" (lane 0). "smrt" is the typo'd sibling.
     let app = TestApp::new()
@@ -4242,7 +4242,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
 #[tokio::test]
 async fn test_delete_existing_key_returns_200() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -4277,7 +4277,7 @@ async fn test_delete_existing_key_returns_200() {
 #[tokio::test]
 async fn test_delete_missing_key_returns_404() {
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let (addr, handle) = serve_with_gov(gov).await;
@@ -4304,7 +4304,7 @@ async fn test_delete_key_is_not_idempotent_204() {
     // After a successful delete, a second delete of the same id must 404 (proves the 204 was a
     // real revocation, not a no-op masquerading as success).
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -4346,7 +4346,7 @@ async fn test_concurrent_delete_returns_exactly_one_204() {
     // an audit trail). The delete handler serializes its lookup→delete critical section, so the
     // winner returns 204 and every loser returns 404. Fire a burst and assert exactly one 204.
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -4408,7 +4408,7 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
     // DELETE closes the window. This sequential case (DELETE fully precedes PATCH) proves the base
     // contract: PATCH on a deleted key 404s and leaves it deleted (a later GET/usage stays 404).
     crate::metrics::init();
-    let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
@@ -4482,7 +4482,7 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
 /// A `Store` decorator that can pause inside `put_key` to force the exact PATCH/DELETE
 /// interleaving the resurrection race needs — something a black-box HTTP burst cannot do
 /// deterministically (the window between `update_key`'s `get_key` and `put_key` is microscopic).
-/// All methods delegate to an inner `SqliteStore`; only `put_key` is instrumented, and only once
+/// All methods delegate to an inner `MemoryStore`; only `put_key` is instrumented, and only once
 /// armed (so the create-time `put_key` during setup is unaffected).
 ///
 /// When armed, the FIRST subsequent `put_key` (the PATCH's) signals `entered` and then BLOCKS on
@@ -4490,7 +4490,7 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
 /// its write, so the test can run a DELETE in that gap and observe whether the gate prevents the
 /// PATCH from re-inserting (resurrecting) the just-revoked row.
 struct BarrierStore {
-    inner: SqliteStore,
+    inner: MemoryStore,
     armed: std::sync::atomic::AtomicBool,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -4569,7 +4569,7 @@ async fn test_patch_interleaved_with_delete_never_resurrects_key() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let store = Arc::new(BarrierStore {
-        inner: SqliteStore::open_in_memory().unwrap(),
+        inner: MemoryStore::new(),
         armed: std::sync::atomic::AtomicBool::new(false),
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
@@ -4664,7 +4664,7 @@ async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let store = Arc::new(BarrierStore {
-        inner: SqliteStore::open_in_memory().unwrap(),
+        inner: MemoryStore::new(),
         armed: std::sync::atomic::AtomicBool::new(false),
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
@@ -4782,7 +4782,7 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let store = Arc::new(BarrierStore {
-        inner: SqliteStore::open_in_memory().unwrap(),
+        inner: MemoryStore::new(),
         armed: std::sync::atomic::AtomicBool::new(false),
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),

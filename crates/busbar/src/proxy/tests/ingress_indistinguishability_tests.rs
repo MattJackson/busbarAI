@@ -409,7 +409,7 @@ async fn test_cross_protocol_response_carries_ingress_ct_and_native_id() {
 /// response is the ingress-native 500 AND that the gov budget recorded ZERO spend.
 #[tokio::test]
 async fn test_untranslatable_2xx_does_not_charge_tokens() {
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
     crate::metrics::init();
     let state = Arc::new(MockServerState::new());
     // OpenAI-shaped 2xx: a real `usage` block (so the tap WOULD count 7+3=10 tokens) but an EMPTY
@@ -429,7 +429,7 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
 
     // Gov + a virtual key: 0c/request, 100c/1k tokens, so 10 tokens would cost 1c if (wrongly)
     // charged. A zero post-call spend proves no token billing happened.
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
     let (key, _secret) = gov
         .create_key(
@@ -520,14 +520,14 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
 #[tokio::test]
 async fn test_same_protocol_nonstream_multichunk_counts_usage() {
     use super::FirstByteBody;
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
     use bytes::Bytes;
     use http_body_util::BodyExt as _;
     crate::metrics::init();
 
     // Gov + virtual key: 0c/request, 100c/1k tokens → a 1000-token response costs 100c. A nonzero
     // post-drain spend proves the reassembled body's `usage` was counted.
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
     let (key, _secret) = gov
         .create_key(
@@ -786,12 +786,12 @@ async fn test_cross_protocol_stream_delivers_trailing_usage_anthropic_sse() {
 #[tokio::test]
 async fn test_mid_stream_transport_error_does_not_bill_partial_usage() {
     use super::FirstByteBody;
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
     use bytes::Bytes;
     use http_body_util::BodyExt as _;
     crate::metrics::init();
 
-    let store = Arc::new(SqliteStore::open_in_memory().expect("store"));
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov")); // 0c/req, 100c/1k tokens
     let (key, _s) = gov
         .create_key(
@@ -2551,7 +2551,7 @@ async fn test_streaming_nonsse_mid_body_transport_error_records_transient() {
 #[tokio::test]
 async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
     use super::FirstByteBody;
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
     use crate::store::{BreakerCfg, BreakerState, TripConfig, TripMode};
     use bytes::Bytes;
     use futures::StreamExt as _;
@@ -2588,7 +2588,7 @@ async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
 
     // A usage sink over a real GovState priced at 100c per 1k tokens, so any `record_tokens`
     // call with nonzero tokens leaves an observable spend in the key's window.
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
     let charged_at: u64 = 1_700_000_000;
     let (key, _secret) = gov
@@ -2695,7 +2695,7 @@ async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
 #[tokio::test]
 async fn test_cancel_drop_bills_partial_tokens() {
     use super::FirstByteBody;
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
     use crate::store::BreakerCfg;
     use bytes::Bytes;
     use futures::StreamExt as _;
@@ -2709,7 +2709,7 @@ async fn test_cancel_drop_bills_partial_tokens() {
         .pool("p", &[(0, 1)])
         .build();
 
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov")); // 100c per 1k tokens
     let charged_at: u64 = 1_700_000_000;
     let (key, _secret) = gov
@@ -2796,7 +2796,7 @@ async fn test_cancel_drop_bills_partial_tokens() {
 #[tokio::test]
 async fn test_cancel_drop_skips_billing_on_aborted_translate() {
     use super::FirstByteBody;
-    use crate::governance::{GovState, NewKeySpec, SqliteStore};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
     use crate::store::BreakerCfg;
     use bytes::Bytes;
     use futures::StreamExt as _;
@@ -2810,7 +2810,7 @@ async fn test_cancel_drop_skips_billing_on_aborted_translate() {
         .pool("p", &[(0, 1)])
         .build();
 
-    let store = Arc::new(SqliteStore::open_in_memory().expect("in-memory store"));
+    let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov")); // 100c per 1k tokens
     let charged_at: u64 = 1_700_000_000;
     let (key, _secret) = gov
