@@ -3,7 +3,7 @@
 
 //! Plugin artifact **signing + trust evaluation** for busbar.
 //!
-//! An approved plugin ships a [`Manifest`] — `{name, kind, publisher, abi_version, sha256,
+//! An approved plugin ships a [`Manifest`] — `{name, version, kind, publisher, abi_version, sha256,
 //! signature}` — where `signature` is an **ed25519** signature over the artifact's SHA-256, made with
 //! the publisher's PRIVATE key (which never touches busbar). busbar holds only the PUBLIC keys of
 //! approved publishers (config `plugins.trust.publishers` + the embedded Busbar release key), and on
@@ -19,12 +19,13 @@
 //! AND a request-supplied hash can be rewritten in transit, but the signature cannot be forged
 //! without the private key.
 //!
-//! This crate is pure crypto + policy: no I/O, no engine state. The engine calls [`evaluate`] before
-//! writing/loading; the `busbar-sign` CLI calls [`sign`] (key generation lives in the CLI, which
-//! owns the RNG).
+//! This crate is pure crypto + policy: no I/O, no engine state. The engine only ever calls
+//! [`evaluate`] (verification) before writing/loading. [`sign`] exists for the release pipeline /
+//! enterprise signing tooling — OSS ships verification, not a signing CLI. Key generation lives in
+//! that tooling (it owns the RNG this engine-facing crate deliberately avoids).
 
-// `SigningKey` is re-exported so the busbar-sign CLI can name it via this crate (it owns key
-// generation, which needs an RNG this engine-facing crate deliberately avoids).
+// `SigningKey`/`VerifyingKey` are re-exported so external signing tooling can name them via this
+// crate.
 use ed25519_dalek::{Signature, Signer, Verifier};
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,10 @@ use std::collections::BTreeMap;
 pub struct Manifest {
     /// Logical plugin name, e.g. `store-sqlite`.
     pub name: String,
+    /// The plugin's own release version (semver, e.g. `1.2.3`) — surfaced by the admin API so an
+    /// upstream dashboard can compare against the latest and flag "update available". Signed, so it
+    /// can't be spoofed. (Distinct from `abi_version`, which is the wire-compat version.)
+    pub version: String,
     /// Plugin category: `store` | `auth` | `hook`.
     pub kind: String,
     /// The publisher identity whose key signed this — must resolve to an allowlisted public key.
@@ -109,29 +114,34 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// and separators are fixed forever (v1).
 pub fn signing_input(
     name: &str,
+    version: &str,
     kind: &str,
     publisher: &str,
     abi_version: u32,
     sha256: &str,
 ) -> Vec<u8> {
-    format!("busbar-plugin-v1|{name}|{kind}|{publisher}|{abi_version}|{sha256}").into_bytes()
+    format!("busbar-plugin-v1|{name}|{version}|{kind}|{publisher}|{abi_version}|{sha256}")
+        .into_bytes()
 }
 
-/// Sign an artifact with a publisher's key, producing a ready-to-ship [`Manifest`]. Used by the
-/// `busbar-sign` CLI. Never runs in the engine.
+/// Sign an artifact with a publisher's key, producing a ready-to-ship [`Manifest`]. For the release
+/// pipeline / external signing tooling — never runs in the engine (which only verifies).
+#[allow(clippy::too_many_arguments)]
 pub fn sign(
     key: &SigningKey,
     name: &str,
+    version: &str,
     kind: &str,
     publisher: &str,
     abi_version: u32,
     artifact: &[u8],
 ) -> Manifest {
     let sha256 = sha256_hex(artifact);
-    let msg = signing_input(name, kind, publisher, abi_version, &sha256);
+    let msg = signing_input(name, version, kind, publisher, abi_version, &sha256);
     let sig = key.sign(&msg);
     Manifest {
         name: name.to_string(),
+        version: version.to_string(),
         kind: kind.to_string(),
         publisher: publisher.to_string(),
         abi_version,
@@ -166,6 +176,7 @@ fn signature_ok(manifest: &Manifest, bytes: &[u8], key: &VerifyingKey) -> Result
     let sig = Signature::from_bytes(&sig_arr);
     let msg = signing_input(
         &manifest.name,
+        &manifest.version,
         &manifest.kind,
         &manifest.publisher,
         manifest.abi_version,
@@ -228,7 +239,15 @@ mod tests {
         let key = test_key(1);
         let pubk = key.verifying_key();
         let artifact = b"\x7fELF fake plugin bytes";
-        let m = sign(&key, "store-sqlite", "store", "busbar", 1, artifact);
+        let m = sign(
+            &key,
+            "store-sqlite",
+            "1.0.0",
+            "store",
+            "busbar",
+            1,
+            artifact,
+        );
         // manifest is serde-round-trippable (it travels as JSON).
         let j = serde_json::to_string(&m).unwrap();
         let m2: Manifest = serde_json::from_str(&j).unwrap();
@@ -247,7 +266,7 @@ mod tests {
     fn tampered_bytes_fail_even_under_halt() {
         let key = test_key(1);
         let pubk = key.verifying_key();
-        let m = sign(&key, "p", "store", "busbar", 1, b"original");
+        let m = sign(&key, "p", "1.0.0", "store", "busbar", 1, b"original");
         let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
         // Flip the artifact: hash no longer matches the (signed) manifest -> rejected.
         let err = evaluate(b"tampered!", Some(&m), &pol).unwrap_err();
@@ -260,7 +279,7 @@ mod tests {
         let attacker = test_key(2);
         let artifact = b"bytes";
         // Signed by `key`, but the allowlist maps 'busbar' to the ATTACKER's key -> signature fails.
-        let m = sign(&key, "p", "store", "busbar", 1, artifact);
+        let m = sign(&key, "p", "1.0.0", "store", "busbar", 1, artifact);
         let pol = policy(&[("busbar", &attacker.verifying_key())], OnUntrusted::Halt);
         assert!(evaluate(artifact, Some(&m), &pol).is_err());
     }
@@ -269,7 +288,7 @@ mod tests {
     fn unknown_publisher_is_untrusted() {
         let key = test_key(1);
         let artifact = b"bytes";
-        let m = sign(&key, "p", "store", "acme", 1, artifact);
+        let m = sign(&key, "p", "1.0.0", "store", "acme", 1, artifact);
         let pol = policy(&[("busbar", &key.verifying_key())], OnUntrusted::Halt);
         let err = evaluate(artifact, Some(&m), &pol).unwrap_err();
         assert!(err.0.contains("not in the allowlist"), "got {err:?}");
