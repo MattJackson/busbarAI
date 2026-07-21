@@ -204,6 +204,10 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
+    // Stage profiler: PREPARE spans all pre-dispatch bookkeeping (op-support filter, wants_stream +
+    // affinity derivation, failover/breaker config) up to the failover loop. Zero cost when
+    // `BUSBAR_PROFILE` is unset — `start` returns `None` and takes no `Instant`.
+    let _prep = crate::profile::start(crate::profile::Stage::Prepare);
     // EGRESS deletion switch (design §3, same contract as `forward_operation`): every candidate
     // lane's protocol must HOLD this operation's handler. A protocol whose handler was deleted is
     // not a valid egress for the operation — a clean no-handler 404 in the CALLER's dialect, never a
@@ -836,6 +840,8 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     // Why the PREVIOUS attempt failed — feeds the attempt-stage tap payload (the failover story).
     let mut last_failure: Option<&'static str> = None;
 
+    // PREPARE ends here (dispatch loop begins).
+    drop(_prep);
     let mut first_hop_v = v;
     for attempt in 0..=max_cap {
         // Check deadline first (propagated across hops)
@@ -848,6 +854,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             );
         }
 
+        let _pick = crate::profile::start(crate::profile::Stage::LanePick);
         let (i, permit) = match pick_among(
             &app,
             &cands,
@@ -888,6 +895,8 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 .await;
             }
         };
+        // LANE_PICK ends here (a lane + permit are in hand).
+        drop(_pick);
 
         // Mark this lane as excluded for future attempts in this request
         request_ctx.exclude(i);
@@ -942,6 +951,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         // parsed `Value` tree per hop: a single JSON parse is far cheaper in time and peak heap than
         // an O(n) `Value::clone` of a large request (long histories / base64 images / big tool
         // schemas), which under sustained failover compounded to O(n × max_cap) allocations.
+        let _xlate = crate::profile::start(crate::profile::Stage::TranslateReq);
         let hop_v: Option<Value> = if !body_is_json {
             None // opaque ingress body: byte-level relay/translate; nothing to re-parse.
         } else {
@@ -993,6 +1003,10 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 return *resp;
             }
         };
+        // TRANSLATE_REQ ends here (egress payload bytes in hand). CLIENT_BUILD spans the egress auth
+        // + URL/path build + reqwest RequestBuilder construction that follows.
+        drop(_xlate);
+        let _cbuild = crate::profile::start(crate::profile::Stage::ClientBuild);
         let base = &app.lanes[i].base_url;
 
         // Mode-aware key selection: passthrough uses caller token, others use lane's api_key
@@ -1091,6 +1105,10 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 request_ctx.remaining(now()).max(1),
             )); // min 1s timeout
         }
+        // CLIENT_BUILD ends here (the RequestBuilder is fully assembled). UPSTREAM_SEND spans the
+        // `req.send().await` round-trip to response headers.
+        drop(_cbuild);
+        let _send = crate::profile::start(crate::profile::Stage::UpstreamSend);
         // Wall-clock start of the upstream call, for the `metrics.latencyMs` a native bedrock
         // ConverseStream `metadata` frame carries on the buffered-synthesis path below.
         let upstream_started = std::time::Instant::now();
@@ -1149,6 +1167,8 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             }
             None => req.send().await,
         };
+        // UPSTREAM_SEND ends here (response headers received or transport error).
+        drop(_send);
         record_upstream_rtt(upstream_started.elapsed());
 
         match res {
@@ -1572,6 +1592,8 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                     }
                 }
 
+                // RECORD_SUCCESS: the post-2xx breaker/latency/budget bookkeeping (store lock ops).
+                let _rec = crate::profile::start(crate::profile::Stage::RecordSuccess);
                 // SUCCESS case: the upstream served a 2xx. Record the success for this lane (feeds
                 // the per-lane `ok` counter and the breaker's success window) and consume one unit
                 // of its lifetime request budget (the `max_requests` cost cap; `usable()` stops
@@ -1597,6 +1619,10 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 // is a no-op success there) and `refund_budget` is likewise a no-op there, so an
                 // unlimited lane neither over-counts nor under-counts.
                 let budget_spent = app.store.spend_budget(i);
+                // RECORD_SUCCESS ends; RESP_BUILD spans everything from here to the returned Response
+                // (usage/CT capture, SSE-vs-buffered branch, FirstByteBody wiring, response builder).
+                drop(_rec);
+                let _resp = crate::profile::start(crate::profile::Stage::RespBuild);
 
                 // stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();

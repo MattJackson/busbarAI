@@ -82,21 +82,52 @@ async fn capture_latency_metrics() {
         body: json!({"content": [{"type": "text", "text": "ok"}]}),
     };
 
+    // Scope the `UPSTREAM_RTT_US` task-local exactly as the `server_timing` middleware does in
+    // production, so `record_upstream_rtt` (fired inside the forward path when the upstream call
+    // returns) lands its value in a slot we can read per request. This lets us compute the REAL
+    // `busbar;dur` = total in-process handle time MINUS the upstream round-trip — the number the
+    // `Server-Timing: busbar;dur` header actually reports — instead of the total-including-the-
+    // loopback-HTTP figure the raw handle time conflates. `dur` is busbar's OWN added latency.
+    use std::sync::atomic::Ordering;
+    let run_once = |app: std::sync::Arc<crate::state::App>,
+                    cands: Vec<crate::state::WeightedLane>,
+                    body: bytes::Bytes| async move {
+        let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let t = std::time::Instant::now();
+        let _ = crate::proxy::UPSTREAM_RTT_US
+            .scope(slot.clone(), forward(app, cands, body, None, None))
+            .await;
+        let total_ns = t.elapsed().as_nanos() as u64;
+        let rtt_ns = match slot.load(Ordering::Relaxed) {
+            u64::MAX => 0, // no upstream hop recorded → attribute the full time to busbar
+            us => us.saturating_mul(1000),
+        };
+        // `busbar;dur` in NANOS: total in-process handle minus the upstream round-trip.
+        let dur_ns = total_ns.saturating_sub(rtt_ns);
+        (total_ns, dur_ns)
+    };
+
     for _ in 0..warmup {
         state.push(ok());
-        let _ = forward(app.clone(), cands(), body.clone(), None, None).await;
+        let _ = run_once(app.clone(), cands(), body.clone()).await;
     }
-    let mut ns: Vec<u64> = Vec::with_capacity(n);
+    let mut ns: Vec<u64> = Vec::with_capacity(n); // total in-process handle time (incl. upstream RTT)
+    let mut durs: Vec<u64> = Vec::with_capacity(n); // busbar;dur = total - upstream RTT (nanos)
     for _ in 0..n {
         state.push(ok());
-        let t = std::time::Instant::now();
-        let _ = forward(app.clone(), cands(), body.clone(), None, None).await;
-        ns.push(t.elapsed().as_nanos() as u64);
+        let (total_ns, dur_ns) = run_once(app.clone(), cands(), body.clone()).await;
+        ns.push(total_ns);
+        durs.push(dur_ns);
     }
     ns.sort_unstable();
+    durs.sort_unstable();
     let pct = |p: f64| -> f64 {
         let i = (((ns.len() - 1) as f64) * p).round() as usize;
         ns[i] as f64 / 1000.0
+    };
+    let pct_dur = |p: f64| -> f64 {
+        let i = (((durs.len() - 1) as f64) * p).round() as usize;
+        durs[i] as f64 / 1000.0
     };
     eprintln!(
         "BUSBAR_METRICS busbar.latency.inproc_handle_us n={} p50={:.2} p90={:.2} p99={:.2}",
@@ -105,6 +136,17 @@ async fn capture_latency_metrics() {
         pct(0.90),
         pct(0.99)
     );
+    // THE number that counts: busbar's own added latency (total minus upstream RTT), i.e. `busbar;dur`.
+    eprintln!(
+        "BUSBAR_METRICS busbar.dur_us n={} p50={:.2} p90={:.2} p99={:.2}",
+        n,
+        pct_dur(0.50),
+        pct_dur(0.90),
+        pct_dur(0.99)
+    );
+    // When `BUSBAR_PROFILE` is set, emit the per-stage breakdown accumulated across the run (the
+    // `BUSBAR_PROFILE stage=...` lines). No-op otherwise.
+    crate::profile::dump();
     server.shutdown().await;
 }
 

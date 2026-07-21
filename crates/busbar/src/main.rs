@@ -77,6 +77,7 @@ mod net_guard;
 mod observability;
 mod operation;
 mod plugin_trust;
+mod profile;
 mod proto;
 mod proxy;
 mod sigv4;

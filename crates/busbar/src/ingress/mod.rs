@@ -415,6 +415,8 @@ fn finish_inner(
     resp: Response,
     refund_on_non_2xx: bool,
 ) -> Response {
+    // FINISH stage: metrics record + request-log gate + non-2xx refund check (zero cost unprofiled).
+    let _fin = crate::profile::start(crate::profile::Stage::Finish);
     let outcome = match resp.status().as_u16() {
         200..=299 => "ok",
         503 => "exhausted",
