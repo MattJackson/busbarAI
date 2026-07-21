@@ -30,6 +30,9 @@ busbar-store-memory = { path = "../store-memory" }
 # amalgamation (~4.7 MB of C) is what makes the default binary lean; `store: memory` needs nothing,
 # `store: sqlite` loads the dropped-in plugin.
 busbar-plugin-loader = { path = "../plugin-loader" }
+# Plugin signature VERIFICATION + trust posture (pure crypto/policy, no unsafe): verifies a plugin's
+# signed manifest against the configured trust policy at boot-load and admin-install.
+busbar-plugin-sign = { path = "../plugin-sign" }
 # The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
 # so the matching feature (below) compiles each IN or OUT of the binary.
 busbar-auth-tokens = { path = "../auth-tokens", optional = true }

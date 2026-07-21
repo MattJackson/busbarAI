@@ -1482,6 +1482,49 @@ pub(crate) enum GovernanceStore {
     Postgres,
 }
 
+/// Plugin signing/trust policy (`governance.trust`). Governs how the engine treats a loadable
+/// plugin's signed manifest at boot-load and admin-install: a plugin whose `plugin.json` verifies
+/// against an allowlisted publisher is TRUSTED; anything else (unsigned, unknown publisher, tampered)
+/// is untrusted and handled per `on_untrusted`.
+#[derive(Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PluginTrustCfg {
+    /// What to do with an untrusted plugin: `halt` (only approved plugins load — the
+    /// `allow3rdparties=false` posture), `alert`, `log` (default — loads with a warning), or `allow`.
+    #[serde(default)]
+    pub(crate) on_untrusted: busbar_plugin_sign::OnUntrusted,
+    /// Allowlisted publishers whose signatures mark a plugin TRUSTED. Each maps a publisher name to a
+    /// hex ed25519 public key; a plugin manifest's `publisher` must resolve here.
+    #[serde(default)]
+    pub(crate) publishers: Vec<PluginPublisher>,
+}
+
+/// One allowlisted plugin publisher: a name and its hex ed25519 public key.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PluginPublisher {
+    pub(crate) name: String,
+    pub(crate) public_key: String,
+}
+
+impl PluginTrustCfg {
+    /// Resolve into the `busbar-plugin-sign` policy (parsing each publisher's public key). A malformed
+    /// key is a boot error, not a silent skip (a skipped trust anchor could wrongly reject a good
+    /// plugin, or under a loose posture load an unverified one).
+    pub(crate) fn to_policy(&self) -> Result<busbar_plugin_sign::TrustPolicy, String> {
+        let mut publishers = std::collections::BTreeMap::new();
+        for p in &self.publishers {
+            let key = busbar_plugin_sign::public_key_from_hex(&p.public_key)
+                .map_err(|e| format!("governance.trust.publishers['{}']: {e}", p.name))?;
+            publishers.insert(p.name.clone(), key);
+        }
+        Ok(busbar_plugin_sign::TrustPolicy {
+            publishers,
+            on_untrusted: self.on_untrusted,
+        })
+    }
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GovernanceCfg {
@@ -1513,6 +1556,11 @@ pub(crate) struct GovernanceCfg {
     /// plugin from this directory. Default `plugins` (relative to the working directory).
     #[serde(default = "default_plugins_dir")]
     pub(crate) plugins_dir: String,
+    /// Plugin signing/trust policy — how the engine treats a plugin's signed manifest at load. Default
+    /// posture `log` (unsigned plugins load with a warning); set `on_untrusted: halt` for "only
+    /// approved (signed by an allowlisted publisher) plugins load".
+    #[serde(default)]
+    pub(crate) trust: PluginTrustCfg,
     /// Amortization interval for the rate-limiter stale-entry sweep: every Nth `check_rate` pays the
     /// full retain (default 256).
     #[serde(default = "default_rate_sweep_interval")]
@@ -1536,6 +1584,7 @@ impl Default for GovernanceCfg {
             admin_token: None,
             sqlite_busy_timeout_ms: default_sqlite_busy_timeout_ms(),
             plugins_dir: default_plugins_dir(),
+            trust: PluginTrustCfg::default(),
             rate_sweep_interval: default_rate_sweep_interval(),
             usage_flush_interval_ms: default_usage_flush_interval_ms(),
         }

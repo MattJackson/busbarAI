@@ -76,6 +76,7 @@ mod metrics;
 mod net_guard;
 mod observability;
 mod operation;
+mod plugin_trust;
 mod proto;
 mod proxy;
 mod sigv4;
@@ -1039,6 +1040,29 @@ pub(crate) fn load_config_from_disk(
 /// misattributes or discards breaker/latency knowledge. Errors are returned (never process-exit):
 /// boot maps them to `die`, the apply endpoints to `invalid_request` — an invalid apply changes
 /// nothing.
+///
+/// Verify a store plugin's signed manifest against `governance.trust` before it is loaded. Returns
+/// `Err` (aborting boot) only when the trust posture is `halt` and the plugin isn't validly signed by
+/// an allowlisted publisher; `log`/`alert`/`allow` postures return `Ok` (the load proceeds, and
+/// `plugin_trust::verify` has already logged the decision).
+fn verify_plugin_trust(
+    g: &config::GovernanceCfg,
+    lib_path: &std::path::Path,
+    store: &str,
+) -> Result<(), String> {
+    let policy = g
+        .trust
+        .to_policy()
+        .map_err(|e| format!("governance.trust is invalid: {e}"))?;
+    plugin_trust::verify(lib_path, &policy).map_err(|reason| {
+        format!(
+            "governance store '{store}' plugin rejected by the trust policy: {reason}. Sign it with \
+             an allowlisted publisher, or relax governance.trust.on_untrusted."
+        )
+    })?;
+    Ok(())
+}
+
 pub(crate) fn build_app_from_config(
     cfg: config::RootCfg,
     governance_cfg: Option<config::GovernanceCfg>,
@@ -1472,6 +1496,7 @@ pub(crate) fn build_app_from_config(
                     "busy_timeout_ms": g.sqlite_busy_timeout_ms,
                 })
                 .to_string();
+                verify_plugin_trust(&g, &lib_path, "sqlite")?;
                 match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
                     Ok(s) => Arc::from(s),
                     Err(e) => {
@@ -1491,6 +1516,7 @@ pub(crate) fn build_app_from_config(
                     busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
                 let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
                 let cfg_json = serde_json::json!({ "url": g.db_path }).to_string();
+                verify_plugin_trust(&g, &lib_path, "postgres")?;
                 match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
                     Ok(s) => Arc::from(s),
                     Err(e) => {

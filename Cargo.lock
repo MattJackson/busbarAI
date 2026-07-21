@@ -207,6 +207,7 @@ dependencies = [
  "busbar-auth-tokens",
  "busbar-hooks-ranking",
  "busbar-plugin-loader",
+ "busbar-plugin-sign",
  "busbar-store-memory",
  "bytes",
  "crc32fast",

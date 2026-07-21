@@ -42,6 +42,15 @@ item under **Changed**.
   compile a backend straight in — no `cfg` sprawl.
 - **`governance.plugins_dir` (default `plugins`)** — the directory busbar loads store plugins from. A
   `store` other than `memory` is a library dropped here.
+- **Plugin signing & trust — `governance.trust`.** A plugin ships a signed sidecar manifest
+  (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library
+  `sha256`, and a signature over the whole manifest). At boot-load busbar verifies it against
+  `governance.trust`: a valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED;
+  anything else (unsigned / unknown publisher / tampered) is handled per `trust.on_untrusted` —
+  `halt` (only approved plugins load), `alert`, `log` (default — loads with a warning), or `allow`.
+  Because the signature covers the whole manifest and the manifest pins the library by hash, neither
+  can be altered or swapped independently. The default `log` posture keeps unsigned plugins working
+  out of the box; enterprises set `halt`.
 - **Postgres store plugin — `governance.store: postgres`** — the shared, multi-node durable store:
   one Postgres behind a fleet of busbar nodes, so virtual keys, budgets, and usage are shared across
   the cluster. Drop in the Postgres store plugin (`libbusbar_store_postgres_plugin.{so,dll,dylib}`) and

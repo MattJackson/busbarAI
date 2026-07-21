@@ -1414,6 +1414,7 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
             admin_token: Some(blank.to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             plugins_dir: "plugins".to_string(),
+            trust: Default::default(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
@@ -1437,6 +1438,7 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
         admin_token: Some("  real-secret  ".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         plugins_dir: "plugins".to_string(),
+        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1475,6 +1477,7 @@ fn test_validate_governance_ok_when_enabled_with_admin_token() {
         admin_token: Some("an-operator-secret".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         plugins_dir: "plugins".to_string(),
+        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1496,6 +1499,7 @@ fn test_validate_governance_rejects_zero_rate_sweep_interval() {
         admin_token: Some("an-operator-secret".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         plugins_dir: "plugins".to_string(),
+        trust: Default::default(),
         rate_sweep_interval: 0,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1518,6 +1522,7 @@ fn test_validate_governance_disabled_carries_no_requirement() {
         admin_token: None,
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         plugins_dir: "plugins".to_string(),
+        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1559,6 +1564,7 @@ fn test_validate_governance_rejects_passthrough_combination() {
             admin_token: Some("an-operator-secret".to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             plugins_dir: "plugins".to_string(),
+            trust: Default::default(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
@@ -1588,6 +1594,7 @@ fn test_validate_governance_allows_token_and_none_modes() {
             admin_token: Some("an-operator-secret".to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
             plugins_dir: "plugins".to_string(),
+            trust: Default::default(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
@@ -1610,6 +1617,7 @@ fn test_validate_governance_passthrough_ignored_when_disabled() {
         admin_token: None,
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
         plugins_dir: "plugins".to_string(),
+        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
