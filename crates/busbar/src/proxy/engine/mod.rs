@@ -1050,6 +1050,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         // reserved chars like `:` signs `%3A` but a raw send transmits `:`). Encode the path ONCE and
         // use it for both signing and the wire URL — the percent-encoded `%XX` sequences pass through
         // the `url` crate's path parser unchanged, so transmitted path == signed canonical path.
+        let _cb_auth = crate::profile::start(crate::profile::Stage::CbAuth);
         let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
         let signing_ctx = crate::proto::SigningContext {
             host: &app.lanes[i].signing_host,
@@ -1059,6 +1060,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             upstream_creds: app.upstream_creds(),
         };
         let auth = lane_auth_headers(&app.lanes[i], key, &signing_ctx);
+        drop(_cb_auth);
 
         // Egress request Content-Type: JSON bodies stay JSON (chat byte-identical). An OPAQUE body
         // relays the caller's own CT same-protocol (multipart boundary preserved verbatim) and uses
@@ -1074,6 +1076,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 .map(|h| h.egress_request_content_type())
                 .unwrap_or(APPLICATION_JSON)
         };
+        let _cb_reqwest = crate::profile::start(crate::profile::Stage::CbReqwest);
         let mut req = app
             .client
             .post(format!("{base}{wire_path}"))
@@ -1090,6 +1093,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             // response chooses its own. Not part of SigV4 SignedHeaders, so no signature impact.
             .header(ACCEPT, op.egress_accept(writer, wants_stream))
             .body(payload);
+        drop(_cb_reqwest);
         // reqwest's per-request `.timeout()` bounds the ENTIRE request lifecycle, INCLUDING reading
         // the response body. For a STREAMING response that body is a long-lived generation stream
         // (SSE / Bedrock eventstream) that a real vendor holds open for as long as the model emits
@@ -1623,6 +1627,10 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 // (usage/CT capture, SSE-vs-buffered branch, FirstByteBody wiring, response builder).
                 drop(_rec);
                 let _resp = crate::profile::start(crate::profile::Stage::RespBuild);
+                // RB_PRE sub-stage: header/CT/relay-id capture + SSE detection + translate resolution,
+                // up to `FirstByteBody::new`. (The cross-protocol buffered branch returns before the
+                // streaming builder, so on that path RB_PRE covers the pre-buffer work only.)
+                let _rb_pre = crate::profile::start(crate::profile::Stage::RbPre);
 
                 // stream the response body incrementally with first-byte boundary tracking
                 let ct = r.headers().get(CONTENT_TYPE).cloned();
@@ -2014,6 +2022,9 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                             .and_then(|p| p.writer().make_array_stream_framer())
                     })
                     .flatten();
+                // RB_PRE ends; RB_BODY spans the FirstByteBody wiring + response builder + return.
+                drop(_rb_pre);
+                let _rb_body = crate::profile::start(crate::profile::Stage::RbBody);
                 let upstream_stream = r.bytes_stream();
                 let guarded_body = FirstByteBody::new(
                     upstream_stream,

@@ -42,12 +42,24 @@ pub(crate) enum Stage {
     TranslateReq,
     /// Egress auth headers (bearer / SigV4) + URL/path build + `reqwest::RequestBuilder` construction.
     ClientBuild,
+    /// Sub-stage of ClientBuild: `sign_and_wire_path_parts` + `lane_auth_headers` (auth String allocs
+    /// + `HeaderValue::from_str`).
+    CbAuth,
+    /// Sub-stage of ClientBuild: `convert_headers` (HeaderMap rebuild) + the reqwest builder chain
+    /// (`post(format!(url))`, `.headers()`, `.header()×3`, `.body()`).
+    CbReqwest,
     /// `req.send().await` — the upstream round-trip to response headers (the mock upstream here).
     UpstreamSend,
     /// Post-2xx breaker/latency/budget bookkeeping (record_success/record_latency/spend_budget).
     RecordSuccess,
     /// Response body streaming setup: `FirstByteBody::new` + `into_body` + response builder + headers.
     RespBuild,
+    /// Sub-stage of RespBuild: header/CT/relay-id capture + SSE detection + translate resolution
+    /// (everything before `FirstByteBody::new`).
+    RbPre,
+    /// Sub-stage of RespBuild: `FirstByteBody::new` + `into_body` + the axum `Response::builder`
+    /// chain + `maybe_attach_*` header calls + `.body()`.
+    RbBody,
     /// The ingress `finish` boundary: metrics record + request-log gate + refund check.
     Finish,
 }
@@ -62,9 +74,13 @@ impl Stage {
             Stage::LanePick => "lane_pick",
             Stage::TranslateReq => "translate_req",
             Stage::ClientBuild => "client_build",
+            Stage::CbAuth => "  cb_auth",
+            Stage::CbReqwest => "  cb_reqwest",
             Stage::UpstreamSend => "upstream_send",
             Stage::RecordSuccess => "record_success",
             Stage::RespBuild => "resp_build",
+            Stage::RbPre => "  rb_pre",
+            Stage::RbBody => "  rb_body",
             Stage::Finish => "finish",
         }
     }
@@ -76,7 +92,7 @@ impl Stage {
 }
 
 /// Number of `Stage` variants (the bucket-array length). Must equal the number of enum arms above.
-const STAGE_COUNT: usize = 8;
+const STAGE_COUNT: usize = 12;
 
 /// One-shot env read: profiling is ON iff `BUSBAR_PROFILE` is present (any value) in the environment.
 /// Read exactly once and cached in an `AtomicBool` so the hot-path check is a single relaxed load.
@@ -169,9 +185,13 @@ pub(crate) fn dump() {
         Stage::LanePick,
         Stage::TranslateReq,
         Stage::ClientBuild,
+        Stage::CbAuth,
+        Stage::CbReqwest,
         Stage::UpstreamSend,
         Stage::RecordSuccess,
         Stage::RespBuild,
+        Stage::RbPre,
+        Stage::RbBody,
         Stage::Finish,
     ];
     for stage in stages {
