@@ -1510,6 +1510,15 @@ pub(crate) fn build_app_from_config(
             // keep-alive connection is detected proactively, not discovered as a spurious failure on
             // the next request (added latency + a needless failover hop).
             .tcp_keepalive(Duration::from_secs(60))
+            // Disable Nagle's algorithm on the EGRESS sockets. Busbar writes a whole request body in
+            // one shot and then immediately awaits the response, so Nagle has nothing to coalesce —
+            // but on a small body it interacts with the peer's delayed-ACK to hold the final segment
+            // for up to ~40 ms waiting for an ACK that only arrives once the peer's timer fires. That
+            // manifests as a bimodal tail-latency spike (a native SDK, which also sets TCP_NODELAY,
+            // never sees it) and is pure added latency on the request path. Inbound accepted sockets
+            // already set this (tls.rs serve loops); this brings the egress leg to parity. `axum`'s
+            // own serve() defaults nodelay on; reqwest does NOT, so it must be set explicitly.
+            .tcp_nodelay(true)
             .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
             // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
             // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.

@@ -1693,7 +1693,18 @@ pub(crate) const REQUEST_BODY_MAX_BYTES_FLOOR: usize = 64 * 1024;
 /// is a memory-exhaustion foot-gun. 1 GiB is far above any legitimate completion payload.
 pub(crate) const REQUEST_BODY_MAX_BYTES_CEIL: usize = 1024 * 1024 * 1024;
 /// Default max idle keep-alive connections the upstream client pools per host. Mirrors `main.rs`.
-const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 64;
+///
+/// Sized for the sustained-throughput regime, not the idle-footprint regime: under an LLM-latency
+/// workload the in-flight connection count is `RPS × upstream_latency` (Little's law) — e.g. 40k RPS
+/// against a 20 ms upstream needs ~800 sockets held open concurrently. A small idle cap (the former
+/// 64) forces reqwest to CLOSE every connection beyond the cap the instant a request completes, so
+/// the next request re-pays a full TCP + TLS handshake on the hot path — connection CHURN that both
+/// caps sustained RPS and inflates tail latency. 1024 lets the pool retain the working set for a
+/// 4-core box saturating a 20 ms upstream without reconnecting, at a bounded idle-socket cost
+/// (idle keep-alives are cheap; the OS reclaims them and `pool_idle_timeout`/`tcp_keepalive` bound
+/// their lifetime). Operators with many distinct upstream hosts can lower it; high-RPS single-host
+/// deployments are the ones this default protects.
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 1024;
 /// Default inbound concurrency limit. `0` = unlimited (today's behavior — NO layer added).
 pub(crate) const DEFAULT_MAX_INBOUND_CONCURRENT: usize = 0;
 /// Default hard-down sticky cooldown (seconds). Mirrors `store.rs`.
