@@ -51,7 +51,7 @@ tower = { version = "0.5", features = ["limit"] }
 # none referenced in src/ — so it is dropped to shrink the request-path binary's compile + attack
 # surface.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # CI-ONLY, feature-gated (`openapi-schema`). Derives JSON Schema from the admin-API response VIEW

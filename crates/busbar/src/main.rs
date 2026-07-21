@@ -1519,6 +1519,18 @@ pub(crate) fn build_app_from_config(
             // already set this (tls.rs serve loops); this brings the egress leg to parity. `axum`'s
             // own serve() defaults nodelay on; reqwest does NOT, so it must be set explicitly.
             .tcp_nodelay(true)
+            // HTTP/2 to the upstream, NEGOTIATED via ALPN (NOT prior-knowledge): over TLS the client
+            // offers `h2,http/1.1` and uses whichever the backend accepts, so an h2-capable provider
+            // (Anthropic, OpenAI, Vertex, Bedrock all speak h2) multiplexes many concurrent requests
+            // over ONE connection — collapsing the per-request connect+TLS handshake and the socket /
+            // epoll pressure that caps proxy RPS on a core-bound box — while an HTTP/1-only backend
+            // transparently stays on h1. We deliberately do NOT call `.http2_prior_knowledge()`: that
+            // would FORCE h2 and break every h1 upstream (and a plaintext h1 mock). H2 keep-alive
+            // pings keep a multiplexed connection healthy through idle gaps without the h1 trick of
+            // holding N sockets open. No behavior change against an h1-only upstream.
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
             .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
             // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
             // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
