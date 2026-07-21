@@ -1,57 +1,80 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Plugin artifact **signing + trust evaluation** for busbar.
+//! Plugin artifact **manifest, signing input, and trust evaluation** for busbar.
 //!
-//! An approved plugin ships a [`Manifest`] — `{name, version, kind, publisher, abi_version, sha256,
-//! signature}` — where `signature` is an **ed25519** signature over the artifact's SHA-256, made with
-//! the publisher's PRIVATE key (which never touches busbar). busbar holds only the PUBLIC keys of
-//! approved publishers (config `plugins.trust.publishers` + the embedded Busbar release key), and on
-//! both upload and boot-load it:
+//! Every plugin ships a signed **`plugin.json`** manifest (a *sidecar* file — so it can be read and
+//! verified WITHOUT loading the library; you never `dlopen` untrusted code just to read its name).
+//! The manifest describes the plugin for the operator's "are you sure you want to install X by Y
+//! from Z?" confirmation AND carries the security fields:
 //!
-//! 1. recomputes `sha256(bytes)` and checks it equals the manifest's (integrity),
-//! 2. verifies the signature over that hash with the named publisher's public key (authenticity).
+//! - **provenance/display** (all signed, so the confirmation card can't be spoofed): `name`,
+//!   `version`, `kind`, `author`, `homepage`, `source_url`, `description`, `license`;
+//! - **binding + compat**: `sha256` (of the library bytes — pins the manifest to that exact binary),
+//!   `interface_version` (which busbar plugin interface it targets);
+//! - **authenticity**: `publisher` + `signature` over the *canonical whole manifest*.
 //!
-//! "Approved" = the signature verifies against a key in your allowlist. Anything else — no manifest,
-//! unknown publisher, tampered bytes — is UNTRUSTED, and the [`OnUntrusted`] posture decides whether
-//! to `Halt` (the strict "only approved plugins" mode), `Alert`/`Log` (load but flag), or `Allow`
-//! (dev). A signature — not a bare checksum — is what makes this hold even against a MITM: the bytes
-//! AND a request-supplied hash can be rewritten in transit, but the signature cannot be forged
-//! without the private key.
+//! The signature covers the entire manifest (every field except `signature` itself) via
+//! [`canonical_manifest_bytes`], and the manifest pins the library by `sha256`, so **neither the
+//! manifest nor the library can be altered or swapped independently** — a bad manifest on a good
+//! library has no valid signature, and a good manifest on a swapped library fails the hash check.
 //!
-//! This crate is pure crypto + policy: no I/O, no engine state. The engine only ever calls
-//! [`evaluate`] (verification) before writing/loading. [`sign`] exists for the release pipeline /
-//! enterprise signing tooling — OSS ships verification, not a signing CLI. Key generation lives in
-//! that tooling (it owns the RNG this engine-facing crate deliberately avoids).
+//! "Approved" = the signature verifies against an allowlisted publisher. Anything else — unsigned,
+//! unknown publisher, tampered — is UNTRUSTED, and the [`OnUntrusted`] posture decides `Halt` (only
+//! approved plugins), `Alert`/`Log` (load but flag), or `Allow` (dev). A signature — not a bare
+//! checksum — is what holds against a MITM: bytes and a request-supplied hash can both be rewritten
+//! in transit, but the signature can't be forged.
+//!
+//! This crate is pure data + policy: no I/O, no engine state. The engine only ever calls [`evaluate`]
+//! (verification). [`sign`] is for the release pipeline / external signing tooling — OSS ships
+//! verification, not a signing CLI. (The signing PRIMITIVE is planned to move to Sigstore keyless,
+//! matching busbar's existing build-provenance; the manifest, canonical bytes, and posture here are
+//! primitive-independent and stay.)
 
-// `SigningKey`/`VerifyingKey` are re-exported so external signing tooling can name them via this
-// crate.
+// `SigningKey`/`VerifyingKey` are re-exported so external signing tooling can name them via this crate.
 use ed25519_dalek::{Signature, Signer, Verifier};
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-/// The signed manifest that travels beside a plugin artifact (as `<library>.manifest.json`, or the
-/// fields in the upload request). Every field except `signature` is covered by the signature via the
-/// artifact hash + this crate's canonical signing input, so none can be altered without detection.
+/// The signed `plugin.json` manifest that travels beside a plugin library. Every field except
+/// `signature` is covered by the signature (via [`canonical_manifest_bytes`]), so none can be altered
+/// without detection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Logical plugin name, e.g. `store-sqlite`.
+    /// Logical plugin name, e.g. `store-postgres`.
     pub name: String,
-    /// The plugin's own release version (semver, e.g. `1.2.3`) — surfaced by the admin API so an
-    /// upstream dashboard can compare against the latest and flag "update available". Signed, so it
-    /// can't be spoofed. (Distinct from `abi_version`, which is the wire-compat version.)
+    /// The plugin's own release version (semver, e.g. `1.4.0`) — surfaced by the admin API so an
+    /// upstream dashboard can compare against the latest and flag "update available".
     pub version: String,
     /// Plugin category: `store` | `auth` | `hook`.
     pub kind: String,
+    /// The developer/author, shown on the install-confirmation card (e.g. `Acme Corp`).
+    #[serde(default)]
+    pub author: String,
+    /// The plugin's homepage/website, shown on the confirmation card.
+    #[serde(default)]
+    pub homepage: String,
+    /// Where the artifact came from (release URL / repo), shown on the confirmation card and recorded
+    /// as provenance.
+    #[serde(default)]
+    pub source_url: String,
+    /// One-line description, shown on the confirmation card.
+    #[serde(default)]
+    pub description: String,
+    /// SPDX license id, shown on the confirmation card.
+    #[serde(default)]
+    pub license: String,
     /// The publisher identity whose key signed this — must resolve to an allowlisted public key.
     pub publisher: String,
-    /// The store/plugin ABI version the artifact targets (informational; the loader also checks it).
-    pub abi_version: u32,
-    /// Lowercase hex SHA-256 of the artifact bytes.
+    /// Which version of busbar's plugin INTERFACE (the low-level C calling contract) the library was
+    /// built for. The engine also checks this at load. (Called the "ABI version" inside the code.)
+    pub interface_version: u32,
+    /// Lowercase hex SHA-256 of the library bytes — binds this manifest to that exact binary.
     pub sha256: String,
-    /// Lowercase hex ed25519 signature (64 bytes) over the canonical signing input (see [`signing_input`]).
+    /// Lowercase hex ed25519 signature over [`canonical_manifest_bytes`] (every field but this one).
+    #[serde(default)]
     pub signature: String,
 }
 
@@ -102,52 +125,40 @@ impl std::fmt::Display for Rejected {
 }
 impl std::error::Error for Rejected {}
 
-/// Lowercase-hex SHA-256 of `bytes` — the artifact digest used everywhere (manifest, signing input).
+/// Lowercase-hex SHA-256 of `bytes` — the library digest stored in the manifest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
 }
 
-/// The canonical byte string that is actually signed/verified: binds the signature to the artifact
-/// hash AND the manifest's identity fields, so none of them can be swapped independently. Ordering
-/// and separators are fixed forever (v1).
-pub fn signing_input(
-    name: &str,
-    version: &str,
-    kind: &str,
-    publisher: &str,
-    abi_version: u32,
-    sha256: &str,
-) -> Vec<u8> {
-    format!("busbar-plugin-v1|{name}|{version}|{kind}|{publisher}|{abi_version}|{sha256}")
-        .into_bytes()
+/// The canonical byte string that is signed/verified: the whole manifest MINUS its `signature`, as
+/// deterministic sorted-key JSON. Using a `BTreeMap` makes the key order deterministic INDEPENDENT of
+/// serde_json's `preserve_order` feature (which cargo feature-unification could flip on elsewhere in
+/// the workspace) — so the signer and the verifier always agree, in any build. Any field added to the
+/// manifest is automatically covered.
+pub fn canonical_manifest_bytes(m: &Manifest) -> Vec<u8> {
+    let value = serde_json::to_value(m).expect("manifest is serializable");
+    let obj = value
+        .as_object()
+        .expect("manifest serializes to a JSON object");
+    let sorted: BTreeMap<&str, &serde_json::Value> = obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "signature")
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    serde_json::to_vec(&sorted).expect("canonical manifest serializes")
 }
 
-/// Sign an artifact with a publisher's key, producing a ready-to-ship [`Manifest`]. For the release
+/// Sign a manifest with a publisher's key: set `sha256` from the artifact, clear any existing
+/// `signature`, sign the canonical bytes, and return the completed [`Manifest`]. For the release
 /// pipeline / external signing tooling — never runs in the engine (which only verifies).
-#[allow(clippy::too_many_arguments)]
-pub fn sign(
-    key: &SigningKey,
-    name: &str,
-    version: &str,
-    kind: &str,
-    publisher: &str,
-    abi_version: u32,
-    artifact: &[u8],
-) -> Manifest {
-    let sha256 = sha256_hex(artifact);
-    let msg = signing_input(name, version, kind, publisher, abi_version, &sha256);
-    let sig = key.sign(&msg);
-    Manifest {
-        name: name.to_string(),
-        version: version.to_string(),
-        kind: kind.to_string(),
-        publisher: publisher.to_string(),
-        abi_version,
-        sha256,
-        signature: hex::encode(sig.to_bytes()),
-    }
+pub fn sign(key: &SigningKey, mut manifest: Manifest, artifact: &[u8]) -> Manifest {
+    manifest.sha256 = sha256_hex(artifact);
+    manifest.signature = String::new();
+    let sig = key.sign(&canonical_manifest_bytes(&manifest));
+    manifest.signature = hex::encode(sig.to_bytes());
+    manifest
 }
 
 /// Parse a hex-encoded 32-byte ed25519 public key (as configured in `plugins.trust.publishers`).
@@ -160,12 +171,12 @@ pub fn public_key_from_hex(s: &str) -> Result<VerifyingKey, String> {
     VerifyingKey::from_bytes(&arr).map_err(|e| format!("invalid ed25519 public key: {e}"))
 }
 
-/// Whether a well-formed manifest's signature verifies against `bytes` using `key`. Returns the
-/// low-level reason on failure (used by [`evaluate`]).
+/// Whether a manifest's signature verifies against `bytes` using `key`: the library hash must match
+/// the manifest's `sha256` (binding), and the signature must verify over the canonical manifest
+/// (authenticity + integrity).
 fn signature_ok(manifest: &Manifest, bytes: &[u8], key: &VerifyingKey) -> Result<(), String> {
-    let actual = sha256_hex(bytes);
-    if actual != manifest.sha256 {
-        return Err("artifact hash does not match the manifest".to_string());
+    if sha256_hex(bytes) != manifest.sha256 {
+        return Err("library hash does not match the manifest".to_string());
     }
     let sig_bytes =
         hex::decode(&manifest.signature).map_err(|e| format!("signature not hex: {e}"))?;
@@ -174,15 +185,7 @@ fn signature_ok(manifest: &Manifest, bytes: &[u8], key: &VerifyingKey) -> Result
         .try_into()
         .map_err(|_| "signature must be 64 bytes".to_string())?;
     let sig = Signature::from_bytes(&sig_arr);
-    let msg = signing_input(
-        &manifest.name,
-        &manifest.version,
-        &manifest.kind,
-        &manifest.publisher,
-        manifest.abi_version,
-        &manifest.sha256,
-    );
-    key.verify(&msg, &sig)
+    key.verify(&canonical_manifest_bytes(manifest), &sig)
         .map_err(|_| "signature does not verify".to_string())
 }
 
@@ -194,8 +197,6 @@ pub fn evaluate(
     manifest: Option<&Manifest>,
     policy: &TrustPolicy,
 ) -> Result<Verdict, Rejected> {
-    // Determine the untrusted reason (if any); a valid signature from an allowlisted publisher is the
-    // only path to Trusted.
     let untrusted_reason: Option<String> = match manifest {
         None => Some("artifact is unsigned (no manifest)".to_string()),
         Some(m) => match policy.publishers.get(&m.publisher) {
@@ -227,6 +228,24 @@ mod tests {
         SigningKey::from_bytes(&[seed; 32])
     }
 
+    /// A manifest with the rich metadata filled (sha256/signature set by `sign`).
+    fn manifest(name: &str, publisher: &str) -> Manifest {
+        Manifest {
+            name: name.to_string(),
+            version: "1.4.0".to_string(),
+            kind: "store".to_string(),
+            author: "Acme Corp".to_string(),
+            homepage: "https://acme.dev".to_string(),
+            source_url: "https://github.com/acme/plugin".to_string(),
+            description: "A store plugin".to_string(),
+            license: "Apache-2.0".to_string(),
+            publisher: publisher.to_string(),
+            interface_version: 1,
+            sha256: String::new(),
+            signature: String::new(),
+        }
+    }
+
     fn policy(pairs: &[(&str, &VerifyingKey)], on_untrusted: OnUntrusted) -> TrustPolicy {
         TrustPolicy {
             publishers: pairs.iter().map(|(n, k)| (n.to_string(), **k)).collect(),
@@ -239,19 +258,10 @@ mod tests {
         let key = test_key(1);
         let pubk = key.verifying_key();
         let artifact = b"\x7fELF fake plugin bytes";
-        let m = sign(
-            &key,
-            "store-sqlite",
-            "1.0.0",
-            "store",
-            "busbar",
-            1,
-            artifact,
-        );
-        // manifest is serde-round-trippable (it travels as JSON).
+        let m = sign(&key, manifest("store-sqlite", "busbar"), artifact);
+        // manifest round-trips through JSON (it travels as plugin.json).
         let j = serde_json::to_string(&m).unwrap();
-        let m2: Manifest = serde_json::from_str(&j).unwrap();
-        assert_eq!(m, m2);
+        assert_eq!(serde_json::from_str::<Manifest>(&j).unwrap(), m);
 
         let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
         assert_eq!(
@@ -263,14 +273,20 @@ mod tests {
     }
 
     #[test]
-    fn tampered_bytes_fail_even_under_halt() {
+    fn tampering_any_signed_field_fails() {
         let key = test_key(1);
         let pubk = key.verifying_key();
-        let m = sign(&key, "p", "1.0.0", "store", "busbar", 1, b"original");
+        let artifact = b"bytes";
+        let m = sign(&key, manifest("p", "busbar"), artifact);
         let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
-        // Flip the artifact: hash no longer matches the (signed) manifest -> rejected.
-        let err = evaluate(b"tampered!", Some(&m), &pol).unwrap_err();
-        assert!(err.0.contains("hash does not match"), "got {err:?}");
+
+        // Flip a DISPLAY field the confirm-card shows — signature must break (card can't be spoofed).
+        let mut forged = m.clone();
+        forged.author = "Busbar Official".into();
+        assert!(evaluate(artifact, Some(&forged), &pol).is_err());
+
+        // Swap the library under a good manifest -> hash mismatch.
+        assert!(evaluate(b"different!", Some(&m), &pol).is_err());
     }
 
     #[test]
@@ -278,8 +294,7 @@ mod tests {
         let key = test_key(1);
         let attacker = test_key(2);
         let artifact = b"bytes";
-        // Signed by `key`, but the allowlist maps 'busbar' to the ATTACKER's key -> signature fails.
-        let m = sign(&key, "p", "1.0.0", "store", "busbar", 1, artifact);
+        let m = sign(&key, manifest("p", "busbar"), artifact);
         let pol = policy(&[("busbar", &attacker.verifying_key())], OnUntrusted::Halt);
         assert!(evaluate(artifact, Some(&m), &pol).is_err());
     }
@@ -288,35 +303,47 @@ mod tests {
     fn unknown_publisher_is_untrusted() {
         let key = test_key(1);
         let artifact = b"bytes";
-        let m = sign(&key, "p", "1.0.0", "store", "acme", 1, artifact);
+        let m = sign(&key, manifest("p", "acme"), artifact);
         let pol = policy(&[("busbar", &key.verifying_key())], OnUntrusted::Halt);
         let err = evaluate(artifact, Some(&m), &pol).unwrap_err();
         assert!(err.0.contains("not in the allowlist"), "got {err:?}");
     }
 
     #[test]
-    fn posture_allow_and_log_permit_unsigned() {
-        let pol_allow = policy(&[], OnUntrusted::Allow);
-        match evaluate(b"x", None, &pol_allow).unwrap() {
-            Verdict::Allowed { action, .. } => assert_eq!(action, OnUntrusted::Allow),
-            v => panic!("expected Allowed, got {v:?}"),
-        }
-        let pol_log = policy(&[], OnUntrusted::Log);
+    fn posture_allow_and_log_permit_unsigned_but_halt_refuses() {
         assert!(matches!(
-            evaluate(b"x", None, &pol_log).unwrap(),
+            evaluate(b"x", None, &policy(&[], OnUntrusted::Allow)).unwrap(),
+            Verdict::Allowed {
+                action: OnUntrusted::Allow,
+                ..
+            }
+        ));
+        assert!(matches!(
+            evaluate(b"x", None, &policy(&[], OnUntrusted::Log)).unwrap(),
             Verdict::Allowed { .. }
         ));
-        // Halt refuses the same unsigned artifact.
-        let pol_halt = policy(&[], OnUntrusted::Halt);
-        assert!(evaluate(b"x", None, &pol_halt).is_err());
+        assert!(evaluate(b"x", None, &policy(&[], OnUntrusted::Halt)).is_err());
+    }
+
+    #[test]
+    fn canonical_bytes_are_stable_and_exclude_signature() {
+        let key = test_key(1);
+        let m = sign(&key, manifest("p", "busbar"), b"bytes");
+        let a = canonical_manifest_bytes(&m);
+        // Changing ONLY the signature does not change the canonical bytes (signature is excluded).
+        let mut m2 = m.clone();
+        m2.signature = "deadbeef".into();
+        assert_eq!(a, canonical_manifest_bytes(&m2));
+        // The canonical form is sorted-key JSON (author sorts before version).
+        let s = String::from_utf8(a).unwrap();
+        assert!(s.find("\"author\"").unwrap() < s.find("\"version\"").unwrap());
     }
 
     #[test]
     fn public_key_hex_roundtrip() {
         let key = test_key(1);
         let hex = hex::encode(key.verifying_key().to_bytes());
-        let back = public_key_from_hex(&hex).unwrap();
-        assert_eq!(back, key.verifying_key());
+        assert_eq!(public_key_from_hex(&hex).unwrap(), key.verifying_key());
         assert!(public_key_from_hex("zz").is_err());
     }
 }
