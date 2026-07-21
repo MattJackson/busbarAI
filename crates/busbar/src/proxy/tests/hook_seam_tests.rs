@@ -1435,7 +1435,7 @@ async fn send_user_falls_back_to_synthesized_group_key_identity() {
     }];
     // A synthesized principal key exactly as the auth layer builds one for a group/SSO caller:
     // id/name carry the principal, key_hash is a non-secret marker never inserted into by_hash.
-    let synth = crate::governance::VirtualKey {
+    let synth = std::sync::Arc::new(crate::governance::VirtualKey {
         id: "eng-oncall".to_string(),
         key_hash: "principal:eng-oncall".to_string(),
         name: "eng-oncall".to_string(),
@@ -1446,7 +1446,7 @@ async fn send_user_falls_back_to_synthesized_group_key_identity() {
         tpm_limit: None,
         enabled: true,
         created_at: 0,
-    };
+    });
     let rc = RequestCtx::new(60);
     let v = body();
     // caller_token is the RAW SSO bearer — NOT a virtual-key secret, so lookup would miss.
@@ -1503,7 +1503,7 @@ async fn forward_with_pool_keyed_threads_group_key_to_pool_policy() {
         .pool("p", &[(0, 1)])
         .pool_runtime("p", rt)
         .build();
-    let synth = crate::governance::VirtualKey {
+    let synth = std::sync::Arc::new(crate::governance::VirtualKey {
         id: "eng-oncall".to_string(),
         key_hash: "principal:eng-oncall".to_string(),
         name: "eng-oncall".to_string(),
@@ -1514,7 +1514,7 @@ async fn forward_with_pool_keyed_threads_group_key_to_pool_policy() {
         tpm_limit: None,
         enabled: true,
         created_at: 0,
-    };
+    });
     let body = Bytes::from(serde_json::to_vec(&body()).unwrap());
     let cands = vec![WeightedLane {
         reasoning: None,

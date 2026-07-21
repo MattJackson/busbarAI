@@ -141,12 +141,16 @@ impl Drop for ProbeGuard<'_> {
 /// the healthy subset, returning the chosen lane index and its acquired concurrency permit.
 /// `cands` is a `&[WeightedLane]` slice where each lane carries its configured weight.
 /// `request_ctx` provides accumulated exclusions to avoid retrying failed lanes.
-/// `affinity_key` enables sticky routing as a preference (not a hard constraint).
+/// `affinity_key_hash` enables sticky routing as a preference (not a hard constraint). It is the
+/// PRE-COMPUTED [`stable_hash`] of the session key (header value or the body-derived `system` string),
+/// hashed once at the ingress boundary from BORROWED bytes — so the sticky preference costs no
+/// per-request `String` allocation here (the hash is the only thing this function ever needed from the
+/// key). `None` = no sticky preference (pure SWRR).
 pub(crate) async fn pick_among(
     app: &Arc<App>,
     cands: &[WeightedLane],
     request_ctx: &mut RequestCtx,
-    affinity_key: Option<&str>,
+    affinity_key_hash: Option<u64>,
     pool_name: &str,
     // The routing policy's ranked preference for this request, resolved ONCE before the failover loop
     // (see the ROUTING-POLICY SEAM in `forward_with_pool`). `None` is the ZERO-COST default: pure
@@ -157,11 +161,11 @@ pub(crate) async fn pick_among(
     let t = now();
 
     // Session affinity preference - try sticky lane first if usable (in this pool's breaker view).
-    // Uses a stable hash (NOT DefaultHasher, whose seed is randomized per process) so a session
-    // pins to the same lane across restarts.
-    if let Some(k) = affinity_key {
+    // The hash was taken with `stable_hash` (NOT DefaultHasher, whose seed is randomized per process)
+    // at the ingress boundary, so a session pins to the same lane across restarts.
+    if let Some(h) = affinity_key_hash {
         if !cands.is_empty() {
-            let pos = (stable_hash(k) as usize) % cands.len();
+            let pos = (h as usize) % cands.len();
             let sticky = cands[pos].idx;
 
             // DRAIN (`weight: 0`): an operator weights a member to 0 to bleed it off before

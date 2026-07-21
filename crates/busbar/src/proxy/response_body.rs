@@ -5,8 +5,10 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct UsageSink {
     pub(crate) gov: Arc<crate::governance::GovState>,
-    pub(crate) key_id: String,
-    pub(crate) period: String,
+    /// The resolved virtual key, shared via `Arc` — `key_id` and `budget_period` are read THROUGH it
+    /// (`key.id` / `key.budget_period`) at charge time, so building the sink (once per request) and
+    /// cloning it (once per failover attempt) is a refcount bump, not two per-request `String` clones.
+    pub(crate) key: Arc<crate::governance::VirtualKey>,
     /// Wall-clock epoch (seconds) captured ONCE at header-arrival time for this request. Both the
     /// flat per-request fee (`ingress::budget_check` → `try_charge_request_within_budget`) and the token fee (`record_tokens`,
     /// fired at stream end / on the buffered path) are attributed to the window this epoch implies,
@@ -536,8 +538,8 @@ where
                             // than its headers arrived would split its two charges across two windows
                             // (#29).
                             sink.gov.record_tokens(
-                                &sink.key_id,
-                                &sink.period,
+                                &sink.key.id,
+                                &sink.key.budget_period,
                                 sink.charged_at,
                                 tokens,
                             );
@@ -548,7 +550,7 @@ where
                                 this.app.as_ref().and_then(|a| a.lanes.get(this.lane_idx))
                             {
                                 sink.gov.record_metering(
-                                    &sink.key_id,
+                                    &sink.key.id,
                                     &lane.model,
                                     &lane.provider,
                                     ir_usage.as_ref(),
@@ -600,13 +602,17 @@ impl<S, P> Drop for FirstByteBody<S, P> {
         let usage = self.translate.as_ref().and_then(|t| t.usage()).cloned();
         let tokens = usage.as_ref().map(|u| u.billable_tokens()).unwrap_or(0);
         if tokens > 0 {
-            sink.gov
-                .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
+            sink.gov.record_tokens(
+                &sink.key.id,
+                &sink.key.budget_period,
+                sink.charged_at,
+                tokens,
+            );
             // Meter the delivered-then-dropped partial too (same serving-lane attribution as the
             // natural-end site) — the tokens were really consumed against this model.
             if let Some(lane) = self.app.as_ref().and_then(|a| a.lanes.get(self.lane_idx)) {
                 sink.gov.record_metering(
-                    &sink.key_id,
+                    &sink.key.id,
                     &lane.model,
                     &lane.provider,
                     usage.as_ref(),

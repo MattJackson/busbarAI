@@ -52,7 +52,7 @@ pub(crate) async fn forward_with_pool_keyed(
     cands: Vec<WeightedLane>,
     body: Bytes,
     caller_token: Option<&str>,
-    resolved_gov_key: Option<&crate::governance::VirtualKey>,
+    resolved_gov_key: Option<&std::sync::Arc<crate::governance::VirtualKey>>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -108,7 +108,7 @@ pub(crate) async fn forward_with_pool_parsed(
     v: Option<Value>,
     req_content_type: &str,
     caller_token: Option<&str>,
-    resolved_gov_key: Option<&crate::governance::VirtualKey>,
+    resolved_gov_key: Option<&std::sync::Arc<crate::governance::VirtualKey>>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -193,7 +193,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     caller_token: Option<&str>,
     // The key the auth layer already resolved/synthesized for this caller (`GovCtx.key`) — used as
     // the routing-signal source when the token is not a virtual-key secret (group/SSO principals).
-    resolved_gov_key: Option<&crate::governance::VirtualKey>,
+    resolved_gov_key: Option<&std::sync::Arc<crate::governance::VirtualKey>>,
     pool_name: &str,
     affinity_key: Option<&str>,
     ingress_protocol: &str,
@@ -361,16 +361,17 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             })
             .unwrap_or(false);
 
-    // Derive affinity key early (before any mutations to v). When no affinity header was supplied,
-    // fall back to the operation's body-derived key: chat uses the top-level `system` string
-    // (byte-identical to the previous inline read); other ops default to no body affinity.
-    let affinity_key_str: Option<String> = if let Some(k) = affinity_key {
-        Some(k.to_string())
-    } else {
-        v.as_ref()
-            .and_then(|v| op.body_affinity_key(v))
-            .map(String::from)
-    };
+    // Derive the affinity HASH early (before any mutations to v), from BORROWED bytes — the sticky
+    // preference needs only `stable_hash(key)`, never the owned string, so hashing here avoids a
+    // per-request `String` allocation. Prefer the supplied header key; else fall back to the
+    // operation's body-derived key (chat: the top-level `system` string — byte-identical selection to
+    // the previous owned-String read; other ops: no body affinity). `None` = no sticky preference.
+    let affinity_key_hash: Option<u64> =
+        affinity_key.map(crate::proxy::stable_hash).or_else(|| {
+            v.as_ref()
+                .and_then(|v| op.body_affinity_key(v))
+                .map(crate::proxy::stable_hash)
+        });
 
     // Before-first-byte failover boundary:
     // Failover is allowed ONLY until the first upstream byte reaches the client.
@@ -851,7 +852,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             &app,
             &cands,
             &mut request_ctx,
-            affinity_key_str.as_deref(),
+            affinity_key_hash,
             pool_name,
             policy_order.as_deref(),
         )
@@ -1037,7 +1038,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         // the `url` crate's path parser unchanged, so transmitted path == signed canonical path.
         let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
         let signing_ctx = crate::proto::SigningContext {
-            host: host_from_base(base),
+            host: &app.lanes[i].signing_host,
             canonical_uri,
             body: &payload,
             timestamp_epoch: now(),

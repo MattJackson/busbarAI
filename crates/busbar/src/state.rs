@@ -16,6 +16,12 @@ pub(crate) struct Lane {
     pub(crate) model: String,
     pub(crate) provider: String,
     pub(crate) base_url: String,
+    /// The SigV4 signed-`host` header value, derived ONCE at boot from `base_url` (scheme + userinfo
+    /// stripped, authority only — see `proxy::host_from_base`). Precomputed so the request path borrows
+    /// it into `SigningContext` instead of re-running the parse + `String` allocation on every
+    /// forwarded request (it is a pure function of the immutable `base_url`). Only the Bedrock SigV4
+    /// writer reads it; other protocols ignore `SigningContext::host`.
+    pub(crate) signing_host: String,
     pub(crate) api_key: String,
     pub(crate) protocol: Arc<Protocol>,
     /// Outbound credential — how this lane presents Busbar's identity to the upstream. Resolved once

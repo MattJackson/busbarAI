@@ -13,7 +13,7 @@ pub(crate) fn sigv4_sign_headers(
         (Some(a), Some(s), tok) if !a.is_empty() && !s.is_empty() => (a, s, tok),
         _ => return vec![],
     };
-    let region = match derive_sigv4_region(&ctx.host) {
+    let region = match derive_sigv4_region(ctx.host) {
         Some(r) => r,
         None => {
             tracing::warn!(host = %ctx.host, "could not derive AWS region from Bedrock endpoint host; defaulting SigV4 scope to us-east-1 (set a bedrock-runtime[-fips].<region>.amazonaws.com host)");
@@ -38,7 +38,7 @@ pub(crate) fn sigv4_sign_headers(
             "content-type".to_string(),
             crate::proxy::APPLICATION_JSON.to_string(),
         ),
-        ("host".to_string(), ctx.host.clone()),
+        ("host".to_string(), ctx.host.to_string()),
         (
             crate::sigv4::X_AMZ_CONTENT_SHA256.to_string(),
             payload_hash.clone(),

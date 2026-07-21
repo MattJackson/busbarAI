@@ -199,7 +199,7 @@ fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
     crate::metrics::init();
     let (app, key) = governed_app_with_key();
     let gov = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
     let govstate = app.governance.as_ref().unwrap().clone();
     let at = 1_700_000_000u64;
@@ -269,7 +269,7 @@ fn test_pre_routing_failure_does_not_refund_prior_charge() {
     crate::metrics::init();
     let (app, key) = governed_app_with_key();
     let gov = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
     let govstate = app.governance.as_ref().unwrap().clone();
 
@@ -357,7 +357,7 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
     let mut app = minimal_app();
     Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
     let govctx = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
 
     let charged_at: u64 = 1_700_000_000; // a fixed past day
@@ -458,7 +458,7 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     let mut app = minimal_app();
     Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
     let govctx = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
 
     assert_eq!(
@@ -3009,7 +3009,7 @@ async fn test_governance_rejection_is_counted_via_finish() {
     crate::metrics::init();
     let (app, key) = governed_app_pool_restricted();
     let gov = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
 
     // Request a pool the key is NOT allowed on → 403, and the guard returns Err(response).
@@ -3059,7 +3059,7 @@ async fn test_governance_guard_passes_when_allowed() {
     crate::metrics::init();
     let (app, key) = governed_app_pool_restricted();
     let gov = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
     let passed = governance_guard(
         &app,
@@ -3085,7 +3085,7 @@ async fn finish_admitted_does_not_refund_an_uncharged_admit() {
     crate::metrics::init();
     let (app, key) = governed_app_pool_restricted();
     let gov = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
     let at = 1_700_000_000;
     // A PRIOR legitimate request charges the flat fee (price=30) into this window.
@@ -3136,7 +3136,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     // --- 403: pool not allowed ---
     let (app, key) = governed_app_pool_restricted();
     let gov = crate::governance::GovCtx {
-        key: Some(key.clone()),
+        key: Some(std::sync::Arc::new(key.clone())),
     };
     let resp =
         pool_authorized(&gov, "denied-pool", "openai").expect("disallowed pool ⇒ 403 response");
@@ -3149,7 +3149,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     // vendor returns 402 here. ---
     let (app2, key2) = governed_app_over_budget();
     let gov2 = crate::governance::GovCtx {
-        key: Some(key2.clone()),
+        key: Some(std::sync::Arc::new(key2.clone())),
     };
     let resp = budget_check(&app2, &gov2, "openai", crate::store::now())
         .await
@@ -3162,7 +3162,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     // ServiceQuotaExceededException (the native AWS shape), NOT 429.
     let (app2b, key2b) = governed_app_over_budget();
     let gov2b = crate::governance::GovCtx {
-        key: Some(key2b.clone()),
+        key: Some(std::sync::Arc::new(key2b.clone())),
     };
     let resp = budget_check(&app2b, &gov2b, "bedrock", crate::store::now())
         .await
@@ -3179,7 +3179,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     // --- 429: rate limited. A key with rpm_limit=0 is rate-limited on the first request. ---
     let (app3, key3) = governed_app_rate_limited();
     let gov3 = crate::governance::GovCtx {
-        key: Some(key3.clone()),
+        key: Some(std::sync::Arc::new(key3.clone())),
     };
     let resp =
         rate_check(&app3, &gov3, "openai", crate::store::now()).expect("rpm=0 key ⇒ 429 response");

@@ -329,7 +329,7 @@ fn test_virtualkey_debug_redacts_key_hash() {
 
     // Redaction holds TRANSITIVELY through GovCtx (its derived Debug delegates to VirtualKey's).
     let ctx = GovCtx {
-        key: Some(k.clone()),
+        key: Some(std::sync::Arc::new(k.clone())),
     };
     let ctx_dbg = format!("{ctx:?}");
     assert!(
@@ -506,7 +506,7 @@ fn test_refresh_updates_both_indices_atomically() {
 
     // Present in BOTH indices before deletion.
     assert_eq!(
-        gov.lookup(&bearer).map(|k| k.id),
+        gov.lookup(&bearer).map(|k| k.id.clone()),
         Some(key.id.clone()),
         "bearer must resolve via by_hash before delete"
     );

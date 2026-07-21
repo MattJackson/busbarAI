@@ -99,7 +99,11 @@ struct BudgetCell {
 /// SAME store snapshot, so a disabled/deleted/re-minted key is reflected in both — now also visible
 /// to readers atomically (the one lock guarantees no reader sees a half-applied swap).
 struct GovCaches {
-    by_hash: HashMap<String, VirtualKey>,
+    /// Hashed-secret → key. Values are `Arc<VirtualKey>` so the per-request bearer `lookup` (on the
+    /// chat hot path) resolves to a REFCOUNT BUMP rather than a deep clone of a multi-`String`
+    /// `VirtualKey` under the read lock — the resolved key is immutable for the life of the request
+    /// and threaded read-only through governance/routing, so sharing it via `Arc` is exact.
+    by_hash: HashMap<String, Arc<VirtualKey>>,
     by_access_key_id: HashMap<String, AwsKeyEntry>,
 }
 
@@ -189,7 +193,7 @@ mod state;
 pub(crate) fn synthesize_principal_key(
     principal: &crate::auth::Principal,
     group_map: &std::collections::HashMap<String, crate::config::GroupMapEntry>,
-) -> Option<VirtualKey> {
+) -> Option<Arc<VirtualKey>> {
     let granting: Vec<&crate::config::GroupMapEntry> = principal
         .groups
         .iter()
@@ -231,7 +235,7 @@ pub(crate) fn synthesize_principal_key(
     let rpm = cap_union(|e| e.rpm_limit.map(i64::from)).map(|v| v as u32);
     let tpm = cap_union(|e| e.tpm_limit.map(i64::from)).map(|v| v as u32);
     let budget = cap_union(|e| e.max_budget_cents);
-    Some(VirtualKey {
+    Some(Arc::new(VirtualKey {
         id: principal.id.clone(),
         // NOT a credential hash — a marker. The synthetic key never authenticates anything (the
         // auth module already did); it exists purely to carry grants through enforcement.
@@ -247,14 +251,17 @@ pub(crate) fn synthesize_principal_key(
         tpm_limit: tpm,
         enabled: true,
         created_at: 0,
-    })
+    }))
 }
 
 /// Resolved governance context attached to each request by the auth middleware. `key` is `None`
 /// when governance is disabled (so downstream enforcement is a no-op).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GovCtx {
-    pub(crate) key: Option<VirtualKey>,
+    /// The resolved virtual key (or synthesized principal key), shared via `Arc`: attaching it to the
+    /// request and threading it through governance/routing is then a refcount bump, never a clone of
+    /// the key's `String` fields. `None` when governance is disabled (enforcement is a no-op).
+    pub(crate) key: Option<Arc<VirtualKey>>,
 }
 
 /// Generate a virtual-key secret from 32 bytes of the OS CSPRNG (portable across Unix/Windows via

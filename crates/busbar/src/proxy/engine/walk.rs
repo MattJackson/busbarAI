@@ -275,7 +275,7 @@ pub(crate) async fn forward_once(
     // degraded path no longer re-splits and allocates a second String for the canonical URI.
     let (wire_path, canonical_uri) = sign_and_wire_path_parts(&url_path);
     let signing_ctx = crate::proto::SigningContext {
-        host: host_from_base(base),
+        host: &app.lanes[i].signing_host,
         canonical_uri,
         body: &payload,
         timestamp_epoch: now(),

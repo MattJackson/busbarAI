@@ -70,7 +70,15 @@ async fn sticky_affinity_never_selects_zero_weight_drained_member() {
         attempt_timeout_ms: None,
     }];
     let mut rc = RequestCtx::new(60);
-    let picked = pick_among(&app, &drained_only, &mut rc, Some("session-abc"), "p", None).await;
+    let picked = pick_among(
+        &app,
+        &drained_only,
+        &mut rc,
+        Some(crate::proxy::stable_hash("session-abc")),
+        "p",
+        None,
+    )
+    .await;
     assert!(
         picked.is_none(),
         "a drained (weight 0) member must never be stickily selected; got {:?}",
@@ -96,9 +104,16 @@ async fn sticky_affinity_never_selects_zero_weight_drained_member() {
     ];
     for key in ["s1", "s2", "session-xyz", "abc", "00000", "user-42"] {
         let mut rc = RequestCtx::new(60);
-        let (idx, _permit) = pick_among(&app, &drained_and_healthy, &mut rc, Some(key), "p", None)
-            .await
-            .expect("the healthy lane is selectable");
+        let (idx, _permit) = pick_among(
+            &app,
+            &drained_and_healthy,
+            &mut rc,
+            Some(crate::proxy::stable_hash(key)),
+            "p",
+            None,
+        )
+        .await
+        .expect("the healthy lane is selectable");
         assert_eq!(
             idx, 1,
             "key {key:?} must route to the healthy lane, never the drained (weight 0) one"

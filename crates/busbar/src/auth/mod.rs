@@ -1064,8 +1064,9 @@ pub(crate) async fn auth_middleware(
             let mut req = Request::from_parts(parts, Body::from(body_bytes.clone()));
             return match verify_bedrock_sigv4(gov, &req, &body_bytes) {
                 Ok(key) => {
-                    req.extensions_mut()
-                        .insert(crate::governance::GovCtx { key: Some(key) });
+                    req.extensions_mut().insert(crate::governance::GovCtx {
+                        key: Some(std::sync::Arc::new(key)),
+                    });
                     Ok(next.run(req).await)
                 }
                 // EVERY failure (missing/malformed header, unknown AccessKeyId, expired date,

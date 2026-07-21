@@ -239,8 +239,7 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
 
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 
@@ -303,8 +302,7 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
         .expect("create key");
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at: 1_700_000_000,
     });
 

@@ -541,7 +541,7 @@ pub(crate) async fn decide_policy_order(
     ingress_protocol: &str,
     wants_stream: bool,
     caller_token: Option<&str>,
-    resolved_gov_key: Option<&crate::governance::VirtualKey>,
+    resolved_gov_key: Option<&std::sync::Arc<crate::governance::VirtualKey>>,
 ) -> PolicyOutcome {
     use crate::hooks::{
         Candidate, ResolvedPolicy, RoutingContext, RoutingDecision, RoutingRequest,

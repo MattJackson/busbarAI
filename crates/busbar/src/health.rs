@@ -177,7 +177,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
     // and reuse it for both the signed canonical URI and the wire URL so signed == sent.
     let wire_path = crate::proxy::sign_and_wire_path(&url_path);
     let signing_ctx = crate::proto::SigningContext {
-        host: crate::proxy::host_from_base(&lane.base_url),
+        host: &lane.signing_host,
         canonical_uri: wire_path
             .split('?')
             .next()

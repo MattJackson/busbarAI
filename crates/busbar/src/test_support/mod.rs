@@ -603,6 +603,7 @@ impl LaneSpec {
             credential: crate::egress_auth::resolve(self.protocol.name(), auth),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            signing_host: crate::proxy::host_from_base(&self.base_url),
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
             protocol: self.protocol.clone(),

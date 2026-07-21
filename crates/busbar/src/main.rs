@@ -1383,10 +1383,14 @@ pub(crate) fn build_app_from_config(
             }
             _ => egress_auth::resolve(&provider_cfg.protocol, provider_cfg.auth),
         };
+        let base_url = provider_cfg.base_url.trim_end_matches('/').to_string();
         lanes.push(Lane {
             model: ld.model.clone(),
             provider: ld.provider.clone(),
-            base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
+            // Precompute the SigV4 signed-host once at boot (pure function of base_url) so the forward
+            // path borrows it into SigningContext instead of re-parsing/allocating it per request.
+            signing_host: proxy::host_from_base(&base_url),
+            base_url,
             api_key,
             credential,
             protocol,

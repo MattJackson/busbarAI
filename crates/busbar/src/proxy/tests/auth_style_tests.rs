@@ -17,6 +17,7 @@ fn lane_with_auth(auth: Option<&str>) -> Lane {
         default_max_tokens: None,
         model: "gpt-4o".to_string(),
         provider: "azure".to_string(),
+        signing_host: "res.openai.azure.com".to_string(),
         base_url: "https://res.openai.azure.com".to_string(),
         api_key: "SECRETKEY".to_string(),
         protocol: Arc::new(Protocol::openai()),
@@ -35,7 +36,7 @@ fn lane_with_auth(auth: Option<&str>) -> Lane {
 
 fn ctx<'a>(body: &'a [u8]) -> SigningContext<'a> {
     SigningContext {
-        host: "res.openai.azure.com".to_string(),
+        host: "res.openai.azure.com",
         canonical_uri: "/openai/deployments/gpt-4o/chat/completions".to_string(),
         body,
         timestamp_epoch: 0,

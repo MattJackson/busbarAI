@@ -256,8 +256,8 @@ mod tests {
     use crate::test_support::{LaneSpec, TestApp};
 
     /// A virtual key restricted to `allowed_pools` (empty = all pools).
-    fn vkey(allowed_pools: &[&str]) -> VirtualKey {
-        VirtualKey {
+    fn vkey(allowed_pools: &[&str]) -> std::sync::Arc<VirtualKey> {
+        std::sync::Arc::new(VirtualKey {
             id: "k-test".to_string(),
             key_hash: "deadbeef".to_string(),
             name: "test".to_string(),
@@ -268,7 +268,7 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 1_700_000_000,
-        }
+        })
     }
 
     /// Two pools, three lanes: `pool-a` -> lanes {0,1}, `pool-b` -> lane {2}. Lane 2's model is

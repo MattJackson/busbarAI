@@ -297,8 +297,10 @@ pub(crate) trait ProtocolReader: Send + Sync {
 /// Per-request signing context. Most protocols' `auth_headers` ignore this; protocols that
 /// sign the whole request (AWS SigV4 for Bedrock) need the method/host/path/body/time.
 pub(crate) struct SigningContext<'a> {
-    /// Upstream host (no scheme), e.g. `bedrock-runtime.us-east-1.amazonaws.com`.
-    pub(crate) host: String,
+    /// Upstream host (no scheme), e.g. `bedrock-runtime.us-east-1.amazonaws.com`. Borrowed from the
+    /// lane's precomputed `signing_host` on the forward path (no per-request allocation); only the
+    /// Bedrock SigV4 writer reads it.
+    pub(crate) host: &'a str,
     /// URI-encoded request path (no query), e.g. `/model/anthropic.claude%3A0/converse`.
     pub(crate) canonical_uri: String,
     /// The exact request body bytes that will be sent.

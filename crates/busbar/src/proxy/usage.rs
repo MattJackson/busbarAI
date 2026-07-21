@@ -32,7 +32,7 @@ pub(crate) fn record_resp_usage(
         // when nothing token-bills.
         if let Some((model, provider)) = lane {
             sink.gov
-                .record_metering(&sink.key_id, model, provider, None, sink.charged_at);
+                .record_metering(&sink.key.id, model, provider, None, sink.charged_at);
         }
     }
 }
@@ -52,14 +52,18 @@ pub(crate) fn record_ir_usage(
         if tokens > 0 {
             // Same window as the flat per-request fee (`sink.charged_at`, header-arrival epoch), so
             // the buffered-path token fee and the per-request fee never split across windows (#29).
-            sink.gov
-                .record_tokens(&sink.key_id, &sink.period, sink.charged_at, tokens);
+            sink.gov.record_tokens(
+                &sink.key.id,
+                &sink.key.budget_period,
+                sink.charged_at,
+                tokens,
+            );
         }
         // Metering (raw per-model consumption series) records the SPLIT — even a zero-token
         // delivered response counts its request. Same pinned epoch as the budget charges (#29).
         if let Some((model, provider)) = lane {
             sink.gov
-                .record_metering(&sink.key_id, model, provider, Some(usage), sink.charged_at);
+                .record_metering(&sink.key.id, model, provider, Some(usage), sink.charged_at);
         }
     }
 }

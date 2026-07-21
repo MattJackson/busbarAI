@@ -1019,11 +1019,13 @@ impl GovState {
         flushed
     }
 
-    pub(crate) fn load(store: &dyn Store) -> StoreResult<HashMap<String, VirtualKey>> {
+    pub(crate) fn load(store: &dyn Store) -> StoreResult<HashMap<String, Arc<VirtualKey>>> {
+        // Wrap each key in `Arc` at load time so the per-request `lookup` on the hot path is a
+        // refcount bump, not a deep clone; the values are immutable until the next `refresh` swap.
         Ok(store
             .list_keys()?
             .into_iter()
-            .map(|k| (k.key_hash.clone(), k))
+            .map(|k| (k.key_hash.clone(), Arc::new(k)))
             .collect())
     }
 
@@ -1034,11 +1036,13 @@ impl GovState {
     /// a `GovCtx` for. `access_key_id` is the PRIMARY KEY of `aws_credentials`, so entries are unique.
     pub(crate) fn load_by_access_key_id(
         store: &dyn Store,
-        by_hash: &HashMap<String, VirtualKey>,
+        by_hash: &HashMap<String, Arc<VirtualKey>>,
     ) -> StoreResult<HashMap<String, AwsKeyEntry>> {
         // Index the live keys by id for the join (by_hash is keyed by key_hash, not id).
-        let by_id: HashMap<&str, &VirtualKey> =
-            by_hash.values().map(|k| (k.id.as_str(), k)).collect();
+        let by_id: HashMap<&str, &VirtualKey> = by_hash
+            .values()
+            .map(|k| (k.id.as_str(), k.as_ref()))
+            .collect();
         let mut map = HashMap::new();
         for cred in store.list_aws_credentials()? {
             if let Some(key) = by_id.get(cred.key_id.as_str()) {
@@ -1055,7 +1059,9 @@ impl GovState {
     }
 
     /// Resolve a presented secret to its virtual key (cache lookup; secret hashed, never compared raw).
-    pub(crate) fn lookup(&self, secret: &str) -> Option<VirtualKey> {
+    /// Returns a SHARED `Arc<VirtualKey>` — the clone is a refcount bump, not a deep copy of the key's
+    /// `String` fields (the per-request bearer resolution on the chat hot path).
+    pub(crate) fn lookup(&self, secret: &str) -> Option<Arc<VirtualKey>> {
         let hash = crate::sigv4::sha256_hex(secret.as_bytes());
         self.caches_read().by_hash.get(&hash).cloned()
     }

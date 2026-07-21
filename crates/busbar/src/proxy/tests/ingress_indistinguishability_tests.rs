@@ -447,8 +447,7 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
     let charged_at: u64 = 1_700_000_000;
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 
@@ -545,8 +544,7 @@ async fn test_same_protocol_nonstream_multichunk_counts_usage() {
     let charged_at: u64 = 1_700_000_000;
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 
@@ -809,8 +807,7 @@ async fn test_mid_stream_transport_error_does_not_bill_partial_usage() {
     let charged_at: u64 = 1_700_000_000;
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 
@@ -2606,8 +2603,7 @@ async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
         .expect("create key");
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 
@@ -2727,8 +2723,7 @@ async fn test_cancel_drop_bills_partial_tokens() {
         .expect("create key");
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 
@@ -2828,8 +2823,7 @@ async fn test_cancel_drop_skips_billing_on_aborted_translate() {
         .expect("create key");
     let sink = Some(UsageSink {
         gov: gov.clone(),
-        key_id: key.id.clone(),
-        period: key.budget_period.clone(),
+        key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
 

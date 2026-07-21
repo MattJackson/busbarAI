@@ -62,7 +62,7 @@ fn auth_headers_api_key_trims_leading_whitespace() {
     // `sk-ant-api…` key through the ApiKey arm — assert both emit the CLEAN header.
     let raw = "   sk-ant-api03-secret-key";
     let ctx = crate::proto::SigningContext {
-        host: "api.anthropic.com".to_string(),
+        host: "api.anthropic.com",
         canonical_uri: PATH_UPSTREAM.to_string(),
         body: b"{}",
         timestamp_epoch: 0,
@@ -109,7 +109,7 @@ fn auth_headers_oauth_and_passthrough_preserve_leading_whitespace() {
     // Ambiguous passthrough Bearer (wire path) likewise round-trips verbatim.
     let amb = "  opaque-caller-token";
     let ctx = crate::proto::SigningContext {
-        host: "api.anthropic.com".to_string(),
+        host: "api.anthropic.com",
         canonical_uri: PATH_UPSTREAM.to_string(),
         body: b"{}",
         timestamp_epoch: 0,
@@ -154,7 +154,7 @@ fn auth_headers_unrecognized_credential_emits_both_headers() {
 fn sign_request_resolves_ambiguous_credential_to_single_header_by_mode() {
     let body = b"{}";
     let ctx = |creds| crate::proto::SigningContext {
-        host: "api.anthropic.com".to_string(),
+        host: "api.anthropic.com",
         canonical_uri: PATH_UPSTREAM.to_string(),
         body,
         timestamp_epoch: 0,
