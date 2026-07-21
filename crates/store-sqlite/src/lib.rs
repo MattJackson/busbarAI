@@ -6,7 +6,8 @@
 //! depending only on the `busbar-api` contract (plus rusqlite), never on the engine.
 
 use busbar_api::{
-    AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage, VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
+    VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
@@ -69,6 +70,21 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     tokens_cache_creation INTEGER NOT NULL DEFAULT 0,
     requests              INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (key_id, bucket, model, provider)
+);
+-- The admin AUDIT log's durable home (design: the audit log persists through the configured store).
+-- Append-only; `seq` is the engine's monotonic sequence (unique within a process lineage, continued
+-- across restart) and the primary key. The engine computes the hash chain — the store persists each
+-- record verbatim (INSERT OR REPLACE on `seq` so a replay of the same seq is idempotent) and returns
+-- them oldest-first for the boot restore. No secret: action/resource/outcome/principal metadata only.
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq       INTEGER PRIMARY KEY,
+    ts        INTEGER NOT NULL,
+    action    TEXT NOT NULL,
+    resource  TEXT NOT NULL,
+    outcome   TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    hash      TEXT NOT NULL
 );
 ";
 
@@ -560,6 +576,56 @@ impl Store for SqliteStore {
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
         Self::get_usage_inner(&self.conn, key_id, window_start)
     }
+
+    fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+        // INSERT OR REPLACE on the `seq` PK: append-only in practice, but idempotent if the engine
+        // ever re-writes a record for the same seq (e.g. a snapshot replay), never a UNIQUE error.
+        self.lock_conn()
+            .execute(
+                "INSERT OR REPLACE INTO audit_log
+                    (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    entry.seq as i64,
+                    entry.ts as i64,
+                    entry.action,
+                    entry.resource,
+                    entry.outcome,
+                    entry.principal,
+                    entry.prev_hash,
+                    entry.hash,
+                ],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash
+                 FROM audit_log ORDER BY seq",
+            )
+            .store()?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AuditRecord {
+                    seq: r.get::<_, i64>(0)?.max(0) as u64,
+                    ts: r.get::<_, i64>(1)?.max(0) as u64,
+                    action: r.get(2)?,
+                    resource: r.get(3)?,
+                    outcome: r.get(4)?,
+                    principal: r.get(5)?,
+                    prev_hash: r.get(6)?,
+                    hash: r.get(7)?,
+                })
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        Ok(rows)
+    }
 }
 
 // Direct-store SQL primitives retained ONLY for the governance unit tests that pin their
@@ -831,6 +897,45 @@ mod tests {
             (2, 15, 75),
             "writes must keep accruing on a recovered (poisoned) conn lock"
         );
+    }
+
+    /// Durable audit (#17): `append_audit` persists records and `list_audit` returns them oldest-first
+    /// by `seq`, verbatim (the store never interprets the hash chain). A re-append of the same seq
+    /// upserts (idempotent), never a UNIQUE error — so a snapshot replay is safe.
+    #[test]
+    fn test_audit_append_and_list_roundtrip() {
+        use busbar_api::AuditRecord;
+        let s = SqliteStore::open_in_memory().unwrap();
+        let mk = |seq: u64, prev: &str, hash: &str| AuditRecord {
+            seq,
+            ts: 1000 + seq,
+            action: "hook.register".into(),
+            resource: format!("hook:{seq}"),
+            outcome: "applied".into(),
+            principal: "admin".into(),
+            prev_hash: prev.into(),
+            hash: hash.into(),
+        };
+        // Insert out of order to prove the ORDER BY seq.
+        s.append_audit(&mk(2, "h1", "h2")).unwrap();
+        s.append_audit(&mk(1, "", "h1")).unwrap();
+        s.append_audit(&mk(3, "h2", "h3")).unwrap();
+        let got = s.list_audit().unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            (got[0].seq, got[1].seq, got[2].seq),
+            (1, 2, 3),
+            "oldest-first by seq"
+        );
+        assert_eq!(got[0].prev_hash, "");
+        assert_eq!(got[1].prev_hash, "h1");
+        assert_eq!(got[2].resource, "hook:3");
+
+        // Idempotent upsert on seq (a replay overwrites, never a UNIQUE violation).
+        s.append_audit(&mk(2, "h1", "h2b")).unwrap();
+        let got2 = s.list_audit().unwrap();
+        assert_eq!(got2.len(), 3, "re-appending seq 2 upserts, not duplicates");
+        assert_eq!(got2[1].hash, "h2b", "the upsert overwrote the record");
     }
 
     #[test]

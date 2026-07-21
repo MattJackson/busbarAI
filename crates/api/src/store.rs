@@ -168,6 +168,31 @@ pub struct MeteringRow {
     pub requests: u64,
 }
 
+/// One admin AUDIT record, as it crosses the store seam for DURABLE persistence. Mirrors the engine's
+/// in-memory `admin::audit::AuditEntry` field-for-field (the hash chain is computed engine-side; a
+/// store persists these verbatim and returns them verbatim, preserving the chain across a restart).
+/// A store is a dumb durable sink here — it never interprets or recomputes the digest. Plain data, no
+/// secret (audit records carry action/resource/outcome/principal metadata, never a credential).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuditRecord {
+    /// Monotonic sequence number (1-based within a process lineage; continues across restart).
+    pub seq: u64,
+    /// Unix seconds the mutation was attempted.
+    pub ts: u64,
+    /// `noun.verb` action (e.g. `hook.register`, `plugin.install`).
+    pub action: String,
+    /// The resource acted on (e.g. `hook:compress`). Never a secret.
+    pub resource: String,
+    /// Stable outcome token (`applied` | `rejected`).
+    pub outcome: String,
+    /// The authenticated principal id that attempted the mutation.
+    pub principal: String,
+    /// The preceding entry's `hash` (empty for the first entry of a lineage).
+    pub prev_hash: String,
+    /// The tamper-evidence digest over this entry's fields (computed + verified engine-side).
+    pub hash: String,
+}
+
 /// The result type every `Store` method returns.
 pub type StoreResult<T> = Result<T, StoreError>;
 
@@ -262,6 +287,28 @@ pub trait Store: Send + Sync + 'static {
     /// DEFAULTED to an empty list: a store with no AWS-credential support simply has none to index, so
     /// SigV4 ingress is unavailable — never an auth bypass.
     fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
+        Ok(Vec::new())
+    }
+
+    /// Append one admin AUDIT record for DURABLE persistence (design: the audit log's durable home is
+    /// the configured store — memory = ephemeral, sqlite/postgres/redis = durable). The engine keeps
+    /// the hot in-memory hash-chained ring for reads and write-THROUGHs each appended entry here, so a
+    /// hard crash loses ~0 entries and the ring's size bound stops pruning HISTORY (the store keeps it
+    /// all). Append-only, ordered by `seq`; a store never rewrites or recomputes the digest.
+    ///
+    /// DEFAULTED to `Ok(())` (a no-op) so this is BACKWARD-COMPATIBLE: every existing store plugin —
+    /// including already-signed dynamic-library artifacts that predate this method — keeps working
+    /// unchanged, simply providing no durable audit (the RAM default's behavior). A backend that wants
+    /// durable audit overrides this + [`Store::list_audit`].
+    fn append_audit(&self, _entry: &AuditRecord) -> StoreResult<()> {
+        Ok(())
+    }
+
+    /// Every persisted audit record, oldest-first (by `seq`) — the boot RESTORE source when a durable
+    /// store is configured (the store becomes the source of truth; the hash chain is verified after
+    /// load). DEFAULTED to an empty list so a store with no durable-audit support restores nothing
+    /// (the RAM default) rather than forcing every backend to implement it.
+    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
         Ok(Vec::new())
     }
 }

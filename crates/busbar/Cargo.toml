@@ -200,6 +200,10 @@ hooks-ranking = ["dep:busbar-hooks-ranking"]
 openapi-schema = ["dep:schemars"]
 
 [dev-dependencies]
+# The durable-audit (#17) tests exercise the REAL SQLite store's append_audit/list_audit over a
+# simulated restart — a dev-only dependency (the store itself ships as a droppable plugin, not linked
+# into the release binary).
+busbar-store-sqlite = { path = "../store-sqlite" }
 # In-crate #[cfg(test)] harness needs reqwest's json feature + axum http1 server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 axum = { version = "0.8", features = ["http1"] }

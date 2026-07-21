@@ -84,6 +84,11 @@ pub fn dispatch(store: &dyn Store, req: StoreRequest) -> Result<StoreResponse, S
             R::Unit
         }
         Q::ListAwsCredentials => R::AwsCreds(store.list_aws_credentials()?),
+        Q::AppendAudit(e) => {
+            store.append_audit(&e)?;
+            R::Unit
+        }
+        Q::ListAudit => R::Audit(store.list_audit()?),
     })
 }
 
@@ -383,6 +388,34 @@ mod tests {
             assert!(!out.is_null());
             free_impl(out, out_len);
             close_impl(handle);
+        }
+    }
+
+    /// The new audit ABI variants dispatch through the trait: `AppendAudit` maps to `append_audit`
+    /// (Unit response) and `ListAudit` to `list_audit` (Audit response). Against the memory store the
+    /// trait defaults no-op, so append returns Unit and list returns an empty Audit vec — proving the
+    /// ADDITIVE variants are wired end-to-end without breaking the existing dispatch.
+    #[test]
+    fn dispatch_handles_audit_variants() {
+        use busbar_api::AuditRecord;
+        let store = MemoryStore::new();
+        let rec = AuditRecord {
+            seq: 1,
+            ts: 2,
+            action: "hook.register".into(),
+            resource: "hook:a".into(),
+            outcome: "applied".into(),
+            principal: "admin".into(),
+            prev_hash: String::new(),
+            hash: "h".into(),
+        };
+        match dispatch(&store, StoreRequest::AppendAudit(rec)).unwrap() {
+            StoreResponse::Unit => {}
+            other => panic!("expected Unit, got {other:?}"),
+        }
+        match dispatch(&store, StoreRequest::ListAudit).unwrap() {
+            StoreResponse::Audit(v) => assert!(v.is_empty(), "memory store persists no audit"),
+            other => panic!("expected Audit, got {other:?}"),
         }
     }
 

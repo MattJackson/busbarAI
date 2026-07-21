@@ -209,6 +209,7 @@ dependencies = [
  "busbar-plugin-loader",
  "busbar-plugin-sign",
  "busbar-store-memory",
+ "busbar-store-sqlite",
  "bytes",
  "crc32fast",
  "futures",

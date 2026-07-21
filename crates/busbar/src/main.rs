@@ -524,6 +524,33 @@ async fn run() {
     app.versions
         .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
 
+    // DURABLE AUDIT (#17): when a durable governance store is configured (sqlite/postgres/redis), it
+    // is the audit log's durable home. Attach it as the write-through SINK (every future admin
+    // mutation persists as it is appended), and RESTORE the ring from it first — the store is the
+    // source of truth, so its history (which can exceed the RAM ring bound) survives restart with the
+    // hash chain intact. The RAM default (`store: memory`) has no durable audit: the sink no-ops and
+    // the restore reads nothing, so the log stays ephemeral exactly as before. A chain-verification
+    // failure on restore is logged (a tamper signal) and we fall through to the file snapshot below.
+    let mut audit_restored_from_store = false;
+    if let Some(gov) = app.governance.as_ref() {
+        let store = gov.store();
+        crate::admin::audit::AUDIT.set_sink(store.clone());
+        match crate::admin::audit::AUDIT.restore_from_store(store.as_ref()) {
+            Ok(0) => {} // no durable audit (memory default / empty) — fall through to the snapshot
+            Ok(n) => {
+                audit_restored_from_store = true;
+                tracing::info!(
+                    entries = n,
+                    "audit log restored from the durable governance store"
+                );
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "durable audit restore failed (chain verification); falling back to the state snapshot"
+            ),
+        }
+    }
+
     // D3 RESTORE: bring back the persisted process state (health by lane identity, audit ring,
     // version history) so the restart forgot nothing. Fail-soft in every direction.
     let state_file = state_persist::resolve_path(Some(&config_path));
@@ -535,7 +562,12 @@ async fn run() {
             // rebuilding its store here is safe; the swap-in happens before the first request.
             // (Simplest correct wiring: restore INTO the existing store's lanes by identity.)
             app.store.restore_health(&persisted.health);
-            crate::admin::audit::AUDIT.load(persisted.audit);
+            // Only seed the audit ring from the FILE snapshot when the durable store did NOT already
+            // provide it — otherwise a stale snapshot would clobber the store's authoritative (and
+            // more complete) history and rewind the sequence.
+            if !audit_restored_from_store {
+                crate::admin::audit::AUDIT.load(persisted.audit);
+            }
             app.versions.load(persisted.versions);
             // Re-record the boot floor ON TOP of the restored history (a fresh boot version entry).
             app.versions.record(

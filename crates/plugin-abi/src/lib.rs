@@ -29,7 +29,7 @@
 //! the version it was built against; the engine refuses to load a mismatch (a plugin built for a
 //! different ABI is not loaded, never mis-called). The ABI is append-only, like the frozen Admin API.
 
-use busbar_api::{AwsCredential, MeteringDelta, MeteringRow, Usage, VirtualKey};
+use busbar_api::{AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Usage, VirtualKey};
 use serde::{Deserialize, Serialize};
 use std::os::raw::c_void;
 
@@ -90,6 +90,12 @@ pub enum StoreRequest {
         cred: AwsCredential,
     },
     ListAwsCredentials,
+    /// `append_audit` — persist one admin audit record durably. ADDITIVE (ABI stays v1): a plugin
+    /// built against the older SDK never sees this variant; the engine's loader maps its
+    /// "unexpected/unsupported response" into the trait's default no-op, so old plugins are safe.
+    AppendAudit(AuditRecord),
+    /// `list_audit` — every persisted audit record (oldest-first), the boot restore source. ADDITIVE.
+    ListAudit,
 }
 
 /// The success payload for a `call`, matched to the request variant. Store-level errors do NOT ride
@@ -109,6 +115,8 @@ pub enum StoreResponse {
     Metering(Vec<MeteringRow>),
     /// `list_aws_credentials` — every credential.
     AwsCreds(Vec<AwsCredential>),
+    /// `list_audit` — every persisted audit record, oldest-first. ADDITIVE (ABI stays v1).
+    Audit(Vec<AuditRecord>),
 }
 
 // ── C fn-pointer signatures the engine resolves ──────────────────────────────────────────────────
@@ -152,7 +160,20 @@ pub type CloseFn = unsafe extern "C" fn(handle: *mut c_void);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use busbar_api::VirtualKey;
+    use busbar_api::{AuditRecord, VirtualKey};
+
+    fn sample_audit() -> AuditRecord {
+        AuditRecord {
+            seq: 7,
+            ts: 123,
+            action: "plugin.install".into(),
+            resource: "plugin:x".into(),
+            outcome: "applied".into(),
+            principal: "admin".into(),
+            prev_hash: "abc".into(),
+            hash: "def".into(),
+        }
+    }
 
     fn sample_key() -> VirtualKey {
         VirtualKey {
@@ -191,12 +212,22 @@ mod tests {
             },
             StoreRequest::ListMetering(9),
             StoreRequest::ListAwsCredentials,
+            StoreRequest::AppendAudit(sample_audit()),
+            StoreRequest::ListAudit,
         ];
         for r in reqs {
             let j = serde_json::to_vec(&r).unwrap();
             let back: StoreRequest = serde_json::from_slice(&j).unwrap();
             // Re-serialize and compare bytes (the enums aren't PartialEq, but their JSON is stable).
             assert_eq!(serde_json::to_vec(&back).unwrap(), j);
+        }
+
+        // The audit response variant round-trips too.
+        let ar = StoreResponse::Audit(vec![sample_audit()]);
+        let j = serde_json::to_vec(&ar).unwrap();
+        match serde_json::from_slice::<StoreResponse>(&j).unwrap() {
+            StoreResponse::Audit(v) => assert_eq!(v, vec![sample_audit()]),
+            _ => panic!("wrong variant"),
         }
 
         let key = sample_key();

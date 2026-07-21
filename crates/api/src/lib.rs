@@ -27,6 +27,6 @@ pub use hooks::{
     RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest, TransformOutcome,
 };
 pub use store::{
-    AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
-    VirtualKey,
+    AuditRecord, AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError,
+    StoreResult, Usage, VirtualKey,
 };

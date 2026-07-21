@@ -16,7 +16,8 @@
 //! + the write-behind usage flush), so serializing access on one connection is correct and simple.
 
 use busbar_api::{
-    AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage, VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
+    VirtualKey,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row};
@@ -73,6 +74,19 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     tokens_cache_creation BIGINT NOT NULL DEFAULT 0,
     requests              BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (key_id, bucket, model, provider)
+);
+-- The admin AUDIT log's durable home (mirrors the SQLite backend). Append-only; `seq` is the engine's
+-- monotonic sequence (PK). The engine owns the hash chain; the store persists each record verbatim
+-- (upsert on `seq` so a replay is idempotent) and returns them oldest-first for boot restore.
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq       BIGINT PRIMARY KEY,
+    ts        BIGINT NOT NULL,
+    action    TEXT NOT NULL,
+    resource  TEXT NOT NULL,
+    outcome   TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    hash      TEXT NOT NULL
 );
 ";
 
@@ -367,6 +381,58 @@ impl Store for PostgresStore {
                 access_key_id: r.get(0),
                 key_id: r.get(1),
                 secret_access_key: r.get(2),
+            })
+            .collect())
+    }
+
+    fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+        // Upsert on the `seq` PK: append-only in practice, idempotent if the engine re-writes a record
+        // for the same seq (never a UNIQUE violation).
+        let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
+        self.lock()
+            .execute(
+                "INSERT INTO audit_log
+                    (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT (seq) DO UPDATE SET
+                    ts=EXCLUDED.ts, action=EXCLUDED.action, resource=EXCLUDED.resource,
+                    outcome=EXCLUDED.outcome, principal=EXCLUDED.principal,
+                    prev_hash=EXCLUDED.prev_hash, hash=EXCLUDED.hash",
+                &[
+                    &seq,
+                    &ts,
+                    &entry.action,
+                    &entry.resource,
+                    &entry.outcome,
+                    &entry.principal,
+                    &entry.prev_hash,
+                    &entry.hash,
+                ],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
+        let rows = self
+            .lock()
+            .query(
+                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash
+                 FROM audit_log ORDER BY seq",
+                &[],
+            )
+            .store()?;
+        Ok(rows
+            .iter()
+            .map(|r| AuditRecord {
+                seq: read_u64(r.get::<_, i64>(0)),
+                ts: read_u64(r.get::<_, i64>(1)),
+                action: r.get(2),
+                resource: r.get(3),
+                outcome: r.get(4),
+                principal: r.get(5),
+                prev_hash: r.get(6),
+                hash: r.get(7),
             })
             .collect())
     }

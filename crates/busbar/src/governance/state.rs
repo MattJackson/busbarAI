@@ -1073,8 +1073,8 @@ impl GovState {
             .cloned()
     }
 
-    /// Direct handle to the backing store, for tests that seed/inspect persistence.
-    #[cfg(test)]
+    /// Direct handle to the backing store — for tests that seed/inspect persistence AND for the boot
+    /// audit wiring (the durable audit sink + restore read the configured governance store).
     pub(crate) fn store(&self) -> Arc<dyn Store> {
         self.store.clone()
     }

@@ -15,7 +15,8 @@
 //! it while the handle is in use would dangle — and the handle is `close`d before the library drops.
 
 use busbar_api::{
-    AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage, VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
+    VirtualKey,
 };
 use busbar_plugin_abi::{
     symbol, CallFn, CloseFn, FreeFn, StoreRequest, StoreResponse, ABI_VERSION, STATUS_OK,
@@ -187,6 +188,24 @@ impl Store for DynStore {
     fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
         match self.call_raw(StoreRequest::ListAwsCredentials)? {
             StoreResponse::AwsCreds(c) => Ok(c),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+        // A plugin built against an OLDER SDK never learned this request variant and will reject it
+        // (a protocol error). The engine's audit write-through is best-effort, so that error simply
+        // means "this store has no durable audit" — the RAM ring still holds the entry; we never fail
+        // an admin mutation on it. New plugins (durable stores) handle it and return `Unit`.
+        match self.call_raw(StoreRequest::AppendAudit(entry.clone()))? {
+            StoreResponse::Unit => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
+        match self.call_raw(StoreRequest::ListAudit)? {
+            StoreResponse::Audit(a) => Ok(a),
             other => Err(unexpected(other)),
         }
     }
@@ -458,6 +477,44 @@ mod tests {
 
         store.delete_key("vk_dyn").expect("delete");
         assert!(store.get_key("vk_dyn").expect("get after delete").is_none());
+    }
+
+    /// The DURABLE AUDIT surface (#17) works over the C ABI through the real sqlite plugin: append two
+    /// records and read them back oldest-first — proving the new `AppendAudit`/`ListAudit` variants
+    /// serialize across the boundary and the plugin persists them. This is the dynamic-library path a
+    /// `governance.store: sqlite` deployment actually uses for durable audit.
+    #[test]
+    fn dyn_store_durable_audit_over_abi() {
+        use busbar_api::AuditRecord;
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let store = load_store(&path, r#"{"db_path": ":memory:"}"#).expect("load sqlite plugin");
+        let rec = |seq: u64, prev: &str, hash: &str| AuditRecord {
+            seq,
+            ts: 1000 + seq,
+            action: "plugin.install".into(),
+            resource: format!("plugin:{seq}"),
+            outcome: "applied".into(),
+            principal: "admin".into(),
+            prev_hash: prev.into(),
+            hash: hash.into(),
+        };
+        store.append_audit(&rec(1, "", "h1")).expect("append 1");
+        store.append_audit(&rec(2, "h1", "h2")).expect("append 2");
+        let got = store.list_audit().expect("list_audit over the ABI");
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].seq, got[1].seq),
+            (1, 2),
+            "oldest-first across the ABI"
+        );
+        assert_eq!(
+            got[1].prev_hash, "h1",
+            "chain fields survive the JSON-over-C round-trip"
+        );
+        assert_eq!(got[0].resource, "plugin:1");
     }
 
     /// A non-plugin library (or a missing file) is refused with a clear error, never a crash.
