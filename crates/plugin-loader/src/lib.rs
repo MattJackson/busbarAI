@@ -304,6 +304,104 @@ pub fn plugin_library_filename(crate_snake: &str) -> String {
     }
 }
 
+/// Validate that a library is a busbar store plugin the engine can speak to — it exports the ABI
+/// handshake and targets a matching ABI version — WITHOUT constructing a store (no `open`). Returns
+/// the plugin's ABI version. Used to vet an uploaded artifact before writing it into the plugins
+/// directory, and to inventory the directory.
+pub fn validate_plugin(lib_path: &Path) -> Result<u32, String> {
+    let display = lib_path.display().to_string();
+    // SAFETY: loading runs the library's init code — the same trust as loading it to serve, which is
+    // itself the trust of compiling it in. The path is operator/admin-supplied, never request data.
+    let lib = unsafe { Library::new(lib_path) }
+        .map_err(|e| format!("failed to load plugin '{display}': {e}"))?;
+    let abi_version = unsafe {
+        let f = lib
+            .get::<busbar_plugin_abi::AbiVersionFn>(symbol::ABI_VERSION)
+            .map_err(|_| format!("'{display}' is not a busbar store plugin (no ABI symbol)"))?;
+        (*f)()
+    };
+    if abi_version != ABI_VERSION {
+        return Err(format!(
+            "plugin '{display}' targets store ABI v{abi_version}, engine speaks v{ABI_VERSION}"
+        ));
+    }
+    // Confirm the operational symbols resolve too, so a half-built library is caught here rather than
+    // at first use.
+    unsafe {
+        lib.get::<busbar_plugin_abi::OpenFn>(symbol::OPEN)
+            .map_err(|e| format!("plugin '{display}' missing open: {e}"))?;
+        lib.get::<CallFn>(symbol::CALL)
+            .map_err(|e| format!("plugin '{display}' missing call: {e}"))?;
+        lib.get::<FreeFn>(symbol::FREE)
+            .map_err(|e| format!("plugin '{display}' missing free: {e}"))?;
+        lib.get::<CloseFn>(symbol::CLOSE)
+            .map_err(|e| format!("plugin '{display}' missing close: {e}"))?;
+    }
+    Ok(abi_version)
+}
+
+/// One entry in a plugins-directory inventory: the library filename and whether it validated as a
+/// busbar store plugin (with its ABI version, or the reason it didn't). Serialized by the admin
+/// `GET /admin/plugins` endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PluginInfo {
+    /// The library filename (not the full path).
+    pub file: String,
+    /// True when the library exports the store ABI at a version the engine speaks.
+    pub valid: bool,
+    /// The plugin's ABI version when `valid`.
+    pub abi_version: Option<u32>,
+    /// Why it didn't validate, when `!valid`.
+    pub error: Option<String>,
+}
+
+/// Is `file` a dynamic-library name for this platform (by extension)?
+fn is_library_file(file: &str) -> bool {
+    let ext = if cfg!(target_os = "windows") {
+        ".dll"
+    } else if cfg!(target_os = "macos") {
+        ".dylib"
+    } else {
+        ".so"
+    };
+    file.ends_with(ext)
+}
+
+/// Inventory the plugins directory: every dynamic library present, each validated (ABI handshake) so
+/// the admin surface can show what's installed and whether it's loadable. A missing directory is an
+/// empty inventory, not an error.
+pub fn inventory(dir: &Path) -> Vec<PluginInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if !path.is_file() || !is_library_file(file) {
+            continue;
+        }
+        match validate_plugin(&path) {
+            Ok(v) => out.push(PluginInfo {
+                file: file.to_string(),
+                valid: true,
+                abi_version: Some(v),
+                error: None,
+            }),
+            Err(e) => out.push(PluginInfo {
+                file: file.to_string(),
+                valid: false,
+                abi_version: None,
+                error: Some(e),
+            }),
+        }
+    }
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +468,32 @@ mod tests {
             Ok(_) => panic!("a missing library must not load"),
         };
         assert!(err.contains("failed to load plugin"), "got: {err}");
+    }
+
+    /// `validate_plugin` accepts the real sqlite cdylib (ABI v1) without constructing a store, and
+    /// `inventory` finds it (and any sibling plugins) in the target directory as valid.
+    #[test]
+    fn validate_and_inventory() {
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        assert_eq!(validate_plugin(&path).expect("validate"), ABI_VERSION);
+
+        let dir = path.parent().unwrap();
+        let inv = inventory(dir);
+        let sqlite = inv
+            .iter()
+            .find(|p| p.file.contains("busbar_store_sqlite_plugin"))
+            .expect("sqlite plugin in inventory");
+        assert!(sqlite.valid);
+        assert_eq!(sqlite.abi_version, Some(ABI_VERSION));
+        assert!(sqlite.error.is_none());
+    }
+
+    /// `inventory` of a missing directory is empty, not an error.
+    #[test]
+    fn inventory_missing_dir_is_empty() {
+        assert!(inventory(Path::new("/no/such/plugins/dir")).is_empty());
     }
 }

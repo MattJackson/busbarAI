@@ -11,6 +11,7 @@ license = "Apache-2.0"
 busbar-api = { path = "../api" }
 busbar-plugin-abi = { path = "../plugin-abi" }
 libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # NOTE: the end-to-end test loads the SQLite plugin cdylib, but a cdylib crate cannot be a Rust

@@ -295,6 +295,7 @@ dependencies = [
  "busbar-api",
  "busbar-plugin-abi",
  "libloading",
+ "serde",
  "serde_json",
 ]
 
