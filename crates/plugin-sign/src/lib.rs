@@ -27,9 +27,31 @@
 //!
 //! This crate is pure data + policy: no I/O, no engine state. The engine only ever calls [`evaluate`]
 //! (verification). [`sign`] is for the release pipeline / external signing tooling — OSS ships
-//! verification, not a signing CLI. (The signing PRIMITIVE is planned to move to Sigstore keyless,
-//! matching busbar's existing build-provenance; the manifest, canonical bytes, and posture here are
-//! primitive-independent and stay.)
+//! verification, not a signing CLI. The signing PRIMITIVE is INTERIM **ed25519**; only the verify
+//! internals of [`evaluate`] (and the `sign` helper) would swap for another primitive — the manifest,
+//! canonical bytes, and posture are primitive-independent and stay.
+//!
+//! ## Why NOT Sigstore keyless yet (1.5.0 spike outcome — deferred)
+//!
+//! Sigstore keyless was the intended direction (it matches busbar's existing build-provenance and has
+//! nothing to leak). A 1.5.0 spike of the `sigstore` crate (v0.14) found it **cannot be adopted on a
+//! release-held branch without regressing the security gates**, so the interim ed25519 path stays:
+//!
+//! - **cargo-deny advisories FAIL.** `sigstore → oci-client → jsonwebtoken → rsa 0.9.10` carries
+//!   **RUSTSEC-2023-0071** (the "Marvin Attack" RSA timing sidechannel) with *"No safe upgrade is
+//!   available"* — an unpatched vulnerability busbar's `cargo deny check advisories` gate rejects.
+//!   (`openidconnect` pulls the same `rsa` too.) Ironically, adopting a *signing* dependency would
+//!   INTRODUCE a known crypto vulnerability into the trust path.
+//! - **Dependency-surface blow-up.** The tree resolves ~389 packages and adds ~26 duplicate-major
+//!   crates (vs ~13 today) — the whole TUF/Fulcio/Rekor + OCI-registry + OIDC stack — cutting against
+//!   the workspace's "single stack" goal.
+//! - Licenses and sources were clean (the tree is allow-list compatible, no git deps), so the blocker
+//!   is squarely the `rsa` advisory + the dependency weight, not licensing.
+//!
+//! When `sigstore` (or `jsonwebtoken`/`rsa`) ships a Marvin-mitigated release and the dep tree slims,
+//! the swap is localized to `evaluate`'s signature check — trust becomes "a valid Sigstore cosign
+//! bundle over the canonical manifest, from an allowlisted OIDC identity" — with no change to the
+//! manifest shape, the posture, or any caller.
 
 // `SigningKey`/`VerifyingKey` are re-exported so external signing tooling can name them via this crate.
 use ed25519_dalek::{Signature, Signer, Verifier};
