@@ -1327,7 +1327,11 @@ async fn test_disabled_virtual_key_is_rejected_401() {
     };
     store.put_key(&mk("kdis", disabled_secret, false)).unwrap();
     store.put_key(&mk("kena", enabled_secret, true)).unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
+    // real deploy keys can only be minted through the admin API, which requires this token — so a
+    // store holding minted keys implies an admin token is set. Without it the engine is INERT and
+    // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -1441,7 +1445,11 @@ async fn test_none_mode_with_governance_still_requires_virtual_key() {
             created_at: 0,
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
+    // real deploy keys can only be minted through the admin API, which requires this token — so a
+    // store holding minted keys implies an admin token is set. Without it the engine is INERT and
+    // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -1545,7 +1553,11 @@ async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
             created_at: 0,
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
+    // real deploy keys can only be minted through the admin API, which requires this token — so a
+    // store holding minted keys implies an admin token is set. Without it the engine is INERT and
+    // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -1716,7 +1728,11 @@ fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
                         created_at: 0,
                     })
                     .unwrap();
-                let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+                // Admin token → governance is ACTIVE, so the inert-allowlist branch (and its
+                // one-shot warning) is reached. An inert engine (no admin token) would fall through
+                // to the static chain and never emit the warning.
+                let gov =
+                    Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
                 // auth.mode=token WITH a non-empty static allowlist — the inert combination. The
                 // listed static token is NOT the governance virtual key.
@@ -2086,7 +2102,11 @@ async fn test_governance_accepts_vendor_carriers_and_native_401() {
             created_at: 0,
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
+    // real deploy keys can only be minted through the admin API, which requires this token — so a
+    // store holding minted keys implies an admin token is set. Without it the engine is INERT and
+    // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -2203,7 +2223,11 @@ async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
             created_at: 0,
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
+    // real deploy keys can only be minted through the admin API, which requires this token — so a
+    // store holding minted keys implies an admin token is set. Without it the engine is INERT and
+    // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -2642,4 +2666,346 @@ fn test_canonical_query_string_sorts_and_encodes() {
     assert_eq!(canonical_query_string(Some("p=a/b")), "p=a%2Fb");
     // Bare key signs as key= (empty value).
     assert_eq!(canonical_query_string(Some("flag")), "flag=");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BACK-COMPAT REGRESSION: governance is ALWAYS constructed (RAM store by default), but must be
+// INERT until an admin token is configured. A legacy deploy that never opted into governance (no
+// admin token, no minted keys) must behave EXACTLY as it did when `governance:` defaulted to
+// disabled: the static `auth.chain` gates ingress and inference succeeds. These pin that the
+// on-by-default governance engine does NOT silently supersede the static chain / open relay.
+// See `auth/mod.rs`: the vkey-resolution branch is gated on `admin_token_hash().is_some()`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// (a) DEFAULT DEPLOY, NO admin token, `auth.chain:[tokens]` + a static client_tokens entry: a
+/// request bearing that static token MUST be admitted by the static chain (governance is inert and
+/// does NOT require a virtual key). Before the fix this 401'd because the always-present engine
+/// forced a vkey lookup that no minted key could satisfy.
+#[cfg(feature = "auth-tokens")]
+#[tokio::test]
+async fn test_governance_inert_without_admin_token_static_token_admitted() {
+    use crate::governance::{GovState, MemoryStore};
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    crate::metrics::init();
+
+    let state = Arc::new(MockServerState::new());
+    state.push(MockResponse::Ok {
+        status: axum::http::StatusCode::OK,
+        body: json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    });
+    let server = MockServer::new(state).await;
+
+    let token = "busbar-static-token";
+    let auth_cfg = crate::config::AuthCfg {
+        chain: vec!["tokens".to_string()],
+        upstream_credentials: crate::auth::UpstreamCreds::Own,
+        client_tokens: vec![token.to_string()],
+        modules: std::collections::HashMap::new(),
+    };
+    // The default-deploy governance engine: RAM store, NO admin token, NO minted keys → INERT.
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    assert!(
+        gov.admin_token_hash().is_none(),
+        "precondition: engine must be inert (no admin token)"
+    );
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .api_key("busbar-upstream-key"),
+        )
+        .pool("pa", &[(0, 1)])
+        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .governance(gov)
+        .build();
+
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/pa/v1/messages");
+    let body =
+        json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+    // The static token MUST be honoured by the static chain — governance is inert, so no vkey needed.
+    let r_ok = client
+        .post(&url)
+        .bearer_auth(token)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_ok.status().as_u16(),
+        200,
+        "an inert governance engine must NOT supersede the static [tokens] chain (got {})",
+        r_ok.status()
+    );
+
+    // A WRONG token is still rejected by the static chain (the chain still gates, as before).
+    let r_bad = client
+        .post(&url)
+        .bearer_auth("not-the-token")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_bad.status().as_u16(),
+        401,
+        "the static chain must still reject a non-allowlisted token (got {})",
+        r_bad.status()
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+/// (b) NO admin token + EMPTY chain (open relay): a request presenting NO token MUST be admitted —
+/// the open front door's accept-every-request semantics are honoured because governance is inert.
+/// Before the fix the always-present engine rejected the tokenless request.
+#[tokio::test]
+async fn test_governance_inert_without_admin_token_open_relay_admits() {
+    use crate::governance::{GovState, MemoryStore};
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    crate::metrics::init();
+
+    let state = Arc::new(MockServerState::new());
+    state.push(MockResponse::Ok {
+        status: axum::http::StatusCode::OK,
+        body: json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    });
+    let server = MockServer::new(state).await;
+
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .api_key("busbar-upstream-key"),
+        )
+        .pool("pa", &[(0, 1)])
+        // Empty chain = open relay (the old `mode: none`).
+        .upstream_creds(crate::auth::UpstreamCreds::Own)
+        .governance(gov)
+        .build();
+
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/pa/v1/messages");
+    let body =
+        json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+    // NO token — the open relay must admit (governance is inert, not superseding the open door).
+    let r_none = client.post(&url).body(body).send().await.unwrap();
+    assert_eq!(
+        r_none.status().as_u16(),
+        200,
+        "an inert governance engine must NOT supersede the open relay (got {})",
+        r_none.status()
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+/// (c) WITH admin token + a minted enabled key: governance is ACTIVE, so a valid virtual key is
+/// admitted and an unknown token is rejected — the enforcement path is unchanged once active.
+#[tokio::test]
+async fn test_governance_active_with_admin_token_enforces_minted_key() {
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    crate::metrics::init();
+
+    let state = Arc::new(MockServerState::new());
+    state.push(MockResponse::Ok {
+        status: axum::http::StatusCode::OK,
+        body: json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "test-model",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    });
+    let server = MockServer::new(state).await;
+
+    let secret = "sk-vk-active";
+    let store = Arc::new(MemoryStore::new());
+    store
+        .put_key(&VirtualKey {
+            id: "k".to_string(),
+            key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
+            name: "k".to_string(),
+            allowed_pools: vec!["pa".to_string()],
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        })
+        .unwrap();
+    // Admin token set → governance is ACTIVE (this is the real minted-keys deploy).
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    assert!(
+        gov.admin_token_hash().is_some(),
+        "precondition: engine active"
+    );
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .api_key("busbar-upstream-key"),
+        )
+        .pool("pa", &[(0, 1)])
+        .governance(gov)
+        .build();
+
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/pa/v1/messages");
+    let body =
+        json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+    // The enabled virtual key is admitted.
+    let r_ok = client
+        .post(&url)
+        .bearer_auth(secret)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_ok.status().as_u16(),
+        200,
+        "an enabled virtual key must pass under active governance (got {})",
+        r_ok.status()
+    );
+
+    // An unknown token is rejected — enforcement is live.
+    let r_bad = client
+        .post(&url)
+        .bearer_auth("sk-vk-unknown")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_bad.status().as_u16(),
+        401,
+        "active governance must reject an unknown token (got {})",
+        r_bad.status()
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+/// (d) WITH admin token but the request lacks any virtual key: even with an OPEN static chain,
+/// active governance still requires a vkey and rejects the tokenless request. This is the
+/// documented "governance supersedes the open relay" behaviour — preserved when active.
+#[tokio::test]
+async fn test_governance_active_with_admin_token_rejects_missing_vkey() {
+    use crate::governance::{GovState, MemoryStore};
+    use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    crate::metrics::init();
+
+    // No upstream call should happen — auth must reject before routing.
+    let state = Arc::new(MockServerState::new());
+    let server = MockServer::new(state).await;
+
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .api_key("busbar-upstream-key"),
+        )
+        .pool("pa", &[(0, 1)])
+        // Open static chain — but active governance supersedes it.
+        .upstream_creds(crate::auth::UpstreamCreds::Own)
+        .governance(gov)
+        .build();
+
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/pa/v1/messages");
+    let body =
+        json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+    // No virtual key under active governance → 401, even with an open static chain.
+    let r_none = client.post(&url).body(body).send().await.unwrap();
+    assert_eq!(
+        r_none.status().as_u16(),
+        401,
+        "active governance must require a virtual key even behind an open static chain (got {})",
+        r_none.status()
+    );
+
+    handle.abort();
+    server.shutdown().await;
 }

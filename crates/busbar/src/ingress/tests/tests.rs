@@ -156,7 +156,7 @@ fn governed_app_with_key() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
     // 30 cents flat per request, no per-token fee.
-    let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -340,7 +340,9 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
     crate::metrics::init();
 
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(GovState::new(store.clone(), 30, 0, None).unwrap()); // 30c/request
+    let gov = std::sync::Arc::new(
+        GovState::new(store.clone(), 30, 0, Some("admintok".to_string())).unwrap(),
+    ); // 30c/request
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -439,7 +441,9 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     // so the deterministic precondition matches what the in-memory admission gate reads. (Enforcement
     // is now in-memory: seeding via the store alone would be invisible to `budget_check`.)
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(GovState::new(store.clone(), 30, 0, None).unwrap()); // 30c/req
+    let gov = std::sync::Arc::new(
+        GovState::new(store.clone(), 30, 0, Some("admintok".to_string())).unwrap(),
+    ); // 30c/req
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -1955,7 +1959,7 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
     }
     let server = MockServer::new(state.clone()).await;
     let store = StdArc::new(MemoryStore::new());
-    let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = StdArc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let auth_cfg = crate::config::AuthCfg {
         chain: vec!["test-groups-module".to_string()],
         upstream_credentials: crate::auth::UpstreamCreds::Own,
@@ -2981,7 +2985,7 @@ async fn test_unknown_model_404_uses_canonical_openai_type() {
 fn governed_app_pool_restricted() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -3223,7 +3227,7 @@ fn assert_leak_free(body: &str, key_id: &str, pool: &str) {
 fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -3246,7 +3250,7 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
 fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 30, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4475,7 +4479,7 @@ async fn governed_pool_acl_router(
             created_at: 0,
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 1, 0, None).unwrap());
+    let gov = StdArc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new()
         .governance(gov)
         .lane(LaneSpec::new(model, protocol, "http://127.0.0.1:1").provider(provider))
@@ -4733,7 +4737,7 @@ async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
             created_at: 0,
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = StdArc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     // Lane 0 → pool A (reachable mock). Lane 1 → pool B (the disallowed fallback target).
     let app = TestApp::new()
@@ -4819,7 +4823,7 @@ async fn test_fallback_pool_acl_allows_key_permitted_on_both_pools() {
             created_at: 0,
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = StdArc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .governance(gov)
@@ -4989,7 +4993,7 @@ async fn test_adhoc_governance_pool_acl_403_via_router() {
             created_at: 0,
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 1, 0, None).unwrap());
+    let gov = StdArc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new()
         .governance(gov)
         .lane(
@@ -5306,7 +5310,7 @@ async fn governed_limit_router(
             created_at: 0,
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 1, 0, None).unwrap());
+    let gov = StdArc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let (addr, handle) = serve(app).await;
     (addr, handle, SECRET)

@@ -960,12 +960,28 @@ pub(crate) async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    // when governance is enabled, the caller's token MUST resolve to an enabled virtual key; the
+    // when governance is ACTIVE, the caller's token MUST resolve to an enabled virtual key; the
     // resolved key is attached for downstream allowed-pools enforcement. This supersedes the static
     // Auth-chain token check. The token may arrive via any supported carrier (Bearer / x-api-key /
     // x-goog-api-key) — `client_token` already encodes that precedence. When governance is
-    // disabled, the configured auth chain (empty = open, [tokens] = validated) applies unchanged.
-    if let Some(gov) = &app.governance {
+    // inert (or absent), the configured auth chain (empty = open, [tokens] = validated) applies
+    // unchanged.
+    //
+    // BACK-COMPAT: the governance engine is ALWAYS constructed (RAM store by default), but it is
+    // INERT until an admin token is configured — virtual keys can ONLY be minted through the
+    // admin API, which is itself gated by the admin token (see `validate_governance`), so a deploy
+    // with no admin token can never have a key for a request to resolve to. Enforcing the
+    // vkey-resolution branch in that state would reject every inference request and silently
+    // supersede the operator's static `auth.chain` / open-relay configuration — a behaviour
+    // inversion for legacy deploys that never opted into governance. Gate the branch on
+    // `admin_token_hash().is_some()` so an inert engine is treated EXACTLY as `governance: None`:
+    // the static auth chain (`else` below) applies verbatim. Once an admin token IS set, every
+    // existing enforcement path is preserved unchanged.
+    if let Some(gov) = app
+        .governance
+        .as_ref()
+        .filter(|g| g.admin_token_hash().is_some())
+    {
         // governance enabled + `upstream_credentials: passthrough` is a self-contradictory deployment: the
         // governance branch below requires every request to present a valid enabled busbar virtual
         // key (superseding passthrough's "accept any caller credential and forward it upstream"
