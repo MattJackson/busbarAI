@@ -104,6 +104,7 @@ tokio::task_local! {
 mod egress;
 mod engine;
 mod hooks;
+mod lazy_body;
 mod response_body;
 mod select;
 mod usage;
@@ -111,6 +112,7 @@ mod wire;
 pub(crate) use egress::*;
 pub(crate) use engine::*;
 pub(crate) use hooks::*;
+pub(crate) use lazy_body::*;
 pub(crate) use response_body::*;
 pub(crate) use select::*;
 pub(crate) use usage::*;

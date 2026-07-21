@@ -89,11 +89,16 @@ pub(crate) async fn operation_ingress(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    // Parse ONCE, before model extraction, so a malformed JSON body gets the parse 400 (below),
-    // never a misleading missing-model 400.
-    let parsed_v: Option<serde_json::Value> = if ct.starts_with("application/json") || ct.is_empty()
+    // VALIDATE ONCE, before model extraction, so a malformed JSON body gets the parse 400 (below),
+    // never a misleading missing-model 400. `LazyBody::parse` preserves the exact malformed-body
+    // reject set of the old eager `parse::<Value>` (same depth guard, same parser, full-body scan)
+    // but builds NO DOM — only the top-level head projection the passthrough path reads. The full
+    // `Value` tree is materialized downstream ONLY on the paths that need it (cross-protocol
+    // translation, hooks, taps, gates, failover hops 2+).
+    let parsed_v: Option<crate::proxy::LazyBody> = if ct.starts_with("application/json")
+        || ct.is_empty()
     {
-        match crate::json::parse(&body) {
+        match crate::proxy::LazyBody::parse(&body) {
             Ok(v) => Some(v),
             Err(_) => {
                 tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
@@ -121,9 +126,14 @@ pub(crate) async fn operation_ingress(
     } else if ct.starts_with("multipart/") {
         multipart_model(&body)
     } else {
-        parsed_v
-            .as_ref()
-            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string))
+        // `model` is a captured head key: this point read never materializes the DOM and returns
+        // exactly what the full `Value` returned (missing / non-string / non-object body -> None).
+        parsed_v.as_ref().and_then(|v| {
+            v.probe()
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
     };
     let model = match model {
         Some(m) if !m.is_empty() => m,
@@ -176,7 +186,7 @@ pub(crate) async fn operation_resolved(
     model: &str,
     headers: &HeaderMap,
     body: Bytes,
-    parsed_v: Option<serde_json::Value>,
+    parsed_v: Option<crate::proxy::LazyBody>,
     caller_token: Option<&str>,
     started: Instant,
     charged_at: u64,

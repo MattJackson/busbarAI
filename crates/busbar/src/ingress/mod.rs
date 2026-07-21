@@ -638,7 +638,9 @@ async fn ingress_path_model(
         model,
         headers,
         injected,
-        Some(v),
+        // Path-model ingress already parsed (and shim-injected into) the body — carry the DOM
+        // eagerly; the engine's pristine head check reads it directly and behaves as before.
+        Some(crate::proxy::LazyBody::from_value(v)),
         caller_token,
         started,
         charged_at,

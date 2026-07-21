@@ -59,7 +59,9 @@ pub(crate) async fn forward_with_pool_keyed(
     op: crate::handlers::Op,
     usage_sink: Option<UsageSink>,
 ) -> Response {
-    let v: Value = match crate::json::parse(&body) {
+    // Validate + head-project WITHOUT building a DOM (same malformed-body 400 contract as the old
+    // eager parse — `LazyBody::parse` goes through the identical `crate::json` guard + parser).
+    let v: LazyBody = match LazyBody::parse(&body) {
         Ok(v) => v,
         Err(_) => {
             tracing::debug!(detail = %crate::json::parse_err_log(body.len()), "request body JSON parse failed");
@@ -105,7 +107,7 @@ pub(crate) async fn forward_with_pool_parsed(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     body: Bytes,
-    v: Option<Value>,
+    mut v: Option<LazyBody>,
     req_content_type: &str,
     caller_token: Option<&str>,
     resolved_gov_key: Option<&std::sync::Arc<crate::governance::VirtualKey>>,
@@ -123,14 +125,23 @@ pub(crate) async fn forward_with_pool_parsed(
     let completion_shape = if app.tap_hooks_completion.is_empty() {
         None
     } else {
+        // `stream` is a captured head key — read it via `probe` (no DOM needed); the SHAPE capture
+        // reads arbitrary body fields, so materialize the DOM (taps are configured — the DOM was
+        // going to be built for the request stages anyway).
+        let stream = v
+            .as_ref()
+            .and_then(|b| b.probe().get("stream"))
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false);
+        let dom: Option<&Value> = match v.as_mut() {
+            Some(l) => l.ensure_dom().ok().map(|m| &*m),
+            None => None,
+        };
         Some(capture_stage_shape(
-            v.as_ref(),
+            dom,
             pool_name,
             ingress_protocol,
-            v.as_ref()
-                .and_then(|b| b.get("stream"))
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false),
+            stream,
         ))
     };
     let completion_app = app.clone();
@@ -183,11 +194,14 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     app: Arc<App>,
     cands: Vec<WeightedLane>,
     mut body: Bytes,
-    // The request body parsed ONCE by the caller for JSON-body operations; `None` for an OPAQUE
-    // ingress body (multipart transcription, binary) — those relay/translate at the BYTE level via
-    // the operation codecs and skip every JSON-only read below. `mut` so the global rewrite pass can
-    // mutate it before dispatch.
-    mut v: Option<Value>,
+    // The request body VALIDATED once by the caller for JSON-body operations, carried as a
+    // `LazyBody` (head projection + on-demand DOM); `None` for an OPAQUE ingress body (multipart
+    // transcription, binary) — those relay/translate at the BYTE level via the operation codecs and
+    // skip every JSON-only read below. The top-level point reads below (`stream`, affinity `system`,
+    // shim keys) go through the head `probe`; the full DOM is materialized ONLY when a consumer
+    // needs the tree (rewrite hooks, taps, gates/policies, cross-protocol translation, failover).
+    // `mut` so the global rewrite pass can materialize + mutate it before dispatch.
+    mut v: Option<LazyBody>,
     // The ingress request Content-Type — the byte-level codec's parse hint (multipart boundary).
     req_content_type: &str,
     caller_token: Option<&str>,
@@ -250,7 +264,13 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     // translation rewrites `v` (Gemini routes streaming requests to a different upstream endpoint).
     // Delegated to the operation: chat reads the OpenAI-family `stream` boolean (byte-identical to
     // the previous inline read); a non-streaming op always returns false.
-    let wants_stream = v.as_ref().map(|v| op.wants_stream(v)).unwrap_or(false);
+    // `probe()` answers this from the head projection (chat reads only the top-level `stream`
+    // boolean — a captured head key) without materializing the DOM; once a DOM exists, `probe()` IS
+    // the DOM, so the read is byte-identical either way.
+    let wants_stream = v
+        .as_ref()
+        .map(|l| op.wants_stream(l.probe()))
+        .unwrap_or(false);
 
     // ── GLOBAL REWRITE (transform) PASS ─────────────────────────────────────────────────────────
     // Fire the global `prompt: rw` gates (compression/redaction) BEFORE dispatch AND before the
@@ -268,7 +288,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         .map(|r| r.rewrite_hooks.as_slice())
         .unwrap_or(&[]);
     if !app.rewrite_hooks.is_empty() || !pool_rewrites.is_empty() {
-        if let Some(parsed) = v.as_mut() {
+        if let Some(lazy) = v.as_mut() {
             // A rewrite hook's REJECT stops the request here — the same client shaping a decide-
             // path gate rejection gets (clamped status, sanitized message, native envelope).
             let reject = |status: u16, message: String| {
@@ -284,6 +304,16 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                     reject_kind_for_status(status),
                     &message,
                 ))
+            };
+            // Rewrite hooks mutate the tree — materialize the DOM (rewrite paths always paid this
+            // parse). The unreachable-in-practice parse failure (these bytes already validated)
+            // fails CLOSED, matching the rewrite guarantee's serialize guard below.
+            let Ok(parsed) = lazy.ensure_dom() else {
+                tracing::error!(
+                    "materializing the validated request body for the rewrite pass failed; \
+                     rejecting rather than forwarding un-rewritten"
+                );
+                return reject(500, "request rewrite could not be applied".to_string());
             };
             let mut applied = match apply_global_rewrites(
                 &app.rewrite_hooks,
@@ -341,8 +371,12 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     // gets the prompt-content projection, a `prompt: no` (default) tap gets shape-only — so a tap
     // never over-shares. At most TWO projections are built (shape-only + with-prompt), regardless of
     // tap count. ZERO COST when no tap is configured (empty-list branch).
-    if let Some(body) = v.as_ref() {
-        fire_global_taps(&app, body, pool_name, ingress_protocol, wants_stream);
+    // Hoisted empty check (mirrors `fire_global_taps`'s own first-line early return) so the DOM is
+    // only materialized when a tap is actually configured — ZERO COST stays zero-parse.
+    if !app.tap_hooks.is_empty() {
+        if let Some(Ok(body)) = v.as_mut().map(|l| l.ensure_dom()) {
+            fire_global_taps(&app, body, pool_name, ingress_protocol, wants_stream);
+        }
     }
 
     // Gemini ingress streaming WITHOUT `?alt=sse`: the native client expects a JSON-array streamed
@@ -360,7 +394,8 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             .map(|p| {
                 p.writer().uses_array_stream_shim()
                     && v.as_ref()
-                        .map(|v| p.writer().wants_array_stream(v))
+                        // The shim key is a captured head key — `probe()` answers without a DOM.
+                        .map(|l| p.writer().wants_array_stream(l.probe()))
                         .unwrap_or(false)
             })
             .unwrap_or(false);
@@ -373,7 +408,9 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     let affinity_key_hash: Option<u64> =
         affinity_key.map(crate::proxy::stable_hash).or_else(|| {
             v.as_ref()
-                .and_then(|v| op.body_affinity_key(v))
+                // Chat's body affinity key is the top-level `system` string — a captured head key,
+                // so `probe()` answers without materializing the DOM.
+                .and_then(|l| op.body_affinity_key(l.probe()))
                 .map(crate::proxy::stable_hash)
         });
 
@@ -463,9 +500,16 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             app.global_gates.iter().chain(pool_gates.iter()).collect();
         chain.sort_by_key(|(p, _)| *p);
         // Every concurrently-firing gate borrows the same parsed body; the shared Null stands in
-        // for a non-JSON body (the same projection the sequential path used).
+        // for a non-JSON body (the same projection the sequential path used). Gates project
+        // arbitrary body fields, so a configured gate materializes the DOM (as it always did).
         static NULL_BODY: Value = Value::Null;
-        let gate_body: &Value = v.as_ref().unwrap_or(&NULL_BODY);
+        let gate_body: &Value = match v.as_mut() {
+            Some(l) => match l.ensure_dom() {
+                Ok(m) => &*m,
+                Err(()) => &NULL_BODY,
+            },
+            None => &NULL_BODY,
+        };
         let outcomes: Vec<PolicyOutcome> =
             futures::future::join_all(chain.iter().map(|(_, gate)| {
                 decide_policy_order(
@@ -642,12 +686,22 @@ pub(crate) async fn forward_with_pool_parsed_inner(
             // A non-default policy is configured: build the projection, run the decision (bounded by its
             // timeout), and coerce the outcome to a ranked order (or `None` ⇒ SWRR) per `on_error`.
             Some(resolved) => {
+                // A configured routing policy projects the body — materialize the DOM (this pool
+                // always paid the parse). `NULL_BODY_POLICY` stands in for non-JSON, as before.
+                static NULL_BODY_POLICY: Value = Value::Null;
+                let policy_body: &Value = match v.as_mut() {
+                    Some(l) => match l.ensure_dom() {
+                        Ok(m) => &*m,
+                        Err(()) => &NULL_BODY_POLICY,
+                    },
+                    None => &NULL_BODY_POLICY,
+                };
                 let outcome = decide_policy_order(
                     &app,
                     resolved,
                     &cands,
                     &request_ctx,
-                    v.as_ref().unwrap_or(&Value::Null),
+                    policy_body,
                     pool_name,
                     ingress_protocol,
                     wants_stream,
@@ -815,8 +869,14 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     let stage_shape = if app.tap_hooks_route.is_empty() && app.tap_hooks_attempt.is_empty() {
         None
     } else {
+        // Stage taps read arbitrary body fields for the shape — materialize the DOM (taps are
+        // configured, so this request always paid the parse).
+        let dom: Option<&Value> = match v.as_mut() {
+            Some(l) => l.ensure_dom().ok().map(|m| &*m),
+            None => None,
+        };
         Some(capture_stage_shape(
-            v.as_ref(),
+            dom,
             pool_name,
             ingress_protocol,
             wants_stream,
@@ -952,17 +1012,40 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         // an O(n) `Value::clone` of a large request (long histories / base64 images / big tool
         // schemas), which under sustained failover compounded to O(n × max_cap) allocations.
         let _xlate = crate::profile::start(crate::profile::Stage::TranslateReq);
-        let hop_v: Option<Value> = if !body_is_json {
-            None // opaque ingress body: byte-level relay/translate; nothing to re-parse.
+        // REQUEST SHORT-CIRCUIT WITHOUT A DOM (perf/throughput-1.5.0): hop 1 of a SAME-protocol
+        // JSON dispatch whose head projection PROVES no same-proto invalidator (#1-#4, Vertex)
+        // fires re-emits the retained bytes verbatim — the exact bytes the translate seam's own
+        // pristine short-circuit would emit — without ever materializing the `Value` tree.
+        // `head_provably_pristine` is one-sided (see its docs + parity test): any doubt falls
+        // through to the unchanged materialize-and-translate path below, so the wire bytes are
+        // byte-identical on every branch. When the DOM was already materialized (hooks/taps/gates/
+        // path-model ingress), `probe()` IS the (possibly hook-rewritten) DOM and `body` was
+        // re-serialized in lockstep by the rewrite pass — the check stays sound.
+        let head_pristine = ingress_protocol == egress_name
+            && first_hop_v
+                .as_ref()
+                .is_some_and(|l| head_provably_pristine(&app, i, l.probe()));
+        let payload = if head_pristine {
+            // Consume the hop-1 body exactly as the translate path does; failover hops 2+ re-parse
+            // from the retained pristine bytes, unchanged. `Bytes::clone` = refcount bump.
+            first_hop_v = None;
+            body.clone()
         } else {
-            Some(match first_hop_v.take() {
-                // First hop: reuse the pristine parse from above (no second parse on the common path).
-                Some(v) => v,
-                // Failover hops: re-parse from the retained pristine bytes (sonic-rs: SIMD parse).
-                None => match crate::json::parse(&body) {
-                    Ok(v) => v,
-                    // `body` already parsed once successfully above; this re-parse is infallible.
-                    Err(_) => {
+            let hop_v: Option<Value> = if !body_is_json {
+                None // opaque ingress body: byte-level relay/translate; nothing to re-parse.
+            } else {
+                let parsed = match first_hop_v.take() {
+                    // First hop: consume the carried body — the memoized DOM when one was
+                    // materialized (hooks/taps/gates/path-model), else ONE parse of the validated
+                    // bytes (the parse the old eager path performed at ingress).
+                    Some(l) => l.into_value(),
+                    // Failover hops: re-parse from the retained pristine bytes (sonic-rs: SIMD parse).
+                    None => crate::json::parse(&body).map_err(|_| ()),
+                };
+                match parsed {
+                    Ok(v) => Some(v),
+                    // `body` already validated/parsed once successfully above; this is infallible.
+                    Err(()) => {
                         // Probe class guard: this lane may have CAS-won the single-flight recovery probe in
                         // `pick_among`. We bail BEFORE dispatching any request, so no outcome will be
                         // recorded to clear `probe_in_flight` — release it here or the recovering lane stays
@@ -976,31 +1059,31 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                             DETAIL_INTERNAL_ERROR,
                         );
                     }
-                },
-            })
-        };
-        // SINGLE shared cross-protocol request-shaping seam (shared verbatim with `forward_once`'s
-        // degraded path): read→clear-extra→write, shim-key strip, model rewrite, serialize. Both
-        // paths route through `translate_request_cross_protocol` so neither can carry a translation
-        // step the other lacks (the recurring drift class this round's unification ends).
-        let payload = match translate_request_cross_protocol(
-            &app,
-            i,
-            ingress_protocol,
-            op,
-            hop_v,
-            req_content_type,
-            effective_reasoning(&cands, i, app.lanes[i].reasoning),
-            &body,
-        ) {
-            Ok(p) => p,
-            Err(resp) => {
-                // Probe class guard: a translation failure also bails before dispatch, so release
-                // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
-                // leak as the re-parse path above.
-                app.store.release_probe_in(pool_name, i);
-                drop(permit);
-                return *resp;
+                }
+            };
+            // SINGLE shared cross-protocol request-shaping seam (shared verbatim with `forward_once`'s
+            // degraded path): read→clear-extra→write, shim-key strip, model rewrite, serialize. Both
+            // paths route through `translate_request_cross_protocol` so neither can carry a translation
+            // step the other lacks (the recurring drift class this round's unification ends).
+            match translate_request_cross_protocol(
+                &app,
+                i,
+                ingress_protocol,
+                op,
+                hop_v,
+                req_content_type,
+                effective_reasoning(&cands, i, app.lanes[i].reasoning),
+                &body,
+            ) {
+                Ok(p) => p,
+                Err(resp) => {
+                    // Probe class guard: a translation failure also bails before dispatch, so release
+                    // the (possibly won) single-flight probe before returning — same wedged-HalfOpen
+                    // leak as the re-parse path above.
+                    app.store.release_probe_in(pool_name, i);
+                    drop(permit);
+                    return *resp;
+                }
             }
         };
         // TRANSLATE_REQ ends here (egress payload bytes in hand). CLIENT_BUILD spans the egress auth
