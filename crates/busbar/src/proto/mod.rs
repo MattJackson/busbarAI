@@ -1000,6 +1000,14 @@ impl Protocol {
         self.name
     }
 
+    /// The protocol name as the registry's INTERNED `&'static str` (the `name` field is `&'static`).
+    /// Lets a caller that must OUTLIVE the borrowed lookup key (e.g. a streaming response body that
+    /// stores the ingress protocol for the life of the stream) hold the name without allocating an
+    /// owned copy — the value points into the process-lifetime protocol table, not the request.
+    pub(crate) fn name_static(&self) -> &'static str {
+        self.name
+    }
+
     /// Returns the reader for this protocol.
     pub(crate) fn reader(&self) -> &dyn ProtocolReader {
         self.reader.as_ref()

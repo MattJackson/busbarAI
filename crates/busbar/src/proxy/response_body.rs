@@ -32,7 +32,13 @@ pub(crate) struct FirstByteBody<S, P> {
     /// is emitted in THIS protocol's framing so a native client SDK can decode it — keying the
     /// framing decision off the upstream CT (which on a cross-protocol reframe describes the egress,
     /// not the client) was the bug.
-    ingress_protocol: Box<str>,
+    ///
+    /// Held as `&'static str` (the registry interns every protocol name as `&'static`), not an owned
+    /// `Box<str>` — the previous `Box::from(ingress_protocol)` heap-allocated + memcpy'd this short
+    /// static name on EVERY streaming response. Resolved once in the constructor to the canonical
+    /// interned name (falling back to `"openai"` for an unknown ingress, the same default the error
+    /// framing already uses), so a streaming response no longer allocates for it.
+    ingress_protocol: &'static str,
     /// The operation this response belongs to. Drives whether the non-stream body is buffered for
     /// usage extraction (`taps_nonstream_usage`) and how usage is read from it (`extract_usage`).
     /// Chat reads the egress reader's IR usage; a flat-fee op taps nothing.
@@ -112,18 +118,26 @@ where
         usage_sink: Option<UsageSink>,
         budget_spent: bool,
     ) -> Self {
+        // Resolve the ingress protocol ONCE: it supplies both the binary-eventstream flag AND the
+        // interned `&'static` name we store (no per-response allocation for the name). An unknown
+        // ingress protocol falls back to `openai` — the exact default `ingress_error` /
+        // `mid_stream_error_bytes` already use for framing, so the fallback is behavior-preserving.
+        let ingress_proto = crate::proto::protocol_for(ingress_protocol);
         Self {
             inner,
             first_byte_sent: Arc::new(AtomicBool::new(false)),
             is_sse,
-            // Resolve the ingress protocol's writer ONCE to determine whether the client expects a
-            // binary event-stream body (Bedrock) rather than SSE text. Dispatches through the
-            // `ingress_is_eventstream` vtable method so this constructor carries no `== "bedrock"`
-            // branch — a future protocol with a binary framing just overrides the method.
-            ingress_eventstream: crate::proto::protocol_for(ingress_protocol)
+            // Whether the client expects a binary event-stream body (Bedrock) rather than SSE text.
+            // Dispatches through the `ingress_is_eventstream` vtable method so this constructor carries
+            // no `== "bedrock"` branch — a future protocol with binary framing just overrides it.
+            ingress_eventstream: ingress_proto
+                .as_ref()
                 .map(|p| p.writer().ingress_is_eventstream())
                 .unwrap_or(false),
-            ingress_protocol: Box::from(ingress_protocol),
+            ingress_protocol: ingress_proto
+                .as_ref()
+                .map(|p| p.name_static())
+                .unwrap_or("openai"),
             op,
             permit: Some(permit),
             app: Some(app),
@@ -301,7 +315,7 @@ where
                         // alone would inject SSE text into a binary eventstream body on a
                         // bedrock-ingress → SSE-egress reframe — an undecodable frame for the SDK.
                         let err_bytes = mid_stream_error_bytes(
-                            &this.ingress_protocol,
+                            this.ingress_protocol,
                             this.ingress_eventstream,
                             MID_STREAM_GENERIC_DETAIL,
                         );
@@ -502,7 +516,7 @@ where
                         // reports IR usage (byte-identical to the previous inline read); a
                         // flat-fee op returns None and bills nothing.
                         let buf = std::mem::take(&mut this.nonstream_buf);
-                        this.op.extract_usage(&this.ingress_protocol, &buf)
+                        this.op.extract_usage(this.ingress_protocol, &buf)
                     } else {
                         None
                     };
