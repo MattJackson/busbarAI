@@ -151,7 +151,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 - With **governance active** (a `governance.admin_token` is configured), the caller's
   bearer token must resolve to an enabled virtual key, which is attached to the request
   for downstream ACL/budget checks.
-- With governance **inert** (no admin token — the default), the static `AuthMode` applies
+- With governance **inert** (no admin token, the default), the static `AuthMode` applies
   (`token` allowlist, `passthrough`, or `none`), exactly as if governance were absent. The
   caller's bearer token is threaded through for passthrough forwarding.
 - **Bedrock ingress** has two modes depending on whether governance is active:

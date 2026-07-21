@@ -2,18 +2,18 @@
 
 Busbar keeps serving through provider failures. That reliability is not one feature but a stack of them, spread across a few guides. This page is the map, and the worked example at the end shows them working together.
 
-**Structure** — how you describe your backends ([Core concepts](/docs/pools/)):
+**Structure**: how you describe your backends ([Core concepts](/docs/pools/)):
 
 - **[Pools](/docs/pools/)** - group backends into one named target with weighting and automatic failover.
 - **[Routing policies](/docs/routing/)** - choose which member serves each request: cheapest, fastest, least busy, or your own logic.
 
-**Resilience** — what happens when a backend misbehaves (the guides in this section):
+**Resilience**: what happens when a backend misbehaves (the guides in this section):
 
 - **[Circuit breaker](/docs/circuit-breaker/)** - fault-attributed breaking that classifies each failure and benches only the lane at fault.
 - **[In-flight failover](/docs/failover/)** - reroute a failing request before your client sees a byte, even mid-stream, across protocols.
 - **[Health and observability](/docs/observability/)** - `/healthz`, `/stats`, `/metrics`, and the signals to watch.
 
-**Control** — who may spend what ([Governance](/docs/guides/governance/)):
+**Control**: who may spend what ([Governance](/docs/guides/governance/)):
 
 - **[Governance and limits](/docs/guides/governance/)** - virtual keys, budgets, rate limits, and pool access control.
 

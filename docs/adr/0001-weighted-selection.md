@@ -1,4 +1,4 @@
-# ADR-0001 — Smooth weighted round-robin (SWRR) member selection
+# ADR-0001: Smooth weighted round-robin (SWRR) member selection
 
 > Status: accepted (reconstructed from code). The number `ADR-0001` is referenced
 > in `crates/busbar/src/store/mod.rs`; the prose below is reconstructed from the implementation, not
@@ -23,7 +23,7 @@ selection over the healthy candidate subset (implementation:
 `InMemoryStore::select_weighted_for` in `crates/busbar/src/store/mod.rs`):
 
 1. Filter candidates to the usable subset (not dead, budget remaining, breaker
-   cell admits — see [ADR-0002](0002-circuit-breaker.md)).
+   cell admits, see [ADR-0002](0002-circuit-breaker.md)).
 2. For every healthy candidate, `current_weight += effective_weight`.
 3. Pick the candidate with the largest `current_weight`.
 4. `current_weight -= total_weight` (sum of the healthy subset's weights) for the
@@ -39,7 +39,7 @@ weight 1 (selection over the lane-default cell).
 
 ## Consequences
 
-- Distribution is proportional *and* smooth — no thundering one member then
+- Distribution is proportional *and* smooth: no thundering one member then
   another.
 - Selection naturally adapts when members drop out: an unhealthy member is
   filtered before the weight math, so the remaining members absorb its share for
@@ -52,7 +52,7 @@ weight 1 (selection over the lane-default cell).
 
 ## See also
 
-- [docs/internals.md](../internals.md) — the selection math worked through.
-- [docs/architecture.md](../architecture.md) — where selection sits in the
+- [docs/internals.md](../internals.md) - the selection math worked through.
+- [docs/architecture.md](../architecture.md) - where selection sits in the
   request lifecycle.
-- [docs/configuration.md](../configuration.md) — pool / member `weight` config.
+- [docs/configuration.md](../configuration.md) - pool / member `weight` config.

@@ -66,7 +66,7 @@ chmod +x busbar
 ./busbar --version
 ```
 
-**Or use Docker**: a tiny `FROM scratch` image (the static binary plus the provider catalog, amd64 + arm64 — see the image-size badge on the [repo](https://github.com/GetBusbar/busbar) for the current compressed size), cosign-signed with build provenance:
+**Or use Docker**: a tiny `FROM scratch` image (the static binary plus the provider catalog, amd64 + arm64, see the image-size badge on the [repo](https://github.com/GetBusbar/busbar) for the current compressed size), cosign-signed with build provenance:
 
 ```bash
 docker run -d -p 8080:8080 \
@@ -111,7 +111,7 @@ models:
     provider: anthropic
 ```
 
-`provider` is the only required field on a model. `max_concurrent` (a per-lane concurrency limiter) is optional and defaults to unbounded — add it only when you want to cap in-flight requests to a model.
+`provider` is the only required field on a model. `max_concurrent` (a per-lane concurrency limiter) is optional and defaults to unbounded; add it only when you want to cap in-flight requests to a model.
 
 The key itself is never in this file. `api_key_env: ANTHROPIC_KEY` tells Busbar "read this provider's key from the `$ANTHROPIC_KEY` environment variable at startup", so you set the real secret in your environment ([Step 3](#step-3-set-environment-variables-and-run)), and `config.yaml` stays safe to commit and share.
 
@@ -125,7 +125,7 @@ Save this as `config.yaml` in your working directory.
 |---|---|
 | `providers.<name>.api_key_env` | Name of the environment variable holding this provider's API key |
 | `models.<name>.provider` | Which provider entry in the `providers` block this model calls |
-| `models.<name>.max_concurrent` | Optional per-lane concurrency limiter — max simultaneous in-flight requests to this model. Omit for unbounded (the default); set a value ≥ 1 to cap. |
+| `models.<name>.max_concurrent` | Optional per-lane concurrency limiter: max simultaneous in-flight requests to this model. Omit for unbounded (the default); set a value ≥ 1 to cap. |
 
 `providers` and `models` are the only required sections. `listen` defaults to `0.0.0.0:8080`. `auth` defaults to `none` (open relay) when omitted, fine for local dev, not for production.
 
@@ -340,7 +340,7 @@ auth:
 
 The caller's own token (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`) is forwarded directly to the upstream provider. Use this when each caller has their own provider key and you want Busbar purely for routing and protocol translation, not credential management.
 
-Note: `passthrough` is incompatible with an active governance engine (`governance.admin_token` set) — validation rejects the combination.
+Note: `passthrough` is incompatible with an active governance engine (`governance.admin_token` set); validation rejects the combination.
 
 ### Bedrock egress (Busbar signs requests with SigV4)
 
@@ -390,9 +390,9 @@ Before taking Busbar out of dev mode:
 
 - [ ] Set `auth.chain: [tokens]` with at least one `client_tokens` entry (or enable governance for per-key virtual tokens)
 - [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
-- [ ] Consider setting `max_concurrent` on models where you want to cap in-flight load to your provider tier (optional — omitted = unbounded)
+- [ ] Consider setting `max_concurrent` on models where you want to cap in-flight load to your provider tier (optional; omitted = unbounded)
 - [ ] Set `max_requests` to `-1` (unlimited lifetime budget) or a finite positive budget per model
-- [ ] Run `busbar --validate` (in CI and before every deploy/reload): parses and validates both YAML files with no server, no network, and no secrets required — exit `0` = valid, `1` = errors. See [`operations.md#validating-configuration-busbar---validate`](operations.md#validating-configuration-busbar---validate)
+- [ ] Run `busbar --validate` (in CI and before every deploy/reload): parses and validates both YAML files with no server, no network, and no secrets required. Exit `0` = valid, `1` = errors. See [`operations.md#validating-configuration-busbar---validate`](operations.md#validating-configuration-busbar---validate)
 - [ ] Verify `/healthz` returns `200` and `/stats` shows all lanes `usable: true` before routing production traffic
 - [ ] Consider `health.mode: dead` on providers you care about (re-probes tripped lanes so they recover faster after an outage clears)
 - [ ] Set `RUST_LOG=info` (the default); increase to `debug` only temporarily for diagnostics

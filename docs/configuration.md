@@ -97,19 +97,19 @@ A map of provider name → `ProviderDef`. The shipped catalog is a curated set o
 | `protocol` | string | no | `anthropic` | One of the six supported wire protocols: `anthropic`, `openai`, `gemini`, `bedrock`, `responses`, `cohere`. An unknown protocol is a startup error. |
 | `base_url` | string | **yes** | n/a | Scheme + host (+ optional path prefix). Must start with `https://` for external endpoints. An `http://` URL in the catalog is not blocked at parse time but will be rejected by the SSRF guard on deployment use. Trailing slash is trimmed. |
 | `error_map` | map<string, string> | no | `{}` | Maps a provider-specific error **code string** (from the JSON error body) to a canonical disposition class. Valid values: `rate_limit`, `overloaded`, `server_error`, `timeout`, `network`, `auth`, `billing`, `client_error`, `context_length`. An unrecognized class value is a startup error. HTTP-status classification (401→auth, 429→rate_limit, 5xx→server_error, etc.) applies automatically without an `error_map`; this field is only for provider-specific JSON codes. |
-| `path` | string | no | Protocol's standard path | Overrides the upstream request path appended to `base_url`. Must begin with `/`. Static — ignores the per-request model. Use when the API version is in `base_url` and the endpoint path differs from the protocol default (e.g. `/chat/completions` without `/v1`). |
+| `path` | string | no | Protocol's standard path | Overrides the upstream request path appended to `base_url`. Must begin with `/`. Static, ignores the per-request model. Use when the API version is in `base_url` and the endpoint path differs from the protocol default (e.g. `/chat/completions` without `/v1`). |
 | `path_base` | string | no | Protocol's default base | For URL-model protocols: overrides the hardcoded base segment while the per-request suffix is still appended. Must begin with `/`. On **Gemini** it replaces `/v1beta/models` (suffix `/{model}:verb`) to reach Google Vertex AI's `/v1/projects/{project}/locations/{location}/publishers/google/models` layout; on **Anthropic** it enables Claude-on-Vertex (the model moves into a `:rawPredict`/`:streamRawPredict` suffix and the body carries `anthropic_version` in place of `model`). Config-only, no code. |
-| `auth` | string | no | Protocol's native auth | The egress auth mechanism. `bearer` (sends `Authorization: Bearer <key>`) · `api-key` (sends `api-key: <key>`, for Azure OpenAI) · `jwt-bearer` (OAuth 2.0 JWT-bearer, RFC 7523 — mints + auto-refreshes a bearer from a service-account key in `api_key_env`; e.g. Google Vertex AI) · `oauth-client-credentials` (OAuth 2.0 client-credentials, RFC 6749 §4.4 — `api_key_env` holds `client_id:client_secret`, exchanged at `token_url` for a bearer; e.g. Azure OpenAI via Entra ID). When unset, each protocol uses its native scheme: bearer for anthropic/openai/responses/cohere, `x-goog-api-key` for gemini, AWS SigV4 for bedrock. |
-| `token_url` | string | no | none | OAuth token endpoint for `auth: oauth-client-credentials` — where busbar POSTs the client credentials for a bearer. Required for that auth; must be https for a public host. |
+| `auth` | string | no | Protocol's native auth | The egress auth mechanism. `bearer` (sends `Authorization: Bearer <key>`) · `api-key` (sends `api-key: <key>`, for Azure OpenAI) · `jwt-bearer` (OAuth 2.0 JWT-bearer, RFC 7523: mints + auto-refreshes a bearer from a service-account key in `api_key_env`; e.g. Google Vertex AI) · `oauth-client-credentials` (OAuth 2.0 client-credentials, RFC 6749 §4.4: `api_key_env` holds `client_id:client_secret`, exchanged at `token_url` for a bearer; e.g. Azure OpenAI via Entra ID). When unset, each protocol uses its native scheme: bearer for anthropic/openai/responses/cohere, `x-goog-api-key` for gemini, AWS SigV4 for bedrock. |
+| `token_url` | string | no | none | OAuth token endpoint for `auth: oauth-client-credentials`, where busbar POSTs the client credentials for a bearer. Required for that auth; must be https for a public host. |
 | `scope` | string | no | none | OAuth scope for `auth: oauth-client-credentials`. Required for that auth. |
 | `health` | object | no | none | Active health-probe config. See [Health probing](#health-probing). |
 
-> **OAuth self-minting (`jwt-bearer` / `oauth-client-credentials`) — boot window.** These lanes mint
+> **OAuth self-minting (`jwt-bearer` / `oauth-client-credentials`): boot window.** These lanes mint
 > their first bearer token in the background at startup and on every config reload. For the brief window
 > before that first mint completes, the lane has no token and requests routed to it fail auth (upstream
 > 401); a burst can trip the lane's breaker, which then recovers automatically once the token lands (the
 > active health prober skips the lane until it is ready, so probing never parks it). This self-heals in
-> well under a second — but if you route heavy traffic to a freshly-booted OAuth lane, expect a few 401s
+> well under a second. But if you route heavy traffic to a freshly-booted OAuth lane, expect a few 401s
 > until the first token mints. Static-key lanes (`bearer` / `api-key` / SigV4) have no such window.
 
 Example entries:
@@ -206,7 +206,7 @@ the files and restarting. Full operational guide:
 
 ### `auth`
 
-Front-door authentication for clients. This chain is what gates requests by default. When [governance](#governance) is **active** (a `governance.admin_token` is set), governance virtual keys supersede static `auth` entirely — every request must then carry a valid enabled virtual key. With no admin token governance is inert and this chain applies unchanged.
+Front-door authentication for clients. This chain is what gates requests by default. When [governance](#governance) is **active** (a `governance.admin_token` is set), governance virtual keys supersede static `auth` entirely: every request must then carry a valid enabled virtual key. With no admin token governance is inert and this chain applies unchanged.
 
 ```yaml
 auth:
@@ -218,10 +218,10 @@ auth:
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `chain` | list<string> | no | `[]` | The ordered authentication chain — each name is a compiled-in auth module (the built-in is `tokens`). `[]` (default) is the open front door: no client authentication, development only, loud startup warning. An unknown module name is a startup error. |
-| `upstream_credentials` | string | no | `own` | Whose key hits the provider: `own` (Busbar's configured lane credential) or `passthrough` (forward the caller's own token upstream — Busbar holds no keys). |
+| `chain` | list<string> | no | `[]` | The ordered authentication chain, each name a compiled-in auth module (the built-in is `tokens`). `[]` (default) is the open front door: no client authentication, development only, loud startup warning. An unknown module name is a startup error. |
+| `upstream_credentials` | string | no | `own` | Whose key hits the provider: `own` (Busbar's configured lane credential) or `passthrough` (forward the caller's own token upstream; Busbar holds no keys). |
 | `client_tokens` | list<string> | no | `[]` | The `tokens` module's allowlist (env-interpolated). Required to be non-empty when `tokens` is in the chain. All comparisons are constant-time (no timing oracle). Inert when `tokens` is not in the chain. |
-| `modules` | map | no | `{}` | Per-module trust-boundary caps, keyed by module name — see below. |
+| `modules` | map | no | `{}` | Per-module trust-boundary caps, keyed by module name (see below). |
 | `mode` | string | no | n/a | **Removed in 1.3** (was `token`/`passthrough`/`none`). The `auth` block rejects unknown keys, so a stale `mode:` is a hard parse error. Mapping: `mode: token` → `chain: [tokens]`; `mode: none` → `chain: []`; `mode: passthrough` → `chain: []` + `upstream_credentials: passthrough`. |
 
 **Token extraction order:** `Authorization: Bearer`, then `x-api-key`, then `x-goog-api-key`. Blank values are treated as absent.
@@ -244,7 +244,7 @@ auth:
 
 All other five ingress protocols use bearer-style auth and work with every chain configuration.
 
-#### `auth.modules` — per-module trust-boundary caps
+#### `auth.modules`: per-module trust-boundary caps
 
 An auth module is a fully trusted endpoint: a module asserting `groups: ["busbar-admins"]` IS
 asserting an admin. Two operator-owned caps bound any module's blast radius, applying wherever
@@ -260,15 +260,15 @@ auth:
 
 | Field | Default | Notes |
 |---|---|---|
-| `allowed_groups` | absent (no cap) | Busbar intersects the module's returned groups with this allowlist BEFORE `group_map` resolution — a module cannot claim a group you did not pre-authorize for it. |
+| `allowed_groups` | absent (no cap) | Busbar intersects the module's returned groups with this allowlist BEFORE `group_map` resolution: a module cannot claim a group you did not pre-authorize for it. |
 | `max_admin_scope` | `read-only` | Ceiling on the admin scope obtainable through this module, regardless of what `group_map` grants: `read-only` \| `hooks-register` \| `full`. `full` is an explicit opt-in, warned at startup. The built-in `admin-tokens` operator credential is exempt (it is the root credential). |
 
 ---
 
 ### `admin_auth` and `group_map`
 
-The admin API (`/api/v1/admin/*`) authenticates through its own chain — `admin_auth:` (default
-`[admin-tokens]`, the single operator token) — and `group_map:` maps identity-provider GROUPS to
+The admin API (`/api/v1/admin/*`) authenticates through its own chain, `admin_auth:` (default
+`[admin-tokens]`, the single operator token), and `group_map:` maps identity-provider GROUPS to
 authority, both admin and data-plane:
 
 ```yaml
@@ -284,12 +284,12 @@ group_map:
 |---|---|
 | `admin_scope` | The admin authority this group grants: `read-only` \| `hooks-register` \| `full`. Absent = none. The most permissive of a principal's mapped groups wins (then the module ceiling applies). |
 | `allowed_pools` | DATA-PLANE grant: pools this group may target. Setting it (even `[]` = every pool) is what grants inference access at all; a group with only `admin_scope` confers none. Pool lists union across a principal's groups. |
-| `rpm_limit` / `tpm_limit` / `max_budget_cents` | Rate and spend caps for principals granted through this group — enforced by exactly the machinery a virtual key uses, keyed by the principal. Most-permissive union: a granting group without a cap lifts that axis; otherwise the max wins. |
+| `rpm_limit` / `tpm_limit` / `max_budget_cents` | Rate and spend caps for principals granted through this group, enforced by exactly the machinery a virtual key uses, keyed by the principal. Most-permissive union: a granting group without a cap lifts that axis; otherwise the max wins. |
 
 Unmapped groups grant nothing (fail closed): with governance active (an `admin_token` set), an
 identified principal whose groups earn no `allowed_pools` grant is rejected outright.
 
-The admin chain is live-mutable over the API (`PUT /api/v1/admin/auth`) with an anti-lockout guard —
+The admin chain is live-mutable over the API (`PUT /api/v1/admin/auth`) with an anti-lockout guard;
 see the [Admin API guide](./admin-api.md).
 
 ---
@@ -348,13 +348,13 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `provider` | string | **yes** | n/a | Must name a key in this file's `providers` map. |
-| `max_concurrent` | integer | no | unset (unbounded) | Optional per-lane concurrency limiter: the max simultaneous in-flight requests for this lane (semaphore size). **Omit it for no cap** (unbounded) — a limiter you opt into, mirroring `max_requests`. Set a positive integer to cap. Must be ≥ 1 when set (`0` = a lane that never admits a request = startup error). |
+| `max_concurrent` | integer | no | unset (unbounded) | Optional per-lane concurrency limiter: the max simultaneous in-flight requests for this lane (semaphore size). **Omit it for no cap** (unbounded): a limiter you opt into, mirroring `max_requests`. Set a positive integer to cap. Must be ≥ 1 when set (`0` = a lane that never admits a request = startup error). |
 | `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` (default) = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
 | `upstream_model` | string | no | the config key | The model id sent to the provider on the wire (request body for body-model protocols; URL path for path-model protocols like Bedrock/Gemini; and health probes). Defaults to the config key. Set it when the key can't be the wire id: most commonly to run the **same model behind two providers** (the keys must differ, but each needs its own provider-specific model string). Must be non-empty when set. Metrics, breaker cells, and logs still key off the config key, not this. |
 | `attempt_timeout_ms` | integer | no | unset (no cap) | Per-attempt cap, in milliseconds, on time to **response headers** (the hang detector). If the provider has not started answering within the cap, the attempt is treated exactly like a transport timeout: the breaker records a transient failure and the request fails over to the next pool member within the same request. Because the cap covers only connect + headers, a healthy long **stream body** is never cut off by it. A pool member's own `attempt_timeout_ms` overrides this per pool. Must be ≥ 1 when set (0 is a startup error); always floored by the request's remaining `failover.timeout_secs` budget. |
-| `reasoning` | bool | no | `false` | Operator declaration that this model accepts reasoning/thinking request parameters (Anthropic `thinking`, Gemini `thinkingConfig`, OpenAI `reasoning_effort`). Gates the [cross-protocol reasoning carry](#cross-protocol-reasoning-reasoning): without the flag, a translated reasoning ask is dropped at the seam (warned) and never sent, so a non-reasoning model can never 400 from translation. Capability is per-model, not per-provider (Sonnet takes `thinking`; Haiku rejects it) — you declare what you deployed, like `context_max`. A pool member's `reasoning` overrides this per pool. Same-protocol passthrough ignores it. |
-| `prompt_caching` | bool | no | `false` | Operator declaration that this model accepts prompt-cache markers on dialects where the marker is **model-gated** — Bedrock Converse's `cachePoint`, which Claude accepts but Amazon Nova hard-rejects with a 400 ("extraneous key"). The cache twin of `reasoning`: without the flag, cross-protocol `cache_control` breakpoints headed to such a dialect are dropped at the seam (warned) and the request proceeds uncached — fail-safe, never a translation-induced 400. Set it on Claude-on-Bedrock models to keep their prompt caching across the Anthropic→Bedrock translation. Dialects whose cache form is universally accepted (the Anthropic API's `cache_control`) ignore the flag, as does same-protocol passthrough (byte-exact). |
+| `reasoning` | bool | no | `false` | Operator declaration that this model accepts reasoning/thinking request parameters (Anthropic `thinking`, Gemini `thinkingConfig`, OpenAI `reasoning_effort`). Gates the [cross-protocol reasoning carry](#cross-protocol-reasoning-reasoning): without the flag, a translated reasoning ask is dropped at the seam (warned) and never sent, so a non-reasoning model can never 400 from translation. Capability is per-model, not per-provider (Sonnet takes `thinking`; Haiku rejects it). You declare what you deployed, like `context_max`. A pool member's `reasoning` overrides this per pool. Same-protocol passthrough ignores it. |
+| `prompt_caching` | bool | no | `false` | Operator declaration that this model accepts prompt-cache markers on dialects where the marker is **model-gated**: Bedrock Converse's `cachePoint`, which Claude accepts but Amazon Nova hard-rejects with a 400 ("extraneous key"). The cache twin of `reasoning`: without the flag, cross-protocol `cache_control` breakpoints headed to such a dialect are dropped at the seam (warned) and the request proceeds uncached, fail-safe, never a translation-induced 400. Set it on Claude-on-Bedrock models to keep their prompt caching across the Anthropic→Bedrock translation. Dialects whose cache form is universally accepted (the Anthropic API's `cache_control`) ignore the flag, as does same-protocol passthrough (byte-exact). |
 
 ```yaml
 models:
@@ -520,7 +520,7 @@ Guard rails, applied automatically: the budget is clamped to leave at least 1024
 
 #### Pool `hooks`: ordering and gates
 
-A pool names the hooks it wants — an **ordering strategy** and/or **gates** — in one `hooks: [...]` list. The ordering strategy decides the **order** in which healthy members are tried; gates can **reject**, **restrict**, or **order** the request before dispatch. The default (no list, or no strategy named) is `weighted` (SWRR) — zero-cost and byte-identical to the pre-hooks baseline. The full hook model — the registry, taps vs gates, grants, reply arms, and guarantees — lives in [Hooks](hooks.md).
+A pool names the hooks it wants (an **ordering strategy** and/or **gates**) in one `hooks: [...]` list. The ordering strategy decides the **order** in which healthy members are tried; gates can **reject**, **restrict**, or **order** the request before dispatch. The default (no list, or no strategy named) is `weighted` (SWRR), zero-cost and byte-identical to the pre-hooks baseline. The full hook model (the registry, taps vs gates, grants, reply arms, and guarantees) lives in [Hooks](hooks.md).
 
 ```yaml
 hooks:                      # top-level registry: define each hook once
@@ -553,9 +553,9 @@ pools:
 
 **The pool `hooks:` list:**
 
-- **At most one ordering strategy** — `weighted`, `cheapest`, `fastest`, `least_busy`, or `usage` — sets the pool's base ranking. Naming none leaves the base defaulted: the registry's `default: true` hook (if one exists) becomes the base, else the compiled-in `weighted`.
-- **Any other name is a gate reference** into the top-level `hooks:` registry (must exist and be `kind: gate` — a dangling name or a tap is a startup error).
-- **Several gates may share the list.** All decision gates — the pool's and any `global_hooks` — fire **concurrently** per request and reconcile deterministically: any `reject` wins (the lowest-`priority` gate's status/message surfaces), `restrict`s intersect (an empty intersection applies that gate's `on_empty` — fail-closed by default), and with multiple `order`s the last in the chain wins. A restriction persists across every failover hop.
+- **At most one ordering strategy** (`weighted`, `cheapest`, `fastest`, `least_busy`, or `usage`) sets the pool's base ranking. Naming none leaves the base defaulted: the registry's `default: true` hook (if one exists) becomes the base, else the compiled-in `weighted`.
+- **Any other name is a gate reference** into the top-level `hooks:` registry (must exist and be `kind: gate`; a dangling name or a tap is a startup error).
+- **Several gates may share the list.** All decision gates (the pool's and any `global_hooks`) fire **concurrently** per request and reconcile deterministically: any `reject` wins (the lowest-`priority` gate's status/message surfaces), `restrict`s intersect (an empty intersection applies that gate's `on_empty`, fail-closed by default), and with multiple `order`s the last in the chain wins. A restriction persists across every failover hop.
 
 **Top-level `hooks:` registry fields** (per named hook; full reference in [Hooks](hooks.md)):
 
@@ -564,14 +564,14 @@ pools:
 | `kind` | `tap` \| `gate` | required | `gate` = fire-and-wait (may rank/reject/restrict/rewrite); `tap` = fire-and-forget observation. |
 | `socket` | string | none | Absolute Unix-domain-socket path of the operator-run hook binary (lazy connect; Unix only). Exactly one of `socket`/`webhook`. |
 | `webhook` | string | none | Sidecar URL. SSRF-guarded (loopback allowed; RFC-1918/CGNAT/link-local/metadata blocked; remote must be `https://`). |
-| `timeout_ms` | integer | `1` | Hard wall-clock deadline for a gate decision. Co-located socket ≈ 8 µs, webhook ≈ 34 µs — raise it when the hook does I/O. On timeout the decision is coerced to `on_error`. |
-| `on_error` | string | `nothing` | Fallback when a gate times out / errors / saturates: `nothing` (default — do not participate — a failing non-routing gate can never displace another gate's verdict), `weighted` (the ordering floor; same behavior, the name for ordering gates), `reject` (fail closed — security gates set this), `first`, or the NAME of a fallback hook (a chain, proven terminating at boot). A gate's deliberate `reject` reply is a decision, not a failure — `on_error` never applies to it. |
+| `timeout_ms` | integer | `1` | Hard wall-clock deadline for a gate decision. Co-located socket ≈ 8 µs, webhook ≈ 34 µs. Raise it when the hook does I/O. On timeout the decision is coerced to `on_error`. |
+| `on_error` | string | `nothing` | Fallback when a gate times out / errors / saturates: `nothing` (default: do not participate, a failing non-routing gate can never displace another gate's verdict), `weighted` (the ordering floor; same behavior, the name for ordering gates), `reject` (fail closed; security gates set this), `first`, or the NAME of a fallback hook (a chain, proven terminating at boot). A gate's deliberate `reject` reply is a decision, not a failure. `on_error` never applies to it. |
 | `prompt` | `no` \| `ro` \| `rw` | `no` | Prompt-content grant: `ro` sends the prompt read-only; `rw` additionally allows a `rewrite` reply. `rw` on a tap is a startup error. Immutable after registration; enforced both directions. |
 | `user` | `no` \| `ro` | `no` | Caller-identity grant: governance key id/name (never the secret) + the body's end-user field. |
 | `priority` | integer | `0` | Chain ordering key: orders the rewrite transform chain and tie-breaks the phase-2 reconcile (which reject surfaces; which order is "last"). Ties keep globals first, then config order. |
-| `on_empty` | string | `reject` | A restrict gate's empty-intersection behavior: `reject` (fail closed, 503) or `weighted` (advisory escape — that gate's restriction is skipped). |
-| `global` | boolean | `false` | Fire on every request (overlay on top of each pool's own hooks) — inline sugar for listing the name in `global_hooks:`. |
-| `default` | boolean | `false` | Make this hook THE base ordering for pools that named no strategy (replacement, not overlay). At most one hook may set it — a second is a startup error. |
+| `on_empty` | string | `reject` | A restrict gate's empty-intersection behavior: `reject` (fail closed, 503) or `weighted` (advisory escape: that gate's restriction is skipped). |
+| `global` | boolean | `false` | Fire on every request (overlay on top of each pool's own hooks): inline sugar for listing the name in `global_hooks:`. |
+| `default` | boolean | `false` | Make this hook THE base ordering for pools that named no strategy (replacement, not overlay). At most one hook may set it. A second is a startup error. |
 | `settings` | map | `{}` | Opaque settings pushed to the hook via the `configure` wire message: as the first message on every socket (re)connection, and live via `PATCH /api/v1/admin/hooks/{name}/settings` (commit-on-ack). Busbar never interprets the contents. |
 
 The per-member `tier`, `cost_per_mtok`, and `tags` fields documented in [Members and weights](#members-and-weights) above feed the ordering strategies and gate candidates. Gate observability: the `x-busbar-route-policy` / `x-busbar-route-target` response headers name the deciding hook and chosen lane.
@@ -792,12 +792,12 @@ observability:
 
 ### `governance`
 
-The virtual-key governance layer. **Governance is always available but INERT by default** — it enforces nothing until you set `governance.admin_token` (and mint keys via the admin API). This section only *configures* it; it has no `enabled` switch.
+The virtual-key governance layer. **Governance is always available but INERT by default**: it enforces nothing until you set `governance.admin_token` (and mint keys via the admin API). This section only *configures* it; it has no `enabled` switch.
 
-- **Inert (default — no `admin_token`):** governance enforces nothing. Requests are gated by the static [`auth`](#auth) chain (`[tokens]` or open relay) **exactly as if governance were absent** — a default deploy behaves the same as before governance was on-by-default. The `/api/v1/admin` key-management API is disabled (no token to guard it), so no virtual keys can be minted.
+- **Inert (default, no `admin_token`):** governance enforces nothing. Requests are gated by the static [`auth`](#auth) chain (`[tokens]` or open relay) **exactly as if governance were absent**. A default deploy behaves the same as before governance was on-by-default. The `/api/v1/admin` key-management API is disabled (no token to guard it), so no virtual keys can be minted.
 - **Active (`admin_token` set):** enforcement turns on. Static `auth` tokens are superseded and **every inference request must resolve to an enabled busbar-issued virtual key**. Per-key controls apply: allowed pools (ACL), budget (cents), budget period, and rate limits (RPM/TPM). The admin API (guarded by the admin token) is what mints those keys.
 
-The store defaults to **in-memory (ephemeral RAM)** — zero setup, but keys/budgets/usage reset on restart. Choose a durable `store` (`sqlite`, `postgres`, `redis`, each a loadable plugin) for persistence.
+The store defaults to **in-memory (ephemeral RAM)**: zero setup, but keys/budgets/usage reset on restart. Choose a durable `store` (`sqlite`, `postgres`, `redis`, each a loadable plugin) for persistence.
 
 > **Durable-store caveat.** If you point governance at a durable store that already holds virtual keys from a prior run but then run with **no `admin_token`**, governance is inert and those persisted keys are **NOT enforced** (their budget / RPM / TPM / allowed_pools are bypassed and access falls through to the static `auth.chain`). Busbar detects this at boot and emits a **loud error** (`durable governance store contains N key(s) but no admin_token is set … set governance.admin_token to enforce them`) on stderr and at ERROR level. Set `governance.admin_token` to re-activate enforcement.
 
@@ -1093,8 +1093,8 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | Breaker `max_cooldown < base_cooldown` | Cooldown ceiling below the base |
 | `tokens` in `auth.chain` + empty `client_tokens` | Every request would be rejected |
 | `auth.chain` names an unknown module | Every chain entry must be a compiled-in auth module |
-| `auth.mode` present | Removed in 1.3 — write `chain:` + `upstream_credentials:` |
-| `governance.admin_token` set but blank/whitespace-only | Admin API would be silently inaccessible (an unset token is fine — governance is simply inert) |
+| `auth.mode` present | Removed in 1.3. Write `chain:` + `upstream_credentials:` |
+| `governance.admin_token` set but blank/whitespace-only | Admin API would be silently inaccessible (an unset token is fine: governance is simply inert) |
 | `governance.admin_token` set + `upstream_credentials: passthrough` | Unsupported combination (active governance supersedes passthrough) |
 | `${VAR}` unset in config | Unresolvable interpolation reference |
 | `${}` or unclosed `${` | Malformed interpolation syntax |
@@ -1108,5 +1108,5 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | Heterogeneous pool (members span more than one backend protocol, cross-protocol translation applies) |
 | `api_key_env` names an env var that is unset or empty at boot (lane will fail auth) |
 | `allowed_pools` on a virtual key (admin API) names a pool not currently configured |
-| `chain: [tokens]` or `chain: []` with governance ACTIVE (`admin_token` set) — static auth is superseded; effective mode is governance virtual keys |
-| Durable governance store holding keys with no `admin_token` set — governance is inert; those persisted keys are NOT enforced (boot emits a loud error) |
+| `chain: [tokens]` or `chain: []` with governance ACTIVE (`admin_token` set): static auth is superseded; effective mode is governance virtual keys |
+| Durable governance store holding keys with no `admin_token` set: governance is inert; those persisted keys are NOT enforced (boot emits a loud error) |

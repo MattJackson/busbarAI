@@ -1,4 +1,4 @@
-# ADR-0005 — Superset IR & translation fidelity
+# ADR-0005: Superset IR & translation fidelity
 
 > Status: accepted (reconstructed from code). `ADR-0005` is referenced in
 > `crates/busbar/src/ir/mod.rs` (including the explicit f64-not-f32 note). The prose is
@@ -9,11 +9,11 @@
 Busbar's thesis is *protocols, not providers*: a client speaking one wire
 protocol can reach a backend speaking another. That requires an intermediate
 representation (IR) every protocol can read into and write out of. The IR's whole
-reason to exist is **fidelity** — if translating a request silently mutates the
+reason to exist is **fidelity**: if translating a request silently mutates the
 caller's intent, the gateway has failed at its one job. Two specific hazards:
 
 1. **Numeric drift.** JSON numbers are IEEE-754 doubles. If `temperature` were
-   held as `f32`, a caller's `0.7` round-trips to `0.699999988…` — a silent
+   held as `f32`, a caller's `0.7` round-trips to `0.699999988…`, a silent
    mutation of exactly the kind busbar exists to prevent.
 2. **Dropped semantics.** Anthropic-style `cache_control`, extended-thinking
    blocks (with their `signature`), and citations carry real billing/behavioral
@@ -25,11 +25,11 @@ Define a **superset IR** (`crates/busbar/src/ir/mod.rs`) that is the union of wh
 protocols can represent, not the intersection:
 
 - `IrRequest` holds `system`, `messages`, `tools`, `max_tokens`,
-  `temperature: Option<f64>` (explicitly f64 — see the in-code comment), a
+  `temperature: Option<f64>` (explicitly f64, see the in-code comment), a
   `stream` flag, and an `extra: Map` passthrough for modeled-subset-adjacent
   fields (e.g. `top_p`).
 - `IrBlock` models `Text { cache_control, citations }`,
-  `Thinking { signature }`, `ToolUse`, `ToolResult`, and `Image` — so
+  `Thinking { signature }`, `ToolUse`, `ToolResult`, and `Image`, so
   cache-control, thinking signatures, and citations survive a hop.
 - `IrResponse` carries `model` (the upstream-reported serving model) so a pooled
   cross-protocol response still names the member that served it, matching a direct
@@ -50,16 +50,16 @@ about *what the IR preserves*).
 - Fields outside the modeled subset survive a *same-protocol* route losslessly
   (passthrough) and survive a *cross-protocol* route only insofar as they are
   modeled or carried in `extra`. Anything neither modeled nor in `extra` is
-  **lossy by necessity** on a cross-protocol hop — this is documented as expected
+  **lossy by necessity** on a cross-protocol hop; this is documented as expected
   behavior in [operations.md](../operations.md) troubleshooting.
 - The IR is a superset, so adding a protocol that introduces a genuinely new
   content kind may require extending the IR enums (and every writer's handling of
-  the new variant) — a deliberate, compiler-enforced cost.
+  the new variant), a deliberate, compiler-enforced cost.
 
 ## See also
 
-- [docs/internals.md](../internals.md) — the fidelity contract and what is lossy.
-- [docs/architecture.md](../architecture.md) — the IR seam in the request
+- [docs/internals.md](../internals.md) - the fidelity contract and what is lossy.
+- [docs/architecture.md](../architecture.md) - the IR seam in the request
   lifecycle.
-- [docs/development.md](../development.md) — adding a protocol against the IR
+- [docs/development.md](../development.md) - adding a protocol against the IR
   contract.

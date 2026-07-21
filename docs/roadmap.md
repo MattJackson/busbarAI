@@ -83,11 +83,11 @@ the next **auth adapters** on a seam that already exists.
 These reuse existing protocols (no new wire format) gated behind an auth shim: the
 same pattern Bedrock established with SigV4 and Azure OpenAI (shipped in 0.14):
 
-- **Google Vertex AI**: **shipped in 1.4** — both **Gemini-on-Vertex** (`gemini`
+- **Google Vertex AI**: **shipped in 1.4**, both **Gemini-on-Vertex** (`gemini`
   protocol) and **Claude-on-Vertex** (`anthropic` protocol), at a project/location-
   scoped URL (`path_base`) authed with the new `auth: jwt-bearer` OAuth adapter (a
   short-lived bearer minted from a service-account key via the RFC 7523 JWT-bearer
-  grant, and auto-refreshed). Each is a `providers.yaml` entry — no new protocol.
+  grant, and auto-refreshed). Each is a `providers.yaml` entry, no new protocol.
   Claude-on-Vertex additionally moves the model into the URL (`:rawPredict`) and
   adds the `anthropic_version` body field, both handled automatically.
 - **Databricks Foundation Model APIs**: `openai` protocol with bearer auth, but

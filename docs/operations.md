@@ -19,15 +19,15 @@ variables.
 
 **Worker threads and scaling.** Busbar's request path is CPU-bound (parse, translate, serialize), so
 throughput scales with worker threads. The default is **one worker per available core**
-(`available_parallelism`, which respects CPU affinity and the cgroup **cpuset** — but **not** the CFS
+(`available_parallelism`, which respects CPU affinity and the cgroup **cpuset**, but **not** the CFS
 `cpu.max` bandwidth quota, which it cannot see), which gives linear scaling: ~9,750 req/s per core,
 sub-millisecond, to ~156k on 16 cores in our [benchmark](https://getbusbar.com/performance). Each worker
 carries a thread stack and, on glibc, its own malloc arena, so idle memory grows slowly with the count. For
 a **footprint-sensitive sidecar** set `BUSBAR_WORKER_THREADS=1` (or `2`). On a **CPU-quota-limited pod** (a
 k8s CPU *limit* on a many-core node) the default sizes to the node's full core count and oversubscribes the
-quota — **set `BUSBAR_WORKER_THREADS` to your CPU limit**; likewise to cap a shared box, set it to the cores
+quota: **set `BUSBAR_WORKER_THREADS` to your CPU limit**; likewise to cap a shared box, set it to the cores
 you want Busbar to use. Scale up by default, tune down deliberately. *(Before 1.4.0 the default was capped at
-`min(cores, 4)`, which pinned throughput to ~4 cores regardless of box size — set the variable explicitly
+`min(cores, 4)`, which pinned throughput to ~4 cores regardless of box size, set the variable explicitly
 on older binaries.)*
 
 Startup is fail-loud: an unset `${VAR}`, an unknown provider reference, an unknown
@@ -39,7 +39,7 @@ The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive c
 
 ### Validating configuration (`busbar --validate`)
 
-`busbar --validate` runs the exact load → resolve → validate pipeline the gateway runs at boot —
+`busbar --validate` runs the exact load → resolve → validate pipeline the gateway runs at boot,
 then exits, **without** starting the server. It binds no port, writes no state file, spawns no
 tasks, opens no TLS material, and makes no network call, so it is safe to run anywhere, including
 in CI and against a config edited on a live host before you reload it.
@@ -50,11 +50,11 @@ BUSBAR_CONFIG=./config.yaml BUSBAR_PROVIDERS=./providers.yaml busbar --validate
 #   note: 1 env var(s) referenced but unset here — required at runtime: BUSBAR_CLIENT_TOKEN
 ```
 
-- **Exit `0`** = valid; **`1`** = errors (same diagnostics boot prints — invalid YAML, removed keys,
+- **Exit `0`** = valid; **`1`** = errors (same diagnostics boot prints: invalid YAML, removed keys,
   dangling pool/lane references, malformed auth chains, cert-file and `base_url`/`path` SSRF violations).
   Use it as a CI gate: `busbar --validate && deploy`.
 - **Secrets are not required.** It checks *structure*, not upstream reachability, so a `${VAR}` unset
-  in your shell is reported in a `note:` ("required at runtime") rather than failing — you can validate
+  in your shell is reported in a `note:` ("required at runtime") rather than failing, you can validate
   in CI without production secrets. (At real boot an unset `${VAR}` is still a hard error.)
 - Honors `BUSBAR_CONFIG`, `BUSBAR_PROVIDERS`, and `--safe-mode` exactly as boot does. Because it reuses
   the boot path, a clean `--validate` means a clean boot.
@@ -134,7 +134,7 @@ directly exposed to untrusted networks is not recommended.
 
 ## Running multiple instances (HA)
 
-Busbar is **stateless** (unless governance is enabled — see below), so the robust
+Busbar is **stateless** (unless governance is enabled, see below), so the robust
 production shape is **N instances behind a load balancer**, each configured
 identically, each health-checked on `GET /healthz`. Any instance serves any request;
 lose one and the LB routes around it. On Kubernetes this is `replicaCount` + the
@@ -144,8 +144,8 @@ Service/Ingress + a PodDisruptionBudget; on VMs it is N hosts behind an external
 Three things are worth understanding before you scale out:
 
 - **Circuit-breaker and lane health are per-instance.** Each instance learns upstream
-  health independently from its own traffic. This is correct — a lane that's dead for
-  one instance is usually dead for all — and a new instance re-learns within seconds.
+  health independently from its own traffic. This is correct (a lane that's dead for
+  one instance is usually dead for all) and a new instance re-learns within seconds.
   Nothing is shared or needs sharing.
 - **Session affinity is per-instance.** The `affinity` header pins a session to a lane
   *within one instance*. Across instances, an LB that spreads a client's requests will
@@ -153,7 +153,7 @@ Three things are worth understanding before you scale out:
   LB (e.g. by the affinity header / a cookie) so a session lands on the same instance.
 - **Governance is per-instance and not shared.** Budgets and rate limits live in each
   instance's local SQLite store, so with N instances a "global" limit is enforced
-  **per instance** — effectively ×N. For strict global budget/rate enforcement, run a
+  **per instance**, effectively ×N. For strict global budget/rate enforcement, run a
   **single instance** (scale vertically) until an external governance store is
   available. The proxy path itself scales horizontally without this caveat; only
   governance *enforcement* is bounded to one writer.

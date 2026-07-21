@@ -16,77 +16,77 @@ item under **Changed**.
 ### Changed
 
 - **Governance is now always available; `governance.enabled` is removed.** Governance no longer has an
-  on/off switch — it is always present and simply INERT until an admin token is set and virtual keys are
+  on/off switch. It is always present and simply INERT until an admin token is set and virtual keys are
   minted (a default deploy with no admin token behaves exactly as "off" did, with identical RAM). The
-  durable-store backend is now the choice, via **`governance.store`**: `memory` (default — ephemeral RAM,
+  durable-store backend is now the choice, via **`governance.store`**: `memory` (default, ephemeral RAM,
   zero-setup) or `sqlite` (persists to `db_path`). The engine names storage only through the `Store`
   contract; SQLite and the RAM store are swappable plugin crates (`busbar-store-sqlite`,
   `busbar-store-memory`).
-- **Migration** — a config that sets `governance.enabled` will fail to start (unknown field). Remove it.
-  **If you relied on SQLite persistence, you must now set `governance.store: sqlite`** — otherwise
+- **Migration.** A config that sets `governance.enabled` will fail to start (unknown field). Remove it.
+  **If you relied on SQLite persistence, you must now set `governance.store: sqlite`**, otherwise
   governance defaults to the ephemeral in-memory store and keys/budgets reset on restart. On the RAM
   default, busbar logs a startup warning to that effect.
 
 ### Added
 
-- **Store plugins — durable backends load from a dynamic library, and the default binary is lean.** The
+- **Store plugins: durable backends load from a dynamic library, and the default binary is lean.** The
   SQLite store is no longer compiled into the engine; it ships as a droppable plugin
   (`libbusbar_store_sqlite_plugin.{so,dll,dylib}`) that busbar loads in-process at boot over a stable,
   versioned **store C ABI** when `governance.store: sqlite`. That drops the bundled ~4.7 MB SQLite C
-  amalgamation from the default build — **release binary ~14 MB → ~9.4 MB**. New workspace crates:
-  `busbar-plugin-abi` (the frozen ABI — five extern-C symbols carrying JSON `StoreRequest`/`Response`),
+  amalgamation from the default build (**release binary ~14 MB → ~9.4 MB**). New workspace crates:
+  `busbar-plugin-abi` (the frozen ABI, five extern-C symbols carrying JSON `StoreRequest`/`Response`),
   `busbar-plugin-sdk` (`export_store_plugin!` to author a store in Rust and build it as a `cdylib`), and
-  `busbar-plugin-loader` (the `libloading` loader — all FFI `unsafe` is isolated here, so the engine keeps
+  `busbar-plugin-loader` (the `libloading` loader; all FFI `unsafe` is isolated here, so the engine keeps
   its `forbid(unsafe_code)` guarantee). A store call is JSON over the C ABI, off the request hot path
   (write-behind), so it never touches latency. The same store crate also links statically, so a build can
-  compile a backend straight in — no `cfg` sprawl.
-- **`governance.plugins_dir` (default `plugins`)** — the directory busbar loads store plugins from. A
+  compile a backend straight in, no `cfg` sprawl.
+- **`governance.plugins_dir` (default `plugins`)**: the directory busbar loads store plugins from. A
   `store` other than `memory` is a library dropped here.
-- **Plugin signing & trust — `governance.trust`.** A plugin ships a signed sidecar manifest
+- **Plugin signing & trust, `governance.trust`.** A plugin ships a signed sidecar manifest
   (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library
   `sha256`, and a signature over the whole manifest). At boot-load busbar verifies it against
   `governance.trust`: a valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED;
-  anything else (unsigned / unknown publisher / tampered) is handled per `trust.on_untrusted` —
-  `halt` (only approved plugins load), `alert`, `log` (default — loads with a warning), or `allow`.
+  anything else (unsigned / unknown publisher / tampered) is handled per `trust.on_untrusted`:
+  `halt` (only approved plugins load), `alert`, `log` (default, loads with a warning), or `allow`.
   Because the signature covers the whole manifest and the manifest pins the library by hash, neither
   can be altered or swapped independently. The default `log` posture keeps unsigned plugins working
   out of the box; enterprises set `halt`.
-- **Postgres store plugin — `governance.store: postgres`** — the shared, multi-node durable store:
+- **Postgres store plugin (`governance.store: postgres`)**: the shared, multi-node durable store:
   one Postgres behind a fleet of busbar nodes, so virtual keys, budgets, and usage are shared across
   the cluster. Drop in the Postgres store plugin (`libbusbar_store_postgres_plugin.{so,dll,dylib}`) and
-  set `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite — drop-in
+  set `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite, drop-in
   interchangeable.
-- **Migration** — if you set `governance.store: sqlite`, install the SQLite store plugin into
+- **Migration.** If you set `governance.store: sqlite`, install the SQLite store plugin into
   `governance.plugins_dir` (drop `libbusbar_store_sqlite_plugin` there), or busbar fails to start with a
   message naming the expected file. The default `store: memory` needs no plugin.
-- **`governance.usage_flush_interval_ms` (default 100)** — write-behind flush cadence (ms) for the
+- **`governance.usage_flush_interval_ms` (default 100)**: write-behind flush cadence (ms) for the
   in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this
   window of accrued spend/requests can be lost; a graceful shutdown flushes fully.
 
 ### Changed
 
-- **Governance budget enforcement is now in-memory on the request path** — the per-request budget
+- **Governance budget enforcement is now in-memory on the request path.** The per-request budget
   check-and-charge is an atomic in-memory hard cap (mirroring the existing rate limiter); SQLite became a
   write-behind durability layer (boot-hydrate, a background flush every `usage_flush_interval_ms`, and a
-  final flush on graceful shutdown). Admission no longer performs — or awaits — a SQLite write, removing the
+  final flush on graceful shutdown). Admission no longer performs (or awaits) a SQLite write, removing the
   per-request fsync from the hot path (on local SSD this lifts the single-node governed-throughput ceiling by
   ~5.6×). The flat-fee cap remains a hard cap; token cost is still reconciled post-response, bounded to one
   in-flight request.
-- **Migration** — the `governance.budget_on_store_error` key has been **removed** and the governance config
+- **Migration.** The `governance.budget_on_store_error` key has been **removed** and the governance config
   rejects unknown fields, so a config that still sets it will fail to start. Delete the key. The guarantee it
   offered (a hard cap even when the store errors) is now unconditional, because admission never touches the
   store.
 
 ### Removed
 
-- **`governance.budget_on_store_error`** — obsolete (see **Migration** under **Changed**): in-memory
+- **`governance.budget_on_store_error`**: obsolete (see **Migration** under **Changed**): in-memory
   admission cannot incur a store error, so the fail-open/closed knob no longer has a failure to govern.
 
 ## [1.4.1], 2026-07-20
 
 ### Added
 
-- **Published OpenAPI schema per release** — every tagged release now attaches the admin API's OpenAPI 3.1
+- **Published OpenAPI schema per release.** Every tagged release now attaches the admin API's OpenAPI 3.1
   document as a release asset (`busbar-openapi-<tag>.json`), emitted in CI from the same `openapi_doc()` that
   serves `GET /api/v1/admin/openapi.json` and stamped with the release version. Downstream tooling can
   generate a client or diff the API surface across releases without running the gateway.
@@ -95,41 +95,41 @@ item under **Changed**.
 
 - **Repository now at [`github.com/GetBusbar/busbar`](https://github.com/GetBusbar/busbar)** (older links
   redirect). Release binaries, the GHCR image (`ghcr.io/getbusbar/busbar`), and build-provenance attestation
-  are published under this repository — verify this release's artifacts with `--repo GetBusbar/busbar`.
+  are published under this repository; verify this release's artifacts with `--repo GetBusbar/busbar`.
   Docker Hub (`getbusbar/busbar`) is unchanged.
 
 ## [1.4.0], 2026-07-19
 
 ### Added
 
-- **`jwt-bearer` egress auth (OAuth 2.0 JWT-bearer grant, RFC 7523)** — the 5th auth mechanism. A provider
+- **`jwt-bearer` egress auth (OAuth 2.0 JWT-bearer grant, RFC 7523)**: the 5th auth mechanism. A provider
   with `auth: jwt-bearer` self-mints a short-lived bearer by signing a JWT assertion (RS256) and posting it
   to the token endpoint, then refreshes in the background ahead of expiry. A Google service-account JSON is a
   recognized credential container (`client_email`→iss, `private_key`→signing key, `token_uri`→aud); `scope`
   defaults to `cloud-platform` and is overridable. Any RFC 7523 provider works via config, no new code.
-- **`oauth-client-credentials` egress auth (OAuth 2.0 client-credentials grant, RFC 6749 §4.4)** — the 6th
+- **`oauth-client-credentials` egress auth (OAuth 2.0 client-credentials grant, RFC 6749 §4.4)**: the 6th
   auth mechanism. `auth: oauth-client-credentials` with `token_url` + `scope` exchanges a
   `client_id:client_secret` for a bearer and refreshes it. This is what authenticates Azure OpenAI via Entra
-  ID (AAD). It shares the self-minting bearer-refresh machinery with `jwt-bearer` — the two differ only in the
+  ID (AAD). It shares the self-minting bearer-refresh machinery with `jwt-bearer`; the two differ only in the
   mint call.
-- **`path_base` provider knob** — overrides a URL-model protocol's hardcoded base segment while keeping the
+- **`path_base` provider knob**: overrides a URL-model protocol's hardcoded base segment while keeping the
   `/{model}:verb` suffix, so one config line can reach a non-standard base path (e.g. Vertex's
   `/v1/projects/{project}/locations/{location}/publishers/{publisher}/models`).
-- **Google Vertex AI, delivered as configuration** — Gemini on Vertex (`protocol: gemini` + `path_base` +
+- **Google Vertex AI, delivered as configuration.** Gemini on Vertex (`protocol: gemini` + `path_base` +
   `auth: jwt-bearer`) and Claude on Vertex (`protocol: anthropic` + `path_base` + `auth: jwt-bearer`; the
   model moves into the `:rawPredict`/`:streamRawPredict` URL and the body carries `anthropic_version` in
-  place of `model`). No new protocol — Vertex speaks Gemini and Anthropic on the wire, so it is a config
+  place of `model`). No new protocol: Vertex speaks Gemini and Anthropic on the wire, so it is a config
   entry, not code. Azure OpenAI via Entra ID lands the same way (`protocol: openai` +
   `auth: oauth-client-credentials`).
 - **`token_url` and `scope` provider fields**, consumed by the OAuth auth mechanisms above.
-- **Oracle OCI Generative AI, delivered as configuration** — the `oci-genai` catalog entry targets OCI's
+- **Oracle OCI Generative AI, delivered as configuration.** The `oci-genai` catalog entry targets OCI's
   OpenAI-compatible surface (`/openai/v1/chat/completions`, serving OCI's hosted OpenAI/Llama/xAI/Google/
-  Cohere models). Since Jan 2026 OCI issues plain API keys (`Bearer`), so no OCI request-signing is needed —
+  Cohere models). Since Jan 2026 OCI issues plain API keys (`Bearer`), so no OCI request-signing is needed:
   `protocol: openai` + `auth: bearer` with the OCI regional `base_url`. No new protocol or code; its
   `TooManyRequests`/`QuotaExceeded`/`LimitExceeded`-in-a-400 quirk is handled by the catalog `error_map`.
 
   The support surface is now **6 protocols × 6 auth mechanisms**. To be clear on direction: these are
-  **egress** auth mechanisms — how Busbar authenticates OUTWARD to each upstream AI provider (Busbar →
+  **egress** auth mechanisms: how Busbar authenticates OUTWARD to each upstream AI provider (Busbar →
   provider), configured per provider in `providers.yaml`. They are unrelated to how clients authenticate
   INWARD to Busbar (client → Busbar), which is the separate `auth:` client-token / virtual-key layer. Any
   upstream speaking one of the six wire protocols and one of the six egress auth styles is a config entry,
@@ -139,35 +139,35 @@ item under **Changed**.
 
 - **Default worker-thread count now scales to the box.** The async worker pool defaulted to `min(cores, 4)`
   in 1.3.1–1.3.3 (1.3.0 used Tokio's all-cores default), which pinned the CPU-bound request path (parse,
-  translate, serialize) to ~4 cores no matter how large the machine — throughput plateaued regardless of
+  translate, serialize) to ~4 cores no matter how large the machine: throughput plateaued regardless of
   core count. The default is now one
   worker per available core (`available_parallelism`, which respects CPU affinity and the cgroup **cpuset**
-  — but **not** the CFS `cpu.max` bandwidth quota, which it cannot see), so **throughput scales linearly
-  with cores out of the box** — ~9,750 req/s per core, ~156k req/s on 16 cores at 100% success in the
+  but **not** the CFS `cpu.max` bandwidth quota, which it cannot see), so **throughput scales linearly
+  with cores out of the box**: ~9,750 req/s per core, ~156k req/s on 16 cores at 100% success in the
   [published benchmark](https://getbusbar.com/performance), with added latency flat at ~33 µs. On a
   quota-limited orchestrator (e.g. a k8s pod with a CPU limit on a many-core node) this defaults to the
-  node's core count and oversubscribes the quota — **pin `BUSBAR_WORKER_THREADS` to your CPU limit there.**
+  node's core count and oversubscribes the quota. **Pin `BUSBAR_WORKER_THREADS` to your CPU limit there.**
   Each worker carries a thread stack and its own allocator arena, so idle memory grows slowly with the
   count; footprint-sensitive sidecars should set `BUSBAR_WORKER_THREADS=1` (or `2`). No config or API
   change. For back-compat, an operator who pinned the standard `TOKIO_WORKER_THREADS` on 1.3.0 (honored
-  by 1.3.0's `#[tokio::main]` runtime) still gets that pool size — it is read as a fallback when
+  by 1.3.0's `#[tokio::main]` runtime) still gets that pool size: it is read as a fallback when
   `BUSBAR_WORKER_THREADS` is unset; an explicitly-set-but-invalid value warns instead of being silently
   ignored. The reproducible throughput/scaling harness and raw per-core data are checked in under
   `bench/scaling/`.
 - **Allocator: jemalloc with a background purge thread.** The request hot path holds a few copies of each
   request body while it is parsed and forwarded, so peak RSS tracks `peak concurrency × payload size`. The
   system allocator (glibc) almost never returns freed pages to the OS, so after a big-payload burst RSS
-  stayed pinned at the peak indefinitely — memory read as a one-way ratchet even though the live set had
+  stayed pinned at the peak indefinitely: memory read as a one-way ratchet even though the live set had
   collapsed. Busbar now uses jemalloc with `background_thread` enabled: freed pages return to the OS after a
   short decay, so memory **plateaus** under sustained load and **falls back toward idle** when the load
   subsides (measured: a ~1.2 GB plateau under a 5-minute 150 KB-payload soak drops to ~250 MB within ~30 s of
-  the load stopping). It remains bounded — a function of in-flight work, never unbounded growth. Cost: ~450 KB
+  the load stopping). It remains bounded, a function of in-flight work, never unbounded growth. Cost: ~450 KB
   of binary and four new dependency crates (`tikv-jemallocator` / `tikv-jemalloc-ctl` / `tikv-jemalloc-sys`
   plus the `paste` build-macro dep), all vendored under the Apache-2.0/MIT compatible set. Reproduction harness in `bench/memory/`. **Windows (`msvc` target) keeps the system allocator:**
   jemalloc's C build is incompatible with the MSVC toolchain, so it is compiled in only for non-msvc targets
-  (Linux/macOS, incl. the published container and static musl builds) — Windows binaries build and run
+  (Linux/macOS, incl. the published container and static musl builds). Windows binaries build and run
   unchanged on the system allocator and do not get the plateau/fall-back-to-idle behavior.
-- `ring` and `base64` are now direct dependencies (both were already in the lockfile via rustls) — used for
+- `ring` and `base64` are now direct dependencies (both were already in the lockfile via rustls), used for
   the RS256 JWT signature and the PKCS#8/base64url handling in `jwt-bearer`. No new crates enter the tree.
 - Streaming: for a cross-protocol stream whose backend reports token usage in a SEPARATE trailing chunk
   (the OpenAI `include_usage` convention), the terminal usage frame is now DEFERRED and the trailing usage
@@ -177,7 +177,7 @@ item under **Changed**.
   which previously discarded it). Behavior-preserving for OpenAI ingress (which still receives the separate
   usage chunk) and Bedrock ingress (which carries usage in its `metadata` frame). **Wire-shape note:** a
   Gemini JSON-array (non-SSE) client on a cross-protocol stream now receives one ADDITIONAL trailing array
-  element carrying the terminal `usageMetadata` that 1.3.0 silently dropped — spec-correct for native Gemini
+  element carrying the terminal `usageMetadata` that 1.3.0 silently dropped, spec-correct for native Gemini
   streaming, but a client that counted or hashed raw array elements will see N+1 elements.
 - **Upgrade hint for the removed `auth.mode:` key.** A config that still carries the pre-`auth.chain`
   `auth.mode:` key now fails to boot with a targeted migration hint (`mode: none` → an empty/omitted
@@ -186,13 +186,13 @@ item under **Changed**.
 
 ### Fixed
 
-- **Security — OAuth egress SSRF hardening (config-time AND runtime):** the `token_url` a
+- **Security: OAuth egress SSRF hardening (config-time AND runtime):** the `token_url` a
   `oauth-client-credentials` provider POSTs the client secret to now runs through the SAME SSRF/cloud-metadata
   denylist and case-insensitive https requirement as `base_url` (previously only a case-sensitive `http://`
   check with NO metadata guard, so a typo'd/templated `token_url` pointing at IMDS or
   `metadata.google.internal` could leak the secret). Additionally: (a) both self-minting OAuth clients
-  (`jwt-bearer`, `oauth-client-credentials`) now **refuse HTTP redirects and carry connect/overall timeouts**
-  — the credential rides in the POST body, so a 307/308 from a compromised token endpoint would otherwise
+  (`jwt-bearer`, `oauth-client-credentials`) now **refuse HTTP redirects and carry connect/overall timeouts**,
+  the credential rides in the POST body, so a 307/308 from a compromised token endpoint would otherwise
   re-POST the plaintext `client_secret` / signed assertion to a redirect target the boot-time URL check never
   saw; (b) the `jwt-bearer` service-account `token_uri` now gets the same https + metadata denylist vetting as
   `token_url`; and (c) `busbar --validate` now dry-run-validates a `jwt-bearer` credential's SA JSON + PKCS#8
@@ -209,7 +209,7 @@ item under **Changed**.
   and the previous generation exits instead of leaking one task-set per reload (which also pinned the orphaned
   snapshot and wrote breaker outcomes into a store no longer serving traffic).
 - A mid-stream upstream **transport** error no longer token-bills the partial usage accumulated before the cut
-  — symmetric with the terminal-error / translate-abort no-bill gates.
+  (symmetric with the terminal-error / translate-abort no-bill gates).
 - Translation fidelity: the Cohere reader surfaces `message.tool_plan` (the assistant's pre-tool reasoning was
   silently dropped on any Cohere→X hop); the Cohere and Responses writers emit a raw-string tool argument
   verbatim instead of JSON-encoding it a second time; a prompt-level Gemini `RECITATION` block maps to `safety`
@@ -226,7 +226,7 @@ item under **Changed**.
 
 ### Added
 
-- `busbar --validate` — validate a config file without booting or binding a socket (the `nginx -t`
+- `busbar --validate`: validate a config file without booting or binding a socket (the `nginx -t`
   workflow). Reports structural/reference errors and, in lenient env mode, records unset `${VARS}` as
   placeholders (structure, not secrets) so a config can be checked in CI without the runtime environment.
 
@@ -235,7 +235,7 @@ item under **Changed**.
 - Egress auth is now fully separated from the protocol writers: a `CredentialProvider` owned by the lane
   (resolved once at boot from protocol + auth style) produces each request's outbound auth headers via
   `lane.credential.headers_for(...)`, replacing per-writer `auth_headers`/`sign_request`. Behavior-preserving
-  — every protocol emits byte-identical auth — and it sets up a self-minting (OAuth/Vertex) credential later.
+  (every protocol emits byte-identical auth) and it sets up a self-minting (OAuth/Vertex) credential later.
 - Release profile is `opt-level = 3` (was `s`). New `BUSBAR_WORKER_THREADS` env knob hard-caps the Tokio
   worker pool (default `min(cores, 4)`, ~5% lower RSS on many-core hosts). Deduped busbar's own
   `getrandom` usage onto 0.3 (dropped the 0.4 copy); `ring` still vendors its own 0.2 line, so two
@@ -250,7 +250,7 @@ item under **Changed**.
   unbounded in-flight tasks; over-cap taps are dropped and counted (`tap_notifications_dropped_total`).
 - Config overlay no longer risks tombstone-loss: an unreadable overlay file is refused rather than
   overwritten (which previously could silently drop persisted admin state).
-- Request rewrite-on-failover now fails **closed** — if a queued rewrite can't be re-applied to the retried
+- Request rewrite-on-failover now fails **closed**: if a queued rewrite can't be re-applied to the retried
   upstream, the request is rejected (500) instead of silently forwarding the un-rewritten body.
 
 ### Security
@@ -265,15 +265,15 @@ item under **Changed**.
 ### Fixed
 
 - Finished greening the CI matrix 1.3.1 began; three still-red checks are now clean with no binary change.
-  **fmt** — committed the rustfmt reformatting of `render_histogram` that had been applied locally but never
-  committed. **Windows** — `PolicyOnError` (used only by the unix-only socket-gate tests) is now imported
-  under `#[cfg(unix)]`. **cargo-deny** — workspace member crates are versionless path deps; marking them
+  **fmt**: committed the rustfmt reformatting of `render_histogram` that had been applied locally but never
+  committed. **Windows**: `PolicyOnError` (used only by the unix-only socket-gate tests) is now imported
+  under `#[cfg(unix)]`. **cargo-deny**: workspace member crates are versionless path deps; marking them
   `publish = false` (they never go to crates.io) lets `allow-wildcard-paths` apply, so `bans` passes while
   external wildcards stay denied.
 
 ### Changed
 
-- `scripts/preflight.sh` now fails on an **uncommitted working tree** (CI tests the committed state — an
+- `scripts/preflight.sh` now fails on an **uncommitted working tree** (CI tests the committed state; an
   uncommitted `cargo fmt` is how the fmt red slipped past 1.3.1) and runs **cargo-deny** (the Security job)
   when installed.
 - Dependency bumps (Dependabot): `bytes` 1.12.0 → 1.12.1; CI/release actions `docker/build-push@7`,
@@ -294,14 +294,14 @@ config-specific breakage caught here can't recur.
 
 ### Added
 
-- `scripts/preflight.sh` — a pre-release gate mirroring the full CI matrix locally (fmt, structure-lint,
+- `scripts/preflight.sh`: a pre-release gate mirroring the full CI matrix locally (fmt, structure-lint,
   clippy + build + test on both the default and `--no-default-features` feature sets, and a best-effort
   Windows type-check). Run it before tagging so a release can't ship red CI.
 
 ## [1.3.0], 2026-07-13
 
 The API release: everything you could only do by editing YAML and restarting, you can now do over an
-authenticated, audited API. The routing hook grew into a hook system — gates and taps on every request.
+authenticated, audited API. The routing hook grew into a hook system: gates and taps on every request.
 
 This release reshapes how hooks and policies are configured. Hooks are now defined once by name and referenced
 everywhere; the old inline `policy:` block and transport-named `route:` values are replaced. **Existing
@@ -312,7 +312,7 @@ instead.
 ### Added
 
 - **FinOps metering, built for third parties.** `GET /api/v1/admin/usage` reports per-model and per-key
-  consumption as the RAW token split (input / output / cache-read / cache-creation — each prices differently)
+  consumption as the RAW token split (input / output / cache-read / cache-creation, each prices differently)
   in fixed UTC-day buckets, with `spend_micros` (micro-USD, integer math) derived at read time from your
   configured prices. Busbar exposes the inputs of cost, not just its own number, so a consumer with negotiated
   per-model pricing reconstructs cost exactly from the split. `?window=` selects past buckets; over-cap key
@@ -320,7 +320,7 @@ instead.
   numbers.
 - **Hooks are control-plane citizens.** A hook self-reports its OBSERVED settings and its own operational
   metrics over the new `status` wire message, and `GET /api/v1/admin/hooks/{name}/status` surfaces it with a
-  desired-vs-reported drift verdict — so a dashboard built on Busbar sees what every plug is doing without
+  desired-vs-reported drift verdict, so a dashboard built on Busbar sees what every plug is doing without
   each hook needing its own dashboard.
 - **One professional wire contract, audited to zero.** Three independent contract-audit rounds on the Admin
   API and two on the hook wire, all findings fixed pre-freeze: one error envelope everywhere with a frozen
@@ -332,7 +332,7 @@ instead.
   wire.
 - **The Admin API is a full config plane.** Anything the config file can express, the API can do: read the
   running config, apply a validated change atomically, roll back to any previous version, register hooks,
-  adjust pools, budgets, and rate limits. Drive Busbar from Terraform, Ansible, or CI — no SSH, no file edits,
+  adjust pools, budgets, and rate limits. Drive Busbar from Terraform, Ansible, or CI: no SSH, no file edits,
   no restarts.
 - **Config overlay.** API-applied changes persist to a Busbar-owned overlay file; your hand-written
   `config.yaml` is never touched. The effective config is base plus overlay, both human-readable, so "who set
@@ -340,7 +340,7 @@ instead.
 - **Admin audit log.** Every admin mutation records who changed what, when. Scoped admin tokens let you mint
   credentials that can, for example, only register hooks or only read.
 - **Named hooks.** Define a hook once under `hooks:`, reference it anywhere: in a pool's `hooks: [...]` list
-  or via `global_hooks:` to run on every request. One list carries both jobs — a pool names its ranking
+  or via `global_hooks:` to run on every request. One list carries both jobs: a pool names its ranking
   strategy (weighted, cheapest, fastest, least_busy, usage) and any gates together, e.g. `hooks: [cheapest,
   pii-guard]`. The old `route:` values and inline `policy:` block are removed; an old-form key is a clear
   startup error naming its replacement (a clean cut, no silent fallback). See the 1.2.x → 1.3 migration guide.
@@ -353,7 +353,7 @@ instead.
 - **Concurrent hooks.** All of a request's hooks fire at once, so added latency is the slowest hook, not the
   sum. Any reject wins; restrictions intersect; the route ranks what survives.
 - **Pluggable auth.** Authentication is now an ordered chain of modules: each identifies the caller, rejects,
-  or passes to the next. Token auth is the first module and the default, and it is removable — list only your
+  or passes to the next. Token auth is the first module and the default, and it is removable: list only your
   own module and tokens are gone. External modules speak the same hook transports; validated identities are
   cached (with instant admin flush), and auth always fails closed. Budgets, rate limits, pool access, and
   audit all follow the authenticated principal, whoever issued it.
@@ -361,7 +361,7 @@ instead.
   (read-only, hooks-register, full) replacing the single shared admin token, and every mutation in the audit
   log attributed to the person who made it. The chain itself is live-mutable (`PUT /api/v1/admin/admin-auth`)
   and guarded so a change that would lock the caller out is refused instead of applied.
-- **The rewrite verb.** A trusted gate (`prompt: rw`) can replace the request body before dispatch — context
+- **The rewrite verb.** A trusted gate (`prompt: rw`) can replace the request body before dispatch: context
   compression and redaction, across all six protocols at once, because it fires on the normalized form.
   Rewrites persist across failover, token accounting uses the rewritten body (the savings are real and
   measured), and a malformed or slow rewrite proceeds with the original body untouched; a broken compressor
@@ -372,7 +372,7 @@ instead.
 - **Config reload, and health that survives everything.** `POST /api/v1/admin/config/reload` re-reads your
   config files and applies them atomically, and lane health (circuit breakers, cooldowns, learned latency) is
   carried across by model identity, not list position, so a reorder or added model never resets what Busbar
-  has learned. That health state now persists across restarts too — kill Busbar, fix the config, start again,
+  has learned. That health state now persists across restarts too: kill Busbar, fix the config, start again,
   and sub-second it comes back remembering which lanes were misbehaving. `--safe-mode` boots from your base
   config alone when an API-applied overlay is the problem.
 - **Group-based governance.** `group_map:` maps identity-provider groups to authority in one place: admin
@@ -380,7 +380,7 @@ instead.
   virtual key uses. Per-module caps bound what any auth module can assert: an allowlist of groups it may claim
   and a ceiling on the admin scope obtainable through it.
 - **The admin API runs on its own listener, always.** The management surface (`/api/v1/admin/…`) is served on
-  a dedicated `admin_listen` and is never mounted on the data `listen` — the public bind cannot serve
+  a dedicated `admin_listen` and is never mounted on the data `listen`: the public bind cannot serve
   `/api/v1/admin/*` at all. It carries its own `admin_tls:` (cert + optional `client_ca_file` for
   client-certificate mTLS), so the control plane can require client certs, bind, and firewall independently of
   public LLM traffic. `admin_listen` defaults to loopback (`127.0.0.1:8081`), so a zero-config deployment
@@ -410,7 +410,7 @@ instead.
 
 ### Security
 
-- **Exposed admin plane requires mTLS — fail closed.** A network-exposed `admin_listen` (any non-loopback
+- **Exposed admin plane requires mTLS, fail closed.** A network-exposed `admin_listen` (any non-loopback
   bind) refuses to boot unless protected by client-certificate mTLS (`admin_tls.client_ca_file`). A loopback
   admin bind is exempt (unreachable off-host), and an operator fronting admin with a mesh that terminates mTLS
   can waive the guard explicitly with `admin_insecure: true`. The management plane is never silently published
@@ -432,7 +432,7 @@ make screening hooks possible.
   pool's fallback. Unix-only; on other platforms use `route: webhook`.
 - **Hook payload opt-ins: `policy.send_prompt` and `policy.send_user`.** The hook payload stays shape-only by
   default; two per-pool booleans (both default `false`) extend it. `send_prompt` adds the flattened prompt
-  content (`request.system` + `request.messages` as `{role, text}`) so a trusted hook can screen content —
+  content (`request.system` + `request.messages` as `{role, text}`) so a trusted hook can screen content:
   PII, guardrails, audit. `send_user` adds caller identity (`request.user`: the governance virtual-key
   `id`/`name` plus the body's end-user field) so a hook can route by who is asking. The caller's secret/token
   is never in the payload, under any configuration. Both transports carry the same fields; a pool that sets
@@ -442,13 +442,13 @@ make screening hooks possible.
 - **The hook `reject` verb.** A hook may reply `{"reject": {"status": 451, "message": "..."}}` instead of an
   order: no upstream is dispatched and the caller receives a dialect-native error. Fail-closed and bounded:
   the status is clamped to 400–499 (default 403) and picks the typed error class the SDK sees, the message is
-  sanitized, and a malformed reject still rejects — never silently routes. Counted in the new
+  sanitized, and a malformed reject still rejects, never silently routes. Counted in the new
   `busbar_route_policy_rejections_total` metric. Combined with `send_prompt`, this is the PII-screen
   primitive: a hook that sees content can stop a request before it leaves your network.
 
 ### Changed
 
-- **Default hook deadline is now 1 ms** (`policy.timeout_ms`, was 150). The default says hooks are fast — a
+- **Default hook deadline is now 1 ms** (`policy.timeout_ms`, was 150). The default says hooks are fast: a
   co-located socket hook decides in ~8 µs and a co-located webhook in ~34 µs. Raise it when your hook
   legitimately does I/O or crosses the network; on timeout the decision falls back per `on_error` and the
   request proceeds regardless.
@@ -463,7 +463,7 @@ make screening hooks possible.
 ### Fixed
 
 - **Hardened throughout.** Multiple rounds of extensive adversarial testing and code review over the full
-  1.2.0 change set and the new hook layer surfaced and fixed a broad batch of defects — protocol-translation
+  1.2.0 change set and the new hook layer surfaced and fixed a broad batch of defects: protocol-translation
   edge cases, input validation and sanitization, error handling, and observability gaps. Every fix shipped
   with the regression test that catches it; the suite grew by several hundred tests this release.
 
@@ -471,7 +471,7 @@ make screening hooks possible.
 
 Busbar now speaks more than chat. Five new operations land on top of chat: **Embeddings**, **Moderations**,
 **Image generation**, **Audio** (transcription and speech), and **Rerank**. Every one is **cross-protocol**,
-carried by the same lossless translation that already carried chat — a Gemini client can call embeddings on an
+carried by the same lossless translation that already carried chat: a Gemini client can call embeddings on an
 Amazon Bedrock backend, an OpenAI client can route images and audio to Google Gemini, and every answer comes
 back in the caller's own dialect, lossless in both directions, errors included. Chat itself is byte-for-byte
 unchanged: it is simply the first operation now, not a special case.
@@ -511,7 +511,7 @@ unchanged: it is simply the first operation now, not a special case.
   Gemini** (Imagen), or **Amazon Bedrock** (Titan) and comes back in the caller's dialect.
 - **Rerank (`/v2/rerank` and Bedrock rerank models), cross-protocol.** The sixth operation: **Cohere** v2
   rerank and **Amazon Bedrock** rerank models (via `InvokeModel`, detected by the `query` + `documents` body)
-  translate exactly in both directions — the two wires share the same result shape (`index` +
+  translate exactly in both directions: the two wires share the same result shape (`index` +
   `relevance_score`), so a Cohere-dialect client can rerank on a Bedrock backend and vice versa, with pools,
   failover, and breakers like every other operation. The other four protocols ship no rerank surface and
   answer with the standard dialect-native 404.
@@ -537,7 +537,7 @@ unchanged: it is simply the first operation now, not a special case.
 ### Changed
 
 - **License: Apache 2.0.** Busbar 1.2.0 and onward is licensed under the **Apache License, Version 2.0**:
-  permissive, commercial-friendly, with an explicit patent grant, no copyleft obligations — use, modify, and
+  permissive, commercial-friendly, with an explicit patent grant, no copyleft obligations: use, modify, and
   redistribute privately or commercially.
 - **Every operation is lossless across protocols, errors included.** Responses *and* error envelopes always
   come back in the caller's own protocol dialect, and token/usage accounting survives the cross-protocol round
@@ -562,7 +562,7 @@ unchanged: it is simply the first operation now, not a special case.
 
 ### Added
 
-- **`GET /v1/models` and `GET /v1beta/models`**: the list-models surface. Returns every routable name —
+- **`GET /v1/models` and `GET /v1beta/models`**: the list-models surface. Returns every routable name:
   configured pools first, then model entries, each sorted. This is the first call `client.models.list()` and
   self-hosted UIs (Open WebUI, LibreChat) make to build a model picker; it previously returned 404. Three
   protocols put list-models on the same noun, so Busbar answers in the **caller's dialect** by protocol
@@ -574,7 +574,7 @@ unchanged: it is simply the first operation now, not a special case.
 
 - **Operations are now a first-class axis of the forward engine (internal).** The request path is generic over
   an operation spec (`OpSpec`) rather than hardcoding chat's assumptions (stream intent, upstream path, usage
-  extraction, affinity, egress `Accept`). Chat is spec #1 and its behavior is byte-for-byte unchanged — the
+  extraction, affinity, egress `Accept`). Chat is spec #1 and its behavior is byte-for-byte unchanged: the
   full test suite passes unmodified. Groundwork that lets a future release add non-chat operations
   (embeddings, moderations, images, audio) as small spec files with no change to the reliability engine. No
   user-visible behavior change.
@@ -582,13 +582,13 @@ unchanged: it is simply the first operation now, not a special case.
 ### Fixed
 
 - **`/metrics` is no longer empty before the first request.** The unlabeled counter family is pre-registered
-  at startup and per-lane `busbar_lane_state` gauges are now also emitted for direct-model (pool-less) lanes —
-  labeled with the model name as `pool`, matching the counter convention — so a freshly booted gateway exposes
+  at startup and per-lane `busbar_lane_state` gauges are now also emitted for direct-model (pool-less) lanes
+  (labeled with the model name as `pool`, matching the counter convention), so a freshly booted gateway exposes
   a live exposition to Prometheus immediately. Both issues were found by the user-emulated acceptance harness
   on its first run.
 - **`/stats` output is now deterministic across restarts.** Lanes are built sorted by model name (previously
   in `HashMap` iteration order, randomized per process), and `/stats` serializes pools in sorted key order.
-  The lane/pool ordering — and therefore metric lane-series identity — is now stable boot to boot, so scrapes,
+  The lane/pool ordering (and therefore metric lane-series identity) is now stable boot to boot, so scrapes,
   dashboards, and tests are reproducible.
 
 ## [1.1.0], 2026-06-30
@@ -767,7 +767,7 @@ governance contract are unchanged.
 ### Added
 
 - **`Server-Timing: busbar;dur=<ms>` response header.** Busbar reports its own internal processing time (total
-  request time minus the upstream round-trip) on every response — a W3C-standard, per-request measurement of
+  request time minus the upstream round-trip) on every response: a W3C-standard, per-request measurement of
   exactly the latency Busbar adds (not the network, not the model), readable in browser DevTools or any APM
   tool, on your own production traffic.
 - **Cross-protocol losslessness completeness.** Provider-native request/response features now survive
@@ -906,7 +906,7 @@ refactor.
 ### Security
 
 - **mTLS client-cert enforcement.** With `client_ca_file` set, unauthenticated connections are rejected at the
-  TLS layer, before HTTP routing or governance checks — zero-trust transport without a service mesh.
+  TLS layer, before HTTP routing or governance checks: zero-trust transport without a service mesh.
 - **TLS handshake timeout.** A 10-second wall-clock cap on each incoming TLS handshake prevents a client from
   parking a file descriptor and task indefinitely before authentication (slowloris / handshake-flood
   mitigation). A timed-out or failed handshake drops only that connection; the server continues serving other
@@ -990,7 +990,7 @@ beyond the new ingress routes.
 
 - **`/metrics` is no longer unconditionally open.** It now goes through the same auth check as `/stats`
   (requires a valid client token in `token` mode, or a virtual key under governance) because the Prometheus
-  exposition — lane/pool topology, per-protocol counters, error rates — is an information-disclosure surface.
+  exposition (lane/pool topology, per-protocol counters, error rates) is an information-disclosure surface.
   Only `/healthz` remains unconditionally open. In `none`/`passthrough` mode `/metrics` is still admitted
   unconditionally. This supersedes the 0.16.2 security-review note that described `/metrics` as intentionally
   open.
@@ -1081,7 +1081,7 @@ hardening gaps review surfaced.
 - **Provider `health:` in `config.yaml` now takes effect.** The deployment-side `ProviderDeploy` had no
   `health` field, so a `health:` block under a provider in `config.yaml` (exactly as the shipped example
   documents) was silently dropped at parse time and `resolve()` only used the catalog's `providers.yaml`
-  health — meaning active/dead health probing never spawned for config-defined health. `ProviderDeploy` now
+  health, meaning active/dead health probing never spawned for config-defined health. `ProviderDeploy` now
   carries `health`, and `resolve()` merges it deployment-wins-over-catalog (mirroring `path`/`auth`). +
   regression test.
 
