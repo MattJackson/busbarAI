@@ -95,9 +95,9 @@ pools:
       action: least_bad        # degraded but available; never hard-503
 
 governance:
-  enabled: true
+  store: sqlite                          # durable (a loadable plugin); omit for the RAM default
   db_path: /var/lib/busbar/governance.db
-  admin_token: "${BUSBAR_ADMIN_TOKEN}"
+  admin_token: "${BUSBAR_ADMIN_TOKEN}"   # setting this ACTIVATES enforcement
   price_per_request_cents: 0
   price_per_1k_tokens_cents: 10
 ```

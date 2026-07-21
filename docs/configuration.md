@@ -206,7 +206,7 @@ the files and restarting. Full operational guide:
 
 ### `auth`
 
-Front-door authentication for clients. When [governance](#governance) is enabled, governance virtual keys supersede static `auth` entirely, every request must carry a valid virtual key.
+Front-door authentication for clients. This chain is what gates requests by default. When [governance](#governance) is **active** (a `governance.admin_token` is set), governance virtual keys supersede static `auth` entirely — every request must then carry a valid enabled virtual key. With no admin token governance is inert and this chain applies unchanged.
 
 ```yaml
 auth:
@@ -240,7 +240,7 @@ auth:
 **Bedrock ingress.** Native Bedrock SDK clients authenticate with AWS SigV4 (`Authorization: AWS4-HMAC-SHA256 …`). There are two tracks:
 
 - **Without governance** (`chain: []`, with or without `upstream_credentials: passthrough`): Busbar does not verify the inbound SigV4 signature. The header is forwarded upstream (passthrough) or ignored entirely. Use this for transparent Bedrock proxying without per-key controls.
-- **With governance** (`chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **With active governance** (`chain: [tokens]` + `governance.admin_token` set): Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`, including body-hash integrity). Mint a key with `"issue_aws_credential": true`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). The Bedrock SDK authenticates with that pair; Busbar verifies the signature, then applies the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 All other five ingress protocols use bearer-style auth and work with every chain configuration.
 
@@ -286,8 +286,8 @@ group_map:
 | `allowed_pools` | DATA-PLANE grant: pools this group may target. Setting it (even `[]` = every pool) is what grants inference access at all; a group with only `admin_scope` confers none. Pool lists union across a principal's groups. |
 | `rpm_limit` / `tpm_limit` / `max_budget_cents` | Rate and spend caps for principals granted through this group — enforced by exactly the machinery a virtual key uses, keyed by the principal. Most-permissive union: a granting group without a cap lifts that axis; otherwise the max wins. |
 
-Unmapped groups grant nothing (fail closed): with governance enabled, an identified principal
-whose groups earn no `allowed_pools` grant is rejected outright.
+Unmapped groups grant nothing (fail closed): with governance active (an `admin_token` set), an
+identified principal whose groups earn no `allowed_pools` grant is rejected outright.
 
 The admin chain is live-mutable over the API (`PUT /api/v1/admin/auth`) with an anti-lockout guard —
 see the [Admin API guide](./admin-api.md).
@@ -348,8 +348,8 @@ A model is a **lane**: one model at one provider, with its own concurrency semap
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
 | `provider` | string | **yes** | n/a | Must name a key in this file's `providers` map. |
-| `max_concurrent` | integer | **yes** | n/a | Maximum simultaneous in-flight requests for this lane (semaphore size). Must be ≥ 1. |
-| `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
+| `max_concurrent` | integer | no | unset (unbounded) | Optional per-lane concurrency limiter: the max simultaneous in-flight requests for this lane (semaphore size). **Omit it for no cap** (unbounded) — a limiter you opt into, mirroring `max_requests`. Set a positive integer to cap. Must be ≥ 1 when set (`0` = a lane that never admits a request = startup error). |
+| `max_requests` | integer | no | `-1` | Lifetime request budget. `-1` (default) = unlimited. When the counter reaches `0` the lane is unusable. Must not be `0` (zero budget = permanently unusable = startup error). |
 | `default_max_tokens` | integer | no | `4096` | Injected **only** on a cross-protocol hop to a backend that requires `max_tokens` (Anthropic protocol) when the caller omitted it. Has no effect on same-protocol passthrough. Must be > 0 when set. |
 | `upstream_model` | string | no | the config key | The model id sent to the provider on the wire (request body for body-model protocols; URL path for path-model protocols like Bedrock/Gemini; and health probes). Defaults to the config key. Set it when the key can't be the wire id: most commonly to run the **same model behind two providers** (the keys must differ, but each needs its own provider-specific model string). Must be non-empty when set. Metrics, breaker cells, and logs still key off the config key, not this. |
 | `attempt_timeout_ms` | integer | no | unset (no cap) | Per-attempt cap, in milliseconds, on time to **response headers** (the hang detector). If the provider has not started answering within the cap, the attempt is treated exactly like a transport timeout: the breaker records a transient failure and the request fails over to the next pool member within the same request. Because the cap covers only connect + headers, a healthy long **stream body** is never cut off by it. A pool member's own `attempt_timeout_ms` overrides this per pool. Must be ≥ 1 when set (0 is a startup error); always floored by the request's remaining `failover.timeout_secs` budget. |
@@ -792,22 +792,31 @@ observability:
 
 ### `governance`
 
-Optional virtual-key governance layer. When enabled, static `auth` tokens are superseded, every request must carry a busbar-issued virtual key. Per-key controls: allowed pools (ACL), budget (cents), budget period, and rate limits (RPM/TPM). State is durable in embedded SQLite.
+The virtual-key governance layer. **Governance is always available but INERT by default** — it enforces nothing until you set `governance.admin_token` (and mint keys via the admin API). This section only *configures* it; it has no `enabled` switch.
+
+- **Inert (default — no `admin_token`):** governance enforces nothing. Requests are gated by the static [`auth`](#auth) chain (`[tokens]` or open relay) **exactly as if governance were absent** — a default deploy behaves the same as before governance was on-by-default. The `/api/v1/admin` key-management API is disabled (no token to guard it), so no virtual keys can be minted.
+- **Active (`admin_token` set):** enforcement turns on. Static `auth` tokens are superseded and **every inference request must resolve to an enabled busbar-issued virtual key**. Per-key controls apply: allowed pools (ACL), budget (cents), budget period, and rate limits (RPM/TPM). The admin API (guarded by the admin token) is what mints those keys.
+
+The store defaults to **in-memory (ephemeral RAM)** — zero setup, but keys/budgets/usage reset on restart. Choose a durable `store` (`sqlite`, `postgres`, `redis`, each a loadable plugin) for persistence.
+
+> **Durable-store caveat.** If you point governance at a durable store that already holds virtual keys from a prior run but then run with **no `admin_token`**, governance is inert and those persisted keys are **NOT enforced** (their budget / RPM / TPM / allowed_pools are bypassed and access falls through to the static `auth.chain`). Busbar detects this at boot and emits a **loud error** (`durable governance store contains N key(s) but no admin_token is set … set governance.admin_token to enforce them`) on stderr and at ERROR level. Set `governance.admin_token` to re-activate enforcement.
 
 ```yaml
 governance:
-  enabled: true
-  db_path: /var/lib/busbar/governance.db
-  admin_token: "${BUSBAR_ADMIN_TOKEN}"
+  # store: memory        # default — ephemeral RAM; omit for the default
+  admin_token: "${BUSBAR_ADMIN_TOKEN}"   # set this to ACTIVATE enforcement
   price_per_request_cents: 1
   price_per_1k_tokens_cents: 50
+  # For persistence, choose a durable store (a loadable plugin):
+  # store: sqlite
+  # db_path: /var/lib/busbar/governance.db
 ```
 
 | Field | Type | Required | Default | Validation | Notes |
 |---|---|---|---|---|---|
-| `enabled` | bool | no | `false` | n/a | Master switch. |
-| `db_path` | string | no | `busbar-governance.db` | n/a | Path to the SQLite file. The directory must exist and be writable. |
-| `admin_token` | string | no | none (admin API disabled) | Must be non-empty (non-whitespace) when `enabled: true` | Guards the `/api/v1/admin/keys` API. If absent when `enabled: true`, Busbar refuses to start (the admin API would be silently inaccessible). |
+| `store` | string | no | `memory` | one of `memory` \| `sqlite` \| `postgres` \| `redis` | Backend for keys + counters. `memory` (default) is ephemeral RAM (resets on restart). `sqlite`/`postgres`/`redis` are durable, each loaded as a plugin from `plugins_dir`. |
+| `admin_token` | string | no | none (governance INERT, admin API disabled) | Must be non-empty (non-whitespace) when present | The activation gate. Absent = governance inert (static `auth` chain applies, no admin API). Present = enforcement on; guards the `/api/v1/admin/keys` API. A blank/whitespace-only value is a startup error. |
+| `db_path` | string | no | `busbar-governance.db` | n/a | Connection target for a durable store: a SQLite file path (`store: sqlite`), or a libpq/redis URL (`store: postgres` / `redis`). Unused for `store: memory`. |
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
 | `budget_on_store_error` | string | no | `allow` | `allow` or `deny` | Behavior when the budget store errors during the atomic admission check-and-charge. `allow` (default) fails open, the request proceeds, preserving availability on a store hiccup. `deny` fails closed, the request is rejected, providing a hard budget guarantee for security/regulated deployments. A definitive over-budget result always rejects regardless of this setting. |
@@ -821,7 +830,7 @@ governance:
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
 - **Budget admission is a hard, atomic cap.** The budget check and the flat per-request charge are one atomic conditional UPSERT (`charge_within_budget`): a request whose fee would push the window's spend past `max_budget_cents` is rejected before it is forwarded, and a concurrent burst cannot race past the limit. The **token-priced component** (`price_per_1k_tokens_cents`) is accrued post-response, so spend from requests already in flight when the cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its flat fee refunded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed).
 
-**Incompatible combination:** `enabled: true` + `auth.upstream_credentials: passthrough` is a startup error. Governance supersedes passthrough; the combination is unsupported.
+**Incompatible combination:** an active governance engine (`admin_token` set) + `auth.upstream_credentials: passthrough` is a startup error. Active governance supersedes passthrough (every request must resolve to a virtual key); the combination is unsupported. (With no `admin_token`, governance is inert and the pairing carries no requirement.)
 
 **Virtual key format:** `sk-bb-<32 hex characters>` (128-bit CSPRNG). Shown in plaintext exactly once at mint; stored as SHA-256 hash only. Key IDs have the form `vk_<16 hex characters>`.
 
@@ -899,8 +908,9 @@ listen: "0.0.0.0:8080"
 
 # ---------------------------------------------------------------------------
 # Auth: clients send Authorization: Bearer <BUSBAR_CLIENT_TOKEN>
-# Governance is enabled below, so this becomes vestigial, governance keys
-# supersede static tokens once governance is active.
+# Governance is ACTIVATED below (admin_token is set), so this static chain
+# becomes vestigial — governance virtual keys supersede static tokens once an
+# admin_token is set. With no admin_token, this chain is what gates requests.
 # ---------------------------------------------------------------------------
 auth:
   chain: [tokens]
@@ -1022,12 +1032,15 @@ observability:
 
 # ---------------------------------------------------------------------------
 # Governance: virtual keys, budgets, rate limits.
-# Note: upstream_credentials: passthrough is incompatible with governance.enabled: true.
+# Setting admin_token ACTIVATES enforcement (every request must resolve to a
+# virtual key). With no admin_token, governance is inert and the static auth
+# chain above applies. Note: upstream_credentials: passthrough is incompatible
+# with an ACTIVE governance engine (admin_token set).
 # ---------------------------------------------------------------------------
 governance:
-  enabled: true
+  store: sqlite                            # durable (a loadable plugin); omit for the RAM default
   db_path: /var/lib/busbar/governance.db
-  admin_token: "${BUSBAR_ADMIN_TOKEN}"
+  admin_token: "${BUSBAR_ADMIN_TOKEN}"     # set this to turn enforcement ON
   price_per_request_cents: 1
   price_per_1k_tokens_cents: 50
 ```
@@ -1053,7 +1066,7 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `path` malformed | `path` does not begin with `/` |
 | Model name reserved | Model named `admin` |
 | `provider` reference missing | `models.<name>.provider` does not name a configured provider |
-| `max_concurrent: 0` | A concurrency semaphore of 0 never grants a permit |
+| `max_concurrent: 0` | A concurrency semaphore of 0 never grants a permit (omit the field for unbounded; `0` is the only rejected value) |
 | `max_requests: 0` | Zero lifetime budget = permanently unusable lane |
 | `default_max_tokens: 0` | Would be injected upstream and rejected |
 | Pool name reserved | Pool named `admin` |
@@ -1081,8 +1094,8 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `tokens` in `auth.chain` + empty `client_tokens` | Every request would be rejected |
 | `auth.chain` names an unknown module | Every chain entry must be a compiled-in auth module |
 | `auth.mode` present | Removed in 1.3 — write `chain:` + `upstream_credentials:` |
-| `governance.enabled: true` + no `admin_token` | Admin API silently inaccessible |
-| `governance.enabled: true` + `upstream_credentials: passthrough` | Unsupported combination |
+| `governance.admin_token` set but blank/whitespace-only | Admin API would be silently inaccessible (an unset token is fine — governance is simply inert) |
+| `governance.admin_token` set + `upstream_credentials: passthrough` | Unsupported combination (active governance supersedes passthrough) |
 | `${VAR}` unset in config | Unresolvable interpolation reference |
 | `${}` or unclosed `${` | Malformed interpolation syntax |
 
@@ -1095,4 +1108,5 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | Heterogeneous pool (members span more than one backend protocol, cross-protocol translation applies) |
 | `api_key_env` names an env var that is unset or empty at boot (lane will fail auth) |
 | `allowed_pools` on a virtual key (admin API) names a pool not currently configured |
-| `chain: [tokens]` or `chain: []` with governance enabled (static auth is superseded; effective mode is governance virtual keys) |
+| `chain: [tokens]` or `chain: []` with governance ACTIVE (`admin_token` set) — static auth is superseded; effective mode is governance virtual keys |
+| Durable governance store holding keys with no `admin_token` set — governance is inert; those persisted keys are NOT enforced (boot emits a loud error) |

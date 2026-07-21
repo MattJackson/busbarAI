@@ -109,8 +109,9 @@ providers:
 models:
   claude-sonnet:
     provider: anthropic
-    max_concurrent: 10
 ```
+
+`provider` is the only required field on a model. `max_concurrent` (a per-lane concurrency limiter) is optional and defaults to unbounded — add it only when you want to cap in-flight requests to a model.
 
 The key itself is never in this file. `api_key_env: ANTHROPIC_KEY` tells Busbar "read this provider's key from the `$ANTHROPIC_KEY` environment variable at startup", so you set the real secret in your environment ([Step 3](#step-3-set-environment-variables-and-run)), and `config.yaml` stays safe to commit and share.
 
@@ -124,7 +125,7 @@ Save this as `config.yaml` in your working directory.
 |---|---|
 | `providers.<name>.api_key_env` | Name of the environment variable holding this provider's API key |
 | `models.<name>.provider` | Which provider entry in the `providers` block this model calls |
-| `models.<name>.max_concurrent` | Max simultaneous in-flight requests to this model (the concurrency semaphore); must be ≥ 1 |
+| `models.<name>.max_concurrent` | Optional per-lane concurrency limiter — max simultaneous in-flight requests to this model. Omit for unbounded (the default); set a value ≥ 1 to cap. |
 
 `providers` and `models` are the only required sections. `listen` defaults to `0.0.0.0:8080`. `auth` defaults to `none` (open relay) when omitted, fine for local dev, not for production.
 
@@ -339,7 +340,7 @@ auth:
 
 The caller's own token (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`) is forwarded directly to the upstream provider. Use this when each caller has their own provider key and you want Busbar purely for routing and protocol translation, not credential management.
 
-Note: `passthrough` is incompatible with `governance.enabled: true` (validation rejects the combination).
+Note: `passthrough` is incompatible with an active governance engine (`governance.admin_token` set) — validation rejects the combination.
 
 ### Bedrock egress (Busbar signs requests with SigV4)
 
@@ -365,7 +366,7 @@ Busbar signs each outbound request with SigV4 (region parsed from the host); you
 **Bedrock ingress** (acting as a Bedrock endpoint for native AWS SDK clients) has two tracks:
 
 - **Without governance** (`auth.chain: []` with `upstream_credentials: passthrough`, or `chain: []` alone): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (plain `chain: []`).
-- **With governance** (`auth.chain: [tokens]` + `governance.enabled: true`): Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **With active governance** (`auth.chain: [tokens]` + `governance.admin_token` set): Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
 
 ### Injecting `max_tokens` for cross-protocol calls
 
@@ -389,7 +390,7 @@ Before taking Busbar out of dev mode:
 
 - [ ] Set `auth.chain: [tokens]` with at least one `client_tokens` entry (or enable governance for per-key virtual tokens)
 - [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
-- [ ] Set `max_concurrent` on every model to a value your provider tier actually supports
+- [ ] Consider setting `max_concurrent` on models where you want to cap in-flight load to your provider tier (optional — omitted = unbounded)
 - [ ] Set `max_requests` to `-1` (unlimited lifetime budget) or a finite positive budget per model
 - [ ] Run `busbar --validate` (in CI and before every deploy/reload): parses and validates both YAML files with no server, no network, and no secrets required — exit `0` = valid, `1` = errors. See [`operations.md#validating-configuration-busbar---validate`](operations.md#validating-configuration-busbar---validate)
 - [ ] Verify `/healthz` returns `200` and `/stats` shows all lanes `usable: true` before routing production traffic

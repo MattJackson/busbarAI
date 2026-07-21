@@ -148,14 +148,15 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
   if you need unauthenticated scraping.
 - `/admin/*` requires the governance **admin token** (as `Authorization: Bearer` or
   `X-Admin-Token`); disabled (401) if no admin token is configured.
-- With **governance enabled**, the caller's bearer token must resolve to an enabled
-  virtual key, which is attached to the request for downstream ACL/budget checks.
-- With governance disabled, the static `AuthMode` applies (`token` allowlist,
-  `passthrough`, or `none`). The caller's bearer token is threaded through for
-  passthrough forwarding.
-- **Bedrock ingress** has two modes depending on governance:
-  - *Without governance* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
-  - *With governance* (`token` mode + `governance.enabled: true`): `crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with `"issue_aws_credential": true`. Note: `crates/busbar/src/sigv4.rs` provides signing primitives; the inbound verifier lives in `crates/busbar/src/auth/mod.rs`.
+- With **governance active** (a `governance.admin_token` is configured), the caller's
+  bearer token must resolve to an enabled virtual key, which is attached to the request
+  for downstream ACL/budget checks.
+- With governance **inert** (no admin token — the default), the static `AuthMode` applies
+  (`token` allowlist, `passthrough`, or `none`), exactly as if governance were absent. The
+  caller's bearer token is threaded through for passthrough forwarding.
+- **Bedrock ingress** has two modes depending on whether governance is active:
+  - *Governance inert* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
+  - *Governance active* (`token` mode + `governance.admin_token` set): `crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with `"issue_aws_credential": true`. Note: `crates/busbar/src/sigv4.rs` provides signing primitives; the inbound verifier lives in `crates/busbar/src/auth/mod.rs`.
 
 ### 3. Governance checks
 

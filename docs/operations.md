@@ -328,8 +328,10 @@ for graceful degradation.
 
 ## Governance & the admin API
 
-When `governance.enabled: true`, clients authenticate with **virtual keys** and the
-static `auth` tokens no longer apply to proxied requests. Keys are managed over the
+When governance is **active** (a `governance.admin_token` is set), clients authenticate
+with **virtual keys** and the static `auth` tokens no longer apply to proxied requests.
+With no admin token governance is inert and the static `auth` chain applies unchanged.
+Keys are managed over the
 admin API, guarded by `governance.admin_token` (sent as `Authorization: Bearer
 <admin_token>` or `X-Admin-Token: <admin_token>`). With no admin token configured,
 the admin API returns `401`.
