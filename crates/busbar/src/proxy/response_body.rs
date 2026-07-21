@@ -188,10 +188,15 @@ where
                     // and (b) the unknown-protocol fallback (`new_same_proto` returned `None`), which has
                     // no reader to drive the IR and therefore no usage source. The bytes always stream to
                     // the client unchanged; for (a) we retain a bounded copy for IR-based billing below.
-                    // Only buffer when the operation actually taps usage from the body. Chat and the
-                    // token-billed ops do; a flat-fee op (or a large-binary response) skips the copy
-                    // entirely — the bytes still relay verbatim below, unbuffered.
-                    if !this.is_sse && this.op.taps_nonstream_usage() {
+                    // Only buffer when the operation taps usage from the body AND there is a sink to
+                    // bill it to. Chat and the token-billed ops tap; but with governance OFF (or no
+                    // resolved key) `usage_sink` is `None`, so the reassembled copy + stream-end
+                    // parse+IR-decode below would be pure waste — nothing consumes the extracted usage.
+                    // Gating on `usage_sink.is_some()` skips the per-response buffer copy AND the
+                    // full-body JSON parse + IR build entirely on the no-governance hot path (a large
+                    // RPS/RSS win), while a flat-fee op (or a large-binary response) skips it too. The
+                    // bytes still relay verbatim below, unbuffered. (R1.)
+                    if !this.is_sse && this.op.taps_nonstream_usage() && this.usage_sink.is_some() {
                         // SAME-PROTOCOL NON-STREAM `application/json` passthrough (Change A path #4): the
                         // non-stream analog of B's read-for-IR-emit-verbatim. The body relays verbatim,
                         // but a bounded copy is retained so the stream-end arm can run the egress reader
@@ -484,19 +489,23 @@ where
                     //     was relayed verbatim; this is the read-for-IR side-channel for billing.
                     // The unknown-protocol fallback passthrough has no reader and yields `None` (no usage
                     // source — same as before; an unknown protocol cannot be metered).
-                    let ir_usage: Option<crate::ir::IrUsage> =
-                        if let Some(t) = this.translate.as_ref() {
-                            t.usage().cloned()
-                        } else if !this.is_sse && !this.nonstream_buf.is_empty() {
-                            // Same-protocol non-stream body relayed verbatim; the operation reads
-                            // usage from the reassembled bytes. Chat runs the egress reader and
-                            // reports IR usage (byte-identical to the previous inline read); a
-                            // flat-fee op returns None and bills nothing.
-                            let buf = std::mem::take(&mut this.nonstream_buf);
-                            this.op.extract_usage(&this.ingress_protocol, &buf)
-                        } else {
-                            None
-                        };
+                    // Skip usage extraction ENTIRELY when there is no sink to bill (governance off /
+                    // no key): the terminal-usage clone and the non-stream reader run only to feed
+                    // `record_tokens`, which the `usage_sink.take()` gate below no-ops. (R1.)
+                    let ir_usage: Option<crate::ir::IrUsage> = if this.usage_sink.is_none() {
+                        None
+                    } else if let Some(t) = this.translate.as_ref() {
+                        t.usage().cloned()
+                    } else if !this.is_sse && !this.nonstream_buf.is_empty() {
+                        // Same-protocol non-stream body relayed verbatim; the operation reads
+                        // usage from the reassembled bytes. Chat runs the egress reader and
+                        // reports IR usage (byte-identical to the previous inline read); a
+                        // flat-fee op returns None and bills nothing.
+                        let buf = std::mem::take(&mut this.nonstream_buf);
+                        this.op.extract_usage(&this.ingress_protocol, &buf)
+                    } else {
+                        None
+                    };
                     // Charge this request's token usage to the virtual key's budget (once) — but ONLY
                     // for a cleanly-terminated stream. A stream that saw a reader-emitted terminal ERROR
                     // event (`translate.terminal_error()`) OR whose cross-protocol translate aborted
