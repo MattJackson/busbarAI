@@ -84,6 +84,70 @@ fn hook_plugins_compiled_in() -> Vec<&'static str> {
     .to_vec()
 }
 
+/// Read + parse a plugin's signed sidecar manifest (`<library>.manifest.json`), if present and valid.
+/// Best-effort: a missing or malformed manifest yields `None` (an unsigned plugin has no manifest).
+/// This is the DISPLAY read — every field is signature-covered (verification is separate, via
+/// [`crate::plugin_trust::verify`]), so the console can render "install X by Y from Z" faithfully.
+fn read_sidecar_manifest(lib_path: &std::path::Path) -> Option<busbar_plugin_sign::Manifest> {
+    let manifest_path = crate::plugin_trust::manifest_path_for(lib_path);
+    let raw = std::fs::read(&manifest_path).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// The platform-native dynamic-library extension for this host — the one an uploaded store plugin's
+/// filename must carry (`.so`/`.dll`/`.dylib`). Per-OS artifacts, never one universal file.
+fn plugin_lib_extension() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ".dll"
+    } else if cfg!(target_os = "macos") {
+        ".dylib"
+    } else {
+        ".so"
+    }
+}
+
+/// Longest a plugin filename may be — generous headroom over any real library name, guarding the
+/// filesystem path we build from admin-supplied input.
+const MAX_PLUGIN_FILENAME_LEN: usize = 256;
+
+/// Validate an admin-supplied plugin FILENAME and return it owned. Fail-closed against path traversal
+/// (a filename is the LAST path component only — no `/`, `\`, `..`, or absolute/rooted path can reach
+/// outside the plugins directory) and enforce the platform-native library extension. This is the one
+/// gate every plugin write/delete funnels through, so the plugins directory is the hard boundary.
+fn validate_plugin_filename(file: &str) -> Result<String, AdminError> {
+    let ext = plugin_lib_extension();
+    if file.is_empty() || file.len() > MAX_PLUGIN_FILENAME_LEN {
+        return Err(AdminError::Validation(format!(
+            "plugin filename must be 1..={MAX_PLUGIN_FILENAME_LEN} chars"
+        )));
+    }
+    // Reject anything that isn't a bare filename — the component the OS would treat as a directory
+    // separator, a parent ref, or a rooted path lets an admin-supplied name escape the plugins dir.
+    if file.contains('/') || file.contains('\\') || file.contains("..") {
+        return Err(AdminError::Validation(
+            "plugin filename must be a bare filename (no path separators or `..`)".into(),
+        ));
+    }
+    // Belt-and-braces: the parsed path must have exactly one normal component equal to `file` (so a
+    // platform-specific rooted form, e.g. a Windows drive prefix, can never slip through).
+    let path = std::path::Path::new(file);
+    let mut comps = path.components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(file) => {}
+        _ => {
+            return Err(AdminError::Validation(
+                "plugin filename must be a single, normal path component".into(),
+            ));
+        }
+    }
+    if !file.ends_with(ext) {
+        return Err(AdminError::Validation(format!(
+            "plugin filename must be a `{ext}` dynamic library for this platform"
+        )));
+    }
+    Ok(file.to_string())
+}
+
 /// Best-effort reachability probe for a hook's transport, for the health read. NEVER sends a hook
 /// request — it only checks whether the endpoint accepts a connection. A socket gets a short-timeout
 /// `connect` (unix only); a webhook is not probed here (returns `None` with a note — webhooks lazy-
@@ -613,13 +677,13 @@ impl AdminService {
                 // Compiled-in auth modules (feature-gated). Active = present in the auth chain.
                 let chain = self.app.auth.chain_names();
                 for name in auth_modules_compiled_in() {
-                    plugins.push(PluginView {
-                        name: name.to_string(),
-                        r#type: "auth",
-                        loader: "compiled-in",
-                        active: Some(chain.contains(&name)),
-                        target: None,
-                    });
+                    plugins.push(PluginView::basic(
+                        name.to_string(),
+                        "auth",
+                        "compiled-in",
+                        Some(chain.contains(&name)),
+                        None,
+                    ));
                 }
                 // External auth modules (runtime-registered) — none until the auth-module registration
                 // endpoint lands (#56); the catalog shape is ready for them.
@@ -627,21 +691,21 @@ impl AdminService {
             "hooks" => {
                 // The weighted SWRR floor is compiled in unconditionally (the non-removable default
                 // hook); activation is the per-pool default, not summarized here.
-                plugins.push(PluginView {
-                    name: "weighted".to_string(),
-                    r#type: "hooks",
-                    loader: "compiled-in",
-                    active: None,
-                    target: None,
-                });
+                plugins.push(PluginView::basic(
+                    "weighted".to_string(),
+                    "hooks",
+                    "compiled-in",
+                    None,
+                    None,
+                ));
                 for name in hook_plugins_compiled_in() {
-                    plugins.push(PluginView {
-                        name: name.to_string(),
-                        r#type: "hooks",
-                        loader: "compiled-in",
-                        active: None,
-                        target: None,
-                    });
+                    plugins.push(PluginView::basic(
+                        name.to_string(),
+                        "hooks",
+                        "compiled-in",
+                        None,
+                        None,
+                    ));
                 }
                 // External hooks = the configured registry entries (socket/webhook). Configured ⇒
                 // active; the transport target is projected (operator config, not a secret).
@@ -651,25 +715,255 @@ impl AdminService {
                     .iter()
                     .map(|(name, cfg)| {
                         let target = cfg.socket.clone().or_else(|| cfg.webhook.clone());
-                        PluginView {
-                            name: name.clone(),
-                            r#type: "hooks",
-                            loader: "external",
-                            active: Some(true),
-                            target,
-                        }
+                        PluginView::basic(name.clone(), "hooks", "external", Some(true), target)
                     })
                     .collect();
                 externals.sort_by(|a, b| a.name.cmp(&b.name));
                 plugins.append(&mut externals);
             }
+            // `store` (alias `db`) — DYNAMIC-LIBRARY plugins in the plugins directory. Always includes
+            // the compiled-in `memory` default; then every loadable library present, each vetted (ABI
+            // handshake) and its signed sidecar manifest read + re-evaluated against the running trust
+            // posture. The store the operator configured (`governance.store`) is `active`.
+            "store" | "db" => {
+                plugins.append(&mut self.store_plugin_catalog());
+            }
             other => {
                 return Err(AdminError::Validation(format!(
-                    "unknown plugin type `{other}`: expected `auth` or `hooks`"
+                    "unknown plugin type `{other}`: expected `auth`, `hooks`, or `store`"
                 )));
             }
         }
         Ok(Page::single(plugins))
+    }
+
+    /// The DYNAMIC-LIBRARY store catalog (`GET /api/v1/admin/plugins?type=store`): the compiled-in
+    /// `memory` default plus every loadable library in `plugins_dir`, each with its ABI-validity and
+    /// signed-manifest metadata + re-evaluated trust verdict. Pure read (no library is `open`ed — the
+    /// ABI handshake `dlopen`s to inspect but never constructs a store, and the manifest is a sidecar
+    /// file). Sorted by filename after the `memory` head.
+    fn store_plugin_catalog(&self) -> Vec<PluginView> {
+        // The compiled-in RAM default is always present. Which store backend is ACTIVE is a
+        // `governance.store` config concern (read via `GET /config`), not summarized per-row here —
+        // the same posture the compiled-in hook rows take (`active: None`).
+        let mut out = vec![PluginView::basic(
+            "memory".to_string(),
+            "store",
+            "compiled-in",
+            None,
+            None,
+        )];
+        let policy = self.app.plugin_trust.to_policy().ok();
+        for info in busbar_plugin_loader::inventory(&self.app.plugins_dir) {
+            let lib_path = self.app.plugins_dir.join(&info.file);
+            // The signed sidecar manifest (`<lib>.manifest.json`) — the displayed metadata (all
+            // signature-covered fields, so the "install X by Y" card can't be spoofed).
+            let manifest = read_sidecar_manifest(&lib_path);
+            // The trust verdict is re-evaluated server-side against the RUNNING posture (never a
+            // stored value): `verify` reads the library bytes + sidecar manifest and judges them. A
+            // `halt`-posture rejection reports `"rejected"`; a permissive posture reports
+            // `"unverified"`; an allowlisted signature reports `"trusted"`. Unresolvable policy ⇒ None.
+            let trust = policy
+                .as_ref()
+                .map(|p| match crate::plugin_trust::verify(&lib_path, p) {
+                    Ok(note) if note.starts_with("signed by") => "trusted",
+                    Ok(_) => "unverified",
+                    Err(_) => "rejected",
+                });
+            // The plugin NAME is the manifest name when present, else the library filename.
+            let name = manifest
+                .as_ref()
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| info.file.clone());
+            out.push(PluginView {
+                name,
+                r#type: "store",
+                loader: "dynamic-library",
+                // A dynamic store is "active" when it is the configured backend AND its plugin
+                // filename matches — but the catalog can't cheaply map a filename to a store kind, so
+                // activation is left unsummarized here (the configured backend shows on the `memory`
+                // row or is inferable from `governance.store`); dynamic rows report `None`.
+                active: None,
+                target: Some(info.file.clone()),
+                version: manifest.as_ref().map(|m| m.version.clone()),
+                publisher: manifest.as_ref().map(|m| m.publisher.clone()),
+                interface_version: manifest.as_ref().map(|m| m.interface_version),
+                trust,
+                valid: Some(info.valid),
+                error: info.error.clone(),
+            });
+        }
+        out
+    }
+
+    /// `POST /api/v1/admin/plugins` — INSTALL a dynamic-library store plugin: the caller uploads the
+    /// library bytes (and optionally its signed manifest); the engine RE-VERIFIES them server-side
+    /// against the running `governance.trust` posture (the client is NEVER trusted — the upload may
+    /// originate remotely), validates the store ABI handshake, and atomically writes the library (+
+    /// manifest sidecar) into `plugins_dir`. Full scope. The store change takes effect on the next
+    /// store (re)load (restart / `governance.store` apply), not as a hot swap.
+    ///
+    /// Verification order (fail-closed, nothing written until every gate passes):
+    /// 1. Filename sanity — a bare, platform-native library filename (no path traversal, right ext).
+    /// 2. TRUST — [`crate::plugin_trust`]-style `evaluate` over the uploaded bytes + manifest against
+    ///    the running policy. A `halt`-posture rejection is a `409 conflict` (nothing is written).
+    /// 3. ABI — `validate_plugin` on a TEMP copy (never `dlopen` a file already in `plugins_dir` mid-
+    ///    write): the library must export the store ABI at a version the engine speaks, else `400`.
+    /// 4. Atomic publish — write the temp files, then rename into place (library + manifest sidecar).
+    pub(crate) fn install_store_plugin(
+        &self,
+        file: &str,
+        library: &[u8],
+        manifest_bytes: Option<&[u8]>,
+    ) -> Result<crate::admin::v1::contract::PluginInstallView, AdminError> {
+        use busbar_plugin_sign::{evaluate, Manifest, Verdict};
+
+        // ── 1. filename sanity: a bare, platform-native library filename ──
+        let file = validate_plugin_filename(file)?;
+
+        // Parse the optional manifest up front (a malformed manifest is a client error, not a silent
+        // "unsigned"): the operator MEANT to sign it, so surface the parse failure.
+        let manifest: Option<Manifest> =
+            match manifest_bytes {
+                None => None,
+                Some(raw) => Some(serde_json::from_slice(raw).map_err(|e| {
+                    AdminError::Validation(format!("malformed plugin manifest: {e}"))
+                })?),
+            };
+
+        // ── 2. TRUST re-verify against the RUNNING posture (server-side; the client is not trusted) ──
+        let policy = self
+            .app
+            .plugin_trust
+            .to_policy()
+            .map_err(|_| AdminError::Internal)?;
+        let (trust, publisher, version) = match evaluate(library, manifest.as_ref(), &policy) {
+            Ok(Verdict::Trusted { publisher }) => (
+                "trusted",
+                Some(publisher),
+                manifest.as_ref().map(|m| m.version.clone()),
+            ),
+            Ok(Verdict::Allowed { .. }) => (
+                "unverified",
+                manifest.as_ref().map(|m| m.publisher.clone()),
+                manifest.as_ref().map(|m| m.version.clone()),
+            ),
+            // `halt` posture forbids an untrusted upload — a terminal state conflict (retrying the same
+            // bytes can't fix it; sign it, or relax the posture). The reason is safe to surface.
+            Err(rejected) => {
+                return Err(AdminError::Conflict(format!(
+                    "plugin rejected by the trust policy: {}. Sign it with an allowlisted publisher, \
+                     or relax governance.trust.on_untrusted.",
+                    rejected.0
+                )));
+            }
+        };
+
+        // ── 3. ABI validate on a TEMP copy (never dlopen a file we're mid-writing in plugins_dir) ──
+        let dir = &self.app.plugins_dir;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AdminError::Validation(format!("cannot create plugins dir: {e}")))?;
+        // A unique temp basename in the SAME directory (so the final rename is same-filesystem atomic).
+        let stamp = format!("{}-{}", std::process::id(), crate::store::now());
+        let tmp_lib = dir.join(format!(".{file}.{stamp}.tmp"));
+        std::fs::write(&tmp_lib, library).map_err(|e| {
+            AdminError::Validation(format!("cannot write plugin to plugins dir: {e}"))
+        })?;
+        let interface_version = match busbar_plugin_loader::validate_plugin(&tmp_lib) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_lib);
+                return Err(AdminError::Validation(format!(
+                    "uploaded library is not a loadable busbar store plugin: {e}"
+                )));
+            }
+        };
+
+        // ── 4. atomic publish: rename the library into place, then write the manifest sidecar ──
+        let lib_path = dir.join(&file);
+        if let Err(e) = std::fs::rename(&tmp_lib, &lib_path) {
+            let _ = std::fs::remove_file(&tmp_lib);
+            return Err(AdminError::Validation(format!(
+                "cannot publish plugin into plugins dir: {e}"
+            )));
+        }
+        let manifest_path = crate::plugin_trust::manifest_path_for(&lib_path);
+        if let Some(raw) = manifest_bytes {
+            if let Err(e) = std::fs::write(&manifest_path, raw) {
+                // The library is published but the sidecar failed — roll the library back so the
+                // install is all-or-nothing (a library without its manifest would mis-report trust).
+                let _ = std::fs::remove_file(&lib_path);
+                return Err(AdminError::Validation(format!(
+                    "plugin library written but manifest sidecar failed: {e}"
+                )));
+            }
+        } else {
+            // An unsigned re-install over a previously-signed one must not inherit the stale manifest.
+            let _ = std::fs::remove_file(&manifest_path);
+        }
+
+        Ok(crate::admin::v1::contract::PluginInstallView {
+            file,
+            name: manifest.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| {
+                lib_path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("plugin")
+                    .to_string()
+            }),
+            interface_version,
+            trust,
+            version,
+            publisher,
+            note: "installed durably in the plugins directory; a store change takes effect on the next \
+                   store (re)load (restart or governance.store apply), not as a hot swap",
+        })
+    }
+
+    /// `DELETE /api/v1/admin/plugins/{file}` — REMOVE a dynamic-library plugin: delete the library and
+    /// its manifest sidecar from the plugins directory. Full scope. `404 not_found` if the file isn't
+    /// present. A currently-loaded store keeps running on its already-`dlopen`ed handle until the next
+    /// store (re)load — removing the file only affects the NEXT load (folder = source of truth).
+    pub(crate) fn remove_store_plugin(
+        &self,
+        file: &str,
+    ) -> Result<crate::admin::v1::contract::PluginRemoveView, AdminError> {
+        let file = validate_plugin_filename(file)?;
+        let lib_path = self.app.plugins_dir.join(&file);
+        if !lib_path.is_file() {
+            return Err(AdminError::NotFound(format!("plugin `{file}`")));
+        }
+        std::fs::remove_file(&lib_path)
+            .map_err(|e| AdminError::Validation(format!("cannot remove plugin: {e}")))?;
+        // Best-effort: drop the manifest sidecar too (a missing sidecar is fine).
+        let _ = std::fs::remove_file(crate::plugin_trust::manifest_path_for(&lib_path));
+        Ok(crate::admin::v1::contract::PluginRemoveView {
+            file,
+            removed: true,
+        })
+    }
+
+    /// `POST /api/v1/admin/plugins/reload` — re-scan the plugins directory and report the current
+    /// dynamic-library inventory (the SAME projection `GET /plugins?type=store` produces, minus the
+    /// compiled-in `memory` head). Full scope. Reconciles the reported set to the folder (folder =
+    /// source of truth), the exact sibling of `config/reload`. A store change still applies on the
+    /// next store (re)load, not as a hot swap.
+    pub(crate) fn reload_store_plugins(
+        &self,
+    ) -> Result<crate::admin::v1::contract::PluginReloadView, AdminError> {
+        // Reuse the store catalog projection, dropping the compiled-in `memory` head (reload reports
+        // only the on-disk dynamic set it reconciled).
+        let plugins: Vec<PluginView> = self
+            .store_plugin_catalog()
+            .into_iter()
+            .filter(|p| p.loader == "dynamic-library")
+            .collect();
+        Ok(crate::admin::v1::contract::PluginReloadView {
+            plugins,
+            note:
+                "re-scanned the plugins directory; a store change takes effect on the next store \
+                   (re)load (restart or governance.store apply), not as a hot swap",
+        })
     }
 
     /// `GET /api/v1/admin/config` — the EFFECTIVE running config, composed from the same redacted reads as
@@ -1158,5 +1452,267 @@ mod tests {
             build_with_hook(&after_first, "g", hook(HookKind::Gate, false)).is_ok(),
             "re-registering with identical grants is allowed"
         );
+    }
+
+    // ── plugin admin surface (#13) ───────────────────────────────────────────────────────────────
+
+    use busbar_plugin_sign::{sign, Manifest, OnUntrusted, SigningKey};
+
+    /// A unique temp plugins directory for one test (isolated so parallel tests never collide).
+    fn tmp_plugins_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "busbar-plugin-admin-{}-{n}-{tag}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The store ABI version the engine speaks (for test manifests; `interface_version` is display
+    /// metadata — `evaluate` verifies the signature, not this field).
+    const TEST_ABI_VERSION: u32 = 1;
+
+    /// The platform-native filename a store plugin must carry for THIS host.
+    fn lib_name(stem: &str) -> String {
+        format!("{stem}{}", plugin_lib_extension())
+    }
+
+    /// Build a service over an App whose plugins dir + trust posture are the given ones.
+    fn svc_with(dir: std::path::PathBuf, trust: crate::config::PluginTrustCfg) -> AdminService {
+        let app = TestApp::new().plugins_dir(dir).plugin_trust(trust).build();
+        AdminService::new(app)
+    }
+
+    /// A permissive (`log`) posture with no publishers — an unsigned upload loads "unverified".
+    fn log_posture() -> crate::config::PluginTrustCfg {
+        crate::config::PluginTrustCfg {
+            on_untrusted: OnUntrusted::Log,
+            publishers: Vec::new(),
+        }
+    }
+
+    /// Locate the real sqlite plugin cdylib in the build's target dir (like the loader tests). `None`
+    /// if it wasn't built (a `-p busbar`-only run) — the caller skips.
+    fn sqlite_plugin_path() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
+        let name = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+        let candidate = profile_dir.join(&name);
+        candidate.exists().then_some(candidate)
+    }
+
+    /// Install rejects a filename that isn't a bare, platform-native library name (path traversal /
+    /// wrong extension) BEFORE any bytes touch disk.
+    #[test]
+    fn install_rejects_bad_filenames() {
+        let dir = tmp_plugins_dir("badname");
+        let svc = svc_with(dir.clone(), log_posture());
+        let ext = plugin_lib_extension();
+        for bad in [
+            format!("../escape{ext}"),
+            format!("sub/dir{ext}"),
+            "no_extension".to_string(),
+            format!("..{ext}"),
+        ] {
+            assert!(
+                matches!(
+                    svc.install_store_plugin(&bad, b"bytes", None),
+                    Err(AdminError::Validation(_))
+                ),
+                "filename `{bad}` must reject"
+            );
+        }
+        // Nothing was written for any rejected name.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// Install rejects an upload that is not a loadable busbar store plugin (ABI handshake fails), and
+    /// leaves NOTHING in the plugins dir (the temp copy is cleaned up).
+    #[test]
+    fn install_rejects_non_plugin_bytes() {
+        let dir = tmp_plugins_dir("nonplugin");
+        let svc = svc_with(dir.clone(), log_posture());
+        let file = lib_name("libnope");
+        assert!(
+            matches!(
+                svc.install_store_plugin(&file, b"\x7fELF not really a plugin", None),
+                Err(AdminError::Validation(_))
+            ),
+            "non-plugin bytes must fail ABI validation"
+        );
+        assert!(
+            !dir.join(&file).exists(),
+            "no library published on ABI failure"
+        );
+        // No leftover temp files either.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// Under the `halt` posture, an UNSIGNED upload is rejected as a conflict and nothing is written —
+    /// even a real, ABI-valid plugin (trust is checked BEFORE the ABI probe writes any temp copy).
+    #[test]
+    fn install_halt_posture_rejects_unsigned() {
+        let dir = tmp_plugins_dir("halt");
+        let trust = crate::config::PluginTrustCfg {
+            on_untrusted: OnUntrusted::Halt,
+            publishers: Vec::new(),
+        };
+        let svc = svc_with(dir.clone(), trust);
+        let file = lib_name("libanything");
+        assert!(
+            matches!(
+                svc.install_store_plugin(&file, b"whatever", None),
+                Err(AdminError::Conflict(_))
+            ),
+            "halt posture rejects an unsigned upload as a conflict"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    /// End-to-end install of the REAL sqlite plugin cdylib under a `log` posture: it re-verifies
+    /// (unverified — unsigned), passes the ABI handshake, and is published into the plugins dir. Then
+    /// the catalog reports it and `remove` deletes it.
+    #[test]
+    fn install_catalog_remove_roundtrip_real_plugin() {
+        let Some(src) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&src).unwrap();
+        let dir = tmp_plugins_dir("roundtrip");
+        let svc = svc_with(dir.clone(), log_posture());
+        let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+
+        let view = svc
+            .install_store_plugin(&file, &bytes, None)
+            .expect("install a real, ABI-valid plugin under the log posture");
+        assert_eq!(view.trust, "unverified", "unsigned under log = unverified");
+        assert_eq!(view.file, file);
+        assert!(dir.join(&file).exists(), "library published");
+
+        // Catalog: the memory head + our dynamic plugin, valid, dynamic-library loader.
+        let cat = svc.store_plugin_catalog();
+        assert_eq!(cat[0].name, "memory");
+        let dyn_row = cat
+            .iter()
+            .find(|p| p.loader == "dynamic-library")
+            .expect("dynamic plugin in catalog");
+        assert_eq!(dyn_row.valid, Some(true));
+        assert_eq!(dyn_row.target.as_deref(), Some(file.as_str()));
+
+        // Reload reports only the dynamic set (no memory head).
+        let reload = svc.reload_store_plugins().unwrap();
+        assert!(reload.plugins.iter().all(|p| p.loader == "dynamic-library"));
+        assert_eq!(reload.plugins.len(), 1);
+
+        // Remove deletes it; a second remove is a 404.
+        svc.remove_store_plugin(&file).expect("remove");
+        assert!(!dir.join(&file).exists());
+        assert!(matches!(
+            svc.remove_store_plugin(&file),
+            Err(AdminError::NotFound(_))
+        ));
+    }
+
+    /// A SIGNED upload from an allowlisted publisher installs as `trusted`, and its manifest sidecar
+    /// is written so the catalog reports the signed metadata + trusted verdict.
+    #[test]
+    fn install_signed_is_trusted_and_manifest_persisted() {
+        let Some(src) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&src).unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let manifest = sign(
+            &key,
+            Manifest {
+                name: "sqlite-store".into(),
+                version: "2.1.0".into(),
+                kind: "store".into(),
+                author: "Acme".into(),
+                homepage: String::new(),
+                source_url: String::new(),
+                description: String::new(),
+                license: String::new(),
+                publisher: "acme".into(),
+                interface_version: TEST_ABI_VERSION,
+                sha256: String::new(),
+                signature: String::new(),
+            },
+            &bytes,
+        );
+        let trust = crate::config::PluginTrustCfg {
+            on_untrusted: OnUntrusted::Halt,
+            publishers: vec![crate::config::PluginPublisher {
+                name: "acme".into(),
+                public_key: hex::encode(key.verifying_key().to_bytes()),
+            }],
+        };
+        let dir = tmp_plugins_dir("signed");
+        let svc = svc_with(dir.clone(), trust);
+        let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let view = svc
+            .install_store_plugin(&file, &bytes, Some(&manifest_bytes))
+            .expect("a signed, allowlisted upload installs even under halt");
+        assert_eq!(view.trust, "trusted");
+        assert_eq!(view.publisher.as_deref(), Some("acme"));
+        assert_eq!(view.version.as_deref(), Some("2.1.0"));
+        assert_eq!(view.name, "sqlite-store");
+
+        // The manifest sidecar was persisted; the catalog reports trusted + signed metadata.
+        let cat = svc.store_plugin_catalog();
+        let row = cat
+            .iter()
+            .find(|p| p.loader == "dynamic-library")
+            .expect("dynamic plugin");
+        assert_eq!(row.trust, Some("trusted"));
+        assert_eq!(row.publisher.as_deref(), Some("acme"));
+        assert_eq!(row.version.as_deref(), Some("2.1.0"));
+        assert_eq!(row.name, "sqlite-store");
+    }
+
+    /// A signed upload whose publisher is NOT allowlisted is untrusted; under `halt` it is a conflict
+    /// (rejected), and nothing is written.
+    #[test]
+    fn install_unknown_publisher_halts() {
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        let bytes = b"\x7fELF plugin-ish".to_vec();
+        let manifest = sign(
+            &key,
+            Manifest {
+                name: "x".into(),
+                version: "1.0.0".into(),
+                kind: "store".into(),
+                author: String::new(),
+                homepage: String::new(),
+                source_url: String::new(),
+                description: String::new(),
+                license: String::new(),
+                publisher: "stranger".into(),
+                interface_version: TEST_ABI_VERSION,
+                sha256: String::new(),
+                signature: String::new(),
+            },
+            &bytes,
+        );
+        let dir = tmp_plugins_dir("unknownpub");
+        let trust = crate::config::PluginTrustCfg {
+            on_untrusted: OnUntrusted::Halt,
+            publishers: Vec::new(),
+        };
+        let svc = svc_with(dir.clone(), trust);
+        let file = lib_name("libx");
+        let mb = serde_json::to_vec(&manifest).unwrap();
+        assert!(matches!(
+            svc.install_store_plugin(&file, &bytes, Some(&mb)),
+            Err(AdminError::Conflict(_))
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }

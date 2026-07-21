@@ -4865,3 +4865,210 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
     );
     handle.abort();
 }
+
+// ── plugin admin endpoints (#13), end-to-end over the live router ─────────────────────────────────
+
+/// Serve a router whose App points its plugin surface at `dir` (log posture, no publishers), with a
+/// known admin token — for the install/list/remove/reload plugin endpoints.
+async fn serve_with_plugins_dir(
+    dir: std::path::PathBuf,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let app = TestApp::new().governance(gov).plugins_dir(dir).build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (addr, handle)
+}
+
+/// Locate the sqlite plugin cdylib in the build's target dir (like the loader/service tests).
+fn admin_sqlite_plugin_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+    let candidate = profile_dir.join(&name);
+    candidate.exists().then_some(candidate)
+}
+
+/// FULL LIFECYCLE over the wire: `POST /plugins` installs a real (unsigned, log-posture) store plugin
+/// → `GET /plugins?type=store` lists it as a valid dynamic-library row → `POST /plugins/reload`
+/// reports it → `DELETE /plugins/{file}` removes it (204) → a second DELETE is 404. Every mutation is
+/// admin-token guarded and audited.
+#[tokio::test]
+async fn test_admin_v1_plugin_install_list_reload_remove() {
+    use base64::Engine as _;
+    crate::metrics::init();
+    let Some(src) = admin_sqlite_plugin_path() else {
+        eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+        return;
+    };
+    let bytes = std::fs::read(&src).unwrap();
+    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+    let dir =
+        std::env::temp_dir().join(format!("busbar-admin-plugins-http-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, handle) = serve_with_plugins_dir(dir.clone()).await;
+    let client = reqwest::Client::new();
+
+    // INSTALL — 201 with a trust verdict of "unverified" (unsigned under the log posture).
+    let body = serde_json::json!({
+        "file": file,
+        "library_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    });
+    let resp = client
+        .post(format!("http://{addr}/api/v1/admin/plugins"))
+        .header("x-admin-token", "admintok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "install returns 201 Created");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["file"], file);
+    assert_eq!(v["trust"], "unverified");
+    assert!(dir.join(&file).exists(), "library published to disk");
+
+    // A mutation WITHOUT the admin token is rejected (401) — the whole surface is guarded.
+    let unauth = client
+        .post(format!("http://{addr}/api/v1/admin/plugins"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401);
+
+    // LIST — the store catalog reports the memory head + our dynamic plugin (valid).
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/admin/plugins?type=store"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(items[0]["name"], "memory");
+    let dyn_row = items
+        .iter()
+        .find(|p| p["loader"] == "dynamic-library")
+        .expect("dynamic-library row present");
+    assert_eq!(dyn_row["valid"], true);
+    assert_eq!(dyn_row["target"], file);
+
+    // RELOAD — reports the reconciled dynamic set (no memory head).
+    let reload: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/admin/plugins/reload"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(reload["plugins"].as_array().unwrap().len(), 1);
+
+    // REMOVE — 204, then a second remove is 404 in the frozen envelope.
+    let del = client
+        .delete(format!("http://{addr}/api/v1/admin/plugins/{file}"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 204);
+    assert!(!dir.join(&file).exists(), "library removed from disk");
+
+    let del2 = client
+        .delete(format!("http://{addr}/api/v1/admin/plugins/{file}"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del2.status().as_u16(), 404);
+    let b: serde_json::Value = del2.json().await.unwrap();
+    assert_eq!(b["error"]["code"], "not_found");
+
+    // The install + remove both left audit rows (every mutation is audited).
+    let audit: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/admin/audit"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let actions: Vec<&str> = audit["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["action"].as_str())
+        .collect();
+    assert!(
+        actions.contains(&"plugin.install"),
+        "install audited: {actions:?}"
+    );
+    assert!(
+        actions.contains(&"plugin.remove"),
+        "remove audited: {actions:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    handle.abort();
+}
+
+/// A malformed install body (bad base64) is a `400 invalid_request` in the frozen envelope, and a
+/// non-plugin upload is a `400` too — nothing is published.
+#[tokio::test]
+async fn test_admin_v1_plugin_install_rejections() {
+    crate::metrics::init();
+    let dir = std::env::temp_dir().join(format!("busbar-admin-plugins-rej-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, handle) = serve_with_plugins_dir(dir.clone()).await;
+    let client = reqwest::Client::new();
+    let ext = if cfg!(target_os = "windows") {
+        ".dll"
+    } else if cfg!(target_os = "macos") {
+        ".dylib"
+    } else {
+        ".so"
+    };
+
+    // Bad base64.
+    let bad = client
+        .post(format!("http://{addr}/api/v1/admin/plugins"))
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"file": format!("libx{ext}"), "library_b64": "!!!not base64!!!"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 400);
+    let b: serde_json::Value = bad.json().await.unwrap();
+    assert_eq!(b["error"]["code"], "invalid_request");
+
+    // Valid base64 but not a plugin → ABI validation fails (400).
+    use base64::Engine as _;
+    let notplugin = client
+        .post(format!("http://{addr}/api/v1/admin/plugins"))
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({
+            "file": format!("libnope{ext}"),
+            "library_b64": base64::engine::general_purpose::STANDARD.encode(b"not a real library"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(notplugin.status().as_u16(), 400);
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "nothing published"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    handle.abort();
+}

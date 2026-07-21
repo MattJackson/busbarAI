@@ -1474,6 +1474,26 @@ pub(crate) fn build_app_from_config(
         }
     }
 
+    // Capture the plugin-directory + trust posture for the Admin API plugin surface BEFORE
+    // `governance_cfg` is consumed by the store-load branch below. These ride on the `App` snapshot so
+    // the catalog/install/remove/reload endpoints resolve the SAME directory + posture the boot
+    // store-load uses. Absent `governance:` ⇒ the defaults (`plugins`, `on_untrusted: log`).
+    let (plugins_dir, plugin_trust) = governance_cfg.as_ref().map_or_else(
+        || {
+            let d = config::GovernanceCfg::default();
+            (
+                std::path::PathBuf::from(d.plugins_dir),
+                config::PluginTrustCfg::default(),
+            )
+        },
+        |g| {
+            (
+                std::path::PathBuf::from(g.plugins_dir.clone()),
+                g.trust.clone(),
+            )
+        },
+    );
+
     // open the governance store + load the virtual-key cache when enabled.
     let governance = if let Some(p) = prior {
         // REUSED across applies: the keys + spend/rate state must survive config changes.
@@ -1650,6 +1670,8 @@ pub(crate) fn build_app_from_config(
         fallback_pools,
         on_exhausted_cfgs,
         governance,
+        plugins_dir,
+        plugin_trust,
         default_max_tokens: cfg.limits.default_max_tokens,
         reasoning_effort_budgets: {
             let b = cfg.limits.reasoning_effort_budgets;

@@ -421,23 +421,129 @@ pub(crate) struct HookHealthView {
 }
 
 /// One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either
-/// COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)
-/// or EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where
-/// activation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`
-/// where it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
+/// COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`),
+/// EXTERNAL (registered at runtime over socket/webhook), or a DYNAMIC-LIBRARY plugin (a loadable
+/// `.so`/`.dll`/`.dylib` in the plugins directory, loaded over the store C ABI). `active` is
+/// `Some(true/false)` where activation is tracked (auth modules: in the chain?; external hooks:
+/// configured = true; dynamic store: the configured `governance.store`) and `None` where it is a
+/// per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct PluginView {
     pub(crate) name: String,
-    /// `"auth"` or `"hooks"` — the plugin TYPE (each a distinct engine contract).
+    /// `"auth"`, `"hooks"`, or `"store"` — the plugin TYPE (each a distinct engine contract).
     pub(crate) r#type: &'static str,
-    /// `"compiled-in"` or `"external"`.
+    /// `"compiled-in"`, `"external"`, or `"dynamic-library"`.
     pub(crate) loader: &'static str,
     /// Whether the plugin is currently active, where tracked; `None` when activation is not summarized
     /// at this level.
     pub(crate) active: Option<bool>,
-    /// For an external plugin, its transport target (socket path / webhook URL). `None` for compiled-in.
+    /// For an external plugin, its transport target (socket path / webhook URL); for a dynamic-library
+    /// plugin, its library FILENAME in the plugins directory (the handle `DELETE` takes). `None` for
+    /// compiled-in.
     pub(crate) target: Option<String>,
+    /// The plugin's semantic version, from its signed sidecar manifest (dynamic-library plugins only).
+    /// `None` for compiled-in/external, or a dynamic plugin with no/invalid manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+    /// The manifest's declared publisher (dynamic-library plugins with a manifest).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publisher: Option<String>,
+    /// The store C-ABI (`interface_version`) the manifest declares (dynamic-library plugins with a
+    /// manifest). Operator-facing name for the "ABI" the engine speaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) interface_version: Option<u32>,
+    /// The server-side trust verdict for a dynamic-library plugin, re-evaluated against the running
+    /// `governance.trust` posture: `"trusted"` (signed by an allowlisted publisher), `"unverified"`
+    /// (loaded but not verified — the posture permits it), or `"rejected"` (the `halt` posture would
+    /// refuse it). `None` for compiled-in/external.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trust: Option<&'static str>,
+    /// For a dynamic-library plugin: whether the library validated as a busbar store plugin the engine
+    /// can load (ABI handshake). `None` for compiled-in/external.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) valid: Option<bool>,
+    /// Why a dynamic-library plugin did not validate (`valid: false`) — a short, secret-free reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+}
+
+impl PluginView {
+    /// A COMPILED-IN or EXTERNAL plugin row (no manifest metadata) — the historical shape. The
+    /// dynamic-library fields (`version`/`publisher`/`interface_version`/`trust`/`valid`/`error`) are
+    /// `None` and skip serialization, so the wire is byte-identical to before this addition.
+    pub(crate) fn basic(
+        name: String,
+        r#type: &'static str,
+        loader: &'static str,
+        active: Option<bool>,
+        target: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            r#type,
+            loader,
+            active,
+            target,
+            version: None,
+            publisher: None,
+            interface_version: None,
+            trust: None,
+            valid: None,
+            error: None,
+        }
+    }
+}
+
+/// The result of installing a dynamic-library store plugin (`POST /api/v1/admin/plugins`). The
+/// engine RE-VERIFIED the uploaded bytes against the running trust posture (the client is never
+/// trusted), validated the ABI handshake, and atomically wrote the library (+ its manifest sidecar)
+/// into the plugins directory. `active` takes effect on the next store (re)load — a store change
+/// applies on restart / `governance.store` apply, not as a hot swap (design: store install is
+/// boot-time/config-apply). Additive-only; never a secret.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct PluginInstallView {
+    /// The library FILENAME written into the plugins directory (the handle `DELETE` takes).
+    pub(crate) file: String,
+    /// The plugin name from its manifest (or the filename when unsigned).
+    pub(crate) name: String,
+    /// The store C-ABI (`interface_version`) the engine validated the library against.
+    pub(crate) interface_version: u32,
+    /// The server-side trust verdict from the RE-VERIFY: `"trusted"` | `"unverified"`. (A `"rejected"`
+    /// verdict is an error, never a success body.)
+    pub(crate) trust: &'static str,
+    /// The manifest version, when the upload carried a signed manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+    /// The manifest publisher, when signed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publisher: Option<String>,
+    /// A human note: this install is durable in the folder but takes effect on the next store (re)load.
+    pub(crate) note: &'static str,
+}
+
+/// The result of removing a dynamic-library plugin (`DELETE /api/v1/admin/plugins/{file}`) — the
+/// library and its manifest sidecar are deleted from the plugins directory. `204 No Content` is the
+/// wire response; this view backs the OpenAPI schema for tooling that models a body.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct PluginRemoveView {
+    pub(crate) file: String,
+    pub(crate) removed: bool,
+}
+
+/// The result of re-scanning the plugins directory (`POST /api/v1/admin/plugins/reload`): the
+/// current dynamic-library inventory, each with its ABI-validity. Reconciles the reported set to the
+/// folder (the folder is the source of truth), exactly as `config/reload` reconciles config to disk.
+/// A store change still applies on the next store (re)load, not as a hot swap.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct PluginReloadView {
+    /// The dynamic-library plugins now present in the directory, sorted by filename.
+    pub(crate) plugins: Vec<PluginView>,
+    /// A human note on when a store change actually takes effect.
+    pub(crate) note: &'static str,
 }
 
 /// The ingress auth chain read (`GET /api/v1/admin/auth`): the ordered module names that authenticate

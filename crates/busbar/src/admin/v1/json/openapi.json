@@ -1303,8 +1303,78 @@
         ],
         "type": "object"
       },
+      "PluginInstallView": {
+        "description": "The result of installing a dynamic-library store plugin (`POST /api/v1/admin/plugins`). The\nengine RE-VERIFIED the uploaded bytes against the running trust posture (the client is never\ntrusted), validated the ABI handshake, and atomically wrote the library (+ its manifest sidecar)\ninto the plugins directory. `active` takes effect on the next store (re)load — a store change\napplies on restart / `governance.store` apply, not as a hot swap (design: store install is\nboot-time/config-apply). Additive-only; never a secret.",
+        "properties": {
+          "file": {
+            "description": "The library FILENAME written into the plugins directory (the handle `DELETE` takes).",
+            "type": "string"
+          },
+          "interface_version": {
+            "description": "The store C-ABI (`interface_version`) the engine validated the library against.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "The plugin name from its manifest (or the filename when unsigned).",
+            "type": "string"
+          },
+          "note": {
+            "description": "A human note: this install is durable in the folder but takes effect on the next store (re)load.",
+            "type": "string"
+          },
+          "publisher": {
+            "description": "The manifest publisher, when signed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "description": "The server-side trust verdict from the RE-VERIFY: `\"trusted\"` | `\"unverified\"`. (A `\"rejected\"`\nverdict is an error, never a success body.)",
+            "type": "string"
+          },
+          "version": {
+            "description": "The manifest version, when the upload carried a signed manifest.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "file",
+          "name",
+          "interface_version",
+          "trust",
+          "note"
+        ],
+        "type": "object"
+      },
+      "PluginReloadView": {
+        "description": "The result of re-scanning the plugins directory (`POST /api/v1/admin/plugins/reload`): the\ncurrent dynamic-library inventory, each with its ABI-validity. Reconciles the reported set to the\nfolder (the folder is the source of truth), exactly as `config/reload` reconciles config to disk.\nA store change still applies on the next store (re)load, not as a hot swap.",
+        "properties": {
+          "note": {
+            "description": "A human note on when a store change actually takes effect.",
+            "type": "string"
+          },
+          "plugins": {
+            "description": "The dynamic-library plugins now present in the directory, sorted by filename.",
+            "items": {
+              "$ref": "#/components/schemas/PluginView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "plugins",
+          "note"
+        ],
+        "type": "object"
+      },
       "PluginView": {
-        "description": "One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either\nCOMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)\nor EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where\nactivation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`\nwhere it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.",
+        "description": "One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either\nCOMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`),\nEXTERNAL (registered at runtime over socket/webhook), or a DYNAMIC-LIBRARY plugin (a loadable\n`.so`/`.dll`/`.dylib` in the plugins directory, loaded over the store C ABI). `active` is\n`Some(true/false)` where activation is tracked (auth modules: in the chain?; external hooks:\nconfigured = true; dynamic store: the configured `governance.store`) and `None` where it is a\nper-pool concern not summarized here (compiled-in ranking policies). Additive-only.",
         "properties": {
           "active": {
             "description": "Whether the plugin is currently active, where tracked; `None` when activation is not summarized\nat this level.",
@@ -1313,23 +1383,67 @@
               "null"
             ]
           },
+          "error": {
+            "description": "Why a dynamic-library plugin did not validate (`valid: false`) — a short, secret-free reason.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "interface_version": {
+            "description": "The store C-ABI (`interface_version`) the manifest declares (dynamic-library plugins with a\nmanifest). Operator-facing name for the \"ABI\" the engine speaks.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "loader": {
-            "description": "`\"compiled-in\"` or `\"external\"`.",
+            "description": "`\"compiled-in\"`, `\"external\"`, or `\"dynamic-library\"`.",
             "type": "string"
           },
           "name": {
             "type": "string"
           },
+          "publisher": {
+            "description": "The manifest's declared publisher (dynamic-library plugins with a manifest).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "target": {
-            "description": "For an external plugin, its transport target (socket path / webhook URL). `None` for compiled-in.",
+            "description": "For an external plugin, its transport target (socket path / webhook URL); for a dynamic-library\nplugin, its library FILENAME in the plugins directory (the handle `DELETE` takes). `None` for\ncompiled-in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trust": {
+            "description": "The server-side trust verdict for a dynamic-library plugin, re-evaluated against the running\n`governance.trust` posture: `\"trusted\"` (signed by an allowlisted publisher), `\"unverified\"`\n(loaded but not verified — the posture permits it), or `\"rejected\"` (the `halt` posture would\nrefuse it). `None` for compiled-in/external.",
             "type": [
               "string",
               "null"
             ]
           },
           "type": {
-            "description": "`\"auth\"` or `\"hooks\"` — the plugin TYPE (each a distinct engine contract).",
+            "description": "`\"auth\"`, `\"hooks\"`, or `\"store\"` — the plugin TYPE (each a distinct engine contract).",
             "type": "string"
+          },
+          "valid": {
+            "description": "For a dynamic-library plugin: whether the library validated as a busbar store plugin the engine\ncan load (ABI handshake). `None` for compiled-in/external.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "version": {
+            "description": "The plugin's semantic version, from its signed sidecar manifest (dynamic-library plugins only).\n`None` for compiled-in/external, or a dynamic plugin with no/invalid manifest.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1739,7 +1853,7 @@
   "info": {
     "description": "The frozen, additive-only /api/v1/admin surface. Errors use the stable envelope {\"error\":{\"code\",\"message\"}}; tooling branches on `code`.",
     "title": "Busbar Admin API",
-    "version": "1.4.1"
+    "version": "1.5.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -4075,7 +4189,7 @@
       "get": {
         "parameters": [
           {
-            "description": "Plugin type: `auth` | `hooks` (required)",
+            "description": "Plugin type: `auth` | `hooks` | `store` (required)",
             "in": "query",
             "name": "type",
             "required": true,
@@ -4124,8 +4238,217 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Plugin catalog by type (compiled-in + external)",
+        "summary": "Plugin catalog by type (compiled-in + external + dynamic-library)",
         "x-busbar-required-scope": "read-only"
+      },
+      "post": {
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginInstallView"
+                }
+              }
+            },
+            "description": "Installed — `{file, name, interface_version, trust, version?, publisher?, note}`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Malformed body, bad base64, or the library is not a loadable busbar store plugin (`invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "The upload is rejected by the trust policy under the `halt` posture (`conflict`) — sign it or relax governance.trust.on_untrusted"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Install a dynamic-library store plugin: upload the library (base64) + optional signed manifest; the engine RE-VERIFIES against the running trust posture, validates the store ABI, and writes it atomically into the plugins directory. Takes effect on the next store (re)load",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/plugins/reload": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginReloadView"
+                }
+              }
+            },
+            "description": "`{plugins, note}` — the current dynamic-library inventory"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Re-scan the plugins directory and report the reconciled dynamic-library inventory (the sibling of config/reload). A store change takes effect on the next store (re)load",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/plugins/{file}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "file",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid plugin filename (`invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "No such plugin file (`not_found`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove a dynamic-library plugin (library + manifest sidecar) from the plugins directory. A loaded store keeps running until the next store (re)load",
+        "x-busbar-required-scope": "full"
       }
     },
     "/api/v1/admin/pools": {

@@ -657,6 +657,8 @@ pub(crate) struct TestApp {
     global_hooks: Vec<String>,
     base_hook_names: std::collections::HashSet<String>,
     overlay_path: Option<std::path::PathBuf>,
+    plugins_dir: Option<std::path::PathBuf>,
+    plugin_trust: Option<crate::config::PluginTrustCfg>,
 }
 
 #[allow(dead_code)]
@@ -675,7 +677,21 @@ impl TestApp {
             global_hooks: Vec::new(),
             base_hook_names: std::collections::HashSet::new(),
             overlay_path: None,
+            plugins_dir: None,
+            plugin_trust: None,
         }
+    }
+
+    /// Point the plugin surface at a specific directory (for the Admin API plugin catalog / install /
+    /// remove / reload tests). Defaults to `plugins` when unset.
+    pub(crate) fn plugins_dir(mut self, path: std::path::PathBuf) -> Self {
+        self.plugins_dir = Some(path);
+        self
+    }
+    /// Set the plugin trust posture (for install re-verification tests). Defaults to the `log` posture.
+    pub(crate) fn plugin_trust(mut self, trust: crate::config::PluginTrustCfg) -> Self {
+        self.plugin_trust = Some(trust);
+        self
     }
 
     /// Enable config-overlay persistence at `path` (for testing runtime-change durability).
@@ -795,6 +811,10 @@ impl TestApp {
             fallback_pools: self.fallback_pools,
             on_exhausted_cfgs: self.on_exhausted_cfgs,
             governance: self.governance,
+            plugins_dir: self
+                .plugins_dir
+                .unwrap_or_else(|| std::path::PathBuf::from("plugins")),
+            plugin_trust: self.plugin_trust.unwrap_or_default(),
             default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
             reasoning_effort_budgets: [1024, 4096, 8192, 16384],
         });

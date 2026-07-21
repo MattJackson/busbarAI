@@ -84,6 +84,148 @@ pub(crate) async fn list_plugins(
     respond(StatusCode::OK, service(&handle).list_plugins(ptype).await)
 }
 
+/// The `POST /api/v1/admin/plugins` request body: install a dynamic-library store plugin. The
+/// library bytes ride as base64 (`library_b64`) — a plugin is an opaque binary, so base64 keeps it a
+/// clean JSON field; the optional signed `manifest` is an inline JSON object (the engine RE-VERIFIES
+/// it server-side against the running trust posture — the client is never trusted). `file` is the
+/// bare, platform-native library filename to write (`.so`/`.dll`/`.dylib`).
+#[derive(serde::Deserialize)]
+pub(crate) struct InstallPluginReq {
+    file: String,
+    library_b64: String,
+    #[serde(default)]
+    manifest: Option<serde_json::Value>,
+}
+
+/// `POST /api/v1/admin/plugins` — INSTALL a dynamic-library store plugin (Full scope). Decodes the
+/// uploaded library, RE-VERIFIES it against the running `governance.trust` posture, validates the
+/// store ABI handshake, and atomically writes it (+ its manifest sidecar) into the plugins directory.
+/// `201 Created` with the install result. The store change takes effect on the next store (re)load,
+/// not as a hot swap. Every attempt (success AND failure) is audited.
+pub(crate) async fn install_plugin(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    body: axum::body::Bytes,
+) -> Response {
+    use base64::Engine as _;
+    let actor = principal.actor_id().to_string();
+    let req: InstallPluginReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "plugin.install",
+                "plugin:?",
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            return err_json(&AdminError::Validation(format!(
+                "malformed plugin body: {e}"
+            )));
+        }
+    };
+    let resource = format!("plugin:{}", req.file);
+    let library = match base64::engine::general_purpose::STANDARD.decode(req.library_b64.as_bytes())
+    {
+        Ok(b) => b,
+        Err(e) => {
+            audit::AUDIT.record_by("plugin.install", &resource, audit::OUTCOME_REJECTED, &actor);
+            return err_json(&AdminError::Validation(format!(
+                "library_b64 is not valid base64: {e}"
+            )));
+        }
+    };
+    // Serialize the inline manifest back to bytes for the sidecar (canonical verification re-sorts
+    // keys, so the on-disk byte order is irrelevant to trust — this is the DISPLAY/store copy).
+    let manifest_bytes: Option<Vec<u8>> = match req.manifest.as_ref() {
+        None => None,
+        Some(v) => match serde_json::to_vec(v) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                audit::AUDIT.record_by(
+                    "plugin.install",
+                    &resource,
+                    audit::OUTCOME_REJECTED,
+                    &actor,
+                );
+                return err_json(&AdminError::Validation(format!("invalid manifest: {e}")));
+            }
+        },
+    };
+    // The install itself is filesystem I/O + a `dlopen` for the ABI probe — run it off the async
+    // runtime's worker so a slow disk / large library can't stall the reactor.
+    let svc_handle = handle.clone();
+    let file = req.file.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        service(&svc_handle).install_store_plugin(&file, &library, manifest_bytes.as_deref())
+    })
+    .await;
+    match result {
+        Ok(Ok(view)) => {
+            audit::AUDIT.record_by("plugin.install", &resource, audit::OUTCOME_APPLIED, &actor);
+            ok_json(StatusCode::CREATED, &view)
+        }
+        Ok(Err(e)) => {
+            audit::AUDIT.record_by("plugin.install", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+        Err(_) => {
+            audit::AUDIT.record_by("plugin.install", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&AdminError::Internal)
+        }
+    }
+}
+
+/// `DELETE /api/v1/admin/plugins/{file}` — REMOVE a dynamic-library plugin (Full scope): delete the
+/// library + its manifest sidecar from the plugins directory. `404 not_found` if absent. `204 No
+/// Content` on success. A currently-loaded store keeps running until the next store (re)load.
+pub(crate) async fn remove_plugin(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(file): Path<String>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let resource = format!("plugin:{file}");
+    match service(&handle).remove_store_plugin(&file) {
+        Ok(_) => {
+            audit::AUDIT.record_by("plugin.remove", &resource, audit::OUTCOME_APPLIED, &actor);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("plugin.remove", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
+/// `POST /api/v1/admin/plugins/reload` — re-scan the plugins directory and report the reconciled
+/// dynamic-library inventory (Full scope) — the sibling of `config/reload`. Audited.
+pub(crate) async fn reload_plugins(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    match service(&handle).reload_store_plugins() {
+        Ok(view) => {
+            audit::AUDIT.record_by(
+                "plugin.reload",
+                "plugin:dir",
+                audit::OUTCOME_APPLIED,
+                &actor,
+            );
+            ok_json(StatusCode::OK, &view)
+        }
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "plugin.reload",
+                "plugin:dir",
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            err_json(&e)
+        }
+    }
+}
+
 /// `GET /api/v1/admin/auth` — the ingress auth chain + upstream-credential mode (no secrets).
 pub(crate) async fn get_auth(State(handle): State<Arc<AppHandle>>) -> Response {
     respond(StatusCode::OK, service(&handle).get_auth().await)
@@ -1282,7 +1424,7 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     (PATH_HOOKS, "Hook registry (definitions)"),
     (
         "/plugins",
-        "Plugin catalog by type (compiled-in + external)",
+        "Plugin catalog by type (compiled-in + external + dynamic-library)",
     ),
     (
         "/auth",
@@ -1362,6 +1504,55 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
             }),
         );
     }
+    // Plugin INSTALL: POST on the /plugins collection (merged onto its GET entry above).
+    if let Some(obj) = paths
+        .get_mut(&ap("/plugins"))
+        .and_then(|p| p.as_object_mut())
+    {
+        obj.insert(
+            "post".to_string(),
+            json!({
+                "summary": "Install a dynamic-library store plugin: upload the library (base64) + optional signed manifest; the engine RE-VERIFIES against the running trust posture, validates the store ABI, and writes it atomically into the plugins directory. Takes effect on the next store (re)load",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "201": {"description": "Installed — `{file, name, interface_version, trust, version?, publisher?, note}`"},
+                    "400": {"description": "Malformed body, bad base64, or the library is not a loadable busbar store plugin (`invalid_request`)"},
+                    "409": {"description": "The upload is rejected by the trust policy under the `halt` posture (`conflict`) — sign it or relax governance.trust.on_untrusted"}
+                }
+            }),
+        );
+    }
+    // Plugin RELOAD + REMOVE (templated).
+    paths.insert(
+        ap("/plugins/reload"),
+        json!({
+            "post": {
+                "summary": "Re-scan the plugins directory and report the reconciled dynamic-library inventory (the sibling of config/reload). A store change takes effect on the next store (re)load",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{plugins, note}` — the current dynamic-library inventory"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        ap("/plugins/{file}"),
+        json!({
+            "delete": {
+                "summary": "Remove a dynamic-library plugin (library + manifest sidecar) from the plugins directory. A loaded store keeps running until the next store (re)load",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "file", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "204": {"description": "Removed"},
+                    "400": {"description": "Invalid plugin filename (`invalid_request`)"},
+                    "404": {"description": "No such plugin file (`not_found`)"}
+                }
+            }
+        }),
+    );
     // Templated + non-GET routes.
     paths.insert(
         ap("/hooks/{name}"),
@@ -1805,7 +1996,11 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         ),
         (
             "/plugins",
-            &[("type", "Plugin type: `auth` | `hooks` (required)", true)],
+            &[(
+                "type",
+                "Plugin type: `auth` | `hooks` | `store` (required)",
+                true,
+            )],
         ),
         (
             "/usage",
@@ -1941,7 +2136,8 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
 
     use crate::admin::v1::contract::{
         AdminAuthView, AuthView, ConfigValidateView, EffectiveConfigView, HookHealthView, HookView,
-        InfoView, ModelView, Page, PluginView, PoolDetailView, PoolView, ProviderView, UsageView,
+        InfoView, ModelView, Page, PluginInstallView, PluginReloadView, PluginView, PoolDetailView,
+        PoolView, ProviderView, UsageView,
     };
 
     // Info & topology.
@@ -1967,6 +2163,8 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/auth/cache/flush", "post", "200", sview::CacheFlushView);
     // Plugins, usage, config.
     typed!("/plugins", "get", "200", Page<PluginView>);
+    typed!("/plugins", "post", "201", PluginInstallView);
+    typed!("/plugins/reload", "post", "200", PluginReloadView);
     typed!("/usage", "get", "200", UsageView);
     typed!("/config", "get", "200", EffectiveConfigView);
     typed!(PATH_CONFIG_VALIDATE, "post", "200", ConfigValidateView);
