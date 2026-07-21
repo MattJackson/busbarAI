@@ -367,17 +367,33 @@ fn main() {
     #[cfg(not(target_env = "msvc"))]
     {
         use tikv_jemalloc_ctl::background_thread;
-        match background_thread::write(true).and_then(|()| background_thread::read()) {
-            Ok(true) => {} // enabled — RSS falls back to idle; nothing to report
-            Ok(false) => eprintln!(
-                "[warn] jemalloc background purge thread did NOT enable on this target (no \
-                 background-thread support); RSS is still bounded under load by foreground decay purge, \
-                 but may not fall back to idle as promptly when the process is fully idle"
-            ),
-            Err(e) => eprintln!(
-                "[warn] could not enable jemalloc background purge thread ({e}); falling back to \
-                 foreground decay purge"
-            ),
+        let enabled = match background_thread::write(true).and_then(|()| background_thread::read())
+        {
+            Ok(true) => true, // enabled — RSS falls back to idle; nothing to report
+            Ok(false) => {
+                eprintln!(
+                    "[warn] jemalloc background purge thread did NOT enable on this target (no \
+                     background-thread support); enabling busbar's idle purge fallback so RSS still \
+                     returns to idle after a load burst"
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!(
+                    "[warn] could not enable jemalloc background purge thread ({e}); enabling \
+                     busbar's idle purge fallback so RSS still returns to idle after a load burst"
+                );
+                false
+            }
+        };
+        // WITHOUT background threads (static-musl release builds — jemalloc compiles them out under
+        // musl — and macOS dev builds), jemalloc's decay purge is FOREGROUND-only: it advances only
+        // on allocator activity. A fully idle process therefore never purges, so after a big-payload
+        // burst RSS ratchets at (roughly) the burst's dirty-page peak forever — observed as
+        // idle 8.7 MiB → burst 322 MiB → "idle" 56 MiB that never comes back down. The fallback
+        // below restores the return-to-idle property with ZERO unsafe code and ZERO hot-path cost.
+        if !enabled {
+            spawn_jemalloc_idle_purge_fallback();
         }
     }
     // Worker-thread count. `BUSBAR_WORKER_THREADS` is the operator override; the DEFAULT is one worker
@@ -874,6 +890,81 @@ async fn reshape_body_limit_413(
     reshape_oversized_413(&path, resp).await
 }
 
+/// Per-process count of requests that entered the middleware stack — the idleness signal for the
+/// jemalloc idle-purge fallback (bumped once per request in `server_timing`, read every sweep tick
+/// by the purge thread). Wraps harmlessly (only equality-across-a-window is compared).
+static REQUEST_ACTIVITY_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How often the idle-purge fallback wakes to check for idleness (and how long a request-free window
+/// must be before it purges). 15 s keeps "RSS returns to idle within ~60 s of load stopping" with
+/// plenty of margin while never firing under any sustained traffic.
+#[cfg(not(target_env = "msvc"))]
+const IDLE_PURGE_SWEEP_SECS: u64 = 15;
+
+/// FALLBACK idle purge for targets where jemalloc's background purge threads are unavailable
+/// (static-musl release builds compile them out; macOS lacks them). jemalloc's decay purge is
+/// otherwise FOREGROUND-only — driven by allocator activity — so a fully idle process never returns
+/// its freed dirty pages to the OS and RSS ratchets at the last burst's peak (measured on this
+/// machine: an 8-worker burst left 595 MiB of freed-but-unpurged RSS parked indefinitely; one purge
+/// pass dropped it to 14.7 MiB). This thread watches the request-activity ticker and, after a full
+/// sweep window with ZERO requests, forces a one-shot purge of every INITIALIZED arena's dirty pages
+/// by writing `arena.<i>.dirty_decay_ms = 0` (jemalloc's documented "purge all unused dirty pages
+/// immediately" setting) and then restoring the configured decay value — all through
+/// tikv-jemalloc-ctl's SAFE typed mallctl API (`AsName`/`Access`; no `unsafe` anywhere).
+///
+/// Per-arena (not the `MALLCTL_ARENAS_ALL` pseudo-index) because the ALL write EFAULTs the moment it
+/// hits an UNINITIALIZED arena (jemalloc creates arenas lazily; most of the default 4×ncpu set never
+/// initialize), poisoning the whole batch. Individual errors on uninitialized arenas are expected
+/// and skipped; `arenas.narenas` is re-read each pass so late-created arenas are covered.
+///
+/// Request behavior is untouched: the purge only ever fires in a window that served NO requests, the
+/// restore returns decay to exactly the configured value, and under load the thread does nothing but
+/// one atomic read per 15 s. Repeated purges on a long-idle process are no-ops (no dirty pages
+/// remain). Best-effort throughout — mallctl errors are skipped, never panicked on.
+#[cfg(not(target_env = "msvc"))]
+fn spawn_jemalloc_idle_purge_fallback() {
+    use tikv_jemalloc_ctl::{Access, AsName};
+    // The configured default decay (what arenas run with; the value restored after each purge).
+    const ARENAS_DIRTY_DECAY_DEFAULT: &[u8] = b"opt.dirty_decay_ms\0";
+    const ARENAS_NARENAS: &[u8] = b"arenas.narenas\0";
+    let spawned = std::thread::Builder::new()
+        .name("busbar-idle-purge".into())
+        .spawn(move || {
+            let restore: isize = match ARENAS_DIRTY_DECAY_DEFAULT.name().read() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "[warn] jemalloc idle-purge fallback disabled: could not read \
+                         opt.dirty_decay_ms ({e})"
+                    );
+                    return;
+                }
+            };
+            let mut last = REQUEST_ACTIVITY_TICKS.load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(IDLE_PURGE_SWEEP_SECS));
+                let cur = REQUEST_ACTIVITY_TICKS.load(std::sync::atomic::Ordering::Relaxed);
+                let idle = cur == last;
+                last = cur;
+                if !idle {
+                    continue;
+                }
+                // Idle window: force the purge on every initialized arena (decay 0 ⇒ jemalloc purges
+                // all unused dirty pages during the set), then restore the configured decay. An
+                // uninitialized arena's write errors — expected; skip it.
+                let narenas: u32 = ARENAS_NARENAS.name().read().unwrap_or(0);
+                for i in 0..narenas {
+                    let key = format!("arena.{i}.dirty_decay_ms\0");
+                    let name = key.as_bytes().name();
+                    let _ = name.write(0isize).and_then(|()| name.write(restore));
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[warn] could not spawn the jemalloc idle-purge fallback thread ({e})");
+    }
+}
+
 /// Compute the `Server-Timing` `dur` value (milliseconds) for a request: Busbar's own processing
 /// time = total request wall-clock minus the upstream round-trip. `upstream_us == u64::MAX` means
 /// "no upstream hop" (admin/health/early error), so the full time is reported. Saturating, so clock
@@ -900,6 +991,10 @@ async fn server_timing(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use std::sync::atomic::Ordering;
+    // Activity tick for the jemalloc idle-purge fallback (see `spawn_jemalloc_idle_purge_fallback`):
+    // one relaxed add on the outermost middleware, so the purge thread can tell "no requests this
+    // window" apart from "under load" without touching the metrics registry. Negligible cost.
+    REQUEST_ACTIVITY_TICKS.fetch_add(1, Ordering::Relaxed);
     let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_UPSTREAM_RTT));
     let start = std::time::Instant::now();
     let mut resp = proxy::UPSTREAM_RTT_US
