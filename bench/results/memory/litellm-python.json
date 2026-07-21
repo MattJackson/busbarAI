@@ -1,0 +1,15 @@
+{
+  "gateway": "litellm-python",
+  "build": "litellm==?",
+  "served": true,
+  "idle_rss_mib": 290.5,
+  "peak_rss_mib": 826.7,
+  "post_load_rss_mib": 815.4,
+  "payload_bytes": 150000,
+  "concurrency": 1500,
+  "duration_s": 90,
+  "endpoint": "/v1/chat/completions",
+  "model": "gpt-4o-mini",
+  "hardware": "aarch64 16vCPU",
+  "measured_at": "2026-07-21T02:41:21Z"
+}
