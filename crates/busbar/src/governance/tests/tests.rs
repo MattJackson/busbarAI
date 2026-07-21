@@ -923,7 +923,7 @@ fn test_add_rate_tokens_reinitialises_a_genuinely_stale_entry() {
     // Seed a stale W0 entry directly (simulating an entry the sweep has not yet evicted), then
     // credit with a NEWER start window W1.
     {
-        let mut map = gov.rate.write().unwrap_or_else(|p| p.into_inner());
+        let mut map = gov.rate.write("k1");
         map.insert(
             "k1".to_string(),
             RateState {
@@ -934,7 +934,7 @@ fn test_add_rate_tokens_reinitialises_a_genuinely_stale_entry() {
         );
     }
     gov.record_tokens("k1", BUDGET_PERIOD_TOTAL, w1, 40);
-    let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
+    let map = gov.rate.read("k1");
     let st = map.get("k1").expect("entry exists");
     assert_eq!(
         st.window_start, w1,
@@ -988,7 +988,7 @@ fn test_check_rate_resets_stale_entry_without_eager_sweep() {
     // POST-increment: a call fires the sweep when the value AFTER its increment is a multiple of
     // N. Set the ticker to 1 so the next call's post-increment value is 2, which is not a
     // multiple of N.
-    gov.rate_sweep_ticker.store(1, Ordering::Relaxed);
+    gov.rate.sweep_ticker_for("k1").store(1, Ordering::Relaxed);
     assert!(
         !2u32.is_multiple_of(RATE_SWEEP_INTERVAL),
         "test precondition: next call's post-increment value must skip the eager sweep"
@@ -1010,42 +1010,49 @@ fn test_check_rate_resets_stale_entry_without_eager_sweep() {
 #[test]
 fn test_check_rate_sweep_evicts_silent_keys_to_bound_map() {
     // The amortized sweep must still evict entries for keys that have gone silent in older
-    // windows, so the map stays bounded. We seed many distinct keys in W0, then trigger a sweep
-    // on a later window and confirm the stale entries are gone.
+    // windows, so the map stays bounded. Under the sharded rate map the sweep is PER-SHARD, so we
+    // exercise a single shard: seed a stale entry and a live key that share ONE shard, force that
+    // shard's sweep on the live key's admission, and confirm the stale co-tenant is evicted.
     let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store, 0, 0, None).unwrap();
     let w0 = 1_700_000_040 / 60 * 60;
 
-    for i in 0..10 {
-        let mut k = sample_key(&format!("k{i}"), &format!("h{i}"));
-        k.rpm_limit = Some(5);
-        k.tpm_limit = None;
-        assert!(gov.check_rate(&k, w0).is_ok());
+    let mut live = sample_key("survivor", "hs");
+    live.rpm_limit = Some(5);
+    live.tpm_limit = None;
+
+    // Seed a STALE (older-window) entry directly INTO the live key's shard so the eager sweep on
+    // that shard has something to evict. Using the survivor's shard guarantees co-tenancy.
+    {
+        let mut map = gov.rate.write("survivor");
+        map.insert(
+            "stale-cotenant".to_string(),
+            RateState {
+                window_start: w0 - RATE_WINDOW_SECS,
+                requests: 0,
+                tokens: 0,
+            },
+        );
     }
-    assert_eq!(
-        gov.rate.read().unwrap_or_else(|p| p.into_inner()).len(),
-        10,
-        "10 W0 entries present"
-    );
 
-    // Force the next call to run the eager sweep. POST-increment: the sweep fires when the value
-    // AFTER the increment is a multiple of N, so set the ticker to N-1 (the next call's
-    // post-increment value is N, a multiple of the interval).
-    gov.rate_sweep_ticker
+    // Force the next admission on this shard to run the eager sweep. POST-increment: the sweep
+    // fires when the value AFTER the increment is a multiple of N, so set THIS SHARD's ticker to
+    // N-1 (the next call's post-increment value is N, a multiple of the interval).
+    gov.rate
+        .sweep_ticker_for("survivor")
         .store(RATE_SWEEP_INTERVAL - 1, Ordering::Relaxed);
-    let mut survivor = sample_key("survivor", "hs");
-    survivor.rpm_limit = Some(5);
-    survivor.tpm_limit = None;
     let w_later = w0 + RATE_WINDOW_SECS * 2;
-    assert!(gov.check_rate(&survivor, w_later).is_ok());
+    assert!(gov.check_rate(&live, w_later).is_ok());
 
-    let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
-    assert_eq!(
-        map.len(),
-        1,
-        "sweep evicted all 10 stale W0 entries, leaving only the current-window survivor"
+    let map = gov.rate.read("survivor");
+    assert!(
+        !map.contains_key("stale-cotenant"),
+        "the shard's sweep evicted the stale co-tenant"
     );
-    assert!(map.contains_key("survivor"));
+    assert!(
+        map.contains_key("survivor"),
+        "the current-window key survives its own sweep"
+    );
 }
 
 #[test]
@@ -1065,10 +1072,10 @@ fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
     k.tpm_limit = None;
     let w0 = 1_700_000_040 / 60 * 60;
 
-    // Seed a STALE entry under an older window so a sweep would evict it. Use a distinct key so
-    // we can observe whether the sweep ran by whether the stale entry survives.
+    // Seed a STALE co-tenant under an older window, INTO k1's shard, so k1's own admission runs the
+    // (per-shard) sweep that would evict it. Distinct entry key so we observe whether the sweep ran.
     {
-        let mut map = gov.rate.write().unwrap_or_else(|p| p.into_inner());
+        let mut map = gov.rate.write("k1");
         map.insert(
             "stale".to_string(),
             RateState {
@@ -1079,34 +1086,29 @@ fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
         );
     }
 
-    // FIRST call: ticker is 0, post-increment value is 1 (not a multiple of N) -> NO sweep.
-    // The stale entry must survive.
-    assert_eq!(gov.rate_sweep_ticker.load(Ordering::Relaxed), 0);
+    // FIRST call: k1's shard ticker is 0, post-increment value is 1 (not a multiple of N) -> NO
+    // sweep. The stale co-tenant must survive.
+    assert_eq!(gov.rate.sweep_ticker_for("k1").load(Ordering::Relaxed), 0);
     assert!(gov.check_rate(&k, w0).is_ok());
     assert!(
-        gov.rate
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key("stale"),
+        gov.rate.read("k1").contains_key("stale"),
         "first call must NOT sweep (post-increment value 1 is not a multiple of N)"
     );
 
-    // Drive the ticker to N-1 so the next call's post-increment value is exactly N -> sweep runs.
-    gov.rate_sweep_ticker
+    // Drive k1's shard ticker to N-1 so the next call's post-increment value is exactly N -> sweep.
+    gov.rate
+        .sweep_ticker_for("k1")
         .store(RATE_SWEEP_INTERVAL - 1, Ordering::Relaxed);
     assert!(gov.check_rate(&k, w0).is_ok());
     assert!(
-        !gov.rate
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key("stale"),
+        !gov.rate.read("k1").contains_key("stale"),
         "call N must run the sweep and evict the stale entry"
     );
 
     // WRAP boundary: pre-increment value 0xFFFFFFFF is NOT a multiple of N, but post-increment
     // wraps to 0 (a multiple of N) so the sweep must still fire — no skipped cycle.
     {
-        let mut map = gov.rate.write().unwrap_or_else(|p| p.into_inner());
+        let mut map = gov.rate.write("k1");
         map.insert(
             "stale2".to_string(),
             RateState {
@@ -1116,18 +1118,17 @@ fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
             },
         );
     }
-    gov.rate_sweep_ticker.store(u32::MAX, Ordering::Relaxed);
+    gov.rate
+        .sweep_ticker_for("k1")
+        .store(u32::MAX, Ordering::Relaxed);
     assert!(gov.check_rate(&k, w0).is_ok());
     assert_eq!(
-        gov.rate_sweep_ticker.load(Ordering::Relaxed),
+        gov.rate.sweep_ticker_for("k1").load(Ordering::Relaxed),
         0,
         "ticker wrapped to 0"
     );
     assert!(
-        !gov.rate
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key("stale2"),
+        !gov.rate.read("k1").contains_key("stale2"),
         "wrap boundary must still sweep (post-increment 0 is a multiple of N) — no skipped cycle"
     );
 }
@@ -1357,11 +1358,7 @@ fn test_unlimited_key_does_not_grow_rate_map() {
     // record_tokens carries only the key id (no caps), so it must also not materialise an entry.
     gov.record_tokens("uncapped", BUDGET_PERIOD_TOTAL, now, 9999);
     assert!(
-        gov.rate
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get("uncapped")
-            .is_none(),
+        gov.rate.read("uncapped").get("uncapped").is_none(),
         "an uncapped key must never gain a rate-map entry"
     );
 
@@ -1371,7 +1368,7 @@ fn test_unlimited_key_does_not_grow_rate_map() {
     capped.tpm_limit = Some(100_000);
     assert!(gov.check_rate(&capped, now).is_ok());
     gov.record_request(&capped, now, 500);
-    let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
+    let map = gov.rate.read("capped");
     let st = map
         .get("capped")
         .expect("a capped key must have a rate-map entry");
@@ -1405,29 +1402,21 @@ fn test_add_rate_tokens_is_update_only_never_materialises_entry() {
     // must leave the map untouched for this key.
     gov.record_request(&capped, now, 500);
     assert!(
-        gov.rate
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get("late")
-            .is_none(),
+        gov.rate.read("late").get("late").is_none(),
         "add_rate_tokens must not materialise an entry for a key with no prior check_rate"
     );
 
     // Likewise via record_tokens (the token-fee path): no entry exists, so nothing is created.
     gov.record_tokens("late", BUDGET_PERIOD_TOTAL, now, 500);
     assert!(
-        gov.rate
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get("late")
-            .is_none(),
+        gov.rate.read("late").get("late").is_none(),
         "record_tokens (update-only) must not materialise an entry either"
     );
 
     // Once check_rate creates the entry (the real admission path), a subsequent credit lands.
     assert!(gov.check_rate(&capped, now).is_ok());
     gov.record_request(&capped, now, 300);
-    let map = gov.rate.read().unwrap_or_else(|p| p.into_inner());
+    let map = gov.rate.read("late");
     assert_eq!(
         map.get("late")
             .expect("entry exists after check_rate")
@@ -1486,13 +1475,16 @@ fn test_poisoned_rate_lock_recovers_not_panics() {
     k.tpm_limit = None;
     let now = 1_700_000_040;
 
-    // Poison the rate lock: panic inside the write guard.
+    // Poison the rate SHARD that key "k1" resolves to: panic inside its write guard.
     let g = gov.clone();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = g.rate.write().unwrap();
+        let _guard = g.rate.shard_lock_for("k1").write().unwrap();
         panic!("intentional poison");
     }));
-    assert!(gov.rate.is_poisoned(), "lock must be poisoned for the test");
+    assert!(
+        gov.rate.shard_lock_for("k1").is_poisoned(),
+        "k1's shard lock must be poisoned for the test"
+    );
 
     // Despite the poison, the hot path keeps working (no panic, RPM still enforced).
     assert!(gov.check_rate(&k, now).is_ok(), "1st admits after poison");

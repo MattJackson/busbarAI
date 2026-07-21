@@ -17,15 +17,12 @@ impl GovState {
             }),
             price_per_request_cents,
             price_per_1k_tokens_cents,
-            rate: RwLock::new(HashMap::new()),
-            token_spend_carry: std::sync::Mutex::new(HashMap::new()),
-            rate_sweep_ticker: AtomicU32::new(0),
-            carry_sweep_ticker: AtomicU32::new(0),
+            rate: Sharded::new(),
+            token_spend_carry: Sharded::new(),
             admin_token_hash: admin_token
                 .as_ref()
                 .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
-            budget: RwLock::new(HashMap::new()),
-            budget_sweep_ticker: AtomicU32::new(0),
+            budget: Sharded::new(),
         })
     }
 
@@ -72,10 +69,10 @@ impl GovState {
         // Add the carried remainder, flush the WHOLE cents, keep the 0..999 millicent remainder.
         let millicents = tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64);
         let whole_cents = {
-            let mut carry = self
-                .token_spend_carry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // This key's carry shard (its read-modify-write is atomic within the shard lock, exactly
+            // as under the former global lock — only OTHER keys in other shards no longer serialize).
+            let carry_shard = self.token_spend_carry.shard_for(key_id);
+            let mut carry = carry_shard.map.write().unwrap_or_else(|p| p.into_inner());
             // Bound the carry map: a key seen once (leaving a <1c remainder) then never again would
             // keep its entry forever — slow unbounded growth under key churn. Past a threshold, prune
             // DEFINITELY-stale entries; the dropped sub-cent remainder is the documented acceptable loss.
@@ -91,9 +88,16 @@ impl GovState {
             // would run under-lock on EVERY flush while removing nothing. Firing the scan only every Nth
             // over-threshold flush restores the amortized-O(1) hot path; churned ageable entries are still
             // reclaimed within N flushes. (found: 1.4.0 audit, governance hot-path lock.)
-            const TOKEN_SPEND_CARRY_SWEEP_THRESHOLD: usize = 4096;
-            let carry_sweep_needed = self
-                .carry_sweep_ticker
+            // Per-shard threshold: with the carry map sharded ~1/GOV_SHARDS ways, a fixed global
+            // threshold would almost never trip per shard; scale it down so each shard still bounds
+            // its own memory. (1 is the floor so a tiny deployment still eventually sweeps.)
+            const TOKEN_SPEND_CARRY_SWEEP_THRESHOLD: usize = if 4096 / GOV_SHARDS > 1 {
+                4096 / GOV_SHARDS
+            } else {
+                1
+            };
+            let carry_sweep_needed = carry_shard
+                .sweep_ticker
                 .fetch_add(1, Ordering::Relaxed)
                 .wrapping_add(1)
                 .is_multiple_of(crate::limits::rate_sweep_interval());
@@ -138,7 +142,7 @@ impl GovState {
         //   - no cell → insert a fresh one for `window` (defensive: post-admission it should exist, but
         //     an uncapped key or a token-only test path may reach here with none).
         {
-            let mut map = self.budget_write();
+            let mut map = self.budget.write(key_id);
             let cell = match map.get_mut(key_id) {
                 Some(c) if window > c.window_start => {
                     *c = BudgetCell {
@@ -215,40 +219,6 @@ impl GovState {
         (self.price_per_request_cents, self.price_per_1k_tokens_cents)
     }
 
-    /// Acquire the `rate` map for writing, recovering from a poisoned lock rather than panicking.
-    ///
-    /// A panic while any holder owns this lock marks it poisoned; a plain `.write().unwrap()` would
-    /// then panic on EVERY subsequent `check_rate`/`add_rate_tokens`, cascading a single transient
-    /// fault into a full governance outage (the project rule is no panic on the request path). The
-    /// `rate` map is best-effort, single-node TPM/RPM accounting — its invariants are re-established
-    /// per call (stale windows are reset in place), so continuing with the recovered guard is safe.
-    fn rate_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, RateState>> {
-        self.rate.write().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Acquire the `rate` map for reading (poison-recovering, same rationale as `rate_write`).
-    /// Read by `rate_headroom`, which is wired into production routing: `decide_policy_order` in
-    /// `proxy engine` calls `lookup` + `rate_headroom` (one key lookup shared with the `send_user`
-    /// identity projection) to compute the per-lane `usage` routing signal.
-    fn rate_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, RateState>> {
-        self.rate.read().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Acquire the AUTHORITATIVE `budget` map for writing, recovering from a poisoned lock rather than
-    /// panicking (mirrors `rate_write`). This lock is on the request hot path (`charge_budget_mem`,
-    /// `record_tokens`, `refund_request`) and the project rule is no panic on the request path; the
-    /// map's invariants are re-established per call (a stale cell is reset in place for the current
-    /// window), so continuing with the recovered guard is safe.
-    fn budget_write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, BudgetCell>> {
-        self.budget.write().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// Acquire the `budget` map for reading (poison-recovering, same rationale as `budget_write`).
-    /// Read by `usage_for`, which treats a present current-window cell as authoritative.
-    fn budget_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, BudgetCell>> {
-        self.budget.read().unwrap_or_else(|p| p.into_inner())
-    }
-
     /// READ-ONLY rate-limit headroom for a key: the fraction `[0.0, 1.0]` of the most-constrained
     /// configured rate limit (RPM and/or TPM) still available in the current 60s window, where `1.0`
     /// is "fully unused" and `0.0` is "at the cap". `None` when the key has neither an RPM nor a TPM
@@ -268,7 +238,7 @@ impl GovState {
         }
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
         // Counters for THIS window only; a stale (older-window) entry contributes zero usage.
-        let (requests, tokens) = match self.rate_read().get(&key.id) {
+        let (requests, tokens) = match self.rate.read(&key.id).get(&key.id) {
             Some(st) if st.window_start == window => (st.requests, st.tokens),
             _ => (0, 0),
         };
@@ -527,13 +497,14 @@ impl GovState {
                 return;
             }
         };
-        let mut map = self.budget_write();
+        // Boot-only (off the hot path): insert each key's hydrated cell into ITS shard. Per-key shard
+        // selection keeps hydration consistent with every runtime access (a key always uses one shard).
         for key in keys {
             let window = budget_window(&key.budget_period, now);
             match self.store.get_usage(&key.id, window) {
                 Ok(u) => {
                     if u.spend_cents != 0 || u.tokens != 0 || u.requests != 0 {
-                        map.insert(
+                        self.budget.write(&key.id).insert(
                             key.id,
                             BudgetCell {
                                 window_start: window,
@@ -561,7 +532,7 @@ impl GovState {
             Some(key) => {
                 let window = budget_window(&key.budget_period, now);
                 // Cell-authoritative for the current window.
-                if let Some(cell) = self.budget_read().get(id) {
+                if let Some(cell) = self.budget.read(id).get(id) {
                     if cell.window_start == window {
                         return Ok(Some(Usage {
                             spend_cents: cell.spend_cents,
@@ -631,12 +602,16 @@ impl GovState {
         // Using `wrapping_add(1)` on the returned pre-increment value reproduces the value now stored
         // in the atomic: the sweep fires on calls N, 2N, 3N, ... and the wrap boundary (pre = 0xFFFF…F
         // -> post = 0, a multiple of N) is handled correctly with no skipped cycle.
-        let sweep_needed = self
-            .rate_sweep_ticker
+        // Per-shard amortized sweep + per-key check/increment under THIS key's shard lock. The ticker
+        // is the shard's own, so each shard sweeps only its own (~1/GOV_SHARDS) entries — the memory
+        // bound holds per shard, and cross-key contention is confined to a single shard.
+        let shard = self.rate.shard_for(&key.id);
+        let sweep_needed = shard
+            .sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
             .is_multiple_of(crate::limits::rate_sweep_interval());
-        let mut map = self.rate_write();
+        let mut map = shard.map.write().unwrap_or_else(|p| p.into_inner());
         if sweep_needed {
             map.retain(|_, st| st.window_start == window);
         }
@@ -712,7 +687,7 @@ impl GovState {
             return;
         }
         let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
-        let mut map = self.rate_write();
+        let mut map = self.rate.write(key_id);
         let Some(st) = map.get_mut(key_id) else {
             // No entry -> do NOT materialise one. An uncapped key has no entry (check_rate never made
             // one), so skipping creation here bounds the rate map for caps-free deployments. A capped
@@ -850,12 +825,16 @@ impl GovState {
         // only every Nth admission (POST-increment semantics via `wrapping_add(1)` so the first call
         // and the u32 wrap boundary are handled correctly), and per-key correctness is independent of
         // the sweep because the resolution below resets a stale cell in place for `window`.
-        let sweep_needed = self
-            .budget_sweep_ticker
+        // Per-shard amortized sweep + the atomic check-and-charge under THIS key's shard lock — the
+        // hard-cap guarantee is unchanged (a key is only ever charged under one lock), only different
+        // keys stop serializing. The shard's own ticker sweeps ~1/GOV_SHARDS of the cells.
+        let shard = self.budget.shard_for(&key.id);
+        let sweep_needed = shard
+            .sweep_ticker
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
             .is_multiple_of(crate::limits::rate_sweep_interval());
-        let mut map = self.budget_write();
+        let mut map = shard.map.write().unwrap_or_else(|p| p.into_inner());
         if sweep_needed {
             map.retain(|_, c| c.window_start == window);
         }
@@ -907,7 +886,7 @@ impl GovState {
     pub(crate) fn refund_request(&self, key: &VirtualKey, now: u64) {
         let window = budget_window(&key.budget_period, now);
         let fee = self.price_per_request_cents.max(0);
-        let mut map = self.budget_write();
+        let mut map = self.budget.write(&key.id);
         if let Some(cell) = map.get_mut(&key.id) {
             if cell.window_start == window {
                 cell.spend_cents = (cell.spend_cents - fee).max(0);
@@ -937,7 +916,7 @@ impl GovState {
         // Straddle-safe resolution matching `record_tokens` (`now` is `charged_at`, so the live cell may
         // be NEWER than `window`): reset only a genuinely-stale (older) cell; otherwise credit in place.
         {
-            let mut map = self.budget_write();
+            let mut map = self.budget.write(&key.id);
             let cell = match map.get_mut(&key.id) {
                 Some(c) if window > c.window_start => {
                     *c = BudgetCell {
@@ -980,13 +959,14 @@ impl GovState {
     /// than lost. Snapshotting under the lock but writing off it keeps the hot-path lock hold O(dirty)
     /// and never blocks a charge on SQLite. Returns the number of cells flushed.
     pub(crate) fn flush_budgets(&self) -> usize {
-        // Snapshot dirty cells and clear their flags under one short critical section.
-        let dirty: Vec<(String, u64, i64, u64, u64)> = {
-            let mut map = self.budget_write();
-            let mut out = Vec::new();
+        // Snapshot dirty cells across ALL shards and clear their flags. One shard is locked at a time
+        // (the `write_all` iterator acquires each guard lazily), so a concurrent per-key charge blocks
+        // only on the single shard the snapshot currently holds, not the whole map.
+        let mut dirty: Vec<(String, u64, i64, u64, u64)> = Vec::new();
+        for mut map in self.budget.write_all() {
             for (id, cell) in map.iter_mut() {
                 if cell.dirty {
-                    out.push((
+                    dirty.push((
                         id.clone(),
                         cell.window_start,
                         cell.spend_cents,
@@ -996,8 +976,7 @@ impl GovState {
                     cell.dirty = false;
                 }
             }
-            out
-        };
+        }
         let mut flushed = 0usize;
         for (id, window, spend, tokens, requests) in dirty {
             match self.store.put_usage(&id, window, spend, tokens, requests) {
@@ -1007,7 +986,7 @@ impl GovState {
                     // RE-MARK dirty so the increment is not lost — only if the cell still exists for the
                     // SAME window (a rollover since the snapshot means those values are already stale and
                     // must not resurrect an old window's spend).
-                    let mut map = self.budget_write();
+                    let mut map = self.budget.write(&id);
                     if let Some(cell) = map.get_mut(&id) {
                         if cell.window_start == window {
                             cell.dirty = true;

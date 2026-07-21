@@ -88,6 +88,107 @@ struct BudgetCell {
     dirty: bool,
 }
 
+/// Number of shards for the per-key enforcement maps (`rate`, `budget`, `token_spend_carry`). A
+/// power of two so `hash & (N-1)` selects the shard with a mask (no modulo). 64 keeps lock
+/// contention low well past typical core counts while adding trivial fixed memory (64 small empty
+/// maps + 64 atomics per `GovState`). Each key deterministically maps to ONE shard, so a key's
+/// read-modify-write (rate window, budget charge, spend carry) stays atomic within that shard's lock
+/// exactly as it was under the single global lock — sharding only removes CROSS-key serialization,
+/// never a per-key invariant.
+const GOV_SHARDS: usize = 64;
+
+/// One shard of a [`Sharded`] map: the key→value map plus its OWN amortized-sweep ticker (the sweep
+/// is per-shard, so a shard scans only its own — ~1/64th — of the keys when it fires).
+struct MapShard<V> {
+    map: RwLock<HashMap<String, V>>,
+    sweep_ticker: AtomicU32,
+}
+
+impl<V> Default for MapShard<V> {
+    fn default() -> Self {
+        Self {
+            map: RwLock::new(HashMap::new()),
+            sweep_ticker: AtomicU32::new(0),
+        }
+    }
+}
+
+/// A key-id-sharded `HashMap`, replacing a single `RwLock<HashMap>` that every governed request
+/// contended. A key always resolves to the SAME shard (`stable_hash(key_id) & (GOV_SHARDS-1)`), so
+/// per-key semantics (window straddle, atomic check-and-charge, spend carry) are byte-identical to
+/// the single-lock version — only requests for DIFFERENT keys whose ids land in different shards no
+/// longer serialize on one lock. Whole-map operations (flush / hydrate / usage sweep) iterate every
+/// shard.
+struct Sharded<V> {
+    shards: Box<[MapShard<V>]>,
+}
+
+impl<V> Sharded<V> {
+    fn new() -> Self {
+        let mut shards = Vec::with_capacity(GOV_SHARDS);
+        shards.resize_with(GOV_SHARDS, MapShard::default);
+        Self {
+            shards: shards.into_boxed_slice(),
+        }
+    }
+
+    /// The shard owning `key_id`. `GOV_SHARDS` is a power of two, so this masks the stable hash — a
+    /// process-stable hash (NOT `DefaultHasher`) so a key maps to the same shard across restarts,
+    /// which is irrelevant to correctness (the maps are ephemeral) but keeps behaviour deterministic.
+    #[inline]
+    fn shard_for(&self, key_id: &str) -> &MapShard<V> {
+        let h = crate::store::fnv1a_u64(key_id) as usize;
+        &self.shards[h & (GOV_SHARDS - 1)]
+    }
+
+    /// Acquire this key's shard for writing (poison-recovering — a panic under any holder must not
+    /// cascade into a governance outage on the request path; the maps' invariants are re-established
+    /// per call, so the recovered guard is safe to use).
+    #[inline]
+    fn write(&self, key_id: &str) -> std::sync::RwLockWriteGuard<'_, HashMap<String, V>> {
+        self.shard_for(key_id)
+            .map
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Acquire this key's shard for reading (poison-recovering, same rationale as [`Sharded::write`]).
+    #[inline]
+    fn read(&self, key_id: &str) -> std::sync::RwLockReadGuard<'_, HashMap<String, V>> {
+        self.shard_for(key_id)
+            .map
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Every shard's write guard, in shard order — for the whole-map operations that must visit ALL
+    /// keys (the write-behind flush snapshot). Each guard is acquired lazily by the iterator, so only
+    /// one shard is locked at a time (no cross-shard deadlock, and a concurrent per-key op contends
+    /// only for the single shard the iterator currently holds).
+    fn write_all(
+        &self,
+    ) -> impl Iterator<Item = std::sync::RwLockWriteGuard<'_, HashMap<String, V>>> {
+        self.shards
+            .iter()
+            .map(|s| s.map.write().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// TEST-ONLY: the sweep ticker for the shard owning `key_id`, so a test can drive the amortized
+    /// sweep cadence for a specific key exactly as it did against the old single global ticker.
+    #[cfg(test)]
+    fn sweep_ticker_for(&self, key_id: &str) -> &AtomicU32 {
+        &self.shard_for(key_id).sweep_ticker
+    }
+
+    /// TEST-ONLY: the raw shard lock owning `key_id`, for the poison-recovery test (it panics inside
+    /// the write guard to poison exactly the shard the key resolves to, then asserts the hot path
+    /// recovers for that same key).
+    #[cfg(test)]
+    fn shard_lock_for(&self, key_id: &str) -> &RwLock<HashMap<String, V>> {
+        &self.shard_for(key_id).map
+    }
+}
+
 /// The two auth-path key caches, held together under `GovState::caches`'s single `RwLock` so
 /// `refresh` can swap both in one critical section. `by_hash` is the hashed-secret → key index; it
 /// backs `lookup`. `by_access_key_id` is the AWS AccessKeyId → resolved-credential index for inbound
@@ -121,8 +222,10 @@ pub(crate) struct GovState {
     price_per_request_cents: i64,
     /// cents per 1000 tokens (input + output), accrued from response usage at stream end.
     price_per_1k_tokens_cents: i64,
-    /// per-key RPM/TPM windows (ephemeral).
-    rate: RwLock<HashMap<String, RateState>>,
+    /// per-key RPM/TPM windows (ephemeral). SHARDED by key id so concurrent admissions for different
+    /// keys don't serialize on one lock (each key deterministically owns one shard; per-key window
+    /// semantics are unchanged — see [`Sharded`]).
+    rate: Sharded<RateState>,
     /// Per-key accumulator of the sub-cent (millicent) remainder of token spend. Token cost is
     /// `tokens/1000 * price_per_1k_tokens_cents`; in pure integer cents a request whose cost is < 1
     /// cent (e.g. 500 tokens at 1¢/1k = 0.5¢) used to TRUNCATE to 0 and be lost forever. We instead
@@ -135,17 +238,9 @@ pub(crate) struct GovState {
     /// RESET when the window rolls over, so a sub-cent remainder never leaks across a day/month boundary
     /// into the next window's spend (the <1¢ dropped at a rollover is the same accepted trade-off as the
     /// on-restart drop). One entry per key (not per key×window), so growth stays key-count-bounded.
-    token_spend_carry: std::sync::Mutex<HashMap<String, (u64, u64)>>,
-    /// Admission counter that amortizes the bounded eviction sweep of `rate` (see
-    /// `RATE_SWEEP_INTERVAL`): every Nth `check_rate` call performs the full stale-entry retain,
-    /// so the per-request hot path does not scan all active keys on every admission.
-    rate_sweep_ticker: AtomicU32,
-    /// Admission counter that amortizes the bounded eviction sweep of `token_spend_carry`. The sweep is
-    /// only useful for churned, ageable (windowed) keys; a deployment with many long-lived `total`-period
-    /// keys (`window == 0`, never age out) keeps the map size permanently above the threshold, so gating
-    /// the O(n) retain solely on `len > THRESHOLD` would run it under-lock on EVERY flush. This ticker
-    /// makes the scan fire only every Nth over-threshold flush — restoring the amortized-O(1) hot path.
-    carry_sweep_ticker: AtomicU32,
+    /// SHARDED by key id (mirrors `rate`). The value is `(window, remainder)`; each shard carries its
+    /// own amortized eviction ticker (see [`MapShard`]).
+    token_spend_carry: Sharded<(u64, u64)>,
     /// SHA-256 hex digest of the configured /admin bearer token, computed once at construction. The
     /// plaintext token is NOT retained — only its digest, which is all the constant-time compare on
     /// the /admin path needs (less plaintext secret held in memory). `None` = admin API disabled.
@@ -159,13 +254,10 @@ pub(crate) struct GovState {
     /// single `RwLock` gives the SAME hard-cap guarantee the SQL UPSERT gave, now in memory (single
     /// node) — and, being in-memory, it can never fail with a store error, so there is no admission
     /// fail-mode to configure.
-    budget: RwLock<HashMap<String, BudgetCell>>,
-    /// Admission counter that amortizes the bounded eviction sweep of `budget` (mirrors
-    /// `rate_sweep_ticker`): every Nth `charge_budget_mem` call performs the full stale-cell retain,
-    /// so the per-request hot path does not scan all active keys on every admission. Per-key
-    /// correctness does not depend on the sweep (a looked-up cell is reset in place when its window is
-    /// stale); the sweep purely bounds the map by evicting cells for keys that have gone silent.
-    budget_sweep_ticker: AtomicU32,
+    /// SHARDED by key id (mirrors `rate`): the atomic per-key check-and-charge runs under that key's
+    /// shard lock, so the hard-cap guarantee is unchanged (a key is only ever charged under one lock);
+    /// different keys no longer serialize. Each shard carries its own amortized eviction ticker.
+    budget: Sharded<BudgetCell>,
 }
 
 /// Parameters for minting a new virtual key (from the management API).
