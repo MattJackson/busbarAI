@@ -179,16 +179,21 @@ fn synth_id_with_prefix(prefix: &str) -> String {
 /// exact distribution it had when it lived in `proto::mod`.
 pub(crate) fn synth_anthropic_request_id() -> Option<String> {
     const ALPHABET: &[u8; 62] = crate::proto::BASE62_ALPHABET;
-    // 24 base62 chars (≈143 bits) of CSPRNG entropy. A u128 holds at most 12 base62 digits worth of
-    // headroom safely (62^12 < 2^128), so build the 24-char token from two independent 9-byte (72-bit)
-    // draws, each emitting 12 base62 digits — collision-free in practice and matching the native
-    // `req_01` + 24 = 30-char shape.
+    // 24 base62 chars (≈143 bits) of CSPRNG entropy, built from two independent 9-byte (72-bit) draws,
+    // each emitting 12 base62 digits (62^12 > 2^71, so 9 bytes fit in 12 digits) — collision-free in
+    // practice and matching the native `req_01` + 24 = 30-char shape. ONE `getrandom::fill` of 18
+    // bytes serves both halves: this runs on the streaming-response hot path (every 2xx that
+    // synthesizes an id), and `getrandom` is a syscall (or vDSO) per call, so drawing both halves in
+    // a single fill halves the per-response entropy cost with an IDENTICAL output distribution (the
+    // two 9-byte windows are still independent CSPRNG bytes, just from one draw).
     let mut token = [0u8; 24];
+    let mut rand = [0u8; 18];
+    getrandom::fill(&mut rand).ok()?;
     for half in 0..2 {
-        let mut buf = [0u8; 9];
-        getrandom::fill(&mut buf).ok()?;
-        // 72 bits → 12 base62 digits (62^12 > 2^71, so 9 bytes fit in 12 digits).
-        let mut n = buf.iter().fold(0u128, |acc, &b| (acc << 8) | b as u128);
+        // 72 bits → 12 base62 digits.
+        let mut n = rand[half * 9..half * 9 + 9]
+            .iter()
+            .fold(0u128, |acc, &b| (acc << 8) | b as u128);
         for slot in token[half * 12..half * 12 + 12].iter_mut().rev() {
             *slot = ALPHABET[(n % 62) as usize];
             n /= 62;
