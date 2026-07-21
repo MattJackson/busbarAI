@@ -431,7 +431,16 @@ pub(crate) struct ModelCfg {
     #[serde(default = "neg1")]
     pub(crate) max_requests: i64,
     pub(crate) provider: String,
-    pub(crate) max_concurrent: usize,
+    /// Per-lane concurrency limiter: the max number of in-flight requests admitted to this lane at
+    /// once (excess requests park on the lane's semaphore until a slot frees or the request budget
+    /// expires). OPTIONAL — omitted means UNBOUNDED (no concurrency cap), the same opt-in-limiter
+    /// posture as `max_requests` (default -1 = unlimited). Set a positive integer to opt into a cap;
+    /// `0` is rejected at boot (`config_validate`) as a lane that admits nothing. Unbounded is
+    /// realized as a `Semaphore` seeded with `tokio::sync::Semaphore::MAX_PERMITS` (see main.rs) —
+    /// "effectively unbounded"; a literal `usize::MAX` would panic (tokio caps permits at
+    /// `MAX_PERMITS`).
+    #[serde(default)]
+    pub(crate) max_concurrent: Option<usize>,
     /// Default max output tokens injected when a cross-protocol translation targets a backend that
     /// REQUIRES `max_tokens` (Anthropic Messages) and the source request omitted it (legal for
     /// OpenAI). Unset falls back to `crate::proto::DEFAULT_MAX_TOKENS`. Must be > 0 when set.

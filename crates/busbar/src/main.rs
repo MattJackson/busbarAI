@@ -1289,13 +1289,22 @@ pub(crate) fn build_app_from_config(
             );
         }
         let limited = mc.max_requests >= 0;
+        // `max_concurrent` is an OPT-IN limiter: omitted (None) = UNBOUNDED. Realize "unbounded" as a
+        // semaphore seeded with `Semaphore::MAX_PERMITS` (usize::MAX >> 3) — a lane will never reach
+        // 2^60 concurrent in-flight requests, so this never throttles, yet it keeps the entire
+        // permit-based dispatch path (which every selection route depends on) intact. A literal
+        // usize::MAX would PANIC: `Semaphore::new` asserts `permits <= MAX_PERMITS`. `max` records the
+        // same count so /stats `inflight = max - available` stays coherent.
+        let max_concurrent = mc
+            .max_concurrent
+            .unwrap_or(tokio::sync::Semaphore::MAX_PERMITS);
         by_model.insert(model.clone(), lanes_data.len());
         lane_provider_cfgs.push(provider_cfg);
         lanes_data.push(LaneData {
             model: model.clone(),
             provider: mc.provider.clone(),
-            max: mc.max_concurrent,
-            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(mc.max_concurrent)),
+            max: max_concurrent,
+            sem: std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             limited,
             budget: if limited { mc.max_requests } else { -1 },
             cooldown_until: 0,
@@ -1316,7 +1325,11 @@ pub(crate) fn build_app_from_config(
             model,
             mc.provider,
             provider_cfg.base_url.trim_end_matches('/'),
-            mc.max_concurrent,
+            // Show the operator-facing form: an omitted cap reads "unbounded", not 2^60.
+            match mc.max_concurrent {
+                Some(n) => n.to_string(),
+                None => "unbounded".to_string(),
+            },
             // Surface the alias→wire-id indirection at boot so an operator can see this lane sends a
             // different model string upstream than the config key it's filed under.
             match &mc.upstream_model {

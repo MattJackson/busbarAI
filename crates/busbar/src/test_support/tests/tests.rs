@@ -3250,7 +3250,7 @@ mod disposition_matrix_tests {
             prompt_caching: None,
             max_requests: -1,
             provider: "p".into(),
-            max_concurrent: 10,
+            max_concurrent: Some(10),
             default_max_tokens: None,
             upstream_model: None,
             attempt_timeout_ms: None,
@@ -5758,6 +5758,92 @@ async fn test_saturated_lane_respects_deadline_no_infinite_spin() {
         "pick_among must honor the deadline and not block indefinitely (took {elapsed:?})"
     );
     drop(held);
+    server.shutdown().await;
+}
+
+/// `max_concurrent` OMITTED (unbounded) must impose NO concurrency cap: a burst far larger than the
+/// old default cap acquires every permit without a single denial. This models exactly what main.rs
+/// builds for a `None` config field — a lane seeded with `Semaphore::MAX_PERMITS` permits. Before the
+/// fix `max_concurrent` was mandatory, so an operator always had SOME finite cap; now the default is
+/// truly unbounded.
+#[tokio::test]
+async fn test_unbounded_max_concurrent_never_throttles_a_burst() {
+    crate::metrics::init();
+    let state = Arc::new(MockServerState::new());
+    let server = MockServer::new(state).await;
+
+    // A lane built exactly as an OMITTED max_concurrent resolves in main.rs: MAX_PERMITS permits.
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "unbounded-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .max(tokio::sync::Semaphore::MAX_PERMITS),
+        )
+        .pool("default", &[(0, 1)])
+        .build();
+
+    // A burst WAY above the old default cap (10). Every acquire must succeed — no throttling.
+    const BURST: usize = 5_000;
+    let mut permits = Vec::with_capacity(BURST);
+    for i in 0..BURST {
+        let p = app
+            .store
+            .try_acquire(0)
+            .unwrap_or_else(|| panic!("unbounded lane must admit permit #{i} without throttling"));
+        permits.push(p);
+    }
+    assert_eq!(
+        permits.len(),
+        BURST,
+        "an unbounded lane must admit the entire burst"
+    );
+    // Sanity: still far from exhaustion — the lane is effectively unbounded.
+    assert!(
+        app.store.try_acquire(0).is_some(),
+        "an unbounded lane still has permits after a large burst"
+    );
+
+    drop(permits);
+    server.shutdown().await;
+}
+
+/// A model WITH `max_concurrent` set still enforces the cap (existing behaviour preserved): the
+/// (N+1)th concurrent acquire is denied until a permit frees.
+#[tokio::test]
+async fn test_bounded_max_concurrent_still_enforces_the_cap() {
+    crate::metrics::init();
+    let state = Arc::new(MockServerState::new());
+    let server = MockServer::new(state).await;
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "capped-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .max(2), // cap = 2
+        )
+        .pool("default", &[(0, 1)])
+        .build();
+
+    let p1 = app.store.try_acquire(0).expect("permit 1 of 2 acquires");
+    let p2 = app.store.try_acquire(0).expect("permit 2 of 2 acquires");
+    // The cap is reached — the 3rd immediate acquire must be denied.
+    assert!(
+        app.store.try_acquire(0).is_none(),
+        "a max_concurrent=2 lane must deny the 3rd concurrent permit"
+    );
+    // Free one → a slot opens again (the limiter is live, not a one-way latch).
+    drop(p1);
+    assert!(
+        app.store.try_acquire(0).is_some(),
+        "releasing a permit must free a slot under the cap"
+    );
+    drop(p2);
     server.shutdown().await;
 }
 

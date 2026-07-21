@@ -106,9 +106,11 @@ pub(crate) fn validate_with_unset(
         // A `max_concurrent: 0` lane builds a `Semaphore::new(0)` at startup (main.rs), which never
         // grants a permit — every request to the lane is permanently capacity-exhausted with no
         // boot-time diagnostic. Reject it loudly here rather than silently black-holing the lane.
-        if model_cfg.max_concurrent == 0 {
+        // OMITTED (None) is the valid default: unbounded (no concurrency cap), the opt-in-limiter
+        // posture that mirrors max_requests's -1. Only an explicit `Some(0)` is pathological.
+        if model_cfg.max_concurrent == Some(0) {
             errors.push(format!(
-                "model '{}' has max_concurrent: 0; must be >= 1",
+                "model '{}' has max_concurrent: 0; must be >= 1, or omit it (default = unbounded)",
                 model_name
             ));
         }

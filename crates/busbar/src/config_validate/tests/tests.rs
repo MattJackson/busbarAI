@@ -59,12 +59,22 @@ fn make_provider(protocol: &str, base_url: &str, api_key_env: &str) -> config::P
 }
 
 fn make_model(provider: &str, max_concurrent: usize) -> config::ModelCfg {
+    // Existing callers pass a concrete cap; wrap it as `Some` now that the field is optional
+    // (None = unbounded). The omitted-cap case is covered by `make_model_unbounded`.
+    let mut m = make_model_unbounded(provider);
+    m.max_concurrent = Some(max_concurrent);
+    m
+}
+
+/// A model config with `max_concurrent` OMITTED (None = unbounded), exercising the opt-in-limiter
+/// default that mirrors `max_requests: -1`.
+fn make_model_unbounded(provider: &str) -> config::ModelCfg {
     config::ModelCfg {
         reasoning: None,
         prompt_caching: None,
         max_requests: -1,
         provider: provider.into(),
-        max_concurrent,
+        max_concurrent: None,
         default_max_tokens: None,
         upstream_model: None,
         attempt_timeout_ms: None,
@@ -831,6 +841,46 @@ fn test_validate_rejects_zero_max_concurrent() {
     assert!(
         !errs.iter().any(|e| e.contains("okmodel")),
         "a positive max_concurrent must not error; got: {errs:?}"
+    );
+}
+
+/// `max_concurrent` OMITTED (None = unbounded) must VALIDATE cleanly — it is an opt-in limiter, not
+/// a required field. Only an explicit `Some(0)` is rejected; absence carries no requirement, exactly
+/// like `max_requests: -1`.
+#[test]
+fn test_validate_accepts_omitted_max_concurrent() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "myprovider".to_string(),
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "unbounded".to_string(),
+        make_model_unbounded("myprovider"), // max_concurrent: None
+    );
+
+    let cfg = make_root_cfg(providers, models, HashMap::new());
+    validate(&cfg)
+        .expect("a model omitting max_concurrent must validate (unbounded is the default)");
+}
+
+/// A minimal model config that OMITS max_concurrent must DESERIALIZE — proving the field is no
+/// longer mandatory at the serde layer (the config-load foot-gun this fix removes).
+#[test]
+fn test_minimal_model_config_without_max_concurrent_deserializes() {
+    // Only `provider` is required; every other ModelCfg field (max_requests, max_concurrent, …)
+    // defaults. Before the fix this failed with "missing field `max_concurrent`".
+    let m: config::ModelCfg = serde_yaml::from_str("provider: myprovider\n")
+        .expect("a model config with only `provider` must load (max_concurrent is optional)");
+    assert_eq!(m.provider, "myprovider");
+    assert_eq!(
+        m.max_concurrent, None,
+        "an omitted max_concurrent must be None (unbounded)"
+    );
+    assert_eq!(
+        m.max_requests, -1,
+        "an omitted max_requests must default to -1 (unlimited)"
     );
 }
 
