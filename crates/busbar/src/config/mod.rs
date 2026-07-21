@@ -1470,9 +1470,9 @@ pub(crate) struct SecurityCfg {
 // unset). Mirrors the same guard on AuthCfg.
 /// The governance durable-store backend. Governance is ALWAYS available; this only chooses where its
 /// (bounded) keys + counters live. `memory` (default) is RAM — ephemeral, zero-setup. `sqlite`
-/// (single-node durable) and `postgres` (shared across a cluster) are dynamic-library plugins loaded
-/// from `plugins_dir`; both read their connection target from `db_path` (a file path for sqlite, a
-/// libpq URL for postgres).
+/// (single-node durable), `postgres`, and `redis` (both shared across a cluster) are dynamic-library
+/// plugins loaded from `plugins_dir`; each reads its connection target from `db_path` (a file path for
+/// sqlite, a libpq URL for postgres, a `redis://` URL for redis).
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum GovernanceStore {
@@ -1480,6 +1480,7 @@ pub(crate) enum GovernanceStore {
     Memory,
     Sqlite,
     Postgres,
+    Redis,
 }
 
 /// Plugin signing/trust policy (`governance.trust`). Governs how the engine treats a loadable

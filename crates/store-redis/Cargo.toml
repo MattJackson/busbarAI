@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-store-redis"
+version = "1.5.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "The Redis backend for busbar's durable governance store — the shared, multi-node db plugin over a KV data model. Implements busbar_api::Store on a mutex-guarded synchronous redis connection."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../api" }
+# The SYNCHRONOUS redis client only: no async runtime, no TLS (front Redis with a TLS-terminating
+# proxy / stunnel, mirroring the Postgres backend's NoTls posture). Trimming default-features keeps
+# the dependency tree small and license-clean (redis + its deps are MIT/Apache/BSD — all already in
+# deny.toml's allow-list) and avoids pulling a second async stack / TLS backend into the plugin.
+redis = { version = "1", default-features = false }
+serde_json = "1"
