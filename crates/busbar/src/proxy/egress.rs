@@ -66,6 +66,19 @@ pub(crate) fn sign_and_wire_path(url_path: &str) -> String {
 /// `String` for the canonical URI. On the common no-query path the encoded path IS the canonical URI,
 /// so it is reused for both fields and only the wire path is (cheaply) cloned; with a query the wire
 /// path is `canonical?query`. Output is byte-identical to the previous split-and-`to_string` form.
+/// True when every byte of `path` is SigV4-unreserved (`A-Z a-z 0-9 - _ . ~ /`), i.e.
+/// `uri_encode_path` would return it byte-for-byte unchanged. The openai/anthropic/cohere/responses
+/// lanes (all `/v1/...` style paths, no reserved chars) hit this; only a Bedrock modelId (carrying a
+/// `:` and other reserved chars) fails it. Lets the encode fast path skip the redundant second
+/// double-encode scan+allocation without changing any signed byte.
+#[inline]
+fn path_is_sigv4_unreserved(path: &str) -> bool {
+    path.bytes().all(|b| {
+        matches!(b,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/')
+    })
+}
+
 pub(crate) fn sign_and_wire_path_parts(url_path: &str) -> (String, String) {
     // The wire path is single-URI-encoded (what actually goes on the request line). The SigV4
     // CANONICAL path is DOUBLE-URI-encoded for every service except S3 (Bedrock included): AWS
@@ -79,6 +92,20 @@ pub(crate) fn sign_and_wire_path_parts(url_path: &str) -> (String, String) {
         Some((p, q)) => (p, Some(q)),
         None => (url_path, None),
     };
+    // Fast path (openai/anthropic/cohere/responses — every non-Bedrock lane, i.e. the throughput
+    // hot path): the path holds only SigV4-unreserved bytes, so both `uri_encode_path` passes are
+    // identity no-ops (`encoded == path`) and the double-encode `canonical == wire_path == path`.
+    // Skip BOTH encode allocations and the second pass; allocate the owned `wire`/`canonical` the
+    // callers require exactly once each straight from the borrowed path. Byte-identical output to
+    // the always-encode form — `uri_encode_path` provably returns its input unchanged here. Only a
+    // path carrying an encodable char (a Bedrock modelId's `:`) takes the full double-encode below.
+    if path_is_sigv4_unreserved(path) {
+        let wire = match query {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_string(),
+        };
+        return (wire, path.to_string());
+    }
     let wire_path = crate::sigv4::uri_encode_path(path);
     let canonical = crate::sigv4::uri_encode_path(&wire_path); // double-encode (non-S3 SigV4 rule)
     let wire = match query {
