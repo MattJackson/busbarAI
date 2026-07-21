@@ -1499,10 +1499,18 @@ pub(crate) fn build_app_from_config(
         // REUSED across applies: the pooled connections + their kept-alive upstream sockets.
         p.client.clone()
     } else {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(
-                cfg.limits.upstream_request_timeout_secs,
-            ))
+        // Opt-in HTTP/2 PRIOR-KNOWLEDGE for CLEARTEXT upstreams (no TLS/ALPN to negotiate over):
+        // `BUSBAR_UPSTREAM_H2_PRIOR_KNOWLEDGE=1` makes the shared client assume h2 without ALPN. This
+        // is a PROCESS-WIDE, DEFAULT-OFF switch — production keeps ALPN (safe against h1 upstreams);
+        // it exists so a cleartext h2c backend (e.g. the benchmark mock, or an in-mesh h2c service)
+        // can exercise multiplexing without TLS. It FORCES h2, so every configured upstream must speak
+        // h2c when set — never enable it against a mixed/h1 fleet. Read once at client-build time.
+        let h2_prior_knowledge = std::env::var_os("BUSBAR_UPSTREAM_H2_PRIOR_KNOWLEDGE")
+            .is_some_and(|v| v != "0" && !v.is_empty());
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(
+            cfg.limits.upstream_request_timeout_secs,
+        ));
+        builder = builder
             // Bound the TCP connect separately from the coarse overall timeout: a stalled SYN would
             // otherwise hang up to the streaming `.timeout()` (minutes) before failover kicks in.
             .connect_timeout(Duration::from_secs(10))
@@ -1524,10 +1532,11 @@ pub(crate) fn build_app_from_config(
             // (Anthropic, OpenAI, Vertex, Bedrock all speak h2) multiplexes many concurrent requests
             // over ONE connection — collapsing the per-request connect+TLS handshake and the socket /
             // epoll pressure that caps proxy RPS on a core-bound box — while an HTTP/1-only backend
-            // transparently stays on h1. We deliberately do NOT call `.http2_prior_knowledge()`: that
-            // would FORCE h2 and break every h1 upstream (and a plaintext h1 mock). H2 keep-alive
-            // pings keep a multiplexed connection healthy through idle gaps without the h1 trick of
-            // holding N sockets open. No behavior change against an h1-only upstream.
+            // transparently stays on h1. By DEFAULT we do NOT call `.http2_prior_knowledge()` (that
+            // would FORCE h2 and break every h1 upstream and a plaintext h1 mock) — it is applied only
+            // when the cleartext-h2c opt-in below is set. H2 keep-alive pings keep a multiplexed
+            // connection healthy through idle gaps without the h1 trick of holding N sockets open. No
+            // behavior change against an h1-only upstream on the default (ALPN) path.
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_timeout(Duration::from_secs(10))
             .http2_adaptive_window(true)
@@ -1540,9 +1549,13 @@ pub(crate) fn build_app_from_config(
             // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
             // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
             // normal operation, so disabling redirect following entirely closes the vector at no cost.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("build upstream HTTP client")
+            .redirect(reqwest::redirect::Policy::none());
+        // Cleartext h2c opt-in (bench / in-mesh): FORCE h2 without ALPN. Default-off; when set, every
+        // upstream must speak h2c. Applied last so it overrides the ALPN default above.
+        if h2_prior_knowledge {
+            builder = builder.http2_prior_knowledge();
+        }
+        builder.build().expect("build upstream HTTP client")
     };
 
     // The `default:` hook (if any) — the base ordering that pools which named none inherit, replacing
