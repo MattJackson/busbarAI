@@ -98,8 +98,9 @@ fn usage_sink(
     match (&app.governance, &gov.key) {
         (Some(g), Some(key)) => Some(crate::proxy::UsageSink {
             gov: g.clone(),
-            key_id: key.id.clone(),
-            period: key.budget_period.clone(),
+            // Share the resolved key by `Arc` — no per-request `id`/`budget_period` String clone;
+            // both are read through `sink.key` at charge time.
+            key: key.clone(),
             // The header-arrival epoch this request was admitted at — reused for the token fee so it
             // shares the flat per-request fee's window (#29). See `UsageSink::charged_at`.
             charged_at,
@@ -420,20 +421,12 @@ fn finish_inner(
         400..=499 => "client_error",
         _ => "error",
     };
-    metrics::counter!(
-        crate::metrics::REQUESTS_TOTAL,
-        "ingress_protocol" => ingress_protocol.to_string(),
-        "pool" => pool.to_string(),
-        "outcome" => outcome
-    )
-    .increment(1);
+    // Per-request emits via CACHED handles (see `metrics::incr_requests_total` /
+    // `record_request_duration`): the steady-state path is a lock-free map read + atomic op, with no
+    // per-request `Label`/`Key` allocation or registry probe. Same series/values as the macros.
+    crate::metrics::incr_requests_total(ingress_protocol, pool, outcome);
     let elapsed = started.elapsed();
-    metrics::histogram!(
-        crate::metrics::REQUEST_DURATION_SECONDS,
-        "ingress_protocol" => ingress_protocol.to_string(),
-        "pool" => pool.to_string()
-    )
-    .record(elapsed.as_secs_f64());
+    crate::metrics::record_request_duration(ingress_protocol, pool, elapsed.as_secs_f64());
 
     // best-effort request-log webhook (no-op unless configured). Gated on the configured check so an
     // unconfigured webhook (the default) skips even BUILDING the JSON payload — `fire_request_log`
