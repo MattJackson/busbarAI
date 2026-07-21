@@ -210,21 +210,30 @@ pub(crate) async fn forward_with_pool_parsed_inner(
     // silent dispatch. Dormant while all six protocols serve chat; load-bearing the moment one is
     // removed (the deletion test).
     let mut cands: Vec<WeightedLane> = {
-        let (kept, dropped): (Vec<WeightedLane>, Vec<WeightedLane>) =
-            cands.into_iter().partition(|wl| {
-                crate::handlers::request_handler(app.lanes[wl.idx].protocol.name())
-                    .and_then(|rh| rh.operation_handler(op.operation))
-                    .is_some()
-            });
-        if kept.is_empty() && !dropped.is_empty() {
-            return ingress_error(
-                ingress_protocol,
-                StatusCode::NOT_FOUND,
-                KIND_NOT_FOUND,
-                DETAIL_MODEL_UNSUPPORTED_OPERATION,
-            );
+        let supports = |wl: &WeightedLane| {
+            crate::handlers::request_handler(app.lanes[wl.idx].protocol.name())
+                .and_then(|rh| rh.operation_handler(op.operation))
+                .is_some()
+        };
+        // Fast path (the norm: every registered protocol serves every 1.x operation): all candidates
+        // support the operation, so keep the caller's Vec as-is — no partition, no re-allocation.
+        // Only when at least one lane lacks the handler do we pay the filter; semantics identical to
+        // the previous `partition` (an all-dropped non-empty set is the same no-handler 404, and an
+        // initially-empty set passes through to the pool-empty 503 below either way).
+        if cands.iter().all(supports) {
+            cands
+        } else {
+            let kept: Vec<WeightedLane> = cands.into_iter().filter(|wl| supports(wl)).collect();
+            if kept.is_empty() {
+                return ingress_error(
+                    ingress_protocol,
+                    StatusCode::NOT_FOUND,
+                    KIND_NOT_FOUND,
+                    DETAIL_MODEL_UNSUPPORTED_OPERATION,
+                );
+            }
+            kept
         }
-        kept
     };
     // `v` is the PRISTINE parsed request body (parsed once by the caller). Never mutated after this
     // point: each failover hop derives a fresh per-hop `hop_v` (the first hop consumes `v`; hops 2+
@@ -387,13 +396,10 @@ pub(crate) async fn forward_with_pool_parsed_inner(
 
     // Breaker config: prefer this pool's own settings, fall back to ADR-0002 defaults. Resolved
     // once and shared (Arc) so the streaming guard can record mid-stream failures with the same
-    // thresholds the synchronous path used.
-    let breaker_cfg: std::sync::Arc<crate::store::BreakerCfg> = std::sync::Arc::new(
-        app.pool_runtime
-            .get(pool_name)
-            .and_then(|r| r.breaker.clone())
-            .unwrap_or_default(),
-    );
+    // thresholds the synchronous path used. The default (no per-pool breaker — the common case) is
+    // a process-wide cached Arc, so the hot path pays no per-request allocation for it.
+    let breaker_cfg: std::sync::Arc<crate::store::BreakerCfg> =
+        resolve_breaker_cfg(&app, pool_name);
 
     let mut request_ctx = RequestCtx::new(deadline_secs);
 
@@ -2115,6 +2121,31 @@ fn fire_global_taps(
             crate::proxy::hooks::spawn_bounded_tap(
                 async move { policy.notify(&proj, budget).await },
             );
+        }
+    }
+}
+
+/// Resolve the effective `BreakerCfg` Arc for a pool: the pool's own settings when configured, else
+/// a PROCESS-WIDE cached default Arc. The default is by far the common case, and the previous
+/// per-request `Arc::new(clone().unwrap_or_default())` paid a heap allocation + struct clone on
+/// EVERY forwarded request for a value that never changes; the cached Arc reduces that to a refcount
+/// bump. Behavior is identical — the resolved thresholds are byte-for-byte the same.
+pub(crate) fn resolve_breaker_cfg(
+    app: &Arc<App>,
+    pool_name: &str,
+) -> std::sync::Arc<crate::store::BreakerCfg> {
+    match app
+        .pool_runtime
+        .get(pool_name)
+        .and_then(|r| r.breaker.as_ref())
+    {
+        Some(cfg) => std::sync::Arc::new(cfg.clone()),
+        None => {
+            static DEFAULT: std::sync::OnceLock<std::sync::Arc<crate::store::BreakerCfg>> =
+                std::sync::OnceLock::new();
+            DEFAULT
+                .get_or_init(|| std::sync::Arc::new(crate::store::BreakerCfg::default()))
+                .clone()
         }
     }
 }

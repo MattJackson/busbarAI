@@ -231,16 +231,17 @@ pub(crate) async fn operation_resolved(
         .get(affinity_header_for(app, model))
         .and_then(|h| h.to_str().ok())
         .map(str::to_string);
-    let req_ct_owned = ct.to_string();
     let resp = crate::proxy::forward_with_pool_parsed(
         app.clone(),
         cands,
         body,
         v,
-        if req_ct_owned.is_empty() {
+        // `ct` borrows `headers` (a caller-held reference that outlives this call) — no per-request
+        // `to_string` copy is needed to thread the Content-Type through.
+        if ct.is_empty() {
             crate::proxy::APPLICATION_JSON
         } else {
-            &req_ct_owned
+            ct
         },
         caller_token,
         // The key the auth layer resolved/synthesized for this caller — lets the routing-signal

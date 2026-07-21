@@ -21,7 +21,7 @@ fn shape_same_proto(
 ) -> Vec<u8> {
     let app = app_with_lane(proto, lane_model);
     // hop_bytes = the exact serialized source bytes the caller retained for this hop.
-    let hop_bytes = crate::json::to_vec(&body).unwrap();
+    let hop_bytes = bytes::Bytes::from(crate::json::to_vec(&body).unwrap());
     translate_request_cross_protocol(
         &app,
         0,
@@ -33,6 +33,7 @@ fn shape_same_proto(
         &hop_bytes,
     )
     .expect("same-proto shaping is infallible for a valid body")
+    .to_vec()
 }
 
 // ---- FIDELITY PROOF: pristine same-proto request → bytes == retained original, all 6 protocols.
@@ -89,7 +90,7 @@ fn upstream_model_override_rewrites_body_and_url_model() {
         )
         .build();
     let body = json!({"model":"client-alias","messages":[]});
-    let hop_bytes = crate::json::to_vec(&body).unwrap();
+    let hop_bytes = bytes::Bytes::from(crate::json::to_vec(&body).unwrap());
     let out = translate_request_cross_protocol(
         &app,
         0,
@@ -143,7 +144,7 @@ fn claude_on_vertex_drops_model_and_injects_anthropic_version() {
         )
         .build();
     let body = json!({"model":"claude-3-5-sonnet","max_tokens":7,"messages":[{"role":"user","content":"hi"}]});
-    let hop_bytes = crate::json::to_vec(&body).unwrap();
+    let hop_bytes = bytes::Bytes::from(crate::json::to_vec(&body).unwrap());
     let out = translate_request_cross_protocol(
         &app,
         0,

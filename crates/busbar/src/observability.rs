@@ -431,6 +431,15 @@ pub(crate) fn configure_webhook(url: Option<String>, client: Client) {
     let _ = CLIENT.set(client);
 }
 
+/// True when a request-log webhook is configured. Lets the per-request finish path skip BUILDING the
+/// JSON payload entirely (a `serde_json::Value` map + several small heap allocations per request)
+/// when no webhook is set — `fire_request_log` would only discard it. Purely an allocation guard:
+/// when configured, the built payload and delivery are byte-identical to before.
+#[inline]
+pub(crate) fn request_log_configured() -> bool {
+    WEBHOOK_URL.get().is_some()
+}
+
 /// Build the request-log JSON payload. Pure (no I/O) so it is unit-testable.
 pub(crate) fn build_request_log(
     ts: u64,

@@ -435,14 +435,18 @@ fn finish_inner(
     )
     .record(elapsed.as_secs_f64());
 
-    // best-effort request-log webhook (no-op unless configured).
-    crate::observability::fire_request_log(crate::observability::build_request_log(
-        crate::store::now(),
-        ingress_protocol,
-        pool,
-        outcome,
-        elapsed.as_millis() as u64,
-    ));
+    // best-effort request-log webhook (no-op unless configured). Gated on the configured check so an
+    // unconfigured webhook (the default) skips even BUILDING the JSON payload — `fire_request_log`
+    // would only drop it; when configured, the payload/delivery are unchanged.
+    if crate::observability::request_log_configured() {
+        crate::observability::fire_request_log(crate::observability::build_request_log(
+            crate::store::now(),
+            ingress_protocol,
+            pool,
+            outcome,
+            elapsed.as_millis() as u64,
+        ));
+    }
 
     // The flat per-request fee was charged ATOMICALLY at admission (fix 2a). REFUND it for a request
     // that produced no usable upstream result (non-2xx: router 503 exhaustion, upstream 5xx, 4xx

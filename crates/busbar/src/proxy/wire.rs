@@ -299,8 +299,10 @@ pub(crate) fn translate_request_cross_protocol(
     // same-protocol passthrough where no same-proto-reachable mutation fired (the request short-
     // circuit, Change B step 1), these exact bytes are re-emitted verbatim instead of re-serializing
     // the `Value` — keeping the upstream payload byte-identical and skipping the serialize hot spot.
-    hop_bytes: &[u8],
-) -> Result<Vec<u8>, Box<Response>> {
+    // `&Bytes` (not `&[u8]`) so the short-circuit re-emit is a REFCOUNT BUMP (`Bytes::clone`), never
+    // an O(body) `to_vec` memcpy — the return type is `Bytes` for the same reason.
+    hop_bytes: &Bytes,
+) -> Result<Bytes, Box<Response>> {
     let egress_name = app.lanes[i].protocol.name();
     // OPAQUE ingress body (multipart/binary — `None`): translate at the BYTE level through the
     // operation codecs (cross-protocol) or relay the pristine bytes verbatim (same-protocol) —
@@ -343,9 +345,10 @@ pub(crate) fn translate_request_cross_protocol(
                     || !app.lanes[i].protocol.writer().cache_markers_model_gated(),
             });
             ir_req.set_model(app.lanes[i].wire_model());
-            return Ok(eh.write_request(&ir_req).to_vec());
+            return Ok(eh.write_request(&ir_req));
         }
-        return Ok(hop_bytes.to_vec());
+        // Same-protocol opaque relay: the retained bytes go upstream verbatim — refcount bump only.
+        return Ok(hop_bytes.clone());
     };
     // Request short-circuit pristine-tracking (Change B). Starts true; flips false the moment ANY
     // same-protocol-reachable mutation actually changes the body. The cross-protocol branch below
@@ -421,7 +424,7 @@ pub(crate) fn translate_request_cross_protocol(
                         // resolved model in-band, and the JSON-only post-shaping below (shim strips,
                         // model rewrite) does not apply — emit the handler's bytes directly.
                         ir_req.set_model(app.lanes[i].wire_model());
-                        return Ok(eh.write_request(&ir_req).to_vec());
+                        return Ok(eh.write_request(&ir_req));
                     }
                 }
                 // The body was fully rebuilt from the IR (read_request → write_request), so it bears
@@ -481,12 +484,13 @@ pub(crate) fn translate_request_cross_protocol(
     // those exact bytes verbatim — byte-identical to the old re-serialize path, minus the serialize
     // cost (and minus any key-ordering / float-formatting drift a round-trip could introduce). Cross-
     // protocol hops set `pristine = false` above and always fall through to the serialize arm.
+    // `Bytes::clone` is a refcount bump — the pristine passthrough copies ZERO body bytes.
     if ingress_protocol == egress_name && pristine {
-        return Ok(hop_bytes.to_vec());
+        return Ok(hop_bytes.clone());
     }
     // sonic-rs: SIMD serialize of the (large, string-heavy) upstream body — the request-path hot spot.
     match crate::json::to_vec(&body) {
-        Ok(p) => Ok(p),
+        Ok(p) => Ok(Bytes::from(p)),
         // Re-serializing a Value parsed from valid JSON and rewritten only with serde_json values is
         // effectively infallible; return a shaped 500 rather than panic a worker on the request path
         // (the layer's no-unwrap/expect rule).
