@@ -302,6 +302,31 @@ fn open_relay_banner(chain_empty: bool, auth_present: bool) -> Option<&'static s
     })
 }
 
+/// Return the INERT-KEYS banner to emit when a DURABLE governance store still holds virtual keys
+/// from a prior run but NO admin token is configured. In that state the governance engine is inert
+/// (the auth middleware gates the vkey-resolution branch on `admin_token_hash().is_some()`), so the
+/// persisted keys' per-key controls (budget, RPM/TPM, allowed_pools) are silently NOT enforced —
+/// access falls through to the static `auth.chain` instead. A RAM store can never reach this state
+/// (keys are only minted through the admin API, which itself requires the admin token), so this is
+/// scoped to durable stores. Returns `None` when the state does not apply (RAM store, no keys, or an
+/// admin token IS set). `key_count` is the number of keys the store reports at boot.
+fn inert_durable_keys_banner(
+    store_is_durable: bool,
+    key_count: usize,
+    admin_token_set: bool,
+) -> Option<String> {
+    if store_is_durable && key_count > 0 && !admin_token_set {
+        Some(format!(
+            "durable governance store contains {key_count} key(s) but no admin_token is set — \
+             governance is INERT and those keys are NOT enforced (per-key budget / RPM / TPM / \
+             allowed_pools are bypassed and access falls through to the static auth.chain). Set \
+             governance.admin_token to enforce them."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Resolve each model's single `context_max` from the pool members that reference it.
 ///
 /// A model is realized as exactly one lane (keyed by model name in `by_model`), so its
@@ -1756,6 +1781,26 @@ pub(crate) fn build_app_from_config(
                 // BOOT-ONLY crash-recovery: hydrate the in-memory budget cells from the durable store
                 // so a restart resumes enforcement from persisted spend. A no-op for the empty RAM store.
                 gs.hydrate_budgets(crate::store::now());
+                // INERT-KEYS GUARD: a durable store may carry virtual keys minted in a prior run
+                // whose admin_token was later REMOVED from config — governance then goes inert and
+                // those keys' per-key controls are silently bypassed (access falls to the static
+                // auth.chain). Surface it LOUD: ERROR level (survives RUST_LOG=error) AND
+                // unconditionally on stderr, mirroring the open-relay banner so log config can't mask
+                // it. RAM stores can't reach this state, so `key_count` there is 0 (or the store is
+                // non-durable) and the banner is None. `all_keys()` failure is non-fatal — treat as 0
+                // keys (the enforcement gate is unaffected; we only lose the advisory).
+                let store_is_durable = g.store != crate::config::GovernanceStore::Memory;
+                let key_count = gs.all_keys().map(|k| k.len()).unwrap_or(0);
+                let admin_token_set = g
+                    .admin_token
+                    .as_deref()
+                    .is_some_and(|t| !t.trim().is_empty());
+                if let Some(banner) =
+                    inert_durable_keys_banner(store_is_durable, key_count, admin_token_set)
+                {
+                    eprintln!("[error] {banner}");
+                    tracing::error!("{banner}");
+                }
                 Some(gs)
             }
             Err(e) => return Err(format!("governance init failed: {e}")),

@@ -3009,3 +3009,226 @@ async fn test_governance_active_with_admin_token_rejects_missing_vkey() {
     handle.abort();
     server.shutdown().await;
 }
+
+/// BYPASS-EDGE (the durable-store-with-persisted-keys-but-admin-token-removed case): a store that
+/// STILL holds a virtual key, but whose engine has NO admin token, is INERT. A request bearing that
+/// persisted key's secret is therefore NOT governed by the key's per-key controls — it falls through
+/// to the STATIC auth.chain. This pins the exact "bypass by mistake" behaviour the boot guard warns
+/// about: the key's `allowed_pools` (here a pool the request does NOT target) is NOT enforced, and
+/// the static chain (a token allowlist that does NOT list the key secret) is what decides admission.
+///
+/// The auth gate keys inertness on `admin_token_hash().is_some()`, independent of the store backend,
+/// so a seeded `MemoryStore` + `None` admin token faithfully reproduces the durable-store edge for
+/// the middleware's purposes (the store's DURABILITY only matters for the boot-time banner, covered
+/// by the main-crate tests).
+#[cfg(feature = "auth-tokens")]
+#[tokio::test]
+async fn test_inert_governance_persisted_key_is_not_enforced_static_chain_wins() {
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
+    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    crate::metrics::init();
+
+    let state = Arc::new(MockServerState::new());
+    for _ in 0..2 {
+        state.push(MockResponse::Ok {
+            status: axum::http::StatusCode::OK,
+            body: json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "test-model",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }),
+        });
+    }
+    let server = MockServer::new(state).await;
+
+    // A key PERSISTED from a prior run, scoped to pool "restricted" ONLY (a pool the request below
+    // does NOT target). If the key's controls were enforced, a request to pool "pa" bearing this
+    // secret would be pool-ACL rejected. Under an INERT engine they are NOT consulted at all.
+    let persisted_secret = "sk-vk-persisted-from-prior-run";
+    let store = Arc::new(MemoryStore::new());
+    store
+        .put_key(&VirtualKey {
+            id: "kold".to_string(),
+            key_hash: crate::sigv4::sha256_hex(persisted_secret.as_bytes()),
+            name: "kold".to_string(),
+            allowed_pools: vec!["restricted".to_string()],
+            max_budget_cents: Some(0), // a budget that, if enforced, would block every request
+            budget_period: "total".to_string(),
+            rpm_limit: Some(0), // an RPM of 0 that, if enforced, would reject every request
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        })
+        .unwrap();
+    // NO admin token → INERT: the persisted key's controls are bypassed.
+    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    assert!(
+        gov.admin_token_hash().is_none(),
+        "precondition: engine must be inert (no admin token)"
+    );
+
+    // The STATIC chain is what actually gates now — a token allowlist that lists a DIFFERENT token,
+    // NOT the persisted key secret.
+    let static_token = "static-chain-token";
+    let auth_cfg = crate::config::AuthCfg {
+        chain: vec!["tokens".to_string()],
+        upstream_credentials: crate::auth::UpstreamCreds::Own,
+        client_tokens: vec![static_token.to_string()],
+        modules: std::collections::HashMap::new(),
+    };
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .api_key("busbar-upstream-key"),
+        )
+        .pool("pa", &[(0, 1)])
+        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .governance(gov)
+        .build();
+
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/pa/v1/messages");
+    let body =
+        json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+    // (1) The persisted key secret is NOT in the static allowlist → the static chain REJECTS it.
+    // This is the crux: the persisted key confers NOTHING now (its controls are inert); only the
+    // static chain speaks. (If governance were still enforcing, this same secret would be ADMITTED
+    // as a valid vkey — then pool-ACL/budget/RPM rejected. The 401-from-the-static-chain proves the
+    // vkey path is not taken.)
+    let r_key = client
+        .post(&url)
+        .bearer_auth(persisted_secret)
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_key.status().as_u16(),
+        401,
+        "an inert engine's persisted key must confer nothing — the static chain (which does not \
+         list it) rejects it (got {})",
+        r_key.status()
+    );
+
+    // (2) The STATIC token is admitted — the static chain is fully in charge, and the key's zero
+    // budget / zero RPM (which would block EVERY request if enforced) are NOT consulted. A 200 here
+    // is the direct proof the persisted key's controls are bypassed.
+    let r_static = client
+        .post(&url)
+        .bearer_auth(static_token)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_static.status().as_u16(),
+        200,
+        "the static chain governs an inert engine; the persisted key's 0-budget/0-RPM are NOT \
+         enforced (got {})",
+        r_static.status()
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}
+
+/// CONTROL for the bypass-edge test: the SAME persisted key, but WITH an admin token set →
+/// governance is ACTIVE and the key's per-key controls ARE enforced. The pool-ACL alone is enough
+/// to prove enforcement: the key is scoped to "restricted" but the request targets "pa", so an
+/// active engine rejects it (403 pool-ACL), whereas the inert twin above let the static chain decide.
+#[tokio::test]
+async fn test_active_governance_persisted_key_is_enforced() {
+    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
+    use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    crate::metrics::init();
+
+    // No upstream body queued — enforcement must reject before any upstream call.
+    let state = Arc::new(MockServerState::new());
+    let server = MockServer::new(state).await;
+
+    let persisted_secret = "sk-vk-persisted-enforced";
+    let store = Arc::new(MemoryStore::new());
+    store
+        .put_key(&VirtualKey {
+            id: "kold".to_string(),
+            key_hash: crate::sigv4::sha256_hex(persisted_secret.as_bytes()),
+            name: "kold".to_string(),
+            allowed_pools: vec!["restricted".to_string()], // NOT "pa"
+            max_budget_cents: None,
+            budget_period: "total".to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 0,
+        })
+        .unwrap();
+    // Admin token SET → ACTIVE: the key resolves and its pool-ACL is enforced.
+    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    assert!(
+        gov.admin_token_hash().is_some(),
+        "precondition: engine active"
+    );
+
+    let app = TestApp::new()
+        .lane(
+            LaneSpec::new(
+                "test-model",
+                crate::proto::Protocol::anthropic(),
+                &server.base_url(),
+            )
+            .api_key("busbar-upstream-key"),
+        )
+        .pool("pa", &[(0, 1)])
+        .governance(gov)
+        .build();
+
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/pa/v1/messages");
+    let body =
+        json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
+            .to_string();
+
+    // The key resolves (active engine) but its allowed_pools excludes "pa" → pool-ACL 403. The key
+    // IS enforced — the opposite of the inert twin, where the static chain decided instead.
+    let r = client
+        .post(&url)
+        .bearer_auth(persisted_secret)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        403,
+        "an active engine enforces the persisted key's pool-ACL (got {})",
+        r.status()
+    );
+
+    handle.abort();
+    server.shutdown().await;
+}

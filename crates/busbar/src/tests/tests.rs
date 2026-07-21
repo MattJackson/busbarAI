@@ -173,6 +173,64 @@ fn test_open_relay_banner_silent_when_auth_engaged() {
     assert!(open_relay_banner(false, true).is_none());
 }
 
+/// INERT-KEYS BOOT GUARD (bypass-edge): a DURABLE store carrying keys with NO admin token is the
+/// one state where a prior run's keys become silently unenforced (governance goes inert). The
+/// banner fires EXACTLY there and nowhere else.
+#[test]
+fn test_inert_durable_keys_banner_fires_only_for_durable_keyed_no_token() {
+    // The dangerous edge: durable store, keys present, no admin token → LOUD banner.
+    let b = inert_durable_keys_banner(true, 3, false).expect("durable+keys+no-token must banner");
+    assert!(
+        b.contains("INERT") && b.contains("3 key") && b.contains("admin_token"),
+        "banner must name the count and the fix; got: {b}"
+    );
+
+    // An admin token IS set → keys are enforced, no banner.
+    assert!(
+        inert_durable_keys_banner(true, 3, true).is_none(),
+        "an admin token makes governance active — no inert-keys banner"
+    );
+
+    // Durable store but EMPTY (fresh durable deploy, no keys yet) → nothing to bypass, no banner.
+    assert!(
+        inert_durable_keys_banner(true, 0, false).is_none(),
+        "an empty durable store has no keys to leave unenforced"
+    );
+
+    // A RAM (non-durable) store never persists keys across the admin-token removal that creates
+    // this edge — even if it somehow reported keys, the banner is scoped to durable stores.
+    assert!(
+        inert_durable_keys_banner(false, 5, false).is_none(),
+        "the inert-keys banner is scoped to durable stores"
+    );
+}
+
+/// A MEMORY store can never REACH the inert-with-keys state in practice: keys are only minted
+/// through the admin API, which is gated by the admin token — so a keyed engine implies an admin
+/// token, and a RAM store starts empty every boot. This pins that invariant end-to-end: a fresh
+/// `MemoryStore` reports zero keys, and its `admin_token_hash()` gate matches the token it was
+/// constructed with. (The durable-store analogue is exercised by the router-level bypass test.)
+#[test]
+fn test_memory_store_cannot_reach_inert_with_keys() {
+    use crate::governance::{GovState, MemoryStore};
+    use std::sync::Arc;
+
+    // No admin token → engine inert AND the store is empty (RAM starts fresh each boot). There is
+    // no keyed-but-inert state to warn about: key_count is 0, so the banner is None regardless.
+    let store = Arc::new(MemoryStore::new());
+    let gov = GovState::new(store, 0, 0, None).unwrap();
+    assert!(gov.admin_token_hash().is_none(), "no admin token → inert");
+    let key_count = gov.all_keys().map(|k| k.len()).unwrap_or(0);
+    assert_eq!(key_count, 0, "a fresh RAM store holds no keys");
+    // store_is_durable = false for memory → banner is None even if key_count were nonzero.
+    assert!(inert_durable_keys_banner(false, key_count, false).is_none());
+
+    // With an admin token the same engine is active — the state a real minted-keys deploy is in.
+    let store2 = Arc::new(MemoryStore::new());
+    let gov2 = GovState::new(store2, 0, 0, Some("admintok".to_string())).unwrap();
+    assert!(gov2.admin_token_hash().is_some(), "admin token → active");
+}
+
 /// The fallback handlers infer the ingress protocol from the
 /// request path so a 404/405 is shaped in the client's own protocol, not a bare axum body.
 #[test]
