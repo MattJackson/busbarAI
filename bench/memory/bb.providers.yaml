@@ -1,9 +1,0 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 Busbar Inc and contributors
-#
-# One provider, `mock`, pointing at the local fast mock (mock.go). Busbar's OpenAI writer appends
-# `/v1/chat/completions`, which the mock serves. No real egress, no real keys.
-mock:
-  protocol: openai
-  base_url: http://127.0.0.1:8000
-  error_map: {}
