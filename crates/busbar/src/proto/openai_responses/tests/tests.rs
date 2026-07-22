@@ -6221,6 +6221,83 @@ fn test_hosted_tools_dropped_cross_protocol() {
             "no empty-name function tool may reach a non-Responses backend: {t}"
         );
     }
+
+    // WIRE-LEVEL CROSS-PROTOCOL COVERAGE: the drop happens in `prepare_for_egress` (egress-agnostic),
+    // so EVERY non-Responses egress that renders this same dropped-hosted-tool IR must emit a
+    // tools body with the ONE surviving function tool and NO malformed empty-name tool. Each writer
+    // nests the tool name differently (Anthropic `tools[].name`, Gemini
+    // `tools[].functionDeclarations[].name`, Cohere `tools[].function.name`, Bedrock
+    // `toolConfig.tools[].toolSpec.name`), so rather than hard-code every path, walk the whole body
+    // and assert no object ANYWHERE carries a `"name": ""` (the empty-name mangling tell a hosted
+    // tool would have produced had it survived), while confirming the `get_weather` name is present.
+    fn any_empty_name(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(m) => {
+                if m.get("name") == Some(&serde_json::json!("")) {
+                    return true;
+                }
+                m.values().any(any_empty_name)
+            }
+            serde_json::Value::Array(a) => a.iter().any(any_empty_name),
+            _ => false,
+        }
+    }
+    fn mentions_name(v: &serde_json::Value, needle: &str) -> bool {
+        match v {
+            serde_json::Value::Object(m) => m
+                .iter()
+                .any(|(k, val)| (k == "name" && val == needle) || mentions_name(val, needle)),
+            serde_json::Value::Array(a) => a.iter().any(|e| mentions_name(e, needle)),
+            _ => false,
+        }
+    }
+
+    // Anthropic egress.
+    let anthropic = crate::proto::anthropic::AnthropicWriter.write_request(&ir);
+    assert!(
+        !any_empty_name(&anthropic),
+        "Anthropic egress must not emit an empty-name tool: {anthropic}"
+    );
+    assert!(
+        mentions_name(&anthropic, "get_weather"),
+        "Anthropic egress must keep the surviving function tool: {anthropic}"
+    );
+
+    // Gemini egress. Bind the interior-mutable writer const to a local before use (its per-stream
+    // Mutex state makes a bare-const borrow a clippy::borrow_interior_mutable_const).
+    let gemini_writer = crate::proto::gemini::GeminiWriter;
+    let gemini = gemini_writer.write_request(&ir);
+    assert!(
+        !any_empty_name(&gemini),
+        "Gemini egress must not emit an empty-name tool: {gemini}"
+    );
+    assert!(
+        mentions_name(&gemini, "get_weather"),
+        "Gemini egress must keep the surviving function tool: {gemini}"
+    );
+
+    // Cohere egress. Same interior-mutable-const bind as Gemini above.
+    let cohere_writer = crate::proto::cohere::CohereWriter;
+    let cohere = cohere_writer.write_request(&ir);
+    assert!(
+        !any_empty_name(&cohere),
+        "Cohere egress must not emit an empty-name tool: {cohere}"
+    );
+    assert!(
+        mentions_name(&cohere, "get_weather"),
+        "Cohere egress must keep the surviving function tool: {cohere}"
+    );
+
+    // Bedrock egress.
+    let bedrock = crate::proto::bedrock::BedrockWriter.write_request(&ir);
+    assert!(
+        !any_empty_name(&bedrock),
+        "Bedrock egress must not emit an empty-name tool: {bedrock}"
+    );
+    assert!(
+        mentions_name(&bedrock, "get_weather"),
+        "Bedrock egress must keep the surviving function tool: {bedrock}"
+    );
 }
 
 /// FINDING 6 (usage required fields): the emitted Responses `usage` object must carry `total_tokens`
