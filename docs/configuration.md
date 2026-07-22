@@ -809,9 +809,17 @@ governance:
   admin_token: "${BUSBAR_ADMIN_TOKEN}"   # set this to ACTIVATE enforcement
   price_per_request_cents: 1
   price_per_1k_tokens_cents: 50
-  # For persistence, choose a durable store (a loadable plugin):
-  # store: sqlite
+  # For persistence, choose a durable store (a loadable plugin dropped in plugins_dir):
+  # store: sqlite                            # single-node durable
   # db_path: /var/lib/busbar/governance.db
+  # store: postgres                          # shared across a cluster
+  # db_path: "postgres://user:pass@host/busbar"
+  # store: redis                             # shared across a cluster
+  # db_path: "redis://host:6379"
+  # plugins_dir: plugins                     # where store plugins are loaded from (default: plugins)
+  # usage_flush_interval_ms: 100             # write-behind flush cadence for durable stores
+  # trust:                                   # plugin signing policy (see "Plugin trust" below)
+  #   on_untrusted: log                      # halt | alert | log (default) | allow
 ```
 
 | Field | Type | Required | Default | Validation | Notes |
@@ -821,16 +829,18 @@ governance:
 | `db_path` | string | no | `busbar-governance.db` | n/a | Connection target for a durable store: a SQLite file path (`store: sqlite`), or a libpq/redis URL (`store: postgres` / `redis`). Unused for `store: memory`. |
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
-| `budget_on_store_error` | string | no | `allow` | `allow` or `deny` | Behavior when the budget store errors during the atomic admission check-and-charge. `allow` (default) fails open, the request proceeds, preserving availability on a store hiccup. `deny` fails closed, the request is rejected, providing a hard budget guarantee for security/regulated deployments. A definitive over-budget result always rejects regardless of this setting. |
-| `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. |
+| `plugins_dir` | string | no | `plugins` | n/a | Directory the engine loads store (and other) plugins from. A durable `store` other than `memory` is a plugin library dropped here (e.g. `store: sqlite` loads `libbusbar_store_sqlite_plugin` from this directory). Path is relative to the working directory. |
+| `trust` | table | no | see below | n/a | Plugin signing/trust policy applied to each plugin's signed manifest at load. Sub-keys: `on_untrusted` (`halt` \| `alert` \| `log` (default) \| `allow`) and `publishers` (a list of `{ name, public_key }` allowlisted ed25519 publishers). See [Plugin trust](#plugin-trust) below. |
+| `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. Applies to `store: sqlite`. |
 | `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
+| `usage_flush_interval_ms` | integer | no | `100` | n/a | Write-behind flush cadence (milliseconds) for the in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this many ms of accrued spend/requests can be lost; a graceful shutdown flushes fully. Only relevant with a durable `store`. |
 
 **Budget spend per request:** `price_per_request_cents + (total_tokens / 1000) * price_per_1k_tokens_cents`.
 
 **Enforcement semantics (important for operators):**
 - **RPM is precise.** The per-minute counter is incremented synchronously on admission.
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
-- **Budget admission is a hard, atomic cap.** The budget check and the flat per-request charge are one atomic conditional UPSERT (`charge_within_budget`): a request whose fee would push the window's spend past `max_budget_cents` is rejected before it is forwarded, and a concurrent burst cannot race past the limit. The **token-priced component** (`price_per_1k_tokens_cents`) is accrued post-response, so spend from requests already in flight when the cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its flat fee refunded. On store errors, behavior is controlled by `budget_on_store_error` (default `allow` = fail open; set `deny` for fail-closed).
+- **Budget admission is a hard, atomic cap.** The budget check and the flat per-request charge are one atomic conditional UPSERT (`charge_within_budget`): a request whose fee would push the window's spend past `max_budget_cents` is rejected before it is forwarded, and a concurrent burst cannot race past the limit. The **token-priced component** (`price_per_1k_tokens_cents`) is accrued post-response, so spend from requests already in flight when the cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its flat fee refunded. Admission is an in-memory operation and never touches the durable store, so the cap holds even if the store is unreachable; durability is a write-behind concern (flushed every `usage_flush_interval_ms`), not an admission-path one.
 
 **Incompatible combination:** an active governance engine (`admin_token` set) + `auth.upstream_credentials: passthrough` is a startup error. Active governance supersedes passthrough (every request must resolve to a virtual key); the combination is unsupported. (With no `admin_token`, governance is inert and the pairing carries no requirement.)
 
@@ -847,6 +857,41 @@ governance:
 | `/api/v1/admin/keys/{id}` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
 
 See [operations.md](operations.md) for the full admin API payload schemas and virtual key fields, including the `issue_aws_credential` Bedrock SigV4 option.
+
+#### Durable stores
+
+The default `store: memory` is ephemeral RAM (keys, budgets, and usage reset on restart) and needs no plugin. Every durable backend ships as a droppable dynamic-library plugin that busbar loads at boot from `plugins_dir` over a stable store C ABI:
+
+| `store` | Plugin library | `db_path` target |
+|---|---|---|
+| `sqlite` | `libbusbar_store_sqlite_plugin.{so,dll,dylib}` | SQLite file path (default `busbar-governance.db`) — single-node durable. |
+| `postgres` | `libbusbar_store_postgres_plugin.{so,dll,dylib}` | `postgres://` libpq URL — shared across a cluster. |
+| `redis` | `libbusbar_store_redis_plugin.{so,dll,dylib}` | `redis://` URL — shared across a cluster. |
+
+If the configured store's plugin is not present in `plugins_dir`, busbar fails to start with a message naming the expected library file. Set `store: memory` (no plugin) to run without a durable backend.
+
+#### Plugin trust
+
+A plugin ships a signed sidecar manifest (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library `sha256`, and an ed25519 signature over the whole manifest). At boot-load busbar verifies it against `governance.trust`. A valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED; anything else (unsigned, unknown publisher, or tampered) is handled per `trust.on_untrusted`:
+
+| `on_untrusted` | Behavior |
+|---|---|
+| `halt` | Only approved (signed by an allowlisted publisher) plugins load; an untrusted plugin is a boot error. |
+| `alert` | Loads the untrusted plugin but flags it. |
+| `log` (default) | Loads the untrusted plugin with a warning. Keeps unsigned plugins working out of the box. |
+| `allow` | Loads without flagging (development). |
+
+```yaml
+governance:
+  store: sqlite
+  trust:
+    on_untrusted: halt
+    publishers:
+      - name: busbar
+        public_key: "<hex ed25519 public key>"
+```
+
+Because the signature covers the whole manifest and the manifest pins the library by `sha256`, neither the manifest nor the library can be altered or swapped independently. A malformed publisher key is a boot error, not a silent skip.
 
 ---
 
