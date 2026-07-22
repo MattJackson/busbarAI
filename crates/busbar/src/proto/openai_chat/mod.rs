@@ -665,12 +665,19 @@ impl super::StreamFraming for OpenAiStreamFraming {
     /// `on_egress_chunk` never runs. Busbar forces `include_usage` UPSTREAM (to bill), so the OpenAI
     /// upstream stamps `"usage":null` on EVERY intermediate content chunk (and the finish chunk) - a key
     /// a native opted-out OpenAI stream never carries, hence a wire-shape tell. When the CLIENT did not
-    /// opt in, request a byte-level strip of the top-level `usage` member from any `chat.completion.chunk`
-    /// that carries a `usage` FIELD alongside a NON-EMPTY `choices` array (a content/finish chunk). The
-    /// trailing usage-ONLY chunk (empty `choices`, a usage OBJECT) is dropped whole by
-    /// `suppress_same_proto_frame` instead, so it is deliberately NOT matched here. The opted-in case
-    /// returns `false` (the client asked for usage; re-emit verbatim). The A-tap already captured usage
-    /// for billing before this seam.
+    /// opt in, request a byte-level strip of the top-level `usage` member from any content/finish chunk
+    /// that carries a `usage` FIELD alongside a NON-EMPTY `choices` array.
+    ///
+    /// The predicate deliberately does NOT require `object == "chat.completion.chunk"`. An
+    /// OpenAI-COMPATIBLE upstream may omit the `object` field (or use a variant) on its content chunks
+    /// while still stamping the forced-`include_usage` `"usage":null` tell; requiring the exact `object`
+    /// value would let that tell leak to an opted-out client. A frame with a NON-EMPTY `choices` array
+    /// and a top-level `usage` key is a content/finish chunk regardless of `object`, so that pairing is
+    /// sufficient. The trailing usage-ONLY chunk (EMPTY `choices`, a usage OBJECT) is dropped whole by
+    /// `suppress_same_proto_frame` instead, so it is deliberately NOT matched here (the non-empty
+    /// `choices` gate excludes it). The opted-in case returns `false` (the client asked for usage;
+    /// re-emit verbatim), so a usage the client legitimately requested is never stripped. The A-tap
+    /// already captured usage for billing before this seam.
     fn strip_same_proto_usage(&self, data: &serde_json::Value) -> bool {
         if self.client_include_usage {
             return false;
@@ -678,11 +685,9 @@ impl super::StreamFraming for OpenAiStreamFraming {
         let Some(obj) = data.as_object() else {
             return false;
         };
-        if obj.get("object").and_then(|v| v.as_str()) != Some(OBJ_CHUNK) {
-            return false;
-        }
-        // Only content/finish chunks (non-empty choices). The empty-choices usage-only trailer is
-        // suppressed wholesale by `suppress_same_proto_frame`, so exclude it here.
+        // A content/finish chunk carries a NON-EMPTY `choices` array. This gate (not `object`) is what
+        // distinguishes a content/finish chunk from the empty-choices usage-only trailer, and it works
+        // for compatible upstreams that omit or vary `object`.
         let choices_non_empty = obj
             .get("choices")
             .and_then(|c| c.as_array())

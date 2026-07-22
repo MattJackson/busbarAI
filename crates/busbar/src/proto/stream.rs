@@ -923,11 +923,15 @@ impl StreamTranslate {
 /// in place of the original JSON substring, leaving the frame's framing bytes untouched.
 ///
 /// Fallback (rare shapes only): if the byte-level strip declines (`None`), or the JSON is not a clean
-/// single-substring of the frame (e.g. a multi-`data:`-line frame), parse the JSON, remove `usage`
-/// from the DOM, re-serialize, and reframe as a bare `data:` frame. This is correctness-over-speed for
-/// the uncommon shape and only ever runs for THAT frame. If even the fallback cannot parse, the
-/// ORIGINAL frame bytes are returned unchanged (never a corrupt splice) - the strip is best-effort but
-/// the stream is never damaged.
+/// single-substring of the frame (e.g. a multi-`data:`-line frame), the frame is reframed as a bare
+/// `data:` frame. This is correctness-over-speed for the uncommon shape and only ever runs for THAT
+/// frame. Crucially the fallback must NOT itself introduce a wire-shape tell: it PRESERVES the JSON
+/// key ORDER and the ORIGINAL line TERMINATOR (CRLF vs LF) exactly, differing from a direct stream
+/// only by the removed `usage` key. It first retries the order-preserving byte strip on the extracted
+/// payload (which keeps key order); only if that also declines does it parse-reserialize via a DOM,
+/// and even then it uses a preserve-order map so keys are not reordered. If the JSON will not parse at
+/// all, the ORIGINAL frame bytes are returned unchanged (never a corrupt splice) - the strip is
+/// best-effort but the stream is never damaged.
 fn rewrite_frame_strip_usage(frame: &[u8], data_str: &str) -> Vec<u8> {
     // Fast path: byte-level strip spliced back into the frame in place of the JSON substring.
     if let Some(stripped) = crate::proto::strip_top_level_usage_member(data_str) {
@@ -949,17 +953,95 @@ fn rewrite_frame_strip_usage(frame: &[u8], data_str: &str) -> Vec<u8> {
             }
         }
     }
-    // Fallback: parse-modify-reserialize for this frame only. Reframe as a bare `data:` frame (the
-    // OpenAI shape). If the JSON will not parse, re-emit the original bytes verbatim rather than risk
-    // corruption.
-    match crate::json::parse_str::<serde_json::Value>(data_str) {
-        Ok(mut v) => {
-            if let Some(obj) = v.as_object_mut() {
-                obj.remove("usage");
-            }
-            format!("data: {v}\n\n").into_bytes()
-        }
-        Err(_) => frame.to_vec(),
+    // Fallback. Determine the ORIGINAL terminator so the reframed frame matches the wire shape a direct
+    // stream would send (CRLF must stay CRLF; a native OpenAI stream never silently downgrades CRLF to
+    // LF, and doing so here would be the very indistinguishability tell the strip exists to remove).
+    let terminator: &str = if frame.ends_with(b"\r\n\r\n") {
+        "\r\n\r\n"
+    } else if frame.ends_with(b"\n\n") {
+        "\n\n"
+    } else if frame.ends_with(b"\r\n") {
+        "\r\n"
+    } else if frame.ends_with(b"\n") {
+        "\n"
+    } else {
+        "\n\n"
+    };
+
+    // Use the order-preserving byte strip on the extracted payload: it keeps the original key order and
+    // only removes the `usage` member. This handles the "JSON not a clean single substring of the
+    // frame" case (multi-`data:`-line frames) without reordering keys, reframed with the original
+    // terminator so no wire-shape tell is introduced.
+    if let Some(stripped) = crate::proto::strip_top_level_usage_member(data_str) {
+        return format!("data: {stripped}{terminator}").into_bytes();
+    }
+
+    // Last resort: the byte scanner could not classify this payload (a non-object, or a shape it does
+    // not fully understand). A DOM reserialize is deliberately NOT used here: `serde_json` is built
+    // WITHOUT the `preserve_order` feature, so `serde_json::Value` / `Map` is a sorted `BTreeMap` and a
+    // round-trip would REORDER keys - reintroducing exactly the indistinguishability tell this strip
+    // exists to remove. Since the payload also carries no reliably strippable top-level `usage` (the
+    // scanner declined), re-emit the ORIGINAL frame bytes verbatim. The strip is documented best-effort;
+    // never a reordered or corrupt frame.
+    frame.to_vec()
+}
+
+#[cfg(test)]
+mod rewrite_frame_strip_usage_tests {
+    use super::rewrite_frame_strip_usage;
+
+    /// FIX 2 (byte-stripper fallback indistinguishability): when the fast byte-splice path declines and
+    /// the fallback is taken (here forced by a `data_str` that is NOT a verbatim substring of the raw
+    /// frame, mirroring a multi-`data:`-line frame), the reframed frame must NOT introduce a wire-shape
+    /// tell: JSON key ORDER is preserved and the ORIGINAL CRLF terminator is preserved. Only the
+    /// top-level `usage` key is removed.
+    #[test]
+    fn fallback_preserves_key_order_and_crlf() {
+        // A CRLF-terminated frame. Keys are in a DELIBERATELY non-sorted order (id, object, choices,
+        // usage) so that any BTreeMap/Value round-trip (which would sort to choices, id, object, usage)
+        // is detectable. `usage` sits in the MIDDLE, so a correct strip must keep the surrounding order.
+        let payload = r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","choices":[{"delta":{"content":"hi"}}],"usage":null}"#;
+        // Force the fallback deterministically: hand a frame whose bytes do NOT contain `payload`
+        // verbatim (mirroring a multi-`data:`-line frame whose extracted join differs from the raw
+        // bytes), with a CRLF terminator. The fast splice's verbatim-find fails, so the fallback runs.
+        let raw_frame = b"data: <multiline-join-not-verbatim>\r\n\r\n";
+        let out = rewrite_frame_strip_usage(raw_frame, payload);
+        let out_str = std::str::from_utf8(&out).unwrap();
+
+        // CRLF terminator preserved.
+        assert!(
+            out_str.ends_with("\r\n\r\n"),
+            "CRLF terminator must be preserved, got {out_str:?}"
+        );
+        // The `usage` key is gone.
+        assert!(
+            !out_str.contains("usage"),
+            "usage must be stripped: {out_str:?}"
+        );
+        // Remaining keys keep their ORIGINAL order: id before object before choices. A sorted
+        // reserialize would put `choices` first.
+        let id_at = out_str.find("\"id\"").expect("id present");
+        let object_at = out_str.find("\"object\"").expect("object present");
+        let choices_at = out_str.find("\"choices\"").expect("choices present");
+        assert!(
+            id_at < object_at && object_at < choices_at,
+            "original key order (id, object, choices) must be preserved, got {out_str:?}"
+        );
+    }
+
+    /// The fallback keeps an LF-only terminator as LF (it must not upgrade LF to CRLF either).
+    #[test]
+    fn fallback_preserves_lf_terminator() {
+        let payload = r#"{"id":"x","object":"chat.completion.chunk","usage":null,"choices":[]}"#;
+        let raw_frame = b"data: <not-verbatim>\n\n";
+        let out = rewrite_frame_strip_usage(raw_frame, payload);
+        let out_str = std::str::from_utf8(&out).unwrap();
+        assert!(
+            out_str.ends_with("\n\n"),
+            "LF terminator preserved: {out_str:?}"
+        );
+        assert!(!out_str.contains("\r"), "no CR introduced: {out_str:?}");
+        assert!(!out_str.contains("usage"), "usage stripped: {out_str:?}");
     }
 }
 

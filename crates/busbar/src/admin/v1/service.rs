@@ -837,7 +837,10 @@ impl AdminService {
             .plugin_trust
             .to_policy()
             .map_err(|_| AdminError::Internal)?;
-        let (trust, publisher, version) = match evaluate(library, manifest.as_ref(), &policy) {
+        // The floor keys on the identity the plugin will be LOADED by, i.e. its published filename
+        // (`dir.join(&file)`), not the manifest's self-declared name.
+        let (trust, publisher, version) = match evaluate(library, manifest.as_ref(), &file, &policy)
+        {
             Ok(Verdict::Trusted { publisher }) => (
                 "trusted",
                 Some(publisher),

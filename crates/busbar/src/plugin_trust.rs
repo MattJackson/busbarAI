@@ -67,7 +67,7 @@ pub(crate) fn verify_read(
         .and_then(|f| f.to_str())
         .unwrap_or("plugin");
 
-    match evaluate(&bytes, manifest.as_ref(), policy) {
+    match evaluate(&bytes, manifest.as_ref(), name, policy) {
         Ok(Verdict::Trusted { publisher }) => {
             tracing::info!(plugin = name, publisher = %publisher, "plugin trust: signed by an allowlisted publisher");
             Ok((format!("signed by '{publisher}'"), bytes))
@@ -161,5 +161,32 @@ mod tests {
             min_versions: BTreeMap::new(),
         };
         assert!(verify(&lib, &log).unwrap().contains("unverified"));
+    }
+
+    /// FIX 1 at the engine boundary: the anti-downgrade floor keys on the LIBRARY FILENAME (the
+    /// identity the engine resolves the plugin by), so deleting the sidecar manifest cannot slip old
+    /// vulnerable bytes past a floor even under a loose `allow` posture. Without a floor the unsigned
+    /// bytes load; with a floor pinned on the filename, a manifest-less load is a HARD reject.
+    #[test]
+    fn missing_manifest_cannot_bypass_the_floor_keyed_on_filename() {
+        let dir = tmp();
+        // No sidecar manifest at all.
+        let lib = write_plugin(&dir, "libfloored.so", b"old vulnerable bytes", None);
+
+        // Loose posture, no floor: an unsigned artifact loads.
+        let loose = TrustPolicy {
+            publishers: BTreeMap::new(),
+            on_untrusted: OnUntrusted::Allow,
+            min_versions: BTreeMap::new(),
+        };
+        assert!(verify(&lib, &loose).unwrap().contains("unverified"));
+
+        // Same loose posture, but a floor pinned on the LIBRARY FILENAME: hard reject.
+        let mut floored = loose.clone();
+        floored
+            .min_versions
+            .insert("libfloored.so".to_string(), "1.4.0".to_string());
+        let err = verify(&lib, &floored).unwrap_err();
+        assert!(err.contains("anti-downgrade"), "got {err}");
     }
 }

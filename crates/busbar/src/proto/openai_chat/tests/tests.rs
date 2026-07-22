@@ -3607,6 +3607,58 @@ fn test_framing_gates_usage_on_client_include_usage() {
     );
 }
 
+/// FIX 3 (usage-strip object gate): an OpenAI-COMPATIBLE upstream may omit the `object` field on its
+/// content chunks while still stamping the forced-`include_usage` `"usage":null` tell. The same-proto
+/// strip predicate must fire on a content chunk (non-empty `choices` + a top-level `usage` key)
+/// REGARDLESS of `object`, and must never strip a usage the client legitimately requested.
+#[test]
+fn strip_same_proto_usage_fires_without_object_field() {
+    // Opted-out framing (default).
+    let framing = OpenAiStreamFraming::default();
+
+    // A content chunk with NO `object` field but a top-level `usage:null` and a non-empty `choices`.
+    let no_object_content = serde_json::json!({
+        "id": "chatcmpl-x",
+        "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": serde_json::Value::Null}],
+        "usage": serde_json::Value::Null
+    });
+    assert!(
+        framing.strip_same_proto_usage(&no_object_content),
+        "an opted-out client must have the usage:null tell stripped even when the chunk omits `object`"
+    );
+
+    // A variant `object` value (not exactly `chat.completion.chunk`) must also be stripped.
+    let variant_object = serde_json::json!({
+        "object": "chat.completion.chunk.delta",
+        "choices": [{"index": 0, "delta": {"content": "yo"}}],
+        "usage": serde_json::Value::Null
+    });
+    assert!(
+        framing.strip_same_proto_usage(&variant_object),
+        "a compatible upstream using an `object` variant must still have the usage tell stripped"
+    );
+
+    // Guard: the trailing usage-ONLY chunk (EMPTY choices) is NOT matched here (it is dropped whole by
+    // suppress_same_proto_frame), so strip must decline it.
+    let usage_only_trailer = serde_json::json!({
+        "choices": [],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    });
+    assert!(
+        !framing.strip_same_proto_usage(&usage_only_trailer),
+        "the empty-choices usage-only trailer must not be strip-matched here"
+    );
+
+    // Guard: a client that legitimately opted in must NEVER have usage stripped.
+    let mut opted_in = OpenAiStreamFraming::default();
+    use crate::proto::StreamFraming;
+    opted_in.set_client_include_usage(true);
+    assert!(
+        !opted_in.strip_same_proto_usage(&no_object_content),
+        "an opted-in client's requested usage must never be stripped"
+    );
+}
+
 /// FINDING 1 (0-based streaming tool_calls index, unit): `remap_tool_call_index` rewrites the
 /// writer's raw IR-block index onto a 0-based per-call ordinal. First distinct raw index → 0, next →
 /// 1; the same raw index (argument-fragment chunks) replays its ordinal. Guarantees the first tool

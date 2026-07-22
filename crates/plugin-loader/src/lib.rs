@@ -45,31 +45,33 @@ pub struct DynStore {
     close: CloseFn,
     /// The plugin path, for diagnostics.
     path: String,
+    /// The loaded library. Declared BEFORE `_backing` so it drops FIRST (Rust drops fields in
+    /// declaration order, AFTER the manual `Drop::drop` below has `close`d the handle). Unloading the
+    /// library before the backing temp file is removed is what makes the Windows cleanup work: the DLL
+    /// is unmapped/unlocked first, so `_backing`'s `remove_file` can then succeed instead of failing
+    /// against a still-mapped file and leaking the temp.
+    _lib: Library,
     /// A private temp file backing this load, when the library was loaded from in-memory verified
     /// bytes ([`load_store_from_bytes`]) rather than a path. On unix it is already unlinked (the
     /// mapping outlives the dir entry); on Windows the file is locked while mapped, so it is removed
-    /// on drop. `None` for a plain path load.
+    /// on drop - which is why it MUST drop after `_lib` (see above). `None` for a plain path load.
     _backing: Option<BackingFile>,
-    /// Kept last so it drops LAST (fields drop in declaration order): the fn pointers and handle
-    /// remain valid until after `Drop` has `close`d the handle.
-    _lib: Library,
 }
 
-/// A private, per-load temp file that backs a from-bytes load. Removed on drop (best-effort) so a
-/// from-bytes load never leaves an artifact behind — and on Windows, where the file cannot be
-/// deleted while the DLL is mapped, this deferral is the ONLY time it can be removed.
+/// A private, per-load staging DIRECTORY that backs a from-bytes load (it contains exactly the staged
+/// library file). Removed on drop (best-effort) so a from-bytes load never leaves an artifact behind -
+/// and on Windows, where the file cannot be deleted while the DLL is mapped, this deferral is the ONLY
+/// time it can be removed. Removing the whole directory (not just the file) also reclaims the private
+/// per-load subdir created by [`write_private_temp`].
 struct BackingFile {
-    path: std::path::PathBuf,
-    /// True once the on-disk entry has already been unlinked (unix, immediately after `dlopen`) — so
-    /// `Drop` does not try to remove it a second time.
-    already_unlinked: bool,
+    dir: std::path::PathBuf,
 }
 
 impl Drop for BackingFile {
     fn drop(&mut self) {
-        if !self.already_unlinked {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        // Whether or not the library file was already unlinked (unix), removing the private directory
+        // reclaims everything staged for this load. `remove_dir_all` tolerates the file being gone.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -271,8 +273,10 @@ impl Store for DynStore {
 
 impl Drop for DynStore {
     fn drop(&mut self) {
-        // Close the instance while the library is still mapped (fields drop after this runs; `_lib`
-        // is declared last so it unloads last).
+        // Close the instance while the library is still mapped (fields drop after this runs). Field
+        // drop order is declaration order: `_lib` is declared BEFORE `_backing`, so the library
+        // unloads FIRST and the backing temp file is removed AFTER (essential on Windows, where the
+        // file cannot be deleted while the DLL is still mapped).
         unsafe { (self.close)(self.handle) };
     }
 }
@@ -305,15 +309,30 @@ pub fn load_store(lib_path: &Path, cfg_json: &str) -> Result<Box<dyn Store>, Str
 /// The engine's boot/reload path verifies a plugin's hash/signature over the bytes it read from disk,
 /// then must load THOSE SAME bytes. Handing `load_store` a path re-opens the file, leaving a window in
 /// which an attacker with write access to the plugins directory could swap the file between the
-/// verify-read and the `dlopen` (a classic time-of-check/time-of-use gap). This function closes it:
-/// the caller reads + verifies the bytes ONCE, then passes them here; we materialize them into a
-/// PRIVATE, freshly-created temp file (owner-only, `create_new` so it is never an attacker's
-/// pre-planted path) and `dlopen` that. The bytes loaded are byte-for-byte the bytes verified — no
-/// on-disk path the caller verified is ever re-read, so nothing can be swapped underneath it.
+/// verify-read and the `dlopen` (a classic time-of-check/time-of-use gap). This function closes THAT
+/// gap for the verified bytes: the caller reads + verifies the bytes ONCE, then passes them here; we
+/// materialize them into a PRIVATE, owner-created staging directory (`0700` on unix) and `dlopen` the
+/// file inside it. The plugins-directory path the caller verified is NEVER re-read, so it cannot be
+/// swapped between verify and load - the bytes loaded are byte-for-byte the bytes verified.
 ///
-/// On unix the temp file is unlinked immediately after `dlopen` (the mapping outlives the directory
-/// entry), so it is never visible for a swap; on Windows it is removed when the store drops.
-/// `display` is a human label for diagnostics (typically the real plugin path).
+/// RESIDUAL (do not overstate): the staging directory is created under the process temp base
+/// (`std::env::temp_dir()`, honoring `TMPDIR`), and the library is then re-opened BY PATH via
+/// `Library::new` (a portable `dlopen`/`LoadLibrary` that takes a path, not the open fd). Because WE
+/// create the per-load subdirectory `0700` and only we own it, an attacker who does not own that
+/// directory cannot substitute the file between our write and the `dlopen`. What this does NOT fully
+/// neutralize is a HOSTILE temp BASE: if `TMPDIR` itself points into a directory an attacker controls,
+/// they could interfere with the base before our subdir exists (our `create_dir` still fails closed if
+/// the exact path is pre-planted, but a controlled parent is a weaker position than a trusted base).
+/// A fully fd-mediated load (dlopen of an already-open descriptor / `memfd`) that would remove the
+/// by-path reopen entirely is not portable across the platforms this crate targets, so we stage into
+/// an owner-created private subdir instead and document the residual here rather than claim the window
+/// is gone. Operators handling untrusted uploads should point `TMPDIR` at a trusted, non-shared base.
+///
+/// On unix the staged file is unlinked immediately after `dlopen` (the mapping outlives the directory
+/// entry), so it is never visible for a swap, and the now-empty private directory is reclaimed when the
+/// store drops; on Windows the file is locked while mapped, so both the file and its private directory
+/// are removed when the store drops. `display` is a human label for diagnostics (typically the real
+/// plugin path).
 pub fn load_store_from_bytes(
     bytes: &[u8],
     cfg_json: &str,
@@ -326,56 +345,83 @@ pub fn load_store_from_bytes(
     // contents cannot have been substituted between the caller's verification and this load.
     let lib = unsafe { Library::new(&path) }
         .map_err(|e| format!("failed to load plugin '{display}': {e}"))?;
-    // On unix the file is mapped; unlink it now so it is never exposed for a swap or left behind. On
-    // Windows the file is locked while loaded, so defer removal to `BackingFile`'s drop.
+    // On unix the file is mapped; unlink it now so it is never exposed for a swap or left behind (the
+    // now-empty private directory is reclaimed when `BackingFile` drops). On Windows the file is locked
+    // while loaded, so both the file and its directory are removed on `BackingFile`'s drop.
     #[cfg(unix)]
-    let backing = {
-        let mut backing = backing;
-        if std::fs::remove_file(&path).is_ok() {
-            backing.already_unlinked = true;
-        }
-        backing
-    };
+    let _ = std::fs::remove_file(&path);
     wire_up_store(lib, cfg_json, display.to_string(), Some(backing))
 }
 
-/// Write `bytes` to a fresh, private (owner-only), uniquely-named temp file and return its path plus a
-/// [`BackingFile`] guard that removes it on drop. `create_new` guarantees we never adopt a path an
-/// attacker pre-planted (the create fails if it already exists).
+/// Write `bytes` to a fresh, private, owner-created staging file and return its path plus a
+/// [`BackingFile`] guard that removes it (and its private directory) on drop.
+///
+/// The library is staged inside a per-load subdirectory that WE create under the temp base:
+/// `<temp_base>/busbar-plugin-<pid>-<seq>-<nanos>/lib<suffix>`. `create_dir` is atomic-exclusive (it
+/// fails if the path already exists), so we never adopt a directory an attacker pre-planted, and on
+/// unix the directory is created `0700` (owner-only). Because the parent directory is owner-owned and
+/// not writable by others, an attacker who does not own it cannot create, rename, or swap the library
+/// file inside it - which is what shrinks the residual TOCTOU window that staging directly into a
+/// world-writable, non-sticky `TMPDIR` would leave open. This does NOT fully eliminate the window on a
+/// hostile `TMPDIR` (see [`load_store_from_bytes`]'s doc for the precise residual): a `TMPDIR` whose
+/// PARENT an attacker controls could still interfere with the base itself; the guarantee is that the
+/// staged file lives in a directory this process created and owns.
 fn write_private_temp(bytes: &[u8]) -> std::io::Result<(std::path::PathBuf, BackingFile)> {
     use std::io::Write as _;
-    // A unique basename in the process temp dir. Uniqueness comes from pid + an atomic counter, so
-    // concurrent loads (multiple stores) never collide, and `create_new` fails closed if they did.
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        "busbar-plugin-{}-{}{}",
-        std::process::id(),
-        seq,
-        dylib_suffix()
-    );
-    let path = std::env::temp_dir().join(name);
+    // pid + atomic seq + wall-clock nanos: enough to avoid collisions with our own concurrent loads
+    // and to make the name unpredictable to a would-be pre-planter. The real exclusivity comes from
+    // `create_dir` failing closed if the path exists, not from the entropy alone.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir_name = format!("busbar-plugin-{}-{}-{}", std::process::id(), seq, nanos);
+    let dir = std::env::temp_dir().join(dir_name);
+
+    // Create the private staging directory. `create_dir` (not `create_dir_all`) fails if it already
+    // exists, so we never reuse a directory we did not just create.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::DirBuilder::new().create(&dir)?;
+    }
+
+    let path = dir.join(format!("lib{}", dylib_suffix()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o700);
+        opts.mode(0o600);
     }
-    let mut f = opts.open(&path)?;
-    f.write_all(bytes)?;
-    f.flush()?;
+    // On Windows the file inherits the ACL of the owner-created private directory above (there is no
+    // portable per-file unix-mode equivalent). We open with `create_new` so we never adopt a
+    // pre-planted file; the private parent directory is the primary permission boundary. See the
+    // `load_store_from_bytes` doc for the exact residual on this platform.
+    let mut f = match opts.open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Clean up the directory we created if the file open fails, so a failed load leaves nothing.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
+    if let Err(e) = f.write_all(bytes).and_then(|()| f.flush()) {
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     // Drop the handle so the file is closed before we `dlopen` it (Windows in particular dislikes an
     // open writable handle racing the loader's read).
     drop(f);
-    Ok((
-        path.clone(),
-        BackingFile {
-            path,
-            already_unlinked: false,
-        },
-    ))
+    Ok((path, BackingFile { dir }))
 }
 
 /// The platform dynamic-library suffix, used only to give the staged temp file a plausible extension
@@ -460,8 +506,8 @@ fn wire_up_store(
         free,
         close,
         path: display,
-        _backing: backing,
         _lib: lib,
+        _backing: backing,
     }))
 }
 
@@ -791,5 +837,84 @@ mod tests {
             .expect("verified bytes still load despite the on-disk swap");
         assert!(store.list_keys().expect("list over the ABI").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX 5 (path-mediated TOCTOU residual): `write_private_temp` stages into a per-load PRIVATE
+    /// directory that WE create (not directly in the shared temp base), and on unix that directory is
+    /// `0700` and the staged file is `0600` (owner-only). This is the reduced-window staging the doc
+    /// now describes precisely.
+    #[cfg(unix)]
+    #[test]
+    fn write_private_temp_stages_owner_only_in_private_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (path, backing) = write_private_temp(b"\x7fELF staged bytes").expect("stage");
+        // The file lives inside a dedicated subdirectory (not directly under the temp base).
+        let parent = path.parent().expect("staged file has a parent dir");
+        assert_eq!(
+            parent, backing.dir,
+            "the staged file sits in its private backing dir"
+        );
+        assert_ne!(
+            parent,
+            std::env::temp_dir(),
+            "staging must NOT be directly in the shared temp base"
+        );
+        // Directory is owner-only (0700) and the file is owner-only (0600).
+        let dmode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "private dir must be 0700, got {dmode:o}");
+        let fmode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fmode, 0o600, "staged file must be 0600, got {fmode:o}");
+
+        // Dropping the BackingFile removes the whole private directory (FIX 4 cleanup contract).
+        let dir = backing.dir.clone();
+        drop(backing);
+        assert!(
+            !dir.exists(),
+            "dropping BackingFile must remove the private staging dir: {dir:?}"
+        );
+    }
+
+    /// FIX 4/5 (no leaked artifact + drop-order cleanup): after a from-bytes load's store DROPS, nothing
+    /// is left behind. On unix the staged file is unlinked right after `dlopen` and the private
+    /// directory is reclaimed when the store (hence `BackingFile`) drops. Because `DynStore` declares
+    /// `_lib` before `_backing`, the library unloads BEFORE the backing directory is removed - the order
+    /// Windows requires (the file cannot be deleted while the DLL is mapped). This asserts the unix
+    /// no-leak outcome directly; the Windows unload-before-remove ordering is enforced by the field
+    /// declaration order and documented on `DynStore`.
+    #[test]
+    fn from_bytes_load_leaves_no_artifact_after_drop() {
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read sqlite cdylib");
+        // Snapshot the temp base's busbar-plugin dirs before and after, so we can assert this load
+        // leaves none of its own staging directories behind once the store drops.
+        let base = std::env::temp_dir();
+        let count_ours = || {
+            std::fs::read_dir(&base)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("busbar-plugin-"))
+                })
+                .count()
+        };
+        let before = count_ours();
+        {
+            let store =
+                load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "no-leak-check")
+                    .expect("load from bytes");
+            assert!(store.list_keys().expect("list").is_empty());
+        } // store drops here -> library unloads, then the private staging dir is removed.
+        let after = count_ours();
+        assert!(
+            after <= before,
+            "a from-bytes load must leave no staging directory behind after the store drops \
+             (before={before}, after={after})"
+        );
     }
 }

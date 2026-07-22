@@ -243,40 +243,35 @@ pub fn version_at_least(have: &str, floor: &str) -> bool {
 }
 
 /// Evaluate an artifact against the trust policy. `manifest` is `None` when the artifact arrived
-/// unsigned. Returns [`Verdict`] when it may proceed (trusted, or untrusted-but-posture-permits), or
-/// [`Rejected`] when the posture forbids it.
+/// unsigned. `load_identity` is the identity the engine will actually LOAD this artifact by (the
+/// library filename such as `libx.so`), NOT the manifest's self-declared `name`. Returns [`Verdict`]
+/// when it may proceed (trusted, or untrusted-but-posture-permits), or [`Rejected`] when the posture
+/// (or the anti-downgrade floor) forbids it.
 ///
-/// Anti-downgrade: even after a signature verifies, a manifest whose `version` is below the policy's
-/// pinned `min_versions[name]` floor is REJECTED unconditionally (not subject to `on_untrusted`) — a
-/// rollback of an older validly-signed release must never be accepted once a floor is set. The
-/// `version` field is signature-covered, so an attacker cannot forge a higher one to clear the floor.
+/// Anti-downgrade (hard reject, un-bypassable): if `policy.min_versions` pins a floor for
+/// `load_identity`, the load must PROVE (via a valid signature from an allowlisted publisher over a
+/// manifest whose `version` is at or above the floor) that it meets the floor. A load that cannot
+/// prove this is REJECTED regardless of `on_untrusted`. This closes three bypasses that keying the
+/// floor on the manifest's self-declared `name` (and only checking it when a manifest was present)
+/// left open:
+///   * NO-MANIFEST: deleting the sidecar makes `manifest = None`; the floor still fires on
+///     `load_identity` and rejects (an unsigned artifact cannot prove it meets the floor).
+///   * NAME-MISMATCH: `manifest.name` is attacker-controlled; keying on `load_identity` (the engine's
+///     resolved filename) means renaming the manifest's `name` no longer dodges the floor.
+///   * LOOSE POSTURE: the floor is checked BEFORE any posture relaxation and requires a *trusted*
+///     manifest, so `log`/`alert`/`allow` cannot launder a stripped-signature downgrade past it.
+///
+/// The `version` field is signature-covered, so an attacker cannot forge a higher one to clear a floor.
 pub fn evaluate(
     bytes: &[u8],
     manifest: Option<&Manifest>,
+    load_identity: &str,
     policy: &TrustPolicy,
 ) -> Result<Verdict, Rejected> {
-    // `Ok(None)` from this match is the ONLY path to a trusted verdict, and it carries the VERIFIED
-    // manifest - so the trusted publisher is always `m.publisher`, never an empty string. (The prior
-    // shape re-`map`ped `manifest` with an `unwrap_or_default()` fallback, whose `None` arm was dead:
-    // a `None` manifest yields `Some(reason)` here and can never reach the trusted verdict. Carrying
-    // the verified manifest through removes that misleading empty-publisher-Trusted dead branch.)
-    // ── anti-downgrade floor (hard reject, BEFORE any posture relaxation) ──
-    // A pinned floor for this plugin name refuses any presented manifest whose version is below it —
-    // whether trusted or not — so a loose `on_untrusted` posture cannot be used to sneak an older,
-    // stripped-signature manifest past a floor either. The floor keys on `name`; a downgrade attack
-    // must reuse a name (a store plugin the engine resolves by name), and `version` is signed, so a
-    // trusted manifest's version cannot be forged upward to clear the floor.
-    if let Some(m) = manifest {
-        if let Some(floor) = policy.min_versions.get(&m.name) {
-            if !version_at_least(&m.version, floor) {
-                return Err(Rejected(format!(
-                    "plugin '{}' version {} is below the pinned minimum {} (anti-downgrade)",
-                    m.name, m.version, floor
-                )));
-            }
-        }
-    }
-
+    // Trust determination first: a manifest is TRUSTED only when a signature from an allowlisted
+    // publisher verifies over these exact bytes. That verification is the sole thing that makes
+    // `version` (and any other manifest field) trustworthy, so the floor below leans on it rather than
+    // on unverified self-declared fields.
     let trusted_or_reason: Result<&Manifest, String> = match manifest {
         None => Err("artifact is unsigned (no manifest)".to_string()),
         Some(m) => match policy.publishers.get(&m.publisher) {
@@ -290,6 +285,31 @@ pub fn evaluate(
             },
         },
     };
+
+    // Anti-downgrade floor (hard reject, BEFORE any posture relaxation). Keyed on `load_identity` (the
+    // engine's resolved library filename), NOT the manifest's self-declared `name`. If a floor is
+    // pinned for this identity, the load must be TRUSTED and its now-verified version must clear the
+    // floor. Anything else (no manifest, an untrusted manifest, or a trusted-but-too-old version) is a
+    // hard reject that no `on_untrusted` posture can relax.
+    if let Some(floor) = policy.min_versions.get(load_identity) {
+        match &trusted_or_reason {
+            Ok(m) if version_at_least(&m.version, floor) => { /* proven at/above floor; proceed */ }
+            Ok(m) => {
+                return Err(Rejected(format!(
+                    "plugin '{load_identity}' version {} is below the pinned minimum {floor} \
+                     (anti-downgrade)",
+                    m.version
+                )));
+            }
+            Err(reason) => {
+                return Err(Rejected(format!(
+                    "plugin '{load_identity}' has a pinned minimum version {floor} but the load could \
+                     not prove it meets the floor ({reason}); a signed manifest at or above the floor \
+                     is required (anti-downgrade)"
+                )));
+            }
+        }
+    }
 
     match trusted_or_reason {
         Ok(m) => Ok(Verdict::Trusted {
@@ -349,7 +369,7 @@ mod tests {
 
         let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
         assert_eq!(
-            evaluate(artifact, Some(&m), &pol).unwrap(),
+            evaluate(artifact, Some(&m), "libstore.so", &pol).unwrap(),
             Verdict::Trusted {
                 publisher: "busbar".into()
             }
@@ -364,13 +384,13 @@ mod tests {
         let m = sign(&key, manifest("p", "busbar"), artifact);
         let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
 
-        // Flip a DISPLAY field the confirm-card shows — signature must break (card can't be spoofed).
+        // Flip a DISPLAY field the confirm-card shows: signature must break (card can't be spoofed).
         let mut forged = m.clone();
         forged.author = "Busbar Official".into();
-        assert!(evaluate(artifact, Some(&forged), &pol).is_err());
+        assert!(evaluate(artifact, Some(&forged), "libp.so", &pol).is_err());
 
         // Swap the library under a good manifest -> hash mismatch.
-        assert!(evaluate(b"different!", Some(&m), &pol).is_err());
+        assert!(evaluate(b"different!", Some(&m), "libp.so", &pol).is_err());
     }
 
     #[test]
@@ -380,7 +400,7 @@ mod tests {
         let artifact = b"bytes";
         let m = sign(&key, manifest("p", "busbar"), artifact);
         let pol = policy(&[("busbar", &attacker.verifying_key())], OnUntrusted::Halt);
-        assert!(evaluate(artifact, Some(&m), &pol).is_err());
+        assert!(evaluate(artifact, Some(&m), "libp.so", &pol).is_err());
     }
 
     #[test]
@@ -389,24 +409,24 @@ mod tests {
         let artifact = b"bytes";
         let m = sign(&key, manifest("p", "acme"), artifact);
         let pol = policy(&[("busbar", &key.verifying_key())], OnUntrusted::Halt);
-        let err = evaluate(artifact, Some(&m), &pol).unwrap_err();
+        let err = evaluate(artifact, Some(&m), "libp.so", &pol).unwrap_err();
         assert!(err.0.contains("not in the allowlist"), "got {err:?}");
     }
 
     #[test]
     fn posture_allow_and_log_permit_unsigned_but_halt_refuses() {
         assert!(matches!(
-            evaluate(b"x", None, &policy(&[], OnUntrusted::Allow)).unwrap(),
+            evaluate(b"x", None, "libp.so", &policy(&[], OnUntrusted::Allow)).unwrap(),
             Verdict::Allowed {
                 action: OnUntrusted::Allow,
                 ..
             }
         ));
         assert!(matches!(
-            evaluate(b"x", None, &policy(&[], OnUntrusted::Log)).unwrap(),
+            evaluate(b"x", None, "libp.so", &policy(&[], OnUntrusted::Log)).unwrap(),
             Verdict::Allowed { .. }
         ));
-        assert!(evaluate(b"x", None, &policy(&[], OnUntrusted::Halt)).is_err());
+        assert!(evaluate(b"x", None, "libp.so", &policy(&[], OnUntrusted::Halt)).is_err());
     }
 
     #[test]
@@ -443,17 +463,18 @@ mod tests {
         assert!(!version_at_least("not-a-version", "0.0.1"));
     }
 
-    /// ANTI-DOWNGRADE: an OLDER but validly-signed manifest for the SAME plugin name is REJECTED once
-    /// a floor is pinned — even though its signature verifies against the allowlisted publisher. This
-    /// is the rollback/replay attack: re-presenting a known-vulnerable prior release the vendor really
-    /// did sign. Bumping the version to meet the floor is impossible without re-signing (version is a
-    /// signed field), so the floor holds.
+    /// ANTI-DOWNGRADE: an OLDER but validly-signed manifest for a floored LOAD IDENTITY is REJECTED
+    /// once a floor is pinned, even though its signature verifies against the allowlisted publisher.
+    /// This is the rollback/replay attack: re-presenting a known-vulnerable prior release the vendor
+    /// really did sign. Bumping the version to meet the floor is impossible without re-signing (version
+    /// is a signed field), so the floor holds. The floor keys on the load identity (library filename),
+    /// not the manifest's self-declared name.
     #[test]
     fn signed_but_downgraded_version_is_rejected() {
         let key = test_key(1);
         let pubk = key.verifying_key();
         let artifact = b"older vulnerable build";
-        // A genuinely, validly-signed v1.0.0 of "store-sqlite".
+        // A genuinely, validly-signed v1.0.0 loaded as "libstore.so".
         let mut old = manifest("store-sqlite", "busbar");
         old.version = "1.0.0".into();
         let old = sign(&key, old, artifact);
@@ -461,29 +482,29 @@ mod tests {
         // With NO floor it verifies as trusted (baseline).
         let mut pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
         assert!(matches!(
-            evaluate(artifact, Some(&old), &pol).unwrap(),
+            evaluate(artifact, Some(&old), "libstore.so", &pol).unwrap(),
             Verdict::Trusted { .. }
         ));
 
-        // Pin the floor to 1.4.0 — the old validly-signed 1.0.0 is now a rejected downgrade.
+        // Pin the floor to 1.4.0 for the LOAD IDENTITY: the old validly-signed 1.0.0 is now rejected.
         pol.min_versions
-            .insert("store-sqlite".to_string(), "1.4.0".to_string());
-        let err = evaluate(artifact, Some(&old), &pol).unwrap_err();
+            .insert("libstore.so".to_string(), "1.4.0".to_string());
+        let err = evaluate(artifact, Some(&old), "libstore.so", &pol).unwrap_err();
         assert!(err.0.contains("anti-downgrade"), "got {err:?}");
 
-        // A current, validly-signed 1.4.0 of the same plugin still passes the floor.
+        // A current, validly-signed 1.4.0 loaded under the same identity still passes the floor.
         let mut cur = manifest("store-sqlite", "busbar");
         cur.version = "1.4.0".into();
         let cur = sign(&key, cur, artifact);
         assert!(matches!(
-            evaluate(artifact, Some(&cur), &pol).unwrap(),
+            evaluate(artifact, Some(&cur), "libstore.so", &pol).unwrap(),
             Verdict::Trusted { .. }
         ));
     }
 
     /// The floor is a HARD reject that a loose posture cannot bypass: a stripped-signature (untrusted)
-    /// older manifest under `on_untrusted: allow` is STILL refused when it names a floored plugin, so
-    /// a downgrade can't be laundered through a relaxed posture.
+    /// older manifest under `on_untrusted: allow` is STILL refused when the load identity is floored,
+    /// so a downgrade can't be laundered through a relaxed posture.
     #[test]
     fn downgrade_floor_is_not_bypassable_by_loose_posture() {
         let key = test_key(1);
@@ -491,14 +512,94 @@ mod tests {
         let mut old = manifest("store-sqlite", "busbar");
         old.version = "1.0.0".into();
         let old = sign(&key, old, artifact);
-        // Strip the signature to make it "untrusted" — a loose posture would normally allow it.
+        // Strip the signature to make it "untrusted": a loose posture would normally allow it.
         let mut stripped = old.clone();
         stripped.signature = String::new();
 
         let mut pol = policy(&[], OnUntrusted::Allow);
         pol.min_versions
-            .insert("store-sqlite".to_string(), "1.4.0".to_string());
+            .insert("libstore.so".to_string(), "1.4.0".to_string());
         // Even under `allow`, the floored downgrade is rejected outright.
-        assert!(evaluate(artifact, Some(&stripped), &pol).is_err());
+        assert!(evaluate(artifact, Some(&stripped), "libstore.so", &pol).is_err());
+    }
+
+    /// FIX 1 (a) NO-MANIFEST bypass: deleting the sidecar makes `manifest = None`. Under a loose
+    /// posture that would normally load an unsigned artifact, a floored load identity must STILL be
+    /// rejected: an unsigned artifact cannot PROVE it meets the floor, so old vulnerable bytes cannot
+    /// be loaded by dropping the manifest.
+    #[test]
+    fn floor_rejects_missing_manifest_even_under_loose_posture() {
+        let artifact = b"old vulnerable bytes, no manifest";
+        // Loose posture (`allow`) would load an unsigned artifact with no floor...
+        let mut pol = policy(&[], OnUntrusted::Allow);
+        assert!(matches!(
+            evaluate(artifact, None, "libstore.so", &pol).unwrap(),
+            Verdict::Allowed { .. }
+        ));
+        // ...but once the load identity is floored, a manifest-less load is a HARD reject.
+        pol.min_versions
+            .insert("libstore.so".to_string(), "1.4.0".to_string());
+        let err = evaluate(artifact, None, "libstore.so", &pol).unwrap_err();
+        assert!(err.0.contains("anti-downgrade"), "got {err:?}");
+        assert!(
+            err.0.contains("could not prove") || err.0.contains("unsigned"),
+            "reason should say the load could not prove the floor: {err:?}"
+        );
+    }
+
+    /// FIX 1 (b) NAME-MISMATCH bypass: an untrusted manifest's `name` is attacker-controlled. Renaming
+    /// it to a non-floored string no longer dodges the floor, because the floor now keys on the LOAD
+    /// IDENTITY (the library filename the engine resolves it by), not the manifest's self-declared
+    /// name. A floored library with a renamed manifest is REJECTED even under a loose posture.
+    #[test]
+    fn floor_rejects_name_mismatch_manifest() {
+        let key = test_key(1);
+        let artifact = b"old build, manifest renamed to dodge the floor";
+        // A stripped/untrusted manifest whose self-declared name is a non-floored string.
+        let mut m = manifest("totally-different-name", "busbar");
+        m.version = "1.0.0".into();
+        let mut m = sign(&key, m, artifact);
+        m.signature = String::new(); // untrusted
+
+        let mut pol = policy(&[], OnUntrusted::Allow);
+        // Floor is pinned on the LOAD IDENTITY, which the attacker cannot rename.
+        pol.min_versions
+            .insert("libstore.so".to_string(), "1.4.0".to_string());
+        let err = evaluate(artifact, Some(&m), "libstore.so", &pol).unwrap_err();
+        assert!(err.0.contains("anti-downgrade"), "got {err:?}");
+        // And with NO floor on the load identity, the renamed manifest name is irrelevant: the floor
+        // pinned under the OLD (self-declared) key does not fire, confirming the floor no longer keys
+        // on `manifest.name`.
+        let mut pol2 = policy(&[], OnUntrusted::Allow);
+        pol2.min_versions
+            .insert("totally-different-name".to_string(), "1.4.0".to_string());
+        assert!(
+            matches!(
+                evaluate(artifact, Some(&m), "libstore.so", &pol2).unwrap(),
+                Verdict::Allowed { .. }
+            ),
+            "a floor keyed on the manifest's self-declared name must NOT gate a differently-named \
+             load identity"
+        );
+    }
+
+    /// FIX 1 positive control: a legitimately-signed plugin at or above the floor, loaded under the
+    /// floored identity, still loads as Trusted (the hardening does not break the happy path).
+    #[test]
+    fn floored_identity_accepts_signed_at_or_above_floor() {
+        let key = test_key(1);
+        let pubk = key.verifying_key();
+        let artifact = b"current good build";
+        let mut cur = manifest("store-sqlite", "busbar");
+        cur.version = "1.4.0".into();
+        let cur = sign(&key, cur, artifact);
+
+        let mut pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
+        pol.min_versions
+            .insert("libstore.so".to_string(), "1.4.0".to_string());
+        assert!(matches!(
+            evaluate(artifact, Some(&cur), "libstore.so", &pol).unwrap(),
+            Verdict::Trusted { .. }
+        ));
     }
 }
