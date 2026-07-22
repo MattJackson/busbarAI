@@ -98,7 +98,12 @@ pub(crate) async fn forward_with_pool_keyed(
 // Plumbing function: each parameter is an independent request input (state, candidates, body, parsed
 // body, caller token, pool name, affinity key, ingress protocol, usage sink) with no natural grouping.
 #[allow(clippy::too_many_arguments)]
+// `level = "debug"`: at the default info filter this span is DISABLED at the callsite (one relaxed
+// atomic check) instead of allocating a span + formatting three fields on every request. The
+// info-level events on the rejection paths carry their own pool/policy fields, so no info-level
+// log line loses context; run with RUST_LOG=busbar=debug to get the span back.
 #[tracing::instrument(
+    level = "debug",
     name = "forward",
     skip_all,
     fields(pool = %pool_name, ingress = %ingress_protocol, op = op.name())
