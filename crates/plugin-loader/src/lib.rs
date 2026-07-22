@@ -269,6 +269,26 @@ impl Store for DynStore {
             other => Err(unexpected(other)),
         }
     }
+
+    fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+        // A plugin built against an OLDER SDK never learned this request variant and will reject it
+        // (a protocol/decode error). Fall back to the trait default (`list_audit` + tail-truncation)
+        // so restore still works against old durable plugins - it just materializes the full list
+        // once before truncating rather than bounding at the source. A new plugin returns the bounded
+        // tail directly (no full materialization), which is the point of the variant.
+        match self.call_raw(StoreRequest::ListAuditTail(limit)) {
+            Ok(StoreResponse::Audit(a)) => Ok(a),
+            Ok(other) => Err(unexpected(other)),
+            Err(_) => {
+                let mut all = self.list_audit()?;
+                let limit = limit as usize;
+                if all.len() > limit {
+                    all.drain(0..all.len() - limit);
+                }
+                Ok(all)
+            }
+        }
+    }
 }
 
 impl Drop for DynStore {
@@ -592,9 +612,37 @@ fn is_library_file(file: &str) -> bool {
     file.ends_with(ext)
 }
 
+/// List the dynamic-library FILENAMES in `dir` (sorted), WITHOUT opening any of them - the pure,
+/// side-effect-free directory scan. Unlike [`inventory`], this NEVER `dlopen`s a library, so an
+/// untrusted plugin's init/constructor code cannot run just from enumerating the directory. The trust
+/// gate (and only then the ABI [`validate_plugin`], which does `dlopen`) is applied by the caller,
+/// per file, so no library's code runs until it passes trust. A missing directory is an empty list.
+pub fn list_plugin_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if path.is_file() && is_library_file(file) {
+            out.push(file.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Inventory the plugins directory: every dynamic library present, each validated (ABI handshake) so
 /// the admin surface can show what's installed and whether it's loadable. A missing directory is an
 /// empty inventory, not an error.
+///
+/// WARNING: this `dlopen`s (via [`validate_plugin`]) EVERY library to run the ABI handshake, which
+/// executes each library's init/constructor code. It must therefore only be called on libraries that
+/// have ALREADY passed the trust gate - never as an untrusted-directory inspection. The admin catalog
+/// uses [`list_plugin_files`] + a per-file trust check instead, and `dlopen`s only what trust permits.
 pub fn inventory(dir: &Path) -> Vec<PluginInfo> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {

@@ -89,6 +89,7 @@ pub fn dispatch(store: &dyn Store, req: StoreRequest) -> Result<StoreResponse, S
             R::Unit
         }
         Q::ListAudit => R::Audit(store.list_audit()?),
+        Q::ListAuditTail(limit) => R::Audit(store.list_audit_tail(limit)?),
     })
 }
 

@@ -318,6 +318,24 @@ pub trait Store: Send + Sync + 'static {
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
         Ok(Vec::new())
     }
+
+    /// The most-recent `limit` audit records, oldest-first - the BOUNDED boot restore source. The
+    /// engine's ring is size-bounded, so restoring the whole (never-pruned) durable history is
+    /// wasteful and, over the plugin ABI, can exceed the response size cap or OOM on a large log.
+    /// Restore reads only the tail it will keep (plus the head is verified within that tail).
+    ///
+    /// DEFAULTED to a `list_audit` fallback + tail-truncation so every existing backend keeps working:
+    /// a store that has not overridden this still restores correctly (it just materializes the full
+    /// list once before truncating). A durable backend SHOULD override this with a `LIMIT`ed query so
+    /// the bound is enforced at the source (in the DB / across the ABI), which is the whole point.
+    fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+        let mut all = self.list_audit()?;
+        let limit = limit as usize;
+        if all.len() > limit {
+            all.drain(0..all.len() - limit);
+        }
+        Ok(all)
+    }
 }
 
 #[cfg(test)]

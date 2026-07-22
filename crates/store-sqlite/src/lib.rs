@@ -626,6 +626,38 @@ impl Store for SqliteStore {
             .store()?;
         Ok(rows)
     }
+
+    fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+        // BOUNDED restore read (audit issue): select only the most-recent `limit` rows at the SOURCE
+        // (a `LIMIT` on a descending scan), then reverse into oldest-first. This keeps the ABI
+        // response and the engine ring bounded regardless of how large the never-pruned durable log
+        // has grown, so restore cannot exceed the plugin response cap or OOM.
+        let conn = self.lock_conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, ts, action, resource, outcome, principal, prev_hash, hash
+                 FROM audit_log ORDER BY seq DESC LIMIT ?1",
+            )
+            .store()?;
+        let mut rows = stmt
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                Ok(AuditRecord {
+                    seq: r.get::<_, i64>(0)?.max(0) as u64,
+                    ts: r.get::<_, i64>(1)?.max(0) as u64,
+                    action: r.get(2)?,
+                    resource: r.get(3)?,
+                    outcome: r.get(4)?,
+                    principal: r.get(5)?,
+                    prev_hash: r.get(6)?,
+                    hash: r.get(7)?,
+                })
+            })
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        rows.reverse(); // DESC LIMIT gave newest-first; the restore contract is oldest-first.
+        Ok(rows)
+    }
 }
 
 // Direct-store SQL primitives retained ONLY for the governance unit tests that pin their

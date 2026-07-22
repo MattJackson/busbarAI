@@ -96,6 +96,11 @@ pub enum StoreRequest {
     AppendAudit(AuditRecord),
     /// `list_audit` — every persisted audit record (oldest-first), the boot restore source. ADDITIVE.
     ListAudit,
+    /// `list_audit_tail` - the most-recent `limit` audit records, oldest-first (the BOUNDED boot
+    /// restore source). ADDITIVE (ABI stays v1): a plugin built against the older SDK never sees this
+    /// variant, so the engine's loader FALLS BACK to `ListAudit` + tail-truncation. Bounds the restore
+    /// read so a large durable history cannot exceed the ABI response cap or OOM the ring.
+    ListAuditTail(u64),
 }
 
 /// The success payload for a `call`, matched to the request variant. Store-level errors do NOT ride
@@ -214,6 +219,7 @@ mod tests {
             StoreRequest::ListAwsCredentials,
             StoreRequest::AppendAudit(sample_audit()),
             StoreRequest::ListAudit,
+            StoreRequest::ListAuditTail(500),
         ];
         for r in reqs {
             let j = serde_json::to_vec(&r).unwrap();

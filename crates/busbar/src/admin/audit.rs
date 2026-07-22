@@ -108,6 +108,15 @@ pub(crate) struct AuditLog {
     /// write-through failure logs a warning but NEVER fails the admin mutation (the RAM ring still
     /// holds the entry; the periodic state snapshot is a second safety net). `None` = ephemeral.
     sink: std::sync::Mutex<Option<std::sync::Arc<dyn busbar_api::Store>>>,
+    /// The highest CONTIGUOUS seq known to be durably persisted (0 = none yet). The write-through
+    /// backfills from `durable_high + 1` up to each new entry's seq, so a TRANSIENT `append_audit`
+    /// failure that previously left a permanent gap now heals: the next successful write-through
+    /// catches up the skipped seq(s) from the RAM ring, keeping the durable hash chain CONTIGUOUS
+    /// (which the strict `restore_from_store` linkage check requires). Serialized by `durable_lock`.
+    durable_high: std::sync::atomic::AtomicU64,
+    /// Serializes the write-through (backfill + append) so two concurrent recorders cannot interleave
+    /// their catch-up writes and re-introduce a gap or write a seq out of order to the store.
+    durable_lock: std::sync::Mutex<()>,
 }
 
 impl AuditLog {
@@ -116,6 +125,8 @@ impl AuditLog {
             entries: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seq: std::sync::atomic::AtomicU64::new(1),
             sink: std::sync::Mutex::new(None),
+            durable_high: std::sync::atomic::AtomicU64::new(0),
+            durable_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -136,8 +147,15 @@ impl AuditLog {
         &self,
         store: &dyn busbar_api::Store,
     ) -> Result<usize, String> {
+        // BOUNDED read (audit issue): the durable log is never pruned and can dwarf the RAM ring; over
+        // the plugin ABI the full list can exceed the response cap or OOM. Restore only the most-recent
+        // `MAX_AUDIT_ENTRIES` - exactly what the ring keeps - so the read is bounded regardless of how
+        // large the durable history grew. The tail is the NEWEST records, so its max seq IS the durable
+        // max (the seq floor below stays correct), and tamper-evidence is verified over the loaded tail
+        // (internal linkage + the tail head's self-digest). `list_audit_tail` bounds at the source for a
+        // durable backend and falls back to `list_audit` + truncation for an older plugin.
         let records = store
-            .list_audit()
+            .list_audit_tail(MAX_AUDIT_ENTRIES as u64)
             .map_err(|e| format!("audit restore read failed: {}", e.0))?;
         if records.is_empty() {
             return Ok(0);
@@ -151,6 +169,10 @@ impl AuditLog {
         let durable_max = entries.iter().map(|e| e.seq).max().unwrap_or(0);
         self.seq
             .fetch_max(durable_max + 1, std::sync::atomic::Ordering::Relaxed);
+        // Seed the durable-catch-up watermark: the store already holds a contiguous chain through
+        // `durable_max`, so the write-through backfill starts appending at `durable_max + 1`.
+        self.durable_high
+            .fetch_max(durable_max, std::sync::atomic::Ordering::Relaxed);
         // Verify the full restored chain BEFORE trusting it (tamper-evidence across restart): every
         // entry's digest recomputes, and each links to its predecessor. The first restored entry's
         // predecessor may pre-date what we hold, so only its self-digest is checked.
@@ -225,19 +247,64 @@ impl AuditLog {
         };
         // Write-through to the durable sink (best-effort): the store keeps the FULL history so a hard
         // crash loses ~0 entries and pruning the RAM ring never loses durable history. A failure is
-        // logged once and swallowed — an audit-store hiccup must NEVER fail the admin mutation it
-        // records (the RAM ring already holds it, and the periodic snapshot is a second net). No sink
-        // (memory default) ⇒ no-op, ephemeral as before.
+        // logged and swallowed - an audit-store hiccup must NEVER fail the admin mutation it records
+        // (the RAM ring already holds it, and the periodic snapshot is a second net). No sink (memory
+        // default) ⇒ no-op, ephemeral as before.
         let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(store) = sink {
+            self.durable_write_through(store.as_ref(), record.seq);
+        }
+    }
+
+    /// RESILIENT durable write-through with GAP BACKFILL (audit chain-corruption fix). A TRANSIENT
+    /// `append_audit` failure used to be swallowed while the mutation still succeeded, leaving a
+    /// PERMANENT hole in the durable chain (seq N missing, N+1 present with `prev_hash` pointing at N):
+    /// on restart the strict contiguous linkage check in [`restore_from_store`] hits the gap, rejects
+    /// the whole durable chain, and the boot falls back to the stale file snapshot - silently
+    /// discarding all durable audit history. This never self-heals.
+    ///
+    /// Instead of writing only `new_seq`, catch up the durable chain from `durable_high + 1` up TO AND
+    /// INCLUDING `new_seq`, pulling each entry from the authoritative RAM ring. So a write that failed
+    /// on seq N (leaving `durable_high = N-1`) is retried on the NEXT successful mutation: it appends N
+    /// (from the ring) then N+1, keeping the durable chain CONTIGUOUS. Serialized by `durable_lock` so
+    /// concurrent recorders can't interleave their catch-up writes. Best-effort throughout: any append
+    /// error stops the catch-up, logs, and leaves `durable_high` where it is so the next mutation
+    /// retries from the same point (the mutation itself never fails). If the gap is older than the ring
+    /// bound (many consecutive failures), the un-recoverable seq(s) simply stay missing - the ring is
+    /// the only in-process source - but a single transient hiccup can no longer corrupt the chain.
+    fn durable_write_through(&self, store: &dyn busbar_api::Store, new_seq: u64) {
+        let _serial = self.durable_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let start = self.durable_high.load(std::sync::atomic::Ordering::Relaxed) + 1;
+        for seq in start..=new_seq {
+            // Source the record for `seq` from the RAM ring (the authoritative in-process copy).
+            let record = {
+                let q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+                q.iter().find(|e| e.seq == seq).map(to_record)
+            };
+            let Some(record) = record else {
+                // `seq` has already been pruned from the ring (a gap older than the ring bound); it
+                // cannot be backfilled in-process. Skip it and keep going so newer entries still land;
+                // do NOT advance `durable_high` past a hole we couldn't fill.
+                tracing::warn!(
+                    seq,
+                    "durable audit backfill: seq no longer in the RAM ring; cannot catch up this entry"
+                );
+                continue;
+            };
             if let Err(e) = store.append_audit(&record) {
                 tracing::warn!(
-                    seq = record.seq,
+                    seq,
                     action = %record.action,
                     error = %e.0,
-                    "durable audit write-through failed (entry retained in the in-memory ring + state snapshot)"
+                    "durable audit write-through failed (entry retained in the in-memory ring + state \
+                     snapshot; will backfill on the next successful write-through)"
                 );
+                // Stop the catch-up here; `durable_high` stays put so the next mutation retries from
+                // this seq, keeping the durable chain contiguous once the store recovers.
+                return;
             }
+            self.durable_high
+                .fetch_max(seq, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -526,16 +593,27 @@ mod tests {
         );
         assert_eq!(persisted.last().unwrap().seq as usize, total);
 
-        // A restart restores the recent tail into the ring and resumes the sequence past the max.
+        // A restart restores the recent BOUNDED tail into the ring and resumes the sequence past the
+        // max. The restore read is bounded to the ring cap (audit bounded-read fix), so it reports the
+        // count it LOADED - the tail - not the full (possibly huge) durable history.
         let log2 = AuditLog::new();
         let n = log2.restore_from_store(store.as_ref()).expect("restore");
-        assert_eq!(n, total, "restore reports the full durable count");
+        assert_eq!(
+            n, MAX_AUDIT_ENTRIES,
+            "restore loads (and reports) only the bounded tail"
+        );
         assert_eq!(
             log2.list(usize::MAX).len(),
             MAX_AUDIT_ENTRIES,
             "the restored ring is bounded to the recent tail"
         );
         assert!(log2.verify(), "the restored tail's chain verifies");
+        // The durable store still holds the FULL history - only the RESTORE READ is bounded.
+        assert_eq!(
+            store.list_audit().unwrap().len(),
+            total,
+            "the durable store keeps the full history; only the boot read is bounded"
+        );
     }
 
     /// A memory store (the RAM default — trait-default `append_audit`/`list_audit`) makes durable
@@ -588,5 +666,172 @@ mod tests {
             fresh.restore_from_store(store.as_ref()).is_err(),
             "a tampered durable record must fail chain verification on restore"
         );
+    }
+
+    // ── transient-failure durability + bounded restore ───────────────────────────────────────────
+
+    /// A `Store` decorator over a real SQLite store that FAILS `append_audit` for a configured set of
+    /// seqs (simulating a TRANSIENT durable-write hiccup), then behaves normally once those seqs are
+    /// cleared. All reads delegate to the inner store. Used to prove the write-through backfill heals a
+    /// gap rather than leaving the durable chain permanently corrupt.
+    struct FlakyAuditStore {
+        inner: busbar_store_sqlite::SqliteStore,
+        fail_seqs: std::sync::Mutex<std::collections::HashSet<u64>>,
+    }
+
+    impl Store for FlakyAuditStore {
+        fn put_key(&self, key: &busbar_api::VirtualKey) -> busbar_api::StoreResult<()> {
+            self.inner.put_key(key)
+        }
+        fn get_key(&self, id: &str) -> busbar_api::StoreResult<Option<busbar_api::VirtualKey>> {
+            self.inner.get_key(id)
+        }
+        fn list_keys(&self) -> busbar_api::StoreResult<Vec<busbar_api::VirtualKey>> {
+            self.inner.list_keys()
+        }
+        fn delete_key(&self, id: &str) -> busbar_api::StoreResult<()> {
+            self.inner.delete_key(id)
+        }
+        fn get_usage(
+            &self,
+            key_id: &str,
+            window_start: u64,
+        ) -> busbar_api::StoreResult<busbar_api::Usage> {
+            self.inner.get_usage(key_id, window_start)
+        }
+        fn put_usage(
+            &self,
+            key_id: &str,
+            window_start: u64,
+            spend_cents: i64,
+            tokens: u64,
+            requests: u64,
+        ) -> busbar_api::StoreResult<()> {
+            self.inner
+                .put_usage(key_id, window_start, spend_cents, tokens, requests)
+        }
+        fn add_metering(&self, delta: &busbar_api::MeteringDelta) -> busbar_api::StoreResult<()> {
+            self.inner.add_metering(delta)
+        }
+        fn list_metering(
+            &self,
+            bucket: u64,
+        ) -> busbar_api::StoreResult<Vec<busbar_api::MeteringRow>> {
+            self.inner.list_metering(bucket)
+        }
+        fn append_audit(&self, entry: &busbar_api::AuditRecord) -> busbar_api::StoreResult<()> {
+            if self.fail_seqs.lock().unwrap().contains(&entry.seq) {
+                return Err(busbar_api::StoreError(format!(
+                    "injected transient append_audit failure for seq {}",
+                    entry.seq
+                )));
+            }
+            self.inner.append_audit(entry)
+        }
+        fn list_audit(&self) -> busbar_api::StoreResult<Vec<busbar_api::AuditRecord>> {
+            self.inner.list_audit()
+        }
+        fn list_audit_tail(
+            &self,
+            limit: u64,
+        ) -> busbar_api::StoreResult<Vec<busbar_api::AuditRecord>> {
+            self.inner.list_audit_tail(limit)
+        }
+    }
+
+    /// AUDIT CHAIN-CORRUPTION FIX: a TRANSIENT `append_audit` failure must not permanently corrupt the
+    /// durable chain. We fail the write-through for seq 2, so the old behavior left a permanent hole
+    /// (1, _, 3, …) that fails the strict restore linkage check and discards ALL durable history. With
+    /// the backfill, the next successful write-through (seq 3) catches seq 2 up from the RAM ring, so
+    /// the durable chain is CONTIGUOUS and restores intact.
+    #[test]
+    fn transient_append_failure_is_backfilled_and_chain_survives_restart() {
+        let store = std::sync::Arc::new(FlakyAuditStore {
+            inner: busbar_store_sqlite::SqliteStore::open_in_memory().unwrap(),
+            fail_seqs: std::sync::Mutex::new([2u64].into_iter().collect()),
+        });
+        let log = AuditLog::new();
+        log.set_sink(store.clone());
+
+        log.record_by("hook.register", "hook:a", OUTCOME_APPLIED, "admin"); // seq 1 -> durable
+        log.record_by("hook.register", "hook:b", OUTCOME_APPLIED, "admin"); // seq 2 -> FAILS (gap)
+
+        // After the injected failure, the store is missing seq 2 (the transient hiccup).
+        let after_fail = store.list_audit().unwrap();
+        assert_eq!(
+            after_fail.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1],
+            "seq 2's write-through failed, so only seq 1 is durable so far"
+        );
+
+        // Clear the fault (the store recovered), then record seq 3: its write-through BACKFILLS seq 2
+        // from the RAM ring before appending seq 3, healing the gap.
+        store.fail_seqs.lock().unwrap().clear();
+        log.record_by("hook.delete", "hook:a", OUTCOME_APPLIED, "admin"); // seq 3 -> backfills 2, then 3
+
+        let healed = store.list_audit().unwrap();
+        assert_eq!(
+            healed.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "the transient gap is backfilled; the durable chain is contiguous again"
+        );
+
+        // A restart restores the healed durable chain intact (no permanent loss, chain verifies).
+        let store_ro: std::sync::Arc<dyn Store> = store.clone();
+        let log2 = AuditLog::new();
+        let n = log2
+            .restore_from_store(store_ro.as_ref())
+            .expect("the backfilled chain restores without a linkage break");
+        assert_eq!(n, 3, "all three entries restored (nothing discarded)");
+        assert!(log2.verify(), "the restored chain verifies");
+    }
+
+    /// BOUNDED RESTORE READ: with a durable history far larger than the RAM ring, `restore_from_store`
+    /// must read only the bounded tail (`list_audit_tail`), never materialize the whole log. We record
+    /// more than `MAX_AUDIT_ENTRIES`, then restore and assert the ring holds exactly the cap and the
+    /// restored tail verifies - proving the read is bounded (the SQLite `LIMIT` tail query backs it).
+    #[test]
+    fn restore_read_is_bounded_to_the_ring() {
+        let store: Arc<dyn Store> =
+            Arc::new(busbar_store_sqlite::SqliteStore::open_in_memory().unwrap());
+        let log = AuditLog::new();
+        log.set_sink(store.clone());
+        let total = MAX_AUDIT_ENTRIES + 50;
+        for i in 0..total {
+            log.record_by(
+                "hook.register",
+                &format!("hook:{i}"),
+                OUTCOME_APPLIED,
+                "admin",
+            );
+        }
+
+        // The bounded tail read returns exactly the ring bound, oldest-first, chained to the head.
+        let tail = store.list_audit_tail(MAX_AUDIT_ENTRIES as u64).unwrap();
+        assert_eq!(
+            tail.len(),
+            MAX_AUDIT_ENTRIES,
+            "the source-bounded read caps the tail"
+        );
+        assert_eq!(
+            tail.last().unwrap().seq as usize,
+            total,
+            "the tail ends at the newest durable seq"
+        );
+
+        let log2 = AuditLog::new();
+        let n = log2
+            .restore_from_store(store.as_ref())
+            .expect("bounded restore");
+        assert_eq!(
+            n, MAX_AUDIT_ENTRIES,
+            "restore loads only the bounded tail, not the full history"
+        );
+        assert_eq!(
+            log2.list(usize::MAX).len(),
+            MAX_AUDIT_ENTRIES,
+            "the restored ring is bounded"
+        );
+        assert!(log2.verify(), "the restored bounded tail's chain verifies");
     }
 }
