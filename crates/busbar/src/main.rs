@@ -1599,6 +1599,14 @@ pub(crate) fn build_app_from_config(
             .http2_keep_alive_timeout(Duration::from_secs(10))
             .http2_adaptive_window(true)
             .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
+            // Idle keep-alive lifetime — EXPLICIT 300s default, replacing reqwest's implicit 90s:
+            // the warm working set (amortized TCP+TLS handshakes / h2 sessions) survives
+            // inter-burst gaps of a few minutes instead of being reaped and re-paid as cold
+            // handshakes when the next burst lands. Safe at 300s because `tcp_keepalive(60s)`
+            // above actively validates idle sockets (a silently-dropped connection is caught by
+            // the probe, not by a failed request), and bounded by `pool_max_idle_per_host` + OS
+            // reclamation. Operator-tunable via `limits.pool_idle_timeout_secs`.
+            .pool_idle_timeout(Duration::from_secs(cfg.limits.pool_idle_timeout_secs))
             // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
             // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
             // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream

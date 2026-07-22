@@ -1714,6 +1714,18 @@ pub(crate) const REQUEST_BODY_MAX_BYTES_CEIL: usize = 1024 * 1024 * 1024;
 /// their lifetime). Operators with many distinct upstream hosts can lower it; high-RPS single-host
 /// deployments are the ones this default protects.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 1024;
+/// Default idle keep-alive lifetime (seconds) for pooled upstream connections.
+///
+/// EXPLICIT 300s, replacing reqwest's implicit 90s default: under a bursty LLM workload the warm
+/// working set (`pool_max_idle_per_host` sockets, each carrying an amortized TCP+TLS handshake and
+/// — on h2 — an established multiplexed session) should SURVIVE inter-burst gaps of a few minutes
+/// instead of being reaped at 90s and re-paid as cold handshakes on the hot path when the next
+/// burst lands. Safe to hold that long because `tcp_keepalive(60s)` actively validates every idle
+/// socket — a middlebox silently dropping a long-idle connection is detected by the keepalive
+/// probe, not discovered as a spurious request failure — so the longer lifetime adds warm-socket
+/// retention without adding stale-socket risk. Bounded: the OS reclaims idle sockets under
+/// pressure, and `pool_max_idle_per_host` caps the count.
+pub(crate) const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Default inbound concurrency limit. `0` = unlimited (NO layer added).
 ///
 /// Non-zero by default because this is the ONLY global bound on buffered request memory: every
@@ -1762,6 +1774,9 @@ fn default_request_body_max_bytes() -> usize {
 }
 fn default_pool_max_idle_per_host() -> usize {
     DEFAULT_POOL_MAX_IDLE_PER_HOST
+}
+fn default_pool_idle_timeout_secs() -> u64 {
+    DEFAULT_POOL_IDLE_TIMEOUT_SECS
 }
 fn default_max_inbound_concurrent() -> usize {
     DEFAULT_MAX_INBOUND_CONCURRENT
@@ -1822,6 +1837,10 @@ pub(crate) struct LimitsCfg {
     pub(crate) request_body_max_bytes: usize,
     #[serde(default = "default_pool_max_idle_per_host")]
     pub(crate) pool_max_idle_per_host: usize,
+    /// Idle keep-alive lifetime (seconds) for pooled upstream connections — see
+    /// `DEFAULT_POOL_IDLE_TIMEOUT_SECS` for the 300s (vs reqwest's implicit 90s) rationale.
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub(crate) pool_idle_timeout_secs: u64,
     /// Inbound concurrency cap. `0` (default) = unlimited: NO layer is added (a true no-op). When
     /// `>0`, a `tower` global concurrency limit wraps the router as the outermost layer.
     #[serde(default = "default_max_inbound_concurrent")]
@@ -1890,6 +1909,7 @@ impl Default for LimitsCfg {
             upstream_request_timeout_secs: default_upstream_request_timeout_secs(),
             request_body_max_bytes: default_request_body_max_bytes(),
             pool_max_idle_per_host: default_pool_max_idle_per_host(),
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
             max_inbound_concurrent: default_max_inbound_concurrent(),
             hard_down_cooldown_secs: default_hard_down_cooldown_secs(),
             upstream_error_body_max_bytes: default_upstream_error_body_max_bytes(),
@@ -1959,6 +1979,7 @@ pub(crate) struct LimitsResolved {
     pub(crate) upstream_request_timeout_secs: u64,
     pub(crate) request_body_max_bytes: usize,
     pub(crate) pool_max_idle_per_host: usize,
+    pub(crate) pool_idle_timeout_secs: u64,
     pub(crate) max_inbound_concurrent: usize,
     pub(crate) hard_down_cooldown_secs: u64,
     pub(crate) upstream_error_body_max_bytes: usize,
@@ -2003,6 +2024,7 @@ impl LimitsResolved {
             upstream_request_timeout_secs: limits.upstream_request_timeout_secs,
             request_body_max_bytes: limits.request_body_max_bytes,
             pool_max_idle_per_host: limits.pool_max_idle_per_host,
+            pool_idle_timeout_secs: limits.pool_idle_timeout_secs,
             max_inbound_concurrent: limits.max_inbound_concurrent,
             hard_down_cooldown_secs: limits.hard_down_cooldown_secs,
             upstream_error_body_max_bytes: limits.upstream_error_body_max_bytes,

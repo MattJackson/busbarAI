@@ -1473,6 +1473,11 @@ models:
     );
     assert_eq!(l.request_body_max_bytes, DEFAULT_REQUEST_BODY_MAX_BYTES);
     assert_eq!(l.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
+    assert_eq!(l.pool_idle_timeout_secs, DEFAULT_POOL_IDLE_TIMEOUT_SECS);
+    assert_eq!(
+        l.pool_idle_timeout_secs, 300,
+        "default must be the explicit 5-minute warm-set retention (not reqwest's implicit 90s)"
+    );
     assert_eq!(l.max_inbound_concurrent, DEFAULT_MAX_INBOUND_CONCURRENT);
     assert_eq!(
         l.max_inbound_concurrent, 8192,
@@ -1549,6 +1554,7 @@ limits:
   upstream_request_timeout_secs: 42
   max_inbound_concurrent: 256
   request_body_max_bytes: 1048576
+  pool_idle_timeout_secs: 77
 metrics:
   key_gauge_limit: 9
 governance:
@@ -1570,6 +1576,7 @@ routing:
     assert_eq!(l.upstream_request_timeout_secs, 42);
     assert_eq!(l.max_inbound_concurrent, 256);
     assert_eq!(l.request_body_max_bytes, 1_048_576);
+    assert_eq!(l.pool_idle_timeout_secs, 77);
     assert_eq!(l.key_gauge_limit, 9);
     assert_eq!(l.sqlite_busy_timeout_ms, 1234);
     assert_eq!(l.default_probe_interval_secs, 7);

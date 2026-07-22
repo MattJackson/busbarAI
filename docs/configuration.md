@@ -740,7 +740,7 @@ Members without `context_max` set are always eligible for context-length failove
 
 ### `limits`
 
-Optional. Exposes nine operational limits: eight previously hardcoded, plus the new `max_inbound_concurrent`, so operators can tune them without rebuilding. All fields default to their historical values, so omitting this block is a no-op.
+Optional. Exposes ten operational limits — mostly previously hardcoded, plus `max_inbound_concurrent` and `pool_idle_timeout_secs` — so operators can tune them without rebuilding. All fields default to their historical values, so omitting this block is a no-op.
 
 ```yaml
 limits:
@@ -749,6 +749,7 @@ limits:
   upstream_request_timeout_secs: 300
   tls_handshake_timeout_secs: 10
   pool_max_idle_per_host: 64
+  pool_idle_timeout_secs: 300     # 5 min
   hard_down_cooldown_secs: 1800   # 30 min
   upstream_error_body_max_bytes: 262144  # 256 KiB
   max_honored_retry_after_secs: 86400 # 24 h
@@ -762,6 +763,7 @@ limits:
 | `upstream_request_timeout_secs` | integer | `300` | Per-upstream-request wall-clock timeout. Applies to both the connect and the full response. |
 | `tls_handshake_timeout_secs` | integer | `10` | Wall-clock cap on each inbound TLS handshake; prevents slowloris / handshake-flood. Ignored when `tls:` is absent. |
 | `pool_max_idle_per_host` | integer | `64` | HTTP connection pool idle connection limit per upstream host. |
+| `pool_idle_timeout_secs` | integer | `300` | How long an idle keep-alive connection stays in the upstream pool before being closed. The 300s default keeps the warm working set alive across inter-burst gaps (TCP keepalive validates idle sockets in the meantime); lower it to shed idle sockets sooner. |
 | `hard_down_cooldown_secs` | integer | `1800` | Sticky cooldown for `auth`/`billing` breaker dispositions (hard-down). Recovering these lanes requires a successful health probe. |
 | `upstream_error_body_max_bytes` | integer | `262144` | Maximum bytes buffered from a non-2xx upstream response body for error classification. |
 | `max_honored_retry_after_secs` | integer | `86400` | Maximum value honored from an upstream `Retry-After` header (to prevent overflow). |
