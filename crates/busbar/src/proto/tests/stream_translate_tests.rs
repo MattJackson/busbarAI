@@ -1291,6 +1291,91 @@ fn openai_egress_chunk_identity_and_trailing_usage_byte_shape() {
     }
 }
 
+/// FINDING 1 (0-based streaming tool_calls index): an Anthropic backend stream with a leading text
+/// block (block 0) followed by TWO tool_use blocks (blocks 1 and 2) must translate to an OpenAI
+/// ingress stream whose `tool_calls[].index` starts at 0 and increments per tool call — NOT the raw
+/// IR block indices 1 and 2. OpenAI's SDK argument accumulators key on that index; a first tool call
+/// arriving at index 1 lands in a never-flushed slot and is dropped. This exercises the full
+/// anthropic→openai translate path (the framing seam does the remap).
+#[test]
+fn openai_egress_multi_tool_stream_uses_0_based_tool_call_indices() {
+    let mut st = StreamTranslate::new("openai", "anthropic").expect("translator");
+    let mut raw: Vec<u8> = Vec::new();
+    for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\"}}\n\n",
+            // Block 0: leading text (this is what pushes the first tool_use off index 0).
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me look those up.\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            // Block 1: FIRST tool_use — must become tool_calls[].index == 0 on the wire.
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"get_weather\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"NYC\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            // Block 2: SECOND tool_use — must become tool_calls[].index == 1 on the wire.
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"get_time\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tz\\\":\\\"ET\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":9}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw.extend(st.feed(frame.as_bytes()));
+        }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // Collect the (tool name, tool_call_index) pairs from the OPEN chunks (the only ones carrying
+    // `function.name`), plus every tool_call index seen anywhere. The cross-protocol tool-id remap
+    // rewrites the anthropic `toolu_…` id to a native `call_…` shape, so we key on the stable
+    // function NAME rather than the id.
+    let mut opens: Vec<(String, i64)> = Vec::new();
+    let mut all_indices: Vec<i64> = Vec::new();
+    for data in out.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        let Ok(v) = crate::json::parse::<serde_json::Value>(data.as_bytes()) else {
+            continue;
+        };
+        let Some(calls) = v
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for c in calls {
+            let idx = c
+                .get("index")
+                .and_then(|i| i.as_i64())
+                .expect("tool_call index");
+            all_indices.push(idx);
+            if let Some(name) = c.pointer("/function/name").and_then(|n| n.as_str()) {
+                opens.push((name.to_string(), idx));
+            }
+        }
+    }
+
+    // The FIRST tool call (get_weather, raw block index 1) must be tool_calls index 0.
+    let first = opens
+        .iter()
+        .find(|(name, _)| name == "get_weather")
+        .expect("first tool call open chunk");
+    assert_eq!(
+        first.1, 0,
+        "the FIRST tool call must be tool_calls index 0 (raw IR block index 1); got\n{out}"
+    );
+    // The SECOND tool call (get_time, raw block index 2) must be tool_calls index 1.
+    let second = opens
+        .iter()
+        .find(|(name, _)| name == "get_time")
+        .expect("second tool call open chunk");
+    assert_eq!(
+        second.1, 1,
+        "the SECOND tool call must be tool_calls index 1 (raw IR block index 2); got\n{out}"
+    );
+    // No chunk may carry the raw block index 2 — the un-remapped tell that drops the second call.
+    assert!(
+        all_indices.iter().all(|idx| *idx == 0 || *idx == 1),
+        "tool_calls indices must be the 0-based ordinals {{0,1}}, never the raw block indices; got {all_indices:?}\n{out}"
+    );
+}
+
 /// BYTE-IDENTITY GUARD: locks the wire shape of the Bedrock messageStop/metadata two-frame
 /// deferral. This logic now lives behind the writer vtable in `proto::bedrock`'s `StreamFraming`
 /// impl (the protocol-named `bedrock_metadata_emitted`/`bedrock_metadata_pending` fields are gone
@@ -3216,3 +3301,4 @@ fn test_bedrock_and_responses_register() {
         "/model/anthropic.claude-3/converse"
     );
 }
+

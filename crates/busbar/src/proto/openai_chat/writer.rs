@@ -447,10 +447,16 @@ impl ProtocolWriter for OpenAiWriter {
             IrStreamEvent::BlockStart { index, block } => match block {
                 crate::ir::IrBlockMeta::Text => None,
                 crate::ir::IrBlockMeta::ToolUse { id, name } => {
-                    // Use the IR block index (canonical) so parallel tool calls keep distinct,
-                    // stable indices. OpenAI SDKs route streaming argument fragments by
-                    // `tool_calls[n].index`; the BlockStart and its BlockDeltas must carry the
-                    // same value or the reconstructed arguments collide at index 0.
+                    // Stamp the CANONICAL IR block index here so parallel tool calls keep distinct,
+                    // stable keys and each call's BlockStart + BlockDeltas share ONE value. This is
+                    // NOT necessarily 0-based (a source stream can open the first tool_use at a
+                    // non-zero block index, e.g. text at block 0 then tool_use at block 1). OpenAI's
+                    // streaming contract requires `tool_calls[].index` to ENUMERATE the calls from 0,
+                    // so the OpenAI-ingress framing seam (`OpenAiStreamFraming::remap_tool_call_index`)
+                    // remaps each distinct raw index to its 0-based ordinal on egress — keyed on the
+                    // value emitted here. The writer stays 1:1 and stateless; the per-stream ordinal
+                    // assignment lives in the framing, which is the only seam that sees the whole
+                    // stream. (Finding 1.)
                     let delta_obj = serde_json::json!({
                         "tool_calls": [{
                             "index": index,
@@ -485,8 +491,9 @@ impl ProtocolWriter for OpenAiWriter {
                     Some(("".to_string(), chunk_obj))
                 }
                 crate::ir::IrDelta::InputJsonDelta(json) => {
-                    // Mirror the index emitted by the matching BlockStart so argument
-                    // fragments are routed to the correct parallel tool call.
+                    // Mirror the CANONICAL raw index emitted by the matching BlockStart so argument
+                    // fragments route to the correct parallel tool call; the framing seam remaps this
+                    // to the same 0-based ordinal it assigned the BlockStart (Finding 1).
                     let delta_obj = serde_json::json!({
                         "tool_calls": [{
                             "index": index,

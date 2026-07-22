@@ -3546,6 +3546,69 @@ fn test_ir_request() -> crate::ir::IrRequest {
     }
 }
 
+/// FINDING 1 (0-based streaming tool_calls index, unit): `remap_tool_call_index` rewrites the
+/// writer's raw IR-block index onto a 0-based per-call ordinal. First distinct raw index → 0, next →
+/// 1; the same raw index (argument-fragment chunks) replays its ordinal. Guarantees the first tool
+/// call is index 0 even when the source opened it at a non-zero block index.
+#[test]
+fn test_remap_tool_call_index_is_0_based_per_call() {
+    use crate::proto::StreamFraming;
+    let mut framing = OpenAiStreamFraming::default();
+
+    // First tool call opens at RAW block index 1 (text was block 0) → must remap to 0.
+    let mut open1 = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 1, "id": "call_a", "type": "function",
+            "function": {"name": "get_weather", "arguments": ""}
+        }]}, "finish_reason": null}]
+    });
+    framing.on_egress_chunk(&mut open1);
+    assert_eq!(
+        open1.pointer("/choices/0/delta/tool_calls/0/index"),
+        Some(&serde_json::json!(0)),
+        "first tool call (raw index 1) must remap to 0: {open1}"
+    );
+
+    // Its argument fragment (same raw index 1) must replay ordinal 0.
+    let mut arg1 = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 1, "function": {"arguments": "{}"}
+        }]}, "finish_reason": null}]
+    });
+    framing.on_egress_chunk(&mut arg1);
+    assert_eq!(
+        arg1.pointer("/choices/0/delta/tool_calls/0/index"),
+        Some(&serde_json::json!(0)),
+        "argument fragment for the first call must replay ordinal 0: {arg1}"
+    );
+
+    // Second tool call opens at RAW block index 2 → must remap to 1.
+    let mut open2 = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 2, "id": "call_b", "type": "function",
+            "function": {"name": "get_time", "arguments": ""}
+        }]}, "finish_reason": null}]
+    });
+    framing.on_egress_chunk(&mut open2);
+    assert_eq!(
+        open2.pointer("/choices/0/delta/tool_calls/0/index"),
+        Some(&serde_json::json!(1)),
+        "second tool call (raw index 2) must remap to 1: {open2}"
+    );
+
+    // A content-only chunk (no tool_calls) is untouched.
+    let mut content = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]
+    });
+    let before = content.clone();
+    framing.on_egress_chunk(&mut content);
+    assert_eq!(content, before, "a content chunk must be untouched by the tool-index remap");
+}
+
 /// FINDING 4 (n>1 cross-protocol): a request asking for N>1 candidate completions cannot round-trip
 /// through the single-candidate response IR, so the cross-protocol egress seam
 /// (`prepare_for_egress`) must CLAMP `n` to 1 before the egress writer emits it — otherwise the

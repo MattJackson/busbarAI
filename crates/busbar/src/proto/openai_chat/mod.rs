@@ -578,15 +578,27 @@ struct OpenAiStreamFraming {
     /// The stream-start identity, latched from the first `chat.completion.chunk` that carries an `id`
     /// (the opening role chunk) and replayed onto every later chunk. `None` until that first chunk.
     chunk_identity: Option<OpenAiChunkIdentity>,
+    /// Raw IR-block-index → 0-based tool-call ordinal map (Finding 1). The writer stamps the CANONICAL
+    /// IR block index onto `tool_calls[].index`, but a source stream can open a tool_use at a non-zero
+    /// block index (e.g. an Anthropic stream with text at block 0 and the first tool_use at block 1).
+    /// OpenAI's streaming contract requires `tool_calls[].index` to ENUMERATE the tool calls starting
+    /// at 0 and incrementing per tool call — SDK argument accumulators (openai-python/openai-node) key
+    /// their per-call buffers on that index, so a first tool call arriving at index 1 lands in a
+    /// never-flushed slot and the call is dropped. This map assigns each distinct raw index the next
+    /// 0-based ordinal on first sight and replays it for that call's argument-fragment chunks. Keeps
+    /// PARALLEL tool calls distinct (each raw index → its own ordinal) while guaranteeing the first
+    /// call is index 0. Populated lazily; empty on a tool-less stream.
+    tool_call_index: std::collections::BTreeMap<u64, u64>,
 }
 
 impl super::StreamFraming for OpenAiStreamFraming {
     fn on_egress_chunk(&mut self, chunk: &mut serde_json::Value) -> Option<serde_json::Value> {
-        // (a) Identity replay, then (b) the include_usage un-fold — in this order, because the trailing
-        // chunk's identity is read off `chunk` AFTER the identity has been populated onto it, so both
-        // frames share ONE stream identity. The `[DONE]` sentinel is a separate `finish()` literal and
-        // never routed here.
+        // (a) Identity replay, then (b) the 0-based tool-call index remap, then (c) the include_usage
+        // un-fold — in this order, because the trailing chunk's identity is read off `chunk` AFTER the
+        // identity has been populated onto it, so both frames share ONE stream identity. The `[DONE]`
+        // sentinel is a separate `finish()` literal and never routed here.
         self.apply_chunk_identity(chunk);
+        self.remap_tool_call_index(chunk);
         split_openai_trailing_usage(chunk)
     }
 
@@ -598,6 +610,46 @@ impl super::StreamFraming for OpenAiStreamFraming {
 }
 
 impl OpenAiStreamFraming {
+    /// Remap every `choices[].delta.tool_calls[].index` on a `chat.completion.chunk` from the writer's
+    /// CANONICAL raw IR-block index to a 0-based per-tool-call ordinal (Finding 1). The FIRST distinct
+    /// raw index seen becomes ordinal 0, the next distinct raw index becomes 1, and so on; a raw index
+    /// seen again (the tool call's argument-fragment chunks) replays its assigned ordinal. This makes
+    /// the first tool call arrive at `index: 0` even when the source stream opened it at a non-zero
+    /// block index (e.g. text at block 0, first tool_use at block 1), which is what the OpenAI SDKs
+    /// require to route streamed `function.arguments` fragments into the right accumulator. A chunk
+    /// with no tool_calls is a no-op.
+    fn remap_tool_call_index(&mut self, chunk: &mut serde_json::Value) {
+        let Some(obj) = chunk.as_object_mut() else {
+            return;
+        };
+        if obj.get("object").and_then(|v| v.as_str()) != Some(OBJ_CHUNK) {
+            return;
+        }
+        let Some(choices) = obj.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+            return;
+        };
+        for choice in choices {
+            let Some(tool_calls) = choice
+                .get_mut("delta")
+                .and_then(|d| d.get_mut("tool_calls"))
+                .and_then(|tc| tc.as_array_mut())
+            else {
+                continue;
+            };
+            for tc in tool_calls {
+                let Some(raw) = tc.get("index").and_then(|i| i.as_u64()) else {
+                    continue;
+                };
+                // Assign the next ordinal on first sight of this raw index; replay it thereafter.
+                let next = self.tool_call_index.len() as u64;
+                let ordinal = *self.tool_call_index.entry(raw).or_insert(next);
+                if let Some(tc_obj) = tc.as_object_mut() {
+                    tc_obj.insert("index".to_string(), serde_json::json!(ordinal));
+                }
+            }
+        }
+    }
+
     /// Capture-or-replay the OpenAI stream identity on a `chat.completion.chunk` body. On the first
     /// chunk that carries an `id` (the opening role chunk), latch `id`/`created`/`model`; on every
     /// subsequent chunk (which the writer emits WITHOUT them), inject the latched values.
