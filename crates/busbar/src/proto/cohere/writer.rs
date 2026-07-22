@@ -131,11 +131,21 @@ impl ProtocolWriter for CohereWriter {
                 .iter()
                 .any(|b| matches!(b, crate::ir::IrBlock::ToolResult { .. }));
             if msg.role == crate::ir::IrRole::Tool || has_tool_result {
-                // Emit one Cohere tool message per ToolResult block. Any plain text carried
-                // alongside the tool results (and the degenerate case of a Tool turn with NO
-                // ToolResult block at all) must NOT be silently dropped: fold that text in, onto
-                // the first tool message if there is one, otherwise as a standalone tool message,
-                // so the turn is never lossy.
+                // Anthropic/Gemini put tool_results on the USER turn, and such a user message can
+                // bundle a tool_result block TOGETHER WITH genuine new user text (e.g.
+                // `[{tool_result...}, {text:"and now also do X"}]`). Cohere v2 `/chat` has no way to
+                // carry user text on a tool message; a tool message is `role:"tool"` +
+                // `tool_call_id` + `content` (the result), and a user message is its own
+                // `role:"user"` message. So on a USER-role carrier we must NOT fold that text into
+                // the tool `content` (that would mislabel user speech as tool output) nor drop it;
+                // we emit the tool_result(s) as tool message(s) and preserve the user text/other
+                // content as a separate `role:"user"` message below.
+                //
+                // On a genuine TOOL-role carrier there is no user text; any text is degenerate
+                // tool-channel text, so it is still folded onto the first tool result (or emitted
+                // as a standalone tool message) to stay lossless, as before.
+                let carrier_is_user = msg.role == crate::ir::IrRole::User;
+                let fold_text_into_tool = !carrier_is_user;
                 let mut emitted_tool_result = false;
                 for block in &msg.content {
                     if let crate::ir::IrBlock::ToolResult {
@@ -170,8 +180,11 @@ impl ProtocolWriter for CohereWriter {
                                 }
                             })
                             .collect();
-                        // Prepend any message-level text onto the first tool result so it survives.
-                        if !emitted_tool_result {
+                        // Prepend any message-level text onto the first tool result so it survives,
+                        // ONLY on a genuine Tool-role carrier. On a User-role carrier the text is
+                        // genuine user speech and is preserved as its own `user` message below, so it
+                        // must NOT be folded here.
+                        if fold_text_into_tool && !emitted_tool_result {
                             for t in text_blocks.iter().rev() {
                                 text_parts.insert(0, (*t).clone());
                             }
@@ -188,12 +201,26 @@ impl ProtocolWriter for CohereWriter {
                         emitted_tool_result = true;
                     }
                 }
-                // Degenerate Tool turn with text but no ToolResult: emit the text as a tool message
-                // rather than dropping it entirely. Cohere tool message `content` must be a string,
-                // so we stringify the text blocks (join with "") exactly like the ToolResult path —
-                // forwarding `content_val` here would emit a JSON array for multi-block turns,
-                // producing an invalid Cohere request.
-                if !emitted_tool_result && !text_blocks.is_empty() {
+                if carrier_is_user {
+                    // USER-role carrier: preserve any genuine user content (text and/or images)
+                    // that rode alongside the tool_result(s) as its OWN `role:"user"` message, so
+                    // user speech is neither dropped nor mislabeled as tool output. `content_val`
+                    // already carries the correct user-message shape (bare string for a single text
+                    // block, a text/image parts array otherwise); emit it only when there IS such
+                    // content (a pure tool_result user turn has `content_val == None` and adds no
+                    // user message, matching the original round-1 behavior).
+                    if let Some(user_content) = content_val {
+                        let mut user_obj = serde_json::Map::new();
+                        user_obj.insert("role".to_string(), serde_json::json!("user"));
+                        user_obj.insert("content".to_string(), user_content);
+                        messages_arr.push(serde_json::Value::Object(user_obj));
+                    }
+                } else if !emitted_tool_result && !text_blocks.is_empty() {
+                    // Degenerate Tool turn with text but no ToolResult: emit the text as a tool
+                    // message rather than dropping it entirely. Cohere tool message `content` must be
+                    // a string, so we stringify the text blocks (join with "") exactly like the
+                    // ToolResult path: forwarding `content_val` here would emit a JSON array for
+                    // multi-block turns, producing an invalid Cohere request.
                     let mut tool_obj = serde_json::Map::new();
                     tool_obj.insert("role".to_string(), serde_json::json!("tool"));
                     tool_obj.insert(

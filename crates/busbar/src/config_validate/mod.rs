@@ -1239,6 +1239,13 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
                 .to_string(),
         );
     }
+    if limits.request_body_read_timeout_secs < 1 {
+        errors.push(
+            "limits.request_body_read_timeout_secs must be >= 1 (0 would abort every request whose \
+             body is not instantly buffered)"
+                .to_string(),
+        );
+    }
     if limits.webhook_delivery_timeout_secs < 1 {
         errors.push(
             "observability.webhook_delivery_timeout_secs must be >= 1 (0 would abort every webhook \

@@ -265,6 +265,41 @@ fn test_validate_rejects_zero_default_max_tokens() {
     );
 }
 
+/// FIX E [P1] REGRESSION: `limits.request_body_read_timeout_secs` (added in the round-1 security
+/// fix) had NO zero-guard, unlike its siblings `tls_handshake_timeout_secs` /
+/// `webhook_delivery_timeout_secs`. A value of 0 makes the inter-frame body timer
+/// (`Duration::from_secs(0)`) fire immediately, tearing down EVERY request whose body is not
+/// instantly buffered. `validate()` must reject it; a positive value must validate.
+#[test]
+fn test_validate_rejects_zero_request_body_read_timeout() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "myprovider".to_string(),
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
+    );
+    let mut models = HashMap::new();
+    models.insert("mymodel".to_string(), make_model("myprovider", 10));
+
+    let mut cfg = make_root_cfg(providers, models, HashMap::new());
+    cfg.limits.request_body_read_timeout_secs = 0;
+    let errs = validate(&cfg).expect_err("request_body_read_timeout_secs: 0 must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("request_body_read_timeout_secs")),
+        "expected a request_body_read_timeout_secs guard error; got: {errs:?}"
+    );
+
+    // A positive value (the production default) must NOT trip this guard.
+    cfg.limits.request_body_read_timeout_secs = 30;
+    let errs2 = validate(&cfg).err().unwrap_or_default();
+    assert!(
+        !errs2
+            .iter()
+            .any(|e| e.contains("request_body_read_timeout_secs")),
+        "a positive request_body_read_timeout_secs must not error; got: {errs2:?}"
+    );
+}
+
 #[test]
 fn test_validate_rejects_empty_upstream_model() {
     let mut providers = HashMap::new();

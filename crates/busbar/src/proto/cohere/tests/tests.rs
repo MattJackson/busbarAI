@@ -4576,3 +4576,92 @@ fn test_anthropic_user_tool_result_survives_to_cohere() {
         "Cohere tool message must carry the tool-result text"
     );
 }
+
+/// FIX D [P1] REGRESSION: an Anthropic USER-role message can bundle a `tool_result` block TOGETHER
+/// WITH genuine new user text (e.g. `[{tool_result...}, {text:"and now also do X"}]`). The round-1
+/// fix widened tool-result emission to fire on ANY message carrying a ToolResult block, but it then
+/// FOLDED that follow-up user text into the tool-result `content` string AND dropped the user turn:
+/// mislabeling user speech as tool output and losing it. Cohere v2 `/chat` models a tool result as
+/// its own `role:"tool"` message (`tool_call_id` + `content`) and user text as a separate
+/// `role:"user"` message. This asserts the fixed writer emits BOTH: a `tool` message carrying the
+/// result (uncontaminated by the user text) AND a `user` message carrying the follow-up text:
+/// nothing dropped, nothing mislabeled.
+#[test]
+fn test_anthropic_user_tool_result_plus_text_splits_to_tool_and_user() {
+    let anthropic_body = serde_json::json!({
+        "model": "x",
+        "max_tokens": 10,
+        "messages": [
+            {"role": "user", "content": "Weather in Paris?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_01AAA", "name": "get_weather", "input": {"city": "Paris"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01AAA",
+                 "content": [{"type": "text", "text": "18C sunny"}]},
+                {"type": "text", "text": "and now also book me a table"}
+            ]}
+        ]
+    });
+    let ir = AnthropicReader
+        .read_request(&anthropic_body)
+        .expect("anthropic read_request");
+    // Precondition: the IR carries BOTH a ToolResult and genuine Text on the same User-role message.
+    let bundled = ir
+        .messages
+        .iter()
+        .find(|m| {
+            m.role == crate::ir::IrRole::User
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, crate::ir::IrBlock::ToolResult { .. }))
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, crate::ir::IrBlock::Text { .. }))
+        })
+        .expect("IR must carry a User message bundling a ToolResult AND follow-up Text");
+    assert_eq!(bundled.role, crate::ir::IrRole::User);
+
+    let writer = CohereWriter;
+    let cohere = writer.write_request(&ir);
+    let msgs = cohere.get("messages").unwrap().as_array().unwrap();
+
+    // The tool result is its own `tool` message, carrying ONLY the result; the user text must NOT
+    // have been folded into it.
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("Cohere output MUST include a tool message for the tool_result");
+    assert_eq!(
+        tool_msg.get("tool_call_id").and_then(|c| c.as_str()),
+        Some("toolu_01AAA"),
+        "the tool message must carry the originating tool_call_id"
+    );
+    assert_eq!(
+        tool_msg.get("content").and_then(|c| c.as_str()),
+        Some("18C sunny"),
+        "the tool message content must be ONLY the tool result, not the folded user text"
+    );
+
+    // The follow-up user text survives as its OWN `user` message; not dropped, not mislabeled.
+    let follow_up = msgs
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .find(|m| m.get("content").and_then(|c| c.as_str()) == Some("and now also book me a table"))
+        .expect("the follow-up user text MUST survive as its own Cohere user message");
+    assert_eq!(
+        follow_up.get("content").and_then(|c| c.as_str()),
+        Some("and now also book me a table")
+    );
+
+    // And the user text must appear NOWHERE inside any tool message (no mislabeling anywhere).
+    for m in msgs {
+        if m.get("role").and_then(|r| r.as_str()) == Some("tool") {
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            assert!(
+                !content.contains("book me a table"),
+                "user text leaked into a tool message content: {content}"
+            );
+        }
+    }
+}

@@ -35,8 +35,12 @@ use std::time::Duration;
 /// Read a webhook response body with the 64 KiB cap, aborting (rather than allocating) past it.
 async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>, super::PolicyError> {
     let mut buf: Vec<u8> = Vec::new();
+    // `without_url()`: a reqwest body-read error carries the request URL (WITH any operator-embedded
+    // `user:pass@` userinfo) in its own `Display`. This error is boxed into `PolicyError` and later
+    // logged verbatim (`error = %e`) by the seam's on_error fallback, so strip the URL before boxing
+    // The credential must never reach the log. Parity with the `send()` decide-path hardening.
     while let Some(chunk) = resp.chunk().await.map_err(|e| -> super::PolicyError {
-        format!("webhook response read failed: {e}").into()
+        format!("webhook response read failed: {}", e.without_url()).into()
     })? {
         if buf.len() + chunk.len() > super::wire::MAX_HOOK_REPLY_BYTES {
             return Err(format!(
@@ -185,7 +189,13 @@ impl RoutingPolicy for WebhookPolicy {
             .timeout(budget)
             .send()
             .await
-            .map_err(|e| -> super::PolicyError { format!("configure POST failed: {e}").into() })?;
+            // `without_url()`: the reqwest send error carries the sidecar URL (with any
+            // operator-embedded `user:pass@` userinfo) in its `Display`; this error is boxed into
+            // `PolicyError` and can reach operator logs, so strip the URL before boxing. Parity with
+            // the `send()` decide-path hardening.
+            .map_err(|e| -> super::PolicyError {
+                format!("configure POST failed: {}", e.without_url()).into()
+            })?;
         if !resp.status().is_success() {
             return Err(format!("configure rejected: HTTP {}", resp.status()).into());
         }
@@ -406,6 +416,69 @@ mod tests {
         assert!(
             !shown.contains("hunter2") && !shown.contains("svc:hunter2"),
             "routing-webhook PolicyError leaked embedded userinfo: {shown}"
+        );
+    }
+
+    /// FIX F [P2, security] REGRESSION: the round-1 userinfo-mask fix hardened only the `decide()`
+    /// (`send()`) path. The `configure()` path still `format!`ed a raw reqwest send error, which
+    /// carries the sidecar URL WITH any operator-embedded `user:pass@` userinfo in its `Display`,
+    /// into a `PolicyError` that can reach operator logs. Point `configure` at an unroutable userinfo
+    /// URL, force a transport error, and assert the resulting error carries no credential.
+    #[tokio::test]
+    async fn configure_transport_error_does_not_leak_url_userinfo() {
+        // RFC 5737 TEST-NET-1 host is unroutable, so the POST fails fast with a transport error.
+        let url = "https://svc:hunter2@192.0.2.1/route".to_string();
+        let policy = WebhookPolicy::new(url, client());
+        let settings = serde_json::Map::new();
+        let err = policy
+            .configure("myhook", &settings, 1, Duration::from_millis(200))
+            .await
+            .expect_err("unroutable sidecar must error");
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("svc:hunter2"),
+            "configure() PolicyError leaked embedded userinfo: {shown}"
+        );
+    }
+
+    /// FIX F [P2, security] REGRESSION: the response-body read path (`read_capped`, via `resp.chunk()`)
+    /// also `format!`ed a raw reqwest error that carries the request URL (with any embedded userinfo).
+    /// Drive a body-read error by advertising a `Content-Length` larger than the bytes actually sent,
+    /// then closing the connection, so `chunk()` surfaces an incomplete-body error whose Display carries
+    /// the URL. Assert the resulting `PolicyError` masks the credential.
+    #[tokio::test]
+    async fn response_body_read_error_does_not_leak_url_userinfo() {
+        use tokio::io::AsyncWriteExt;
+        // Raw TCP mock: send valid response headers claiming a 100-byte body, then only 3 bytes and
+        // close. reqwest's body reader errors mid-stream (incomplete message).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Read and discard the request (best-effort) so the client finishes sending.
+                let mut throwaway = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut throwaway).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\nabc",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+                // Drop the socket -> connection closes with the body short of Content-Length.
+            }
+        });
+        // Embed userinfo in the URL so a leaked reqwest error Display would expose it.
+        let url = format!("http://svc:hunter2@{addr}/route");
+        let policy = WebhookPolicy::new(url, client());
+        let cands = [cand(0)];
+        let err = policy
+            .decide(&req(), &cands, &ctx(), Duration::from_secs(2))
+            .await
+            .expect_err("a truncated response body must surface as Err");
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("svc:hunter2"),
+            "response-body read PolicyError leaked embedded userinfo: {shown}"
         );
     }
 
