@@ -407,10 +407,12 @@ impl Store for PostgresStore {
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         tx.execute(
+            // `$3::bigint` casts anchor the parameter type inside GREATEST (whose bare `0` would
+            // otherwise make Postgres infer int4 and fail to serialize the i64 binding).
             "INSERT INTO usage_windows (bucket_id, window_start, requests)
-             VALUES ($1,$2,GREATEST(0,$3))
+             VALUES ($1,$2,GREATEST(0,$3::bigint))
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
-                requests = GREATEST(0, usage_windows.requests + $3)",
+                requests = GREATEST(0, usage_windows.requests + $3::bigint)",
             &[&bucket_id, &ws, &delta.requests],
         )
         .store()?;
@@ -419,12 +421,12 @@ impl Store for PostgresStore {
                 "INSERT INTO usage_ledger
                     (bucket_id, window_start, model,
                      tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
-                 VALUES ($1,$2,$3,GREATEST(0,$4),GREATEST(0,$5),GREATEST(0,$6),GREATEST(0,$7))
+                 VALUES ($1,$2,$3,GREATEST(0,$4::bigint),GREATEST(0,$5::bigint),GREATEST(0,$6::bigint),GREATEST(0,$7::bigint))
                  ON CONFLICT (bucket_id, window_start, model) DO UPDATE SET
-                    tokens_input       = GREATEST(0, usage_ledger.tokens_input + $4),
-                    tokens_output      = GREATEST(0, usage_ledger.tokens_output + $5),
-                    tokens_cache_read  = GREATEST(0, usage_ledger.tokens_cache_read + $6),
-                    tokens_cache_write = GREATEST(0, usage_ledger.tokens_cache_write + $7)",
+                    tokens_input       = GREATEST(0, usage_ledger.tokens_input + $4::bigint),
+                    tokens_output      = GREATEST(0, usage_ledger.tokens_output + $5::bigint),
+                    tokens_cache_read  = GREATEST(0, usage_ledger.tokens_cache_read + $6::bigint),
+                    tokens_cache_write = GREATEST(0, usage_ledger.tokens_cache_write + $7::bigint)",
                 &[
                     &bucket_id,
                     &ws,

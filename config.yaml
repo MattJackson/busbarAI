@@ -265,8 +265,15 @@ pools:
 # for persistence; each durable backend is a signed plugin tarball (see the `plugins:` block below).
 # governance:
 #   admin_token: "$BUSBAR_ADMIN_TOKEN"        # ACTIVATES enforcement; guards /api/v1/admin/keys; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
-#   price_per_request_cents: 1                # flat per-request budget charge
-#   price_per_1k_tokens_cents: 50             # plus per-1000-token charge (from response usage)
+#   price_per_request_cents: 1                # flat per-request budget charge (abstract minor units)
+#   rate_card:                                # per-model token pricing, MICRO-units per token (abstract
+#     gpt-5-mini:    { input_utok: 0.15, output_utok: 0.6 }        # cost units - busbar attaches no
+#     claude-sonnet: { input_utok: 3.0, output_utok: 15.0 }        # currency). ALL-OR-NOTHING: absent =
+#                                             # tokens price 0; present = EVERY configured model needs an
+#                                             # entry (--validate prints a paste-ready stub otherwise).
+#   budget_groups:                            # nestable enforced caps ABOVE the per-key budget; keys bind
+#     acme:   { max_budget_cents: 10000000, budget_period: monthly }         # via the mint field
+#     growth: { max_budget_cents: 2000000,  budget_period: monthly, parent: acme }  # `budget_group`
 #   # store: memory                          # default (ephemeral RAM); omit for the default
 #   # For persistence, pick a durable store PLUGIN (requires plugins.enabled below) by ALIAS or
 #   # CANONICAL NAME, plus its db_path target:
