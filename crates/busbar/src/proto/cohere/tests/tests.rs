@@ -4555,7 +4555,8 @@ fn test_anthropic_user_tool_result_survives_to_cohere() {
         "Anthropic carries tool_result on a User-role message in the IR"
     );
 
-    let cohere = CohereWriter.write_request(&ir);
+    let writer = CohereWriter;
+    let cohere = writer.write_request(&ir);
     let msgs = cohere.get("messages").unwrap().as_array().unwrap();
     let tool_msg = msgs
         .iter()
