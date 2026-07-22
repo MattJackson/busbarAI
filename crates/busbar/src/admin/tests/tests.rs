@@ -5193,3 +5193,92 @@ async fn test_admin_v1_plugin_install_rejections() {
     let _ = std::fs::remove_dir_all(&dir);
     handle.abort();
 }
+
+/// The 1.5.0 mint surface: `budget_group` + `labels` round-trip through create/list, a mint naming
+/// a MISSING budget_group is a 400 that names the offender (fail-closed at the mint boundary), and
+/// the key-usage read derives spend at the current cost model.
+#[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
+async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    // An App whose cost model KNOWS the "growth" group; "ghost" stays unconfigured.
+    let cost = {
+        #[allow(clippy::field_reassign_with_default)]
+        let mut gcfg = crate::config::GovernanceCfg::default();
+        gcfg.budget_groups = std::collections::BTreeMap::from([(
+            "growth".to_string(),
+            crate::config::BudgetGroupCfg {
+                max_budget_cents: 1_000_000,
+                budget_period: "monthly".to_string(),
+                parent: None,
+            },
+        )]);
+        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default())
+    };
+    let app = TestApp::new().governance(gov).cost(cost).build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    // A mint naming a MISSING group is a 400 naming the offender.
+    let resp = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "k", "budget_group": "ghost"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("budget_group 'ghost' does not exist"),
+        "the 400 names the missing group: {body}"
+    );
+
+    // A mint binding a CONFIGURED group with labels succeeds and echoes both.
+    let resp = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({
+            "name": "grouped",
+            "budget_group": "growth",
+            "labels": {"team": "growth", "env": "prod"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "configured group mints");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["budget_group"], "growth");
+    assert_eq!(body["labels"]["env"], "prod");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    // The list surface carries both fields too (metadata round-trip, never the secret).
+    let list: serde_json::Value = client
+        .get(&url)
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == id.as_str())
+        .expect("minted key listed");
+    assert_eq!(row["budget_group"], "growth");
+    assert_eq!(row["labels"]["team"], "growth");
+
+    handle.abort();
+}

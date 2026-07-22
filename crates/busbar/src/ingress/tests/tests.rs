@@ -5651,3 +5651,172 @@ async fn test_forward_resolved_by_model_uses_lane_default_breaker_cell() {
     handle.abort();
     server.shutdown().await;
 }
+
+// ─── Budget-group chain rejections at the ingress boundary (1.5.0 cost model) ────────────────────
+
+/// Governance-enabled App whose key binds to a ZERO-cap budget group ("finance") while the key
+/// itself is uncapped - the CHAIN is what blocks. The 429 body must NAME the exhausted group.
+#[allow(clippy::field_reassign_with_default)]
+fn governed_app_group_blocked() -> (Arc<App>, crate::governance::VirtualKey) {
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let mut gcfg = crate::config::GovernanceCfg::default();
+    gcfg.price_per_request_cents = 30;
+    gcfg.budget_groups = std::collections::BTreeMap::from([(
+        "finance".to_string(),
+        crate::config::BudgetGroupCfg {
+            max_budget_cents: 0,
+            budget_period: "total".to_string(),
+            parent: None,
+        },
+    )]);
+    let cost =
+        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+    let (key, _secret) = gov
+        .create_key(
+            NewKeySpec {
+                name: "grouped".to_string(),
+                allowed_pools: vec![],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                budget_group: Some("finance".to_string()),
+                labels: Default::default(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+    let mut app = minimal_app();
+    let inner = Arc::get_mut(&mut app).expect("sole owner");
+    inner.governance = Some(gov);
+    inner.cost = std::sync::Arc::new(cost);
+    (app, key)
+}
+
+/// A GROUP-blocked admission is a 429 `insufficient_quota` whose body NAMES the exhausted budget
+/// group (cost-model spec: the 429 says WHICH bucket blocked) - while still never leaking the key
+/// id or the internal governance vocabulary. Nothing is charged on the rejected attempt.
+#[tokio::test]
+async fn test_group_blocked_429_names_the_budget_group() {
+    crate::metrics::init();
+    let (app, key) = governed_app_group_blocked();
+    let gov = crate::governance::GovCtx {
+        key: Some(std::sync::Arc::new(key.clone())),
+    };
+    let at = crate::store::now();
+    let resp = budget_check(&app, &gov, "openai", at)
+        .expect_err("a zero-cap group blocks the whole chain");
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = body_string(*resp).await;
+    assert!(
+        body.contains("insufficient_quota"),
+        "canonical quota error type: {body}"
+    );
+    assert!(
+        body.contains("budget group 'finance' exhausted"),
+        "the 429 must NAME the blocking bucket: {body}"
+    );
+    assert!(!body.contains(&key.id), "never the key id: {body}");
+    // All-or-nothing: the rejected attempt charged nothing anywhere in the chain.
+    let g = app.governance.as_ref().unwrap();
+    assert_eq!(
+        g.usage_for(&app.cost, &key.id, at)
+            .unwrap()
+            .unwrap()
+            .requests,
+        0
+    );
+}
+
+/// A key naming a budget_group MISSING from this node's config FAILS CLOSED at admission (429,
+/// bucket named as unconfigured) - never a silent uncapped admit.
+#[tokio::test]
+async fn test_missing_group_fails_closed_at_ingress() {
+    crate::metrics::init();
+    let (app, key) = governed_app_group_blocked();
+    let mut orphan = key.clone();
+    orphan.budget_group = Some("ghost".to_string());
+    let gov = crate::governance::GovCtx {
+        key: Some(std::sync::Arc::new(orphan)),
+    };
+    let resp = budget_check(&app, &gov, "openai", crate::store::now())
+        .expect_err("a missing group must fail closed");
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = body_string(*resp).await;
+    assert!(
+        body.contains("budget group 'ghost'"),
+        "the missing bucket is named for the operator-facing fix: {body}"
+    );
+}
+
+/// ALL-OR-NOTHING pricing at the ingress: with a rate card PRESENT, a governed request for an
+/// arbitrary passthrough model (no configured pool / by-model lane, no rate entry) is rejected
+/// pre-forward with a clear "no configured rate" error; configured lanes are unaffected.
+#[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
+async fn test_unpriced_passthrough_model_rejected_when_rate_card_present() {
+    crate::metrics::init();
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let (key, _secret) = gov
+        .create_key(
+            NewKeySpec {
+                name: "k".to_string(),
+                allowed_pools: vec![],
+                max_budget_cents: None,
+                budget_period: "total".to_string(),
+                rpm_limit: None,
+                tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+    let mut gcfg = crate::config::GovernanceCfg::default();
+    gcfg.rate_card = Some(std::collections::BTreeMap::from([(
+        "m".to_string(),
+        crate::config::RateEntryCfg::default(),
+    )]));
+    let cost =
+        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+    let mut app = minimal_app();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.governance = Some(gov);
+        inner.cost = std::sync::Arc::new(cost);
+    }
+    let gov_ctx = crate::governance::GovCtx {
+        key: Some(std::sync::Arc::new(key.clone())),
+    };
+    // An arbitrary passthrough model string (not a pool, not a by-model lane, not priced).
+    let resp = governance_guard(
+        &app,
+        &gov_ctx,
+        "openai",
+        "mystery-model",
+        std::time::Instant::now(),
+        crate::store::now(),
+    )
+    .expect_err("an unpriced passthrough model must be rejected pre-forward");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(*resp).await;
+    assert!(
+        body.contains("no configured rate for model 'mystery-model'"),
+        "the rejection names the unpriced model: {body}"
+    );
+    // The configured by-model lane ("m" in minimal_app) still passes the pricing guard (it is
+    // priced by the card), so the guard admits and charges it.
+    let ok = governance_guard(
+        &app,
+        &gov_ctx,
+        "openai",
+        "m",
+        std::time::Instant::now(),
+        crate::store::now(),
+    );
+    assert!(ok.is_ok(), "a priced configured lane admits");
+}
