@@ -1151,12 +1151,14 @@ pub(crate) fn validate_with_unset(
         }
 
         // `upstream_credentials: passthrough` with a NON-EMPTY configured api_key on a provider is a
-        // credential-leak risk: proxy engine selects the upstream key as `caller_token.unwrap_or("")`,
-        // so an UNAUTHENTICATED caller forwards an EMPTY credential (the provider 401/403s the
-        // caller), NOT busbar's configured lane key — but a non-empty configured key means busbar's
-        // OWN secret gets substituted upstream on the caller's behalf. WARN (not hard-reject): a
-        // legit Bedrock-ingress passthrough provider signs per-request via SigV4 and resolves EMPTY
-        // here, and a deliberate static-key fallback provider is valid too.
+        // configuration foot-gun: the proxy engine selects the upstream key as
+        // `caller_token.unwrap_or("")` (see `proxy::engine::walk`, LOW #15), so under passthrough the
+        // configured `api_key` is NEVER forwarded — a caller presents their OWN token, or (if absent)
+        // an EMPTY credential the provider 401/403s. The configured key is therefore INERT dead config
+        // whose presence suggests the operator expected static-key gating (`upstream_credentials: own`)
+        // but wired passthrough. WARN (not hard-reject): a legit Bedrock-ingress passthrough provider
+        // signs per-request via SigV4 and needs no static key, so a set-but-unused env is not always a
+        // mistake.
         if auth.upstream_credentials == crate::auth::UpstreamCreds::Passthrough {
             for (provider_name, provider_cfg) in &cfg.providers {
                 let resolved_key = std::env::var(&provider_cfg.api_key_env).unwrap_or_default();
@@ -1165,13 +1167,14 @@ pub(crate) fn validate_with_unset(
                         provider = %provider_name,
                         api_key_env = %provider_cfg.api_key_env,
                         "upstream_credentials: passthrough with a NON-EMPTY configured api_key for \
-                         this provider is a credential-leak risk: an UNAUTHENTICATED caller has \
-                         busbar's OWN configured lane key substituted upstream \
-                         (caller_token.unwrap_or(lane.api_key)), forwarding your secret on the \
-                         caller's behalf. Passthrough should forward the CALLER credential, never a \
-                         configured one. Unset the environment variable named by api_key_env \
-                         (Bedrock-ingress passthrough signs per-request via SigV4 and needs no static \
-                         key), or use upstream_credentials: own to gate callers with an auth chain."
+                         this provider: under passthrough the upstream key is \
+                         caller_token.unwrap_or(\"\"), so the configured api_key is NEVER forwarded \
+                         (a caller presents their own token, or an unauthenticated caller forwards an \
+                         empty credential the provider rejects). The configured key is inert dead \
+                         config. If you intended static-key gating, use upstream_credentials: own \
+                         (plus an auth chain); otherwise unset the environment variable named by \
+                         api_key_env (Bedrock-ingress passthrough signs per-request via SigV4 and \
+                         needs no static key)."
                     );
                 }
             }

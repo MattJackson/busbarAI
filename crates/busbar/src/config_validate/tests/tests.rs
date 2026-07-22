@@ -1772,14 +1772,14 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
 
 #[test]
 fn test_validate_passthrough_warns_on_nonempty_configured_key() {
-    // Regression (LOW #10): in passthrough mode proxy engine selects the upstream key as
-    // `caller_token.unwrap_or(lane.api_key)`, so an UNAUTHENTICATED caller (no token) gets
-    // busbar's OWN configured lane key (resolved from `api_key_env`) substituted upstream — a
-    // credential leak. A passthrough deployment should forward the CALLER credential, never a
-    // configured one. validate() must emit a prominent boot WARNING for any provider whose
-    // `api_key_env` resolves to a NON-EMPTY value while auth.mode=passthrough. A legit Bedrock-
-    // ingress passthrough provider authenticates per-request via SigV4 and resolves an EMPTY key,
-    // so it must NOT warn — that is the second half of this test.
+    // Regression (LOW #10): in passthrough mode the proxy engine selects the upstream key as
+    // `caller_token.unwrap_or("")` (NOT `lane.api_key` — that was hardened per LOW #15), so under
+    // passthrough the configured `api_key` is NEVER forwarded: it is inert dead config. Its presence
+    // means the operator likely wanted static-key gating (`upstream_credentials: own`) but wired
+    // passthrough. validate() must emit a prominent boot WARNING for any provider whose `api_key_env`
+    // resolves to a NON-EMPTY value while auth.mode=passthrough. A legit Bedrock-ingress passthrough
+    // provider authenticates per-request via SigV4 and resolves an EMPTY key, so it must NOT warn —
+    // that is the second half of this test.
     use tracing_subscriber::layer::SubscriberExt as _;
 
     // Unique env-var names so parallel tests cannot clobber the values we set/read here.
@@ -1822,8 +1822,8 @@ fn test_validate_passthrough_warns_on_nonempty_configured_key() {
     let msgs = cap.0.lock().unwrap();
     assert!(
         msgs.iter()
-            .any(|m| m.contains("credential-leak") && m.contains("leaky")),
-        "expected a passthrough credential-leak warning naming the 'leaky' provider; got: {msgs:?}"
+            .any(|m| m.contains("inert dead config") && m.contains("leaky")),
+        "expected a passthrough inert-configured-key warning naming the 'leaky' provider; got: {msgs:?}"
     );
     // The Bedrock-style provider with an EMPTY resolved key must NOT trip the warning — otherwise
     // a legit SigV4 passthrough deployment is spammed with a false-positive credential-leak alert.

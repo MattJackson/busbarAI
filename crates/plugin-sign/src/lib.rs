@@ -219,22 +219,27 @@ pub fn evaluate(
     manifest: Option<&Manifest>,
     policy: &TrustPolicy,
 ) -> Result<Verdict, Rejected> {
-    let untrusted_reason: Option<String> = match manifest {
-        None => Some("artifact is unsigned (no manifest)".to_string()),
+    // `Ok(None)` from this match is the ONLY path to a trusted verdict, and it carries the VERIFIED
+    // manifest — so the trusted publisher is always `m.publisher`, never an empty string. (The prior
+    // shape re-`map`ped `manifest` with an `unwrap_or_default()` fallback, whose `None` arm was dead:
+    // a `None` manifest yields `Some(reason)` here and can never reach the trusted verdict. Carrying
+    // the verified manifest through removes that misleading empty-publisher-Trusted dead branch.)
+    let trusted_or_reason: Result<&Manifest, String> = match manifest {
+        None => Err("artifact is unsigned (no manifest)".to_string()),
         Some(m) => match policy.publishers.get(&m.publisher) {
-            None => Some(format!(
-                "publisher '{}' is not in the allowlist",
-                m.publisher
-            )),
-            Some(key) => signature_ok(m, bytes, key).err(),
+            None => Err(format!("publisher '{}' is not in the allowlist", m.publisher)),
+            Some(key) => match signature_ok(m, bytes, key) {
+                Ok(()) => Ok(m),
+                Err(reason) => Err(reason),
+            },
         },
     };
 
-    match untrusted_reason {
-        None => Ok(Verdict::Trusted {
-            publisher: manifest.map(|m| m.publisher.clone()).unwrap_or_default(),
+    match trusted_or_reason {
+        Ok(m) => Ok(Verdict::Trusted {
+            publisher: m.publisher.clone(),
         }),
-        Some(reason) => match policy.on_untrusted {
+        Err(reason) => match policy.on_untrusted {
             OnUntrusted::Halt => Err(Rejected(reason)),
             action => Ok(Verdict::Allowed { reason, action }),
         },
