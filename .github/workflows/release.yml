@@ -113,8 +113,19 @@ jobs:
 
       # Builds --release for the target (installing the toolchain + cross-linker as
       # needed), tarballs the `busbar` binary, and uploads it to the Release for this tag.
+      #
+      # BUSBAR_RELEASE_PUBKEY (repository VARIABLE, not a secret — it is the PUBLIC half) is
+      # embedded into the binary at build time (plugin-sign's option_env!): busbar-signed
+      # plugins then verify as first-party with zero configuration. The matching PRIVATE half
+      # is the BUSBAR_SIGN_KEY secret used by the store-plugins job below.
+      # TODO(release-keys): the release orchestrator generates the real keypair separately
+      # (`busbar-plugin-pack keygen`) and provisions BOTH: the variable (public) + the secret
+      # (private). Until provisioned, release binaries embed no key and first-party plugin
+      # verification is unavailable (plugins still load via the third-party/unsigned paths).
       - name: Build and upload busbar
         uses: taiki-e/upload-rust-binary-action@v1
+        env:
+          BUSBAR_RELEASE_PUBKEY: ${{ vars.BUSBAR_RELEASE_PUBKEY }}
         with:
           bin: busbar
           target: ${{ matrix.target }}
@@ -131,3 +142,95 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: "busbar-${{ matrix.target }}.*"
+
+  # ── Store-plugin tarballs — one signed .tar.gz per (plugin, target) ──────────────────────────────
+  # Each first-party store backend (sqlite / postgres / redis) ships as a signed plugin tarball
+  # {cdylib + manifest.json} that busbar's plugin subsystem verifies and loads (plugins.enabled +
+  # governance.store). The manifest is signed with the busbar release PRIVATE key (BUSBAR_SIGN_KEY
+  # secret); the matching PUBLIC key is embedded into the busbar binary above (BUSBAR_RELEASE_PUBKEY
+  # repository variable), so these tarballs verify as FIRST-PARTY with zero operator configuration.
+  #
+  # TODO(release-keys): the release orchestrator generates the keypair separately
+  # (`busbar-plugin-pack keygen`) and provisions the BUSBAR_SIGN_KEY secret + the
+  # BUSBAR_RELEASE_PUBKEY variable. Until the secret exists, this job packages UNSIGNED tarballs
+  # (loadable only under plugins.trust.allow_unsigned) so a release is never blocked on key setup —
+  # the gh step prints which mode it ran in.
+  store-plugins:
+    needs: create-release
+    name: store-plugins (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            libext: so
+            libprefix: lib
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            libext: so
+            libprefix: lib
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            libext: dll
+            libprefix: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the store plugin cdylibs + the packer
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p busbar-store-sqlite-plugin -p busbar-store-postgres-plugin -p busbar-store-redis-plugin \
+            -p busbar-plugin-pack
+        shell: bash
+      - name: Package + sign the plugin tarballs
+        env:
+          BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          outdir="plugin-dist"; mkdir -p "$outdir"
+          pack="target/${target}/release/busbar-plugin-pack"
+          [ -x "$pack" ] || pack="target/${target}/release/busbar-plugin-pack.exe"
+          unsigned_flag=""
+          if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
+            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging UNSIGNED plugin tarballs (loadable only under plugins.trust.allow_unsigned). See the TODO(release-keys) seam."
+            unsigned_flag="--allow-unsigned"
+          fi
+          for store in sqlite postgres redis; do
+            lib="target/${target}/release/${{ matrix.libprefix }}busbar_store_${store}_plugin.${{ matrix.libext }}"
+            "$pack" pack \
+              --lib "$lib" \
+              --name "busbar-store-${store}" --alias "${store}" --kind store \
+              --version "$ver" --publisher busbar \
+              --description "busbar ${store} governance store plugin" \
+              --license Apache-2.0 \
+              --out "${outdir}/busbar-store-${store}-${ver}-${target}.tar.gz" \
+              $unsigned_flag
+          done
+          ls -l "$outdir"
+        shell: bash
+      - name: Attach plugin tarballs to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" plugin-dist/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
+        shell: bash
+      # Build-provenance attestation for every plugin tarball, same as the binary archives: a
+      # swapped artifact on the Release page fails `gh attestation verify`.
+      - name: Attest plugin build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "plugin-dist/*.tar.gz"

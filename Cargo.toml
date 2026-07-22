@@ -7,6 +7,7 @@ members = [
     "crates/plugin-sdk",
     "crates/plugin-loader",
     "crates/plugin-sign",
+    "crates/plugin-pack",
     "crates/auth-tokens",
     "crates/auth-admin-tokens",
     "crates/hooks-ranking",

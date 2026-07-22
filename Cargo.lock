@@ -320,6 +320,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-plugin-pack"
+version = "1.5.0"
+dependencies = [
+ "busbar-plugin-loader",
+ "busbar-plugin-sign",
+ "getrandom 0.3.4",
+ "hex",
+]
+
+[[package]]
 name = "busbar-plugin-sdk"
 version = "1.5.0"
 dependencies = [

@@ -1,0 +1,20 @@
+[package]
+name = "busbar-plugin-pack"
+version = "1.5.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "Packaging + signing CLI for busbar plugins: builds the signed manifest over a cdylib and packages the {cdylib + manifest.json} .tar.gz the engine loads. Used by the release pipeline (BUSBAR_SIGN_KEY) and by third-party plugin authors."
+license = "Apache-2.0"
+
+[[bin]]
+name = "busbar-plugin-pack"
+path = "src/main.rs"
+
+[dependencies]
+busbar-plugin-sign = { path = "../plugin-sign" }
+busbar-plugin-loader = { path = "../plugin-loader" }
+hex = "0.4"
+# Keypair generation (`keygen`) draws its ed25519 seed from the OS RNG. The engine-facing
+# plugin-sign crate stays RNG-free on purpose; the RNG lives here, in the tooling.
+getrandom = "0.3"
