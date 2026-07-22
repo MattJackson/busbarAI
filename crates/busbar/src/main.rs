@@ -1627,6 +1627,17 @@ pub(crate) fn build_app_from_config(
         // h2c when set — never enable it against a mixed/h1 fleet. Read once at client-build time.
         let h2_prior_knowledge = std::env::var_os("BUSBAR_UPSTREAM_H2_PRIOR_KNOWLEDGE")
             .is_some_and(|v| v != "0" && !v.is_empty());
+        // Opt-out ESCAPE HATCH for the ALPN h2 default: `BUSBAR_UPSTREAM_HTTP1_ONLY=1` pins the
+        // shared client to HTTP/1.1 (reqwest `.http1_only()`), so ALPN never offers h2 at all. This
+        // is a PROCESS-WIDE, DEFAULT-OFF switch — production keeps the ALPN default (h2 where the
+        // backend accepts it, h1 otherwise); it exists as an operational rollback lever in case a
+        // specific upstream negotiates h2 but misbehaves on it (flow-control stalls, broken
+        // keep-alive pings, intermediary bugs) and you need the pre-h2 wire behavior back without a
+        // rebuild. Mutually exclusive in spirit with the h2c opt-in above (forcing h1 AND forcing
+        // h2 makes no sense); if both are set, http1-only wins because it is applied last. Read
+        // once at client-build time.
+        let http1_only = std::env::var_os("BUSBAR_UPSTREAM_HTTP1_ONLY")
+            .is_some_and(|v| v != "0" && !v.is_empty());
         let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(
             cfg.limits.upstream_request_timeout_secs,
         ));
@@ -1674,6 +1685,11 @@ pub(crate) fn build_app_from_config(
         // upstream must speak h2c. Applied last so it overrides the ALPN default above.
         if h2_prior_knowledge {
             builder = builder.http2_prior_knowledge();
+        }
+        // HTTP/1-only escape hatch: pin the client to h1 (no ALPN h2 offer). Applied last so it
+        // wins over both the ALPN default and the h2c opt-in above.
+        if http1_only {
+            builder = builder.http1_only();
         }
         builder.build().expect("build upstream HTTP client")
     };

@@ -34,8 +34,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Validate version + not already released
+        # The input reaches the shell via `env:` (a plain variable), NEVER via `${{ }}` inside
+        # `run:` — expression interpolation happens before the shell sees the script, so a crafted
+        # "version" would otherwise splice arbitrary shell into the job. As an env var it is inert
+        # data, and the X.Y.Z regex gate below runs before anything else uses it.
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          V='${{ inputs.version }}'
+          V="$VERSION"
           echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::'$V' is not X.Y.Z"; exit 1; }
           if git rev-parse "v$V" >/dev/null 2>&1; then echo "::error::tag v$V already exists"; exit 1; fi
           echo "V=$V" >> "$GITHUB_ENV"
