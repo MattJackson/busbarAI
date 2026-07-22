@@ -744,7 +744,7 @@ Optional. Exposes nine operational limits: eight previously hardcoded, plus the 
 
 ```yaml
 limits:
-  max_inbound_concurrent: 0       # 0 = unlimited; > 0 adds a global concurrency cap
+  max_inbound_concurrent: 8192    # 0 = unlimited; > 0 adds a global concurrency cap
   request_body_max_bytes: 33554432  # 32 MiB
   upstream_request_timeout_secs: 300
   tls_handshake_timeout_secs: 10
@@ -757,7 +757,7 @@ limits:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `max_inbound_concurrent` | integer | `0` | Global inbound concurrency cap. `0` = unlimited (no cap layer installed). Any positive value installs an outermost concurrency-limit middleware before routing. |
+| `max_inbound_concurrent` | integer | `8192` | Global inbound concurrency cap, applied outermost (before request bodies are buffered), so it is the global bound on peak request memory: worst case is this limit times `request_body_max_bytes`. `0` = unlimited (no cap layer installed, the pre-1.5.0 posture). |
 | `request_body_max_bytes` | integer | `33554432` | Maximum inbound request body size (bytes). Exceeding this returns a protocol-native 413. |
 | `upstream_request_timeout_secs` | integer | `300` | Per-upstream-request wall-clock timeout. Applies to both the connect and the full response. |
 | `tls_handshake_timeout_secs` | integer | `10` | Wall-clock cap on each inbound TLS handshake; prevents slowloris / handshake-flood. Ignored when `tls:` is absent. |

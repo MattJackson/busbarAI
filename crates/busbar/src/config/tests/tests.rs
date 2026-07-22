@@ -1475,8 +1475,8 @@ models:
     assert_eq!(l.pool_max_idle_per_host, DEFAULT_POOL_MAX_IDLE_PER_HOST);
     assert_eq!(l.max_inbound_concurrent, DEFAULT_MAX_INBOUND_CONCURRENT);
     assert_eq!(
-        l.max_inbound_concurrent, 0,
-        "default must be the unlimited no-op"
+        l.max_inbound_concurrent, 8192,
+        "default must be the bounded admission cap (the only global bound on buffered request memory)"
     );
     assert_eq!(l.hard_down_cooldown_secs, DEFAULT_HARD_DOWN_COOLDOWN_SECS);
     assert_eq!(

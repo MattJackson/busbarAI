@@ -1714,8 +1714,18 @@ pub(crate) const REQUEST_BODY_MAX_BYTES_CEIL: usize = 1024 * 1024 * 1024;
 /// their lifetime). Operators with many distinct upstream hosts can lower it; high-RPS single-host
 /// deployments are the ones this default protects.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 1024;
-/// Default inbound concurrency limit. `0` = unlimited (today's behavior — NO layer added).
-pub(crate) const DEFAULT_MAX_INBOUND_CONCURRENT: usize = 0;
+/// Default inbound concurrency limit. `0` = unlimited (NO layer added).
+///
+/// Non-zero by default because this is the ONLY global bound on buffered request memory: every
+/// request buffers its body (up to `request_body_max_bytes`, default 32 MiB) BEFORE any handler
+/// logic can reject it, so peak memory is `(concurrent requests) x (body cap)` — with no admission
+/// bound, a hostile connection burst is an OOM, not a slowdown. The limit layer is applied
+/// OUTERMOST (see `apply_inbound_concurrency_limit`), so a queued request has NOT yet buffered its
+/// body — the bound genuinely caps peak at `limit x body cap`. 8192 is ~4x the highest useful
+/// in-flight count measured on a 4-core box (sustained throughput peaks near 1-2k concurrent) —
+/// far above any legitimate working set, low enough that the worst case stays bounded. Operators
+/// who want the old unlimited posture set `limits.max_inbound_concurrent: 0` explicitly.
+pub(crate) const DEFAULT_MAX_INBOUND_CONCURRENT: usize = 8192;
 /// Default hard-down sticky cooldown (seconds). Mirrors `store.rs`.
 pub(crate) const DEFAULT_HARD_DOWN_COOLDOWN_SECS: u64 = 1800;
 /// Default ceiling on a honored upstream `Retry-After` (seconds). Mirrors `store.rs` (24h).
