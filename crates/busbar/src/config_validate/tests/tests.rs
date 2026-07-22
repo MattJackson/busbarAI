@@ -1502,9 +1502,10 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
-        let errs = validate_governance(&gov, None).unwrap_err_or_default(format!(
-            "a whitespace-only admin_token {blank:?} must fail validation"
-        ));
+        let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
+            .unwrap_err_or_default(format!(
+                "a whitespace-only admin_token {blank:?} must fail validation"
+            ));
         assert!(
             errs.iter().any(|e| e.contains("governance.admin_token")
                 && e.contains("/admin management API is unreachable")),
@@ -1526,7 +1527,7 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
-        validate_governance(&gov, None).is_ok(),
+        validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok(),
         "an admin_token with a non-blank core must validate (we do not reject surrounding space)"
     );
 }
@@ -1541,7 +1542,8 @@ fn test_validate_governance_rejects_admin_token_without_module() {
         admin_token: Some("tok".to_string()),
         ..Default::default()
     };
-    let errs = validate_governance(&gov, None).expect_err("must be a boot error");
+    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
+        .expect_err("must be a boot error");
     assert!(
         errs.iter().any(|e| e.contains("auth-admin-tokens")),
         "{errs:?}"
@@ -1564,7 +1566,7 @@ fn test_validate_governance_ok_when_enabled_with_admin_token() {
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
-        validate_governance(&gov, None).is_ok(),
+        validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok(),
         "enabled governance WITH an admin_token must validate"
     );
 }
@@ -1584,7 +1586,7 @@ fn test_validate_governance_rejects_zero_rate_sweep_interval() {
         rate_sweep_interval: 0,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
-    let err = validate_governance(&gov, None)
+    let err = validate_governance(&gov, None, &Default::default(), &Default::default())
         .expect_err("rate_sweep_interval: 0 must be rejected at validation");
     assert!(
         err.iter().any(|e| e.contains("rate_sweep_interval")),
@@ -1607,7 +1609,7 @@ fn test_validate_governance_disabled_carries_no_requirement() {
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
-        validate_governance(&gov, None).is_ok(),
+        validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok(),
         "disabled governance carries no admin_token requirement"
     );
 }
@@ -1648,8 +1650,13 @@ fn test_validate_governance_rejects_passthrough_combination() {
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
-        let errs = validate_governance(&gov, Some(&auth_cfg(mode)))
-            .expect_err("governance + passthrough must be rejected at boot");
+        let errs = validate_governance(
+            &gov,
+            Some(&auth_cfg(mode)),
+            &Default::default(),
+            &Default::default(),
+        )
+        .expect_err("governance + passthrough must be rejected at boot");
         assert!(
             errs.iter().any(
                 |e| e.contains("upstream_credentials: passthrough") && e.contains("governance")
@@ -1678,7 +1685,13 @@ fn test_validate_governance_allows_token_and_none_modes() {
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
         assert!(
-            validate_governance(&gov, Some(&auth_cfg(mode))).is_ok(),
+            validate_governance(
+                &gov,
+                Some(&auth_cfg(mode)),
+                &Default::default(),
+                &Default::default()
+            )
+            .is_ok(),
             "governance + auth.mode={mode} must validate"
         );
     }
@@ -1700,7 +1713,13 @@ fn test_validate_governance_passthrough_ignored_when_disabled() {
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
     assert!(
-        validate_governance(&gov, Some(&auth_cfg("passthrough"))).is_ok(),
+        validate_governance(
+            &gov,
+            Some(&auth_cfg("passthrough")),
+            &Default::default(),
+            &Default::default()
+        )
+        .is_ok(),
         "disabled governance + passthrough must validate (governance inert)"
     );
 }
@@ -3584,5 +3603,252 @@ fn test_path_override_composition_under_metadata_rules() {
     assert!(
         validate(&cfg).is_ok(),
         "well-formed leading-slash path on a public host must validate"
+    );
+}
+
+// ─── Cost-model validation (1.5.0): rate card completeness + budget groups + paste-ready stubs ───
+
+/// Build a models map with one entry (optionally carrying an `upstream_model` override).
+fn one_model(
+    name: &str,
+    upstream: Option<&str>,
+) -> std::collections::HashMap<String, crate::config::ModelCfg> {
+    let yaml = match upstream {
+        Some(u) => format!("provider: p\nupstream_model: {u}"),
+        None => "provider: p".to_string(),
+    };
+    std::collections::HashMap::from([(name.to_string(), serde_yaml::from_str(&yaml).unwrap())])
+}
+
+#[allow(clippy::field_reassign_with_default)]
+fn gov_with_rate_card(entries: &[&str]) -> crate::config::GovernanceCfg {
+    let mut gov = crate::config::GovernanceCfg::default();
+    gov.rate_card = Some(
+        entries
+            .iter()
+            .map(|m| (m.to_string(), crate::config::RateEntryCfg::default()))
+            .collect(),
+    );
+    gov
+}
+
+/// ALL-OR-NOTHING completeness: `rate_card` present with a configured model missing FAILS, and the
+/// error carries a COPY-PASTEABLE zeroed YAML stub of exactly the missing model (post-
+/// `upstream_model` name). The absent-card config passes (token pricing 0, legacy posture).
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn test_validate_rate_card_completeness_fails_closed_with_paste_stub() {
+    let models = one_model("claude-opus-4", None);
+    let gov = gov_with_rate_card(&["some-other-model"]);
+    let errs = validate_governance(&gov, None, &models, &Default::default())
+        .expect_err("a configured model without a rate entry must fail validation");
+    let joined = errs.join("\n");
+    assert!(
+        joined.contains("rate_card is present but 1 configured model has no rate entry"),
+        "must state the completeness rule: {joined}"
+    );
+    assert!(
+        joined.contains(
+            "claude-opus-4: { input_utok: 0, output_utok: 0, cache_read_utok: 0, cache_write_utok: 0 }"
+        ),
+        "must print the paste-ready zeroed stub for exactly the missing model: {joined}"
+    );
+
+    // Complete card passes.
+    let gov_ok = gov_with_rate_card(&["claude-opus-4"]);
+    assert!(
+        validate_governance(&gov_ok, None, &models, &Default::default()).is_ok(),
+        "a complete rate card passes"
+    );
+
+    // Absent card passes regardless (token pricing is 0 for every model - the OFF arm).
+    let gov_absent = crate::config::GovernanceCfg::default();
+    assert!(validate_governance(&gov_absent, None, &models, &Default::default()).is_ok());
+}
+
+/// Completeness resolves through `upstream_model`: the card must price the RESOLVED upstream name
+/// (the runtime rate-lookup key), not the config alias.
+#[test]
+fn test_validate_rate_card_completeness_uses_upstream_model() {
+    let models = one_model("smart", Some("gpt-5"));
+    // Card prices the ALIAS, not the resolved upstream name -> the upstream name is missing.
+    let errs = validate_governance(
+        &gov_with_rate_card(&["smart"]),
+        None,
+        &models,
+        &Default::default(),
+    )
+    .expect_err("the resolved upstream name must be priced");
+    assert!(
+        errs.join("\n").contains("gpt-5:"),
+        "stub names the upstream model: {errs:?}"
+    );
+    // Card pricing the upstream name passes.
+    assert!(validate_governance(
+        &gov_with_rate_card(&["gpt-5"]),
+        None,
+        &models,
+        &Default::default()
+    )
+    .is_ok());
+}
+
+/// Malformed rates (NaN / negative) are rejected naming the exact config path + tier.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn test_validate_rate_card_rejects_nan_and_negative_rates() {
+    let models = one_model("m", None);
+    let mut gov = crate::config::GovernanceCfg::default();
+    gov.rate_card = Some(std::collections::BTreeMap::from([(
+        "m".to_string(),
+        crate::config::RateEntryCfg {
+            input_utok: f64::NAN,
+            output_utok: -1.0,
+            cache_read_utok: 0.0,
+            cache_write_utok: 0.0,
+        },
+    )]));
+    let errs = validate_governance(&gov, None, &models, &Default::default())
+        .expect_err("NaN/negative rates must fail");
+    let joined = errs.join("\n");
+    assert!(
+        joined.contains("governance.rate_card['m'].input_utok"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("governance.rate_card['m'].output_utok"),
+        "{joined}"
+    );
+}
+
+/// budget_groups validation: a missing parent fails with a PASTE-READY stub of the missing group;
+/// an invalid period prints the valid set + a corrected line; a cycle names the exact path
+/// (instruction, not stub - it is not mechanically fixable); depth > 8 is rejected.
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn test_validate_budget_groups_faults_are_named_with_fixes() {
+    let mk = |cap: i64, period: &str, parent: Option<&str>| crate::config::BudgetGroupCfg {
+        max_budget_cents: cap,
+        budget_period: period.to_string(),
+        parent: parent.map(String::from),
+    };
+
+    // Missing parent -> paste-ready stub.
+    let mut gov = crate::config::GovernanceCfg::default();
+    gov.budget_groups =
+        std::collections::BTreeMap::from([("bob".to_string(), mk(500, "monthly", Some("growth")))]);
+    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
+        .expect_err("missing parent must fail");
+    let joined = errs.join("\n");
+    assert!(
+        joined.contains("growth: { max_budget_cents: 0, budget_period: monthly }"),
+        "missing parent gets a paste-ready stub: {joined}"
+    );
+
+    // Invalid period -> the valid set + a corrected line.
+    let mut gov = crate::config::GovernanceCfg::default();
+    gov.budget_groups =
+        std::collections::BTreeMap::from([("t".to_string(), mk(100, "weekly", None))]);
+    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
+        .expect_err("invalid period must fail");
+    let joined = errs.join("\n");
+    assert!(
+        joined.contains("\"total\", \"daily\", \"monthly\""),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("t: { max_budget_cents: 100, budget_period: monthly }"),
+        "{joined}"
+    );
+
+    // Cycle -> the exact offending path, reported ONCE.
+    let mut gov = crate::config::GovernanceCfg::default();
+    gov.budget_groups = std::collections::BTreeMap::from([
+        ("a".to_string(), mk(1, "total", Some("b"))),
+        ("b".to_string(), mk(1, "total", Some("a"))),
+    ]);
+    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
+        .expect_err("a cycle must fail");
+    let cycles: Vec<&String> = errs.iter().filter(|e| e.contains("CYCLE")).collect();
+    assert_eq!(cycles.len(), 1, "one cycle = one error: {errs:?}");
+    assert!(cycles[0].contains("a -> b -> a"), "{cycles:?}");
+
+    // Depth > 8 rejected.
+    let mut gov = crate::config::GovernanceCfg::default();
+    let mut groups = std::collections::BTreeMap::new();
+    for i in 0..10 {
+        let parent = if i == 9 {
+            None
+        } else {
+            Some(format!("g{}", i + 1))
+        };
+        groups.insert(
+            format!("g{i}"),
+            crate::config::BudgetGroupCfg {
+                max_budget_cents: 1,
+                budget_period: "total".to_string(),
+                parent,
+            },
+        );
+    }
+    gov.budget_groups = groups;
+    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
+        .expect_err("a 10-deep chain must fail the depth cap");
+    assert!(errs.join("\n").contains("maximum depth"), "{errs:?}");
+
+    // A valid nested hierarchy passes.
+    let mut gov = crate::config::GovernanceCfg::default();
+    gov.budget_groups = std::collections::BTreeMap::from([
+        ("acme".to_string(), mk(10_000_000, "monthly", None)),
+        ("growth".to_string(), mk(2_000_000, "monthly", Some("acme"))),
+        ("bob".to_string(), mk(500_000, "monthly", Some("growth"))),
+    ]);
+    assert!(validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok());
+}
+
+/// A pool-member 4-tier billing override with NO rate_card is rejected (pricing is all-or-nothing);
+/// conflicting overrides for one model across pools are rejected naming both pools.
+#[test]
+fn test_validate_member_tiered_override_rules() {
+    let models = one_model("m", None);
+    let pool_yaml =
+        "members:\n  - target: m\n    cost_per_mtok: { input_utok: 1.0, output_utok: 2.0 }\n";
+    let pools = std::collections::HashMap::from([(
+        "p1".to_string(),
+        serde_yaml::from_str::<crate::config::PoolCfg>(pool_yaml).unwrap(),
+    )]);
+
+    // No card at all -> the override is an error naming the all-or-nothing rule.
+    let gov = crate::config::GovernanceCfg::default();
+    let errs = validate_governance(&gov, None, &models, &pools)
+        .expect_err("a tiered override without a rate_card must fail");
+    assert!(errs.join("\n").contains("all-or-nothing"), "{errs:?}");
+
+    // With a card, the override itself PRICES the model (no completeness error for 'm').
+    let gov = gov_with_rate_card(&[]);
+    assert!(
+        validate_governance(&gov, None, &models, &pools).is_ok(),
+        "a member override satisfies completeness for its model"
+    );
+
+    // Two pools overriding the SAME model with DIFFERENT rates conflict.
+    let pool2_yaml =
+        "members:\n  - target: m\n    cost_per_mtok: { input_utok: 9.0, output_utok: 9.0 }\n";
+    let pools2 = std::collections::HashMap::from([
+        (
+            "p1".to_string(),
+            serde_yaml::from_str::<crate::config::PoolCfg>(pool_yaml).unwrap(),
+        ),
+        (
+            "p2".to_string(),
+            serde_yaml::from_str::<crate::config::PoolCfg>(pool2_yaml).unwrap(),
+        ),
+    ]);
+    let errs = validate_governance(&gov_with_rate_card(&[]), None, &models, &pools2)
+        .expect_err("conflicting member overrides must fail");
+    let joined = errs.join("\n");
+    assert!(
+        joined.contains("p1") && joined.contains("p2"),
+        "names both pools: {joined}"
     );
 }

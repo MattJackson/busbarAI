@@ -2291,9 +2291,12 @@ pub(crate) fn resolve(
     // existing fail-loud error channel, so an enabled-but-admin-token-less governance block (which
     // silently locks the /admin API) is rejected at boot rather than discovered at runtime.
     if let Some(governance) = &deploy.governance {
-        if let Err(gov_errors) =
-            crate::config_validate::validate_governance(governance, deploy.auth.as_ref())
-        {
+        if let Err(gov_errors) = crate::config_validate::validate_governance(
+            governance,
+            deploy.auth.as_ref(),
+            &deploy.models,
+            &deploy.pools,
+        ) {
             errors.extend(gov_errors);
         }
     }

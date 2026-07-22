@@ -1373,11 +1373,192 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
 /// key (a behaviour inversion that could cause a production outage). The auth runtime emits a
 /// one-time warning, but only `resolve`/this validator can see BOTH blocks at boot, so reject the
 /// combination here with a clear diagnostic rather than letting it pass to a runtime warning.
+/// The budget periods enforcement understands; kept in lock-step with `governance::budget_window`.
+const VALID_BUDGET_PERIODS: &[&str] = &["total", "daily", "monthly"];
+
+/// COST-MODEL validation (the 1.5.0 rate card + budget groups), fail-closed, with PASTE-READY FIX
+/// STUBS: every failure with a mechanical fix prints the exact snippet to add (the validate UX rule
+/// for the whole binary); a non-mechanical fault (a cycle) prints the exact offending path plus the
+/// minimal instruction.
+fn validate_cost_model(
+    governance: &crate::config::GovernanceCfg,
+    models: &HashMap<String, crate::config::ModelCfg>,
+    pools: &HashMap<String, crate::config::PoolCfg>,
+    errors: &mut Vec<String>,
+) {
+    // The set of models a pool-member 4-tier `cost_per_mtok` override prices (keyed by resolved
+    // upstream name) - those need no rate_card entry, and they REQUIRE the card to exist at all
+    // (all-or-nothing pricing has no "just this member" arm).
+    let mut member_priced: HashMap<String, (String, crate::config::RateEntryCfg)> = HashMap::new();
+    let mut pool_names: Vec<&String> = pools.keys().collect();
+    pool_names.sort();
+    for pool in &pool_names {
+        for member in &pools[pool.as_str()].members {
+            let Some(tiered) = member.cost_per_mtok.as_ref().and_then(|c| c.tiered()) else {
+                continue;
+            };
+            if governance.rate_card.is_none() {
+                errors.push(format!(
+                    "pool '{pool}' member '{}' declares a 4-tier cost_per_mtok billing override, but \
+                     governance.rate_card is absent. Pricing is all-or-nothing: add a rate_card (the \
+                     override then wins for this member's model), or use the bare per-mtok number \
+                     form (a routing-only signal).",
+                    member.target
+                ));
+                continue;
+            }
+            let upstream = models
+                .get(&member.target)
+                .and_then(|m| m.upstream_model.as_deref())
+                .unwrap_or(&member.target)
+                .to_string();
+            if let Some((other_pool, prior)) = member_priced.get(&upstream) {
+                if *prior != *tiered {
+                    errors.push(format!(
+                        "pools '{other_pool}' and '{pool}' both declare 4-tier cost_per_mtok \
+                         overrides for model '{upstream}' with DIFFERENT rates. The ledger prices \
+                         per MODEL, so one model has exactly one effective rate: make the two \
+                         overrides identical, or move the rate into governance.rate_card['{upstream}'] \
+                         and drop the member overrides."
+                    ));
+                }
+            } else {
+                member_priced.insert(upstream, (pool.to_string(), *tiered));
+            }
+        }
+    }
+
+    if let Some(card) = &governance.rate_card {
+        // Well-formed rates: every tier finite and >= 0 (names the exact config path).
+        for (model, r) in card {
+            for (tier, v) in [
+                ("input_utok", r.input_utok),
+                ("output_utok", r.output_utok),
+                ("cache_read_utok", r.cache_read_utok),
+                ("cache_write_utok", r.cache_write_utok),
+            ] {
+                if !v.is_finite() || v < 0.0 {
+                    errors.push(format!(
+                        "governance.rate_card['{model}'].{tier} must be a finite, non-negative \
+                         number of micro-units per token (got {v})"
+                    ));
+                }
+            }
+        }
+        // COMPLETENESS (all-or-nothing): rate_card present => EVERY configured model (post-
+        // `upstream_model`, minus member-override-priced ones) has an entry, or boot/--validate
+        // FAIL with a COPY-PASTEABLE zeroed stub of exactly the missing models.
+        let mut model_names: Vec<&String> = models.keys().collect();
+        model_names.sort();
+        let mut missing: Vec<&str> = Vec::new();
+        for name in model_names {
+            let effective = models[name.as_str()]
+                .upstream_model
+                .as_deref()
+                .unwrap_or(name);
+            if !card.contains_key(effective)
+                && !member_priced.contains_key(effective)
+                && !missing.contains(&effective)
+            {
+                missing.push(effective);
+            }
+        }
+        if !missing.is_empty() {
+            let width = missing.iter().map(|m| m.len()).max().unwrap_or(0) + 1;
+            let stub: String = missing
+                .iter()
+                .map(|m| {
+                    format!(
+                        "    {:width$} {{ input_utok: 0, output_utok: 0, cache_read_utok: 0, cache_write_utok: 0 }}\n",
+                        format!("{m}:"),
+                        width = width
+                    )
+                })
+                .collect();
+            errors.push(format!(
+                "rate_card is present but {} configured model{} no rate entry (rate_card is \
+                 AUTHORITATIVE and COMPLETE: you either price nothing or price everything).\n\
+                 Paste these under governance.rate_card and fill in your rates (micro-units per token):\n\n{stub}",
+                missing.len(),
+                if missing.len() == 1 { " has" } else { "s have" },
+            ));
+        }
+    }
+
+    // budget_groups: valid periods, parents exist (paste-ready stub), acyclic, depth <= 8.
+    let groups = &governance.budget_groups;
+    for (name, g) in groups {
+        if !VALID_BUDGET_PERIODS.contains(&g.budget_period.as_str()) {
+            errors.push(format!(
+                "governance.budget_groups['{name}'].budget_period '{}' is invalid; it must be one \
+                 of {VALID_BUDGET_PERIODS:?}. Fix the line to e.g.:\n\n    {name}: {{ max_budget_cents: {}, budget_period: monthly }}\n",
+                g.budget_period, g.max_budget_cents
+            ));
+        }
+        if g.max_budget_cents < 0 {
+            errors.push(format!(
+                "governance.budget_groups['{name}'].max_budget_cents must be >= 0 (got {}); a \
+                 negative cap would reject every request in the group from the first admission",
+                g.max_budget_cents
+            ));
+        }
+        if let Some(parent) = &g.parent {
+            if !groups.contains_key(parent) {
+                errors.push(format!(
+                    "governance.budget_groups['{name}'].parent names '{parent}', which does not \
+                     exist.\nPaste this under governance.budget_groups and set a real cap:\n\n    \
+                     {parent}: {{ max_budget_cents: 0, budget_period: monthly }}\n"
+                ));
+            }
+        }
+    }
+    // Cycle + depth check: walk each group's parent chain with a step cap. A cycle is NOT
+    // mechanically fixable, so it prints the exact offending path plus the instruction.
+    for name in groups.keys() {
+        let mut path: Vec<&str> = vec![name];
+        let mut cur = name.as_str();
+        // `while let` over the parent chain, capped by the depth check inside.
+        while let Some(parent) = groups.get(cur).and_then(|g| g.parent.as_deref()) {
+            if path.contains(&parent) {
+                path.push(parent);
+                // Report each cycle ONCE: only from its lexicographically-smallest member (every
+                // member's walk finds the same cycle; N copies of one error would drown the fix).
+                let cycle_start = path.iter().position(|p| *p == parent).unwrap_or(0);
+                if path[cycle_start..].iter().min() == Some(&name.as_str()) {
+                    errors.push(format!(
+                        "governance.budget_groups parent chain contains a CYCLE: {}. Break the \
+                         cycle by removing one of the `parent:` links.",
+                        path.join(" -> ")
+                    ));
+                }
+                break;
+            }
+            path.push(parent);
+            if path.len() > crate::cost::MAX_GROUP_DEPTH {
+                errors.push(format!(
+                    "governance.budget_groups chain starting at '{name}' exceeds the maximum depth \
+                     of {} ({}); flatten the hierarchy",
+                    crate::cost::MAX_GROUP_DEPTH,
+                    path.join(" -> ")
+                ));
+                break;
+            }
+            if !groups.contains_key(parent) {
+                break; // missing parent already reported above
+            }
+            cur = path[path.len() - 1];
+        }
+    }
+}
+
 pub(crate) fn validate_governance(
     governance: &crate::config::GovernanceCfg,
     auth: Option<&crate::config::AuthCfg>,
+    models: &HashMap<String, crate::config::ModelCfg>,
+    pools: &HashMap<String, crate::config::PoolCfg>,
 ) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
+    validate_cost_model(governance, models, pools, &mut errors);
     // A configured admin token with the `admin-tokens` module compiled OUT would silently disable
     // the admin API (the chain all-Passes) — a silent lockout must be a loud boot error instead.
     #[cfg(not(feature = "auth-admin-tokens"))]
