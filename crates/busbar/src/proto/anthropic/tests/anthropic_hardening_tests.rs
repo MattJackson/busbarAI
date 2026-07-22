@@ -3776,3 +3776,139 @@ fn read_response_cache_usage_is_additive_not_subtracted() {
         Some(10)
     );
 }
+
+/// REGRESSION (finding P1 #1): the request-side unsigned-thinking filter in `write_message` must
+/// NOT drop a REDACTED thinking block. A `redacted_thinking` block is carried in the IR as
+/// `Thinking { redacted: true, signature: None }` (opaque encrypted `data`, no signature — the
+/// Anthropic Messages API accepts `redacted_thinking` WITHOUT a signature, unlike a plaintext
+/// `thinking` block). The old filter matched `Thinking { signature: None, .. }` and dropped it,
+/// silently losing the encrypted reasoning that lets a multi-turn extended-thinking conversation
+/// replay. It must survive and re-emit as a native `redacted_thinking` block carrying the opaque
+/// `data` bytes. FAILS before the `redacted: false` guard was added (the block was dropped and
+/// content.len() == 1); passes after.
+#[test]
+fn write_message_keeps_redacted_thinking_block() {
+    let msg = crate::ir::IrMessage {
+        role: crate::ir::IrRole::Assistant,
+        content: vec![
+            crate::ir::IrBlock::Thinking {
+                text: "ENCRYPTED_OPAQUE_BYTES".to_string(),
+                signature: None,
+                redacted: true,
+                cache_control: None,
+            },
+            crate::ir::IrBlock::Text {
+                text: "the answer".to_string(),
+                cache_control: None,
+                citations: Vec::new(),
+            },
+        ],
+    };
+    let out = write_message(&msg);
+    let content = out
+        .get("content")
+        .and_then(|c| c.as_array())
+        .expect("content array");
+    assert_eq!(
+        content.len(),
+        2,
+        "the redacted_thinking block must survive the request-side filter alongside the text: \
+         {content:?}"
+    );
+    // The redacted block re-emits as a native `redacted_thinking` block carrying `data`, NOT a
+    // plaintext `thinking` block and NOT with a `signature`.
+    let redacted = content
+        .iter()
+        .find(|b| b.get("type").and_then(|t| t.as_str()) == Some("redacted_thinking"))
+        .expect("a native redacted_thinking block must be emitted");
+    assert_eq!(
+        redacted.get("data").and_then(|d| d.as_str()),
+        Some("ENCRYPTED_OPAQUE_BYTES"),
+        "the opaque bytes must ride under `data` on the redacted_thinking block"
+    );
+    assert!(
+        redacted.get("thinking").is_none(),
+        "a redacted block must NOT leak its opaque bytes as plaintext `thinking`: {redacted:?}"
+    );
+    // A plaintext UNSIGNED thinking block is still correctly dropped (the fix is surgical).
+    assert!(
+        !content
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")),
+        "no plaintext thinking block was present in the input; none should appear"
+    );
+}
+
+/// REGRESSION (finding P1 #2): the streaming `content_block_start` skeleton must carry the SEED
+/// field for each block type so an SDK accumulator initializes the field before any delta arrives:
+/// a `text` start ships `text:""`, a `tool_use` start ships `input:{}`, and a `thinking` start
+/// ships `thinking:""`. Omitting the seed leaves the SDK accumulator field undefined and the first
+/// delta concatenates onto `undefined` / raises a KeyError. FAILS before the seeds were added (the
+/// skeletons carried only `type`, plus `id`/`name` for tool_use); passes after.
+#[test]
+fn content_block_start_carries_seed_fields() {
+    // Text block start → `text: ""`.
+    let (_et, out) = AnthropicWriter
+        .write_response_event(&crate::ir::IrStreamEvent::BlockStart {
+            index: 0,
+            block: crate::ir::IrBlockMeta::Text,
+        })
+        .expect("text block_start writes");
+    assert_eq!(
+        out.pointer("/content_block/type").and_then(|v| v.as_str()),
+        Some("text")
+    );
+    assert_eq!(
+        out.pointer("/content_block/text").and_then(|v| v.as_str()),
+        Some(""),
+        "a text content_block_start must seed `text:\"\"` for SDK accumulator init: {out}"
+    );
+
+    // Tool-use block start → `input: {}` (plus id/name).
+    let (_et, out) = AnthropicWriter
+        .write_response_event(&crate::ir::IrStreamEvent::BlockStart {
+            index: 1,
+            block: crate::ir::IrBlockMeta::ToolUse {
+                id: "toolu_01".to_string(),
+                name: "get_weather".to_string(),
+            },
+        })
+        .expect("tool_use block_start writes");
+    assert_eq!(
+        out.pointer("/content_block/type").and_then(|v| v.as_str()),
+        Some("tool_use")
+    );
+    assert_eq!(
+        out.pointer("/content_block/id").and_then(|v| v.as_str()),
+        Some("toolu_01")
+    );
+    assert_eq!(
+        out.pointer("/content_block/name").and_then(|v| v.as_str()),
+        Some("get_weather")
+    );
+    assert_eq!(
+        out.pointer("/content_block/input")
+            .and_then(|v| v.as_object())
+            .map(|o| o.is_empty()),
+        Some(true),
+        "a tool_use content_block_start must seed `input:{{}}` for partial-json accumulation: {out}"
+    );
+
+    // Thinking block start → `thinking: ""`.
+    let (_et, out) = AnthropicWriter
+        .write_response_event(&crate::ir::IrStreamEvent::BlockStart {
+            index: 2,
+            block: crate::ir::IrBlockMeta::Thinking,
+        })
+        .expect("thinking block_start writes");
+    assert_eq!(
+        out.pointer("/content_block/type").and_then(|v| v.as_str()),
+        Some("thinking")
+    );
+    assert_eq!(
+        out.pointer("/content_block/thinking")
+            .and_then(|v| v.as_str()),
+        Some(""),
+        "a thinking content_block_start must seed `thinking:\"\"`: {out}"
+    );
+}
