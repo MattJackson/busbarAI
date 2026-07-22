@@ -42,7 +42,7 @@ listen: "0.0.0.0:8080"
 #   clients must send `Authorization: Bearer <token>` matching the allowlist below. An EMPTY chain is
 #   an open relay (no client auth; dev only). upstream_credentials controls whose key hits the
 #   provider: `own` (default — busbar's configured key) or `passthrough` (forward the caller's key).
-# When governance is enabled (bottom of file), virtual keys supersede this for proxied requests.
+# When governance is active (admin_token set, bottom of file), virtual keys supersede this for proxied requests.
 auth:
   chain: [tokens]
   upstream_credentials: own
