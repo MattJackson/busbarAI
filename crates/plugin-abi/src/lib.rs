@@ -29,13 +29,21 @@
 //! the version it was built against; the engine refuses to load a mismatch (a plugin built for a
 //! different ABI is not loaded, never mis-called). The ABI is append-only, like the frozen Admin API.
 
-use busbar_api::{AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Usage, VirtualKey};
+use busbar_api::{
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, UsageDelta, UsageLedger, VirtualKey,
+};
 use serde::{Deserialize, Serialize};
 use std::os::raw::c_void;
 
 /// The store-plugin ABI version this crate defines. Bumped only on a breaking change to the wire
 /// (the request/response shape or the C signatures); additive changes keep the version.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2 (1.5.0, pre-release): the scalar `Usage { spend_cents, tokens, requests }` counter became the
+/// per-(model, tier) TOKEN LEDGER (`UsageLedger`/`UsageDelta`) and `Get/Put/AddUsage` re-keyed from
+/// `key_id` to `bucket_id` (key buckets and budget-group buckets share the shape). A breaking wire
+/// change, so the version bumps: a v1 plugin is refused at load, never mis-called. 1.5.0 is
+/// unreleased, so no v1 plugin exists in the wild.
+pub const ABI_VERSION: u32 = 2;
 
 /// The exported-symbol names the engine resolves after `dlopen`/`LoadLibrary`. A store plugin MUST
 /// export all five with these exact names and the signatures in the `*Fn` type aliases below. The
@@ -71,27 +79,24 @@ pub enum StoreRequest {
     GetKey(String),
     ListKeys,
     DeleteKey(String),
+    /// `get_usage` — the (bucket, window) token ledger. `bucket_id` is a key id or a budget-group
+    /// bucket id; no dollar field crosses this wire (spend derives from ledger x rate card).
     GetUsage {
-        key_id: String,
+        bucket_id: String,
         window_start: u64,
     },
+    /// `put_usage` — ABSOLUTE set of a (bucket, window) ledger (single-writer write-behind).
     PutUsage {
-        key_id: String,
+        bucket_id: String,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: UsageLedger,
     },
-    /// `add_usage` — ADDITIVE accumulate of a key's window counter (signed deltas; the
-    /// fleet-honest flush). ADDITIVE (ABI stays v1): a plugin built against an older SDK never
-    /// learned this variant and rejects it; the loader falls back to a read-modify-write
-    /// (get + put) with documented single-writer semantics.
+    /// `add_usage` — ADDITIVE accumulate of a (bucket, window) ledger: a signed requests delta plus
+    /// per-(model, tier) signed token deltas (the fleet-honest flush; counters floor at 0).
     AddUsage {
-        key_id: String,
+        bucket_id: String,
         window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
+        delta: UsageDelta,
     },
     AddMetering(MeteringDelta),
     ListMetering(u64),
@@ -125,8 +130,8 @@ pub enum StoreResponse {
     Key(Option<VirtualKey>),
     /// `list_keys` — every key.
     Keys(Vec<VirtualKey>),
-    /// `get_usage` — the window counter.
-    Usage(Usage),
+    /// `get_usage` — the (bucket, window) token ledger.
+    Usage(UsageLedger),
     /// `list_metering` — the bucket's rows.
     Metering(Vec<MeteringRow>),
     /// `list_aws_credentials` — every credential.
@@ -203,6 +208,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 42,
+            budget_group: Some("growth".into()),
+            labels: std::collections::BTreeMap::new(),
         }
     }
 
@@ -216,15 +223,40 @@ mod tests {
             StoreRequest::ListKeys,
             StoreRequest::DeleteKey("vk_1".into()),
             StoreRequest::GetUsage {
-                key_id: "vk_1".into(),
+                bucket_id: "vk_1".into(),
                 window_start: 100,
             },
             StoreRequest::PutUsage {
-                key_id: "vk_1".into(),
+                bucket_id: "vk_1".into(),
                 window_start: 100,
-                spend_cents: 5,
-                tokens: 7,
-                requests: 1,
+                ledger: busbar_api::UsageLedger {
+                    requests: 1,
+                    models: vec![busbar_api::ModelTokens {
+                        model: "gpt-5".into(),
+                        tokens: busbar_api::TierTokens {
+                            input: 7,
+                            output: 3,
+                            cache_read: 1,
+                            cache_write: 0,
+                        },
+                    }],
+                },
+            },
+            StoreRequest::AddUsage {
+                bucket_id: "group:growth".into(),
+                window_start: 100,
+                delta: busbar_api::UsageDelta {
+                    requests: 1,
+                    models: vec![busbar_api::ModelTokensDelta {
+                        model: "gpt-5".into(),
+                        tokens: busbar_api::TierTokensDelta {
+                            input: 7,
+                            output: -3,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    }],
+                },
             },
             StoreRequest::ListMetering(9),
             StoreRequest::ListAwsCredentials,
@@ -258,7 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one() {
-        assert_eq!(ABI_VERSION, 1);
+    fn abi_version_is_two() {
+        // v2 = the token-ledger wire (1.5.0). A v1 plugin is refused at the handshake.
+        assert_eq!(ABI_VERSION, 2);
     }
 }

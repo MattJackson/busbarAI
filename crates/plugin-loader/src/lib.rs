@@ -19,8 +19,8 @@
 //! the time-of-check/time-of-use gap a `verify(path)` + `dlopen(path)` pair would leave open.
 
 use busbar_api::{
-    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
-    VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult,
+    UsageDelta, UsageLedger, VirtualKey,
 };
 use busbar_plugin_abi::{
     symbol, CallFn, CloseFn, FreeFn, StoreRequest, StoreResponse, ABI_VERSION, STATUS_OK,
@@ -173,9 +173,9 @@ impl Store for DynStore {
         }
     }
 
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
         match self.call_raw(StoreRequest::GetUsage {
-            key_id: key_id.to_string(),
+            bucket_id: bucket_id.to_string(),
             window_start,
         })? {
             StoreResponse::Usage(u) => Ok(u),
@@ -185,55 +185,33 @@ impl Store for DynStore {
 
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &UsageLedger,
     ) -> StoreResult<()> {
         match self.call_raw(StoreRequest::PutUsage {
-            key_id: key_id.to_string(),
+            bucket_id: bucket_id.to_string(),
             window_start,
-            spend_cents,
-            tokens,
-            requests,
+            ledger: ledger.clone(),
         })? {
             StoreResponse::Unit => Ok(()),
             other => Err(unexpected(other)),
         }
     }
 
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
-    ) -> StoreResult<()> {
-        // A plugin built against an OLDER SDK never learned this variant and rejects it (a
-        // protocol/decode error). Fall back to the trait-default read-modify-write (get + put) so
-        // the flush still lands against old plugins - with the documented single-writer caveat; a
-        // new plugin performs the native atomic accumulate.
+    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+        // ABI v2 makes `AddUsage` part of the base wire (every v2 plugin knows it — the v1-era
+        // "older SDK never learned this variant" fallback is gone with the version bump), so an
+        // error here is a REAL store error and propagates: silently degrading the fleet-additive
+        // accumulate to a read-modify-write against a live shared backend would be a correctness
+        // downgrade (lost updates), not a compatibility bridge.
         match self.call_raw(StoreRequest::AddUsage {
-            key_id: key_id.to_string(),
+            bucket_id: bucket_id.to_string(),
             window_start,
-            delta_spend_cents,
-            delta_tokens,
-            delta_requests,
-        }) {
-            Ok(StoreResponse::Unit) => Ok(()),
-            Ok(other) => Err(unexpected(other)),
-            Err(_) => {
-                let cur = self.get_usage(key_id, window_start)?;
-                self.put_usage(
-                    key_id,
-                    window_start,
-                    cur.spend_cents.saturating_add(delta_spend_cents).max(0),
-                    cur.tokens.saturating_add_signed(delta_tokens),
-                    cur.requests.saturating_add_signed(delta_requests),
-                )
-            }
+            delta: delta.clone(),
+        })? {
+            StoreResponse::Unit => Ok(()),
+            other => Err(unexpected(other)),
         }
     }
 
@@ -653,20 +631,62 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 7,
+            budget_group: Some("growth".into()),
+            labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
         };
         store.put_key(&key).expect("put_key");
 
         let got = store.get_key("vk_dyn").expect("get_key").expect("present");
         assert_eq!(got.id, "vk_dyn");
         assert_eq!(got.max_budget_cents, Some(500));
+        assert_eq!(
+            got.budget_group.as_deref(),
+            Some("growth"),
+            "budget_group survives the ABI round-trip"
+        );
+        assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
 
         assert_eq!(store.list_keys().expect("list").len(), 1);
 
-        store.put_usage("vk_dyn", 100, 42, 9, 3).expect("put_usage");
+        // The token LEDGER round-trips over the ABI: absolute put, additive add, then read back.
+        let ledger = busbar_api::UsageLedger {
+            requests: 3,
+            models: vec![busbar_api::ModelTokens {
+                model: "gpt-5".into(),
+                tokens: busbar_api::TierTokens {
+                    input: 9,
+                    output: 4,
+                    cache_read: 2,
+                    cache_write: 1,
+                },
+            }],
+        };
+        store.put_usage("vk_dyn", 100, &ledger).expect("put_usage");
+        store
+            .add_usage(
+                "vk_dyn",
+                100,
+                &busbar_api::UsageDelta {
+                    requests: 1,
+                    models: vec![busbar_api::ModelTokensDelta {
+                        model: "gpt-5".into(),
+                        tokens: busbar_api::TierTokensDelta {
+                            input: 1,
+                            output: 1,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    }],
+                },
+            )
+            .expect("add_usage");
         let usage = store.get_usage("vk_dyn", 100).expect("get_usage");
-        assert_eq!(usage.spend_cents, 42);
-        assert_eq!(usage.tokens, 9);
-        assert_eq!(usage.requests, 3);
+        assert_eq!(usage.requests, 4);
+        let t = usage.tokens_for("gpt-5").expect("model row");
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (10, 5, 2, 1)
+        );
 
         store.delete_key("vk_dyn").expect("delete");
         assert!(store.get_key("vk_dyn").expect("get after delete").is_none());
@@ -787,6 +807,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 1,
+            budget_group: None,
+            labels: std::collections::BTreeMap::new(),
         };
         store.put_key(&key).expect("put_key over from-bytes load");
         assert_eq!(

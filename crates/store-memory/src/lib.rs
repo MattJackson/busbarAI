@@ -7,18 +7,19 @@
 //! for persistence. Poison-recovering locks (the governance surface must never panic on a request).
 
 use busbar_api::{
-    AwsCredential, MeteringDelta, MeteringRow, Store, StoreResult, Usage, VirtualKey,
+    AwsCredential, MeteringDelta, MeteringRow, Store, StoreResult, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// In-memory `Store`: keys by id, AWS credentials by access-key-id, usage counters keyed by
-/// (key_id, window_start), metering rows keyed by (key_id, bucket, model, provider).
+/// In-memory `Store`: keys by id, AWS credentials by access-key-id, token ledgers keyed by
+/// (bucket_id, window_start), metering rows keyed by (key_id, bucket, model, provider).
 #[derive(Default)]
 pub struct MemoryStore {
     keys: RwLock<HashMap<String, VirtualKey>>,
     creds: RwLock<HashMap<String, AwsCredential>>,
-    usage: RwLock<HashMap<(String, u64), Usage>>,
+    usage: RwLock<HashMap<(String, u64), UsageLedger>>,
     metering: RwLock<HashMap<(String, u64, String, String), MeteringRow>>,
 }
 
@@ -32,7 +33,7 @@ impl MemoryStore {
     fn creds(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, AwsCredential>> {
         self.creds.write().unwrap_or_else(|e| e.into_inner())
     }
-    fn usage(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<(String, u64), Usage>> {
+    fn usage(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<(String, u64), UsageLedger>> {
         self.usage.write().unwrap_or_else(|e| e.into_inner())
     }
     fn metering(
@@ -67,48 +68,33 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
         Ok(self
             .usage()
-            .get(&(key_id.to_string(), window_start))
-            .copied()
+            .get(&(bucket_id.to_string(), window_start))
+            .cloned()
             .unwrap_or_default())
     }
 
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &UsageLedger,
     ) -> StoreResult<()> {
         // Write-behind ABSOLUTE set (memory is authoritative in the engine; this is durability only).
-        self.usage().insert(
-            (key_id.to_string(), window_start),
-            Usage {
-                spend_cents,
-                tokens,
-                requests,
-            },
-        );
+        self.usage()
+            .insert((bucket_id.to_string(), window_start), ledger.clone());
         Ok(())
     }
 
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
-    ) -> StoreResult<()> {
+    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
         // ADDITIVE accumulate under the write lock (atomic within this process), floored at 0.
         let mut usage = self.usage();
-        let u = usage.entry((key_id.to_string(), window_start)).or_default();
-        u.spend_cents = u.spend_cents.saturating_add(delta_spend_cents).max(0);
-        u.tokens = u.tokens.saturating_add_signed(delta_tokens);
-        u.requests = u.requests.saturating_add_signed(delta_requests);
+        let u = usage
+            .entry((bucket_id.to_string(), window_start))
+            .or_default();
+        u.apply_delta(delta);
         Ok(())
     }
 
@@ -177,31 +163,88 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn ledger(requests: u64, model: &str, input: u64, output: u64) -> UsageLedger {
+        UsageLedger {
+            requests,
+            models: vec![busbar_api::ModelTokens {
+                model: model.to_string(),
+                tokens: busbar_api::TierTokens {
+                    input,
+                    output,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
         }
     }
 
     #[test]
-    fn key_crud_and_usage_roundtrip() {
+    fn key_crud_and_ledger_roundtrip() {
         let s = MemoryStore::new();
         s.put_key(&key("a")).unwrap();
         assert_eq!(s.get_key("a").unwrap().unwrap().id, "a");
         assert_eq!(s.list_keys().unwrap().len(), 1);
         // absolute put_usage then read back
-        s.put_usage("a", 0, 42, 100, 3).unwrap();
+        s.put_usage("a", 0, &ledger(3, "m", 100, 40)).unwrap();
         let u = s.get_usage("a", 0).unwrap();
-        assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 100, 3));
+        assert_eq!(u.requests, 3);
+        assert_eq!(u.tokens_for("m").unwrap().input, 100);
         // absolute overwrite (not additive)
-        s.put_usage("a", 0, 10, 20, 1).unwrap();
-        assert_eq!(s.get_usage("a", 0).unwrap().spend_cents, 10);
-        // unknown window is default-zero
-        assert_eq!(s.get_usage("a", 999).unwrap(), Usage::default());
+        s.put_usage("a", 0, &ledger(1, "m", 20, 0)).unwrap();
+        assert_eq!(
+            s.get_usage("a", 0).unwrap().tokens_for("m").unwrap().input,
+            20
+        );
+        // unknown window is default-empty
+        assert_eq!(s.get_usage("a", 999).unwrap(), UsageLedger::default());
+    }
+
+    /// Additive per-model delta accumulate: two adds sum, a second model materializes its own row,
+    /// and negative deltas floor at 0 (parity contract with sqlite/postgres/redis).
+    #[test]
+    fn add_usage_accumulates_per_model() {
+        let s = MemoryStore::new();
+        let d = UsageDelta {
+            requests: 1,
+            models: vec![busbar_api::ModelTokensDelta {
+                model: "gpt-5".to_string(),
+                tokens: busbar_api::TierTokensDelta {
+                    input: 10,
+                    output: 5,
+                    cache_read: 1,
+                    cache_write: 0,
+                },
+            }],
+        };
+        s.add_usage("bucket", 100, &d).unwrap();
+        s.add_usage("bucket", 100, &d).unwrap();
+        let u = s.get_usage("bucket", 100).unwrap();
+        assert_eq!(u.requests, 2);
+        let t = u.tokens_for("gpt-5").unwrap();
+        assert_eq!((t.input, t.output, t.cache_read), (20, 10, 2));
+        // Refund floors at zero.
+        s.add_usage(
+            "bucket",
+            100,
+            &UsageDelta {
+                requests: -5,
+                models: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(s.get_usage("bucket", 100).unwrap().requests, 0);
     }
 
     #[test]
     fn delete_key_cascades_usage_and_creds() {
         let s = MemoryStore::new();
         s.put_key(&key("a")).unwrap();
-        s.put_usage("a", 0, 5, 0, 1).unwrap();
+        s.put_usage("a", 0, &ledger(1, "m", 5, 0)).unwrap();
         s.put_aws_credential(&AwsCredential {
             access_key_id: "AKIA1".to_string(),
             key_id: "a".to_string(),
@@ -210,7 +253,7 @@ mod tests {
         .unwrap();
         s.delete_key("a").unwrap();
         assert!(s.get_key("a").unwrap().is_none());
-        assert_eq!(s.get_usage("a", 0).unwrap(), Usage::default());
+        assert_eq!(s.get_usage("a", 0).unwrap(), UsageLedger::default());
         assert!(s.list_aws_credentials().unwrap().is_empty());
     }
 

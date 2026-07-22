@@ -6,8 +6,8 @@
 //! depending only on the `busbar-api` contract (plus rusqlite), never on the engine.
 
 use busbar_api::{
-    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
-    VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, ModelTokens, Store, StoreError,
+    StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::sync::Mutex;
@@ -23,6 +23,14 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
     }
 }
 
+/// Store schema version, kept in SQLite's `PRAGMA user_version`. v2 = the 1.5.0 cost-model schema:
+/// the scalar `usage_counters` table (stored `spend_cents` — a derived dollar persisted as truth)
+/// is REPLACED by the per-(bucket, window[, model]) token-ledger pair `usage_windows` +
+/// `usage_ledger`, and `virtual_keys` grows `budget_group` + `labels`. 1.5.0 is UNRELEASED, so the
+/// bump is destructive (drop + recreate), never a migration: a pre-v2 dev database is recreated
+/// empty on open.
+const SCHEMA_VERSION: i64 = 2;
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS virtual_keys (
     id               TEXT PRIMARY KEY,
@@ -34,7 +42,9 @@ CREATE TABLE IF NOT EXISTS virtual_keys (
     rpm_limit        INTEGER,
     tpm_limit        INTEGER,
     enabled          INTEGER NOT NULL DEFAULT 1,
-    created_at       INTEGER NOT NULL
+    created_at       INTEGER NOT NULL,
+    budget_group     TEXT,
+    labels           TEXT NOT NULL DEFAULT '{}'
 );
 -- AWS-style credentials for inbound SigV4 verification (the MinIO/S3-compatible model), kept in a
 -- SEPARATE table keyed by the virtual key's id rather than as columns on `virtual_keys`. This keeps
@@ -51,13 +61,25 @@ CREATE TABLE IF NOT EXISTS aws_credentials (
     secret_access_key TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id);
-CREATE TABLE IF NOT EXISTS usage_counters (
-    key_id       TEXT NOT NULL,
+-- The TOKEN LEDGER (v2): per-(bucket, window) request counts + per-(bucket, window, model) tier
+-- token counts. `bucket_id` is a virtual key's id OR a budget-group bucket id — key buckets and
+-- group buckets share the shape. NO spend column: dollars are derived at read time from
+-- `ledger x rate_card` in the engine, so correcting a rate is a config edit, never a data fix.
+CREATE TABLE IF NOT EXISTS usage_windows (
+    bucket_id    TEXT NOT NULL,
     window_start INTEGER NOT NULL,
-    spend_cents  INTEGER NOT NULL DEFAULT 0,
-    tokens       INTEGER NOT NULL DEFAULT 0,
     requests     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (key_id, window_start)
+    PRIMARY KEY (bucket_id, window_start)
+);
+CREATE TABLE IF NOT EXISTS usage_ledger (
+    bucket_id          TEXT NOT NULL,
+    window_start       INTEGER NOT NULL,
+    model              TEXT NOT NULL,
+    tokens_input       INTEGER NOT NULL DEFAULT 0,
+    tokens_output      INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+    tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_id, window_start, model)
 );
 CREATE TABLE IF NOT EXISTS usage_metering (
     key_id                TEXT NOT NULL,
@@ -148,11 +170,39 @@ impl SqliteStore {
     }
 
     fn migrate(&self) -> StoreResult<()> {
-        // `CREATE TABLE IF NOT EXISTS` for both `virtual_keys` and the new `aws_credentials` table is
-        // idempotent and backward-compatible: an existing on-disk DB keeps its `virtual_keys` rows
-        // untouched and simply gains the `aws_credentials` table (a NEW table, so no `ALTER`/column-add
-        // dance and no risk to existing rows). A bearer-only DB from an older build upgrades cleanly.
-        self.lock_conn().execute_batch(SCHEMA).store()?;
+        let conn = self.lock_conn();
+        // SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model). 1.5.0 is unreleased, so a
+        // pre-v2 database (user_version < 2 with any governance table already present) is DROPPED
+        // and recreated — a bump, not a migration. A fresh database (no tables) simply creates the
+        // v2 schema; a v2 database is untouched (idempotent CREATE IF NOT EXISTS).
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .store()?;
+        if version < SCHEMA_VERSION {
+            let has_legacy: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_counters')
+                       OR EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='virtual_keys')",
+                    [],
+                    |r| r.get(0),
+                )
+                .store()?;
+            if has_legacy {
+                conn.execute_batch(
+                    "DROP TABLE IF EXISTS virtual_keys;
+                     DROP TABLE IF EXISTS aws_credentials;
+                     DROP TABLE IF EXISTS usage_counters;
+                     DROP TABLE IF EXISTS usage_windows;
+                     DROP TABLE IF EXISTS usage_ledger;
+                     DROP TABLE IF EXISTS usage_metering;
+                     DROP TABLE IF EXISTS audit_log;",
+                )
+                .store()?;
+            }
+        }
+        conn.execute_batch(SCHEMA).store()?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .store()?;
         Ok(())
     }
 
@@ -160,64 +210,99 @@ impl SqliteStore {
     // Each `*_inner` holds the EXACT SQL of its accounting method, locking the passed connection mutex
     // (poison-recovering). Takes no `&self`, so it is shared without borrowing the store.
 
-    fn add_usage_inner(
+    fn put_usage_inner(
         conn: &Mutex<Connection>,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        count_request: bool,
+        ledger: &UsageLedger,
     ) -> StoreResult<()> {
-        let req_delta = i64::from(count_request);
-        let conn = Self::lock_conn_raw(conn);
-        conn.execute(
-            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-             VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(key_id, window_start) DO UPDATE SET
-                spend_cents = spend_cents + excluded.spend_cents,
-                tokens      = tokens + excluded.tokens,
-                requests    = requests + excluded.requests",
+        // ABSOLUTE overwrite (memory is authoritative): replace the whole (bucket, window) record —
+        // the requests row AND every model row — in ONE transaction, so a re-flush of the same cell
+        // is idempotent and a reader never sees half a ledger. Clamp u64 counts into i64 (a value
+        // above i64::MAX pins, never wraps).
+        let mut conn = Self::lock_conn_raw(conn);
+        let tx = conn.transaction().store()?;
+        tx.execute(
+            "DELETE FROM usage_ledger WHERE bucket_id=?1 AND window_start=?2",
+            params![bucket_id, window_start as i64],
+        )
+        .store()?;
+        tx.execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests)
+             VALUES (?1,?2,?3)
+             ON CONFLICT(bucket_id, window_start) DO UPDATE SET requests = excluded.requests",
             params![
-                key_id,
+                bucket_id,
                 window_start as i64,
-                spend_cents,
-                i64::try_from(tokens).unwrap_or(i64::MAX),
-                req_delta
+                i64::try_from(ledger.requests).unwrap_or(i64::MAX)
             ],
         )
         .store()?;
+        for m in &ledger.models {
+            tx.execute(
+                "INSERT INTO usage_ledger
+                    (bucket_id, window_start, model,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    bucket_id,
+                    window_start as i64,
+                    m.model,
+                    i64::try_from(m.tokens.input).unwrap_or(i64::MAX),
+                    i64::try_from(m.tokens.output).unwrap_or(i64::MAX),
+                    i64::try_from(m.tokens.cache_read).unwrap_or(i64::MAX),
+                    i64::try_from(m.tokens.cache_write).unwrap_or(i64::MAX),
+                ],
+            )
+            .store()?;
+        }
+        tx.commit().store()?;
         Ok(())
     }
 
-    fn put_usage_inner(
+    fn add_usage_inner(
         conn: &Mutex<Connection>,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        delta: &UsageDelta,
     ) -> StoreResult<()> {
-        // ABSOLUTE overwrite (memory is authoritative): mirrors `add_usage_inner`'s UPSERT shape but
-        // the DO UPDATE SETs (not adds) each counter to the flusher's snapshot of the in-memory cell,
-        // so a re-flush of the same cell is idempotent and never double-counts. Clamp the u64 counts
-        // into i64 like the other inners (a value above i64::MAX pins to i64::MAX, never wraps).
-        let conn = Self::lock_conn_raw(conn);
-        conn.execute(
-            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-             VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(key_id, window_start) DO UPDATE SET
-                spend_cents = excluded.spend_cents,
-                tokens      = excluded.tokens,
-                requests    = excluded.requests",
-            params![
-                key_id,
-                window_start as i64,
-                spend_cents,
-                i64::try_from(tokens).unwrap_or(i64::MAX),
-                i64::try_from(requests).unwrap_or(i64::MAX)
-            ],
+        // ADDITIVE fleet-honest accumulate: the signed requests delta plus every per-model tier
+        // delta land in ONE transaction (atomic across the two tables), each counter floored at 0
+        // so a refund can never drive a durable counter negative.
+        let mut conn = Self::lock_conn_raw(conn);
+        let tx = conn.transaction().store()?;
+        tx.execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests)
+             VALUES (?1,?2,MAX(0,?3))
+             ON CONFLICT(bucket_id, window_start) DO UPDATE SET
+                requests = MAX(0, requests + ?3)",
+            params![bucket_id, window_start as i64, delta.requests],
         )
         .store()?;
+        for m in &delta.models {
+            tx.execute(
+                "INSERT INTO usage_ledger
+                    (bucket_id, window_start, model,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                 VALUES (?1,?2,?3,MAX(0,?4),MAX(0,?5),MAX(0,?6),MAX(0,?7))
+                 ON CONFLICT(bucket_id, window_start, model) DO UPDATE SET
+                    tokens_input       = MAX(0, tokens_input + ?4),
+                    tokens_output      = MAX(0, tokens_output + ?5),
+                    tokens_cache_read  = MAX(0, tokens_cache_read + ?6),
+                    tokens_cache_write = MAX(0, tokens_cache_write + ?7)",
+                params![
+                    bucket_id,
+                    window_start as i64,
+                    m.model,
+                    m.tokens.input,
+                    m.tokens.output,
+                    m.tokens.cache_read,
+                    m.tokens.cache_write,
+                ],
+            )
+            .store()?;
+        }
+        tx.commit().store()?;
         Ok(())
     }
 
@@ -279,95 +364,56 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    fn charge_within_budget_inner(
+    fn get_usage_inner(
         conn: &Mutex<Connection>,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        cost_cents: i64,
-        max_cents: Option<i64>,
-    ) -> StoreResult<bool> {
-        // First-request-in-window guard: if the row does not yet exist the UPSERT's INSERT branch
-        // fires unconditionally (a `WHERE` clause only guards the DO UPDATE branch), so a flat fee
-        // that ALONE exceeds the cap would slip in. Reject it up front — a single request costing
-        // more than the whole budget can never be admitted. (cost_cents is clamped >= 0 by the
-        // caller; max_cents None means uncapped.)
-        if let Some(max) = max_cents {
-            if cost_cents > max {
-                return Ok(false);
-            }
-        }
-        let conn = Self::lock_conn_raw(conn);
-        // ONE atomic UPSERT: insert the first request in the window (always within cap given the
-        // guard above), or accumulate onto an existing row ONLY IF the post-charge spend stays within
-        // `max_cents`. `RETURNING` yields a row exactly when the charge landed; zero rows ⇒ the
-        // conditional DO UPDATE's WHERE failed ⇒ over budget ⇒ reject. SQLite evaluates the bare
-        // column names in the WHERE against the EXISTING row (pre-update), so `spend_cents + :cost`
-        // is the prospective post-charge total. `:max IS NULL` (uncapped) short-circuits to always-charge.
-        // OVERFLOW SAFETY: SQLite arithmetic does NOT wrap on i64 overflow — it promotes the result to
-        // REAL (floating point). So if `spend_cents` were ever near i64::MAX, `spend_cents + :cost`
-        // becomes a large REAL (~9.2e18) which fails `<= :max` and the charge is correctly REJECTED —
-        // there is no C-style negative-wrap that could sneak a charge past the cap. (Verified empirically.)
-        let charged: Option<i64> = conn
+    ) -> StoreResult<UsageLedger> {
+        // Read the requests row + every model row inside ONE transaction so a concurrent
+        // `put_usage`/`add_usage` (another process on the same file) can never yield a torn ledger.
+        let mut conn = Self::lock_conn_raw(conn);
+        let tx = conn.transaction().store()?;
+        let requests: Option<i64> = tx
             .query_row(
-                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-                 VALUES (?1, ?2, ?3, 0, 1)
-                 ON CONFLICT(key_id, window_start) DO UPDATE SET
-                     spend_cents = spend_cents + ?3,
-                     requests    = requests + 1
-                   WHERE ?4 IS NULL OR spend_cents + ?3 <= ?4
-                 RETURNING spend_cents",
-                params![key_id, window_start as i64, cost_cents, max_cents],
-                |r| r.get::<_, i64>(0),
+                "SELECT requests FROM usage_windows WHERE bucket_id=?1 AND window_start=?2",
+                params![bucket_id, window_start as i64],
+                |r| r.get(0),
             )
             .optional()
             .store()?;
-        Ok(charged.is_some())
-    }
-
-    fn refund_request_inner(
-        conn: &Mutex<Connection>,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-    ) -> StoreResult<()> {
-        let conn = Self::lock_conn_raw(conn);
-        // Reverse exactly one atomic charge: subtract the flat fee from spend and one from requests,
-        // each floored at 0 (MAX(0, …)) so a refund can never push a counter negative even if windows
-        // or rows were reset between charge and refund. UPDATE-only: if the row is gone there is
-        // nothing to refund (a no-op, not an error).
-        conn.execute(
-            "UPDATE usage_counters SET
-                 spend_cents = MAX(0, spend_cents - ?3),
-                 requests    = MAX(0, requests - 1)
-             WHERE key_id = ?1 AND window_start = ?2",
-            params![key_id, window_start as i64, cost_cents],
-        )
-        .store()?;
-        Ok(())
-    }
-
-    fn get_usage_inner(
-        conn: &Mutex<Connection>,
-        key_id: &str,
-        window_start: u64,
-    ) -> StoreResult<Usage> {
-        let conn = Self::lock_conn_raw(conn);
-        let row = conn
-            .query_row(
-                "SELECT spend_cents, tokens, requests FROM usage_counters WHERE key_id=?1 AND window_start=?2",
-                params![key_id, window_start as i64],
-                |r| {
-                    Ok(Usage {
-                        spend_cents: r.get(0)?,
-                        // DI-3: clamp a (corrupt / direct-DB) negative stored counter to 0 instead
-                        // of wrapping a negative i64 to a huge u64 via `as`.
-                        tokens: r.get::<_, i64>(1)?.max(0) as u64,
-                        requests: r.get::<_, i64>(2)?.max(0) as u64,
+        let mut ledger = UsageLedger {
+            // DI-3: clamp a (corrupt / direct-DB) negative stored counter to 0 instead of wrapping
+            // a negative i64 to a huge u64 via `as`.
+            requests: requests.unwrap_or(0).max(0) as u64,
+            models: Vec::new(),
+        };
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
+                     FROM usage_ledger WHERE bucket_id=?1 AND window_start=?2 ORDER BY model",
+                )
+                .store()?;
+            let rows = stmt
+                .query_map(params![bucket_id, window_start as i64], |r| {
+                    let u = |v: i64| v.max(0) as u64;
+                    Ok(ModelTokens {
+                        model: r.get(0)?,
+                        tokens: TierTokens {
+                            input: u(r.get(1)?),
+                            output: u(r.get(2)?),
+                            cache_read: u(r.get(3)?),
+                            cache_write: u(r.get(4)?),
+                        },
                     })
-                },
-            )
-            .optional().store()?;
-        Ok(row.unwrap_or_default())
+                })
+                .store()?
+                .collect::<Result<Vec<_>, _>>()
+                .store()?;
+            ledger.models = rows;
+        }
+        tx.commit().store()?;
+        Ok(ledger)
     }
 }
 
@@ -411,12 +457,13 @@ fn pools_from_storage(stored: &str) -> Vec<String> {
 fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey) -> StoreResult<()> {
     conn.execute(
         "INSERT INTO virtual_keys
-                (id, key_hash, name, allowed_pools, max_budget_cents, budget_period, rpm_limit, tpm_limit, enabled, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                (id, key_hash, name, allowed_pools, max_budget_cents, budget_period, rpm_limit, tpm_limit, enabled, created_at, budget_group, labels)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
              ON CONFLICT(id) DO UPDATE SET
                 key_hash=excluded.key_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
                 max_budget_cents=excluded.max_budget_cents, budget_period=excluded.budget_period,
-                rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit, enabled=excluded.enabled",
+                rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit, enabled=excluded.enabled,
+                budget_group=excluded.budget_group, labels=excluded.labels",
         params![
             key.id,
             key.key_hash,
@@ -428,9 +475,22 @@ fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey) -> StoreResult<(
             key.tpm_limit,
             key.enabled as i64,
             key.created_at as i64,
+            key.budget_group,
+            labels_to_storage(&key.labels),
         ],
     ).store()?;
     Ok(())
+}
+
+/// `labels` persist as a JSON object in the `labels TEXT` column (delimiter-safe for arbitrary
+/// operator strings, mirroring the `allowed_pools` JSON storage). Serialization over a
+/// `BTreeMap<String, String>` is infallible; fall back to `{}` rather than panic on a write path.
+fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
+    serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, String> {
+    serde_json::from_str(stored).unwrap_or_default()
 }
 
 fn put_aws_credential_inner(conn: &rusqlite::Connection, cred: &AwsCredential) -> StoreResult<()> {
@@ -454,7 +514,7 @@ impl Store for SqliteStore {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
+                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels
                  FROM virtual_keys WHERE id=?1",
                 params![id],
                 row_to_key,
@@ -466,7 +526,7 @@ impl Store for SqliteStore {
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
+            "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels
              FROM virtual_keys ORDER BY created_at",
         ).store()?;
         let rows = stmt.query_map([], row_to_key).store()?;
@@ -488,7 +548,9 @@ impl Store for SqliteStore {
         let tx = conn.transaction().store()?;
         tx.execute("DELETE FROM virtual_keys WHERE id=?1", params![id])
             .store()?;
-        tx.execute("DELETE FROM usage_counters WHERE key_id=?1", params![id])
+        tx.execute("DELETE FROM usage_windows WHERE bucket_id=?1", params![id])
+            .store()?;
+        tx.execute("DELETE FROM usage_ledger WHERE bucket_id=?1", params![id])
             .store()?;
         // Remove any AWS credential rows tied to this key in the SAME transaction: a revoked key's
         // SigV4 credential must NOT outlive the key, or a Bedrock-SDK client signing with that
@@ -549,51 +611,15 @@ impl Store for SqliteStore {
 
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &UsageLedger,
     ) -> StoreResult<()> {
-        Self::put_usage_inner(
-            &self.conn,
-            key_id,
-            window_start,
-            spend_cents,
-            tokens,
-            requests,
-        )
+        Self::put_usage_inner(&self.conn, bucket_id, window_start, ledger)
     }
 
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
-    ) -> StoreResult<()> {
-        // ADDITIVE fleet-honest accumulate: adds each signed delta atomically (one UPSERT), floored
-        // at 0 so a refund can never drive a durable counter negative. Distinct from `put_usage`'s
-        // absolute overwrite (single-writer) and the legacy `add_usage_inner` charge path.
-        let conn = Self::lock_conn_raw(&self.conn);
-        conn.execute(
-            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-             VALUES (?1,?2,MAX(0,?3),MAX(0,?4),MAX(0,?5))
-             ON CONFLICT(key_id, window_start) DO UPDATE SET
-                spend_cents = MAX(0, spend_cents + ?3),
-                tokens      = MAX(0, tokens + ?4),
-                requests    = MAX(0, requests + ?5)",
-            params![
-                key_id,
-                window_start as i64,
-                delta_spend_cents,
-                delta_tokens,
-                delta_requests
-            ],
-        )
-        .store()?;
-        Ok(())
+    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+        Self::add_usage_inner(&self.conn, bucket_id, window_start, delta)
     }
 
     fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
@@ -604,8 +630,8 @@ impl Store for SqliteStore {
         Self::list_metering_inner(&self.conn, bucket)
     }
 
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        Self::get_usage_inner(&self.conn, key_id, window_start)
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
+        Self::get_usage_inner(&self.conn, bucket_id, window_start)
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
@@ -691,60 +717,22 @@ impl Store for SqliteStore {
     }
 }
 
-// Direct-store SQL primitives retained ONLY for the governance unit tests that pin their
-// UPSERT/boundary and hash-lookup semantics. Production enforcement is the in-memory hard-cap in
-// `GovState` (SQLite is a write-behind durability layer), so these are inherent `#[cfg(test)]`
-// methods on the concrete `SqliteStore` — NOT part of the swappable `Store` plugin contract a `db`
-// plugin (Postgres, …) must implement.
+// Hash-lookup primitive retained for the governance unit tests that pin the by-hash resolution
+// semantics. (The legacy direct-SQL charge/refund/add primitives died with `usage_counters` — v2
+// production enforcement is the in-memory chain charge in `GovState`; the store is a pure
+// write-behind ledger.)
 impl SqliteStore {
     pub fn get_key_by_hash(&self, key_hash: &str) -> StoreResult<Option<VirtualKey>> {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at
+                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels
                  FROM virtual_keys WHERE key_hash=?1",
                 params![key_hash],
                 row_to_key,
             )
             .optional().store()?;
         Ok(row)
-    }
-
-    pub fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        count_request: bool,
-    ) -> StoreResult<()> {
-        Self::add_usage_inner(
-            &self.conn,
-            key_id,
-            window_start,
-            spend_cents,
-            tokens,
-            count_request,
-        )
-    }
-
-    pub fn charge_within_budget(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-        max_cents: Option<i64>,
-    ) -> StoreResult<bool> {
-        Self::charge_within_budget_inner(&self.conn, key_id, window_start, cost_cents, max_cents)
-    }
-
-    pub fn refund_request(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        cost_cents: i64,
-    ) -> StoreResult<()> {
-        Self::refund_request_inner(&self.conn, key_id, window_start, cost_cents)
     }
 }
 
@@ -767,35 +755,16 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
             .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
         enabled: r.get::<_, i64>(8)? != 0,
         created_at: r.get::<_, i64>(9)? as u64,
+        budget_group: r.get(10)?,
+        labels: labels_from_storage(&r.get::<_, String>(11)?),
     })
 }
 
 #[cfg(test)]
 mod tests {
-
-    /// The TRAIT `add_usage` (fleet-additive flush primitive) accumulates signed deltas atomically
-    /// and floors at 0 on an over-refund — distinct from `put_usage`'s absolute overwrite.
-    #[test]
-    fn trait_add_usage_accumulates_and_floors() {
-        use busbar_api::Store as _;
-        let s = SqliteStore::open(":memory:", 5000).unwrap();
-        s.put_usage("k_add", 100, 42, 9, 3).unwrap();
-        Store::add_usage(&s, "k_add", 100, 8, 1, 2).unwrap();
-        let u = s.get_usage("k_add", 100).unwrap();
-        assert_eq!((u.spend_cents, u.tokens, u.requests), (50, 10, 5));
-        // Negative (refund) delta lands; an over-refund floors at 0.
-        Store::add_usage(&s, "k_add", 100, -60, -20, -10).unwrap();
-        let u = s.get_usage("k_add", 100).unwrap();
-        assert_eq!((u.spend_cents, u.tokens, u.requests), (0, 0, 0));
-        // Fresh row via add alone (INSERT arm), floored on a negative first delta.
-        Store::add_usage(&s, "k_new", 100, -5, 7, 1).unwrap();
-        let u = s.get_usage("k_new", 100).unwrap();
-        assert_eq!((u.spend_cents, u.tokens, u.requests), (0, 7, 1));
-    }
     use super::*;
-    use busbar_api::{Store, VirtualKey};
+    use busbar_api::{ModelTokensDelta, Store, TierTokensDelta, VirtualKey};
     use rusqlite::params;
-    use std::sync::Arc;
 
     fn sample_key(id: &str, hash: &str) -> VirtualKey {
         VirtualKey {
@@ -809,19 +778,198 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: std::collections::BTreeMap::new(),
         }
     }
 
+    fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
+        UsageDelta {
+            requests,
+            models: vec![ModelTokensDelta {
+                model: model.to_string(),
+                tokens: TierTokensDelta {
+                    input,
+                    output,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
+        }
+    }
+
+    /// The TRAIT `add_usage` (fleet-additive flush primitive) accumulates per-model signed deltas
+    /// atomically and floors at 0 on an over-refund; `put_usage` stays an absolute overwrite.
+    #[test]
+    fn trait_add_usage_accumulates_and_floors() {
+        let s = SqliteStore::open(":memory:", 5000).unwrap();
+        let base = UsageLedger {
+            requests: 3,
+            models: vec![ModelTokens {
+                model: "gpt-5".into(),
+                tokens: TierTokens {
+                    input: 9,
+                    output: 4,
+                    cache_read: 1,
+                    cache_write: 0,
+                },
+            }],
+        };
+        s.put_usage("k_add", 100, &base).unwrap();
+        Store::add_usage(&s, "k_add", 100, &delta(2, "gpt-5", 1, 1)).unwrap();
+        let u = s.get_usage("k_add", 100).unwrap();
+        assert_eq!(u.requests, 5);
+        let t = u.tokens_for("gpt-5").unwrap();
+        assert_eq!((t.input, t.output, t.cache_read), (10, 5, 1));
+        // A second model materializes its own row.
+        Store::add_usage(&s, "k_add", 100, &delta(0, "haiku", 7, 3)).unwrap();
+        assert_eq!(s.get_usage("k_add", 100).unwrap().models.len(), 2);
+        // Negative (refund) delta lands; an over-refund floors at 0.
+        Store::add_usage(&s, "k_add", 100, &delta(-10, "gpt-5", -100, -100)).unwrap();
+        let u = s.get_usage("k_add", 100).unwrap();
+        assert_eq!(u.requests, 0);
+        assert_eq!(u.tokens_for("gpt-5").unwrap().input, 0);
+        // Fresh row via add alone (INSERT arm), floored on a negative first delta.
+        Store::add_usage(&s, "k_new", 100, &delta(1, "m", -5, 7)).unwrap();
+        let u = s.get_usage("k_new", 100).unwrap();
+        assert_eq!(u.requests, 1);
+        let t = u.tokens_for("m").unwrap();
+        assert_eq!((t.input, t.output), (0, 7));
+    }
+
+    /// `put_usage` is an ABSOLUTE overwrite: a model row present in the old snapshot but absent
+    /// from the new one is REMOVED (the whole (bucket, window) record is replaced).
+    #[test]
+    fn put_usage_replaces_whole_ledger() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        s.put_usage(
+            "k",
+            0,
+            &UsageLedger {
+                requests: 2,
+                models: vec![
+                    ModelTokens {
+                        model: "a".into(),
+                        tokens: TierTokens {
+                            input: 1,
+                            output: 1,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    },
+                    ModelTokens {
+                        model: "b".into(),
+                        tokens: TierTokens {
+                            input: 2,
+                            output: 2,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        s.put_usage(
+            "k",
+            0,
+            &UsageLedger {
+                requests: 1,
+                models: vec![ModelTokens {
+                    model: "a".into(),
+                    tokens: TierTokens {
+                        input: 9,
+                        output: 0,
+                        cache_read: 0,
+                        cache_write: 0,
+                    },
+                }],
+            },
+        )
+        .unwrap();
+        let u = s.get_usage("k", 0).unwrap();
+        assert_eq!(u.requests, 1);
+        assert_eq!(
+            u.models.len(),
+            1,
+            "stale model rows are replaced, not merged"
+        );
+        assert_eq!(u.tokens_for("a").unwrap().input, 9);
+    }
+
+    /// SCHEMA BUMP (v2): opening a database that still carries the pre-cost-model `usage_counters`
+    /// schema DROPS and recreates the governance tables (1.5.0 unreleased: bump, not migrate) and
+    /// stamps `user_version = 2`. A v2 database re-opens untouched.
+    #[test]
+    fn legacy_schema_is_bumped_to_v2_on_open() {
+        let dir = std::env::temp_dir().join(format!("busbar-sqlite-bump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+        let path_str = path.to_str().unwrap().to_string();
+        {
+            // Write a legacy (v1-shaped) database by hand.
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE virtual_keys (
+                     id TEXT PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                     allowed_pools TEXT NOT NULL DEFAULT '', max_budget_cents INTEGER,
+                     budget_period TEXT NOT NULL DEFAULT 'total', rpm_limit INTEGER,
+                     tpm_limit INTEGER, enabled INTEGER NOT NULL DEFAULT 1,
+                     created_at INTEGER NOT NULL);
+                 CREATE TABLE usage_counters (
+                     key_id TEXT NOT NULL, window_start INTEGER NOT NULL,
+                     spend_cents INTEGER NOT NULL DEFAULT 0, tokens INTEGER NOT NULL DEFAULT 0,
+                     requests INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (key_id, window_start));
+                 INSERT INTO usage_counters VALUES ('vk_old', 0, 42, 9, 3);",
+            )
+            .unwrap();
+        }
+        let s = SqliteStore::open(&path_str, 5000).unwrap();
+        // The legacy table is gone; the v2 ledger is empty and functional.
+        assert_eq!(s.get_usage("vk_old", 0).unwrap(), UsageLedger::default());
+        Store::add_usage(&s, "vk_old", 0, &delta(1, "m", 1, 1)).unwrap();
+        assert_eq!(s.get_usage("vk_old", 0).unwrap().requests, 1);
+        let version: i64 = s
+            .lock_conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // Re-open: v2 data survives (no re-drop).
+        drop(s);
+        let s2 = SqliteStore::open(&path_str, 5000).unwrap();
+        assert_eq!(
+            s2.get_usage("vk_old", 0).unwrap().requests,
+            1,
+            "a v2 database must re-open without being dropped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `budget_group` + `labels` persist through the sqlite row round-trip.
+    #[test]
+    fn budget_group_and_labels_roundtrip() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        let mut k = sample_key("kg", "hashG");
+        k.budget_group = Some("growth".to_string());
+        k.labels = std::collections::BTreeMap::from([
+            ("team".to_string(), "growth".to_string()),
+            ("env".to_string(), "prod".to_string()),
+        ]);
+        s.put_key(&k).unwrap();
+        let got = s.get_key("kg").unwrap().unwrap();
+        assert_eq!(got.budget_group.as_deref(), Some("growth"));
+        assert_eq!(got.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(got, k);
+    }
+
     /// DI-2: a direct-DB `rpm_limit`/`tpm_limit` above `u32::MAX` must SATURATE to `u32::MAX` on read,
-    /// not wrap to a wrong (lower) cap via `as u32`. The admin API bounds these on write; this covers
-    /// the direct-DB hole.
+    /// not wrap to a wrong (lower) cap via `as u32`.
     #[test]
     fn test_rpm_tpm_above_u32max_saturate_on_read() {
         let s = SqliteStore::open_in_memory().unwrap();
-        // Seed a key the normal way to satisfy NOT NULL / schema, then poke oversized limits directly.
         let k = sample_key("kbig", "hashBIG");
         s.put_key(&k).unwrap();
-        let huge: i64 = i64::from(u32::MAX) + 1_000; // > u32::MAX, fits i64
+        let huge: i64 = i64::from(u32::MAX) + 1_000;
         {
             let conn = s.lock_conn();
             conn.execute(
@@ -831,45 +979,43 @@ mod tests {
             .unwrap();
         }
         let got = s.get_key("kbig").unwrap().unwrap();
-        assert_eq!(
-            got.rpm_limit,
-            Some(u32::MAX),
-            "an oversized rpm_limit must saturate, not wrap"
-        );
-        assert_eq!(
-            got.tpm_limit,
-            Some(u32::MAX),
-            "an oversized tpm_limit must saturate, not wrap"
-        );
+        assert_eq!(got.rpm_limit, Some(u32::MAX));
+        assert_eq!(got.tpm_limit, Some(u32::MAX));
     }
 
-    /// DI-3: a direct-DB NEGATIVE stored token/request counter must clamp to 0 on read, not wrap to a
-    /// huge u64 via `as u64`.
+    /// DI-3: direct-DB NEGATIVE stored ledger counters clamp to 0 on read, never wrap to a huge u64.
     #[test]
-    fn test_negative_usage_counters_clamp_to_zero_on_read() {
+    fn test_negative_ledger_counters_clamp_to_zero_on_read() {
         let s = SqliteStore::open_in_memory().unwrap();
-        let window_start: i64 = 1_700_000_000;
         {
             let conn = s.lock_conn();
             conn.execute(
-                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-                     VALUES ('kneg', ?1, 0, -5, -3)",
-                params![window_start],
+                "INSERT INTO usage_windows (bucket_id, window_start, requests) VALUES ('kneg', 0, -3)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_ledger (bucket_id, window_start, model,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                 VALUES ('kneg', 0, 'm', -5, -1, -2, -4)",
+                [],
             )
             .unwrap();
         }
-        let u = s.get_usage("kneg", window_start as u64).unwrap();
-        assert_eq!(
-            u.tokens, 0,
-            "a negative stored token counter must clamp to 0"
-        );
+        let u = s.get_usage("kneg", 0).unwrap();
         assert_eq!(
             u.requests, 0,
             "a negative stored request counter must clamp to 0"
         );
+        let t = u.tokens_for("m").unwrap();
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (0, 0, 0, 0),
+            "negative stored token counters clamp to 0"
+        );
     }
 
-    /// DI-3 parity with `get_usage`: a direct-DB negative metering counter clamps to 0 on read.
+    /// DI-3 parity for metering: a direct-DB negative metering counter clamps to 0 on read.
     #[test]
     fn test_negative_metering_counters_clamp_to_zero_on_read() {
         let s = SqliteStore::open_in_memory().unwrap();
@@ -894,49 +1040,36 @@ mod tests {
                 r.tokens_cache_creation,
                 r.requests
             ),
-            (0, 0, 0, 0, 0),
-            "negative stored metering counters clamp to 0"
+            (0, 0, 0, 0, 0)
         );
     }
 
-    /// A pool name CONTAINING a comma must survive a persist/read round-trip as ONE pool, not be
-    /// split into fragments. The old comma-delimited CSV storage corrupted such names (a key for
-    /// `"prod,special"` round-tripped as `["prod", "special"]`, an implicit privilege expansion that
-    /// also failed to match its own compound name). JSON-array storage is delimiter-safe.
+    /// A pool name CONTAINING a comma must survive a persist/read round-trip as ONE pool.
     #[test]
     fn test_comma_bearing_pool_name_roundtrips_as_single_pool() {
         let s = SqliteStore::open_in_memory().unwrap();
         let mut k = sample_key("kc", "hashCOMMA");
         k.allowed_pools = vec!["prod,special".to_string(), "plain".to_string()];
         s.put_key(&k).unwrap();
-
         let got = s.get_key("kc").unwrap().unwrap();
         assert_eq!(
             got.allowed_pools,
-            vec!["prod,special".to_string(), "plain".to_string()],
-            "comma-bearing pool name must not be split on read"
+            vec!["prod,special".to_string(), "plain".to_string()]
         );
-        // The compound name survives storage as ONE pool; splitting on the comma (the pre-JSON
-        // bug) would have produced two. (ACL matching via `pool_allowed` is tested in the engine.)
     }
 
-    /// `pools_from_storage` must still read a LEGACY bare comma-delimited row (written before the
-    /// JSON migration) so an existing on-disk DB keeps working without a migration step.
+    /// `pools_from_storage` must still read a LEGACY bare comma-delimited row.
     #[test]
     fn test_pools_from_storage_reads_legacy_csv() {
-        // New JSON format.
         assert_eq!(
             pools_from_storage("[\"a\",\"b\"]"),
             vec!["a".to_string(), "b".to_string()]
         );
-        // Legacy comma-delimited format (not valid JSON) falls back to the comma split.
         assert_eq!(
             pools_from_storage("a,b"),
             vec!["a".to_string(), "b".to_string()]
         );
-        // A single legacy comma-free value.
         assert_eq!(pools_from_storage("solo"), vec!["solo".to_string()]);
-        // Empty stays empty (= no restriction).
         assert!(pools_from_storage("").is_empty());
         assert!(pools_from_storage("[]").is_empty());
     }
@@ -945,16 +1078,12 @@ mod tests {
     fn test_poisoned_conn_lock_recovers_not_panics() {
         // Regression: a panic while the SqliteStore `conn` Mutex is held poisons it. Every `Store`
         // method acquires the connection via `lock_conn`, which must RECOVER (via into_inner)
-        // rather than `.unwrap()`-panic on every subsequent call — otherwise one transient panic
-        // permanently disables governance persistence (and, via spawn_blocking join, silently fails
-        // budget enforcement OPEN). We deliberately poison the lock, then assert the durable
-        // read/write path still functions.
+        // rather than `.unwrap()`-panic on every subsequent call.
         use std::sync::Arc;
 
         let s = Arc::new(SqliteStore::open_in_memory().unwrap());
-        s.add_usage("k_poison", 100, 10, 50, true).unwrap();
+        Store::add_usage(&*s, "k_poison", 100, &delta(1, "m", 50, 0)).unwrap();
 
-        // Poison the connection Mutex: panic while holding the guard.
         let s2 = Arc::clone(&s);
         let _ = std::thread::spawn(move || {
             let _guard = s2.conn.lock().unwrap();
@@ -966,25 +1095,19 @@ mod tests {
             "conn lock must be poisoned for the test"
         );
 
-        // Despite the poison, durable access keeps working (no panic): reads recover the guard,
-        // and writes continue to accrue correctly on the recovered (still-consistent) connection.
         assert_eq!(
             s.get_usage("k_poison", 100).unwrap().requests,
             1,
             "get_usage must recover the poisoned conn lock instead of panicking"
         );
-        s.add_usage("k_poison", 100, 5, 25, true).unwrap();
+        Store::add_usage(&*s, "k_poison", 100, &delta(1, "m", 25, 0)).unwrap();
         let u = s.get_usage("k_poison", 100).unwrap();
-        assert_eq!(
-            (u.requests, u.spend_cents, u.tokens),
-            (2, 15, 75),
-            "writes must keep accruing on a recovered (poisoned) conn lock"
-        );
+        assert_eq!(u.requests, 2);
+        assert_eq!(u.tokens_for("m").unwrap().input, 75);
     }
 
-    /// Durable audit (#17): `append_audit` persists records and `list_audit` returns them oldest-first
-    /// by `seq`, verbatim (the store never interprets the hash chain). A re-append of the same seq
-    /// upserts (idempotent), never a UNIQUE error — so a snapshot replay is safe.
+    /// Durable audit (#17): `append_audit` persists records and `list_audit` returns them
+    /// oldest-first by `seq`, verbatim; a re-append of the same seq upserts (idempotent).
     #[test]
     fn test_audit_append_and_list_roundtrip() {
         use busbar_api::AuditRecord;
@@ -999,26 +1122,18 @@ mod tests {
             prev_hash: prev.into(),
             hash: hash.into(),
         };
-        // Insert out of order to prove the ORDER BY seq.
         s.append_audit(&mk(2, "h1", "h2")).unwrap();
         s.append_audit(&mk(1, "", "h1")).unwrap();
         s.append_audit(&mk(3, "h2", "h3")).unwrap();
         let got = s.list_audit().unwrap();
         assert_eq!(got.len(), 3);
-        assert_eq!(
-            (got[0].seq, got[1].seq, got[2].seq),
-            (1, 2, 3),
-            "oldest-first by seq"
-        );
+        assert_eq!((got[0].seq, got[1].seq, got[2].seq), (1, 2, 3));
         assert_eq!(got[0].prev_hash, "");
         assert_eq!(got[1].prev_hash, "h1");
-        assert_eq!(got[2].resource, "hook:3");
-
-        // Idempotent upsert on seq (a replay overwrites, never a UNIQUE violation).
         s.append_audit(&mk(2, "h1", "h2b")).unwrap();
         let got2 = s.list_audit().unwrap();
-        assert_eq!(got2.len(), 3, "re-appending seq 2 upserts, not duplicates");
-        assert_eq!(got2[1].hash, "h2b", "the upsert overwrote the record");
+        assert_eq!(got2.len(), 3);
+        assert_eq!(got2[1].hash, "h2b");
     }
 
     #[test]
@@ -1032,10 +1147,9 @@ mod tests {
         assert_eq!(s.get_key("missing").unwrap(), None);
         assert_eq!(s.list_keys().unwrap(), vec![k.clone()]);
 
-        // Update via UPSERT on id.
         let mut k2 = k.clone();
         k2.enabled = false;
-        k2.allowed_pools = vec![]; // empty = all
+        k2.allowed_pools = vec![];
         s.put_key(&k2).unwrap();
         let got = s.get_key("k1").unwrap().unwrap();
         assert!(!got.enabled);
@@ -1045,252 +1159,41 @@ mod tests {
         assert_eq!(s.get_key("k1").unwrap(), None);
     }
 
-    /// fix 2a: the atomic check-and-charge is a HARD cap. A budget of 100c with a 30c flat fee admits
-    /// exactly 3 requests (90c); the 4th would reach 120c > 100c and is REJECTED atomically. The first
-    /// request in a window inserts; subsequent ones take the conditional UPSERT path.
     #[test]
-    fn test_charge_within_budget_is_a_hard_cap() {
+    fn test_delete_key_removes_key_and_ledger_atomically() {
+        // After delete, both the key row AND all of its ledger rows across windows are gone.
         let s = SqliteStore::open_in_memory().unwrap();
-        let w = 0u64;
-        // 3 charges fit (30, 60, 90), the 4th (would be 120) is rejected.
-        assert!(
-            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-            "1st 30c admitted"
-        );
-        assert!(
-            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-            "2nd 60c admitted"
-        );
-        assert!(
-            s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-            "3rd 90c admitted"
-        );
-        assert!(
-            !s.charge_within_budget("k", w, 30, Some(100)).unwrap(),
-            "4th 120c REJECTED"
-        );
-        // The rejected charge did NOT mutate spend — it stays at 90.
-        assert_eq!(
-            s.get_usage("k", w).unwrap().spend_cents,
-            90,
-            "rejected charge must not bill"
-        );
-        assert_eq!(
-            s.get_usage("k", w).unwrap().requests,
-            3,
-            "only admitted requests counted"
-        );
-    }
-
-    /// fix 2a: a single request whose flat fee ALONE exceeds the cap is rejected even as the FIRST
-    /// request in the window (the INSERT-branch guard), and an UNCAPPED key always charges.
-    #[test]
-    fn test_charge_within_budget_first_request_and_uncapped() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        // First-request fee > cap → rejected, no row created.
-        assert!(!s.charge_within_budget("big", 0, 200, Some(100)).unwrap());
-        assert_eq!(
-            s.get_usage("big", 0).unwrap().requests,
-            0,
-            "rejected first request creates no charge"
-        );
-        // Uncapped (None) always charges.
-        assert!(s.charge_within_budget("free", 0, 999_999, None).unwrap());
-        assert_eq!(s.get_usage("free", 0).unwrap().spend_cents, 999_999);
-    }
-
-    /// fix 2a (the headline): CONCURRENT atomic charges cannot overshoot the cap. 50 tasks each try to
-    /// charge 30c against a 100c cap on ONE shared store; exactly 3 may succeed (90c), the rest are
-    /// rejected, and final spend is EXACTLY 90 — never the N×30 overshoot the old non-atomic
-    /// read-then-charge allowed.
-    #[test]
-    fn test_concurrent_charges_cannot_overshoot_cap() {
-        let store: Arc<SqliteStore> = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let mut handles = Vec::new();
-        for _ in 0..50 {
-            let s = store.clone();
-            handles.push(std::thread::spawn(move || {
-                s.charge_within_budget("k", 0, 30, Some(100)).unwrap()
-            }));
-        }
-        let mut admitted = 0u32;
-        for h in handles {
-            if h.join().unwrap() {
-                admitted += 1;
-            }
-        }
-        assert_eq!(
-            admitted, 3,
-            "exactly 3 of 50 concurrent charges fit under a 100c/30c cap"
-        );
-        assert_eq!(
-            store.get_usage("k", 0).unwrap().spend_cents,
-            90,
-            "final spend must be EXACTLY 90 — no concurrency overshoot (the hard-cap guarantee)"
-        );
-    }
-
-    /// M9: cap BOUNDARY semantics through `Store::charge_within_budget` (the admission primitive).
-    /// (a) a FIRST request whose `cost_cents == max_cents` must ADMIT (post-charge spend equals, not
-    /// exceeds, the cap). (b) a window PRE-SEEDED with `spend_cents >= max_cents` must REJECT the next
-    /// charge. These pin the `>`-vs-`>=` boundary the hard cap turns on.
-    #[test]
-    fn test_charge_within_budget_cap_boundaries() {
-        // (a) cost == cap on a fresh window → admit.
-        let s = SqliteStore::open_in_memory().unwrap();
-        assert!(
-            s.charge_within_budget("k", 0, 100, Some(100)).unwrap(),
-            "first request with cost_cents == max_cents must admit (spend lands exactly at the cap)"
-        );
-        assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 100);
-        // A further charge now that spend == cap must reject.
-        assert!(
-            !s.charge_within_budget("k", 0, 1, Some(100)).unwrap(),
-            "once spend == cap, any further charge is rejected"
-        );
-
-        // (b) window pre-seeded at/above the cap → reject the next charge outright.
-        let s2 = SqliteStore::open_in_memory().unwrap();
-        // Seed spend >= max via an uncapped accounting write, then probe with a capped charge.
-        s2.add_usage("k2", 0, 250, 0, true).unwrap();
-        assert!(
-            !s2.charge_within_budget("k2", 0, 1, Some(200)).unwrap(),
-            "a window pre-seeded with spend_cents >= max_cents must reject"
-        );
-        assert_eq!(
-            s2.get_usage("k2", 0).unwrap().spend_cents,
-            250,
-            "the rejected charge must not mutate spend"
-        );
-    }
-
-    /// fix 2a companion: `refund_request` reverses exactly one flat charge, floored at 0 (a refund
-    /// can never drive a counter negative).
-    #[test]
-    fn test_refund_request_reverses_charge_floored_at_zero() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
-        assert!(s.charge_within_budget("k", 0, 30, Some(1000)).unwrap());
-        assert_eq!(s.get_usage("k", 0).unwrap().spend_cents, 60);
-        assert_eq!(s.get_usage("k", 0).unwrap().requests, 2);
-        s.refund_request("k", 0, 30).unwrap();
-        assert_eq!(
-            s.get_usage("k", 0).unwrap().spend_cents,
-            30,
-            "one refund reverses one charge"
-        );
-        assert_eq!(s.get_usage("k", 0).unwrap().requests, 1);
-        // Over-refunding floors at 0, never negative.
-        s.refund_request("k", 0, 30).unwrap();
-        s.refund_request("k", 0, 30).unwrap();
-        assert_eq!(
-            s.get_usage("k", 0).unwrap().spend_cents,
-            0,
-            "refund floors spend at 0"
-        );
-        assert_eq!(
-            s.get_usage("k", 0).unwrap().requests,
-            0,
-            "refund floors requests at 0"
-        );
-    }
-
-    #[test]
-    fn test_usage_accumulates() {
-        let s = SqliteStore::open_in_memory().unwrap();
-        s.add_usage("k1", 100, 25, 1000, true).unwrap();
-        s.add_usage("k1", 100, 30, 500, true).unwrap();
-        let u = s.get_usage("k1", 100).unwrap();
-        assert_eq!(u.spend_cents, 55);
-        assert_eq!(u.tokens, 1500);
-        assert_eq!(u.requests, 2);
-        // A token-accrual call (count_request = false) adds spend/tokens but NOT a request — so the
-        // per-request fee + token usage for one request don't double-count it.
-        s.add_usage("k1", 100, 7, 250, false).unwrap();
-        let u2 = s.get_usage("k1", 100).unwrap();
-        assert_eq!(u2.spend_cents, 62);
-        assert_eq!(u2.tokens, 1750);
-        assert_eq!(
-            u2.requests, 2,
-            "count_request=false must not increment requests"
-        );
-        // Different window is independent; unknown = zero.
-        assert_eq!(s.get_usage("k1", 200).unwrap(), Usage::default());
-    }
-
-    #[test]
-    fn test_delete_key_removes_key_and_usage_atomically() {
-        // Regression: `delete_key` deletes from both `virtual_keys` and `usage_counters`. The two
-        // DELETEs are now wrapped in one transaction so they commit together — leaving no orphaned
-        // usage rows that would (a) accumulate forever and (b) poison a future key re-created with
-        // the same id with stale usage. Here we assert the post-condition: after delete, both the
-        // key row AND all of its usage rows across windows are gone.
-        let s = SqliteStore::open_in_memory().unwrap();
-        let key = VirtualKey {
-            id: "vk_delete_me".into(),
-            key_hash: "hash_delete_me".into(),
-            name: "victim".into(),
-            allowed_pools: vec!["p1".into()],
-            max_budget_cents: Some(1000),
-            budget_period: "total".into(),
-            rpm_limit: Some(60),
-            tpm_limit: Some(1000),
-            enabled: true,
-            created_at: 0,
-        };
+        let key = sample_key("vk_delete_me", "hash_delete_me");
         s.put_key(&key).unwrap();
-        s.add_usage("vk_delete_me", 100, 25, 1000, true).unwrap();
-        s.add_usage("vk_delete_me", 200, 5, 50, true).unwrap();
-        // Precondition: key + usage present.
+        Store::add_usage(&s, "vk_delete_me", 100, &delta(1, "m", 1000, 0)).unwrap();
+        Store::add_usage(&s, "vk_delete_me", 200, &delta(1, "m", 50, 0)).unwrap();
         assert!(s.get_key("vk_delete_me").unwrap().is_some());
         assert_eq!(s.get_usage("vk_delete_me", 100).unwrap().requests, 1);
 
         s.delete_key("vk_delete_me").unwrap();
 
-        // Key row gone.
-        assert!(
-            s.get_key("vk_delete_me").unwrap().is_none(),
-            "key row must be deleted"
-        );
-        // No orphaned usage rows in ANY window.
+        assert!(s.get_key("vk_delete_me").unwrap().is_none());
         assert_eq!(
             s.get_usage("vk_delete_me", 100).unwrap(),
-            Usage::default(),
-            "usage row in window 100 must be deleted alongside the key"
+            UsageLedger::default()
         );
         assert_eq!(
             s.get_usage("vk_delete_me", 200).unwrap(),
-            Usage::default(),
-            "usage row in window 200 must be deleted alongside the key"
+            UsageLedger::default()
         );
     }
 
     #[test]
-    fn test_delete_key_does_not_inherit_stale_usage_on_recreate() {
-        // The orphaned-usage hazard manifests as a re-created key inheriting prior usage. With the
-        // atomic delete, re-minting the same id starts from zero usage.
+    fn test_delete_key_does_not_inherit_stale_ledger_on_recreate() {
         let s = SqliteStore::open_in_memory().unwrap();
-        let mk = |id: &str| VirtualKey {
-            id: id.into(),
-            key_hash: format!("hash_{id}"),
-            name: "k".into(),
-            allowed_pools: vec![],
-            max_budget_cents: None,
-            budget_period: "total".into(),
-            rpm_limit: None,
-            tpm_limit: None,
-            enabled: true,
-            created_at: 0,
-        };
-        s.put_key(&mk("vk_reuse")).unwrap();
-        s.add_usage("vk_reuse", 100, 99, 9999, true).unwrap();
+        s.put_key(&sample_key("vk_reuse", "hash_vk_reuse")).unwrap();
+        Store::add_usage(&s, "vk_reuse", 100, &delta(1, "m", 9999, 0)).unwrap();
         s.delete_key("vk_reuse").unwrap();
-        // Re-create with the same id; the prior window's usage must NOT bleed through.
-        s.put_key(&mk("vk_reuse")).unwrap();
+        s.put_key(&sample_key("vk_reuse", "hash_vk_reuse")).unwrap();
         assert_eq!(
             s.get_usage("vk_reuse", 100).unwrap(),
-            Usage::default(),
-            "re-created key must not inherit the deleted key's usage"
+            UsageLedger::default(),
+            "re-created key must not inherit the deleted key's ledger"
         );
     }
 }

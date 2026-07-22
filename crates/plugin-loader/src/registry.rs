@@ -428,7 +428,7 @@ mod tests {
             kind: "store".into(),
             version: "1.5.0".into(),
             publisher: publisher.into(),
-            abi_version: 1,
+            abi_version: busbar_plugin_abi::ABI_VERSION,
             sha256: String::new(),
             signature: String::new(),
             description: String::new(),
@@ -664,6 +664,9 @@ mod tests {
         let dir = tmpdir("kind");
         let mut m = manifest("busbar-hook-ranker", "ranker", "busbar");
         m.kind = "hook".into();
+        // Hook plugins are still on ABI v1 (the store wire bumped to v2 with the token ledger);
+        // stamp the hook-supported version so the scan admits it and the KIND gate is what rejects.
+        m.abi_version = 1;
         let m = sign(&release, m, b"hook lib");
         write_tarball(&dir, "hook.tar.gz", &m, b"hook lib");
         let reg = scan_and_validate(&dir, &policy(&release)).expect("scan");
@@ -756,6 +759,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 1,
+            budget_group: None,
+            labels: std::collections::BTreeMap::new(),
         };
         store.put_key(&key).expect("put over the ABI");
         assert_eq!(

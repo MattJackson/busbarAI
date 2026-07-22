@@ -27,8 +27,8 @@
 //!   supervisor handle it). The Redis store implements one-shot transparent reconnect.
 
 use busbar_api::{
-    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
-    VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, ModelTokens, Store, StoreError,
+    StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row};
@@ -45,9 +45,18 @@ impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
     }
 }
 
+/// Store schema version, mirrored from the SQLite backend's `PRAGMA user_version` in a tiny
+/// `busbar_schema` table. v2 = the 1.5.0 token-ledger cost model (see the SQLite backend's
+/// `SCHEMA_VERSION` doc). 1.5.0 is unreleased, so a pre-v2 database is dropped and recreated - a
+/// bump, never a migration.
+const SCHEMA_VERSION: i64 = 2;
+
 // Same tables/columns as the SQLite backend, in Postgres types: INTEGER -> BIGINT, the enabled flag
 // as BOOLEAN. `CREATE TABLE IF NOT EXISTS` is idempotent, so migrate() is safe to run every open.
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS busbar_schema (
+    version BIGINT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS virtual_keys (
     id               TEXT PRIMARY KEY,
     key_hash         TEXT NOT NULL UNIQUE,
@@ -58,7 +67,9 @@ CREATE TABLE IF NOT EXISTS virtual_keys (
     rpm_limit        BIGINT,
     tpm_limit        BIGINT,
     enabled          BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at       BIGINT NOT NULL
+    created_at       BIGINT NOT NULL,
+    budget_group     TEXT,
+    labels           TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS aws_credentials (
     access_key_id     TEXT PRIMARY KEY,
@@ -66,13 +77,24 @@ CREATE TABLE IF NOT EXISTS aws_credentials (
     secret_access_key TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id);
-CREATE TABLE IF NOT EXISTS usage_counters (
-    key_id       TEXT NOT NULL,
+-- The TOKEN LEDGER (v2): per-(bucket, window) request counts + per-(bucket, window, model) tier
+-- token counts. `bucket_id` is a virtual key's id OR a budget-group bucket id. NO spend column:
+-- dollars are derived at read time from `ledger x rate_card` in the engine.
+CREATE TABLE IF NOT EXISTS usage_windows (
+    bucket_id    TEXT NOT NULL,
     window_start BIGINT NOT NULL,
-    spend_cents  BIGINT NOT NULL DEFAULT 0,
-    tokens       BIGINT NOT NULL DEFAULT 0,
     requests     BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (key_id, window_start)
+    PRIMARY KEY (bucket_id, window_start)
+);
+CREATE TABLE IF NOT EXISTS usage_ledger (
+    bucket_id          TEXT NOT NULL,
+    window_start       BIGINT NOT NULL,
+    model              TEXT NOT NULL,
+    tokens_input       BIGINT NOT NULL DEFAULT 0,
+    tokens_output      BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_read  BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_write BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_id, window_start, model)
 );
 CREATE TABLE IF NOT EXISTS usage_metering (
     key_id                TEXT NOT NULL,
@@ -147,9 +169,53 @@ impl PostgresStore {
     }
 
     fn migrate(&self) -> StoreResult<()> {
-        self.lock().batch_execute(SCHEMA).store()?;
+        let mut client = self.lock();
+        // SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model). A pre-v2 database - one that
+        // still carries the legacy `usage_counters` table, or a `virtual_keys` without the v2
+        // columns - is DROPPED and recreated (1.5.0 is unreleased: bump, not migrate). A fresh or
+        // already-v2 database passes straight through the idempotent CREATEs.
+        let version: i64 = client
+            .query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+            .ok()
+            .flatten()
+            .map(|r| r.get(0))
+            .unwrap_or(0);
+        if version < SCHEMA_VERSION {
+            let legacy: bool = client
+                .query_one("SELECT to_regclass('usage_counters') IS NOT NULL OR to_regclass('virtual_keys') IS NOT NULL", &[])
+                .store()?
+                .get(0);
+            if legacy {
+                client
+                    .batch_execute(
+                        "DROP TABLE IF EXISTS virtual_keys;
+                         DROP TABLE IF EXISTS aws_credentials;
+                         DROP TABLE IF EXISTS usage_counters;
+                         DROP TABLE IF EXISTS usage_windows;
+                         DROP TABLE IF EXISTS usage_ledger;
+                         DROP TABLE IF EXISTS usage_metering;
+                         DROP TABLE IF EXISTS audit_log;",
+                    )
+                    .store()?;
+            }
+        }
+        client.batch_execute(SCHEMA).store()?;
+        client
+            .execute(
+                "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+                &[&SCHEMA_VERSION],
+            )
+            .store()?;
         Ok(())
     }
+}
+
+// `labels` encoding - identical to the SQLite backend: a JSON object in the `labels TEXT` column.
+fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
+    serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
+}
+fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, String> {
+    serde_json::from_str(stored).unwrap_or_default()
 }
 
 // `allowed_pools` encoding — identical to the SQLite backend: JSON array of strings (delimiter-safe),
@@ -184,30 +250,35 @@ fn row_to_key(r: &Row) -> VirtualKey {
         tpm_limit: r.get::<_, Option<i64>>(7).map(read_u32_cap),
         enabled: r.get(8),
         created_at: read_u64(r.get::<_, i64>(9)),
+        budget_group: r.get(10),
+        labels: labels_from_storage(&r.get::<_, String>(11)),
     }
 }
 
 const KEY_COLUMNS: &str =
-    "id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at";
+    "id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels";
 
 impl Store for PostgresStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         let pools = pools_to_storage(&key.allowed_pools);
+        let labels = labels_to_storage(&key.labels);
         let rpm = key.rpm_limit.map(|v| v as i64);
         let tpm = key.tpm_limit.map(|v| v as i64);
         let created = clamp(key.created_at);
         self.lock()
             .execute(
                 "INSERT INTO virtual_keys
-                    (id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                    (id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                  ON CONFLICT (id) DO UPDATE SET
                     key_hash=EXCLUDED.key_hash, name=EXCLUDED.name, allowed_pools=EXCLUDED.allowed_pools,
                     max_budget_cents=EXCLUDED.max_budget_cents, budget_period=EXCLUDED.budget_period,
-                    rpm_limit=EXCLUDED.rpm_limit, tpm_limit=EXCLUDED.tpm_limit, enabled=EXCLUDED.enabled",
+                    rpm_limit=EXCLUDED.rpm_limit, tpm_limit=EXCLUDED.tpm_limit, enabled=EXCLUDED.enabled,
+                    budget_group=EXCLUDED.budget_group, labels=EXCLUDED.labels",
                 &[
                     &key.id, &key.key_hash, &key.name, &pools, &key.max_budget_cents,
                     &key.budget_period, &rpm, &tpm, &key.enabled, &created,
+                    &key.budget_group, &labels,
                 ],
             )
             .store()?;
@@ -233,7 +304,9 @@ impl Store for PostgresStore {
         let mut tx = client.transaction().store()?;
         tx.execute("DELETE FROM virtual_keys WHERE id=$1", &[&id])
             .store()?;
-        tx.execute("DELETE FROM usage_counters WHERE key_id=$1", &[&id])
+        tx.execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&id])
+            .store()?;
+        tx.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id])
             .store()?;
         tx.execute("DELETE FROM aws_credentials WHERE key_id=$1", &[&id])
             .store()?;
@@ -241,78 +314,130 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
+        // Read the requests row + every model row inside ONE transaction so a concurrent node's
+        // `add_usage` can never yield a torn ledger.
         let ws = clamp(window_start);
-        let row = self
-            .lock()
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let requests: u64 = tx
             .query_opt(
-                "SELECT spend_cents,tokens,requests FROM usage_counters WHERE key_id=$1 AND window_start=$2",
-                &[&key_id, &ws],
+                "SELECT requests FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
+                &[&bucket_id, &ws],
+            )
+            .store()?
+            .map(|r| read_u64(r.get::<_, i64>(0)))
+            .unwrap_or(0);
+        let rows = tx
+            .query(
+                "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
+                 FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2 ORDER BY model",
+                &[&bucket_id, &ws],
             )
             .store()?;
-        Ok(row
-            .map(|r| Usage {
-                spend_cents: r.get(0),
-                tokens: read_u64(r.get::<_, i64>(1)),
-                requests: read_u64(r.get::<_, i64>(2)),
-            })
-            .unwrap_or_default())
+        tx.commit().store()?;
+        Ok(UsageLedger {
+            requests,
+            models: rows
+                .iter()
+                .map(|r| ModelTokens {
+                    model: r.get(0),
+                    tokens: TierTokens {
+                        input: read_u64(r.get::<_, i64>(1)),
+                        output: read_u64(r.get::<_, i64>(2)),
+                        cache_read: read_u64(r.get::<_, i64>(3)),
+                        cache_write: read_u64(r.get::<_, i64>(4)),
+                    },
+                })
+                .collect(),
+        })
     }
 
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &UsageLedger,
     ) -> StoreResult<()> {
-        // ABSOLUTE overwrite (memory is authoritative): SET (not add) each counter, so a re-flush of
-        // the same in-memory cell is idempotent and never double-counts.
-        let (ws, tk, rq) = (clamp(window_start), clamp(tokens), clamp(requests));
-        self.lock()
-            .execute(
-                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-                 VALUES ($1,$2,$3,$4,$5)
-                 ON CONFLICT (key_id, window_start) DO UPDATE SET
-                    spend_cents = EXCLUDED.spend_cents,
-                    tokens      = EXCLUDED.tokens,
-                    requests    = EXCLUDED.requests",
-                &[&key_id, &ws, &spend_cents, &tk, &rq],
+        // ABSOLUTE overwrite (memory is authoritative): replace the whole (bucket, window) record -
+        // the requests row AND every model row - in ONE transaction, so a re-flush is idempotent
+        // and a reader never sees half a ledger.
+        let ws = clamp(window_start);
+        let rq = clamp(ledger.requests);
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        tx.execute(
+            "DELETE FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket_id, &ws],
+        )
+        .store()?;
+        tx.execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests)
+             VALUES ($1,$2,$3)
+             ON CONFLICT (bucket_id, window_start) DO UPDATE SET requests = EXCLUDED.requests",
+            &[&bucket_id, &ws, &rq],
+        )
+        .store()?;
+        for m in &ledger.models {
+            let (ti, to, tcr, tcw) = (
+                clamp(m.tokens.input),
+                clamp(m.tokens.output),
+                clamp(m.tokens.cache_read),
+                clamp(m.tokens.cache_write),
+            );
+            tx.execute(
+                "INSERT INTO usage_ledger
+                    (bucket_id, window_start, model,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                &[&bucket_id, &ws, &m.model, &ti, &to, &tcr, &tcw],
             )
             .store()?;
+        }
+        tx.commit().store()?;
         Ok(())
     }
 
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
-    ) -> StoreResult<()> {
-        // ADDITIVE fleet-honest accumulate: one atomic UPSERT adding each signed delta, floored at
-        // 0 (a refund can never drive a durable counter negative). N nodes flushing deltas sum to
-        // the true fleet total, where `put_usage`'s absolute overwrite is last-writer-wins.
+    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+        // ADDITIVE fleet-honest accumulate: the signed requests delta plus every per-model tier
+        // delta land in ONE transaction, each counter floored at 0 (GREATEST). N nodes flushing
+        // deltas sum to the true fleet total, where `put_usage`'s absolute overwrite is
+        // last-writer-wins. No dollar delta crosses this wire.
         let ws = clamp(window_start);
-        self.lock()
-            .execute(
-                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
-                 VALUES ($1,$2,GREATEST(0,$3),GREATEST(0,$4),GREATEST(0,$5))
-                 ON CONFLICT (key_id, window_start) DO UPDATE SET
-                    spend_cents = GREATEST(0, usage_counters.spend_cents + $3),
-                    tokens      = GREATEST(0, usage_counters.tokens + $4),
-                    requests    = GREATEST(0, usage_counters.requests + $5)",
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        tx.execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests)
+             VALUES ($1,$2,GREATEST(0,$3))
+             ON CONFLICT (bucket_id, window_start) DO UPDATE SET
+                requests = GREATEST(0, usage_windows.requests + $3)",
+            &[&bucket_id, &ws, &delta.requests],
+        )
+        .store()?;
+        for m in &delta.models {
+            tx.execute(
+                "INSERT INTO usage_ledger
+                    (bucket_id, window_start, model,
+                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write)
+                 VALUES ($1,$2,$3,GREATEST(0,$4),GREATEST(0,$5),GREATEST(0,$6),GREATEST(0,$7))
+                 ON CONFLICT (bucket_id, window_start, model) DO UPDATE SET
+                    tokens_input       = GREATEST(0, usage_ledger.tokens_input + $4),
+                    tokens_output      = GREATEST(0, usage_ledger.tokens_output + $5),
+                    tokens_cache_read  = GREATEST(0, usage_ledger.tokens_cache_read + $6),
+                    tokens_cache_write = GREATEST(0, usage_ledger.tokens_cache_write + $7)",
                 &[
-                    &key_id,
+                    &bucket_id,
                     &ws,
-                    &delta_spend_cents,
-                    &delta_tokens,
-                    &delta_requests,
+                    &m.model,
+                    &m.tokens.input,
+                    &m.tokens.output,
+                    &m.tokens.cache_read,
+                    &m.tokens.cache_write,
                 ],
             )
             .store()?;
+        }
+        tx.commit().store()?;
         Ok(())
     }
 
@@ -389,6 +514,7 @@ impl Store for PostgresStore {
     ) -> StoreResult<()> {
         // ATOMIC mint: the bearer key and its AWS credential commit together or not at all.
         let pools = pools_to_storage(&key.allowed_pools);
+        let labels = labels_to_storage(&key.labels);
         let rpm = key.rpm_limit.map(|v| v as i64);
         let tpm = key.tpm_limit.map(|v| v as i64);
         let created = clamp(key.created_at);
@@ -396,15 +522,17 @@ impl Store for PostgresStore {
         let mut tx = client.transaction().store()?;
         tx.execute(
             "INSERT INTO virtual_keys
-                (id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                (id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT (id) DO UPDATE SET
                 key_hash=EXCLUDED.key_hash, name=EXCLUDED.name, allowed_pools=EXCLUDED.allowed_pools,
                 max_budget_cents=EXCLUDED.max_budget_cents, budget_period=EXCLUDED.budget_period,
-                rpm_limit=EXCLUDED.rpm_limit, tpm_limit=EXCLUDED.tpm_limit, enabled=EXCLUDED.enabled",
+                rpm_limit=EXCLUDED.rpm_limit, tpm_limit=EXCLUDED.tpm_limit, enabled=EXCLUDED.enabled,
+                budget_group=EXCLUDED.budget_group, labels=EXCLUDED.labels",
             &[
                 &key.id, &key.key_hash, &key.name, &pools, &key.max_budget_cents,
                 &key.budget_period, &rpm, &tpm, &key.enabled, &created,
+                &key.budget_group, &labels,
             ],
         )
         .store()?;
@@ -555,6 +683,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 99,
+            budget_group: Some("growth".into()),
+            labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
         };
         store.put_key(&key).unwrap();
         let got = store.get_key("vk_pg").unwrap().unwrap();
@@ -562,24 +692,71 @@ mod tests {
         // The comma-bearing pool name survives (JSON encoding, not a bare comma split).
         assert_eq!(got.allowed_pools, vec!["prod,special".to_string()]);
         assert_eq!(got.rpm_limit, Some(60));
-
-        store.put_usage("vk_pg", 100, 42, 9, 3).unwrap();
-        let u = store.get_usage("vk_pg", 100).unwrap();
-        assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 9, 3));
-
-        // ADDITIVE fleet flush primitive: add_usage accumulates signed deltas on top (and a
-        // negative delta refunds, floored at 0).
-        store.add_usage("vk_pg", 100, 8, 1, 2).unwrap();
-        let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!(
-            (u.spend_cents, u.tokens, u.requests),
-            (50, 10, 5),
-            "add_usage accumulates deltas"
+            got.budget_group.as_deref(),
+            Some("growth"),
+            "budget_group survives the Postgres round-trip"
         );
-        store.add_usage("vk_pg", 100, -100, 0, 0).unwrap();
+        assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
+
+        // Absolute put_usage of a per-model token ledger, then read back.
+        let base = UsageLedger {
+            requests: 3,
+            models: vec![ModelTokens {
+                model: "gpt-5".into(),
+                tokens: TierTokens {
+                    input: 9,
+                    output: 4,
+                    cache_read: 2,
+                    cache_write: 1,
+                },
+            }],
+        };
+        store.put_usage("vk_pg", 100, &base).unwrap();
+        let u = store.get_usage("vk_pg", 100).unwrap();
+        assert_eq!(u.requests, 3);
+        assert_eq!(u.tokens_for("gpt-5").unwrap().input, 9);
+
+        // ADDITIVE fleet flush primitive: add_usage accumulates per-model signed deltas on top
+        // (and a negative delta refunds, floored at 0). A second model materializes its own row.
+        let mk_delta = |requests: i64, model: &str, input: i64| busbar_api::UsageDelta {
+            requests,
+            models: vec![busbar_api::ModelTokensDelta {
+                model: model.into(),
+                tokens: busbar_api::TierTokensDelta {
+                    input,
+                    output: 1,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
+        };
+        store
+            .add_usage("vk_pg", 100, &mk_delta(2, "gpt-5", 1))
+            .unwrap();
+        let u = store.get_usage("vk_pg", 100).unwrap();
+        assert_eq!(u.requests, 5, "add_usage accumulates the requests delta");
+        let t = u.tokens_for("gpt-5").unwrap();
         assert_eq!(
-            store.get_usage("vk_pg", 100).unwrap().spend_cents,
-            0,
+            (t.input, t.output),
+            (10, 5),
+            "add_usage accumulates per-model tier deltas"
+        );
+        store
+            .add_usage("vk_pg", 100, &mk_delta(0, "haiku", 7))
+            .unwrap();
+        assert_eq!(
+            store.get_usage("vk_pg", 100).unwrap().models.len(),
+            2,
+            "a second model materializes its own ledger row"
+        );
+        store
+            .add_usage("vk_pg", 100, &mk_delta(-100, "gpt-5", -10_000))
+            .unwrap();
+        let u = store.get_usage("vk_pg", 100).unwrap();
+        assert_eq!(
+            (u.requests, u.tokens_for("gpt-5").unwrap().input),
+            (0, 0),
             "an over-refund floors at 0, never negative"
         );
 
@@ -705,13 +882,12 @@ mod tests {
         );
 
         store.delete_key("vk_pg").unwrap();
-        // CASCADE: the key, its usage counters, AND its AWS credential are all gone.
+        // CASCADE: the key, its token ledger, AND its AWS credential are all gone.
         assert!(store.get_key("vk_pg").unwrap().is_none());
-        let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!(
-            (u.spend_cents, u.tokens, u.requests),
-            (0, 0, 0),
-            "delete_key must cascade to the usage counters"
+            store.get_usage("vk_pg", 100).unwrap(),
+            UsageLedger::default(),
+            "delete_key must cascade to the token ledger"
         );
         assert!(
             !store

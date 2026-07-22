@@ -120,17 +120,26 @@ fn pack(args: &[String]) -> ExitCode {
     let run = || -> Result<String, String> {
         let lib_path = required("lib")?;
         let out = required("out")?;
+        let kind = required("kind")?;
+        // Default the ABI to the NEWEST version this binary's loader supports for the kind, so a
+        // plain `pack` of a store plugin stamps the current store ABI (v2, the token-ledger wire)
+        // instead of a stale literal. `--abi-version` still overrides for cross-version packaging.
+        let default_abi = busbar_plugin_loader::supported_abi(&kind)
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(1);
         let manifest = Manifest {
             name: required("name")?,
             alias: required("alias")?,
-            kind: required("kind")?,
+            kind,
             version: required("version")?,
             publisher: required("publisher")?,
             abi_version: flags
                 .get("abi-version")
                 .map(|v| v.parse::<u32>().map_err(|e| format!("--abi-version: {e}")))
                 .transpose()?
-                .unwrap_or(1),
+                .unwrap_or(default_abi),
             sha256: String::new(),
             signature: String::new(),
             description: flags.get("description").cloned().unwrap_or_default(),
@@ -223,7 +232,11 @@ mod tests {
             kind: "store".into(),
             version: "1.0.0".into(),
             publisher: "acme".into(),
-            abi_version: 1,
+            abi_version: busbar_plugin_loader::supported_abi("store")
+                .iter()
+                .copied()
+                .max()
+                .unwrap(),
             sha256: String::new(),
             signature: String::new(),
             description: String::new(),

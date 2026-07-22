@@ -14,9 +14,14 @@
 //!   indexes them; `busbar:awscred_ids:<key_id>` maps a virtual key to its AccessKeyIds so a key delete
 //!   removes them (a revoked key's SigV4 credential must never outlive it - the same guarantee the SQL
 //!   backends enforce with a `DELETE … WHERE key_id`).
-//! - **usage counters** - `busbar:usage:<key_id>:<window_start>` is a HASH `{spend_cents, tokens,
-//!   requests}`. `put_usage` HSETs absolute values; `add_usage` HINCRBYs deltas (the fleet-additive
-//!   flush, so concurrent nodes accumulate instead of overwriting each other); `get_usage` HGETALLs.
+//! - **token ledger** - `busbar:usage:<bucket_id>:<window_start>` is a HASH holding `requests` plus
+//!   per-(model, tier) token fields `m:<model>:input|output|cache_read|cache_write`. `put_usage`
+//!   replaces the hash with absolute values; `add_usage` HINCRBYs the signed deltas (the
+//!   fleet-additive flush, so concurrent nodes accumulate instead of overwriting each other);
+//!   `get_usage` HGETALLs and parses the model fields. NO spend field: dollars are derived at read
+//!   time from `ledger x rate_card` in the engine. (Floor-at-zero parity note: the SQL backends
+//!   floor each counter at 0 IN THE WRITE; HINCRBY has no atomic floor, so a transient negative is
+//!   possible in the stored hash and is clamped to 0 ON READ - same observable floor.)
 //! - **metering** - `busbar:metering:<bucket>` is a SET of row keys; each row is a HASH accumulated
 //!   with HINCRBY (add), so concurrent responses accumulate without a read-modify-write race.
 //! - **audit** - `busbar:audit` is a SORTED SET scored by `seq`, each member the JSON [`AuditRecord`].
@@ -48,8 +53,8 @@
 //! schedule; the audit zset should be archived, not expired.
 
 use busbar_api::{
-    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
-    VirtualKey,
+    AuditRecord, AwsCredential, MeteringDelta, MeteringRow, ModelTokens, Store, StoreError,
+    StoreResult, TierTokens, UsageDelta, UsageLedger, VirtualKey,
 };
 use redis::{Commands, Connection};
 use std::sync::Mutex;
@@ -61,9 +66,25 @@ const AWSCRED_PREFIX: &str = "busbar:awscred:";
 const AWSCRED_INDEX: &str = "busbar:awscreds";
 const AWSCRED_IDS_PREFIX: &str = "busbar:awscred_ids:";
 const AUDIT_ZSET: &str = "busbar:audit";
+/// The schema-version marker key (mirrors the SQLite `PRAGMA user_version`). v2 = the 1.5.0
+/// token-ledger cost model. A pre-v2 namespace is WIPED on connect (1.5.0 unreleased: bump, not
+/// migrate).
+const SCHEMA_KEY: &str = "busbar:schema";
+const SCHEMA_VERSION: i64 = 2;
 
-fn usage_key(key_id: &str, window_start: u64) -> String {
-    format!("busbar:usage:{key_id}:{window_start}")
+fn usage_key(bucket_id: &str, window_start: u64) -> String {
+    format!("busbar:usage:{bucket_id}:{window_start}")
+}
+
+/// Hash field for one (model, tier) token counter: `m:<model>:<tier>`. Parsed with a RIGHT split on
+/// the tier so a model name containing `:` still round-trips.
+fn model_field(model: &str, tier: &str) -> String {
+    format!("m:{model}:{tier}")
+}
+
+/// Parse a `m:<model>:<tier>` hash field back into `(model, tier)`.
+fn parse_model_field(field: &str) -> Option<(&str, &str)> {
+    field.strip_prefix("m:")?.rsplit_once(':')
 }
 fn metering_set(bucket: u64) -> String {
     format!("busbar:metering:{bucket}")
@@ -140,11 +161,41 @@ impl RedisStore {
         let conn = client
             .get_connection()
             .map_err(|e| StoreError(scrub(e.to_string(), secret.as_deref())))?;
-        Ok(Self {
+        let store = Self {
             client,
             conn: Mutex::new(Some(conn)),
             secret,
-        })
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model): a `busbar:*` namespace written
+    /// by a pre-v2 build (no/older `busbar:schema` marker but governance keys present) is WIPED and
+    /// re-marked - 1.5.0 is unreleased, so this is a bump, never a migration. A fresh namespace is
+    /// simply marked; a v2 namespace passes through untouched.
+    fn migrate(&self) -> StoreResult<()> {
+        let version: i64 = self
+            .with_conn(|c| c.get::<_, Option<i64>>(SCHEMA_KEY))?
+            .unwrap_or(0);
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let existing: Vec<String> = self.with_conn(|c| {
+            c.scan_match::<_, String>("busbar:*")?
+                .collect::<Result<Vec<String>, _>>()
+        })?;
+        if !existing.is_empty() {
+            self.with_conn(|c| {
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for k in &existing {
+                    pipe.del(k).ignore();
+                }
+                pipe.query::<()>(c)
+            })?;
+        }
+        self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION))
     }
 
     /// Run `f` against the live connection, transparently reconnecting ONCE on a connection-level
@@ -276,74 +327,112 @@ impl Store for RedisStore {
         })
     }
 
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
-        let k = usage_key(key_id, window_start);
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
+        let k = usage_key(bucket_id, window_start);
         let fields: Vec<(String, i64)> = self.with_conn(|c| c.hgetall(&k))?;
         if fields.is_empty() {
-            return Ok(Usage::default());
+            return Ok(UsageLedger::default());
         }
-        let mut u = Usage::default();
+        let mut ledger = UsageLedger::default();
         for (name, v) in fields {
-            match name.as_str() {
-                "spend_cents" => u.spend_cents = v,
-                "tokens" => u.tokens = read_u64(v),
-                "requests" => u.requests = read_u64(v),
+            if name == "requests" {
+                ledger.requests = read_u64(v);
+                continue;
+            }
+            let Some((model, tier)) = parse_model_field(&name) else {
+                continue;
+            };
+            let entry = match ledger.models.iter_mut().find(|m| m.model == model) {
+                Some(m) => m,
+                None => {
+                    ledger.models.push(ModelTokens {
+                        model: model.to_string(),
+                        tokens: TierTokens::default(),
+                    });
+                    ledger.models.last_mut().expect("just pushed")
+                }
+            };
+            match tier {
+                "input" => entry.tokens.input = read_u64(v),
+                "output" => entry.tokens.output = read_u64(v),
+                "cache_read" => entry.tokens.cache_read = read_u64(v),
+                "cache_write" => entry.tokens.cache_write = read_u64(v),
                 _ => {}
             }
         }
-        Ok(u)
+        // Deterministic order (mirrors the SQL backends' ORDER BY model).
+        ledger.models.sort_by(|a, b| a.model.cmp(&b.model));
+        Ok(ledger)
     }
 
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &UsageLedger,
     ) -> StoreResult<()> {
-        // ABSOLUTE set: HSET the three fields to the caller's snapshot (idempotent re-put). The
-        // fleet-additive flush path uses `add_usage` instead.
-        let k = usage_key(key_id, window_start);
-        let items: [(&str, i64); 3] = [
-            ("spend_cents", spend_cents),
-            ("tokens", clamp(tokens)),
-            ("requests", clamp(requests)),
-        ];
-        self.with_conn(|c| c.hset_multiple(&k, &items))
+        // ABSOLUTE set: DEL + HSET the whole ledger in ONE atomic MULTI/EXEC so a re-put is
+        // idempotent, a stale model field never lingers, and a reader never sees half a ledger.
+        // The fleet-additive flush path uses `add_usage` instead.
+        let k = usage_key(bucket_id, window_start);
+        self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            pipe.del(&k).ignore();
+            pipe.hset(&k, "requests", clamp(ledger.requests)).ignore();
+            for m in &ledger.models {
+                pipe.hset(&k, model_field(&m.model, "input"), clamp(m.tokens.input))
+                    .ignore();
+                pipe.hset(&k, model_field(&m.model, "output"), clamp(m.tokens.output))
+                    .ignore();
+                pipe.hset(
+                    &k,
+                    model_field(&m.model, "cache_read"),
+                    clamp(m.tokens.cache_read),
+                )
+                .ignore();
+                pipe.hset(
+                    &k,
+                    model_field(&m.model, "cache_write"),
+                    clamp(m.tokens.cache_write),
+                )
+                .ignore();
+            }
+            pipe.query(c)
+        })
     }
 
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
-    ) -> StoreResult<()> {
-        // ADDITIVE accumulate: HINCRBY each field by the caller's DELTA, atomically as one
-        // MULTI/EXEC - the fleet-honest write: N nodes flushing deltas sum to the true fleet total
-        // instead of last-writer-wins overwriting each other.
-        let k = usage_key(key_id, window_start);
+    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+        // ADDITIVE accumulate: HINCRBY the requests delta plus every per-(model, tier) token delta,
+        // atomically as one MULTI/EXEC - the fleet-honest write: N nodes flushing deltas sum to the
+        // true fleet total instead of last-writer-wins overwriting each other. No dollar delta
+        // crosses this wire. (A transient negative is clamped to 0 on read - see the crate doc.)
+        let k = usage_key(bucket_id, window_start);
         self.with_conn(|c| {
-            redis::pipe()
-                .atomic()
-                .cmd("HINCRBY")
-                .arg(&k)
-                .arg("spend_cents")
-                .arg(delta_spend_cents)
-                .ignore()
-                .cmd("HINCRBY")
-                .arg(&k)
-                .arg("tokens")
-                .arg(delta_tokens)
-                .ignore()
-                .cmd("HINCRBY")
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            pipe.cmd("HINCRBY")
                 .arg(&k)
                 .arg("requests")
-                .arg(delta_requests)
-                .ignore()
-                .query(c)
+                .arg(delta.requests)
+                .ignore();
+            for m in &delta.models {
+                for (tier, v) in [
+                    ("input", m.tokens.input),
+                    ("output", m.tokens.output),
+                    ("cache_read", m.tokens.cache_read),
+                    ("cache_write", m.tokens.cache_write),
+                ] {
+                    if v != 0 {
+                        pipe.cmd("HINCRBY")
+                            .arg(&k)
+                            .arg(model_field(&m.model, tier))
+                            .arg(v)
+                            .ignore();
+                    }
+                }
+            }
+            pipe.query(c)
         })
     }
 
@@ -599,6 +688,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 99,
+            budget_group: Some("growth".into()),
+            labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
         }
     }
 
@@ -615,22 +706,90 @@ mod tests {
         // The comma-bearing pool name survives (whole-key JSON, not a bare comma split).
         assert_eq!(got.allowed_pools, vec!["prod,special".to_string()]);
         assert_eq!(got.rpm_limit, Some(60));
+        assert_eq!(
+            got.budget_group.as_deref(),
+            Some("growth"),
+            "budget_group survives the redis JSON round-trip"
+        );
+        assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
         assert!(store
             .list_keys()
             .unwrap()
             .iter()
             .any(|k| k.id == "vk_redis"));
 
-        // Usage: absolute HSET round-trips; additive HINCRBY accumulates on top.
-        store.put_usage("vk_redis", 100, 42, 9, 3).unwrap();
+        // Token ledger: absolute put (DEL + HSET) round-trips; additive HINCRBY accumulates on top.
+        let base = UsageLedger {
+            requests: 3,
+            models: vec![ModelTokens {
+                model: "gpt-5".into(),
+                tokens: TierTokens {
+                    input: 9,
+                    output: 4,
+                    cache_read: 2,
+                    cache_write: 1,
+                },
+            }],
+        };
+        store.put_usage("vk_redis", 100, &base).unwrap();
         let u = store.get_usage("vk_redis", 100).unwrap();
-        assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 9, 3));
-        store.add_usage("vk_redis", 100, 8, 1, 2).unwrap();
-        let u = store.get_usage("vk_redis", 100).unwrap();
+        assert_eq!(u.requests, 3);
+        let t = u.tokens_for("gpt-5").unwrap();
         assert_eq!(
-            (u.spend_cents, u.tokens, u.requests),
-            (50, 10, 5),
-            "add_usage accumulates deltas onto the durable record"
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (9, 4, 2, 1)
+        );
+        store
+            .add_usage(
+                "vk_redis",
+                100,
+                &busbar_api::UsageDelta {
+                    requests: 2,
+                    models: vec![busbar_api::ModelTokensDelta {
+                        model: "gpt-5".into(),
+                        tokens: busbar_api::TierTokensDelta {
+                            input: 1,
+                            output: 1,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    }],
+                },
+            )
+            .unwrap();
+        let u = store.get_usage("vk_redis", 100).unwrap();
+        assert_eq!(u.requests, 5, "add_usage accumulates the requests delta");
+        let t = u.tokens_for("gpt-5").unwrap();
+        assert_eq!(
+            (t.input, t.output),
+            (10, 5),
+            "add_usage accumulates per-model tier deltas onto the durable record"
+        );
+        // A second model materializes its own fields; a model name CONTAINING ':' round-trips.
+        store
+            .add_usage(
+                "vk_redis",
+                100,
+                &busbar_api::UsageDelta {
+                    requests: 0,
+                    models: vec![busbar_api::ModelTokensDelta {
+                        model: "org:custom:model".into(),
+                        tokens: busbar_api::TierTokensDelta {
+                            input: 7,
+                            output: 0,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    }],
+                },
+            )
+            .unwrap();
+        let u = store.get_usage("vk_redis", 100).unwrap();
+        assert_eq!(u.models.len(), 2);
+        assert_eq!(
+            u.tokens_for("org:custom:model").unwrap().input,
+            7,
+            "a colon-bearing model name survives the hash-field encoding"
         );
 
         // Metering: HINCRBY accumulation across two responses on the same row.
@@ -697,7 +856,10 @@ mod tests {
         // Delete removes the key, its usage, and its AWS creds - atomically (one MULTI/EXEC).
         store.delete_key("vk_redis").unwrap();
         assert!(store.get_key("vk_redis").unwrap().is_none());
-        assert_eq!(store.get_usage("vk_redis", 100).unwrap(), Usage::default());
+        assert_eq!(
+            store.get_usage("vk_redis", 100).unwrap(),
+            UsageLedger::default()
+        );
         assert!(
             !store
                 .list_aws_credentials()
