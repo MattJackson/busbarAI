@@ -5520,7 +5520,7 @@ fn write_response_exception_folds_to_stream_union_members() {
 
 /// FINDING 3 [P1] REGRESSION: The native AWS Bedrock ConverseStream `ContentBlockStart$start`
 /// union only models `toolUse`, so a real AWS stream sends NO `contentBlockStart` for a text
-/// block — the block is implied by the first `contentBlockDelta` carrying `text`. The reader's
+/// block; the block is implied by the first `contentBlockDelta` carrying `text`. The reader's
 /// text-delta arm previously emitted a `BlockDelta` with NO preceding `BlockStart`, producing an
 /// orphaned `content_block_delta` at index 0 (breaking the block-event contract when translating
 /// Bedrock ConverseStream -> Anthropic-style block events). The text arm must lazily open a Text

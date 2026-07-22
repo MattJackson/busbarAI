@@ -124,7 +124,7 @@ impl ProtocolWriter for CohereWriter {
             // `User`-role message (Anthropic/Gemini carry tool_results on the user turn in the IR).
             // Cohere v2 `/chat` represents EVERY tool result as its own `role:"tool"` message with a
             // `tool_call_id`; a Cohere user message cannot carry tool results. So the emission must
-            // gate on the PRESENCE of a ToolResult block, not on the carrying role — otherwise
+            // gate on the PRESENCE of a ToolResult block, not on the carrying role; otherwise
             // Anthropic/Gemini -> Cohere silently drops tool results and breaks multi-turn tool use.
             let has_tool_result = msg
                 .content
@@ -133,8 +133,8 @@ impl ProtocolWriter for CohereWriter {
             if msg.role == crate::ir::IrRole::Tool || has_tool_result {
                 // Emit one Cohere tool message per ToolResult block. Any plain text carried
                 // alongside the tool results (and the degenerate case of a Tool turn with NO
-                // ToolResult block at all) must NOT be silently dropped: fold that text in — onto
-                // the first tool message if there is one, otherwise as a standalone tool message —
+                // ToolResult block at all) must NOT be silently dropped: fold that text in, onto
+                // the first tool message if there is one, otherwise as a standalone tool message,
                 // so the turn is never lossy.
                 let mut emitted_tool_result = false;
                 for block in &msg.content {
