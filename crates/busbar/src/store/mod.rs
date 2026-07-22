@@ -297,7 +297,7 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// OWNER-CHECKED variant of `release_probe_in`: reverts the undispatched probe ONLY when the cell's
     /// probe epoch still equals `owned_epoch`. Used by the `ProbeGuard` drop path (the one release site
     /// that can outlive its acquisition across an await, so the one that can be stale). A strict no-op
-    /// when the epoch has moved on — the probe we won was already consumed or superseded.
+    /// when the epoch has moved on - the probe we won was already consumed or superseded.
     fn release_probe_owned_in(&self, pool: &str, lane: usize, owned_epoch: u64);
     // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
     // ALL dispatch (including the degraded `forward_once` fallback/least-bad path) now routes through

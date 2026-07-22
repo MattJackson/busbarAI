@@ -128,7 +128,7 @@ pub(crate) struct ProbeGuard<'a> {
     pub(crate) lane: usize,
     pub(crate) armed: bool,
     /// The probe-epoch (owner token) captured when this guard won the probe. Because a guard can be
-    /// dropped LATE — after parking on the permit-wait await while the cell moved on — the drop uses
+    /// dropped LATE - after parking on the permit-wait await while the cell moved on - the drop uses
     /// the OWNER-CHECKED `release_probe_owned_in` so a stale release cannot revert a NEWER probe (P2
     /// #4). It is a strict no-op unless the cell's epoch still matches this captured value.
     pub(crate) probe_epoch: u64,
@@ -329,7 +329,7 @@ pub(crate) async fn pick_among(
             pool: pool_name,
             lane: picked_lane_idx,
             armed: true,
-            // Capture the owner token NOW — synchronously right after winning, before any await, so the
+            // Capture the owner token NOW - synchronously right after winning, before any await, so the
             // read sees exactly the probe we won (the cell is HalfOpen, single-flight; no peer can win a
             // new one in between). A late guard-drop then only reverts THIS probe, never a successor.
             probe_epoch: app.store.probe_epoch_in(pool_name, picked_lane_idx),

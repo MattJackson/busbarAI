@@ -91,8 +91,8 @@ fn disarmed_guard_leaves_probe_held() {
     );
 }
 
-/// REGRESSION (P2 #4): a STALLED armed guard — one that won an earlier probe, then dropped LATE after
-/// the cell already recorded an outcome AND a NEW probe was won — must NOT revert the fresh winner's
+/// REGRESSION (P2 #4): a STALLED armed guard - one that won an earlier probe, then dropped LATE after
+/// the cell already recorded an outcome AND a NEW probe was won - must NOT revert the fresh winner's
 /// probe. Its owner-checked Drop keys on the epoch captured at acquisition, so once that epoch is
 /// superseded the release is a strict no-op and the current probe owner keeps its HalfOpen cell.
 #[test]
@@ -108,7 +108,7 @@ fn stalled_guard_does_not_release_a_newer_probe() {
         probe_epoch: store.probe_epoch_in("", 0),
     };
     // The probe A won is CONSUMED by a recorded outcome (success → cell_closed), then the lane trips
-    // Open and expires again so a fresh probe can be won — bumping the epoch past A's captured value.
+    // Open and expires again so a fresh probe can be won - bumping the epoch past A's captured value.
     store.record_success_in("", 0);
     store.force_open_in("", 0, 0);
     assert!(
@@ -124,6 +124,6 @@ fn stalled_guard_does_not_release_a_newer_probe() {
     assert!(
         matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
         "a stalled guard from a superseded probe must NOT revert the current probe owner's HalfOpen \
-         cell — the owner check makes its late Drop a no-op"
+         cell - the owner check makes its late Drop a no-op"
     );
 }

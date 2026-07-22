@@ -346,7 +346,7 @@ pub(crate) struct LaneState {
     // FSM state per lane
     pub(crate) breaker_state: AtomicU64, // stored as u64 (ST_CLOSED/ST_OPEN/ST_HALF_OPEN) so it can be CAS'd
     pub(crate) probe_in_flight: AtomicBool,
-    // Single-flight probe owner token — see `BreakerCell::probe_epoch`.
+    // Single-flight probe owner token - see `BreakerCell::probe_epoch`.
     pub(crate) probe_epoch: AtomicU64,
     // SWRR state per lane
     pub(crate) current_weight: AtomicI64,
@@ -891,15 +891,15 @@ impl InMemoryStore {
     /// OWNER-CHECKED probe release: the same revert as [`cell_release_probe`], but a strict NO-OP
     /// unless `owned_epoch` still equals the cell's current `probe_epoch`. This closes the stalled-
     /// release duplication (P2 finding #4): a `ProbeGuard` can outlive its acquisition across the
-    /// permit-wait await, so it may drop LATE — after the cell already recorded an outcome (advancing
+    /// permit-wait await, so it may drop LATE - after the cell already recorded an outcome (advancing
     /// past the probe) and a NEW probe was won (bumping the epoch). The un-owned `cell_release_probe`
     /// would then CAS the FRESH winner's HalfOpen back to Open and clear its `probe_in_flight`, letting
     /// a third caller win a duplicate concurrent probe on an already-probing lane. Checking the epoch
-    /// under the transition lock — the epoch is bumped under the same lock in `cell_acquire_breaker` —
+    /// under the transition lock - the epoch is bumped under the same lock in `cell_acquire_breaker` -
     /// makes a late release affect only the probe it actually won, and nothing once that probe is gone.
     pub(crate) fn cell_release_probe_owned(c: &dyn BreakerCellAccess, owned_epoch: u64) {
         let _tx = lock_recover(c.transition_lock());
-        // Not (still) the owner: the probe we won has already been consumed/superseded. Do nothing —
+        // Not (still) the owner: the probe we won has already been consumed/superseded. Do nothing -
         // reverting here would clobber whatever transition or newer probe now holds the cell.
         if c.probe_epoch().load(Ordering::Acquire) != owned_epoch {
             return;
@@ -985,7 +985,7 @@ impl InMemoryStore {
                     {
                         // Won the single-flight probe: bump the owner-token epoch BEFORE publishing the
                         // in-flight flag. The winner will read `probe_epoch` (synchronously, before any
-                        // await — the cell is HalfOpen so no peer can win a new probe in between) and
+                        // await - the cell is HalfOpen so no peer can win a new probe in between) and
                         // pass it to `cell_release_probe_owned`, which reverts ONLY on an epoch match.
                         // Bumping under the transition lock keeps it paired with the state store.
                         c.probe_epoch().fetch_add(1, Ordering::AcqRel);
@@ -2144,7 +2144,7 @@ impl StateStore for InMemoryStore {
                 // transition lock. They are two separate atomics that a trip/close/probe writes
                 // together; a lock-free pair of loads can straddle a concurrent transition and observe
                 // an INCONSISTENT pair (e.g. Open with a cleared/short cooldown), which this snapshot
-                // then PERSISTS — on restore a hard-down lane would be revived as receiving traffic.
+                // then PERSISTS - on restore a hard-down lane would be revived as receiving traffic.
                 // Holding the same lock the write path holds, for BOTH loads at once, makes the pair
                 // move as a unit (P2 finding #5). Released immediately; the remaining fields are
                 // independent counters with no cross-field invariant.
@@ -2181,7 +2181,7 @@ impl StateStore for InMemoryStore {
                                 cells
                                     .iter()
                                     .map(|(pool, cell)| {
-                                        // Same consistent-pair read as the default cell above — the
+                                        // Same consistent-pair read as the default cell above - the
                                         // per-pool cell's (state, cooldown) is written together under its
                                         // own transition lock, so snapshot both under one hold (P2 #5).
                                         let (breaker_state, cooldown_until) = {
