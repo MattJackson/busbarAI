@@ -102,11 +102,11 @@ impl std::fmt::Debug for AwsCredential {
 /// verify the inbound SigV4 signature. Returned by `GovState::lookup_by_access_key_id`. Carries a
 /// manual redacting `Debug` for the same reason as `AwsCredential` — the secret must never reach a log.
 ///
-/// NOT `Serialize`/`Deserialize` — deliberately. Unlike `VirtualKey`/`AwsCredential` (which the redis
+/// NOT `Serialize`/`Deserialize` - deliberately. Unlike `VirtualKey`/`AwsCredential` (which the redis
 /// store round-trips as JSON, so their derives are a load-bearing PERSISTENCE contract that must stay
 /// faithful), this is a purely in-memory lookup return type built fresh from the store on each hydrate
 /// (`GovState::hydrate_aws_index`). It is never persisted or wire-encoded, so a serde derive would add
-/// no capability — only a latent way for a future `serde_json::to_*` on it to emit the plaintext
+/// no capability - only a latent way for a future `serde_json::to_*` on it to emit the plaintext
 /// `secret_access_key`. Withholding the derive makes that leak a COMPILE error, not a runtime footgun.
 #[derive(Clone, PartialEq)]
 pub struct AwsKeyEntry {
@@ -339,8 +339,8 @@ mod tests {
         }
     }
 
-    /// REGRESSION (P2): the redacting `Debug` — the guard for the structured-logging surface, since
-    /// `tracing` records fields via `Debug`/`Display`, never serde — must NEVER emit the secret-
+    /// REGRESSION (P2): the redacting `Debug` - the guard for the structured-logging surface, since
+    /// `tracing` records fields via `Debug`/`Display`, never serde - must NEVER emit the secret-
     /// equivalent `key_hash` / `secret_access_key`. This is the leak the finding is about: any place a
     /// record reaches a log must show presence only.
     #[test]
@@ -388,7 +388,10 @@ mod tests {
     fn serialize_roundtrip_is_faithful_for_persistence() {
         let key = sample_key();
         let json = serde_json::to_string(&key).unwrap();
-        assert!(json.contains("deadbeefdeadbeef"), "persistence must keep key_hash");
+        assert!(
+            json.contains("deadbeefdeadbeef"),
+            "persistence must keep key_hash"
+        );
         let back: VirtualKey = serde_json::from_str(&json).unwrap();
         assert_eq!(key, back);
 

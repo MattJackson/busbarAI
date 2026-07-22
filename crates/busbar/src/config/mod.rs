@@ -1861,7 +1861,7 @@ pub(crate) struct LimitsCfg {
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub(crate) tls_handshake_timeout_secs: u64,
     /// Max time (seconds) allowed BETWEEN inbound request-body frames before the connection is
-    /// dropped — the slow-loris body defense the header-read timeout does not cover. See
+    /// dropped - the slow-loris body defense the header-read timeout does not cover. See
     /// `DEFAULT_REQUEST_BODY_READ_TIMEOUT_SECS`.
     #[serde(default = "default_request_body_read_timeout_secs")]
     pub(crate) request_body_read_timeout_secs: u64,

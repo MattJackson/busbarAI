@@ -55,7 +55,7 @@ fn handshake_timeout() -> Duration {
 }
 
 /// Max wall-clock time allowed BETWEEN inbound request-body frames before the connection is dropped.
-/// The header-read timeout (`hardened_conn_builder`) covers ONLY the header phase — once headers are
+/// The header-read timeout (`hardened_conn_builder`) covers ONLY the header phase - once headers are
 /// complete an unauthenticated slow-loris can dribble the request BODY one byte at a time, holding a
 /// connection task, an FD, AND (critically) one of the finite `max_inbound_concurrent` (default 8192)
 /// permits indefinitely, starving real traffic. `DefaultBodyLimit` caps total SIZE, not TIME between
@@ -245,7 +245,7 @@ pub(crate) async fn serve(
 /// An inbound-body wrapper that bounds the wall-clock time between successive frames. Wraps the
 /// hyper `Incoming` body; each `poll_frame` races the inner poll against a `body_read_timeout()`
 /// timer that is RESET on every delivered frame. If no frame arrives within the bound, the body
-/// yields an error, which hyper surfaces as a connection error — dropping the stalled connection and
+/// yields an error, which hyper surfaces as a connection error - dropping the stalled connection and
 /// freeing its task, FD, and inbound-concurrency permit. A body that keeps delivering frames on time
 /// is passed through unchanged, so a slow-but-progressing large upload is never falsely killed; only
 /// a stall (no bytes for `timeout`) trips it. `SizeHint`/`is_end_stream` delegate to the inner body
@@ -275,7 +275,10 @@ struct BodyReadTimeout;
 
 impl std::fmt::Display for BodyReadTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "inbound request body read timed out (slow-loris body bound)")
+        write!(
+            f,
+            "inbound request body read timed out (slow-loris body bound)"
+        )
     }
 }
 impl std::error::Error for BodyReadTimeout {}
@@ -329,7 +332,7 @@ where
 /// A hyper `Service` that wraps every inbound request's body in a [`TimeoutBody`] before delegating
 /// to the axum router (bridged by `TowerToHyperService`). This is the seam that installs the
 /// body-read slow-loris bound on BOTH the TLS and plain serve loops, without touching the router or
-/// the routing hot path — the router sees an ordinary `http_body::Body`, just one that fails on a
+/// the routing hot path - the router sees an ordinary `http_body::Body`, just one that fails on a
 /// stalled inbound stream.
 #[derive(Clone)]
 struct BodyTimeoutService {
@@ -347,18 +350,15 @@ impl BodyTimeoutService {
 }
 
 impl hyper::service::Service<hyper::Request<hyper::body::Incoming>> for BodyTimeoutService {
-    type Response =
-        <TowerToHyperService<Router> as hyper::service::Service<
-            hyper::Request<TimeoutBody<hyper::body::Incoming>>,
-        >>::Response;
-    type Error =
-        <TowerToHyperService<Router> as hyper::service::Service<
-            hyper::Request<TimeoutBody<hyper::body::Incoming>>,
-        >>::Error;
-    type Future =
-        <TowerToHyperService<Router> as hyper::service::Service<
-            hyper::Request<TimeoutBody<hyper::body::Incoming>>,
-        >>::Future;
+    type Response = <TowerToHyperService<Router> as hyper::service::Service<
+        hyper::Request<TimeoutBody<hyper::body::Incoming>>,
+    >>::Response;
+    type Error = <TowerToHyperService<Router> as hyper::service::Service<
+        hyper::Request<TimeoutBody<hyper::body::Incoming>>,
+    >>::Error;
+    type Future = <TowerToHyperService<Router> as hyper::service::Service<
+        hyper::Request<TimeoutBody<hyper::body::Incoming>>,
+    >>::Future;
 
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
         let timeout = self.timeout;
@@ -760,7 +760,7 @@ mod tests {
         );
     }
 
-    /// TEST 5 — REGRESSION (P1 slow-loris BODY): the inbound body-read timeout trips on a stalled
+    /// TEST 5 - REGRESSION (P1 slow-loris BODY): the inbound body-read timeout trips on a stalled
     /// request body. Before the fix, only the header-read phase was bounded; a client that finished
     /// its headers then dribbled (here: never sent) the promised body would pin the connection task,
     /// its FD, and one of the finite inbound-concurrency permits INDEFINITELY. This drives the plain
@@ -775,8 +775,10 @@ mod tests {
 
         // Install a SHORT body-read timeout (1s) so the test is fast; leave every other limit at its
         // historical default so no other limits test is perturbed.
-        let mut limits = crate::config::LimitsResolved::default();
-        limits.request_body_read_timeout_secs = 1;
+        let limits = crate::config::LimitsResolved {
+            request_body_read_timeout_secs: 1,
+            ..crate::config::LimitsResolved::default()
+        };
         crate::limits::install(&limits);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -791,29 +793,29 @@ mod tests {
                 "/echo",
                 axum::routing::post(|body: String| async move { body }),
             );
-            super::serve_plain(listener, router, shutdown).await.unwrap();
+            super::serve_plain(listener, router, shutdown)
+                .await
+                .unwrap();
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
         // Headers announce a 100-byte body; we send NONE of it, then stall.
-        sock.write_all(
-            b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n",
-        )
-        .await
-        .unwrap();
+        sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n")
+            .await
+            .unwrap();
         sock.flush().await.unwrap();
 
         // The server must close the connection (read yields EOF/reset) once the body-read bound (1s)
         // elapses with no body forthcoming. Bound the whole wait generously (5s): pre-fix this would
         // hang until the test's own deadline. `read` returning Ok(0) is a clean EOF; an Err is a
-        // reset — either proves the server tore the stalled connection down.
+        // reset - either proves the server tore the stalled connection down.
         let mut buf = [0u8; 256];
         let outcome = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await;
         match outcome {
-            Ok(Ok(0)) => {}                // clean EOF: server closed the stalled connection
-            Ok(Ok(_n)) => {}              // server may first write a 4xx/408-ish response, then close
-            Ok(Err(_)) => {}             // connection reset: also acceptable
+            Ok(Ok(0)) => {}  // clean EOF: server closed the stalled connection
+            Ok(Ok(_n)) => {} // server may first write a 4xx/408-ish response, then close
+            Ok(Err(_)) => {} // connection reset: also acceptable
             Err(_) => panic!(
                 "body-read timeout did NOT trip: the server kept the stalled-body connection open \
                  past the deadline (slow-loris body regression)"

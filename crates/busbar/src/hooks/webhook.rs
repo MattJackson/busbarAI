@@ -85,7 +85,7 @@ impl WebhookPolicy {
         // A reqwest error carries the request URL (WITH any operator-embedded `user:pass@` userinfo)
         // in its own `Display`. This error is boxed into `PolicyError` and later logged verbatim
         // (`error = %e`) by the seam's on_error fallback, so strip the URL from the error with
-        // `without_url()` before boxing — the credential must never reach the log. Parity with the
+        // `without_url()` before boxing - the credential must never reach the log. Parity with the
         // request-log/OTLP userinfo hardening.
         let resp = self
             .client
@@ -389,7 +389,7 @@ mod tests {
     /// REGRESSION (P2 finding 4, routing-webhook radius): a transport error from `decide()` is boxed
     /// into `PolicyError` and later logged verbatim (`error = %e`) by the seam's on_error fallback. If
     /// the operator embedded `user:pass@` userinfo in the sidecar URL, the reqwest error's own Display
-    /// would carry it — so the boxed error must have its URL stripped (`without_url`) before it can
+    /// would carry it - so the boxed error must have its URL stripped (`without_url`) before it can
     /// reach a log. Point the policy at an unroutable userinfo URL, force a transport error, and assert
     /// the resulting PolicyError's Display contains no credential.
     #[tokio::test]

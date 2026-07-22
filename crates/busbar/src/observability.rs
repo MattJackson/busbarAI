@@ -512,7 +512,7 @@ pub(crate) fn fire_request_log(payload: Value) {
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
-                // Mask any embedded userinfo in the logged URL — parity with the OTLP path. An
+                // Mask any embedded userinfo in the logged URL - parity with the OTLP path. An
                 // operator may embed `user:pass@` in the webhook URL (RFC 3986 §3.2.1); logging it
                 // raw on every delivery failure would leak the credential into the log.
                 tracing::warn!(
@@ -1027,7 +1027,7 @@ mod tests {
 
     /// REGRESSION (P2 finding 4): the request-log webhook DELIVERY-FAILURE warn must mask any
     /// embedded userinfo in BOTH the `webhook_url` field AND the reqwest error's Display (`error_kind`).
-    /// The OTLP path was hardened; this one was not — a webhook URL with `user:pass@` was logged
+    /// The OTLP path was hardened; this one was not - a webhook URL with `user:pass@` was logged
     /// verbatim on every delivery failure. This drives a real delivery against an unroutable userinfo
     /// URL, captures the emitted warn fields, and asserts the credential never appears.
     #[tokio::test]
@@ -1039,7 +1039,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // A userinfo URL whose host is guaranteed unroutable (RFC 5737 TEST-NET-1) so the POST fails
-        // fast with a transport error — the branch under test. We call the delivery inline (not via
+        // fast with a transport error - the branch under test. We call the delivery inline (not via
         // the global-`OnceLock` `fire_request_log`) so the test is isolated from other tests that set
         // the process-wide webhook, while exercising the SAME masked log statement.
         let url = "https://user:hunter2@192.0.2.1/log";

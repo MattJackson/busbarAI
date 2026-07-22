@@ -1125,7 +1125,7 @@ pub(crate) fn validate_with_unset(
         // OR-fold into a PHANTOM principal id (cross-principal misattribution in audit/hooks/governance).
         // The module now de-duplicates defensively so at most one position can match, but a duplicate in
         // the config is still almost certainly an operator mistake (a copy-paste, or the belief that two
-        // callers have distinct tokens when they share one). Warn at boot so it is visible — the dedup
+        // callers have distinct tokens when they share one). Warn at boot so it is visible - the dedup
         // means the SECOND+ occurrence is inert and its intended caller shares the first's principal id.
         {
             let mut seen = std::collections::HashSet::new();
@@ -1153,7 +1153,7 @@ pub(crate) fn validate_with_unset(
         // `upstream_credentials: passthrough` with a NON-EMPTY configured api_key on a provider is a
         // configuration foot-gun: the proxy engine selects the upstream key as
         // `caller_token.unwrap_or("")` (see `proxy::engine::walk`, LOW #15), so under passthrough the
-        // configured `api_key` is NEVER forwarded — a caller presents their OWN token, or (if absent)
+        // configured `api_key` is NEVER forwarded - a caller presents their OWN token, or (if absent)
         // an EMPTY credential the provider 401/403s. The configured key is therefore INERT dead config
         // whose presence suggests the operator expected static-key gating (`upstream_credentials: own`)
         // but wired passthrough. WARN (not hard-reject): a legit Bedrock-ingress passthrough provider

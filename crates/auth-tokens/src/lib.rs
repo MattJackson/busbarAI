@@ -28,7 +28,7 @@ impl TokensModule {
     /// requirement, not just tidiness. The principal id minted on a match is the matched allowlist
     /// position, accumulated in `authenticate` by bitwise-OR of the 1-based indices of ALL matching
     /// entries. If the SAME token appeared twice (say positions 1 and 2) BOTH would match a presented
-    /// candidate and the OR-fold would yield `1 | 2 == 3` — a PHANTOM principal id belonging to
+    /// candidate and the OR-fold would yield `1 | 2 == 3` - a PHANTOM principal id belonging to
     /// neither entry (and, worse, colliding with a legitimately-distinct token at position 3). That
     /// cross-principal misattribution would then flow into the audit log, hooks, and governance keying.
     /// Collapsing to distinct digests guarantees AT MOST ONE entry can match, so the OR-fold is always
@@ -114,18 +114,14 @@ mod tests {
 
     /// REGRESSION (P1): a DUPLICATE token must never mint a phantom principal id. Before the dedup
     /// fix, a token duplicated at positions 1 and 2 matched BOTH, and the OR-fold produced
-    /// `1 | 2 == 3` — a `tokens:3` principal belonging to neither entry and colliding with a
+    /// `1 | 2 == 3` - a `tokens:3` principal belonging to neither entry and colliding with a
     /// distinct token legitimately at position 3. After the fix the duplicate collapses to a single
     /// entry, so the presented token mints exactly `tokens:1` and the distinct third token keeps
     /// `tokens:2` (its post-dedup position), with no phantom `tokens:3` ever reachable.
     #[test]
     fn duplicate_token_does_not_mint_phantom_principal() {
-        let m = TokensModule::new(&[
-            "dup".to_string(),
-            "dup".to_string(),
-            "distinct".to_string(),
-        ]);
-        // The duplicated token mints its FIRST position only — never the OR-collision `tokens:3`.
+        let m = TokensModule::new(&["dup".to_string(), "dup".to_string(), "distinct".to_string()]);
+        // The duplicated token mints its FIRST position only - never the OR-collision `tokens:3`.
         assert_eq!(id_of(m.authenticate(Some("dup"))), "tokens:1");
         // The distinct token that followed two identical entries lands at post-dedup position 2,
         // NOT the phantom `tokens:3` the pre-fix OR-fold would have made reachable.
