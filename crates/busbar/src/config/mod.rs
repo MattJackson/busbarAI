@@ -1746,6 +1746,12 @@ pub(crate) const DEFAULT_MAX_HONORED_RETRY_AFTER_SECS: u64 = 86_400;
 pub(crate) const DEFAULT_UPSTREAM_ERROR_BODY_MAX_BYTES: usize = 256 * 1024;
 /// Default TLS handshake wall-clock bound (seconds). Mirrors `tls.rs`.
 pub(crate) const DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Default inbound request-BODY read bound (seconds): the max time allowed BETWEEN inbound body
+/// frames before the connection is dropped. Bounds a slow-loris that dribbles the request body one
+/// byte at a time (the header-read timeout only covers the header phase). Mirrors `tls.rs`. 30s is
+/// far longer than any real client needs to send its next body chunk, so it cannot false-positive on
+/// a healthy upload.
+pub(crate) const DEFAULT_REQUEST_BODY_READ_TIMEOUT_SECS: u64 = 30;
 /// Default global fallback for the translation-injected `max_tokens` (mirrors `proto::DEFAULT_MAX_TOKENS`).
 pub(crate) const DEFAULT_DEFAULT_MAX_TOKENS: u32 = 4096;
 /// Default max concurrent webhook deliveries. Mirrors `observability.rs`.
@@ -1792,6 +1798,9 @@ fn default_upstream_error_body_max_bytes() -> usize {
 }
 fn default_tls_handshake_timeout_secs() -> u64 {
     DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS
+}
+fn default_request_body_read_timeout_secs() -> u64 {
+    DEFAULT_REQUEST_BODY_READ_TIMEOUT_SECS
 }
 fn default_default_max_tokens() -> u32 {
     DEFAULT_DEFAULT_MAX_TOKENS
@@ -1851,6 +1860,11 @@ pub(crate) struct LimitsCfg {
     pub(crate) upstream_error_body_max_bytes: usize,
     #[serde(default = "default_tls_handshake_timeout_secs")]
     pub(crate) tls_handshake_timeout_secs: u64,
+    /// Max time (seconds) allowed BETWEEN inbound request-body frames before the connection is
+    /// dropped - the slow-loris body defense the header-read timeout does not cover. See
+    /// `DEFAULT_REQUEST_BODY_READ_TIMEOUT_SECS`.
+    #[serde(default = "default_request_body_read_timeout_secs")]
+    pub(crate) request_body_read_timeout_secs: u64,
     #[serde(default = "default_max_honored_retry_after_secs")]
     pub(crate) max_honored_retry_after_secs: u64,
     #[serde(default = "default_default_max_tokens")]
@@ -1914,6 +1928,7 @@ impl Default for LimitsCfg {
             hard_down_cooldown_secs: default_hard_down_cooldown_secs(),
             upstream_error_body_max_bytes: default_upstream_error_body_max_bytes(),
             tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
+            request_body_read_timeout_secs: default_request_body_read_timeout_secs(),
             max_honored_retry_after_secs: default_max_honored_retry_after_secs(),
             default_max_tokens: default_default_max_tokens(),
             reasoning_effort_budgets: ReasoningEffortBudgets::default(),
@@ -1984,6 +1999,7 @@ pub(crate) struct LimitsResolved {
     pub(crate) hard_down_cooldown_secs: u64,
     pub(crate) upstream_error_body_max_bytes: usize,
     pub(crate) tls_handshake_timeout_secs: u64,
+    pub(crate) request_body_read_timeout_secs: u64,
     pub(crate) max_honored_retry_after_secs: u64,
     pub(crate) default_max_tokens: u32,
     pub(crate) reasoning_effort_budgets: ReasoningEffortBudgets,
@@ -2029,6 +2045,7 @@ impl LimitsResolved {
             hard_down_cooldown_secs: limits.hard_down_cooldown_secs,
             upstream_error_body_max_bytes: limits.upstream_error_body_max_bytes,
             tls_handshake_timeout_secs: limits.tls_handshake_timeout_secs,
+            request_body_read_timeout_secs: limits.request_body_read_timeout_secs,
             max_honored_retry_after_secs: limits.max_honored_retry_after_secs,
             default_max_tokens: limits.default_max_tokens,
             reasoning_effort_budgets: limits.reasoning_effort_budgets,

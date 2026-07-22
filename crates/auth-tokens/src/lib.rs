@@ -23,10 +23,25 @@ pub struct TokensModule {
 
 impl TokensModule {
     /// Pre-hash the allowlist once. `sha256_hex` is the same digest facility used for virtual keys.
+    ///
+    /// DUPLICATE tokens are DE-DUPLICATED here (first occurrence wins), which is a CORRECTNESS
+    /// requirement, not just tidiness. The principal id minted on a match is the matched allowlist
+    /// position, accumulated in `authenticate` by bitwise-OR of the 1-based indices of ALL matching
+    /// entries. If the SAME token appeared twice (say positions 1 and 2) BOTH would match a presented
+    /// candidate and the OR-fold would yield `1 | 2 == 3` - a PHANTOM principal id belonging to
+    /// neither entry (and, worse, colliding with a legitimately-distinct token at position 3). That
+    /// cross-principal misattribution would then flow into the audit log, hooks, and governance keying.
+    /// Collapsing to distinct digests guarantees AT MOST ONE entry can match, so the OR-fold is always
+    /// an unambiguous single position. `dedup` after a stable sort would reorder ids; instead we keep
+    /// first-seen order (and thus stable 1-based ids across restarts) with a seen-set filter.
     pub fn new(tokens: &[String]) -> Self {
-        Self {
-            hashed_tokens: tokens.iter().map(|t| sha256_hex(t.as_bytes())).collect(),
-        }
+        let mut seen = std::collections::HashSet::new();
+        let hashed_tokens = tokens
+            .iter()
+            .map(|t| sha256_hex(t.as_bytes()))
+            .filter(|h| seen.insert(h.clone()))
+            .collect();
+        Self { hashed_tokens }
     }
 }
 
@@ -63,5 +78,62 @@ impl AuthModule for TokensModule {
         } else {
             AuthOutcome::Reject
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id_of(outcome: AuthOutcome) -> String {
+        match outcome {
+            AuthOutcome::Identify(p) => p.id,
+            other => panic!("expected Identify, got {other:?}"),
+        }
+    }
+
+    /// A single distinct token mints the 1-based position as its principal id.
+    #[test]
+    fn single_token_mints_position_one() {
+        let m = TokensModule::new(&["alpha".to_string()]);
+        assert_eq!(id_of(m.authenticate(Some("alpha"))), "tokens:1");
+    }
+
+    /// Distinct tokens each mint their own stable, first-seen 1-based position.
+    #[test]
+    fn distinct_tokens_mint_their_own_positions() {
+        let m = TokensModule::new(&[
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ]);
+        assert_eq!(id_of(m.authenticate(Some("alpha"))), "tokens:1");
+        assert_eq!(id_of(m.authenticate(Some("bravo"))), "tokens:2");
+        assert_eq!(id_of(m.authenticate(Some("charlie"))), "tokens:3");
+    }
+
+    /// REGRESSION (P1): a DUPLICATE token must never mint a phantom principal id. Before the dedup
+    /// fix, a token duplicated at positions 1 and 2 matched BOTH, and the OR-fold produced
+    /// `1 | 2 == 3` - a `tokens:3` principal belonging to neither entry and colliding with a
+    /// distinct token legitimately at position 3. After the fix the duplicate collapses to a single
+    /// entry, so the presented token mints exactly `tokens:1` and the distinct third token keeps
+    /// `tokens:2` (its post-dedup position), with no phantom `tokens:3` ever reachable.
+    #[test]
+    fn duplicate_token_does_not_mint_phantom_principal() {
+        let m = TokensModule::new(&["dup".to_string(), "dup".to_string(), "distinct".to_string()]);
+        // The duplicated token mints its FIRST position only - never the OR-collision `tokens:3`.
+        assert_eq!(id_of(m.authenticate(Some("dup"))), "tokens:1");
+        // The distinct token that followed two identical entries lands at post-dedup position 2,
+        // NOT the phantom `tokens:3` the pre-fix OR-fold would have made reachable.
+        assert_eq!(id_of(m.authenticate(Some("distinct"))), "tokens:2");
+    }
+
+    /// An unmatched candidate is Rejected; an absent/empty candidate Passes (defers).
+    #[test]
+    fn unmatched_rejects_absent_passes() {
+        let m = TokensModule::new(&["alpha".to_string()]);
+        assert!(matches!(m.authenticate(Some("nope")), AuthOutcome::Reject));
+        assert!(matches!(m.authenticate(Some("")), AuthOutcome::Pass));
+        assert!(matches!(m.authenticate(None), AuthOutcome::Pass));
     }
 }

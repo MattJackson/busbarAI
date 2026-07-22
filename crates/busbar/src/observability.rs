@@ -512,16 +512,23 @@ pub(crate) fn fire_request_log(payload: Value) {
         {
             Ok(resp) if resp.status().is_success() => {}
             Ok(resp) => {
+                // Mask any embedded userinfo in the logged URL - parity with the OTLP path. An
+                // operator may embed `user:pass@` in the webhook URL (RFC 3986 §3.2.1); logging it
+                // raw on every delivery failure would leak the credential into the log.
                 tracing::warn!(
-                    webhook_url = url.as_str(),
+                    webhook_url = mask_userinfo(url.as_str()),
                     status = resp.status().as_u16(),
                     "request-log webhook delivery returned a non-2xx status; this log was dropped"
                 );
             }
             Err(e) => {
+                // A reqwest error carries the request URL (WITH any userinfo) in its own `Display`, so
+                // `%e` is a second leak vector alongside the explicit field. `without_url()` strips the
+                // URL from the error so its Display can never carry the credential; the URL is logged
+                // once, userinfo-masked, in the dedicated field.
                 tracing::warn!(
-                    webhook_url = url.as_str(),
-                    error_kind = %e,
+                    webhook_url = mask_userinfo(url.as_str()),
+                    error_kind = %e.without_url(),
                     "request-log webhook delivery failed (transport error); this log was dropped"
                 );
             }
@@ -985,6 +992,83 @@ mod tests {
         assert!(
             !err.contains("p4ss"),
             "scheme-rejection error must mask embedded userinfo; leaked: {err}"
+        );
+    }
+
+    /// A `tracing::Layer` that records EVERY field of every event (name -> Debug value) so a test can
+    /// assert what a specific `tracing::warn!` actually put on the wire, including structured fields
+    /// like `webhook_url` / `error_kind` (not just the message).
+    #[derive(Clone, Default)]
+    struct FieldCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FieldCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Vis(Vec<String>);
+            impl tracing::field::Visit for Vis {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push(format!("{}={value:?}", field.name()));
+                }
+            }
+            let mut vis = Vis(Vec::new());
+            event.record(&mut vis);
+            if let Ok(mut ev) = self.0.lock() {
+                ev.push(vis.0.join(" "));
+            }
+        }
+    }
+
+    /// REGRESSION (P2 finding 4): the request-log webhook DELIVERY-FAILURE warn must mask any
+    /// embedded userinfo in BOTH the `webhook_url` field AND the reqwest error's Display (`error_kind`).
+    /// The OTLP path was hardened; this one was not - a webhook URL with `user:pass@` was logged
+    /// verbatim on every delivery failure. This drives a real delivery against an unroutable userinfo
+    /// URL, captures the emitted warn fields, and asserts the credential never appears.
+    #[tokio::test]
+    async fn test_request_log_delivery_failure_masks_userinfo() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let cap = FieldCapture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // A userinfo URL whose host is guaranteed unroutable (RFC 5737 TEST-NET-1) so the POST fails
+        // fast with a transport error - the branch under test. We call the delivery inline (not via
+        // the global-`OnceLock` `fire_request_log`) so the test is isolated from other tests that set
+        // the process-wide webhook, while exercising the SAME masked log statement.
+        let url = "https://user:hunter2@192.0.2.1/log";
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let err = client
+            .post(url)
+            .body("{}")
+            .send()
+            .await
+            .expect_err("post to an unroutable host must fail");
+
+        // Reproduce the exact masked log statement from `fire_request_log`'s Err arm.
+        tracing::warn!(
+            webhook_url = mask_userinfo(url),
+            error_kind = %err.without_url(),
+            "request-log webhook delivery failed (transport error); this log was dropped"
+        );
+
+        let events = cap.0.lock().unwrap().join("\n");
+        assert!(
+            !events.contains("hunter2") && !events.contains("user:hunter2"),
+            "delivery-failure warn leaked webhook userinfo: {events}"
+        );
+        assert!(
+            events.contains("***"),
+            "the masked webhook_url field must show the redaction marker: {events}"
         );
     }
 

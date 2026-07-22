@@ -61,6 +61,14 @@ pub(crate) fn tls_handshake_timeout_secs() -> u64 {
         .unwrap_or(crate::config::DEFAULT_TLS_HANDSHAKE_TIMEOUT_SECS)
 }
 
+/// Inbound request-BODY inter-frame read bound (seconds), read per served connection in `tls`. Bounds
+/// a slow-loris that dribbles the request body after headers are complete.
+pub(crate) fn request_body_read_timeout_secs() -> u64 {
+    get()
+        .map(|l| l.request_body_read_timeout_secs)
+        .unwrap_or(crate::config::DEFAULT_REQUEST_BODY_READ_TIMEOUT_SECS)
+}
+
 /// Cap on a buffered upstream ERROR / verbatim-relay body (bytes).
 pub(crate) fn upstream_error_body_max_bytes() -> usize {
     get()

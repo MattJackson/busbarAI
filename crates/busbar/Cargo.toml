@@ -79,6 +79,11 @@ sonic-rs = "0.5"
 serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 futures = "0.3"
 bytes = "1"
+# The `http_body::Body` trait, so the TLS/plain serve loops can wrap the inbound request body in a
+# per-frame read timeout (`tls::TimeoutBody`) - the slow-loris body defense the header-read timeout
+# does not cover. Already in the graph transitively (hyper/http-body-util); named directly here so we
+# can `impl Body`.
+http-body = "1"
 http-body-util = "0.1"
 metrics = "0.24.6"
 # busbar uses this purely as an in-process recorder: `PrometheusBuilder::new().install_recorder()`

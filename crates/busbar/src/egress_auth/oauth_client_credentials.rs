@@ -124,12 +124,15 @@ impl ClientCreds {
             ])
             .send()
             .await
-            .map_err(|e| format!("token endpoint request failed: {e}"))?;
+            // `without_url()`: a reqwest error carries the token-endpoint URL (with any operator-
+            // embedded user:pass@ userinfo) in its Display; this string is surfaced in retry warns, so
+            // strip the URL from the error before formatting it.
+            .map_err(|e| format!("token endpoint request failed: {}", e.without_url()))?;
         let status = resp.status();
         let body = resp
             .text()
             .await
-            .map_err(|e| format!("reading token response failed: {e}"))?;
+            .map_err(|e| format!("reading token response failed: {}", e.without_url()))?;
         if !status.is_success() {
             // Never echo the request (carries the client_secret); status + a short snippet only.
             return Err(format!(
