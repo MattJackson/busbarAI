@@ -665,7 +665,7 @@ pub(crate) use dispatch::operation_ingress;
 // methods on this surface (e.g. `countTokens`, `embedContent`, `batchGenerateContent`) are an
 // intentional, documented limitation rather than a relayed call. They return the native NOT_FOUND
 // envelope so the failure mode is at least Gemini-shaped.
-#[tracing::instrument(name = "gemini_ingress", skip_all)]
+#[tracing::instrument(level = "debug", name = "gemini_ingress", skip_all)]
 pub(crate) async fn gemini_ingress(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(rest): Path<String>,
@@ -920,7 +920,7 @@ fn query_has_alt_sse(query: &str) -> bool {
 // POST /model/:modelId/converse — Bedrock Converse ingress (non-streaming). The model lives in the
 // path (URL-encoded — Bedrock model ids contain `.` and `:`), and the non-`-stream` endpoint means
 // stream=false.
-#[tracing::instrument(name = "bedrock_converse", skip_all)]
+#[tracing::instrument(level = "debug", name = "bedrock_converse", skip_all)]
 pub(crate) async fn bedrock_converse(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(model_id): Path<String>,
@@ -947,7 +947,7 @@ pub(crate) async fn bedrock_converse(
 // CRC32-valid frame per event via `eventstream::encode_frame`, wired through
 // `StreamTranslate::ingress_eventstream`) so a native AWS SDK Bedrock client decodes the response as
 // ConverseStream.
-#[tracing::instrument(name = "bedrock_converse_stream", skip_all)]
+#[tracing::instrument(level = "debug", name = "bedrock_converse_stream", skip_all)]
 pub(crate) async fn bedrock_converse_stream(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(model_id): Path<String>,
@@ -1038,7 +1038,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 // POST /<name>/v1/messages   — name resolves to a pool (weighted) or a single model
-#[tracing::instrument(name = "named", skip_all, fields(pool = %name))]
+#[tracing::instrument(level = "debug", name = "named", skip_all, fields(pool = %name))]
 pub(crate) async fn named(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(name): Path<String>,
@@ -1165,7 +1165,7 @@ pub(crate) async fn named(
 }
 
 // POST /<provider>/<model>/v1/messages — ad-hoc direct
-#[tracing::instrument(name = "adhoc", skip_all, fields(provider = %provider, model = %model))]
+#[tracing::instrument(level = "debug", name = "adhoc", skip_all, fields(provider = %provider, model = %model))]
 pub(crate) async fn adhoc(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path((provider, model)): Path<(String, String)>,

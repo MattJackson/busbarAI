@@ -23,7 +23,9 @@ pub(crate) struct UsageSink {
 /// streaming responses.
 pub(crate) struct FirstByteBody<S, P> {
     inner: S,
-    first_byte_sent: Arc<AtomicBool>,
+    // Plain bool: the flag is only ever read/written from the stream's own poll context (the
+    // Arc<AtomicBool> capability was never shared with anyone) — no alloc, no atomics.
+    first_byte_sent: bool,
     /// True when the upstream body is an incremental stream (SSE or AWS event-stream). Drives the
     /// after-first-byte error-emission behavior (vs. propagating the error for pre-first-byte
     /// failover). Derived from the UPSTREAM Content-Type.
@@ -125,7 +127,7 @@ where
         let ingress_proto = crate::proto::protocol_for(ingress_protocol);
         Self {
             inner,
-            first_byte_sent: Arc::new(AtomicBool::new(false)),
+            first_byte_sent: false,
             is_sse,
             // Whether the client expects a binary event-stream body (Bedrock) rather than SSE text.
             // Dispatches through the `ingress_is_eventstream` vtable method so this constructor carries
@@ -172,8 +174,8 @@ where
         loop {
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    if !this.first_byte_sent.load(Ordering::Relaxed) {
-                        this.first_byte_sent.store(true, Ordering::Relaxed);
+                    if !this.first_byte_sent {
+                        this.first_byte_sent = true;
                     }
                     // cross-protocol → translate egress SSE bytes to the ingress format. SAME-protocol
                     // (Change B) → `t.feed` returns the VERBATIM original frame bytes. Billing now reads
@@ -258,7 +260,7 @@ where
                     // Drop-time token billing (both this SSE arm and the non-SSE arm below), symmetric
                     // with the terminal-error / abort no-bill gates. (audit M3.)
                     this.stream_failed = true;
-                    let had_first = this.first_byte_sent.load(Ordering::Relaxed);
+                    let had_first = this.first_byte_sent;
                     if had_first && this.is_sse {
                         // Mid-stream failure after first byte in SSE mode: record breaker failure then emit SSE error event
                         if let Some(ref app) = this.app {
@@ -421,8 +423,7 @@ where
                         .and_then(|t| t.terminal_error())
                         .is_some();
                     let breaker_failed = stream_terminal_error || translate_aborted;
-                    if this.is_sse && this.first_byte_sent.load(Ordering::Relaxed) && breaker_failed
-                    {
+                    if this.is_sse && this.first_byte_sent && breaker_failed {
                         if let Some(app) = this.app.as_ref() {
                             // Distinguish the two failure lineages in the recorded reason so the
                             // R25 terminal-error path and this R26 translate-abort sibling remain
