@@ -864,9 +864,9 @@ The default `store: memory` is ephemeral RAM (keys, budgets, and usage reset on 
 
 | `store` | Plugin library | `db_path` target |
 |---|---|---|
-| `sqlite` | `libbusbar_store_sqlite_plugin.{so,dll,dylib}` | SQLite file path (default `busbar-governance.db`) — single-node durable. |
-| `postgres` | `libbusbar_store_postgres_plugin.{so,dll,dylib}` | `postgres://` libpq URL — shared across a cluster. |
-| `redis` | `libbusbar_store_redis_plugin.{so,dll,dylib}` | `redis://` URL — shared across a cluster. |
+| `sqlite` | `libbusbar_store_sqlite_plugin.{so,dll,dylib}` | SQLite file path (default `busbar-governance.db`); single-node durable. |
+| `postgres` | `libbusbar_store_postgres_plugin.{so,dll,dylib}` | `postgres://` libpq URL; shared across a cluster. |
+| `redis` | `libbusbar_store_redis_plugin.{so,dll,dylib}` | `redis://` URL; shared across a cluster. |
 
 If the configured store's plugin is not present in `plugins_dir`, busbar fails to start with a message naming the expected library file. Set `store: memory` (no plugin) to run without a durable backend.
 

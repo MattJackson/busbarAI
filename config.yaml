@@ -262,12 +262,12 @@ pools:
 # instead of the static `auth` tokens above. Each key carries allowed-pools (403), a spend budget
 # (429 when exceeded, or 400 for Bedrock ingress), and RPM/TPM rate limits (429). There is no `enabled`
 # switch. The store defaults to ephemeral RAM (keys/budgets reset on restart); choose a durable `store`
-# for persistence — each durable backend is a plugin dropped in `plugins_dir`.
+# for persistence; each durable backend is a plugin dropped in `plugins_dir`.
 # governance:
 #   admin_token: "$BUSBAR_ADMIN_TOKEN"        # ACTIVATES enforcement; guards /api/v1/admin/keys; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
 #   price_per_request_cents: 1                # flat per-request budget charge
 #   price_per_1k_tokens_cents: 50             # plus per-1000-token charge (from response usage)
-#   # store: memory                          # default — ephemeral RAM; omit for the default
+#   # store: memory                          # default (ephemeral RAM); omit for the default
 #   # For persistence, pick a durable store (a loadable plugin in plugins_dir) and its db_path target:
 #   # store: sqlite                          # single-node durable
 #   # db_path: /var/lib/busbar/governance.db
