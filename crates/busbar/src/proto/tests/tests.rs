@@ -802,13 +802,17 @@ fn test_stream_roundtrip_identity() {
     // (the reader dispatches on the SSE `event:` header, not `data.type`, so the field is dropped
     // on read and re-synthesized by the writer — exact-equality holds with `type` present in the
     // fixture).
+    // Native Anthropic seeds `input:{}` on a tool_use `content_block_start` so an SDK accumulator
+    // initializes the partial-json buffer before the first `input_json_delta`; the writer emits that
+    // seed, so the fixture must carry it for exact-equality round-trip.
     let data = serde_json::json!({
         "type": "content_block_start",
         "index": 0,
         "content_block": {
             "type": "tool_use",
             "id": "tool_123",
-            "name": "get_weather"
+            "name": "get_weather",
+            "input": {}
         }
     });
     let ev = reader.read_response_event("content_block_start", &data);
@@ -1985,13 +1989,16 @@ mod ir_property_tests {
         // (matching the SSE `event:` header) that `AnthropicWriter` now emits; the reader drops it
         // (it dispatches on the header, not `data.type`) and the writer re-synthesizes it, so the
         // same-protocol round-trip stays byte-identical with `type` present in the fixture.
+        // Native Anthropic seeds `input:{}` on a tool_use `content_block_start`; the writer emits it,
+        // so the fixture carries it for the byte-identical same-protocol round-trip.
         let data = serde_json::json!({
             "type": "content_block_start",
             "index": 0,
             "content_block": {
                 "type": "tool_use",
                 "id": "call_123",
-                "name": "get_weather"
+                "name": "get_weather",
+                "input": {}
             }
         });
         let ev = reader.read_response_event("content_block_start", &data);
