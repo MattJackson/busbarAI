@@ -944,7 +944,11 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 // No usable lane — whether the members were tripped before this request
                 // arrived or excluded during its failover attempts, apply the configured
                 // exhaustion mode (Status503 / FallbackPool / LeastBad) with loop prevention.
-                return handle_exhaustion_for_pool(
+                // Box::pin: the exhaustion future (~2.1 KB) is COLD (no usable lane), but awaited
+                // inline it alone sets this fn's coroutine union max — boxing it shrinks the
+                // per-request future every happy-path request carries; the alloc only happens on
+                // the already-degraded path. (Same pattern as walk.rs's recursive box.)
+                return Box::pin(handle_exhaustion_for_pool(
                     app.clone(),
                     &cands,
                     now(),
@@ -956,7 +960,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                     op,
                     req_content_type,
                     usage_sink.clone(),
-                )
+                ))
                 .await;
             }
         };
@@ -2174,7 +2178,9 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         }
     }
 
-    handle_exhaustion_for_pool(
+    // Box::pin: cold path (candidates exhausted), boxed for the same coroutine-size reason as the
+    // in-loop exhaustion return above — the happy path never allocates here.
+    Box::pin(handle_exhaustion_for_pool(
         app.clone(),
         &cands,
         now(),
@@ -2186,7 +2192,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         op,
         req_content_type,
         usage_sink,
-    )
+    ))
     .await
 }
 
