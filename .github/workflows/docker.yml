@@ -114,11 +114,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # PGO release build (scripts/pgo-build.sh): instrumented build → on-host training (native-arch
-      # runner, so the musl-static instrumented binary executes locally) → optimized build. FAIL-OPEN:
-      # if any PGO phase fails the script logs loudly and falls back to a plain
-      # `cargo build --release`, always producing a binary at target/pgo/<target>/release/busbar.
-      - name: Build static binary (PGO, fail-open)
+      # PGO release build (scripts/pgo-build.sh): instrumented build -> on-host training (native-arch
+      # runner, so the musl-static instrumented binary executes locally) -> optimized build.
+      # FAIL-CLOSED: PGO is MANDATORY. If any PGO phase fails the script exits non-zero and this
+      # step (and the job) FAILS - it never falls back to a plain `cargo build --release`. On
+      # success the script writes a proof marker at target/pgo/<target>/release/busbar.pgo-verified
+      # which the verification step below asserts, so a non-PGO binary can never ship green.
+      - name: Build static binary (PGO, required/fail-closed)
         env:
           PGO_TARGET: ${{ matrix.target }}
           # musl-gcc drives both the C compiles (bundled SQLite) and the final link.
@@ -138,12 +140,40 @@ jobs:
           je_cv_gcc_sync_atomics: "yes"
           je_cv_gcc_u8_sync_atomics: "yes"
         run: |
+          set -euo pipefail
           scripts/pgo-build.sh
           file "target/pgo/${{ matrix.target }}/release/busbar"
-          # Fail loudly if the binary is not fully static — FROM scratch has no loader.
+          # Fail loudly if the binary is not fully static - FROM scratch has no loader.
           if ldd "target/pgo/${{ matrix.target }}/release/busbar" 2>&1 | grep -qv 'not a dynamic\|statically linked'; then
             echo "binary is dynamically linked; refusing to ship in FROM scratch" && exit 1
           fi
+
+      # POSITIVE PGO GATE: pgo-build.sh writes this marker ONLY after a non-empty merged profile
+      # was fed to a successful -Cprofile-use build. Asserting it here (not just the script's exit
+      # code) means a release cannot ship a non-PGO binary and still pass. Any missing/empty/
+      # unverified marker fails the job and blocks the release.
+      - name: Verify PGO was applied (marker gate)
+        run: |
+          set -euo pipefail
+          marker="target/pgo/${{ matrix.target }}/release/busbar.pgo-verified"
+          if [ ! -s "$marker" ]; then
+            echo "::error::PGO proof marker missing or empty at $marker - refusing to ship a non-PGO binary" >&2
+            exit 1
+          fi
+          echo "--- PGO proof marker ---"
+          cat "$marker"
+          grep -q '^pgo-verified=1$' "$marker" || { echo "::error::marker not marked verified" >&2; exit 1; }
+          bytes="$(grep '^profile_bytes=' "$marker" | cut -d= -f2)"
+          raw="$(grep '^profraw_count=' "$marker" | cut -d= -f2)"
+          if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+            echo "::error::merged profile was empty (profile_bytes=$bytes) - build was not PGO-optimized" >&2
+            exit 1
+          fi
+          if [ -z "$raw" ] || [ "$raw" -le 0 ] 2>/dev/null; then
+            echo "::error::no .profraw files fed the profile (profraw_count=$raw) - build was not PGO-optimized" >&2
+            exit 1
+          fi
+          echo "PGO verified: ${bytes} bytes of merged profile from ${raw} .profraw file(s)."
 
       - uses: actions/upload-artifact@v7
         with:
