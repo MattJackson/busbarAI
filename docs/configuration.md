@@ -440,7 +440,7 @@ pools:
 | `attempt_timeout_ms` | integer | no | the model's value | Per-attempt time-to-response-headers cap for this member **in this pool**, overriding the model-level `attempt_timeout_ms`. Lets the same model carry different hang tolerances per pool (e.g. `10000` in a batch pool, `50` in a latency-critical one). Must be ≥ 1 when set (0 is a startup error). See [Per-attempt timeouts](#per-attempt-timeouts-attempt_timeout_ms). |
 | `reasoning` | bool | no | the model's value | Per-pool override of the model-level `reasoning` capability flag (member wins), so the same lane can allow thinking in a research pool and refuse it in a latency-critical one. See [Cross-protocol reasoning](#cross-protocol-reasoning-reasoning). |
 | `tier` | string | no | none | Operator-declared routing tier label (e.g. `"primary"`, `"overflow"`, `"large"`, `"small"`). Inert for plain weighted pools (no hooks). Exposed to gate hooks as the `tier` field on each candidate. See [Pool `hooks`](#pool-hooks-ordering-and-gates). |
-| `cost_per_mtok` | float | no | none | Operator-declared cost in currency units per million tokens. Drives the `cheapest` ordering strategy and is exposed to gate hooks. Inert when unset or for plain weighted pools. |
+| `cost_per_mtok` | float or map | no | none | Two shapes: a bare NUMBER (abstract cost units per million tokens - a routing-only signal for the `cheapest` ordering strategy and gate hooks, never billing), or the 4-tier rate map `{ input_utok, output_utok, cache_read_utok, cache_write_utok }` (micro-units per token, the `governance.rate_card` entry shape) - a per-member BILLING RATE OVERRIDE for this member's resolved upstream model (requires `governance.rate_card` to be present; the routing scalar then derives as `(input + output) / 2`). Inert when unset. |
 | `tags` | list<string> | no | `[]` | Free-form string labels (e.g. `["opus", "large-context"]`). The `restrict` gate verb intersects the candidate set against these tags (compliance pinning). Exposed to gate hooks for tag-based candidate selection. Inert for plain weighted pools. |
 
 Selection uses Nginx-style smooth weighted round-robin (SWRR) across the healthy subset. A tripped, dead, or capacity-exhausted member is skipped and its share redistributes to the remaining members automatically. Selection state is isolated per-pool (separate SWRR shard), so unrelated pools that share a lane select independently.
@@ -811,7 +811,17 @@ governance:
   # store: memory        # default — ephemeral RAM; omit for the default
   admin_token: "${BUSBAR_ADMIN_TOKEN}"   # set this to ACTIVATE enforcement
   price_per_request_cents: 1
-  price_per_1k_tokens_cents: 50
+  # Per-model RATE CARD (optional; ALL-OR-NOTHING - see "Cost model" below). Rates are ABSTRACT
+  # cost units in MICRO-units per token, split by pricing tier; busbar attaches no currency.
+  # rate_card:
+  #   gpt-5:                 { input_utok: 2.5, output_utok: 10, cache_read_utok: 0.25, cache_write_utok: 3.125 }
+  #   gemini-3.6-flash:      { input_utok: 1.5, output_utok: 7.5 }
+  # Nestable BUDGET GROUPS (optional): enforced caps ABOVE the per-key budget. Keys bind with the
+  # mint field `budget_group`; enforcement walks key -> group -> parent -> ... and ALL must pass.
+  # budget_groups:
+  #   acme:   { max_budget_cents: 10000000, budget_period: monthly }
+  #   growth: { max_budget_cents: 2000000,  budget_period: monthly, parent: acme }
+  #   bob:    { max_budget_cents: 500000,   budget_period: monthly, parent: growth }
   # For persistence, choose a durable store PLUGIN (requires the top-level `plugins.enabled: true`
   # and the store's signed tarball in `plugins.dir` - see the "Plugins" section):
   # store: sqlite                            # single-node durable (alias of busbar-store-sqlite)
@@ -829,18 +839,28 @@ governance:
 | `store` | string | no | `memory` | `memory`, or a plugin ALIAS or CANONICAL NAME | Backend for keys + counters. `memory` (default) is the compiled-in ephemeral RAM store (resets on restart). Anything else names a STORE PLUGIN resolved from the `plugins.*` registry: the shipped first-party stores by alias (`sqlite`, `postgres`, `redis`) or canonical name (`busbar-store-<x>`), or a third-party store by its manifest name. A non-`memory` store requires `plugins.enabled: true` (else a boot error naming the flag). |
 | `admin_token` | string | no | none (governance INERT, admin API disabled) | Must be non-empty (non-whitespace) when present | The activation gate. Absent = governance inert (static `auth` chain applies, no admin API). Present = enforcement on; guards the `/api/v1/admin/keys` API. A blank/whitespace-only value is a startup error. |
 | `db_path` | string | no | `busbar-governance.db` | n/a | Connection target for a durable store: a SQLite file path (`store: sqlite`), or a libpq/redis URL (`store: postgres` / `redis`). Unused for `store: memory`. |
-| `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
-| `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
+| `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents, abstract minor units). Charged pre-forward at admission; orthogonal to the per-token `rate_card`. |
+| `rate_card` | map | no | absent (token pricing = 0) | See "Cost model" below | Per-model, per-tier token rates in MICRO-units (1e-6 abstract cost unit) per token: `model: { input_utok, output_utok, cache_read_utok, cache_write_utok }` (an omitted tier prices 0). ALL-OR-NOTHING: absent = every model's tokens price at 0 (budgets count only the flat fee); present = AUTHORITATIVE and COMPLETE - every configured model must have an entry or boot/`--validate` fail with a paste-ready stub of the missing models. No `default` bucket. Replaces the removed `price_per_1k_tokens_cents` (a stale key is a loud boot error). |
+| `budget_groups` | map | no | empty | Acyclic, parents exist, depth <= 8, valid periods | Nestable enforcement buckets above the per-key budget: `name: { max_budget_cents, budget_period, parent? }`. A key binds via the mint field `budget_group` (never bare `group` - that name belongs to the auth `group_map`, which has OPPOSITE union semantics). Enforcement is AND / most-restrictive across the whole chain; each bucket uses its own `budget_period` window; the 429 names the exhausted bucket. Groups exist ONLY for enforced caps - for pure reporting rollups use key `labels` + external aggregation. |
 | `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. Applies to `store: sqlite`. |
 | `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
 | `usage_flush_interval_ms` | integer | no | `100` | n/a | Write-behind flush cadence (milliseconds) for the in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this many ms of accrued spend/requests can be lost; a graceful shutdown flushes fully. Only relevant with a durable `store`. |
 
-**Budget spend per request:** `price_per_request_cents + (total_tokens / 1000) * price_per_1k_tokens_cents`.
+#### Cost model (1.5.0): tokens are the ledger, dollars are derived
+
+**The store accumulates immutable TOKEN counts per (bucket, window, model, tier)** - input, output, cache-read, and cache-write tokens, each priced differently. Every spend figure (enforcement, admin reads, metrics, hooks) is COMPUTED at read time as `tokens x current rate_card` plus `requests x price_per_request_cents` (key buckets only). No dollar amount is ever stored as truth, so **correcting a rate is a config edit + reload**: every historical window's derived spend is right on the next read, with no re-billing and no data migration. (Honest limit: repricing cannot un-make PAST admit/reject decisions taken under a wrong rate - tokens are always right; only historical 429s stay historical.)
+
+The rate numbers are **abstract cost units** - busbar does pure integer math and never knows or cares what currency they represent. Currency, symbols, and FX are display concerns owned entirely by your dashboard/consumer. `_cents` fields are abstract minor units (1/100 unit); rates are micro-units (1e-6 unit) per token.
+
+**Rate resolution** for a priced request: a pool member's 4-tier `cost_per_mtok` override (the map form - see [Pools](#pools)) wins for that member's resolved upstream model; otherwise `rate_card[<resolved upstream model>]` (after `upstream_model` mapping). With a rate card present, a request for an arbitrary passthrough model with no rate is REJECTED pre-forward (`no configured rate for model X`) - you either price nothing or price everything.
+
+**Budget spend per key-bucket window:** `requests x price_per_request_cents + sum over models(tier tokens x rate_card tiers)`. Group-bucket spend is the token component only (the flat fee counts against the innermost key bucket).
 
 **Enforcement semantics (important for operators):**
 - **RPM is precise.** The per-minute counter is incremented synchronously on admission.
 - **TPM is best-effort.** Token counts are fed post-response; concurrent in-flight requests are not pre-charged. The first request of each rate window is always admitted.
-- **Budget admission is a hard, atomic cap.** The budget check and the flat per-request charge are one atomic conditional UPSERT (`charge_within_budget`): a request whose fee would push the window's spend past `max_budget_cents` is rejected before it is forwarded, and a concurrent burst cannot race past the limit. The **token-priced component** (`price_per_1k_tokens_cents`) is accrued post-response, so spend from requests already in flight when the cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its flat fee refunded. Admission is an in-memory operation and never touches the durable store, so the cap holds even if the store is unreachable; durability is a write-behind concern (flushed every `usage_flush_interval_ms`), not an admission-path one.
+- **Budget admission is a hard, atomic, per-node chain check.** At admission busbar derives every bucket's spend fresh from its token ledger x the current rate card (no spend cache) and admits ONLY if the key's own bucket AND every ancestor budget group are under their caps - all inside one atomic critical section, charging the whole chain or nothing. The rejection is a 429 `insufficient_quota` that names WHICH bucket blocked ("budget group 'growth' exhausted" vs the plain key-quota message). Token spend is accrued post-response, so spend from requests already in flight when a cap is neared can land after admission; that overshoot is bounded by in-flight parallelism. A request admitted and then failing upstream (non-2xx) has its request charge refunded across the chain. Admission is an in-memory operation and never touches the durable store; durability is a write-behind concern (flushed every `usage_flush_interval_ms`).
+- **A key bound to a `budget_group` missing from the running config fails CLOSED** (429 naming the unconfigured bucket) - minting validates the group exists, and boot re-checks every stored key.
 
 **Incompatible combination:** an active governance engine (`admin_token` set) + `auth.upstream_credentials: passthrough` is a startup error. Active governance supersedes passthrough (every request must resolve to a virtual key); the combination is unsupported. (With no `admin_token`, governance is inert and the pairing carries no requirement.)
 
@@ -853,7 +873,7 @@ governance:
 | `/api/v1/admin/keys` | `POST` | Mint a new virtual key. Returns plaintext bearer `secret` once. Pass `"issue_aws_credential": true` to also receive `aws_access_key_id` + `aws_secret_access_key` for Bedrock-SDK clients (both shown once). |
 | `/api/v1/admin/keys` | `GET` | List all keys (metadata only; no secrets). |
 | `/api/v1/admin/keys/{id}` | `PATCH` | Update key fields. Three-state semantics: absent = unchanged, `null` = clear to unlimited, value = set. |
-| `/api/v1/admin/keys/{id}/usage` | `GET` | Current-window spend, tokens, and request count. |
+| `/api/v1/admin/keys/{id}/usage` | `GET` | Current-window DERIVED spend (recomputed from the token ledger x the current rate card at read time), tokens, and request count. |
 | `/api/v1/admin/keys/{id}` | `DELETE` | Revoke a key. Returns 404 if not found (not idempotent). |
 
 See [operations.md](operations.md) for the full admin API payload schemas and virtual key fields, including the `issue_aws_credential` Bedrock SigV4 option.
@@ -1109,7 +1129,11 @@ governance:
   db_path: /var/lib/busbar/governance.db
   admin_token: "${BUSBAR_ADMIN_TOKEN}"     # set this to turn enforcement ON
   price_per_request_cents: 1
-  price_per_1k_tokens_cents: 50
+  rate_card:                               # per-model token pricing (micro-units per token)
+    gpt-5-mini:    { input_utok: 0.15, output_utok: 0.6 }
+    claude-sonnet: { input_utok: 3.0, output_utok: 15.0, cache_read_utok: 0.3, cache_write_utok: 3.75 }
+  budget_groups:
+    growth: { max_budget_cents: 2000000, budget_period: monthly }
 ```
 
 ---

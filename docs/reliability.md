@@ -102,7 +102,11 @@ governance:
   db_path: /var/lib/busbar/governance.db
   admin_token: "${BUSBAR_ADMIN_TOKEN}"   # setting this ACTIVATES enforcement
   price_per_request_cents: 0
-  price_per_1k_tokens_cents: 10
+  rate_card:                             # per-model token pricing, micro-units per token
+    claude-sonnet: { input_utok: 3.0, output_utok: 15.0 }
+    gpt-4o:        { input_utok: 2.5, output_utok: 10.0 }
+    gemini-flash:  { input_utok: 0.15, output_utok: 0.6 }
+    claude-haiku:  { input_utok: 0.8, output_utok: 4.0 }
 ```
 
 What this achieves:

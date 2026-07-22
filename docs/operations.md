@@ -151,15 +151,19 @@ Three things are worth understanding before you scale out:
   *within one instance*. Across instances, an LB that spreads a client's requests will
   spread its affinity too. If you depend on affinity, enable **sticky sessions** at the
   LB (e.g. by the affinity header / a cookie) so a session lands on the same instance.
-- **Governance is per-instance and not shared.** Budgets and rate limits live in each
-  instance's local SQLite store, so with N instances a "global" limit is enforced
-  **per instance**, effectively ×N. For strict global budget/rate enforcement, run a
-  **single instance** (scale vertically) until an external governance store is
-  available. The proxy path itself scales horizontally without this caveat; only
-  governance *enforcement* is bounded to one writer.
+- **Governance state defaults to per-instance memory; enforcement is per-node either
+  way.** The default `store: memory` is ephemeral RAM per instance. A cluster-shared
+  store (postgres/redis) genuinely shares keys, the token ledger, and the audit log
+  across N nodes, and each node's write-behind flush ships ADDITIVE per-(model, tier)
+  token deltas so the store converges on the true fleet totals - but the budget hard
+  cap is still checked from each node's in-memory counters, so between flushes N nodes
+  splitting traffic can admit up to ~N times a configured cap. For a strict single
+  ceiling, run a single instance (scale vertically); the proxy path itself scales
+  horizontally without this caveat.
 
 So: for a stateless (no-governance) gateway, scale out freely behind an LB. With
-governance, keep enforcement on one instance and scale the box, not the count.
+governance, either accept the per-node cap semantics over a shared store, or keep
+enforcement on one instance and scale the box, not the count.
 
 ## Metrics to watch
 
@@ -379,16 +383,22 @@ Create-key fields:
   not a distinct `402`: it surfaces as the vendor-native quota status with
   `error.type: insufficient_quota` in the body, so it stays indistinguishable from
   a real upstream quota error.
-- **Budget** is token-accurate: a flat `price_per_request_cents` is charged at
-  request completion, and `price_per_1k_tokens_cents * tokens/1000` is charged when
-  the response stream completes, tapped from the upstream's reported usage.
+- **Budget** enforcement derives spend from the TOKEN LEDGER at admission time: a
+  flat `price_per_request_cents` is charged (as +1 request) atomically pre-forward,
+  and the response's per-(model, tier) token split is ledgered at stream end from the
+  upstream's reported usage. Spend = requests x fee + tokens x `governance.rate_card`
+  rates, recomputed on every check - with no rate card configured, tokens price at 0
+  and only the flat fee counts. A key bound to a `budget_group` must also pass every
+  ancestor group's cap (AND semantics); the 429 names the exhausted bucket.
 - **Rate windows** are per-key, in-memory, fixed 60s windows (single-node; not yet
   distributed across replicas). RPM is enforced precisely; TPM is enforced against
   tokens accrued in the window from prior responses.
-- **Budget windows** persist in SQLite at `governance.db_path`.
+- **Budget windows** default to in-memory (ephemeral); configure a durable store
+  plugin (`governance.store: sqlite|postgres|redis` + `db_path`) to persist the
+  token ledger across restarts.
 
-> Run a single busbar instance per governance database, or accept that RPM/TPM
-> windows are per-process: rate state is in-memory and not shared across replicas.
+> Rate (RPM/TPM) windows are per-process, and the budget hard cap is enforced
+> per node even over a shared store (see the fleet caveat above).
 
 ## Troubleshooting
 

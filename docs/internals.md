@@ -229,18 +229,22 @@ approximate, but eligibility filtering and long-run proportionality hold. See
 - **Budget windows.** `budget_window(period, now)` maps to an epoch window start:
   `total` → `0` (one all-time window), `daily` → UTC midnight, `monthly` → UTC
   first-of-month (computed with Howard Hinnant's civil-date algorithms, no date
-  crate). Spend = flat `price_per_request_cents` (charged at request completion) +
-  `tokens/1000 * price_per_1k_tokens_cents` (charged at stream end from the usage
-  tap). `is_over_budget` compares accumulated `spend_cents` to `max_budget_cents`.
+  crate). The store accumulates a TOKEN LEDGER per (bucket, window, model, tier);
+  spend is DERIVED at check/read time as `requests x price_per_request_cents +
+  tier tokens x governance.rate_card rates` (integer nano-unit math; no stored
+  dollar). Admission derives every bucket in the key's budget-group chain fresh and
+  compares against each `max_budget_cents` - correcting a rate is a config edit,
+  never a data migration.
 - **Rate windows.** RPM/TPM are **in-memory, fixed 60s** windows per key
   (`RateState`), not persisted, single-node only. `check_rate` returns
   `Err(retry_after_secs)` (→ 429) when over RPM or TPM. TPM is enforced against
   tokens accrued *so far* in the window; since tokens are fed post-response from
   the usage tap, TPM reflects the prior responses' tokens.
-- **SqliteStore.** The ADR-0009 default impl behind the `Store` trait: a single
-  mutex-guarded `rusqlite::Connection`, two tables (`virtual_keys`,
-  `usage_counters`), `INSERT … ON CONFLICT … DO UPDATE` upserts for both key CRUD
-  and usage accumulation. It is embedded + statically linked, preserving the
+- **SqliteStore.** The ADR-0009 durable impl behind the `Store` trait: a single
+  mutex-guarded `rusqlite::Connection`; `virtual_keys` plus the token-ledger pair
+  `usage_windows` (per-bucket request counts) and `usage_ledger` (per-bucket,
+  per-model tier tokens), `INSERT … ON CONFLICT … DO UPDATE` upserts for key CRUD
+  and additive ledger accumulation (schema v2, tracked in `PRAGMA user_version`). It is embedded + statically linked, preserving the
   single-binary story; the `Store` trait leaves room for a `PostgresStore` for
   multi-node later.
 - **Enforcement order** (in `crates/busbar/src/ingress/mod.rs`, before forwarding): allowed-pools

@@ -11,6 +11,83 @@ item under **Changed**.
 
 ## [Unreleased]
 
+### Added
+
+- **The 1.5.0 cost model: tokens are the ledger, dollars are derived.** The governance store now
+  accumulates an immutable TOKEN LEDGER per (bucket, window, model, tier) - input, output,
+  cache-read, and cache-write tokens, each priced differently - and every spend figure
+  (enforcement, admin reads, metrics, hooks) is COMPUTED at read time as
+  `tokens x governance.rate_card + requests x price_per_request_cents`. Nothing dollar-shaped is
+  stored or crosses the store wire, so correcting a rate is a config edit + reload: historical and
+  future derived spend become right on the next read, with no re-billing and no data migration.
+  (Honest limit: repricing cannot un-make PAST admit/reject decisions taken under a wrong rate.)
+- **Per-model rate card (`governance.rate_card`).** Per-model, per-tier token rates in MICRO-units
+  per token of an ABSTRACT cost unit (busbar attaches no currency; denomination is the consumer's
+  display concern). ALL-OR-NOTHING: absent = every model's tokens price at 0 (budgets count only
+  the flat per-request fee); present = authoritative and COMPLETE - every configured model must
+  have an entry or boot/`--validate` fail, printing a copy-pasteable zeroed YAML stub of exactly
+  the missing models. A request for an arbitrary passthrough model with no rate is rejected
+  pre-forward. A pool member's `cost_per_mtok` also accepts the 4-tier map form as a per-member
+  billing override for its resolved upstream model (the bare number stays a routing-only signal).
+- **Budget groups (`governance.budget_groups`).** Nestable enforcement buckets above the per-key
+  budget: `name: { max_budget_cents, budget_period, parent? }` (acyclic, parents-exist, depth <= 8,
+  all validated with paste-ready fixes). A key binds with the mint field `budget_group` (named to
+  never collide with the auth `group_map`, whose union semantics are the opposite) and keeps its
+  optional inline budget as the innermost bucket. Admission walks the whole chain atomically -
+  AND / most-restrictive, all-or-nothing charging - and the 429 `insufficient_quota` NAMES the
+  exhausted bucket ("budget group 'growth' exhausted"). Each bucket evaluates its own
+  `budget_period` window. A key naming a missing group fails closed (mint 400, boot error with a
+  paste-ready stub, runtime 429).
+- **Mint-time key `labels`.** `POST /keys` accepts `labels: {"team": "growth"}`, echoed verbatim
+  onto the key's Prometheus series so external dashboards `sum by (team)` and Alertmanager fires
+  at 80% burn without busbar knowing what a team is.
+- **Cost-model metrics.** `busbar_bucket_tokens{bucket, model, tier}` scrape gauges for key and
+  budget-group buckets (the raw material for external per-model cost dashboards), plus derived
+  `busbar_bucket_spend_cents` / `busbar_bucket_budget_remaining_cents` per group at the current
+  rate card. All emission stays on the scrape path, never the admit decision.
+- **Budget state on the routing hook seam.** `RoutingContext.budget` (and the webhook/socket wire's
+  `context.budget`) carries `{bucket_id, budget_group?, spend_micros_at_current_rate,
+  remaining_micros?, window_start, budget_period}` for the caller key and every ancestor group, so
+  a hook can downshift to a cheaper model as a bucket nears its cap. Busbar ships the READ surface
+  only; routing policy stays in the hook.
+- **Paste-ready `--validate` fixes (binary-wide UX rule).** Every validate failure with a
+  mechanical fix prints the exact snippet to paste (missing rate-card entries -> zeroed stubs,
+  missing budget-group parents -> a stub group, invalid periods -> the valid set plus a corrected
+  line); non-mechanical faults (a parent-chain cycle) print the exact offending path plus the
+  minimal instruction.
+
+### Changed
+
+- **Store contract + plugin ABI v2 (breaking, pre-release).** `busbar_api::Usage` (the scalar
+  `{spend_cents, tokens, requests}`) is replaced by the token-ledger shapes
+  (`UsageLedger`/`UsageDelta` with per-model `TierTokens`); `Store::{get,put,add}_usage` re-key
+  from `key_id` to `bucket_id` (key buckets and budget-group buckets share the machinery) and
+  carry NO dollar field. `add_usage` ships per-(model, tier) signed token deltas (the
+  fleet-additive cross-node flush; each node derives spend locally from its own rate card). The
+  store plugin ABI bumps to v2; sqlite (`PRAGMA user_version`), postgres (`busbar_schema`), and
+  redis (`busbar:schema`) stamp schema v2 and DROP a pre-v2 dev schema on open (1.5.0 is
+  unreleased: a bump, not a migration).
+- **`VirtualKey` grows `budget_group` + `labels`** (serde-defaulted; pre-cost-model persisted rows
+  keep deserializing).
+- **Admin usage reads derive per model.** `GET /usage` prices each metering row at the current
+  rate card (plus the flat fee) instead of a blended per-1k price, and the response no longer
+  carries a `currency` field - `spend_micros` is denominated in the operator's abstract cost unit.
+- **Docs corrected alongside (audited overstatements).** Budget accuracy is now stated as
+  derived-from-the-rate-card (not "token-accurate" flat pricing); budget scoping is per-key /
+  per-budget-group (not "per team"); the governance store default is documented as in-memory (not
+  SQLite); the budget hard cap carries the per-node fleet caveat everywhere it is described.
+
+### Removed
+
+- **`governance.price_per_1k_tokens_cents`.** The flat blended token price is gone;
+  `governance.rate_card` is the ONLY token-pricing mechanism (`price_per_request_cents` stays -
+  the flat per-call surcharge, charged pre-forward at admission). **Migration:** delete the key
+  (a stale key is a loud unknown-field boot error) and, to keep pricing tokens, add a `rate_card`
+  entry per configured model; a former `price_per_1k_tokens_cents: N` is equivalent to
+  `input_utok/output_utok/cache_read_utok/cache_write_utok: N * 10` (N cents per 1k tokens =
+  10 N micro-units per token) on every tier.
+
+
 ## [1.5.0], 2026-07-20
 
 ### Changed
