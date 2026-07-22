@@ -171,6 +171,15 @@ impl StreamTranslate {
         })
     }
 
+    /// Record whether the ORIGINAL client request opted into streaming usage
+    /// (`stream_options.include_usage == true`), forwarding it to the ingress framing (Findings 2+3).
+    /// Only the OpenAI-ingress framing acts on it (its `include_usage` un-fold/strip); every other
+    /// ingress framing ignores it. Called by the engine after it captures the client's intent from the
+    /// request body and before the first frame is fed.
+    pub(crate) fn set_client_include_usage(&mut self, include: bool) {
+        self.framing.set_client_include_usage(include);
+    }
+
     /// Translate one egress event `(event_type, payload)` into ingress wire bytes, advancing the
     /// decode state. Shared by the SSE and event-stream feed paths.
     fn translate_event(&mut self, event_type: &str, data: &serde_json::Value, out: &mut Vec<u8>) {

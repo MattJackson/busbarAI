@@ -944,6 +944,20 @@ pub(crate) trait StreamFraming: Send {
     fn folds_terminal_usage(&self) -> bool {
         true
     }
+
+    /// CLIENT-INTENT seam (OpenAI ingress, Findings 2+3). Records whether the ORIGINAL client request
+    /// carried `stream_options.include_usage == true`. Busbar always injects `include_usage` on the
+    /// UPSTREAM request so it can bill streaming calls (Finding 3), which makes the upstream emit a
+    /// trailing usage chunk; but a native OpenAI stream only emits that usage-bearing trailing chunk
+    /// when the CLIENT opted in. A client that did NOT opt in and receives an unsolicited
+    /// `{choices:[], usage}` chunk hits `choices[0]` IndexError. So when this is `false`, the OpenAI
+    /// framing STRIPS the folded usage entirely (no trailing chunk) rather than un-folding it (Finding
+    /// 2); when `true` it un-folds to the native separate trailing chunk. Billing is unaffected either
+    /// way — it reads the IR-side `last_usage` A-tap, not the client-facing chunk.
+    ///
+    /// Default ([`PassthroughFraming`] and every non-OpenAI ingress): no-op — the flag is meaningless
+    /// for protocols without the `include_usage` convention.
+    fn set_client_include_usage(&mut self, _include: bool) {}
 }
 
 /// Inert default [`StreamFraming`]: every method takes the trait's no-op default. Used by every

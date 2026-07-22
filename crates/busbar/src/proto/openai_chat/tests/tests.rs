@@ -3546,6 +3546,65 @@ fn test_ir_request() -> crate::ir::IrRequest {
     }
 }
 
+/// FINDING 2 (opt-out strips usage): with `client_include_usage == false` (the default), the OpenAI
+/// framing STRIPS a folded usage off the finish chunk and emits NO trailing usage chunk. With `true`
+/// it un-folds into a native separate trailing usage-only chunk.
+#[test]
+fn test_framing_gates_usage_on_client_include_usage() {
+    use crate::proto::StreamFraming;
+
+    fn folded_finish() -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-abc",
+            "object": OBJ_CHUNK,
+            "created": 1234,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": FINISH_STOP}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        })
+    }
+
+    // Opt-out (default): usage stripped, NO trailing chunk.
+    let mut off = OpenAiStreamFraming::default();
+    let mut finish = folded_finish();
+    let trailing = off.on_egress_chunk(&mut finish);
+    assert!(
+        trailing.is_none(),
+        "an opted-out client must get NO trailing usage chunk: {trailing:?}"
+    );
+    assert!(
+        finish.get("usage").is_none(),
+        "the folded usage must be stripped off the finish chunk: {finish}"
+    );
+    assert_eq!(
+        finish.pointer("/choices/0/finish_reason"),
+        Some(&serde_json::json!(FINISH_STOP)),
+        "the finish chunk keeps its finish_reason"
+    );
+
+    // Opt-in: usage un-folded into a separate trailing chunk.
+    let mut on = OpenAiStreamFraming::default();
+    on.set_client_include_usage(true);
+    let mut finish2 = folded_finish();
+    let trailing2 = on
+        .on_egress_chunk(&mut finish2)
+        .expect("opt-in must un-fold a trailing usage chunk");
+    assert!(
+        finish2.get("usage").is_none(),
+        "usage is lifted OFF the finish chunk on opt-in too: {finish2}"
+    );
+    assert_eq!(
+        trailing2.pointer("/usage/total_tokens"),
+        Some(&serde_json::json!(10)),
+        "the trailing chunk carries the usage: {trailing2}"
+    );
+    assert_eq!(
+        trailing2.pointer("/choices"),
+        Some(&serde_json::json!([])),
+        "the trailing usage chunk carries an EMPTY choices array"
+    );
+}
+
 /// FINDING 1 (0-based streaming tool_calls index, unit): `remap_tool_call_index` rewrites the
 /// writer's raw IR-block index onto a 0-based per-call ordinal. First distinct raw index → 0, next →
 /// 1; the same raw index (argument-fragment chunks) replays its ordinal. Guarantees the first tool

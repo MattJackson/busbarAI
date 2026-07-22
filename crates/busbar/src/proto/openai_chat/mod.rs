@@ -589,23 +589,48 @@ struct OpenAiStreamFraming {
     /// PARALLEL tool calls distinct (each raw index → its own ordinal) while guaranteeing the first
     /// call is index 0. Populated lazily; empty on a tool-less stream.
     tool_call_index: std::collections::BTreeMap<u64, u64>,
+    /// Did the ORIGINAL client request carry `stream_options.include_usage == true`? (Findings 2+3.)
+    /// Busbar always injects `include_usage` UPSTREAM so it can bill streaming calls, which makes the
+    /// upstream emit token usage; but a native OpenAI stream only surfaces a trailing usage-only chunk
+    /// to the CLIENT when the client opted in. When this is `false`, `on_egress_chunk` STRIPS the
+    /// folded usage instead of un-folding it, so a client that did not opt in never receives an
+    /// unsolicited `{choices:[], usage}` chunk (which would `choices[0]` IndexError). Default `false`
+    /// (opt-in, matching native OpenAI); the engine sets it from the client body via
+    /// `set_client_include_usage`.
+    client_include_usage: bool,
 }
 
 impl super::StreamFraming for OpenAiStreamFraming {
     fn on_egress_chunk(&mut self, chunk: &mut serde_json::Value) -> Option<serde_json::Value> {
         // (a) Identity replay, then (b) the 0-based tool-call index remap, then (c) the include_usage
-        // un-fold — in this order, because the trailing chunk's identity is read off `chunk` AFTER the
+        // handling — in this order, because the trailing chunk's identity is read off `chunk` AFTER the
         // identity has been populated onto it, so both frames share ONE stream identity. The `[DONE]`
         // sentinel is a separate `finish()` literal and never routed here.
         self.apply_chunk_identity(chunk);
         self.remap_tool_call_index(chunk);
-        split_openai_trailing_usage(chunk)
+        if self.client_include_usage {
+            // Client opted in: un-fold the folded usage into a native separate trailing usage-only
+            // chunk, exactly as real OpenAI does under `stream_options.include_usage:true`.
+            split_openai_trailing_usage(chunk)
+        } else {
+            // Client did NOT opt in: STRIP the folded usage entirely so the finish chunk stays
+            // usage-free and NO trailing usage-only chunk is emitted — matching a native OpenAI stream
+            // without include_usage. Billing is unaffected (it reads the IR-side `last_usage` A-tap,
+            // captured before this seam). This closes Finding 2: an opted-out client never receives the
+            // unsolicited `{choices:[], usage}` chunk that trips `choices[0]`.
+            strip_folded_usage(chunk);
+            None
+        }
     }
 
-    // OpenAI ingress UN-folds: the client expects the separate trailing usage chunk (re-emitted via
-    // on_egress_chunk), so the translator must NOT defer/fold the terminal usage.
+    // OpenAI ingress UN-folds (or strips) usage in `on_egress_chunk`, so the translator must NOT
+    // defer/fold the terminal usage itself.
     fn folds_terminal_usage(&self) -> bool {
         false
+    }
+
+    fn set_client_include_usage(&mut self, include: bool) {
+        self.client_include_usage = include;
     }
 }
 
@@ -746,6 +771,35 @@ fn split_openai_trailing_usage(chunk: &mut serde_json::Value) -> Option<serde_js
     trailing.insert("choices".to_string(), serde_json::Value::Array(Vec::new()));
     trailing.insert("usage".to_string(), usage);
     Some(serde_json::Value::Object(trailing))
+}
+
+/// Remove a folded top-level `usage` object from a `chat.completion.chunk` in place, WITHOUT emitting
+/// any replacement trailing chunk (Finding 2). This is the opt-OUT twin of `split_openai_trailing_usage`:
+/// a client that did not send `stream_options.include_usage` must see a stream that carries NO usage at
+/// all, exactly like a native OpenAI stream without include_usage. Only strips when both a folded `usage`
+/// and a terminal `finish_reason` are present (the shape the writer folds onto), so a non-finish chunk is
+/// never touched. The removed usage was only ever a client-facing echo — billing sources the IR-side
+/// `last_usage` A-tap, which is captured upstream of this seam and is unaffected.
+fn strip_folded_usage(chunk: &mut serde_json::Value) {
+    let Some(obj) = chunk.as_object_mut() else {
+        return;
+    };
+    if obj.get("object").and_then(|v| v.as_str()) != Some(OBJ_CHUNK) {
+        return;
+    }
+    if !obj.contains_key("usage") {
+        return;
+    }
+    let has_finish = obj
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c0| c0.get("finish_reason"))
+        .map(|fr| !fr.is_null())
+        .unwrap_or(false);
+    if has_finish {
+        obj.remove("usage");
+    }
 }
 
 /// OpenAI writer implementation.

@@ -1234,6 +1234,8 @@ fn test_duplicate_terminal_message_delta_after_stop_is_dropped() {
 #[test]
 fn openai_egress_chunk_identity_and_trailing_usage_byte_shape() {
     let mut st = StreamTranslate::new("openai", "anthropic").expect("translator");
+    // The client opted into streaming usage, so the un-fold surfaces the native trailing usage chunk.
+    st.set_client_include_usage(true);
     let mut raw: Vec<u8> = Vec::new();
     for frame in [
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\"}}\n\n",
@@ -1289,6 +1291,63 @@ fn openai_egress_chunk_identity_and_trailing_usage_byte_shape() {
             "no single chunk may carry BOTH finish_reason=stop AND usage (un-fold); got:\n{line}"
         );
     }
+}
+
+/// FINDING 2 (unsolicited trailing usage chunk): a client that did NOT send
+/// `stream_options.include_usage` must receive a stream with NO usage anywhere — no trailing
+/// `{choices:[], usage}` chunk (which would `choices[0]` IndexError) and no folded usage on the finish
+/// chunk. This is the default (opt-out) framing state. Billing is unaffected: it reads the IR-side
+/// usage A-tap, which this test also confirms still holds the real token counts.
+#[test]
+fn openai_egress_without_include_usage_emits_no_usage_chunk() {
+    let mut st = StreamTranslate::new("openai", "anthropic").expect("translator");
+    // Client did NOT opt in (default), but the upstream Anthropic backend still reports usage.
+    st.set_client_include_usage(false);
+    let mut raw: Vec<u8> = Vec::new();
+    for frame in [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_x\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ] {
+            raw.extend(st.feed(frame.as_bytes()));
+        }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // (a) The finish chunk is still present.
+    assert!(
+        out.contains("\"finish_reason\":\"end_turn\"") || out.contains("\"finish_reason\":\"stop\""),
+        "a terminal finish chunk must still be emitted; got\n{out}"
+    );
+    // (b) NO chunk carries a `usage` object, and NO chunk carries an EMPTY choices array (the tell of
+    // an unsolicited trailing usage chunk). An opted-out client sees exactly what native OpenAI emits.
+    for data in out.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value =
+            crate::json::parse(data.as_bytes()).expect("each SSE chunk is valid JSON");
+        assert!(
+            v.get("usage").is_none(),
+            "an opted-out client must receive NO usage object; got:\n{data}"
+        );
+        assert!(
+            v.pointer("/choices")
+                .and_then(|c| c.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(true),
+            "an opted-out client must receive NO empty-choices trailing usage chunk; got:\n{data}"
+        );
+    }
+
+    // (c) Billing is unaffected: the IR usage A-tap the streaming billing path reads STILL holds the
+    // real upstream token counts, even though the client-facing stream carried none.
+    let billed = st.usage().expect("the A-tap must capture usage for billing");
+    assert_eq!(billed.input_tokens, 5, "billing keeps the real input tokens");
+    assert_eq!(billed.output_tokens, 2, "billing keeps the real output tokens");
 }
 
 /// FINDING 1 (0-based streaming tool_calls index): an Anthropic backend stream with a leading text
