@@ -1120,6 +1120,25 @@ pub(crate) fn validate_with_unset(
             );
         }
 
+        // DUPLICATE client_tokens are a foot-gun: the tokens module keys the minted principal on the
+        // token's allowlist POSITION, and a duplicate previously let two positions match one token and
+        // OR-fold into a PHANTOM principal id (cross-principal misattribution in audit/hooks/governance).
+        // The module now de-duplicates defensively so at most one position can match, but a duplicate in
+        // the config is still almost certainly an operator mistake (a copy-paste, or the belief that two
+        // callers have distinct tokens when they share one). Warn at boot so it is visible — the dedup
+        // means the SECOND+ occurrence is inert and its intended caller shares the first's principal id.
+        {
+            let mut seen = std::collections::HashSet::new();
+            if auth.client_tokens.iter().any(|t| !seen.insert(t)) {
+                tracing::warn!(
+                    "auth.client_tokens contains DUPLICATE entries: duplicates are de-duplicated \
+                     (first occurrence wins), so a repeated token grants only its first position's \
+                     principal id and any later duplicate is inert. Remove the duplicate, or give each \
+                     distinct caller a distinct token."
+                );
+            }
+        }
+
         // An empty chain is an open relay: it admits every request unconditionally, so a configured
         // `client_tokens` allowlist has ZERO enforcement effect. Not a hard error (an empty chain may
         // be a deliberate dev open-relay), but it MUST be loud. No-op when no tokens are listed.
