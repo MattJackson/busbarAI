@@ -620,6 +620,17 @@ pub(crate) struct IrTool {
     /// breakpoint was being dropped on every hop. First-class so it survives the seam. Only the
     /// Anthropic reader populates it / writer emits it; other protocols leave it `None`.
     pub(crate) cache_control: Option<CacheControl>,
+    /// HOSTED (built-in) tool passthrough spec (Finding 5). The OpenAI Responses API `tools` array
+    /// mixes CUSTOM function tools with provider-HOSTED tools discriminated purely by a top-level
+    /// `type` (`web_search`, `file_search`, `code_interpreter`, `computer_use_preview`, `mcp`, ...).
+    /// A hosted tool carries NO `name`/`parameters`, so parsing it as a function tool yields an empty
+    /// `{"type":"function","name":""}` that a Responses backend 400s on. When set, this holds the RAW
+    /// hosted-tool JSON object verbatim; the Responses writer re-emits it unchanged (a same-protocol
+    /// passthrough) and skips the function-tool projection. `None` for an ordinary function tool
+    /// (`name`/`input_schema` carry it). Only the Responses reader populates it / writer emits it;
+    /// every other protocol leaves it `None` and ignores it (no hosted-tool analog — a hosted tool
+    /// routed to a non-Responses backend simply has no function-tool equivalent to translate into).
+    pub(crate) hosted: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

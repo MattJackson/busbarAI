@@ -193,6 +193,8 @@ fn test_write_request() {
             description: Some("Get weather for a city".to_string()),
             input_schema: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}),
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: Some(1024),
         temperature: Some(0.7_f64),
@@ -1605,6 +1607,8 @@ fn test_write_request_tool_config_cross_protocol_and_empty() {
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: None,
         temperature: None,
@@ -4636,6 +4640,8 @@ fn tool_choice_req(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequest 
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: None,
         temperature: None,
@@ -4971,6 +4977,8 @@ fn test_cache_control_on_tool_emits_cache_point() {
             description: None,
             input_schema: serde_json::json!({"type": "object"}),
             cache_control: ephemeral(),
+
+            hosted: None,
         }],
     );
     let out = BedrockWriter.write_request(&req);

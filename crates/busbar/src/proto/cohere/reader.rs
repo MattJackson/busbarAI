@@ -386,6 +386,7 @@ impl ProtocolReader for CohereReader {
                         description,
                         input_schema,
                         cache_control: None,
+                        hosted: None,
                     });
                 }
             }

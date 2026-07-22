@@ -73,6 +73,25 @@ impl IrReq {
                     );
                 }
                 crate::proto::decode_request_tool_ids(prep.ingress_protocol, &mut ir.messages);
+                // n>1 clamp on the cross-protocol seam. `n` asks the backend for N candidate
+                // completions, but the neutral `IrResponse` models exactly ONE candidate (`role` +
+                // one `content` vec) — there is no place to carry choices 1..N. Forwarding `n>1` to a
+                // cross-protocol backend made it generate (and BILL for) N candidates while the
+                // translation kept only choice 0 and silently discarded the rest: wasted spend plus a
+                // response that does not match the request. IR cannot round-trip multiple choices, so
+                // the honest behavior is to clamp `n` to 1 before the egress writer emits it, so the
+                // backend generates exactly the one candidate the translated response can carry. A
+                // SAME-protocol passthrough never reaches here (the body is forwarded verbatim), so
+                // `n>1` still works end-to-end where the response is not funneled through the IR.
+                if ir.n.is_some_and(|n| n > 1) {
+                    tracing::warn!(
+                        ingress = %prep.ingress_protocol,
+                        "clamping n>1 to 1 on the cross-protocol seam: the neutral response IR carries \
+                         a single candidate, so extra choices would be generated, billed, and then \
+                         dropped; the backend is asked for exactly one candidate"
+                    );
+                    ir.n = Some(1);
+                }
                 // The reasoning gate. A lane that did not claim the capability never receives a
                 // thinking param (a non-reasoning model would 400 on it); the request still
                 // proceeds, thinking at the backend's default level.

@@ -277,6 +277,25 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         .map(|l| op.wants_stream(l.probe()))
         .unwrap_or(false);
 
+    // Capture whether the ORIGINAL client opted into streaming token usage
+    // (`stream_options.include_usage == true`) BEFORE any rewrite/translation touches `v` (Findings
+    // 2+3). Meaningful only for an OpenAI-family ingress that speaks the `stream_options` convention;
+    // any other ingress body simply lacks the key and reads `false`. Busbar ALWAYS injects
+    // `include_usage` on the upstream request (so it can bill a streaming call — Finding 3), so this
+    // flag alone decides whether the resulting trailing usage chunk is surfaced to THIS client
+    // (Finding 2): a client that did not opt in must not receive the unsolicited `{choices:[], usage}`
+    // chunk. Read from the head projection where available (`probe()` is the head projection until a
+    // DOM is materialized, then the DOM itself), so no DOM is forced for the common non-opt-in case.
+    let client_include_usage = wants_stream
+        && v.as_ref()
+            .map(|l| {
+                l.probe()
+                    .pointer("/stream_options/include_usage")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
     // ── GLOBAL REWRITE (transform) PASS ─────────────────────────────────────────────────────────
     // Fire the global `prompt: rw` gates (compression/redaction) BEFORE dispatch AND before the
     // routing decision, so the decision + upstream both see the rewritten body. Priority-ordered
@@ -1094,6 +1113,22 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                     return *resp;
                 }
             }
+        };
+        // STREAMING-USAGE UPSTREAM INJECTION (Finding 3): busbar bills a streaming chat call from the
+        // token usage it decodes off the upstream stream, but an OpenAI Chat Completions upstream only
+        // emits that usage (in a trailing chunk) when the request carried
+        // `stream_options.include_usage: true`. A client that did not opt in would otherwise leave the
+        // upstream silent on tokens and busbar would bill ZERO. So force `stream_options.include_usage`
+        // on every streaming request to an OpenAI Chat egress, whether the body was forwarded verbatim
+        // (same-protocol) or built by `write_request` (cross-protocol). Scoped to `egress_name ==
+        // "openai"` (Chat Completions) — the Responses egress carries usage unconditionally and has its
+        // own convention, and non-OpenAI egresses always report usage. The client-facing trailing chunk
+        // is then gated on the CLIENT's own opt-in (`client_include_usage`) at the framing seam, so
+        // this injection never leaks an unsolicited usage chunk to an opted-out client (Finding 2).
+        let payload = if wants_stream && body_is_json && egress_name == crate::proto::PROTO_OPENAI {
+            inject_openai_stream_include_usage(payload)
+        } else {
+            payload
         };
         // TRANSLATE_REQ ends here (egress payload bytes in hand). CLIENT_BUILD spans the egress auth
         // + URL/path build + reqwest RequestBuilder construction that follows.
@@ -2105,6 +2140,15 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 } else {
                     None
                 };
+                // Thread the client's streaming-usage opt-in to the framing (Findings 2+3). Busbar
+                // always injected `include_usage` UPSTREAM, so the upstream stream carries a trailing
+                // usage chunk; the OpenAI-ingress framing surfaces it to the client ONLY when the client
+                // itself opted in, and STRIPS it otherwise so an opted-out client never sees the
+                // unsolicited `{choices:[], usage}` chunk. No-op for every non-OpenAI ingress framing.
+                let translate = translate.map(|mut t| {
+                    t.set_client_include_usage(client_include_usage);
+                    t
+                });
                 // Gemini non-`alt=sse` ingress: engage the JSON-array framer (only when this is in
                 // fact a streamed SSE response — a same-protocol non-stream gemini response never
                 // reaches the streaming builder).
@@ -2204,6 +2248,35 @@ pub(crate) async fn forward_with_pool_parsed_inner(
 /// `prompt: ro` tap gets the prompt-content projection, a `prompt: no` (default) tap gets shape-only.
 /// At most TWO projections are built (shape-only + with-prompt) regardless of tap count. ZERO COST
 /// when no tap is configured (the empty-list early return).
+/// Force `stream_options.include_usage: true` on an OpenAI Chat Completions streaming request body so
+/// the upstream emits token usage busbar can bill (Finding 3). Parses `payload`, sets the nested flag
+/// (creating `stream_options` if absent, overwriting a `false`), and re-serializes. On any parse/shape
+/// failure the ORIGINAL bytes are returned unchanged — a malformed body is the upstream's to reject,
+/// not busbar's to mangle, and the worst case is the pre-existing zero-usage billing gap rather than a
+/// corrupted request. A body that already opted in re-serializes identically in effect.
+fn inject_openai_stream_include_usage(payload: Bytes) -> Bytes {
+    let mut v: Value = match crate::json::parse(&payload) {
+        Ok(v) => v,
+        Err(_) => return payload,
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return payload;
+    };
+    let so = obj
+        .entry("stream_options".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(so_obj) = so.as_object_mut() else {
+        // `stream_options` present but not an object: leave the body untouched (the upstream will 400
+        // on the malformed field; busbar must not silently reshape a caller's value).
+        return payload;
+    };
+    so_obj.insert("include_usage".to_string(), Value::Bool(true));
+    match crate::json::to_vec(&v) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(_) => payload,
+    }
+}
+
 fn fire_global_taps(
     app: &Arc<App>,
     body: &Value,
@@ -2284,3 +2357,67 @@ pub(crate) fn resolve_breaker_cfg(
 
 mod walk;
 pub(crate) use walk::*;
+
+#[cfg(test)]
+mod inject_include_usage_tests {
+    use super::inject_openai_stream_include_usage;
+    use bytes::Bytes;
+
+    /// FINDING 3: an OpenAI Chat streaming body with NO `stream_options` gains
+    /// `stream_options.include_usage: true` so the upstream reports usage busbar can bill.
+    #[test]
+    fn adds_include_usage_when_absent() {
+        let body = br#"{"model":"gpt-4o","stream":true,"messages":[]}"#;
+        let out = inject_openai_stream_include_usage(Bytes::from_static(body));
+        let v: serde_json::Value = crate::json::parse(&out).expect("valid JSON");
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true)),
+            "include_usage must be injected: {v}"
+        );
+    }
+
+    /// A body that already carries `stream_options` (with other keys, or include_usage:false) has the
+    /// flag set to true WITHOUT dropping sibling options.
+    #[test]
+    fn upgrades_existing_stream_options_preserving_siblings() {
+        let body = br#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false,"foo":1},"messages":[]}"#;
+        let out = inject_openai_stream_include_usage(Bytes::from_static(body));
+        let v: serde_json::Value = crate::json::parse(&out).expect("valid JSON");
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true)),
+            "include_usage must be forced true: {v}"
+        );
+        assert_eq!(
+            v.pointer("/stream_options/foo"),
+            Some(&serde_json::json!(1)),
+            "sibling stream_options keys must be preserved: {v}"
+        );
+    }
+
+    /// A body whose `stream_options` is NOT an object is left untouched (busbar must not reshape a
+    /// caller's malformed value; the upstream will reject it).
+    #[test]
+    fn leaves_non_object_stream_options_untouched() {
+        let body = br#"{"stream":true,"stream_options":"bogus"}"#;
+        let out = inject_openai_stream_include_usage(Bytes::from_static(body));
+        assert_eq!(
+            &out[..],
+            &body[..],
+            "malformed stream_options must pass through verbatim"
+        );
+    }
+
+    /// A body that already opted in stays semantically opted in.
+    #[test]
+    fn keeps_existing_true() {
+        let body = br#"{"stream":true,"stream_options":{"include_usage":true}}"#;
+        let out = inject_openai_stream_include_usage(Bytes::from_static(body));
+        let v: serde_json::Value = crate::json::parse(&out).expect("valid JSON");
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true))
+        );
+    }
+}

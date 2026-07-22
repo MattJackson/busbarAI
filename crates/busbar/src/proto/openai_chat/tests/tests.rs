@@ -2782,6 +2782,8 @@ fn req_with_tool(
             description: description.map(String::from),
             input_schema,
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: None,
         temperature: None,
@@ -3544,6 +3546,192 @@ fn test_ir_request() -> crate::ir::IrRequest {
         response_format: None,
         extra: serde_json::Map::new(),
     }
+}
+
+/// FINDING 2 (opt-out strips usage): with `client_include_usage == false` (the default), the OpenAI
+/// framing STRIPS a folded usage off the finish chunk and emits NO trailing usage chunk. With `true`
+/// it un-folds into a native separate trailing usage-only chunk.
+#[test]
+fn test_framing_gates_usage_on_client_include_usage() {
+    use crate::proto::StreamFraming;
+
+    fn folded_finish() -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-abc",
+            "object": OBJ_CHUNK,
+            "created": 1234,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": FINISH_STOP}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        })
+    }
+
+    // Opt-out (default): usage stripped, NO trailing chunk.
+    let mut off = OpenAiStreamFraming::default();
+    let mut finish = folded_finish();
+    let trailing = off.on_egress_chunk(&mut finish);
+    assert!(
+        trailing.is_none(),
+        "an opted-out client must get NO trailing usage chunk: {trailing:?}"
+    );
+    assert!(
+        finish.get("usage").is_none(),
+        "the folded usage must be stripped off the finish chunk: {finish}"
+    );
+    assert_eq!(
+        finish.pointer("/choices/0/finish_reason"),
+        Some(&serde_json::json!(FINISH_STOP)),
+        "the finish chunk keeps its finish_reason"
+    );
+
+    // Opt-in: usage un-folded into a separate trailing chunk.
+    let mut on = OpenAiStreamFraming::default();
+    on.set_client_include_usage(true);
+    let mut finish2 = folded_finish();
+    let trailing2 = on
+        .on_egress_chunk(&mut finish2)
+        .expect("opt-in must un-fold a trailing usage chunk");
+    assert!(
+        finish2.get("usage").is_none(),
+        "usage is lifted OFF the finish chunk on opt-in too: {finish2}"
+    );
+    assert_eq!(
+        trailing2.pointer("/usage/total_tokens"),
+        Some(&serde_json::json!(10)),
+        "the trailing chunk carries the usage: {trailing2}"
+    );
+    assert_eq!(
+        trailing2.pointer("/choices"),
+        Some(&serde_json::json!([])),
+        "the trailing usage chunk carries an EMPTY choices array"
+    );
+}
+
+/// FINDING 1 (0-based streaming tool_calls index, unit): `remap_tool_call_index` rewrites the
+/// writer's raw IR-block index onto a 0-based per-call ordinal. First distinct raw index → 0, next →
+/// 1; the same raw index (argument-fragment chunks) replays its ordinal. Guarantees the first tool
+/// call is index 0 even when the source opened it at a non-zero block index.
+#[test]
+fn test_remap_tool_call_index_is_0_based_per_call() {
+    use crate::proto::StreamFraming;
+    let mut framing = OpenAiStreamFraming::default();
+
+    // First tool call opens at RAW block index 1 (text was block 0) → must remap to 0.
+    let mut open1 = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 1, "id": "call_a", "type": "function",
+            "function": {"name": "get_weather", "arguments": ""}
+        }]}, "finish_reason": null}]
+    });
+    framing.on_egress_chunk(&mut open1);
+    assert_eq!(
+        open1.pointer("/choices/0/delta/tool_calls/0/index"),
+        Some(&serde_json::json!(0)),
+        "first tool call (raw index 1) must remap to 0: {open1}"
+    );
+
+    // Its argument fragment (same raw index 1) must replay ordinal 0.
+    let mut arg1 = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 1, "function": {"arguments": "{}"}
+        }]}, "finish_reason": null}]
+    });
+    framing.on_egress_chunk(&mut arg1);
+    assert_eq!(
+        arg1.pointer("/choices/0/delta/tool_calls/0/index"),
+        Some(&serde_json::json!(0)),
+        "argument fragment for the first call must replay ordinal 0: {arg1}"
+    );
+
+    // Second tool call opens at RAW block index 2 → must remap to 1.
+    let mut open2 = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 2, "id": "call_b", "type": "function",
+            "function": {"name": "get_time", "arguments": ""}
+        }]}, "finish_reason": null}]
+    });
+    framing.on_egress_chunk(&mut open2);
+    assert_eq!(
+        open2.pointer("/choices/0/delta/tool_calls/0/index"),
+        Some(&serde_json::json!(1)),
+        "second tool call (raw index 2) must remap to 1: {open2}"
+    );
+
+    // A content-only chunk (no tool_calls) is untouched.
+    let mut content = serde_json::json!({
+        "object": OBJ_CHUNK,
+        "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}]
+    });
+    let before = content.clone();
+    framing.on_egress_chunk(&mut content);
+    assert_eq!(
+        content, before,
+        "a content chunk must be untouched by the tool-index remap"
+    );
+}
+
+/// FINDING 4 (n>1 cross-protocol): a request asking for N>1 candidate completions cannot round-trip
+/// through the single-candidate response IR, so the cross-protocol egress seam
+/// (`prepare_for_egress`) must CLAMP `n` to 1 before the egress writer emits it — otherwise the
+/// backend generates (and bills for) N candidates while translation keeps only choice 0 and
+/// silently drops the rest. Same-protocol passthrough never reaches this seam, so `n>1` still works
+/// end-to-end there (the response is not funneled through the IR).
+#[test]
+fn test_n_gt_1_clamped_to_one_on_cross_protocol_egress() {
+    use crate::ir::variant::{EgressPrep, IrReq};
+
+    fn prep() -> EgressPrep<'static> {
+        EgressPrep {
+            ingress_protocol: "openai",
+            egress_requires_max_tokens: false,
+            lane_default_max_tokens: None,
+            global_default_max_tokens: 4096,
+            reasoning_allowed: true,
+            reasoning_budgets: crate::ir::REASONING_BUDGET_DEFAULTS,
+            prompt_caching_allowed: true,
+        }
+    }
+
+    // n=3 must clamp to 1 on the cross-protocol seam, and the egress writer must emit `n: 1`.
+    let mut ir = test_ir_request();
+    ir.n = Some(3);
+    let mut req = IrReq::Chat(ir);
+    req.prepare_for_egress(&prep());
+    let IrReq::Chat(ir) = req else { unreachable!() };
+    assert_eq!(
+        ir.n,
+        Some(1),
+        "n>1 must clamp to 1 on the cross-protocol seam"
+    );
+    let out = OpenAiWriter.write_request(&ir);
+    assert_eq!(
+        out["n"],
+        serde_json::json!(1),
+        "the egress request must ask the backend for exactly one candidate"
+    );
+
+    // n=1 is left intact (no spurious clamp/warn).
+    let mut ir1 = test_ir_request();
+    ir1.n = Some(1);
+    let mut req1 = IrReq::Chat(ir1);
+    req1.prepare_for_egress(&prep());
+    let IrReq::Chat(ir1) = req1 else {
+        unreachable!()
+    };
+    assert_eq!(ir1.n, Some(1), "n=1 is unchanged");
+
+    // n absent stays absent (no `n` field materialized).
+    let mut ir0 = test_ir_request();
+    ir0.n = None;
+    let mut req0 = IrReq::Chat(ir0);
+    req0.prepare_for_egress(&prep());
+    let IrReq::Chat(ir0) = req0 else {
+        unreachable!()
+    };
+    assert_eq!(ir0.n, None, "absent n stays absent");
 }
 
 // H6: the `"auto"` and `"none"` string forms had no read→write round-trip coverage.

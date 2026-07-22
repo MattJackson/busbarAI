@@ -444,6 +444,7 @@ impl ProtocolReader for GeminiReader {
                             description,
                             input_schema: parameters,
                             cache_control: None,
+                            hosted: None,
                         });
                     }
                 }

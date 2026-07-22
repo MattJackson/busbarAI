@@ -41,7 +41,11 @@ fn captured_head_keys() -> &'static [&'static str] {
     static CACHE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let mut v: Vec<&'static str> = vec!["model", "stream", "system"];
+            // `stream_options` is captured so the engine can read `stream_options.include_usage`
+            // (the OpenAI streaming-usage opt-in, Findings 2+3) off the head projection WITHOUT forcing
+            // a full DOM materialization on the common streaming path. It is a small top-level object;
+            // capturing it keeps the point read O(1) and DOM-equivalent.
+            let mut v: Vec<&'static str> = vec!["model", "stream", "stream_options", "system"];
             v.extend_from_slice(crate::proto::array_stream_shim_keys());
             v.sort_unstable();
             v.dedup();
