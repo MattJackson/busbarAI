@@ -311,28 +311,31 @@ pub(crate) struct InMemoryStore {
     pub(crate) pool_shards: std::sync::RwLock<Vec<(Box<str>, usize)>>,
 }
 
+// Field ORDER is perf-deliberate (hot-path cache locality): the per-request atomics are grouped
+// into one cluster so a dispatch decision (dead check → SWRR weight → breaker CAS → outcome
+// counter) touches 1-2 cache lines instead of hopping over the Strings and Mutex blocks that used
+// to interleave them. Boot-time read-only fields lead; Mutex-guarded cold state trails. Pure
+// layout change — every constructor uses named fields, so semantics are untouched.
 pub(crate) struct LaneState {
+    // ── read-only after boot ──
     pub(crate) model: String,
     pub(crate) provider: String,
     pub(crate) max: usize,
     pub(crate) sem: Arc<Semaphore>,
     pub(crate) limited: bool,
-    pub(crate) budget: AtomicI64,
-    pub(crate) cooldown_until: AtomicU64,
-    pub(crate) streak: AtomicU32,
+    // ── hot per-request atomics (keep contiguous) ──
     pub(crate) dead: AtomicBool,
-    pub(crate) dead_reason: std::sync::Mutex<String>,
-    pub(crate) ok: AtomicU64,
-    pub(crate) err: AtomicU64,
-    pub(crate) client_fault: AtomicU64,
     // FSM state per lane
     pub(crate) breaker_state: AtomicU64, // stored as u64 (ST_CLOSED/ST_OPEN/ST_HALF_OPEN) so it can be CAS'd
     pub(crate) probe_in_flight: AtomicBool,
-    pub(crate) outcome_window: std::sync::Mutex<OutcomeWindow>,
     // SWRR state per lane
     pub(crate) current_weight: AtomicI64,
-    // Serializes state+cooldown transitions on the default cell — see `BreakerCell::transition_lock`.
-    pub(crate) transition_lock: std::sync::Mutex<()>,
+    pub(crate) cooldown_until: AtomicU64,
+    pub(crate) budget: AtomicI64,
+    pub(crate) streak: AtomicU32,
+    pub(crate) ok: AtomicU64,
+    pub(crate) err: AtomicU64,
+    pub(crate) client_fault: AtomicU64,
     // Rolling EWMA of observed end-to-end request latency for this lane, in MILLISECONDS, stored as
     // the raw bits of an `f64` (`f64::to_bits`) so it can be read/updated lock-free with a single
     // atomic — mirroring the lock-free atomic style the rest of this struct uses for cheap per-lane
@@ -350,6 +353,11 @@ pub(crate) struct LaneState {
     // restart with the rest of the learned health.
     pub(crate) trips: AtomicU64,
     pub(crate) last_trip_at: AtomicU64,
+    // ── cold, Mutex-guarded state (rare paths: trips, window maintenance, transitions) ──
+    pub(crate) dead_reason: std::sync::Mutex<String>,
+    pub(crate) outcome_window: std::sync::Mutex<OutcomeWindow>,
+    // Serializes state+cooldown transitions on the default cell — see `BreakerCell::transition_lock`.
+    pub(crate) transition_lock: std::sync::Mutex<()>,
 }
 
 /// Smoothing factor (α) for the per-lane latency EWMA: `ewma = α·sample + (1-α)·ewma`. A smaller α
