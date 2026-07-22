@@ -18,7 +18,7 @@ pub struct VirtualKey {
     pub name: String,
     /// Pools this key may target; empty = all pools allowed.
     pub allowed_pools: Vec<String>,
-    /// Spend cap in cents for the budget period; None = unlimited.
+    /// Spend cap in cents (abstract minor units) for the budget period; None = unlimited.
     pub max_budget_cents: Option<i64>,
     /// "total" | "daily" | "monthly".
     pub budget_period: String,
@@ -28,6 +28,18 @@ pub struct VirtualKey {
     pub tpm_limit: Option<u32>,
     pub enabled: bool,
     pub created_at: u64,
+    /// The `governance.budget_groups` bucket this key charges INTO (in addition to its own inline
+    /// budget above, which stays the innermost bucket). `None` = the key participates in no group
+    /// chain. Named `budget_group` (never bare `group`) to avoid colliding with the auth
+    /// `group_map` concept, which has opposite (union / most-permissive) semantics.
+    /// `#[serde(default)]` keeps persisted pre-cost-model rows deserializable.
+    #[serde(default)]
+    pub budget_group: Option<String>,
+    /// Optional operator-supplied labels attached at mint (e.g. `{"team": "growth"}`), echoed onto
+    /// per-key metric series so external dashboards can `sum by (team)` WITHOUT busbar knowing what
+    /// "team" means. Never interpreted by enforcement. BTreeMap for a deterministic label order.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 // MANUAL Debug that REDACTS `key_hash`. A derived `Debug` would print the SHA-256 of the key's
@@ -57,6 +69,8 @@ impl std::fmt::Debug for VirtualKey {
             .field("tpm_limit", &self.tpm_limit)
             .field("enabled", &self.enabled)
             .field("created_at", &self.created_at)
+            .field("budget_group", &self.budget_group)
+            .field("labels", &self.labels)
             .finish()
     }
 }
@@ -130,12 +144,137 @@ impl std::fmt::Debug for AwsKeyEntry {
     }
 }
 
-/// Accumulated usage for a key within a budget window.
+/// Per-model token counts split by PRICING TIER (input / output / cache-read / cache-write) — the
+/// four token classes providers price differently. RAW counts, never money: every dollar figure is
+/// DERIVED at read time as `tokens x current rate card` (tokens are the ledger; dollars are always
+/// derived, never stored as truth).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub struct Usage {
-    pub spend_cents: i64,
-    pub tokens: u64,
+pub struct TierTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl TierTokens {
+    /// All four tiers zero (nothing to persist / flush).
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+
+    /// Total tokens across all tiers (saturating — counts are upstream-controlled).
+    pub fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+}
+
+/// One model's accumulated tier-token counts inside a [`UsageLedger`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelTokens {
+    pub model: String,
+    pub tokens: TierTokens,
+}
+
+/// The TOKEN LEDGER for one (bucket, window): the request count plus per-(model, tier) token
+/// counts. This replaces the old scalar `Usage { spend_cents, tokens, requests }` — no dollar
+/// field crosses the store boundary; spend is recomputed from `ledger x rate_card` at read time,
+/// so correcting a rate is a config edit, never a data migration.
+///
+/// `models` is a Vec (not a map): the models one bucket actually used is small, order is
+/// deterministic, and consumers do a few multiply-adds over it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct UsageLedger {
     pub requests: u64,
+    pub models: Vec<ModelTokens>,
+}
+
+impl UsageLedger {
+    /// The accumulated tier tokens for `model`, if any.
+    pub fn tokens_for(&self, model: &str) -> Option<&TierTokens> {
+        self.models
+            .iter()
+            .find(|m| m.model == model)
+            .map(|m| &m.tokens)
+    }
+
+    /// Total tokens across every model and tier (the old scalar `tokens` view).
+    pub fn total_tokens(&self) -> u64 {
+        self.models
+            .iter()
+            .fold(0u64, |acc, m| acc.saturating_add(m.tokens.total()))
+    }
+
+    /// Apply one signed per-model tier delta, flooring every counter at 0 (a refund can never
+    /// drive a durable counter negative). Allocates a model entry only on first sight.
+    pub fn apply_model_delta(&mut self, delta: &ModelTokensDelta) {
+        let entry = match self.models.iter_mut().find(|m| m.model == delta.model) {
+            Some(m) => m,
+            None => {
+                self.models.push(ModelTokens {
+                    model: delta.model.clone(),
+                    tokens: TierTokens::default(),
+                });
+                self.models.last_mut().expect("just pushed")
+            }
+        };
+        let t = &mut entry.tokens;
+        t.input = t.input.saturating_add_signed(delta.tokens.input);
+        t.output = t.output.saturating_add_signed(delta.tokens.output);
+        t.cache_read = t.cache_read.saturating_add_signed(delta.tokens.cache_read);
+        t.cache_write = t
+            .cache_write
+            .saturating_add_signed(delta.tokens.cache_write);
+    }
+
+    /// Apply a whole [`UsageDelta`] (requests + every model row), flooring at 0.
+    pub fn apply_delta(&mut self, delta: &UsageDelta) {
+        self.requests = self.requests.saturating_add_signed(delta.requests);
+        for m in &delta.models {
+            self.apply_model_delta(m);
+        }
+    }
+}
+
+/// Signed per-tier token delta (the fleet-additive flush primitive's per-model payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct TierTokensDelta {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+impl TierTokensDelta {
+    /// All four tiers zero (nothing to send).
+    pub fn is_zero(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
+    }
+}
+
+/// One model's signed tier delta inside a [`UsageDelta`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelTokensDelta {
+    pub model: String,
+    pub tokens: TierTokensDelta,
+}
+
+/// The additive cross-node reconciliation payload for one (bucket, window): a signed requests
+/// delta plus per-(model, tier) signed TOKEN deltas. No dollar delta crosses the wire — each node
+/// derives spend locally from its own rate card.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct UsageDelta {
+    pub requests: i64,
+    pub models: Vec<ModelTokensDelta>,
+}
+
+impl UsageDelta {
+    /// Nothing to flush (requests delta zero and every model delta zero).
+    pub fn is_zero(&self) -> bool {
+        self.requests == 0 && self.models.iter().all(|m| m.tokens.is_zero())
+    }
 }
 
 /// One per-(key, model, provider) metering accumulation from a completed response — RAW consumption
@@ -240,45 +379,36 @@ pub trait Store: Send + Sync + 'static {
     fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>>;
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
-    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
+    /// The TOKEN LEDGER for one (bucket, window). `bucket_id` is a key's own budget bucket (its
+    /// key id) OR a budget-group bucket — same shape either way. An untouched (bucket, window)
+    /// reads as the empty ledger. NO dollar field crosses this seam: spend is derived at read time
+    /// from `ledger x rate_card`.
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger>;
 
-    /// Write-behind ABSOLUTE set of a key's window counter. SETS (not adds) spend/tokens/requests
-    /// to the given values. Single-writer semantics only: with multiple busbar nodes sharing one
-    /// store, an absolute overwrite loses the other nodes' accruals — the fleet flush path uses
-    /// [`Store::add_usage`] instead.
+    /// Write-behind ABSOLUTE set of a bucket's window ledger. SETS (replaces) the whole
+    /// requests + per-model token record. Single-writer semantics only: with multiple busbar nodes
+    /// sharing one store, an absolute overwrite loses the other nodes' accruals — the fleet flush
+    /// path uses [`Store::add_usage`] instead.
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &UsageLedger,
     ) -> StoreResult<()>;
 
-    /// Write-behind ADDITIVE accumulate of a key's window counter: adds each (possibly negative,
-    /// e.g. a refund) DELTA to the durable record. This is the FLEET-HONEST flush primitive: N
-    /// nodes each flushing their delta-since-last-flush sum to the true fleet total, where
-    /// `put_usage`'s absolute overwrite would be last-writer-wins. Counters are floored at 0.
+    /// Write-behind ADDITIVE accumulate of a bucket's window ledger: adds the signed requests
+    /// delta plus each per-(model, tier) TOKEN delta (possibly negative, e.g. a refund) to the
+    /// durable record. This is the FLEET-HONEST flush primitive: N nodes each flushing their
+    /// delta-since-last-flush sum to the true fleet total, where `put_usage`'s absolute overwrite
+    /// would be last-writer-wins. Counters are floored at 0. No dollar delta crosses the wire.
     ///
-    /// DEFAULT: a read-modify-write fallback (get + put) for stores without a native atomic add —
-    /// correct for a single writer; a real shared backend overrides with an atomic accumulate
-    /// (SQL `UPDATE x = x + delta` UPSERT / redis `HINCRBY`).
-    fn add_usage(
-        &self,
-        key_id: &str,
-        window_start: u64,
-        delta_spend_cents: i64,
-        delta_tokens: i64,
-        delta_requests: i64,
-    ) -> StoreResult<()> {
-        let cur = self.get_usage(key_id, window_start)?;
-        self.put_usage(
-            key_id,
-            window_start,
-            cur.spend_cents.saturating_add(delta_spend_cents).max(0),
-            cur.tokens.saturating_add_signed(delta_tokens),
-            cur.requests.saturating_add_signed(delta_requests),
-        )
+    /// DEFAULT: a read-modify-write fallback (get + apply + put) for stores without a native
+    /// atomic add — correct for a single writer; a real shared backend overrides with an atomic
+    /// accumulate (SQL `UPDATE x = x + delta` UPSERT / redis `HINCRBY`).
+    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+        let mut cur = self.get_usage(bucket_id, window_start)?;
+        cur.apply_delta(delta);
+        self.put_usage(bucket_id, window_start, &cur)
     }
 
     /// Accumulate one completed response's RAW consumption into the per-(key, bucket, model,
@@ -381,6 +511,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 42,
+            budget_group: Some("growth".to_string()),
+            labels: std::collections::BTreeMap::from([("team".to_string(), "growth".to_string())]),
         }
     }
 
@@ -452,5 +584,138 @@ mod tests {
         );
         let back: AwsCredential = serde_json::from_str(&json).unwrap();
         assert_eq!(cred, back);
+    }
+
+    /// A persisted `VirtualKey` row written BEFORE the cost model (no `budget_group` / `labels`
+    /// fields in its JSON) still deserializes — the new fields default. Guards the redis-style
+    /// JSON persistence across the 1.5.0 schema growth.
+    #[test]
+    fn virtual_key_pre_cost_model_json_still_deserializes() {
+        let old = r#"{"id":"vk_1","key_hash":"h","name":"n","allowed_pools":[],
+            "max_budget_cents":null,"budget_period":"total","rpm_limit":null,"tpm_limit":null,
+            "enabled":true,"created_at":1}"#;
+        let k: VirtualKey = serde_json::from_str(old).unwrap();
+        assert_eq!(k.budget_group, None);
+        assert!(k.labels.is_empty());
+    }
+
+    /// The ledger's additive delta application: model rows materialize on first sight, tiers
+    /// accumulate independently, and negative deltas floor every counter at 0.
+    #[test]
+    fn usage_ledger_applies_deltas_and_floors_at_zero() {
+        let mut l = UsageLedger::default();
+        l.apply_delta(&UsageDelta {
+            requests: 2,
+            models: vec![ModelTokensDelta {
+                model: "gpt-5".to_string(),
+                tokens: TierTokensDelta {
+                    input: 100,
+                    output: 50,
+                    cache_read: 10,
+                    cache_write: 5,
+                },
+            }],
+        });
+        assert_eq!(l.requests, 2);
+        let t = l.tokens_for("gpt-5").unwrap();
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_write),
+            (100, 50, 10, 5)
+        );
+        assert_eq!(l.total_tokens(), 165);
+
+        // A second model materializes its own row; the first is untouched.
+        l.apply_delta(&UsageDelta {
+            requests: 1,
+            models: vec![ModelTokensDelta {
+                model: "haiku".to_string(),
+                tokens: TierTokensDelta {
+                    input: 7,
+                    output: 3,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
+        });
+        assert_eq!(l.models.len(), 2);
+        assert_eq!(l.tokens_for("gpt-5").unwrap().input, 100);
+
+        // Over-refund floors at 0, never negative.
+        l.apply_delta(&UsageDelta {
+            requests: -10,
+            models: vec![ModelTokensDelta {
+                model: "haiku".to_string(),
+                tokens: TierTokensDelta {
+                    input: -1000,
+                    output: -1,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
+        });
+        assert_eq!(l.requests, 0);
+        let h = l.tokens_for("haiku").unwrap();
+        assert_eq!((h.input, h.output), (0, 2));
+    }
+
+    /// The default trait `add_usage` (read-modify-write fallback) accumulates through
+    /// get_usage/put_usage, so a store double implementing only those two is fleet-usable
+    /// (single-writer).
+    #[test]
+    fn default_add_usage_accumulates_via_get_put() {
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Double(Mutex<std::collections::HashMap<(String, u64), UsageLedger>>);
+        impl Store for Double {
+            fn put_key(&self, _: &VirtualKey) -> StoreResult<()> {
+                Ok(())
+            }
+            fn get_key(&self, _: &str) -> StoreResult<Option<VirtualKey>> {
+                Ok(None)
+            }
+            fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+                Ok(Vec::new())
+            }
+            fn delete_key(&self, _: &str) -> StoreResult<()> {
+                Ok(())
+            }
+            fn get_usage(&self, b: &str, w: u64) -> StoreResult<UsageLedger> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get(&(b.to_string(), w))
+                    .cloned()
+                    .unwrap_or_default())
+            }
+            fn put_usage(&self, b: &str, w: u64, l: &UsageLedger) -> StoreResult<()> {
+                self.0.lock().unwrap().insert((b.to_string(), w), l.clone());
+                Ok(())
+            }
+            fn add_metering(&self, _: &MeteringDelta) -> StoreResult<()> {
+                Ok(())
+            }
+            fn list_metering(&self, _: u64) -> StoreResult<Vec<MeteringRow>> {
+                Ok(Vec::new())
+            }
+        }
+        let s = Double::default();
+        let d = UsageDelta {
+            requests: 1,
+            models: vec![ModelTokensDelta {
+                model: "m".to_string(),
+                tokens: TierTokensDelta {
+                    input: 5,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
+        };
+        s.add_usage("bucket", 0, &d).unwrap();
+        s.add_usage("bucket", 0, &d).unwrap();
+        let l = s.get_usage("bucket", 0).unwrap();
+        assert_eq!(l.requests, 2);
+        assert_eq!(l.tokens_for("m").unwrap().input, 10);
     }
 }

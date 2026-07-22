@@ -11,7 +11,7 @@
 //! - **hooks** — the [`RoutingPolicy`] trait (decide/transform/notify + configure/describe) and
 //!   the read-only projections it is invoked with.
 //! - **store** — the [`Store`] trait a `db` plugin implements, plus the durable-store records
-//!   ([`VirtualKey`], [`Usage`], [`AwsCredential`], …) it reads and writes.
+//!   ([`VirtualKey`], [`UsageLedger`], [`AwsCredential`], …) it reads and writes.
 //!
 //! Everything here is a CONTRACT, not machinery: no I/O, no engine state, no transport. A
 //! third-party plugin crate that depends only on `busbar-api` is architecturally identical to a
@@ -27,6 +27,7 @@ pub use hooks::{
     RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest, TransformOutcome,
 };
 pub use store::{
-    AuditRecord, AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError,
-    StoreResult, Usage, VirtualKey,
+    AuditRecord, AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, ModelTokens,
+    ModelTokensDelta, Store, StoreError, StoreResult, TierTokens, TierTokensDelta, UsageDelta,
+    UsageLedger, VirtualKey,
 };
