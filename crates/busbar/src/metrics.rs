@@ -137,6 +137,24 @@ const KEY_BUDGET_REMAINING_CENTS: &str = "busbar_key_budget_remaining_cents";
 /// Label: `key` = virtual-key id. Only emitted when governance is enabled.
 const KEY_TOKENS_TOTAL: &str = "busbar_key_tokens_total";
 
+/// Per-(bucket, model, tier) token counters for the bucket's CURRENT budget window. Scrape-time
+/// gauge, derived from the token ledger. `bucket` is a virtual-key id or `group:<name>` (both
+/// operator-bounded); `model` is bounded by the configured fleet (an ad-hoc passthrough model is
+/// only possible with pricing off); `tier` is one of the four fixed pricing tiers. Key-bucket
+/// series additionally echo the key's mint-time labels, so external dashboards can
+/// `sum by (team)` without busbar knowing what "team" means.
+const BUCKET_TOKENS: &str = "busbar_bucket_tokens";
+
+/// DERIVED spend (cents, abstract minor units) per BUDGET-GROUP bucket for its current window,
+/// recomputed from the token ledger x the CURRENT rate card at scrape time (reprice-on-read).
+/// Label: `bucket` = `group:<name>`. Key-bucket spend stays on `busbar_key_spend_cents`.
+const BUCKET_SPEND_CENTS: &str = "busbar_bucket_spend_cents";
+
+/// Cap minus derived spend per BUDGET-GROUP bucket. Label: `bucket` = `group:<name>`. The
+/// external-alerting linchpin: Alertmanager fires at 80% burn without busbar shipping any
+/// alerting of its own.
+const BUCKET_BUDGET_REMAINING_CENTS: &str = "busbar_bucket_budget_remaining_cents";
+
 /// Per-(pool, lane-model) circuit-breaker health gauge.
 /// Values: 0 = healthy (Closed), 1 = half-open (cooling but probe admitted), 2 = tripped (Open /
 /// hard-down). Scrape-time gauge; side-effect-free (does not trigger Open→HalfOpen transitions).
@@ -225,6 +243,20 @@ fn describe() {
         KEY_BUDGET_REMAINING_CENTS,
         Unit::Count,
         "Per-virtual-key budget remaining in cents (max_budget_cents - spend); only for capped keys (scrape-time)"
+    );
+    describe_gauge!(
+        BUCKET_TOKENS,
+        "Per-(bucket, model, tier) tokens in the bucket's current budget window (key and budget-group buckets; derived from the token ledger at scrape time)"
+    );
+    describe_gauge!(
+        BUCKET_SPEND_CENTS,
+        Unit::Count,
+        "Derived spend (abstract minor units) per budget-group bucket for its current window, recomputed from the token ledger x the current rate card at scrape time"
+    );
+    describe_gauge!(
+        BUCKET_BUDGET_REMAINING_CENTS,
+        Unit::Count,
+        "Budget-group cap minus derived spend for the current window"
     );
     describe_gauge!(
         KEY_TOKENS_TOTAL,
@@ -417,14 +449,93 @@ fn refresh_scrape_gauges(app: &App) {
                     continue;
                 }
             };
-            // key label = the operator-visible virtual-key id (`vk_<hex>`), never the bearer secret.
-            metrics::gauge!(KEY_SPEND_CENTS, "key" => key.id.clone()).set(usage.spend_cents as f64);
-            metrics::gauge!(KEY_TOKENS_TOTAL, "key" => key.id.clone()).set(usage.tokens as f64);
+            // key label = the operator-visible virtual-key id (`vk_<hex>`), never the bearer
+            // secret. The key's MINT-TIME labels (e.g. team=growth) are echoed onto every series
+            // so external Grafana can `sum by (team)` and Alertmanager can fire per team WITHOUT
+            // busbar knowing what "team" means. Label KEYS are operator-chosen at mint (bounded by
+            // the admin surface), never request bytes.
+            let base_labels = |extra: &[(&'static str, String)]| -> Vec<metrics::Label> {
+                let mut labels: Vec<metrics::Label> =
+                    vec![metrics::Label::new("key", key.id.clone())];
+                for (k, v) in &key.labels {
+                    labels.push(metrics::Label::new(k.clone(), v.clone()));
+                }
+                for (k, v) in extra {
+                    labels.push(metrics::Label::new(*k, v.clone()));
+                }
+                labels
+            };
+            metrics::gauge!(KEY_SPEND_CENTS, base_labels(&[])).set(usage.spend_cents as f64);
+            metrics::gauge!(KEY_TOKENS_TOTAL, base_labels(&[])).set(usage.tokens as f64);
             // Budget-remaining: only for keys that carry a `max_budget_cents` cap.
             if let Some(max) = key.max_budget_cents {
                 let remaining = max.saturating_sub(usage.spend_cents).max(0);
-                metrics::gauge!(KEY_BUDGET_REMAINING_CENTS, "key" => key.id.clone())
-                    .set(remaining as f64);
+                metrics::gauge!(KEY_BUDGET_REMAINING_CENTS, base_labels(&[])).set(remaining as f64);
+            }
+            // Per-(bucket, model, tier) token gauges from the key bucket's ledger (the raw
+            // material any external per-model cost dashboard multiplies by its own catalog).
+            for (model, tokens) in gov.bucket_model_tokens(&key.id, &key.budget_period, now) {
+                for (tier, v) in [
+                    ("input", tokens.input),
+                    ("output", tokens.output),
+                    ("cache_read", tokens.cache_read),
+                    ("cache_write", tokens.cache_write),
+                ] {
+                    let mut labels: Vec<metrics::Label> =
+                        vec![metrics::Label::new("bucket", key.id.clone())];
+                    for (k, val) in &key.labels {
+                        labels.push(metrics::Label::new(k.clone(), val.clone()));
+                    }
+                    labels.push(metrics::Label::new("model", model.clone()));
+                    labels.push(metrics::Label::new("tier", tier));
+                    metrics::gauge!(BUCKET_TOKENS, labels).set(v as f64);
+                }
+            }
+        }
+
+        // ── Budget-GROUP buckets: derived spend + remaining + per-(model, tier) tokens ─────────
+        // Bounded by the configured group count (operator-owned names). Spend derives fresh from
+        // the ledger x the CURRENT rate card (reprice-on-read); group spend is tokens-only (the
+        // flat fee counts against key buckets).
+        for group in app.cost.groups() {
+            let derived = match gov.derived_bucket_usage(
+                &app.cost,
+                &group.bucket_id,
+                &group.budget_period,
+                false,
+                now,
+            ) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(bucket = %group.bucket_id, error = %e, "metrics scrape: group ledger read failed; skipping");
+                    continue;
+                }
+            };
+            metrics::gauge!(BUCKET_SPEND_CENTS, "bucket" => group.bucket_id.clone())
+                .set(derived.spend_cents as f64);
+            let remaining = group
+                .max_budget_cents
+                .saturating_sub(derived.spend_cents)
+                .max(0);
+            metrics::gauge!(BUCKET_BUDGET_REMAINING_CENTS, "bucket" => group.bucket_id.clone())
+                .set(remaining as f64);
+            for (model, tokens) in
+                gov.bucket_model_tokens(&group.bucket_id, &group.budget_period, now)
+            {
+                for (tier, v) in [
+                    ("input", tokens.input),
+                    ("output", tokens.output),
+                    ("cache_read", tokens.cache_read),
+                    ("cache_write", tokens.cache_write),
+                ] {
+                    metrics::gauge!(
+                        BUCKET_TOKENS,
+                        "bucket" => group.bucket_id.clone(),
+                        "model" => model.clone(),
+                        "tier" => tier
+                    )
+                    .set(v as f64);
+                }
             }
         }
     }
@@ -689,6 +800,106 @@ mod tests {
                 "uncapped key must not appear in budget_remaining_cents lines; got:\n{line}"
             );
         }
+    }
+
+    /// The 1.5.0 cost-model exposure: `busbar_bucket_tokens{bucket, model, tier}` series for key
+    /// AND budget-group buckets, derived `busbar_bucket_spend_cents` / `_budget_remaining_cents`
+    /// for group buckets, and the key's MINT-TIME labels echoed onto its series (so external
+    /// dashboards can `sum by (team)` without busbar knowing what a team is).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn test_scrape_gauges_bucket_model_tier_and_key_labels() {
+        init();
+
+        let mut key = sample_vkey("vk_bucket_test1");
+        key.budget_group = Some("growth".to_string());
+        key.labels = std::collections::BTreeMap::from([("team".to_string(), "growth".to_string())]);
+        let gov = gov_with_key(key.clone());
+
+        // A cost model with the growth group; flat fee 1 (TestApp default shape).
+        let mut gcfg = crate::config::GovernanceCfg::default();
+        gcfg.budget_groups = std::collections::BTreeMap::from([(
+            "growth".to_string(),
+            crate::config::BudgetGroupCfg {
+                max_budget_cents: 1_000,
+                budget_period: "total".to_string(),
+                parent: None,
+            },
+        )]);
+        let cost =
+            crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+
+        // Accrue per-model tier tokens through the REAL accrual path (fans out to key + group).
+        gov.record_usage(
+            &cost,
+            &key,
+            "gpt-5",
+            &busbar_api::TierTokens {
+                input: 100,
+                output: 40,
+                cache_read: 7,
+                cache_write: 3,
+            },
+            1_700_000_000,
+        );
+
+        let app = TestApp::new()
+            .lane(LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://m",
+            ))
+            .pool("pool-b", &[(0, 1)])
+            .governance(gov)
+            .cost(crate::cost::CostModel::resolve_parts(
+                &gcfg,
+                &Default::default(),
+                &Default::default(),
+            ))
+            .build();
+        refresh_scrape_gauges(&app);
+        let out = render();
+
+        // Key-bucket per-(model, tier) series with the mint label echoed.
+        let key_line = out
+            .lines()
+            .find(|l| {
+                l.starts_with("busbar_bucket_tokens")
+                    && l.contains("bucket=\"vk_bucket_test1\"")
+                    && l.contains("model=\"gpt-5\"")
+                    && l.contains("tier=\"input\"")
+            })
+            .unwrap_or_else(|| panic!("key-bucket input-tier series missing: {out}"));
+        assert!(
+            key_line.contains("team=\"growth\""),
+            "mint labels echo onto metric series: {key_line}"
+        );
+        assert!(
+            key_line.trim_end().ends_with("100"),
+            "input tier value: {key_line}"
+        );
+
+        // Group-bucket series exist too (the chain accrual fanned out).
+        assert!(
+            out.lines().any(|l| l.starts_with("busbar_bucket_tokens")
+                && l.contains("bucket=\"group:growth\"")
+                && l.contains("tier=\"output\"")),
+            "group-bucket token series missing: {out}"
+        );
+        // Derived group spend (0 without a rate card) + remaining (= full cap).
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("busbar_bucket_spend_cents")
+                    && l.contains("bucket=\"group:growth\"")),
+            "group spend gauge missing"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.starts_with("busbar_bucket_budget_remaining_cents")
+                    && l.contains("bucket=\"group:growth\"")
+                    && l.trim_end().ends_with("1000")),
+            "group remaining gauge = full cap when token spend derives to 0: {out}"
+        );
     }
 
     /// `refresh_scrape_gauges` with no governance must not panic and must emit `LANE_STATE` gauges.

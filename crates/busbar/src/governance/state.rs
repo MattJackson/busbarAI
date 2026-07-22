@@ -545,6 +545,38 @@ impl GovState {
         })
     }
 
+    /// SCRAPE-TIME view of one bucket's per-(model, tier) token counters for its CURRENT window:
+    /// the authoritative cell when live, else the durable ledger. Off the hot path (the /metrics
+    /// scrape); allocation here is fine.
+    pub(crate) fn bucket_model_tokens(
+        &self,
+        bucket_id: &str,
+        budget_period: &str,
+        now: u64,
+    ) -> Vec<(String, TierTokens)> {
+        let window = budget_window(budget_period, now);
+        {
+            let map = self.budget.read(bucket_id);
+            if let Some(cell) = map.get(bucket_id) {
+                if cell.window_start == window {
+                    return cell
+                        .models
+                        .iter()
+                        .map(|m| (m.model.to_string(), m.cur))
+                        .collect();
+                }
+            }
+        }
+        match self.store.get_usage(bucket_id, window) {
+            Ok(ledger) => ledger
+                .models
+                .into_iter()
+                .map(|m| (m.model, m.tokens))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// The HOOK-SEAM projection: per-bucket budget state for the key + every ancestor group -
     /// `{bucket_id, spend_micros_at_current_rate, remaining_micros, window}`. Read-only, built off
     /// the default hot path (only routing-policy pools request it). A missing budget group yields
