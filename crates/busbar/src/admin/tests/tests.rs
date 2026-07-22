@@ -4918,13 +4918,27 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
         "file": file,
         "library_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
     });
-    let resp = client
-        .post(format!("http://{addr}/api/v1/admin/plugins"))
-        .header("x-admin-token", "admintok")
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
+    // One retry on a TRANSPORT error only: this POST carries a multi-megabyte body over loopback,
+    // and Windows occasionally aborts the connection mid-exchange (WSAECONNABORTED 10053) when the
+    // server's response races the client's still-in-flight writes — a platform quirk of large
+    // bodies on 127.0.0.1, not a product behavior. An HTTP status (any status) is NEVER retried;
+    // only a failed send. If the abort were deterministic the retry would fail identically, so
+    // this cannot mask a real regression.
+    let install = || async {
+        client
+            .post(format!("http://{addr}/api/v1/admin/plugins"))
+            .header("x-admin-token", "admintok")
+            .json(&body)
+            .send()
+            .await
+    };
+    let resp = match install().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("install POST transport error, retrying once: {e}");
+            install().await.unwrap()
+        }
+    };
     assert_eq!(resp.status().as_u16(), 201, "install returns 201 Created");
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["file"], file);
