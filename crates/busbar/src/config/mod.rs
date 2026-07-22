@@ -1377,7 +1377,11 @@ impl fmt::Debug for ProviderDeploy {
 }
 
 /// Deployment configuration - operator-owned config.yaml structure.
+// deny_unknown_fields: a typo'd or unknown TOP-LEVEL key (e.g. `plugin:` for `plugins:`) must be a
+// loud startup error, not a silently-ignored block - the fail-closed posture every nested
+// security-relevant struct (auth/governance/plugins/security) already enforces.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeployCfg {
     #[serde(default = "default_listen")]
     pub(crate) listen: String,
