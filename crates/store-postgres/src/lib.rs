@@ -108,6 +108,13 @@ fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
+/// Read a signed BIGINT rate-limit column back as a `u32`, SATURATING an out-of-range value to
+/// `u32::MAX` (and clamping a negative to 0) instead of wrapping via `as u32` - mirrors the SQLite
+/// backend's DI-2 posture so a direct-DB write can never silently narrow to a WRONG cap.
+fn read_u32_cap(v: i64) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
 impl PostgresStore {
     /// Connect to Postgres with the given libpq connection string / URL (e.g.
     /// `postgres://user:pass@host:5432/dbname`) and ensure the schema. TLS is not wired in this
@@ -159,8 +166,11 @@ fn row_to_key(r: &Row) -> VirtualKey {
         allowed_pools: pools_from_storage(&r.get::<_, String>(3)),
         max_budget_cents: r.get(4),
         budget_period: r.get(5),
-        rpm_limit: r.get::<_, Option<i64>>(6).map(|v| v as u32),
-        tpm_limit: r.get::<_, Option<i64>>(7).map(|v| v as u32),
+        // DI-2 (mirrors the SQLite backend): a direct-DB BIGINT above u32::MAX (or a negative)
+        // would silently wrap to a WRONG rate-limit cap with `as u32`. Saturate instead - the admin
+        // API bounds these on the write path; this closes the direct-DB hole.
+        rpm_limit: r.get::<_, Option<i64>>(6).map(read_u32_cap),
+        tpm_limit: r.get::<_, Option<i64>>(7).map(read_u32_cap),
         enabled: r.get(8),
         created_at: read_u64(r.get::<_, i64>(9)),
     }
@@ -450,6 +460,20 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DI-2: a BIGINT rate-limit column above `u32::MAX` (or negative) must SATURATE to `u32::MAX`,
+    /// not wrap to a wrong (lower) cap via `as u32`. Matches the SQLite backend's semantics exactly.
+    #[test]
+    fn read_u32_cap_saturates_out_of_range_bigint() {
+        assert_eq!(read_u32_cap(60), 60, "in-range value passes through");
+        assert_eq!(read_u32_cap(0), 0);
+        assert_eq!(read_u32_cap(i64::from(u32::MAX)), u32::MAX, "the boundary");
+        // Above u32::MAX would wrap to a WRONG lower cap with `as u32` (e.g. 0); saturate instead.
+        assert_eq!(read_u32_cap(i64::from(u32::MAX) + 1), u32::MAX);
+        assert_eq!(read_u32_cap(i64::MAX), u32::MAX);
+        // A corrupt/direct-DB negative clamps to u32::MAX too (matches SQLite's unwrap_or(MAX)).
+        assert_eq!(read_u32_cap(-1), u32::MAX);
+    }
 
     /// End-to-end against a REAL Postgres, gated on `BUSBAR_TEST_POSTGRES_URL` (a docker
     /// `postgres:16` service in CI). Skips cleanly when unset LOCALLY so the default `cargo test`
