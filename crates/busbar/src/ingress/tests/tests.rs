@@ -475,7 +475,7 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     );
 
     // Gate keyed off the (past) `charged_at` window sees spend ≥ cap → reject.
-    let rejected = budget_check(&app, &govctx, "openai", past_day).await;
+    let rejected = budget_check(&app, &govctx, "openai", past_day);
     assert!(
         rejected.is_err(),
         "budget_check must reject against the charged_at window where the spend lives (#29)"
@@ -488,7 +488,7 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
 
     // Sanity: today's window is empty, so a gate keyed off the wall clock (the OLD behaviour)
     // would have WRONGLY admitted. This proves the bug was real and the pin fixes it.
-    let admitted_today = budget_check(&app, &govctx, "openai", crate::store::now()).await;
+    let admitted_today = budget_check(&app, &govctx, "openai", crate::store::now());
     assert!(
         admitted_today.is_ok(),
         "today's window is empty; the old clock-based gate would have admitted here"
@@ -3025,7 +3025,6 @@ async fn test_governance_rejection_is_counted_via_finish() {
         Instant::now(),
         crate::store::now(),
     )
-    .await
     .expect_err("a disallowed pool must be rejected by the governance guard");
     assert_eq!(
         rejected.status(),
@@ -3072,8 +3071,7 @@ async fn test_governance_guard_passes_when_allowed() {
         "allowed-only",
         Instant::now(),
         crate::store::now(),
-    )
-    .await;
+    );
     assert!(
         matches!(passed, Ok(true)),
         "an allowed, in-budget, in-rate request is admitted AND charged (Ok(true))"
@@ -3156,10 +3154,9 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
         key: Some(std::sync::Arc::new(key2.clone())),
     };
     let resp = budget_check(&app2, &gov2, "openai", crate::store::now())
-        .await
         .expect_err("zero-budget key ⇒ over-budget response");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    let body = body_string(resp).await;
+    let body = body_string(*resp).await;
     assert_leak_free(&body, &key2.id, "any-pool");
 
     // Bedrock ingress maps the same over-budget condition to a 400-class
@@ -3169,10 +3166,9 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
         key: Some(std::sync::Arc::new(key2b.clone())),
     };
     let resp = budget_check(&app2b, &gov2b, "bedrock", crate::store::now())
-        .await
         .expect_err("zero-budget key ⇒ over-budget response (bedrock)");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body = body_string(resp).await;
+    let body = body_string(*resp).await;
     assert!(
         body.contains("ServiceQuotaExceededException"),
         "bedrock over-budget body carries native quota exception: {body}"

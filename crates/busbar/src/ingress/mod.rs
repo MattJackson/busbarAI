@@ -143,12 +143,12 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
 /// `Ok(false)` = admitted WITHOUT a charge (governance off / no key / store-error fail-open) — a
 /// non-2xx must NOT refund, because `refund_request` is a blind decrement that would erode ANOTHER
 /// request's spend/count in the same window (see `finish_rejected`). `Err(resp)` = rejected.
-async fn budget_check(
+fn budget_check(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     proto: &str,
     charged_at: u64,
-) -> Result<bool, Response> {
+) -> Result<bool, Box<Response>> {
     if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
         // ATOMIC budget check-and-charge (fix 2a): one indivisible UPSERT charges the flat per-request
         // fee + one request IFF it stays within the cap. This replaces the old non-atomic read
@@ -181,12 +181,12 @@ async fn budget_check(
             let status = crate::proto::protocol_for(proto)
                 .map(|p| p.writer().quota_exceeded_status())
                 .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-            Err(ingress_error(
+            Err(Box::new(ingress_error(
                 proto,
                 status,
                 crate::proxy::KIND_INSUFFICIENT_QUOTA,
                 "You have exceeded your current quota. Please check your plan and billing details.",
-            ))
+            )))
         }
     } else {
         // Governance off or no resolved key → no charge landed; nothing to refund on a non-2xx.
@@ -205,23 +205,23 @@ async fn budget_check(
 /// guard passes and the caller should proceed to resolve+forward. Without this, the early returns
 /// from `forward_resolved`/`named`/`adhoc` made every governance-rejected request invisible to
 /// Prometheus and the webhook.
-async fn governance_guard(
+fn governance_guard(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     proto: &'static str,
     pool: &str,
     started: Instant,
     charged_at: u64,
-) -> Result<bool, Response> {
+) -> Result<bool, Box<Response>> {
     // A governance rejection fires BEFORE the model is resolved to a configured pool, so the raw
     // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs)
     // before it reaches `finish` (which stamps it onto REQUESTS_TOTAL / the duration histogram /
     // the request-log webhook). Passing it raw was an unbounded-cardinality DoS vector.
     let label = pool_label(app, pool);
     if let Some(resp) = pool_authorized(gov, pool, proto) {
-        return Err(finish_rejected(
+        return Err(Box::new(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
-        ));
+        )));
     }
     // The initial-pool ACL passed, but the requested pool may be configured to fail over to a
     // FALLBACK pool on exhaustion (`OnExhausted::FallbackPool`). Re-enforce the key's `allowed_pools`
@@ -230,27 +230,27 @@ async fn governance_guard(
     // `proxy::handle_fallback_pool` does not — and cannot — re-check the key; the ACL is enforced
     // at this ingress boundary). A denial is the SAME protocol-native 403 the initial check emits.
     if let Some(resp) = fallback_pools_authorized(app, gov, pool, proto) {
-        return Err(finish_rejected(
+        return Err(Box::new(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
-        ));
+        )));
     }
     // RATE check BEFORE the budget charge: `budget_check` now atomically CHARGES the flat fee at
     // admission (fix 2a), so it must be the LAST guard — nothing may reject an already-charged
     // request. A rate-limited request is rejected here without ever being charged.
     if let Some(resp) = rate_check(app, gov, proto, charged_at) {
-        return Err(finish_rejected(
+        return Err(Box::new(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
-        ));
+        )));
     }
     // Budget charge LAST. On rejection nothing was charged → `finish_rejected` (no refund). On
     // admission, `budget_check` reports whether the flat fee actually LANDED: `Ok(true)` means the
     // post-admission `finish` must refund it on a non-2xx; `Ok(false)` (governance off / no key /
     // store-error fail-open) means NO charge landed, so the caller must NOT refund — a blind refund
     // there erodes another request's spend (found: audit c2r1). That flag is the guard's return.
-    match budget_check(app, gov, proto, charged_at).await {
-        Err(resp) => Err(finish_rejected(
-            app, gov, proto, label, started, charged_at, resp,
-        )),
+    match budget_check(app, gov, proto, charged_at) {
+        Err(resp) => Err(Box::new(finish_rejected(
+            app, gov, proto, label, started, charged_at, *resp,
+        ))),
         Ok(charged) => Ok(charged),
     }
 }
@@ -1072,11 +1072,10 @@ pub(crate) async fn named(
     // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
     // inside `governance_guard` (this handler just returns that response). On admission it reports
     // whether the flat fee was CHARGED, so the post-admission finish only refunds when it landed.
-    let charged =
-        match governance_guard(&app, &gov, PROTO_ANTHROPIC, &name, started, charged_at).await {
-            Err(resp) => return resp,
-            Ok(charged) => charged,
-        };
+    let charged = match governance_guard(&app, &gov, PROTO_ANTHROPIC, &name, started, charged_at) {
+        Err(resp) => return *resp,
+        Ok(charged) => charged,
+    };
 
     if let Some(cands) = app.pools.get(&name) {
         let affinity_key = headers
@@ -1194,11 +1193,10 @@ pub(crate) async fn adhoc(
     // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
     // inside `governance_guard` (this handler just returns that response). `charged` gates the
     // post-admission refund so an un-charged (store-error-Allow) admit never blind-refunds.
-    let charged =
-        match governance_guard(&app, &gov, PROTO_ANTHROPIC, &model, started, charged_at).await {
-            Err(resp) => return resp,
-            Ok(charged) => charged,
-        };
+    let charged = match governance_guard(&app, &gov, PROTO_ANTHROPIC, &model, started, charged_at) {
+        Err(resp) => return *resp,
+        Ok(charged) => charged,
+    };
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {

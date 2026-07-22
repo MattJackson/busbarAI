@@ -196,8 +196,8 @@ pub(crate) async fn operation_resolved(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let charged = match governance_guard(app, gov, proto, model, started, charged_at).await {
-        Err(resp) => return resp,
+    let charged = match governance_guard(app, gov, proto, model, started, charged_at) {
+        Err(resp) => return *resp,
         Ok(charged) => charged,
     };
 

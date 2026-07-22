@@ -1036,7 +1036,7 @@ fn write_server_timing_value(buf: &mut [u8; 40], internal_us: u64) -> usize {
     let mut n = PREFIX.len();
     let whole = internal_us / 1000;
     let frac = (internal_us % 1000) as usize; // 0..=999
-    // Whole milliseconds, itoa-lite into a scratch buffer written back-to-front.
+                                              // Whole milliseconds, itoa-lite into a scratch buffer written back-to-front.
     let mut scratch = [0u8; 20];
     let mut si = scratch.len();
     let mut w = whole;
@@ -2110,8 +2110,7 @@ fn apply_common_layers(
         // Outermost: reshape the body-limit layer's bare-text 413 into a protocol-native JSON
         // envelope. Must wrap the `DefaultBodyLimit` layer above, so it is applied LAST (the last
         // `.layer()` is the outermost on the response path) and therefore sees that layer's 413.
-        .layer(axum::middleware::from_fn(reshape_body_limit_413))
-        ;
+        .layer(axum::middleware::from_fn(reshape_body_limit_413));
     // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
     // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
     // Gated on `observability.emit_server_timing` (default false): when false the header is fully

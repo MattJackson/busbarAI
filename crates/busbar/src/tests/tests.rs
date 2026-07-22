@@ -476,13 +476,10 @@ fn test_write_server_timing_value_matches_float_format() {
         // print threshold — comfortably true for any reachable duration; the integer writer is
         // exact everywhere)
         (1_000_000_000_000_000, NO_UPSTREAM_RTT), // 1e15 µs ≈ 31.7 years
-        (25_000_033, 25_000_000), // benchmark shape: 20ms upstream + 33µs internal
+        (25_000_033, 25_000_000),                 // benchmark shape: 20ms upstream + 33µs internal
     ];
     for &(total, upstream) in cases {
-        let expected = format!(
-            "busbar;dur={:.3}",
-            server_timing_dur_ms(total, upstream)
-        );
+        let expected = format!("busbar;dur={:.3}", server_timing_dur_ms(total, upstream));
         let internal = server_timing_internal_us(total, upstream);
         let mut buf = [0u8; 40];
         let n = write_server_timing_value(&mut buf, internal);
