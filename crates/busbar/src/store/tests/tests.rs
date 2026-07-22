@@ -3398,3 +3398,50 @@ fn test_streak_zero_base_cooldown_is_jittered_and_desynced() {
         );
     }
 }
+
+/// P2 #5: `export_health` must read each cell's (breaker_state, cooldown_until) as a CONSISTENT
+/// PAIR. A transition writes both atomics together under the cell's transition lock; the export now
+/// reads both under the SAME lock, so the snapshot never straddles a transition and observes e.g.
+/// Open with a cleared cooldown (which, once persisted and restored, would revive a hard-down lane
+/// as receiving traffic). This is the deterministic invariant: after a trip that sets Open + a
+/// future cooldown, the exported pair reflects BOTH - never a mismatched (Open, 0).
+#[test]
+fn test_export_health_reads_consistent_state_cooldown_pair() {
+    set_now_for_test(10_000);
+    let store = InMemoryStore::new(vec![make_lane_data(0, 4)]);
+
+    // Trip the DEFAULT cell (lane 0) Open with a real future cooldown, writing the (state, cooldown)
+    // pair together under the transition lock.
+    store.force_open_in("", 0, 10_600);
+    // And trip a PER-POOL cell too, so both export branches (default + per-pool) are covered.
+    let cfg = BreakerCfg::default();
+    for _ in 0..5 {
+        store.record_transient_in("poolA", 0, "5xx", &cfg, None);
+    }
+
+    let snaps = store.export_health();
+    let s0 = &snaps[0];
+
+    // Default cell: Open (ST_OPEN == 1) MUST pair with a non-zero, future cooldown - never a torn
+    // (Open, 0). A lock-free straddling read could observe the state store without the paired
+    // cooldown store; holding the transition lock for both loads rules that out.
+    assert_eq!(s0.breaker_state, 1, "default cell exported as Open");
+    assert!(
+        s0.cooldown_until >= 10_600,
+        "an Open default cell must export its paired future cooldown, not a torn 0: got {}",
+        s0.cooldown_until
+    );
+
+    // Per-pool cell: same paired invariant.
+    let pool_cell = s0
+        .cells
+        .iter()
+        .find(|c| c.pool == "poolA")
+        .expect("the tripped poolA cell must be exported");
+    assert_eq!(pool_cell.breaker_state, 1, "poolA cell exported as Open");
+    assert!(
+        pool_cell.cooldown_until > 10_000,
+        "an Open per-pool cell must export its paired future cooldown, not a torn 0: got {}",
+        pool_cell.cooldown_until
+    );
+}

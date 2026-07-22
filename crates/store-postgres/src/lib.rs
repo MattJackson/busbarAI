@@ -451,13 +451,27 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    /// End-to-end against a REAL Postgres, gated on `BUSBAR_TEST_POSTGRES_URL` (e.g. a docker
-    /// `postgres:16` in CI). Skips cleanly when unset so the default `cargo test` needs no database.
+    /// End-to-end against a REAL Postgres, gated on `BUSBAR_TEST_POSTGRES_URL` (a docker
+    /// `postgres:16` service in CI). Skips cleanly when unset LOCALLY so the default `cargo test`
+    /// needs no database - but MUST NOT silently skip in CI: CI provisions the service and sets the
+    /// URL (see .github/workflows/ci.yml), so when `CI` is set the missing URL is a HARD FAILURE
+    /// rather than a silent skip. Otherwise a broken CI service block would let the only coverage of
+    /// the delete_key cascade / credential cleanup vanish unnoticed (P1 #6).
     #[test]
     fn roundtrip_against_live_postgres() {
-        let Ok(url) = std::env::var("BUSBAR_TEST_POSTGRES_URL") else {
-            eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the Postgres store test");
-            return;
+        let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var_os("CI").is_some() => {
+                panic!(
+                    "BUSBAR_TEST_POSTGRES_URL is unset under CI: the Postgres service container must \
+                     provision it (see .github/workflows/ci.yml). Refusing to silently skip the only \
+                     live-DB coverage in CI."
+                );
+            }
+            Err(_) => {
+                eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the Postgres store test");
+                return;
+            }
         };
         let store = PostgresStore::connect(&url).expect("connect");
         // Isolate from any prior run.
@@ -486,7 +500,39 @@ mod tests {
         let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 9, 3));
 
+        // Attach an AWS credential so delete_key's CASCADE (key + usage + credentials) can be
+        // verified end to end - the credential-cleanup path P1 #6 flagged as untested.
+        let cred = AwsCredential {
+            access_key_id: "AKIA_PG_TEST".into(),
+            key_id: "vk_pg".into(),
+            secret_access_key: "s3cr3t".into(),
+        };
+        store.put_aws_credential(&cred).unwrap();
+        assert!(
+            store
+                .list_aws_credentials()
+                .unwrap()
+                .iter()
+                .any(|c| c.access_key_id == "AKIA_PG_TEST"),
+            "the AWS credential must be present before delete_key"
+        );
+
         store.delete_key("vk_pg").unwrap();
+        // CASCADE: the key, its usage counters, AND its AWS credential are all gone.
         assert!(store.get_key("vk_pg").unwrap().is_none());
+        let u = store.get_usage("vk_pg", 100).unwrap();
+        assert_eq!(
+            (u.spend_cents, u.tokens, u.requests),
+            (0, 0, 0),
+            "delete_key must cascade to the usage counters"
+        );
+        assert!(
+            !store
+                .list_aws_credentials()
+                .unwrap()
+                .iter()
+                .any(|c| c.access_key_id == "AKIA_PG_TEST"),
+            "delete_key must cascade to the AWS credentials (credential cleanup, P1 #6)"
+        );
     }
 }

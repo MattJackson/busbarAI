@@ -13,6 +13,35 @@ jobs:
   check:
     name: fmt · clippy · build · test
     runs-on: ubuntu-latest
+    # Live-DB service containers for the store-postgres / store-redis roundtrip tests. Without these
+    # the roundtrip tests skip (their URLs are unset) and the two 1.5.0 store backends ship with ZERO
+    # CI coverage of the delete_key cascade + credential cleanup. The tests read BUSBAR_TEST_POSTGRES_URL
+    # / REDIS_URL (set on the Test step below) and, because `CI` is set in Actions, HARD-FAIL rather
+    # than silently skip if a service is misconfigured - so this coverage cannot vanish unnoticed.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: busbar
+          POSTGRES_PASSWORD: busbar
+          POSTGRES_DB: busbar_test
+        ports:
+          - 5432:5432
+        # Wait until the DB accepts connections before the job's steps run.
+        options: >-
+          --health-cmd "pg_isready -U busbar"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v7
 
@@ -37,6 +66,11 @@ jobs:
         run: cargo build --workspace --locked --verbose
 
       - name: Test
+        # Point the store-postgres / store-redis roundtrip tests at the service containers above so
+        # they RUN (not skip) in CI. The services publish on localhost via the mapped ports.
+        env:
+          BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
+          REDIS_URL: redis://localhost:6379
         run: cargo test --workspace --locked --verbose
 
   # OpenAPI schema gate (CI-ONLY `openapi-schema` feature). `openapi_doc()` derives typed response
