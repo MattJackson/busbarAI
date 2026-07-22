@@ -701,6 +701,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Locate the REAL sqlite plugin cdylib in the build's target dir (like the loader tests).
+    /// CI hardening: under CI (`cargo test --workspace` always builds it) a missing cdylib is a
+    /// HARD failure, never a silent skip.
+    fn sqlite_cdylib() -> Option<PathBuf> {
+        let candidate = (|| {
+            let exe = std::env::current_exe().ok()?;
+            let profile_dir = exe.parent()?.parent()?;
+            let name = crate::plugin_library_filename("busbar_store_sqlite_plugin");
+            let candidate = profile_dir.join(&name);
+            candidate.exists().then_some(candidate)
+        })();
+        if candidate.is_none() && std::env::var_os("CI").is_some() {
+            panic!(
+                "the sqlite plugin cdylib is not built under CI; refusing to silently skip the                  end-to-end tarball pipeline coverage"
+            );
+        }
+        candidate
+    }
+
+    /// END-TO-END, REAL CODE: package the actual sqlite store cdylib into a SIGNED tarball, run
+    /// the full three-phase pipeline, resolve by ALIAS, and open a live `dyn Store` through the
+    /// memfd (Linux) / private-temp loader — exercising put/get over the C ABI. This is the exact
+    /// seam the engine sees: verified bytes in, `Box<dyn Store>` out, indistinguishable from a
+    /// compiled-in backend.
+    #[test]
+    fn end_to_end_open_store_from_signed_tarball() {
+        let Some(path) = sqlite_cdylib() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let lib = std::fs::read(&path).expect("read sqlite cdylib");
+        let acme = key(3);
+        let dir = tmpdir("e2e");
+        let m = sign(&acme, manifest("acme-store-sqlite", "sqlite", "acme"), &lib);
+        let bytes = tarball::package(&m, "libbusbar_store_sqlite_plugin.so", &lib).unwrap();
+        std::fs::write(dir.join("sqlite.tar.gz"), bytes).unwrap();
+
+        let mut pol = policy(&key(1));
+        pol.publishers
+            .insert("acme".to_string(), acme.verifying_key());
+        let reg = scan_and_validate(&dir, &pol).expect("scan");
+        let store = reg
+            .open_store("sqlite", r#"{"db_path": ":memory:"}"#)
+            .expect("open the real sqlite store through the full pipeline");
+        let key = busbar_api::VirtualKey {
+            id: "vk_pipeline".into(),
+            key_hash: "h".into(),
+            name: "pipeline".into(),
+            allowed_pools: vec!["p".into()],
+            max_budget_cents: Some(9),
+            budget_period: "total".into(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 1,
+        };
+        store.put_key(&key).expect("put over the ABI");
+        assert_eq!(
+            store
+                .get_key("vk_pipeline")
+                .unwrap()
+                .unwrap()
+                .max_budget_cents,
+            Some(9)
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// First-party anti-downgrade in the pipeline: an old (validly signed) first-party plugin is
     /// REJECTED (inventory shows below-floor; scan skips it with the anti-downgrade reason).
     #[test]
