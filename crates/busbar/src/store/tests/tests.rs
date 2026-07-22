@@ -3404,7 +3404,7 @@ fn test_streak_zero_base_cooldown_is_jittered_and_desynced() {
 /// reads both under the SAME lock, so the snapshot never straddles a transition and observes e.g.
 /// Open with a cleared cooldown (which, once persisted and restored, would revive a hard-down lane
 /// as receiving traffic). This is the deterministic invariant: after a trip that sets Open + a
-/// future cooldown, the exported pair reflects BOTH — never a mismatched (Open, 0).
+/// future cooldown, the exported pair reflects BOTH - never a mismatched (Open, 0).
 #[test]
 fn test_export_health_reads_consistent_state_cooldown_pair() {
     set_now_for_test(10_000);
@@ -3422,7 +3422,7 @@ fn test_export_health_reads_consistent_state_cooldown_pair() {
     let snaps = store.export_health();
     let s0 = &snaps[0];
 
-    // Default cell: Open (ST_OPEN == 1) MUST pair with a non-zero, future cooldown — never a torn
+    // Default cell: Open (ST_OPEN == 1) MUST pair with a non-zero, future cooldown - never a torn
     // (Open, 0). A lock-free straddling read could observe the state store without the paired
     // cooldown store; holding the transition lock for both loads rules that out.
     assert_eq!(s0.breaker_state, 1, "default cell exported as Open");
