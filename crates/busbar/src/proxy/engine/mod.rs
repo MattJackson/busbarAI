@@ -2402,7 +2402,11 @@ mod inject_include_usage_tests {
     fn leaves_non_object_stream_options_untouched() {
         let body = br#"{"stream":true,"stream_options":"bogus"}"#;
         let out = inject_openai_stream_include_usage(Bytes::from_static(body));
-        assert_eq!(&out[..], &body[..], "malformed stream_options must pass through verbatim");
+        assert_eq!(
+            &out[..],
+            &body[..],
+            "malformed stream_options must pass through verbatim"
+        );
     }
 
     /// A body that already opted in stays semantically opted in.

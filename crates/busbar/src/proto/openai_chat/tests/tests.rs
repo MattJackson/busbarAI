@@ -2782,6 +2782,8 @@ fn req_with_tool(
             description: description.map(String::from),
             input_schema,
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: None,
         temperature: None,
@@ -3665,7 +3667,10 @@ fn test_remap_tool_call_index_is_0_based_per_call() {
     });
     let before = content.clone();
     framing.on_egress_chunk(&mut content);
-    assert_eq!(content, before, "a content chunk must be untouched by the tool-index remap");
+    assert_eq!(
+        content, before,
+        "a content chunk must be untouched by the tool-index remap"
+    );
 }
 
 /// FINDING 4 (n>1 cross-protocol): a request asking for N>1 candidate completions cannot round-trip
@@ -3696,7 +3701,11 @@ fn test_n_gt_1_clamped_to_one_on_cross_protocol_egress() {
     let mut req = IrReq::Chat(ir);
     req.prepare_for_egress(&prep());
     let IrReq::Chat(ir) = req else { unreachable!() };
-    assert_eq!(ir.n, Some(1), "n>1 must clamp to 1 on the cross-protocol seam");
+    assert_eq!(
+        ir.n,
+        Some(1),
+        "n>1 must clamp to 1 on the cross-protocol seam"
+    );
     let out = OpenAiWriter.write_request(&ir);
     assert_eq!(
         out["n"],
@@ -3709,7 +3718,9 @@ fn test_n_gt_1_clamped_to_one_on_cross_protocol_egress() {
     ir1.n = Some(1);
     let mut req1 = IrReq::Chat(ir1);
     req1.prepare_for_egress(&prep());
-    let IrReq::Chat(ir1) = req1 else { unreachable!() };
+    let IrReq::Chat(ir1) = req1 else {
+        unreachable!()
+    };
     assert_eq!(ir1.n, Some(1), "n=1 is unchanged");
 
     // n absent stays absent (no `n` field materialized).
@@ -3717,7 +3728,9 @@ fn test_n_gt_1_clamped_to_one_on_cross_protocol_egress() {
     ir0.n = None;
     let mut req0 = IrReq::Chat(ir0);
     req0.prepare_for_egress(&prep());
-    let IrReq::Chat(ir0) = req0 else { unreachable!() };
+    let IrReq::Chat(ir0) = req0 else {
+        unreachable!()
+    };
     assert_eq!(ir0.n, None, "absent n stays absent");
 }
 

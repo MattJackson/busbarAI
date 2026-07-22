@@ -523,6 +523,7 @@ fn read_openai_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, I
         description,
         input_schema,
         cache_control: None,
+        hosted: None,
     })
 }
 

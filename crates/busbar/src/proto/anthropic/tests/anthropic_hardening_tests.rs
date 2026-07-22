@@ -2940,6 +2940,8 @@ fn write_request_downgrades_forced_tool_choice_to_auto_when_thinking_emitted() {
                 description: Some("look up weather".to_string()),
                 input_schema: serde_json::json!({"type": "object"}),
                 cache_control: None,
+
+                hosted: None,
             }],
             tool_choice: Some(tc),
             reasoning,

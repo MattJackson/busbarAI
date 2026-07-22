@@ -332,6 +332,32 @@ impl ProtocolReader for ResponsesReader {
         let mut tools: Vec<crate::ir::IrTool> = Vec::new();
         if let Some(tools_val) = obj.get("tools") {
             for tool_val in tools_val.as_array().unwrap_or(&Vec::new()) {
+                // HOSTED-TOOL PASSTHROUGH (Finding 5). The Responses `tools` array mixes CUSTOM
+                // function tools (`type:"function"` with a flat `name`/`parameters`) with provider-
+                // HOSTED tools (`type:"web_search"`/`"file_search"`/`"code_interpreter"`/
+                // `"computer_use_preview"`/`"mcp"`/...) that carry NO `name`/`parameters`. Parsing a
+                // hosted tool as a function tool yielded an empty `{"type":"function","name":""}` that
+                // a Responses backend 400s on. A tool is a function tool ONLY when its `type` is
+                // exactly `"function"` (or, defensively, when `type` is absent but a `name` is present,
+                // the pre-Responses shorthand); ANY other `type` is a hosted tool and must round-trip
+                // its raw JSON verbatim so the writer re-emits it unchanged.
+                let type_str = tool_val.get("type").and_then(|t| t.as_str());
+                let is_function = match type_str {
+                    Some("function") => true,
+                    Some(_) => false,
+                    None => tool_val.get("name").is_some(),
+                };
+                if !is_function {
+                    tools.push(crate::ir::IrTool {
+                        name: String::new(),
+                        description: None,
+                        input_schema: serde_json::Value::Null,
+                        cache_control: None,
+                        hosted: Some(tool_val.clone()),
+                    });
+                    continue;
+                }
+
                 let name = tool_val
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -351,6 +377,7 @@ impl ProtocolReader for ResponsesReader {
                     description,
                     input_schema,
                     cache_control: None,
+                    hosted: None,
                 });
             }
         }

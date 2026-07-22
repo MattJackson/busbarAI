@@ -108,6 +108,8 @@ fn test_write_request() {
                 "required": ["city"]
             }),
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: Some(1024),
         temperature: Some(0.7),
@@ -518,7 +520,11 @@ fn test_write_response_roundtrip_text_only() {
     assert_eq!(out["created_at"], json["created_at"]);
     assert_eq!(out["status"], "completed"); // golden wire-contract literal (kept bare on purpose)
     assert_eq!(out["model"], "gpt-4o");
-    assert_eq!(out["usage"], json["usage"]);
+    // Finding 6: the emitted usage carries ALL SDK-required fields (total_tokens + the two detail
+    // objects), not just the two scalar counts the source body happened to carry.
+    assert_eq!(out["usage"]["input_tokens"], 10);
+    assert_eq!(out["usage"]["output_tokens"], 5);
+    assert_eq!(out["usage"]["total_tokens"], 15);
     assert!(out["error"].is_null());
 
     // The message output item is conformant: native opaque id, status, and annotations.
@@ -5584,9 +5590,12 @@ fn test_cached_tokens_mapping() {
     let ir2 = reader.read_response(&no_cache).expect("read_response");
     assert_eq!(ir2.usage.cache_read_input_tokens, None);
     let out2 = writer.write_response(&ir2);
-    assert!(
-        out2["usage"].get("input_tokens_details").is_none(),
-        "no cache details => no input_tokens_details emitted"
+    // Finding 6: `input_tokens_details` is a REQUIRED field in the official SDKs, so it is ALWAYS
+    // emitted — with `cached_tokens: 0` when there was no cache hit (NOT omitted, which would raise a
+    // strict Pydantic/Zod decoder).
+    assert_eq!(
+        out2["usage"]["input_tokens_details"]["cached_tokens"], 0,
+        "no cache hit => input_tokens_details present with cached_tokens: 0"
     );
 }
 
@@ -6080,5 +6089,124 @@ fn text_format_json_schema_flat_round_trips() {
     assert!(
         fmt.get("json_schema").is_none(),
         "Responses text.format is FLAT — must not nest under json_schema: {out}"
+    );
+}
+
+/// FINDING 5 (hosted tools): a Responses request whose `tools` array mixes a HOSTED tool
+/// (`web_search`, `file_search`) with a CUSTOM function tool must round-trip the hosted specs
+/// VERBATIM — never mangled into empty `{"type":"function","name":""}` tools — while the function
+/// tool keeps its flat Responses shape. Same-protocol Responses -> Responses passthrough.
+#[test]
+fn test_hosted_tools_pass_through_intact() {
+    let json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "search the web",
+        "tools": [
+            {"type": "web_search", "search_context_size": "medium"},
+            {"type": "file_search", "vector_store_ids": ["vs_123"]},
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "look up the weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        ]
+    });
+
+    let ir = ResponsesReader.read_request(&json).expect("reads");
+    // The reader kept three tools: two hosted (raw spec preserved) and one function tool.
+    assert_eq!(ir.tools.len(), 3);
+    assert!(
+        ir.tools[0].hosted.is_some(),
+        "web_search must be a hosted passthrough"
+    );
+    assert!(
+        ir.tools[1].hosted.is_some(),
+        "file_search must be a hosted passthrough"
+    );
+    assert!(
+        ir.tools[2].hosted.is_none(),
+        "the function tool must NOT be hosted"
+    );
+    assert_eq!(ir.tools[2].name, "get_weather");
+
+    let writer = ResponsesWriter;
+    let out = writer.write_request(&ir);
+    let tools = out["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3);
+
+    // (a) The hosted tools are re-emitted VERBATIM: type intact, sibling fields intact, and NOT
+    // rewritten to a function tool.
+    assert_eq!(tools[0]["type"], "web_search");
+    assert_eq!(tools[0]["search_context_size"], "medium");
+    assert!(
+        tools[0].get("name").is_none() && tools[0].get("parameters").is_none(),
+        "a hosted tool must NOT gain function-tool fields: {}",
+        tools[0]
+    );
+    assert_eq!(tools[1]["type"], "file_search");
+    assert_eq!(tools[1]["vector_store_ids"], serde_json::json!(["vs_123"]));
+
+    // (b) The function tool keeps the FLAT Responses shape.
+    assert_eq!(tools[2]["type"], "function");
+    assert_eq!(tools[2]["name"], "get_weather");
+    assert!(tools[2].get("parameters").is_some());
+    // No hosted tool leaked an empty function name (the pre-fix mangling tell).
+    for t in tools {
+        if t["type"] == "function" {
+            assert_ne!(
+                t["name"], "",
+                "no function tool may carry an empty name: {t}"
+            );
+        }
+    }
+}
+
+/// FINDING 6 (usage required fields): the emitted Responses `usage` object must carry `total_tokens`
+/// AND the required `input_tokens_details`/`output_tokens_details` objects, so a strict SDK
+/// (Pydantic/Zod) that types them as required does not raise. Covers both the cache-hit and no-cache
+/// cases (details objects present, and correctly populated, in BOTH).
+#[test]
+fn test_responses_usage_carries_all_required_fields() {
+    // No-cache case: details objects still present, cached/reasoning tokens are 0.
+    let no_cache = crate::ir::IrUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
+    };
+    let u = super::build_responses_usage(&no_cache);
+    assert_eq!(u["input_tokens"], 10);
+    assert_eq!(u["output_tokens"], 5);
+    assert_eq!(
+        u["total_tokens"], 15,
+        "total_tokens is required and must be input+output"
+    );
+    assert_eq!(
+        u["input_tokens_details"]["cached_tokens"], 0,
+        "input_tokens_details.cached_tokens is required (0 when no cache): {u}"
+    );
+    assert_eq!(
+        u["output_tokens_details"]["reasoning_tokens"], 0,
+        "output_tokens_details.reasoning_tokens is required (0 when non-reasoning): {u}"
+    );
+
+    // Cache-hit case: input_tokens is the cache-INCLUSIVE total; cached/write counts surfaced.
+    let cached = crate::ir::IrUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: Some(3),
+        cache_read_input_tokens: Some(7),
+    };
+    let uc = super::build_responses_usage(&cached);
+    assert_eq!(
+        uc["input_tokens"], 20,
+        "input_tokens is the cache-inclusive total (10+7+3)"
+    );
+    assert_eq!(uc["input_tokens_details"]["cached_tokens"], 7);
+    assert_eq!(uc["input_tokens_details"]["cache_write_tokens"], 3);
+    assert_eq!(
+        uc["total_tokens"], 25,
+        "total = input_total(20) + output(5)"
     );
 }

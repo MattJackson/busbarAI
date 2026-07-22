@@ -69,6 +69,7 @@ fn test_write_request() {
             description: Some("..".to_string()),
             input_schema: serde_json::json!({}),
             cache_control: None,
+            hosted: None,
         }],
         max_tokens: Some(1024),
         temperature: Some(0.7),
@@ -3871,6 +3872,8 @@ fn ir_with_tool_choice(tc: Option<crate::ir::IrToolChoice>) -> crate::ir::IrRequ
             description: None,
             input_schema: serde_json::json!({}),
             cache_control: None,
+
+            hosted: None,
         }],
         max_tokens: None,
         temperature: None,

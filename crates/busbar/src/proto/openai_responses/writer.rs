@@ -263,6 +263,17 @@ impl ProtocolWriter for ResponsesWriter {
         if !req.tools.is_empty() {
             let mut tools_arr: Vec<serde_json::Value> = Vec::new();
             for tool in &req.tools {
+                // HOSTED-TOOL PASSTHROUGH (Finding 5). A hosted/built-in Responses tool
+                // (`web_search`/`file_search`/`code_interpreter`/`computer_use_preview`/`mcp`/...) is a
+                // complete tool spec discriminated by its top-level `type`; it carries no
+                // `name`/`parameters` and has no function-tool equivalent. The reader stored its raw
+                // JSON in `hosted`, so re-emit it VERBATIM — wrapping it as a function tool (the prior
+                // behavior) produced an empty `{"type":"function","name":""}` that a Responses backend
+                // 400s on and is a detectable proxy tell.
+                if let Some(hosted) = &tool.hosted {
+                    tools_arr.push(hosted.clone());
+                    continue;
+                }
                 let mut tool_obj = serde_json::Map::new();
                 tool_obj.insert("type".to_string(), serde_json::json!("function"));
                 tool_obj.insert("name".to_string(), serde_json::json!(tool.name));
@@ -796,30 +807,11 @@ impl ProtocolWriter for ResponsesWriter {
                     );
                 }
 
-                // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED
-                // input, but the Responses API's `input_tokens` is a TOTAL that includes the cached
-                // prefix, so add `cache_read` back.
-                let input_total = usage
-                    .input_tokens
-                    .saturating_add(usage.cache_read_input_tokens.unwrap_or(0))
-                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
-                let mut usage_map = serde_json::Map::new();
-                usage_map.insert("input_tokens".to_string(), serde_json::json!(input_total));
-                usage_map.insert(
-                    "output_tokens".to_string(),
-                    serde_json::json!(usage.output_tokens),
-                );
-                // H6: surface the IR read-side cache count on the streaming terminal as the
-                // Responses-native `usage.input_tokens_details.cached_tokens` (only when present), so a
-                // cross-protocol stream carrying a cache hit reports it to a Responses client just as
-                // the non-stream body does. Omitted when absent (no `cached_tokens: 0`).
-                if let Some(cached) = usage.cache_read_input_tokens {
-                    usage_map.insert(
-                        "input_tokens_details".to_string(),
-                        serde_json::json!({ "cached_tokens": cached }),
-                    );
-                }
-                resp_obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+                // Build the SDK-required Responses `usage` object (Finding 6): the streaming terminal
+                // event's inner `response.usage` must carry the SAME complete shape as the non-stream
+                // body — `total_tokens` plus the required `input_tokens_details`/`output_tokens_details`
+                // objects — so the shared builder produces it (as 0 where nothing to report).
+                resp_obj.insert("usage".to_string(), build_responses_usage(usage));
                 // The native terminal `response.completed`/`response.incomplete` event carries the
                 // FULLY assembled inner `response` object: the official Python/Node SDK reads
                 // `event.response.output` to finalize the assembled `Response`, and `output` is a
@@ -1055,31 +1047,11 @@ impl ProtocolWriter for ResponsesWriter {
             }
         }
 
-        // RECONSTRUCT the native WIRE shape from the normalized IR: the IR stores UNCACHED input,
-        // but the Responses API's `input_tokens` is a TOTAL that includes the cached prefix, so add
-        // `cache_read` back.
-        let input_total = resp
-            .usage
-            .input_tokens
-            .saturating_add(resp.usage.cache_read_input_tokens.unwrap_or(0))
-            .saturating_add(resp.usage.cache_creation_input_tokens.unwrap_or(0));
-        let mut usage_map = serde_json::Map::new();
-        usage_map.insert("input_tokens".to_string(), serde_json::json!(input_total));
-        usage_map.insert(
-            "output_tokens".to_string(),
-            serde_json::json!(resp.usage.output_tokens),
-        );
-        // H6: write the IR read-side cache count back as the Responses-native
-        // `usage.input_tokens_details.cached_tokens` (ONLY when present), so a cross-protocol response
-        // that carried a cache hit (e.g. from a Bedrock backend) surfaces it to a Responses client.
-        // Omitted entirely when the IR carries no cache-read value — a real Responses body without
-        // cache hits omits the details object rather than emitting `cached_tokens: 0`.
-        if let Some(cached) = resp.usage.cache_read_input_tokens {
-            usage_map.insert(
-                "input_tokens_details".to_string(),
-                serde_json::json!({ "cached_tokens": cached }),
-            );
-        }
+        // Build the SDK-required Responses `usage` object (Finding 6): `total_tokens` plus the
+        // `input_tokens_details`/`output_tokens_details` objects are REQUIRED by the official SDKs, so
+        // the shared builder always emits them (as 0 when nothing to report) and reconstructs the
+        // cache-inclusive `input_tokens` TOTAL from the normalized IR.
+        let usage_value = build_responses_usage(&resp.usage);
 
         let mut obj = serde_json::Map::new();
         // Emit the SDK-required top-level identity. Same-protocol passthrough carries the captured
@@ -1101,7 +1073,7 @@ impl ProtocolWriter for ResponsesWriter {
             serde_json::json!(resp.model.as_deref().unwrap_or(DEFAULT_MODEL)),
         );
         obj.insert("output".to_string(), serde_json::Value::Array(output_arr));
-        obj.insert("usage".to_string(), serde_json::Value::Object(usage_map));
+        obj.insert("usage".to_string(), usage_value);
         // The official SDK types `Response.error` as a REQUIRED nullable field present on EVERY
         // Response object: `null` on success/incomplete, a populated object on failure. The
         // streaming `response.created` skeleton already emits `error: null`; the non-streaming body

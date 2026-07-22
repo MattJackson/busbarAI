@@ -209,6 +209,44 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Build the Responses API `usage` object from the neutral [`crate::ir::IrUsage`] with ALL fields the
+/// official SDKs require (Finding 6). `openai-python`'s `ResponseUsage` and `openai-node`'s
+/// `ResponseUsage` type `total_tokens`, `input_tokens_details` (with `cached_tokens` and
+/// `cache_write_tokens`), and `output_tokens_details` (with `reasoning_tokens`) as REQUIRED,
+/// non-nullable fields — a strict Pydantic/Zod decoder RAISES when any is omitted, and a real
+/// Responses body always carries them (as `0` when there is nothing to report). The prior writer
+/// emitted only `input_tokens`/`output_tokens` and an `input_tokens_details` gated on a cache hit, so
+/// a client on the official SDK got a `ValidationError` and the missing-detail-objects shape was a
+/// distinguishability tell.
+///
+/// The IR stores UNCACHED input, but the Responses `input_tokens` is a TOTAL that includes the cached
+/// prefix, so `cache_read` (+ `cache_creation`) are added back. `cached_tokens` mirrors the cache-read
+/// count, `cache_write_tokens` the cache-creation count (both `0` when absent — not omitted, matching
+/// the required-field contract). The IR does not model reasoning tokens separately, so
+/// `reasoning_tokens` is `0` (the correct value for the non-reasoning case and the SDK-required
+/// default otherwise). `total_tokens` = `input_total` + `output_tokens`.
+fn build_responses_usage(usage: &crate::ir::IrUsage) -> serde_json::Value {
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
+    let input_total = usage
+        .input_tokens
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    let total = input_total.saturating_add(usage.output_tokens);
+    serde_json::json!({
+        "input_tokens": input_total,
+        "input_tokens_details": {
+            "cached_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+        },
+        "output_tokens": usage.output_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": 0,
+        },
+        "total_tokens": total,
+    })
+}
+
 /// Synthesize a protocol-correct Responses id (`resp_<opaque base62>`) for cross-protocol responses
 /// where the backend supplied none. Native OpenAI Responses ids are `resp_` followed by ~38+ chars
 /// of opaque random data with NO embedded structure; the previous form encoded the unix timestamp as

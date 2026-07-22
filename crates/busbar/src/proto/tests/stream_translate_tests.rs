@@ -396,9 +396,19 @@ fn a2_roundtrip_usage_fidelity_no_cache_emits_no_cache_object() {
         assert_eq!(ir.usage.cache_read_input_tokens, None);
         let out = p.writer().write_response(&ir);
         assert_eq!(out["usage"]["input_tokens"], json!(12));
-        assert!(
-            out["usage"].get("input_tokens_details").is_none(),
-            "no spurious details: {out}"
+        // Finding 6: unlike Chat Completions (where `prompt_tokens_details` is optional), the Responses
+        // API SDKs type `input_tokens_details`/`output_tokens_details` and `total_tokens` as REQUIRED,
+        // so they are ALWAYS emitted — `cached_tokens`/`reasoning_tokens` are 0 with no cache, not
+        // omitted.
+        assert_eq!(
+            out["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(0),
+            "required details present with 0 when no cache: {out}"
+        );
+        assert_eq!(
+            out["usage"]["total_tokens"],
+            json!(16),
+            "total_tokens required: {out}"
         );
     }
     // Anthropic
@@ -1319,7 +1329,8 @@ fn openai_egress_without_include_usage_emits_no_usage_chunk() {
 
     // (a) The finish chunk is still present.
     assert!(
-        out.contains("\"finish_reason\":\"end_turn\"") || out.contains("\"finish_reason\":\"stop\""),
+        out.contains("\"finish_reason\":\"end_turn\"")
+            || out.contains("\"finish_reason\":\"stop\""),
         "a terminal finish chunk must still be emitted; got\n{out}"
     );
     // (b) NO chunk carries a `usage` object, and NO chunk carries an EMPTY choices array (the tell of
@@ -1345,9 +1356,17 @@ fn openai_egress_without_include_usage_emits_no_usage_chunk() {
 
     // (c) Billing is unaffected: the IR usage A-tap the streaming billing path reads STILL holds the
     // real upstream token counts, even though the client-facing stream carried none.
-    let billed = st.usage().expect("the A-tap must capture usage for billing");
-    assert_eq!(billed.input_tokens, 5, "billing keeps the real input tokens");
-    assert_eq!(billed.output_tokens, 2, "billing keeps the real output tokens");
+    let billed = st
+        .usage()
+        .expect("the A-tap must capture usage for billing");
+    assert_eq!(
+        billed.input_tokens, 5,
+        "billing keeps the real input tokens"
+    );
+    assert_eq!(
+        billed.output_tokens, 2,
+        "billing keeps the real output tokens"
+    );
 }
 
 /// FINDING 1 (0-based streaming tool_calls index): an Anthropic backend stream with a leading text
@@ -3360,4 +3379,3 @@ fn test_bedrock_and_responses_register() {
         "/model/anthropic.claude-3/converse"
     );
 }
-

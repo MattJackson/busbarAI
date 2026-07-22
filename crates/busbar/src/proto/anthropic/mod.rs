@@ -541,6 +541,7 @@ fn read_tool(tool_val: &serde_json::Value) -> Result<crate::ir::IrTool, IrError>
         description,
         input_schema,
         cache_control,
+        hosted: None,
     })
 }
 
