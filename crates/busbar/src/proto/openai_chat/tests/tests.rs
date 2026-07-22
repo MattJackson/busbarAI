@@ -3546,6 +3546,59 @@ fn test_ir_request() -> crate::ir::IrRequest {
     }
 }
 
+/// FINDING 4 (n>1 cross-protocol): a request asking for N>1 candidate completions cannot round-trip
+/// through the single-candidate response IR, so the cross-protocol egress seam
+/// (`prepare_for_egress`) must CLAMP `n` to 1 before the egress writer emits it — otherwise the
+/// backend generates (and bills for) N candidates while translation keeps only choice 0 and
+/// silently drops the rest. Same-protocol passthrough never reaches this seam, so `n>1` still works
+/// end-to-end there (the response is not funneled through the IR).
+#[test]
+fn test_n_gt_1_clamped_to_one_on_cross_protocol_egress() {
+    use crate::ir::variant::{EgressPrep, IrReq};
+
+    fn prep() -> EgressPrep<'static> {
+        EgressPrep {
+            ingress_protocol: "openai",
+            egress_requires_max_tokens: false,
+            lane_default_max_tokens: None,
+            global_default_max_tokens: 4096,
+            reasoning_allowed: true,
+            reasoning_budgets: crate::ir::REASONING_BUDGET_DEFAULTS,
+            prompt_caching_allowed: true,
+        }
+    }
+
+    // n=3 must clamp to 1 on the cross-protocol seam, and the egress writer must emit `n: 1`.
+    let mut ir = test_ir_request();
+    ir.n = Some(3);
+    let mut req = IrReq::Chat(ir);
+    req.prepare_for_egress(&prep());
+    let IrReq::Chat(ir) = req else { unreachable!() };
+    assert_eq!(ir.n, Some(1), "n>1 must clamp to 1 on the cross-protocol seam");
+    let out = OpenAiWriter.write_request(&ir);
+    assert_eq!(
+        out["n"],
+        serde_json::json!(1),
+        "the egress request must ask the backend for exactly one candidate"
+    );
+
+    // n=1 is left intact (no spurious clamp/warn).
+    let mut ir1 = test_ir_request();
+    ir1.n = Some(1);
+    let mut req1 = IrReq::Chat(ir1);
+    req1.prepare_for_egress(&prep());
+    let IrReq::Chat(ir1) = req1 else { unreachable!() };
+    assert_eq!(ir1.n, Some(1), "n=1 is unchanged");
+
+    // n absent stays absent (no `n` field materialized).
+    let mut ir0 = test_ir_request();
+    ir0.n = None;
+    let mut req0 = IrReq::Chat(ir0);
+    req0.prepare_for_egress(&prep());
+    let IrReq::Chat(ir0) = req0 else { unreachable!() };
+    assert_eq!(ir0.n, None, "absent n stays absent");
+}
+
 // H6: the `"auto"` and `"none"` string forms had no read→write round-trip coverage.
 #[test]
 fn test_openai_tool_choice_auto_roundtrips() {
