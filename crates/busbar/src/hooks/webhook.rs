@@ -82,6 +82,11 @@ impl WebhookPolicy {
         budget: Duration,
     ) -> Result<super::wire::HookResponse, super::PolicyError> {
         let payload = serde_json::to_vec(&super::wire::build(op, req, candidates, ctx))?;
+        // A reqwest error carries the request URL (WITH any operator-embedded `user:pass@` userinfo)
+        // in its own `Display`. This error is boxed into `PolicyError` and later logged verbatim
+        // (`error = %e`) by the seam's on_error fallback, so strip the URL from the error with
+        // `without_url()` before boxing — the credential must never reach the log. Parity with the
+        // request-log/OTLP userinfo hardening.
         let resp = self
             .client
             .post(&self.url)
@@ -92,8 +97,11 @@ impl WebhookPolicy {
             .body(payload)
             .timeout(budget)
             .send()
-            .await?;
-        let resp = resp.error_for_status()?;
+            .await
+            .map_err(|e| -> super::PolicyError { Box::new(e.without_url()) })?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| -> super::PolicyError { Box::new(e.without_url()) })?;
         let buf = read_capped(resp).await?;
         crate::json::parse(&buf)
             .map_err(|_| -> super::PolicyError { crate::json::parse_err_log(buf.len()).into() })
@@ -376,6 +384,29 @@ mod tests {
             .await
             .expect("ok decision");
         assert_eq!(d, RoutingDecision::Prefer(vec![2, 0, 1]));
+    }
+
+    /// REGRESSION (P2 finding 4, routing-webhook radius): a transport error from `decide()` is boxed
+    /// into `PolicyError` and later logged verbatim (`error = %e`) by the seam's on_error fallback. If
+    /// the operator embedded `user:pass@` userinfo in the sidecar URL, the reqwest error's own Display
+    /// would carry it — so the boxed error must have its URL stripped (`without_url`) before it can
+    /// reach a log. Point the policy at an unroutable userinfo URL, force a transport error, and assert
+    /// the resulting PolicyError's Display contains no credential.
+    #[tokio::test]
+    async fn decide_transport_error_does_not_leak_url_userinfo() {
+        // RFC 5737 TEST-NET-1 host is unroutable, so the POST fails fast with a transport error.
+        let url = "https://svc:hunter2@192.0.2.1/route".to_string();
+        let policy = WebhookPolicy::new(url, client());
+        let cands = [cand(0), cand(1)];
+        let err = policy
+            .decide(&req(), &cands, &ctx(), Duration::from_millis(200))
+            .await
+            .expect_err("unroutable sidecar must error");
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("svc:hunter2"),
+            "routing-webhook PolicyError leaked embedded userinfo: {shown}"
+        );
     }
 
     /// Unknown idxs in the returned order are dropped defensively; dups deduped.
