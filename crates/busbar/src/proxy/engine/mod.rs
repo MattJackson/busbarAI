@@ -295,6 +295,16 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                     .unwrap_or(false)
             })
             .unwrap_or(false);
+    // Companion point-read (also free off the head projection): does the client body carry a
+    // top-level `stream_options` key AT ALL? Drives the byte-level upstream include_usage injection
+    // below - a body with NO `stream_options` can have the flag inserted with a single splice that
+    // preserves the pristine same-proto re-emit (no DOM parse); a body that DOES carry one (but did
+    // not opt in - e.g. `include_usage:false` or a sibling-only object) is the rare case that falls
+    // to the DOM-materializing injector. Meaningful only for a streaming OpenAI-family body.
+    let client_has_stream_options = wants_stream
+        && v.as_ref()
+            .map(|l| l.probe().get("stream_options").is_some())
+            .unwrap_or(false);
 
     // ── GLOBAL REWRITE (transform) PASS ─────────────────────────────────────────────────────────
     // Fire the global `prompt: rw` gates (compression/redaction) BEFORE dispatch AND before the
@@ -1114,19 +1124,40 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 }
             }
         };
-        // STREAMING-USAGE UPSTREAM INJECTION (Finding 3): busbar bills a streaming chat call from the
-        // token usage it decodes off the upstream stream, but an OpenAI Chat Completions upstream only
-        // emits that usage (in a trailing chunk) when the request carried
-        // `stream_options.include_usage: true`. A client that did not opt in would otherwise leave the
-        // upstream silent on tokens and busbar would bill ZERO. So force `stream_options.include_usage`
-        // on every streaming request to an OpenAI Chat egress, whether the body was forwarded verbatim
-        // (same-protocol) or built by `write_request` (cross-protocol). Scoped to `egress_name ==
-        // "openai"` (Chat Completions) — the Responses egress carries usage unconditionally and has its
-        // own convention, and non-OpenAI egresses always report usage. The client-facing trailing chunk
-        // is then gated on the CLIENT's own opt-in (`client_include_usage`) at the framing seam, so
-        // this injection never leaks an unsolicited usage chunk to an opted-out client (Finding 2).
-        let payload = if wants_stream && body_is_json && egress_name == crate::proto::PROTO_OPENAI {
-            inject_openai_stream_include_usage(payload)
+        // STREAMING-USAGE UPSTREAM INJECTION (Finding 3, round-3 regression fix): busbar bills a
+        // streaming chat call from the token usage it decodes off the upstream stream, but an OpenAI
+        // Chat Completions upstream only emits that usage (in a trailing chunk) when the request
+        // carried `stream_options.include_usage: true`. A client that did not opt in would otherwise
+        // leave the upstream silent on tokens and busbar would bill ZERO. So force
+        // `stream_options.include_usage` on a streaming request to an OpenAI Chat egress.
+        //
+        // Round-3 regression (R3-A-a) PERF: the prior form ran the DOM-parse+re-serialize injector
+        // UNCONDITIONALLY for every streaming OpenAI egress, including the same-protocol pristine
+        // passthrough the head short-circuit exists to keep parse-free (the flagship lazy_body win).
+        // Two gates fix that:
+        //   1. If the CLIENT already opted in (`client_include_usage`), the upstream body ALREADY
+        //      carries `include_usage:true` - injection is a pure no-op re-serialize. Skip it entirely,
+        //      preserving the pristine re-emit for the opted-in same-proto path.
+        //   2. Otherwise inject via the HEAD-GATED byte-level path when the body carries no top-level
+        //      `stream_options` (`!client_has_stream_options`): a single splice after the opening `{`
+        //      that never materializes the DOM, so an opted-out pristine same-proto body stays
+        //      parse-free too. Only the rare body that DOES carry a non-opted-in `stream_options`
+        //      (e.g. `include_usage:false`, or sibling keys only) falls to the DOM injector.
+        // Scoped to `egress_name == "openai"` (Chat Completions) - the Responses egress carries usage
+        // unconditionally and non-OpenAI egresses always report usage. The client-facing trailing
+        // chunk is then gated on the CLIENT's own opt-in at the framing seam (both the cross-proto
+        // `on_egress_chunk` un-fold/strip AND the same-proto verbatim strip - R3-A-b), so this
+        // injection never leaks an unsolicited usage chunk to an opted-out client (Finding 2).
+        let payload = if wants_stream
+            && body_is_json
+            && egress_name == crate::proto::PROTO_OPENAI
+            && !client_include_usage
+        {
+            if client_has_stream_options {
+                inject_openai_stream_include_usage(payload)
+            } else {
+                inject_openai_stream_include_usage_pristine(payload)
+            }
         } else {
             payload
         };
@@ -2277,6 +2308,51 @@ fn inject_openai_stream_include_usage(payload: Bytes) -> Bytes {
     }
 }
 
+/// PRISTINE-PRESERVING variant of [`inject_openai_stream_include_usage`] for a body the head
+/// projection already proved carries NO top-level `stream_options` key (R3-A-a). Splices
+/// `"stream_options":{"include_usage":true},` in immediately after the opening `{` instead of
+/// parsing + re-serializing the whole DOM, so a same-protocol pristine passthrough body stays
+/// parse-free while still forcing the upstream to emit billable token usage.
+///
+/// SOUNDNESS: only ever called when `!client_has_stream_options`, i.e. the head point-read on the
+/// captured `stream_options` key returned `None` - so the splice cannot produce a DUPLICATE key (a
+/// duplicate would let last-wins semantics silently override a caller value). The splice is a
+/// LEADING member, so it never lands after the object's final key without a comma, and the object is
+/// known non-empty on the streaming path (`stream` at minimum). Any body that is not a JSON object
+/// starting with `{` (or the degenerate empty `{}`) falls back to the DOM injector, which itself
+/// returns the bytes unchanged on a non-object - so a malformed/edge body is never corrupted.
+fn inject_openai_stream_include_usage_pristine(payload: Bytes) -> Bytes {
+    const INSERT: &[u8] = br#""stream_options":{"include_usage":true},"#;
+    // Find the first `{`, skipping only leading ASCII whitespace (the sole bytes JSON permits before
+    // the top-level value). Anything else at the front is not a plain object body - defer to the DOM
+    // injector rather than splice blindly.
+    let mut i = 0usize;
+    while i < payload.len() && payload[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    // The byte AFTER the brace must begin a KEY (`"`) for the leading-member splice to stay valid
+    // JSON; on `{}` (next non-space is `}`) or any non-object body, fall back to the DOM path.
+    let opens_object = payload.get(i) == Some(&b'{');
+    let next = {
+        let mut j = i + 1;
+        while j < payload.len() && payload[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        payload.get(j).copied()
+    };
+    if !opens_object || next != Some(b'"') {
+        return inject_openai_stream_include_usage(payload);
+    }
+    // Splice: [ .. up to and including `{` ] + INSERT + [ first key .. end ]. `i+1` is the byte just
+    // past the brace; the retained tail is byte-for-byte the caller's, so nothing else is disturbed.
+    let brace_end = i + 1;
+    let mut out = Vec::with_capacity(payload.len() + INSERT.len());
+    out.extend_from_slice(&payload[..brace_end]);
+    out.extend_from_slice(INSERT);
+    out.extend_from_slice(&payload[brace_end..]);
+    Bytes::from(out)
+}
+
 fn fire_global_taps(
     app: &Arc<App>,
     body: &Value,
@@ -2360,8 +2436,68 @@ pub(crate) use walk::*;
 
 #[cfg(test)]
 mod inject_include_usage_tests {
-    use super::inject_openai_stream_include_usage;
+    use super::{inject_openai_stream_include_usage, inject_openai_stream_include_usage_pristine};
     use bytes::Bytes;
+
+    /// R3-A-a: the byte-level pristine injector splices `stream_options.include_usage:true` into a body
+    /// with NO existing `stream_options` WITHOUT parsing - but the result must still be valid JSON with
+    /// the flag set and every original key preserved.
+    #[test]
+    fn pristine_injector_splices_include_usage() {
+        let body =
+            br#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let out = inject_openai_stream_include_usage_pristine(Bytes::from_static(body));
+        let v: serde_json::Value =
+            crate::json::parse(&out).expect("spliced body must be valid JSON");
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true)),
+            "include_usage must be spliced: {v}"
+        );
+        assert_eq!(v.pointer("/model"), Some(&serde_json::json!("gpt-4o")));
+        assert_eq!(v.pointer("/stream"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            v.pointer("/messages/0/content"),
+            Some(&serde_json::json!("hi")),
+            "original keys must survive the splice: {v}"
+        );
+    }
+
+    /// R3-A-a: leading whitespace before the opening `{` is tolerated (the only bytes JSON permits
+    /// ahead of the top-level value) - the splice still lands right after the brace.
+    #[test]
+    fn pristine_injector_tolerates_leading_whitespace() {
+        let body = b"  \n\t{\"model\":\"m\",\"stream\":true}";
+        let out = inject_openai_stream_include_usage_pristine(Bytes::copy_from_slice(body));
+        let v: serde_json::Value = crate::json::parse(&out).expect("valid JSON");
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(v.pointer("/model"), Some(&serde_json::json!("m")));
+    }
+
+    /// R3-A-a: a degenerate `{}` (no first key) and a non-object body fall back to the DOM injector
+    /// rather than producing invalid JSON via a blind splice.
+    #[test]
+    fn pristine_injector_falls_back_on_empty_or_non_object() {
+        // `{}` - next non-space is `}`, not a key: DOM injector inserts stream_options.
+        let out = inject_openai_stream_include_usage_pristine(Bytes::from_static(b"{}"));
+        let v: serde_json::Value = crate::json::parse(&out).expect("valid JSON");
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true)),
+            "empty object must still gain include_usage via fallback: {v}"
+        );
+        // Non-object top level: DOM injector returns it unchanged (nothing to reshape).
+        let arr = br#"[1,2,3]"#;
+        let out = inject_openai_stream_include_usage_pristine(Bytes::from_static(arr));
+        assert_eq!(
+            &out[..],
+            &arr[..],
+            "non-object body must pass through verbatim"
+        );
+    }
 
     /// FINDING 3: an OpenAI Chat streaming body with NO `stream_options` gains
     /// `stream_options.include_usage: true` so the upstream reports usage busbar can bill.

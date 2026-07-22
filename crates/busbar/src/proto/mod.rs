@@ -958,6 +958,23 @@ pub(crate) trait StreamFraming: Send {
     /// Default ([`PassthroughFraming`] and every non-OpenAI ingress): no-op — the flag is meaningless
     /// for protocols without the `include_usage` convention.
     fn set_client_include_usage(&mut self, _include: bool) {}
+
+    /// SAME-PROTOCOL VERBATIM-STRIP seam (OpenAI ingress, round-3 regression fix R3-A-b). On the
+    /// same-protocol universal-translate path the translator re-emits each upstream frame BYTE-FOR-BYTE
+    /// and NEVER routes it through [`on_egress_chunk`], so the `include_usage` strip that protects an
+    /// opted-out client from the unsolicited trailing usage chunk never fires. Busbar forces
+    /// `stream_options.include_usage` on the UPSTREAM request (to bill), so an OpenAI upstream emits a
+    /// NATIVE trailing usage-only chunk (`{... "choices":[], "usage":{...}}`) even when the CLIENT did
+    /// not opt in - which a strict SDK `choices[0]`-IndexErrors on. Returning `true` for that exact
+    /// frame tells the same-proto feed loop to DROP it from the client-facing bytes (billing is
+    /// unaffected: the A-tap already read the usage from the parsed frame). Every other frame - and the
+    /// opted-in case - returns `false` and is re-emitted verbatim.
+    ///
+    /// Default ([`PassthroughFraming`] and every non-OpenAI ingress): `false` - no frame is suppressed
+    /// on the verbatim path (those protocols carry no unsolicited-usage-chunk convention).
+    fn suppress_same_proto_frame(&self, _data: &serde_json::Value) -> bool {
+        false
+    }
 }
 
 /// Inert default [`StreamFraming`]: every method takes the trait's no-op default. Used by every

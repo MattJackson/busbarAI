@@ -6162,6 +6162,67 @@ fn test_hosted_tools_pass_through_intact() {
     }
 }
 
+/// R3-B (hosted tools CROSS-protocol drop): a Responses hosted tool routed to a NON-Responses egress
+/// has no function-tool analog, so `IrReq::prepare_for_egress` (the cross-protocol seam) must DROP it
+/// with a warn - never let a non-Responses writer emit a malformed empty-name function tool the
+/// backend 400s on. The custom function tool alongside it survives. The paired same-protocol
+/// pass-through is proven by `test_hosted_tools_pass_through_intact` (which never calls
+/// `prepare_for_egress`, matching the real same-proto verbatim path).
+#[test]
+fn test_hosted_tools_dropped_cross_protocol() {
+    let json = serde_json::json!({
+        "model": "gpt-4o",
+        "input": "search the web",
+        "tools": [
+            {"type": "web_search", "search_context_size": "medium"},
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "look up the weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        ]
+    });
+    let ir = ResponsesReader.read_request(&json).expect("reads");
+    assert_eq!(ir.tools.len(), 2, "reader keeps hosted + function tool");
+    assert!(ir.tools[0].hosted.is_some(), "web_search is hosted");
+
+    // Cross-protocol egress prep (Responses ingress -> a non-Responses backend). The engine calls this
+    // ONLY on the cross-protocol seam; dropping every hosted tool here is the "keep same-proto, drop
+    // cross-proto" contract.
+    let mut req = crate::ir::variant::IrReq::Chat(ir);
+    req.prepare_for_egress(&crate::ir::variant::EgressPrep {
+        ingress_protocol: "openai-responses",
+        egress_requires_max_tokens: false,
+        lane_default_max_tokens: None,
+        global_default_max_tokens: 4096,
+        reasoning_allowed: false,
+        reasoning_budgets: [0, 0, 0, 0],
+        prompt_caching_allowed: true,
+    });
+    let crate::ir::variant::IrReq::Chat(ir) = req else {
+        panic!("still a chat request");
+    };
+    // The hosted tool is GONE; the function tool remains.
+    assert_eq!(ir.tools.len(), 1, "hosted tool dropped, function tool kept");
+    assert!(
+        ir.tools.iter().all(|t| t.hosted.is_none()),
+        "no hosted tool may survive the cross-protocol seam"
+    );
+    assert_eq!(ir.tools[0].name, "get_weather");
+
+    // The OpenAI-chat (non-Responses) writer now emits NO malformed empty-name function tool.
+    let out = crate::proto::openai_chat::OpenAiWriter.write_request(&ir);
+    let tools = out["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1, "only the function tool is written: {out}");
+    for t in tools {
+        assert_ne!(
+            t["function"]["name"], "",
+            "no empty-name function tool may reach a non-Responses backend: {t}"
+        );
+    }
+}
+
 /// FINDING 6 (usage required fields): the emitted Responses `usage` object must carry `total_tokens`
 /// AND the required `input_tokens_details`/`output_tokens_details` objects, so a strict SDK
 /// (Pydantic/Zod) that types them as required does not raise. Covers both the cache-hit and no-cache
@@ -6191,7 +6252,7 @@ fn test_responses_usage_carries_all_required_fields() {
         "output_tokens_details.reasoning_tokens is required (0 when non-reasoning): {u}"
     );
 
-    // Cache-hit case: input_tokens is the cache-INCLUSIVE total; cached/write counts surfaced.
+    // Cache-hit case: input_tokens is the cache-INCLUSIVE total; only `cached_tokens` is surfaced.
     let cached = crate::ir::IrUsage {
         input_tokens: 10,
         output_tokens: 5,
@@ -6204,9 +6265,17 @@ fn test_responses_usage_carries_all_required_fields() {
         "input_tokens is the cache-inclusive total (10+7+3)"
     );
     assert_eq!(uc["input_tokens_details"]["cached_tokens"], 7);
-    assert_eq!(uc["input_tokens_details"]["cache_write_tokens"], 3);
     assert_eq!(
         uc["total_tokens"], 25,
         "total = input_total(20) + output(5)"
+    );
+    // R3-C: the native Responses usage schema defines NO `cache_write_tokens` - the round-1 writer
+    // fabricated it. Assert it is absent (an extra key is a decode surprise + a distinguishability
+    // tell); cache-creation tokens still fold into the `input_tokens` total (20 above).
+    assert!(
+        uc["input_tokens_details"]
+            .get("cache_write_tokens")
+            .is_none(),
+        "cache_write_tokens is not a native Responses usage field and must not be emitted: {uc}"
     );
 }

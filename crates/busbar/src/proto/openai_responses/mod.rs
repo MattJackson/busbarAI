@@ -211,20 +211,26 @@ fn now_unix_secs() -> u64 {
 
 /// Build the Responses API `usage` object from the neutral [`crate::ir::IrUsage`] with ALL fields the
 /// official SDKs require (Finding 6). `openai-python`'s `ResponseUsage` and `openai-node`'s
-/// `ResponseUsage` type `total_tokens`, `input_tokens_details` (with `cached_tokens` and
-/// `cache_write_tokens`), and `output_tokens_details` (with `reasoning_tokens`) as REQUIRED,
-/// non-nullable fields — a strict Pydantic/Zod decoder RAISES when any is omitted, and a real
-/// Responses body always carries them (as `0` when there is nothing to report). The prior writer
-/// emitted only `input_tokens`/`output_tokens` and an `input_tokens_details` gated on a cache hit, so
-/// a client on the official SDK got a `ValidationError` and the missing-detail-objects shape was a
-/// distinguishability tell.
+/// `ResponseUsage` type `total_tokens`, `input_tokens_details` (with `cached_tokens`), and
+/// `output_tokens_details` (with `reasoning_tokens`) as REQUIRED, non-nullable fields - a strict
+/// Pydantic/Zod decoder RAISES when any is omitted, and a real Responses body always carries them (as
+/// `0` when there is nothing to report). The prior writer emitted only `input_tokens`/`output_tokens`
+/// and an `input_tokens_details` gated on a cache hit, so a client on the official SDK got a
+/// `ValidationError` and the missing-detail-objects shape was a distinguishability tell.
+///
+/// SCHEMA FIDELITY (round-3 fix R3-C): the REAL Responses usage schema defines EXACTLY
+/// `input_tokens_details.cached_tokens` and `output_tokens_details.reasoning_tokens` - there is NO
+/// `cache_write_tokens` field (unlike the Chat Completions `prompt_tokens_details`, the Responses
+/// detail objects carry only `cached_tokens`). The round-1 fix fabricated a non-native
+/// `cache_write_tokens` inside `input_tokens_details`, an EXTRA key a native Responses body never
+/// emits - itself a distinguishability tell and a decode surprise for a strict `extra="forbid"`
+/// model. It is removed here; cache-creation tokens still fold into the `input_tokens` TOTAL below.
 ///
 /// The IR stores UNCACHED input, but the Responses `input_tokens` is a TOTAL that includes the cached
 /// prefix, so `cache_read` (+ `cache_creation`) are added back. `cached_tokens` mirrors the cache-read
-/// count, `cache_write_tokens` the cache-creation count (both `0` when absent — not omitted, matching
-/// the required-field contract). The IR does not model reasoning tokens separately, so
-/// `reasoning_tokens` is `0` (the correct value for the non-reasoning case and the SDK-required
-/// default otherwise). `total_tokens` = `input_total` + `output_tokens`.
+/// count (`0` when absent - not omitted, matching the required-field contract). The IR does not model
+/// reasoning tokens separately, so `reasoning_tokens` is `0` (the correct value for the non-reasoning
+/// case and the SDK-required default otherwise). `total_tokens` = `input_total` + `output_tokens`.
 fn build_responses_usage(usage: &crate::ir::IrUsage) -> serde_json::Value {
     let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
     let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
@@ -237,7 +243,6 @@ fn build_responses_usage(usage: &crate::ir::IrUsage) -> serde_json::Value {
         "input_tokens": input_total,
         "input_tokens_details": {
             "cached_tokens": cache_read,
-            "cache_write_tokens": cache_write,
         },
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {

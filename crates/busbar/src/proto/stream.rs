@@ -654,6 +654,11 @@ impl StreamTranslate {
         // skip (avoid rescanning the already-searched prefix of a frame split across many feeds) apply
         // only ABOVE that floor, so `feed()` stays linear without looping.
         let mut consumed = 0usize;
+        // SAME-PROTOCOL verbatim re-emit cursor (R3-A-b): the start of the not-yet-flushed verbatim
+        // region. The common case flushes `[0..consumed]` in one shot at the end (a single bulk copy);
+        // it only splits when a frame must be SUPPRESSED (the OpenAI opted-out trailing usage chunk),
+        // in which case the run BEFORE the suppressed frame is flushed and the frame's bytes skipped.
+        let mut emit_from = 0usize;
         loop {
             let search_from = self
                 .scanned
@@ -663,7 +668,8 @@ impl StreamTranslate {
             match find_frame_terminator(&self.buf[search_from..]) {
                 Some((rel, term_len)) => {
                     let end = search_from + rel + term_len;
-                    let frame = &self.buf[consumed..end];
+                    let frame_start = consumed;
+                    let frame = &self.buf[frame_start..end];
                     consumed = end;
                     self.scanned = end;
 
@@ -689,6 +695,17 @@ impl StreamTranslate {
                         // `[DONE]`, and the exact `event:`/`data:` line shape and terminator) reaches
                         // the client byte-for-byte unchanged, and the writer/reframe work is skipped.
                         self.extract_usage_only(&event_type, &data);
+                        // R3-A-b: on the verbatim path `on_egress_chunk` never runs, so an opted-out
+                        // OpenAI client would still receive the unsolicited trailing usage chunk busbar
+                        // forced upstream. The framing decides per-frame whether to DROP it - flush the
+                        // verbatim run up to this frame's start, then skip the frame (its usage was
+                        // already A-tapped above for billing). Inert for every non-suppressing frame.
+                        if self.framing.suppress_same_proto_frame(&data) {
+                            if frame_start > emit_from {
+                                out.extend_from_slice(&self.buf[emit_from..frame_start]);
+                            }
+                            emit_from = end;
+                        }
                     } else {
                         self.translate_event(&event_type, &data, &mut out);
                     }
@@ -700,12 +717,14 @@ impl StreamTranslate {
                 }
             }
         }
-        // SAME-PROTOCOL verbatim re-emit: append exactly the bytes the loop consumed (every complete
-        // frame, including the keepalive/`[DONE]`/non-`data:` frames the cross-proto path drops),
-        // BEFORE the consumed prefix is reclaimed below — so the client sees the upstream SSE stream
-        // byte-for-byte, with the IR pipeline acting purely as the usage side-channel above.
-        if self.same_proto && consumed > 0 {
-            out.extend_from_slice(&self.buf[..consumed]);
+        // SAME-PROTOCOL verbatim re-emit: append the remaining un-flushed verbatim region (every
+        // complete frame the loop consumed and did NOT suppress, including the keepalive/`[DONE]`/
+        // non-`data:` frames the cross-proto path drops), BEFORE the consumed prefix is reclaimed below
+        // - so the client sees the upstream SSE stream byte-for-byte, with the IR pipeline acting purely
+        // as the usage side-channel above. In the common (no-suppression) case `emit_from == 0`, so this
+        // is the single bulk copy of `[0..consumed]` the prior code did.
+        if self.same_proto && consumed > emit_from {
+            out.extend_from_slice(&self.buf[emit_from..consumed]);
         }
         // Reclaim the consumed prefix in a single shift (linear), then rebase the cursors.
         if consumed > 0 {

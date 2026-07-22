@@ -627,9 +627,13 @@ pub(crate) struct IrTool {
     /// `{"type":"function","name":""}` that a Responses backend 400s on. When set, this holds the RAW
     /// hosted-tool JSON object verbatim; the Responses writer re-emits it unchanged (a same-protocol
     /// passthrough) and skips the function-tool projection. `None` for an ordinary function tool
-    /// (`name`/`input_schema` carry it). Only the Responses reader populates it / writer emits it;
-    /// every other protocol leaves it `None` and ignores it (no hosted-tool analog — a hosted tool
-    /// routed to a non-Responses backend simply has no function-tool equivalent to translate into).
+    /// (`name`/`input_schema` carry it). Only the Responses reader populates it and only the Responses
+    /// writer honors it. Every OTHER egress writer is `hosted`-BLIND: it projects an `IrTool` as a
+    /// function tool keyed on `name`, so a hosted tool (whose `name` is empty) would be emitted as a
+    /// MALFORMED empty-name `{"type":"function","name":""}` the backend rejects with a 400 - NOT
+    /// silently ignored. To prevent that, `IrReq::prepare_for_egress` DROPS every hosted tool on the
+    /// cross-protocol seam (drop-with-warn), so a hosted tool only ever reaches the Responses writer
+    /// (same-protocol Responses->Responses, where the body is forwarded verbatim anyway).
     pub(crate) hosted: Option<Value>,
 }
 

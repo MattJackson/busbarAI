@@ -3379,3 +3379,110 @@ fn test_bedrock_and_responses_register() {
         "/model/anthropic.claude-3/converse"
     );
 }
+
+/// R3-A-b (SAME-PROTOCOL verbatim strip, OPTED-OUT client): busbar forces
+/// `stream_options.include_usage` UPSTREAM so it can bill, so an OpenAI upstream emits a NATIVE
+/// trailing usage-only chunk (`{... "choices":[], "usage":{...}}`) even on an OpenAI->OpenAI
+/// same-protocol passthrough. The same-proto verbatim path re-emits frames byte-for-byte and never
+/// calls `on_egress_chunk`, so before the fix that unsolicited chunk reached a CLIENT that did NOT opt
+/// in - a strict SDK `choices[0]`-IndexErrors on it. With `client_include_usage == false` that ONE
+/// frame must be dropped from the client bytes while every other frame stays byte-identical AND the
+/// billing A-tap still holds the real token counts.
+#[test]
+fn same_proto_openai_opted_out_strips_trailing_usage_chunk() {
+    let mut st = StreamTranslate::new_same_proto("openai").expect("same-proto translator");
+    st.set_client_include_usage(false);
+    // Native OpenAI include_usage wire: content chunk, finish chunk (usage:null), trailing usage-only
+    // chunk (empty choices), then [DONE].
+    let frames = [
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let mut raw: Vec<u8> = Vec::new();
+    for f in frames {
+        raw.extend(st.feed(f.as_bytes()));
+    }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // The content chunk, finish chunk, and [DONE] survive verbatim.
+    assert!(
+        out.contains("\"content\":\"Hi\""),
+        "content chunk kept:\n{out}"
+    );
+    assert!(
+        out.contains("\"finish_reason\":\"stop\""),
+        "finish chunk kept:\n{out}"
+    );
+    assert!(out.contains("[DONE]"), "terminator kept:\n{out}");
+    // The trailing usage-only chunk (empty choices + usage object) is DROPPED from the client bytes.
+    for data in out.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value =
+            crate::json::parse(data.as_bytes()).expect("each SSE chunk is valid JSON");
+        let usage_obj = v.get("usage").is_some_and(|u| u.is_object());
+        let choices_empty = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|a| a.is_empty());
+        assert!(
+            !(usage_obj && choices_empty),
+            "opted-out client must NOT receive the trailing usage-only chunk; got:\n{data}"
+        );
+    }
+    // BILLING invariant: the A-tap still captured the upstream usage despite the client-side strip.
+    let u = st
+        .usage()
+        .expect("A-tap usage must be populated for billing");
+    assert_eq!(u.output_tokens, 3, "billing output tokens from A-tap");
+    // input_tokens = prompt_tokens minus any cached prefix (none here) = 11.
+    assert_eq!(u.input_tokens, 11, "billing input tokens from A-tap");
+}
+
+/// R3-A-b (SAME-PROTOCOL verbatim, OPTED-IN client): when the client DID send
+/// `stream_options.include_usage:true`, the native trailing usage-only chunk is exactly what it asked
+/// for, so it must reach the client verbatim - AND billing still holds the usage.
+#[test]
+fn same_proto_openai_opted_in_keeps_trailing_usage_chunk() {
+    let mut st = StreamTranslate::new_same_proto("openai").expect("same-proto translator");
+    st.set_client_include_usage(true);
+    let frames = [
+        "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Yo\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let mut raw: Vec<u8> = Vec::new();
+    for f in frames {
+        raw.extend(st.feed(f.as_bytes()));
+    }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // The trailing usage-only chunk IS present for the opted-in client (byte-for-byte).
+    let has_trailing = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .any(|data| {
+            if data.trim() == "[DONE]" {
+                return false;
+            }
+            let v: serde_json::Value = crate::json::parse(data.as_bytes()).expect("valid JSON");
+            v.get("usage").is_some_and(|u| u.is_object())
+                && v.get("choices")
+                    .and_then(|c| c.as_array())
+                    .is_some_and(|a| a.is_empty())
+        });
+    assert!(
+        has_trailing,
+        "opted-in client MUST receive the trailing usage-only chunk verbatim:\n{out}"
+    );
+    // Billing A-tap still populated.
+    let u = st.usage().expect("A-tap usage");
+    assert_eq!(u.output_tokens, 2);
+    assert_eq!(u.input_tokens, 7);
+}

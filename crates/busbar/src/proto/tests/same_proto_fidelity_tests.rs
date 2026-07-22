@@ -39,18 +39,28 @@ fn anthropic_sse_round_trip_byte_exact() {
 
 #[test]
 fn openai_bare_data_round_trip_byte_exact() {
-    // OpenAI bare `data:` frames + `include_usage` trailing usage chunk + [DONE].
+    // OpenAI bare `data:` frames + `include_usage` trailing usage chunk + [DONE]. This fidelity test
+    // pins the VERBATIM re-emit for a client that OPTED IN to streaming usage (R3-A-b): the trailing
+    // usage-only chunk is exactly what that client asked for, so it must pass through byte-for-byte.
+    // (The opted-OUT case, where that same chunk is STRIPPED, is covered by
+    // `stream_translate_tests::same_proto_openai_opted_out_strips_trailing_usage_chunk`.)
     let frames: &[&[u8]] = &[
             b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
             b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
             b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":9,\"total_tokens\":22}}\n\n",
             b"data: [DONE]\n\n",
         ];
-    let (out, t) = run_same_proto("openai", frames);
+    let mut t = StreamTranslate::new_same_proto("openai").expect("same-proto translator");
+    t.set_client_include_usage(true);
+    let mut out = Vec::new();
+    for c in frames {
+        out.extend_from_slice(&t.feed(c));
+    }
+    out.extend_from_slice(&t.finish());
     assert_eq!(
         out,
         concat(frames),
-        "openai bare data: same-proto must be byte-exact (incl [DONE])"
+        "openai bare data: opted-in same-proto must be byte-exact (incl the trailing usage chunk + [DONE])"
     );
     let u = t.usage().expect("openai A-tap usage");
     assert_eq!((u.input_tokens, u.output_tokens), (13, 9));

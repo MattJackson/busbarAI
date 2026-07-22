@@ -633,6 +633,32 @@ impl super::StreamFraming for OpenAiStreamFraming {
     fn set_client_include_usage(&mut self, include: bool) {
         self.client_include_usage = include;
     }
+
+    /// SAME-PROTOCOL verbatim strip (R3-A-b). On OpenAI->OpenAI the translator re-emits upstream
+    /// frames byte-for-byte and never calls `on_egress_chunk`, so the opted-out `include_usage` strip
+    /// above cannot fire. Busbar forces `include_usage` UPSTREAM (to bill), so the OpenAI upstream
+    /// emits a NATIVE trailing usage-only chunk - `object == "chat.completion.chunk"`, a real top-level
+    /// `usage` OBJECT, and an EMPTY `choices` array. When the CLIENT did not opt in, suppress exactly
+    /// that frame from the verbatim client bytes so a strict SDK never `choices[0]`-IndexErrors; the
+    /// A-tap already captured its usage for billing. A normal content/finish chunk (non-empty
+    /// `choices`) is never suppressed, and the opted-in case re-emits it verbatim.
+    fn suppress_same_proto_frame(&self, data: &serde_json::Value) -> bool {
+        if self.client_include_usage {
+            return false;
+        }
+        let Some(obj) = data.as_object() else {
+            return false;
+        };
+        if obj.get("object").and_then(|v| v.as_str()) != Some(OBJ_CHUNK) {
+            return false;
+        }
+        let has_usage_obj = obj.get("usage").is_some_and(|u| u.is_object());
+        let choices_empty = obj
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|arr| arr.is_empty());
+        has_usage_obj && choices_empty
+    }
 }
 
 impl OpenAiStreamFraming {

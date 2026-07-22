@@ -146,6 +146,27 @@ impl IrReq {
                         );
                     }
                 }
+                // HOSTED-TOOL cross-protocol drop (R3-B). A Responses hosted tool
+                // (`{"type":"web_search"}` → `IrTool{ name:"", hosted:Some(..) }`) has NO function-tool
+                // analog: ONLY the Responses writer honors `hosted`; every other egress writer projects
+                // an `IrTool` as a function tool keyed on `name`, so a hosted tool becomes a malformed
+                // empty-name `{"type":"function","name":""}` the backend 400s on. `prepare_for_egress`
+                // runs ONLY on the cross-protocol seam (a same-protocol Responses->Responses passthrough
+                // never reaches here - its body is forwarded verbatim, so hosted tools pass through
+                // intact), so DROPPING every hosted tool here is exactly the "keep same-proto, drop
+                // cross-proto" contract. Retain the count for the warn before draining.
+                let hosted_dropped = ir.tools.iter().filter(|t| t.hosted.is_some()).count();
+                if hosted_dropped > 0 {
+                    ir.tools.retain(|t| t.hosted.is_none());
+                    tracing::warn!(
+                        ingress = %prep.ingress_protocol,
+                        dropped = hosted_dropped,
+                        "dropping cross-protocol hosted (built-in) tool(s): a Responses hosted tool \
+                         has no function-tool equivalent for a non-Responses backend; forwarding it \
+                         would emit a malformed empty-name function tool the upstream rejects (400). \
+                         Route hosted-tool requests to a Responses lane to use them"
+                    );
+                }
                 ir.extra.clear();
             }
             IrReq::Embeddings(_)
