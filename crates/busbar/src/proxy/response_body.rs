@@ -5,6 +5,9 @@ use super::*;
 #[derive(Clone)]
 pub(crate) struct UsageSink {
     pub(crate) gov: Arc<crate::governance::GovState>,
+    /// The resolved cost model (chain topology; rates are NOT used at accrual - tokens are the
+    /// ledger, spend derives at read time). Arc bump per request, rebuilt on config apply.
+    pub(crate) cost: Arc<crate::cost::CostModel>,
     /// The resolved virtual key, shared via `Arc` — `key_id` and `budget_period` are read THROUGH it
     /// (`key.id` / `key.budget_period`) at charge time, so building the sink (once per request) and
     /// cloning it (once per failover attempt) is a refcount bump, not two per-request `String` clones.
@@ -553,32 +556,32 @@ where
                             .is_some()
                             || translate_aborted;
                         if !billing_failed {
-                            // billed tokens = the normalized billable total (A2): uncached input +
-                            // cache_read + cache_creation + output. Readers normalize `input_tokens`
-                            // to UNCACHED and keep the cache fields ADDITIVE, so this single sum is
-                            // correct provider-agnostically — OpenAI-family stay at prompt_total+output
-                            // (no double-count), Anthropic/Bedrock now correctly include their
-                            // additive cache reads/writes. `billable_tokens` saturates internally
-                            // (counts are UPSTREAM-CONTROLLED) rather than risking a request-path panic.
-                            let tokens =
-                                ir_usage.as_ref().map(|u| u.billable_tokens()).unwrap_or(0);
-                            // Attribute the token fee to the SAME window the flat per-request fee was
-                            // charged in (`sink.charged_at`, the header-arrival epoch), not the
-                            // stream-end clock — otherwise a stream that completes in a later window
-                            // than its headers arrived would split its two charges across two windows
-                            // (#29).
-                            sink.gov.record_tokens(
-                                &sink.key.id,
-                                &sink.key.budget_period,
-                                sink.charged_at,
-                                tokens,
-                            );
-                            // Metering (raw per-model consumption series, token SPLIT preserved):
-                            // attribute to the SERVING lane — `lane_idx` is the lane that actually
-                            // answered, post-failover. Same pinned epoch as the budget charges (#29).
+                            // Ledger the TIER SPLIT (uncached input / output / cache-read /
+                            // cache-write - each prices differently under the rate card) against
+                            // the SERVING lane's resolved upstream model (post-`upstream_model`,
+                            // the rate card's key space). Attributed to the SAME window the flat
+                            // per-request fee was charged in (`sink.charged_at`, the header-arrival
+                            // epoch), not the stream-end clock (#29). Readers normalize
+                            // `input_tokens` to UNCACHED and keep the cache fields ADDITIVE, so the
+                            // four tiers are correct provider-agnostically.
+                            let tier = ir_usage
+                                .as_ref()
+                                .map(crate::proxy::usage::tier_tokens)
+                                .unwrap_or_default();
                             if let Some(lane) =
                                 this.app.as_ref().and_then(|a| a.lanes.get(this.lane_idx))
                             {
+                                sink.gov.record_usage(
+                                    &sink.cost,
+                                    &sink.key,
+                                    lane.wire_model(),
+                                    &tier,
+                                    sink.charged_at,
+                                );
+                                // Metering (raw per-model consumption series, token SPLIT
+                                // preserved): attribute to the SERVING lane - `lane_idx` is the
+                                // lane that actually answered, post-failover. Same pinned epoch as
+                                // the budget charges (#29).
                                 sink.gov.record_metering(
                                     &sink.key.id,
                                     &lane.model,
@@ -630,17 +633,23 @@ impl<S, P> Drop for FirstByteBody<S, P> {
             return;
         }
         let usage = self.translate.as_ref().and_then(|t| t.usage()).cloned();
-        let tokens = usage.as_ref().map(|u| u.billable_tokens()).unwrap_or(0);
-        if tokens > 0 {
-            sink.gov.record_tokens(
-                &sink.key.id,
-                &sink.key.budget_period,
-                sink.charged_at,
-                tokens,
-            );
-            // Meter the delivered-then-dropped partial too (same serving-lane attribution as the
-            // natural-end site) — the tokens were really consumed against this model.
+        let tier = usage
+            .as_ref()
+            .map(crate::proxy::usage::tier_tokens)
+            .unwrap_or_default();
+        if !tier.is_zero() {
             if let Some(lane) = self.app.as_ref().and_then(|a| a.lanes.get(self.lane_idx)) {
+                // Ledger the partial tier split against the serving lane's resolved upstream model
+                // (the tokens were really generated + delivered before the drop).
+                sink.gov.record_usage(
+                    &sink.cost,
+                    &sink.key,
+                    lane.wire_model(),
+                    &tier,
+                    sink.charged_at,
+                );
+                // Meter the delivered-then-dropped partial too (same serving-lane attribution as
+                // the natural-end site).
                 sink.gov.record_metering(
                     &sink.key.id,
                     &lane.model,

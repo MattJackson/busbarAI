@@ -989,10 +989,18 @@ pub(crate) struct PoolMember {
     /// `ModelCfg::reasoning` for semantics.
     #[serde(default)]
     pub(crate) reasoning: Option<bool>,
-    /// Operator-declared cost in currency-units per million tokens. Drives the native `cheapest`
-    /// policy and is exposed to webhook/socket policies. Inert when unset.
+    /// Operator-declared cost signal. TWO accepted shapes (untagged):
+    ///  - a bare number: abstract cost units per MILLION tokens (the 1.4.x form) - a ROUTING
+    ///    signal only (drives the native `cheapest` policy + hook projections), never billing.
+    ///  - the 4-tier rate map `{input_utok, output_utok, cache_read_utok, cache_write_utok}`
+    ///    (micro-units per token, the `rate_card` entry shape): a per-member BILLING RATE OVERRIDE
+    ///    for this member's resolved upstream model (wins over `rate_card[model]`; requires
+    ///    `governance.rate_card` to be present - all-or-nothing pricing), AND the routing scalar
+    ///    is derived from it ((input + output) / 2, in units/mtok).
+    ///
+    /// Inert when unset.
     #[serde(default)]
-    pub(crate) cost_per_mtok: Option<f64>,
+    pub(crate) cost_per_mtok: Option<MemberCost>,
     /// Free-form operator tags (e.g. `["opus"]`) a policy can match on. Projected into the routing
     /// `Candidate` and read by webhook/socket policies.
     #[serde(default)]
@@ -1001,6 +1009,35 @@ pub(crate) struct PoolMember {
 
 fn default_weight() -> u32 {
     1
+}
+
+/// The two shapes of `PoolMember.cost_per_mtok` (see its field doc). Untagged: a YAML number
+/// deserializes as `PerMtok`, a map as the 4-tier `Tiered` rate entry.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub(crate) enum MemberCost {
+    PerMtok(f64),
+    Tiered(RateEntryCfg),
+}
+
+impl MemberCost {
+    /// The routing-scalar projection (units per million tokens) fed to the `cheapest` policy and
+    /// the hook `Candidate.cost_per_mtok` signal. For the tiered shape, 1 micro-unit/token equals
+    /// 1 unit/mtok, so the blended (input + output) / 2 is already in units/mtok.
+    pub(crate) fn per_mtok(&self) -> f64 {
+        match self {
+            MemberCost::PerMtok(v) => *v,
+            MemberCost::Tiered(r) => (r.input_utok + r.output_utok) / 2.0,
+        }
+    }
+
+    /// The 4-tier billing override, when this member declared one.
+    pub(crate) fn tiered(&self) -> Option<&RateEntryCfg> {
+        match self {
+            MemberCost::PerMtok(_) => None,
+            MemberCost::Tiered(r) => Some(r),
+        }
+    }
 }
 
 /// Trip mode for breaker configuration.
@@ -1603,13 +1640,34 @@ pub(crate) struct GovernanceCfg {
     /// default `store: memory`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
-    /// Flat cents charged per request for budget accounting. Defaults to 1.
+    /// Flat cents (abstract minor units) charged per request for budget accounting. Defaults to 1.
+    /// Orthogonal to the per-token `rate_card`: the flat fee is charged pre-forward at admission;
+    /// token spend derives from the ledger x rate_card at read time.
     #[serde(default = "default_price_per_request_cents")]
     pub(crate) price_per_request_cents: i64,
-    /// Cents charged per 1000 tokens (input + output), accrued from response usage. Defaults to 0.
-    /// Total budget spend per request = price_per_request_cents + tokens/1000 * price_per_1k_tokens_cents.
+    /// Per-model RATE CARD: model -> per-token rates in MICRO-units (1e-6 of the abstract cost
+    /// unit) per token, split by pricing tier. ALL-OR-NOTHING: absent => token pricing is 0 for
+    /// every model (budgets count only `price_per_request_cents`); present => AUTHORITATIVE and
+    /// COMPLETE - every configured model (config.models, post-`upstream_model`) MUST have an entry
+    /// or boot/`--validate` FAIL naming the missing models. There is NO `default` bucket. The
+    /// numbers are ABSTRACT cost units: busbar does pure integer math and never knows a currency
+    /// (currency is a display concern of the consumer; no currency field, no FX).
+    ///
+    /// Replaces the removed 1.4.x `price_per_1k_tokens_cents` flat blended token price: the rate
+    /// card is the ONLY token-pricing mechanism (a stale `price_per_1k_tokens_cents:` key is a
+    /// loud `deny_unknown_fields` boot error naming this block).
     #[serde(default)]
-    pub(crate) price_per_1k_tokens_cents: i64,
+    pub(crate) rate_card: Option<std::collections::BTreeMap<String, RateEntryCfg>>,
+    /// Nestable BUDGET GROUPS: named enforcement buckets ABOVE the per-key budget. A virtual key
+    /// binds to at most one group (mint field `budget_group`); enforcement walks the chain
+    /// [key bucket -> budget_group -> parent -> ... root] and admits ONLY if EVERY bucket is under
+    /// its own cap (AND / most-restrictive - the OPPOSITE of the auth `group_map` union
+    /// semantics, hence the distinct name). Each bucket evaluates against ITS OWN `budget_period`
+    /// window. Validated acyclic, parents-exist, depth <= 8. Groups are opaque buckets (a person,
+    /// team, org, project - naming is the operator's); they exist ONLY for enforced caps - pure
+    /// reporting rollups should use key `labels` + external aggregation instead.
+    #[serde(default)]
+    pub(crate) budget_groups: std::collections::BTreeMap<String, BudgetGroupCfg>,
     /// bearer token guarding the /admin management API. None = admin API disabled.
     #[serde(default)]
     pub(crate) admin_token: Option<String>,
@@ -1635,7 +1693,8 @@ impl Default for GovernanceCfg {
             store: default_governance_store(),
             db_path: default_gov_db_path(),
             price_per_request_cents: default_price_per_request_cents(),
-            price_per_1k_tokens_cents: 0,
+            rate_card: None,
+            budget_groups: std::collections::BTreeMap::new(),
             admin_token: None,
             sqlite_busy_timeout_ms: default_sqlite_busy_timeout_ms(),
             rate_sweep_interval: default_rate_sweep_interval(),
@@ -1653,7 +1712,8 @@ impl fmt::Debug for GovernanceCfg {
             .field("store", &self.store)
             .field("db_path", &self.db_path)
             .field("price_per_request_cents", &self.price_per_request_cents)
-            .field("price_per_1k_tokens_cents", &self.price_per_1k_tokens_cents)
+            .field("rate_card", &self.rate_card)
+            .field("budget_groups", &self.budget_groups)
             .field(
                 "admin_token",
                 &if self.admin_token.is_some() {
@@ -1679,6 +1739,39 @@ fn default_governance_store() -> String {
 
 fn default_price_per_request_cents() -> i64 {
     1
+}
+
+/// One `governance.rate_card` entry: the four per-token rates in MICRO-units (1e-6 abstract cost
+/// unit) per token, one per pricing tier. A tier omitted in YAML prices at 0 for that tier (e.g. a
+/// model with no cache pricing simply omits the cache rates). Values must be finite and >= 0
+/// (validated at boot). Floats exist ONLY here at the config boundary: they are converted once at
+/// resolve time to integer nano-units per token, and the hot path does pure integer math.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RateEntryCfg {
+    #[serde(default)]
+    pub(crate) input_utok: f64,
+    #[serde(default)]
+    pub(crate) output_utok: f64,
+    #[serde(default)]
+    pub(crate) cache_read_utok: f64,
+    #[serde(default)]
+    pub(crate) cache_write_utok: f64,
+}
+
+/// One `governance.budget_groups` entry: a nestable enforcement bucket with its own cap + window.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BudgetGroupCfg {
+    /// Spend cap in cents (abstract minor units) for this bucket's `budget_period` window.
+    pub(crate) max_budget_cents: i64,
+    /// "total" | "daily" | "monthly" - this bucket's OWN window (independent of its parent's and of
+    /// any member key's period).
+    pub(crate) budget_period: String,
+    /// Optional parent group, forming the enforcement chain. Must exist; the chain must be acyclic
+    /// and at most 8 deep (validated at boot / `--validate`).
+    #[serde(default)]
+    pub(crate) parent: Option<String>,
 }
 
 /// Observability sinks. All fields optional; absent = that sink is disabled.

@@ -85,6 +85,16 @@ struct CreateKeyReq {
     /// SECRET is never exposed again by any read API (mirroring the bearer `secret`). Defaults to false.
     #[serde(default)]
     issue_aws_credential: bool,
+    /// The `governance.budget_groups` bucket this key charges into (in addition to its own inline
+    /// budget above, which stays the innermost bucket). Validated to EXIST at mint - a key naming a
+    /// missing group is a 400 naming the offender. Named `budget_group`, never bare `group` (that
+    /// name belongs to the auth `group_map` concept with opposite union semantics).
+    #[serde(default)]
+    budget_group: Option<String>,
+    /// Optional mint-time labels (e.g. `{"team": "growth"}`) echoed onto this key's metric series
+    /// so external dashboards can aggregate by them; never interpreted by enforcement.
+    #[serde(default)]
+    labels: std::collections::BTreeMap<String, String>,
 }
 
 /// The budget periods `governance::budget_window` actually enforces. An unrecognized value (a typo
@@ -236,6 +246,8 @@ fn key_meta(k: &VirtualKey) -> Value {
         "tpm_limit": k.tpm_limit,
         "enabled": k.enabled,
         "created_at": k.created_at,
+        "budget_group": k.budget_group,
+        "labels": k.labels,
     })
 }
 
@@ -497,6 +509,21 @@ pub(crate) async fn create_key(
             );
         }
     }
+    // MINT-TIME fail-closed check: a `budget_group` must exist in governance.budget_groups NOW - a
+    // dangling binding would make every request on the new key fail closed at admission. 400 with
+    // the offender named (mirrors the boot-side check over stored keys).
+    if let Some(group) = req.budget_group.as_deref() {
+        if app.cost.group_named(group).is_none() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                ERR_TYPE_INVALID_REQUEST,
+                format!(
+                    "budget_group '{group}' does not exist in governance.budget_groups; \
+                     configure it first (e.g. {group}: {{ max_budget_cents: 0, budget_period: monthly }})"
+                ),
+            );
+        }
+    }
     let spec = NewKeySpec {
         name: req.name,
         allowed_pools: req.allowed_pools,
@@ -504,6 +531,8 @@ pub(crate) async fn create_key(
         budget_period,
         rpm_limit: req.rpm_limit,
         tpm_limit: req.tpm_limit,
+        budget_group: req.budget_group,
+        labels: req.labels,
     };
     // Offload the blocking store write off the Tokio worker thread (matches the request-path
     // discipline in governance::charge_within_budget_async / offload_store_write).
@@ -992,8 +1021,11 @@ pub(crate) async fn key_usage(
     let id2 = id.clone();
     // One blocking hop fetches BOTH the usage counters and the key record (the record feeds the
     // in-memory `rate_headroom` read, which needs the configured caps).
+    let cost = app.cost.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let usage = gov2.usage_for(&id2, now)?;
+        // DERIVED at read time: spend_cents = ledger x CURRENT rate card (+ fee x requests) - a
+        // rate-card correction changes this number on the very next read (tokens are the truth).
+        let usage = gov2.usage_for(&cost, &id2, now)?;
         let key = gov2.all_keys()?.into_iter().find(|k| k.id == id2);
         Ok::<_, crate::governance::StoreError>(usage.map(|u| (u, key)))
     })

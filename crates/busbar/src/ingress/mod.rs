@@ -98,6 +98,9 @@ fn usage_sink(
     match (&app.governance, &gov.key) {
         (Some(g), Some(key)) => Some(crate::proxy::UsageSink {
             gov: g.clone(),
+            // The resolved cost model rides along (an Arc bump) so the stream-end accrual can walk
+            // the key's budget-group chain without reaching back into the App snapshot.
+            cost: app.cost.clone(),
             // Share the resolved key by `Arc` — no per-request `id`/`budget_period` String clone;
             // both are read through `sink.key` at charge time.
             key: key.clone(),
@@ -158,35 +161,54 @@ fn budget_check(
         // outcome is REFUNDED in `finish` to preserve the "bill 2xx only" flat-fee policy. This guard
         // runs LAST in `governance_guard` (after pool/rate), so no later guard can reject an
         // already-charged request.
-        // In-memory hard cap: `try_charge_request_within_budget` is now an infallible in-memory
-        // check-and-charge (SQLite is write-behind), so there is no store-error branch — admission
-        // never blocks on or fails from the durable store. `true` = charged + admitted (a non-2xx
-        // refunds this flat fee); `false` = over budget → reject.
-        if g.try_charge_request_within_budget(key, charged_at) {
-            Ok(true)
-        } else {
-            // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the OpenAI
-            // writer passes it through verbatim as a real type; the Responses writer maps it
-            // explicitly). The older `billing_error` token was not in either vocabulary, so it
-            // leaked verbatim as a non-canonical `error.type` that an SDK's typed-exception mapping
-            // did not recognize — a router-side tell on a 402.
-            //
-            // The client-facing message carries only vendor-plausible quota copy — never the
-            // internal key id or governance vocabulary. The key id is recorded server-side.
-            tracing::info!(key_id = %key.id, "governance: key over budget");
-            // Native quota status differs by vendor (Bedrock's `ServiceQuotaExceededException` is
-            // 400; every other vendor surfaces over-quota as 429). The writer owns that mapping via
-            // `quota_exceeded_status()`, so this agnostic guard never branches on the protocol
-            // name. The body `kind` (`insufficient_quota`) drives the per-protocol error vocabulary.
-            let status = crate::proto::protocol_for(proto)
-                .map(|p| p.writer().quota_exceeded_status())
-                .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-            Err(Box::new(ingress_error(
-                proto,
-                status,
-                crate::proxy::KIND_INSUFFICIENT_QUOTA,
-                "You have exceeded your current quota. Please check your plan and billing details.",
-            )))
+        // In-memory hard cap over the whole BUDGET CHAIN: `try_charge_request_within_budget`
+        // derives every bucket's spend from its token ledger x the current rate card (pure
+        // recompute, no spend cache) and admits only if the key bucket AND every ancestor budget
+        // group are under their caps, charging all of them atomically. Infallible in-memory
+        // (write-behind store): admission never blocks on or fails from the durable store.
+        // `Ok(())` = charged + admitted (a non-2xx refunds); `Err` = a NAMED bucket blocked.
+        match g.try_charge_request_within_budget(&app.cost, key, charged_at) {
+            Ok(()) => Ok(true),
+            Err(blocked) => {
+                // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the
+                // OpenAI writer passes it through verbatim as a real type; the Responses writer
+                // maps it explicitly).
+                //
+                // The 429 NAMES WHICH BUCKET blocked (cost-model spec §6): the key's own budget vs
+                // a named budget group. The key ID itself is still never echoed - the key bucket
+                // keeps the vendor-plausible copy verbatim; a GROUP rejection appends the group
+                // name (an operator-chosen, caller-meaningful bucket label, not an internal
+                // credential handle). Server-side tracing records the full detail either way.
+                tracing::info!(key_id = %key.id, blocked = ?blocked, "governance: budget bucket exhausted");
+                let message = match &blocked {
+                    crate::governance::BudgetBlocked::Key => {
+                        "You have exceeded your current quota. Please check your plan and billing details."
+                            .to_string()
+                    }
+                    crate::governance::BudgetBlocked::Group(name) => format!(
+                        "You have exceeded your current quota (budget group '{name}' exhausted). \
+                         Please check your plan and billing details."
+                    ),
+                    // FAIL-CLOSED: a key bound to a group this node's config does not know is not
+                    // admitted; the message names the missing bucket so the operator can fix it.
+                    crate::governance::BudgetBlocked::MissingGroup(name) => format!(
+                        "Your quota configuration is incomplete (budget group '{name}' is not \
+                         configured). Please contact your administrator."
+                    ),
+                };
+                // Native quota status differs by vendor (Bedrock's ServiceQuotaExceededException
+                // is 400; every other vendor surfaces over-quota as 429). The writer owns that
+                // mapping via `quota_exceeded_status()`.
+                let status = crate::proto::protocol_for(proto)
+                    .map(|p| p.writer().quota_exceeded_status())
+                    .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
+                Err(Box::new(ingress_error(
+                    proto,
+                    status,
+                    crate::proxy::KIND_INSUFFICIENT_QUOTA,
+                    &message,
+                )))
+            }
         }
     } else {
         // Governance off or no resolved key → no charge landed; nothing to refund on a non-2xx.
@@ -230,6 +252,29 @@ fn governance_guard(
     // `proxy::handle_fallback_pool` does not — and cannot — re-check the key; the ACL is enforced
     // at this ingress boundary). A denial is the SAME protocol-native 403 the initial check emits.
     if let Some(resp) = fallback_pools_authorized(app, gov, pool, proto) {
+        return Err(Box::new(finish_rejected(
+            app, gov, proto, label, started, charged_at, resp,
+        )));
+    }
+    // ALL-OR-NOTHING pricing, fail-closed arm: when a rate card is PRESENT, every governed request
+    // must resolve to a priced model. A configured pool / by-model lane is priced by construction
+    // (`--validate`/boot enforce rate-card completeness over config.models), so only an ARBITRARY
+    // passthrough model string can be unpriced - reject it with a clear error rather than serve
+    // tokens that cannot be billed. Zero-cost when no rate card is configured (one bool), and a
+    // single borrowed map probe otherwise.
+    if gov.key.is_some()
+        && app.cost.pricing_enabled()
+        && !app.pools.contains_key(pool)
+        && !app.by_model.contains_key(pool)
+        && app.cost.model_unpriced(pool)
+    {
+        tracing::info!(model = %pool, "governance: no configured rate for model; rejecting (rate_card is authoritative and complete)");
+        let resp = ingress_error(
+            proto,
+            StatusCode::BAD_REQUEST,
+            crate::proxy::KIND_INVALID_REQUEST,
+            &format!("no configured rate for model '{pool}'"),
+        );
         return Err(Box::new(finish_rejected(
             app, gov, proto, label, started, charged_at, resp,
         )));
@@ -454,7 +499,7 @@ fn finish_inner(
     let is_success = matches!(resp.status().as_u16(), 200..=299);
     if refund_on_non_2xx && !is_success {
         if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-            g.refund_request(key, charged_at);
+            g.refund_request(&app.cost, key, charged_at);
         }
     }
     resp

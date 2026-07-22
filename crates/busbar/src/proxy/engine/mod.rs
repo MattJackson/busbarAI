@@ -1928,11 +1928,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                             );
                         }
                         if let Some(Ok(mut ir)) = decoded {
-                            record_resp_usage(
-                                &ir,
-                                &usage_sink,
-                                Some((&app.lanes[i].model, &app.lanes[i].provider)),
-                            );
+                            record_resp_usage(&ir, &usage_sink, app.lanes.get(i));
                             ir.prepare_for_ingress(ingress_protocol, now());
                             if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
                                 .and_then(|rh| rh.operation_handler(op.operation))
@@ -1975,11 +1971,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                                 // delivering this body (every exit from this block is a delivered
                                 // response). No FirstByteBody on this buffered path, so bill here —
                                 // straight from the IR usage the egress reader just decoded (Change A).
-                                record_resp_usage(
-                                    &ir,
-                                    &usage_sink,
-                                    Some((&app.lanes[i].model, &app.lanes[i].provider)),
-                                );
+                                record_resp_usage(&ir, &usage_sink, app.lanes.get(i));
                                 // OPERATION-BLIND ingress preparation: the IR reshapes ITSELF for
                                 // delivery in the caller's dialect (chat: native-identity strip, the
                                 // protocol-agnostic `created` boundary signal, tool-id remap — see
@@ -2394,6 +2386,9 @@ fn fire_global_taps(
     let ctx = crate::hooks::RoutingContext {
         pool: pool_name,
         budget_remaining: None,
+        // Taps observe request shape; the budget-chain projection is a routing-policy signal
+        // (decide_policy_order), not a tap payload.
+        budget: &[],
     };
     let build_proj = |with_prompt: bool| {
         let req =

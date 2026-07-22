@@ -611,11 +611,7 @@ pub(crate) async fn forward_once(
                         );
                     }
                     if let Some(Ok(mut ir)) = decoded {
-                        record_resp_usage(
-                            &ir,
-                            &usage_sink,
-                            Some((&app.lanes[i].model, &app.lanes[i].provider)),
-                        );
+                        record_resp_usage(&ir, &usage_sink, app.lanes.get(i));
                         ir.prepare_for_ingress(ingress_protocol, now());
                         if let Some(wire) = crate::handlers::request_handler(ingress_protocol)
                             .and_then(|rh| rh.operation_handler(op.operation))
@@ -650,11 +646,7 @@ pub(crate) async fn forward_once(
                             // (every exit below is a delivered response). No FirstByteBody on this
                             // buffered path, so bill from the IR usage just decoded (Change A,
                             // mirrors the main path).
-                            record_resp_usage(
-                                &ir,
-                                &usage_sink,
-                                Some((&app.lanes[i].model, &app.lanes[i].provider)),
-                            );
+                            record_resp_usage(&ir, &usage_sink, app.lanes.get(i));
                             // OPERATION-BLIND ingress preparation (identity strip, `created`
                             // boundary signal, tool-id remap) — the SAME seam transform the main
                             // path applies; relocated verbatim into `IrResp::prepare_for_ingress`.

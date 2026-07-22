@@ -694,21 +694,18 @@ mod tests {
         }
         fn get_usage(
             &self,
-            key_id: &str,
+            bucket_id: &str,
             window_start: u64,
-        ) -> busbar_api::StoreResult<busbar_api::Usage> {
-            self.inner.get_usage(key_id, window_start)
+        ) -> busbar_api::StoreResult<busbar_api::UsageLedger> {
+            self.inner.get_usage(bucket_id, window_start)
         }
         fn put_usage(
             &self,
-            key_id: &str,
+            bucket_id: &str,
             window_start: u64,
-            spend_cents: i64,
-            tokens: u64,
-            requests: u64,
+            ledger: &busbar_api::UsageLedger,
         ) -> busbar_api::StoreResult<()> {
-            self.inner
-                .put_usage(key_id, window_start, spend_cents, tokens, requests)
+            self.inner.put_usage(bucket_id, window_start, ledger)
         }
         fn add_metering(&self, delta: &busbar_api::MeteringDelta) -> busbar_api::StoreResult<()> {
             self.inner.add_metering(delta)

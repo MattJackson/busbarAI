@@ -268,6 +268,7 @@ mod tests {
         RoutingContext {
             pool: "p",
             budget_remaining: None,
+            budget: &[],
         }
     }
 

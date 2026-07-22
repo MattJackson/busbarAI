@@ -17,34 +17,27 @@ use super::contract::{
     AdminAuthView, AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView,
     HookHealthView, HookTransportView, HookView, InfoView, KeyUsageView, ModelUsageView, ModelView,
     Page, PluginView, PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView,
-    TopologyInfo, UsageBreakdown, UsageView, UsageWindow, USAGE_CURRENCY,
+    TopologyInfo, UsageBreakdown, UsageView, UsageWindow,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PromptAccess, ProviderDef, UserAccess,
 };
 
-/// Micro-units of the usage currency per cent (1 cent = 10 000 micro-USD). The `spend_micros`
-/// derivation unit — integer math, sub-cent precise, no float drift.
-const MICROS_PER_CENT: i64 = 10_000;
-/// Micro-units per token per (cent-per-1000-tokens): `MICROS_PER_CENT / 1000` — a price of
-/// 1¢ per 1k tokens is exactly 10 micro-USD per token, so per-token spend needs no division.
-const TOKEN_MICROS_PER_1K_CENT: i64 = MICROS_PER_CENT / 1_000;
-
-/// Derive busbar's spend ESTIMATE (micro-USD) for one aggregation row from the operator's
-/// configured global prices: `requests × per-request-fee + billable-tokens × per-token price`.
-/// Billable = input + cache-read + cache-creation + output (the same normalized additive-cache
-/// convention `record_tokens` bills budgets with). i128 intermediates clamp — never wrap.
-fn derive_spend_micros(b: &UsageBreakdown, (per_request_cents, per_1k_cents): (i64, i64)) -> i64 {
-    let billable = b
-        .tokens_input
-        .saturating_add(b.tokens_cache_read)
-        .saturating_add(b.tokens_cache_creation)
-        .saturating_add(b.tokens_output);
-    let request_fee =
-        (b.requests as i128) * (per_request_cents.max(0) as i128) * (MICROS_PER_CENT as i128);
-    let token_fee =
-        (billable as i128) * (per_1k_cents.max(0) as i128) * (TOKEN_MICROS_PER_1K_CENT as i128);
-    i64::try_from(request_fee + token_fee).unwrap_or(i64::MAX)
+/// Derive busbar's spend ESTIMATE (micro-units, abstract cost units) for one PER-MODEL metering
+/// row from the CURRENT rate card: the row's tier-token split priced at that model's rates, plus
+/// the flat per-request fee x requests. Recomputed on every read (reprice-on-read: a rate-card
+/// correction changes historical figures on the next read; tokens are the stored truth). Metering
+/// rows attribute by the CONFIGURED model name, so the rate lookup goes through the
+/// `upstream_model` alias resolution.
+fn derive_spend_micros_row(cost: &crate::cost::CostModel, model: &str, b: &UsageBreakdown) -> i64 {
+    let tier = busbar_api::TierTokens {
+        input: b.tokens_input,
+        output: b.tokens_output,
+        cache_read: b.tokens_cache_read,
+        cache_write: b.tokens_cache_creation,
+    };
+    let resolved = cost.resolve_model_alias(model);
+    cost.derive_spend_micros([(resolved, &tier)].into_iter(), b.requests, true)
 }
 
 /// Process start instant, for the `info` uptime read. Stamped ONCE at startup by `mark_start()`.
@@ -1018,7 +1011,6 @@ impl AdminService {
         let empty = || UsageView {
             window,
             as_of: now,
-            currency: USAGE_CURRENCY,
             total: UsageBreakdown::default(),
             by_model: Vec::new(),
             by_key: Vec::new(),
@@ -1031,7 +1023,6 @@ impl AdminService {
         type Fetched = (
             Vec<crate::governance::MeteringRow>,
             std::collections::HashMap<String, String>,
-            (i64, i64),
         );
         let joined = tokio::task::spawn_blocking(move || -> Result<Fetched, ()> {
             let rows = gov.metering_for(bucket).map_err(|_| ())?;
@@ -1042,10 +1033,11 @@ impl AdminService {
                 .into_iter()
                 .map(|k| (k.id, k.name))
                 .collect();
-            Ok((rows, names, gov.prices()))
+            Ok((rows, names))
         })
         .await;
-        let (rows, names, prices) = match joined {
+        let cost = self.app.cost.clone();
+        let (rows, names) = match joined {
             Ok(Ok(f)) => f,
             // A store failure or a blocking-join failure is an internal error (details logged
             // upstream in the store layer); the caller never sees store internals.
@@ -1058,6 +1050,18 @@ impl AdminService {
         let mut by_key: std::collections::BTreeMap<String, UsageBreakdown> =
             std::collections::BTreeMap::new();
         for r in &rows {
+            // Spend derives PER ROW (the model is known here - the per-model rate applies), then
+            // aggregates ADDITIVELY into total/by_model/by_key, so every rollup is exact under a
+            // heterogeneous rate card.
+            let row_view = UsageBreakdown {
+                tokens_input: r.tokens_input,
+                tokens_output: r.tokens_output,
+                tokens_cache_read: r.tokens_cache_read,
+                tokens_cache_creation: r.tokens_cache_creation,
+                requests: r.requests,
+                spend_micros: 0,
+            };
+            let row_spend = derive_spend_micros_row(&cost, &r.model, &row_view);
             for b in [
                 &mut total,
                 by_model
@@ -1072,29 +1076,23 @@ impl AdminService {
                     .tokens_cache_creation
                     .saturating_add(r.tokens_cache_creation);
                 b.requests = b.requests.saturating_add(r.requests);
+                b.spend_micros = b.spend_micros.saturating_add(row_spend);
             }
         }
-        total.spend_micros = derive_spend_micros(&total, prices);
         let by_model = by_model
             .into_iter()
-            .map(|((model, provider), mut usage)| {
-                usage.spend_micros = derive_spend_micros(&usage, prices);
-                ModelUsageView {
-                    model,
-                    provider,
-                    usage,
-                }
+            .map(|((model, provider), usage)| ModelUsageView {
+                model,
+                provider,
+                usage,
             })
             .collect();
         let mut by_key: Vec<KeyUsageView> = by_key
             .into_iter()
-            .map(|(id, mut usage)| {
-                usage.spend_micros = derive_spend_micros(&usage, prices);
-                KeyUsageView {
-                    name: names.get(&id).cloned(),
-                    id,
-                    usage,
-                }
+            .map(|(id, usage)| KeyUsageView {
+                name: names.get(&id).cloned(),
+                id,
+                usage,
             })
             .collect();
         // Bound the response (no memory/latency cliff at fleet scale — 3rd-party review R2 #1):
@@ -1130,7 +1128,6 @@ impl AdminService {
         Ok(UsageView {
             window,
             as_of: now,
-            currency: USAGE_CURRENCY,
             total,
             by_model,
             by_key,
@@ -1443,7 +1440,10 @@ mod tests {
             kind: "store".into(),
             version: version.into(),
             publisher: publisher.into(),
-            abi_version: 1,
+            abi_version: *busbar_plugin_loader::supported_abi("store")
+                .iter()
+                .max()
+                .expect("store abi"),
             sha256: String::new(),
             signature: String::new(),
             description: String::new(),

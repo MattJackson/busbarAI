@@ -660,6 +660,9 @@ impl IrUsage {
     /// the Anthropic/Bedrock family (whose cache reads/writes are separate from input). All adds are
     /// `saturating_add`: the operands are UPSTREAM-CONTROLLED counts, so an unchecked `+` could
     /// panic in debug / wrap in release.
+    // Production billing now ledgers the TIER SPLIT (`proxy::usage::tier_tokens`); this total
+    // survives as the normalization contract's test surface (stream translate/fanout tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn billable_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_add(self.cache_read_input_tokens.unwrap_or(0))

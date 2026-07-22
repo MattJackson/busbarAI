@@ -26,13 +26,6 @@ const RATE_WINDOW_SECS: u64 = 60;
 /// the tests that exercise the default-configured sweep cadence.
 #[cfg(test)]
 const RATE_SWEEP_INTERVAL: u32 = crate::config::DEFAULT_RATE_SWEEP_INTERVAL;
-/// Millicents per whole cent — the divisor that flushes the sub-cent spend carry (`record_tokens`).
-/// This is the milli-prefix scale (1/1000), NOT a token-pricing unit: `price_per_1k_tokens_cents` is
-/// cents-per-1000-tokens ≡ millicents-per-token, so `tokens * price` already lands in millicents and
-/// `/ MILLICENTS_PER_CENT` flushes whole cents with a 0..999 millicent remainder. Named for the
-/// milli→cent conversion it actually performs so a future change to the token-pricing scale (e.g.
-/// per-100-tokens) cannot silently corrupt this divisor.
-const MILLICENTS_PER_CENT: u64 = 1_000;
 /// Seconds in a UTC day, for `budget_window`'s day/month arithmetic. `pub(crate)` so cross-module
 /// TEST code can reference it as `crate::governance::SECS_PER_DAY`; production modules that need the
 /// same value independently (e.g. `sigv4.rs`) keep a private copy where layering prohibits importing
@@ -76,25 +69,106 @@ struct RateState {
     tokens: u64,
 }
 
-/// In-memory budget counter for a key's CURRENT window — the AUTHORITATIVE hot-path enforcement
-/// state. SQLite is a write-behind durability layer flushed off the request path. One cell per key
-/// (current window only; reset on rollover), so growth is key-count-bounded like the rate map.
-#[derive(Clone, Copy)]
+/// One model's in-cell token counters: the CURRENT tier tokens plus the last durably-ACKNOWLEDGED
+/// (flushed) tier tokens - the additive-flush baseline, per model. The model name is an
+/// `Arc<str>` interned ONCE per (bucket, model) on first sight (allocate-on-miss); the per-request
+/// accrual after that is a linear scan over the few models the bucket actually used plus integer
+/// adds - no hashing, no allocation.
+#[derive(Clone)]
+struct ModelCell {
+    model: std::sync::Arc<str>,
+    cur: busbar_api::TierTokens,
+    flushed: busbar_api::TierTokens,
+}
+
+/// In-memory TOKEN-LEDGER cell for a bucket's CURRENT window - the AUTHORITATIVE hot-path
+/// enforcement state. A bucket is a key's own budget bucket OR a budget-group bucket (same shape).
+/// NO SPEND FIELD: dollars are derived at check time as `cell tokens x rate card` (+ the flat fee
+/// x requests on the key bucket) - tokens are the only stored truth, so a rate-card correction
+/// reprices everything on the next read with no data fix. The durable store is a write-behind
+/// layer flushed off the request path. One cell per bucket (current window only; reset on
+/// rollover), so growth is bucket-count-bounded like the rate map.
+#[derive(Clone, Default)]
 struct BudgetCell {
     window_start: u64,
-    spend_cents: i64,
-    tokens: u64,
     requests: u64,
-    dirty: bool,
-    /// The last DURABLY-ACKNOWLEDGED values for this window — the additive-flush baseline. Each
-    /// flush writes only the DELTA (current - flushed) via `Store::add_usage`, then advances these
-    /// on success, so a shared store accumulates the TRUE fleet total across nodes instead of
-    /// being last-writer-wins overwritten. On a failed flush the baseline does not advance and the
-    /// cell is re-marked dirty, so the unacked delta is retried (at-least-once: an ack lost after
-    /// the write landed can double-count at most one flush interval — documented).
-    flushed_spend_cents: i64,
-    flushed_tokens: u64,
+    /// The last durably-acknowledged request count - the additive-flush baseline. Each flush
+    /// writes only the DELTA (current - flushed) via `Store::add_usage`, then advances the
+    /// baselines on success, so a shared store accumulates the TRUE fleet total across nodes. On
+    /// a failed flush the baseline does not advance and the cell is re-marked dirty, so the
+    /// unacked delta is retried (at-least-once: an ack lost after the write landed can
+    /// double-count at most one flush interval - documented).
     flushed_requests: u64,
+    /// Per-(model, tier) token counters + flush baselines. Small Vec (the models this bucket
+    /// actually used), scanned linearly.
+    models: Vec<ModelCell>,
+    dirty: bool,
+}
+
+impl BudgetCell {
+    fn fresh(window_start: u64) -> Self {
+        Self {
+            window_start,
+            ..Self::default()
+        }
+    }
+
+    /// Accrue one response's tier tokens under `model`, interning the model name on first sight.
+    fn accrue(&mut self, model: &str, t: &busbar_api::TierTokens) {
+        let cell = match self.models.iter_mut().find(|m| &*m.model == model) {
+            Some(m) => m,
+            None => {
+                // Allocate ONLY on the first sight of a (bucket, model) pair.
+                self.models.push(ModelCell {
+                    model: std::sync::Arc::from(model),
+                    cur: busbar_api::TierTokens::default(),
+                    flushed: busbar_api::TierTokens::default(),
+                });
+                self.models.last_mut().expect("just pushed")
+            }
+        };
+        cell.cur.input = cell.cur.input.saturating_add(t.input);
+        cell.cur.output = cell.cur.output.saturating_add(t.output);
+        cell.cur.cache_read = cell.cur.cache_read.saturating_add(t.cache_read);
+        cell.cur.cache_write = cell.cur.cache_write.saturating_add(t.cache_write);
+    }
+
+    /// Borrowed (model, current tokens) view for the spend derivation - the few multiply-adds the
+    /// admission check runs.
+    fn model_views(&self) -> impl Iterator<Item = (&str, &busbar_api::TierTokens)> {
+        self.models.iter().map(|m| (&*m.model, &m.cur))
+    }
+
+    /// Total current tokens across models and tiers (the legacy scalar view for admin reads).
+    fn total_tokens(&self) -> u64 {
+        self.models
+            .iter()
+            .fold(0u64, |acc, m| acc.saturating_add(m.cur.total()))
+    }
+}
+
+/// Why an admission was refused by the budget chain - carried to ingress so the 429 NAMES the
+/// blocking bucket. Built only on the rejection path (cold), so the owned String is off the admit
+/// hot path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BudgetBlocked {
+    /// The key's own (innermost) budget bucket is exhausted.
+    Key,
+    /// The named budget group (the key's group or an ancestor) is exhausted.
+    Group(String),
+    /// The key names a `budget_group` that does not exist in this node's config - FAIL-CLOSED
+    /// (mint and boot validate this; it can only arise from a shared durable store whose keys
+    /// reference a group another node's config no longer has).
+    MissingGroup(String),
+}
+
+/// A derived (read-time) usage view for admin/metrics consumers: `spend_cents` is COMPUTED from
+/// the token ledger x the current rate card at the moment of the read - never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DerivedUsage {
+    pub(crate) spend_cents: i64,
+    pub(crate) tokens: u64,
+    pub(crate) requests: u64,
 }
 
 /// Number of shards for the per-key enforcement maps (`rate`, `budget`, `token_spend_carry`). A
@@ -148,6 +222,20 @@ impl<V> Sharded<V> {
     fn shard_for(&self, key_id: &str) -> &MapShard<V> {
         let h = crate::store::fnv1a_u64(key_id) as usize;
         &self.shards[h & (GOV_SHARDS - 1)]
+    }
+
+    /// The shard INDEX owning `key_id` - for the budget-chain charge, which must acquire SEVERAL
+    /// shards' locks in ascending index order (a canonical order makes the multi-shard critical
+    /// section deadlock-free).
+    #[inline]
+    fn shard_index(&self, key_id: &str) -> usize {
+        (crate::store::fnv1a_u64(key_id) as usize) & (GOV_SHARDS - 1)
+    }
+
+    /// The shard at a known index (see [`Sharded::shard_index`]).
+    #[inline]
+    fn shard_at(&self, idx: usize) -> &MapShard<V> {
+        &self.shards[idx]
     }
 
     /// Acquire this key's shard for writing (poison-recovering — a panic under any holder must not
@@ -226,46 +314,27 @@ pub(crate) struct GovState {
     /// Both auth-path caches under ONE lock so `refresh` swaps them atomically — a reader can never
     /// observe a new `by_hash` against a stale `by_access_key_id`. See `GovCaches`.
     caches: RwLock<GovCaches>,
-    /// Flat cents charged per request (one half of the cost model; the other is per-token, below).
-    /// Total budget spend = per-request fee + tokens/1000 * price_per_1k_tokens_cents.
-    price_per_request_cents: i64,
-    /// cents per 1000 tokens (input + output), accrued from response usage at stream end.
-    price_per_1k_tokens_cents: i64,
     /// per-key RPM/TPM windows (ephemeral). SHARDED by key id so concurrent admissions for different
     /// keys don't serialize on one lock (each key deterministically owns one shard; per-key window
     /// semantics are unchanged — see [`Sharded`]).
     rate: Sharded<RateState>,
-    /// Per-key accumulator of the sub-cent (millicent) remainder of token spend. Token cost is
-    /// `tokens/1000 * price_per_1k_tokens_cents`; in pure integer cents a request whose cost is < 1
-    /// cent (e.g. 500 tokens at 1¢/1k = 0.5¢) used to TRUNCATE to 0 and be lost forever. We instead
-    /// accrue spend in MILLICENTS (`tokens * price_per_1k_cents`), flush WHOLE cents to the durable
-    /// store, and carry the 0..999 millicent remainder here until it crosses a cent on a later
-    /// request. In-memory only (dropping a sub-1¢ remainder per key on restart is acceptable);
-    /// bounded by the key count (the same set `caches.by_hash` already holds). The `Mutex` keeps the
-    /// per-key read-modify-write atomic under concurrent requests for the same key. The value is
-    /// `(window, remainder)`: the remainder is attributed to the budget WINDOW it was generated in and
-    /// RESET when the window rolls over, so a sub-cent remainder never leaks across a day/month boundary
-    /// into the next window's spend (the <1¢ dropped at a rollover is the same accepted trade-off as the
-    /// on-restart drop). One entry per key (not per key×window), so growth stays key-count-bounded.
-    /// SHARDED by key id (mirrors `rate`). The value is `(window, remainder)`; each shard carries its
-    /// own amortized eviction ticker (see [`MapShard`]).
-    token_spend_carry: Sharded<(u64, u64)>,
     /// SHA-256 hex digest of the configured /admin bearer token, computed once at construction. The
     /// plaintext token is NOT retained — only its digest, which is all the constant-time compare on
     /// the /admin path needs (less plaintext secret held in memory). `None` = admin API disabled.
     admin_token_hash: Option<String>,
-    /// AUTHORITATIVE in-memory budget counters — the hard-cap admission state consulted (and charged)
-    /// on the request hot path with NO await and NO store round-trip. One `BudgetCell` per key for its
-    /// CURRENT window (reset on rollover), so the map is key-count-bounded exactly like `rate`. SQLite
-    /// is a WRITE-BEHIND durability layer: the flusher (`flush_budgets`) periodically SETS the durable
-    /// counter to a dirty cell's absolute values off the request path, and boot `hydrate_budgets`
-    /// re-loads accrued spend so a restart forgets nothing. The atomic check-and-charge under this
-    /// single `RwLock` gives the SAME hard-cap guarantee the SQL UPSERT gave, now in memory (single
-    /// node) — and, being in-memory, it can never fail with a store error, so there is no admission
-    /// fail-mode to configure.
-    /// SHARDED by key id (mirrors `rate`): the atomic per-key check-and-charge runs under that key's
-    /// shard lock, so the hard-cap guarantee is unchanged (a key is only ever charged under one lock);
-    /// different keys no longer serialize. Each shard carries its own amortized eviction ticker.
+    /// AUTHORITATIVE in-memory TOKEN-LEDGER cells - the hard-cap admission state consulted (and
+    /// charged) on the request hot path with NO await and NO store round-trip. Keyed by BUCKET id:
+    /// a virtual key's id, or `group:<name>` for a budget-group bucket - key buckets and group
+    /// buckets are the same machinery. One `BudgetCell` per bucket for its CURRENT window (reset on
+    /// rollover), so the map is bucket-count-bounded exactly like `rate`. The durable store is a
+    /// WRITE-BEHIND layer: `flush_budgets` pushes each dirty cell's per-model TOKEN deltas
+    /// additively off the request path, and boot `hydrate_budgets` re-loads accrued ledgers so a
+    /// restart forgets nothing. The atomic chain check-and-charge acquires every involved shard
+    /// lock in ascending shard order (deadlock-free), so admission against the whole chain is one
+    /// indivisible critical section per node.
+    /// NOTE (perf, playbook): the old `token_spend_carry` sub-cent carry map is GONE - the ledger
+    /// stores raw tokens and spend derives at read time, so there is no remainder to carry and no
+    /// O(n) carry sweep to amortize.
     budget: Sharded<BudgetCell>,
 }
 
@@ -277,6 +346,10 @@ pub(crate) struct NewKeySpec {
     pub(crate) budget_period: String,
     pub(crate) rpm_limit: Option<u32>,
     pub(crate) tpm_limit: Option<u32>,
+    /// Optional `governance.budget_groups` binding (validated to exist at mint).
+    pub(crate) budget_group: Option<String>,
+    /// Optional mint-time labels echoed onto metrics (never interpreted by enforcement).
+    pub(crate) labels: std::collections::BTreeMap<String, String>,
 }
 
 mod state;
@@ -352,6 +425,10 @@ pub(crate) fn synthesize_principal_key(
         tpm_limit: tpm,
         enabled: true,
         created_at: 0,
+        // Auth `group_map` groups and `budget_groups` are deliberately INDEPENDENT concepts
+        // (union-grant vs intersection-cap); a synthesized principal key binds to no budget group.
+        budget_group: None,
+        labels: std::collections::BTreeMap::new(),
     }))
 }
 
@@ -492,9 +569,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 pub(crate) use busbar_api::{
-    AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
-    VirtualKey,
+    AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, Store, StoreError, StoreResult,
+    TierTokens, UsageDelta, VirtualKey,
 };
+// The full-ledger record is consumed only by TEST assertions (production reads go through the
+// derived views); scoping the re-export keeps the release build warning-free.
+#[cfg(test)]
+pub(crate) use busbar_api::UsageLedger;
 
 /// Seconds in a metering day bucket. Metering is a TIME SERIES in fixed UTC-day buckets —
 /// deliberately decoupled from the per-key budget windows the enforcement counters use, so

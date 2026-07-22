@@ -389,9 +389,11 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
             tpm_limit: Some(30),
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -452,7 +454,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
 /// Regression: token usage from a cross-protocol STREAMING response must be charged to the
 /// virtual key, so TPM limits enforce on streams too. The streaming path records tokens through
 /// a completely separate code path from the non-stream test above: `FirstByteBody`'s stream-end
-/// handler reads IR-derived usage via `translate.usage()` and calls `gov.record_tokens` via the
+/// handler reads IR-derived usage via `translate.usage()` and calls `gov.record_usage` via the
 /// `UsageSink` on clean 2xx completion (proxy engine), NOT the buffered `record_nonstream_usage`.
 /// A regression that broke the
 /// stream-end charge (the drop/poll handler not firing, the sink not wired into the streaming
@@ -498,9 +500,11 @@ async fn test_cross_protocol_stream_records_tokens_for_tpm() {
             tpm_limit: Some(30),
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     // Lane speaks OpenAI; ingress below is Anthropic streaming → cross-protocol SSE reframe.
     let app = TestApp::new()
@@ -902,9 +906,11 @@ async fn test_governance_vkey_auth_and_pool_acl() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new().governance(gov).build();
 
@@ -975,15 +981,27 @@ async fn test_governance_budget_over_quota() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    // Pre-seed usage past the 100c budget (window 0 = "total") in the DURABLE store.
-    store.put_usage("kb", 0, 250, 0, 1).unwrap();
-    let gov = Arc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    // Pre-seed usage past the 100c budget (window 0 = "total") in the DURABLE store: 250 requests
+    // at the TestApp default `CostModel::flat(1)` derive to 250 cents of spend.
+    store
+        .put_usage(
+            "kb",
+            0,
+            &busbar_api::UsageLedger {
+                requests: 250,
+                models: vec![],
+            },
+        )
+        .unwrap();
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // Enforcement is now IN-MEMORY (authoritative): hydrate the budget cells from the store — exactly
     // as boot does — so the admission gate sees the pre-seeded over-budget spend. (Without this the
     // store seed would be invisible to the in-memory gate and the request would be admitted.)
-    gov.hydrate_budgets(0);
+    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0);
 
     let app = TestApp::new().governance(gov).build();
 
@@ -1059,13 +1077,26 @@ async fn over_budget_router() -> (
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    store.put_usage("kbm", 0, 250, 0, 1).unwrap();
-    let gov = Arc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    // Seed 250 requests: at the TestApp default `CostModel::flat(1)` the DERIVED spend is
+    // 250 cents, past the 100-cent cap, so admission rejects before any forwarding.
+    store
+        .put_usage(
+            "kbm",
+            0,
+            &busbar_api::UsageLedger {
+                requests: 250,
+                models: vec![],
+            },
+        )
+        .unwrap();
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // Enforcement is IN-MEMORY (authoritative): hydrate the budget cells from the durable store — as
     // boot does — so the pre-seeded over-budget spend is visible to the admission gate.
-    gov.hydrate_budgets(0);
+    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0);
 
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1264,9 +1295,11 @@ async fn test_governance_rate_limit_429() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new().governance(gov).build();
 
@@ -1353,9 +1386,11 @@ async fn over_rpm_router() -> (
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
@@ -1556,7 +1591,7 @@ async fn test_governance_admin_api() {
 
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new().governance(gov).build();
 

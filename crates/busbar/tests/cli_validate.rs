@@ -84,7 +84,10 @@ fn write_tarball(dir: &Path, file: &str, name: &str, alias: &str, lib: &[u8]) {
         kind: "store".into(),
         version: "1.5.0".into(),
         publisher: "acme".into(),
-        abi_version: 1,
+        abi_version: *busbar_plugin_loader::supported_abi("store")
+            .iter()
+            .max()
+            .expect("store abi"),
         sha256: busbar_plugin_sign::sha256_hex(lib),
         signature: String::new(),
         description: String::new(),
@@ -170,7 +173,10 @@ fn validate_fails_on_sha_mismatch() {
         kind: "store".into(),
         version: "1.5.0".into(),
         publisher: "acme".into(),
-        abi_version: 1,
+        abi_version: *busbar_plugin_loader::supported_abi("store")
+            .iter()
+            .max()
+            .expect("store abi"),
         sha256: busbar_plugin_sign::sha256_hex(b"OTHER bytes"),
         signature: String::new(),
         description: String::new(),

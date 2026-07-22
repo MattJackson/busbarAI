@@ -1324,6 +1324,8 @@ async fn test_disabled_virtual_key_is_rejected_401() {
         tpm_limit: None,
         enabled,
         created_at: 0,
+        budget_group: None,
+        labels: Default::default(),
     };
     store.put_key(&mk("kdis", disabled_secret, false)).unwrap();
     store.put_key(&mk("kena", enabled_secret, true)).unwrap();
@@ -1331,7 +1333,7 @@ async fn test_disabled_virtual_key_is_rejected_401() {
     // real deploy keys can only be minted through the admin API, which requires this token — so a
     // store holding minted keys implies an admin token is set. Without it the engine is INERT and
     // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -1443,13 +1445,15 @@ async fn test_none_mode_with_governance_still_requires_virtual_key() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
     // real deploy keys can only be minted through the admin API, which requires this token — so a
     // store holding minted keys implies an admin token is set. Without it the engine is INERT and
     // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -1551,13 +1555,15 @@ async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
     // real deploy keys can only be minted through the admin API, which requires this token — so a
     // store holding minted keys implies an admin token is set. Without it the engine is INERT and
     // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -1726,13 +1732,15 @@ fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
                         tpm_limit: None,
                         enabled: true,
                         created_at: 0,
+                        budget_group: None,
+                        labels: Default::default(),
                     })
                     .unwrap();
                 // Admin token → governance is ACTIVE, so the inert-allowlist branch (and its
                 // one-shot warning) is reached. An inert engine (no admin token) would fall through
                 // to the static chain and never emit the warning.
                 let gov =
-                    Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+                    Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
                 // auth.mode=token WITH a non-empty static allowlist — the inert combination. The
                 // listed static token is NOT the governance virtual key.
@@ -1843,7 +1851,7 @@ async fn test_admin_blank_header_token_rejected() {
     crate::metrics::init();
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1903,7 +1911,7 @@ async fn test_admin_token_both_carriers_or_fold_no_short_circuit() {
     crate::metrics::init();
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1982,7 +1990,7 @@ async fn test_admin_token_not_acceptable_via_vendor_carriers() {
     crate::metrics::init();
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2100,13 +2108,15 @@ async fn test_governance_accepts_vendor_carriers_and_native_401() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
     // real deploy keys can only be minted through the admin API, which requires this token — so a
     // store holding minted keys implies an admin token is set. Without it the engine is INERT and
     // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -2221,13 +2231,15 @@ async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // An admin token makes the governance engine ACTIVE (the vkey-resolution branch enforces). In a
     // real deploy keys can only be minted through the admin API, which requires this token — so a
     // store holding minted keys implies an admin token is set. Without it the engine is INERT and
     // the static auth chain applies (see `test_governance_inert_without_admin_token_*`).
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -2400,7 +2412,7 @@ fn bedrock_request(path: &str, auth: &str, headers: &[(String, String)]) -> Requ
 fn gov_with_aws_key() -> (std::sync::Arc<crate::governance::GovState>, String, String) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = std::sync::Arc::new(GovState::new(store, None).unwrap());
     let (_key, _bearer, akid, secret) = gov
         .create_key_with_aws(
             NewKeySpec {
@@ -2410,6 +2422,8 @@ fn gov_with_aws_key() -> (std::sync::Arc<crate::governance::GovState>, String, S
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             crate::store::now(),
         )
@@ -2532,7 +2546,7 @@ fn test_verify_bedrock_sigv4_disabled_key_rejected() {
     crate::metrics::init();
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = std::sync::Arc::new(GovState::new(store, None).unwrap());
     let (key, _b, akid, secret) = gov
         .create_key_with_aws(
             NewKeySpec {
@@ -2542,6 +2556,8 @@ fn test_verify_bedrock_sigv4_disabled_key_rejected() {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             crate::store::now(),
         )
@@ -2715,7 +2731,7 @@ async fn test_governance_inert_without_admin_token_static_token_admitted() {
     };
     // The default-deploy governance engine: RAM store, NO admin token, NO minted keys → INERT.
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, None).unwrap());
     assert!(
         gov.admin_token_hash().is_none(),
         "precondition: engine must be inert (no admin token)"
@@ -2807,7 +2823,7 @@ async fn test_governance_inert_without_admin_token_open_relay_admits() {
     let server = MockServer::new(state).await;
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, None).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -2887,10 +2903,12 @@ async fn test_governance_active_with_admin_token_enforces_minted_key() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // Admin token set → governance is ACTIVE (this is the real minted-keys deploy).
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     assert!(
         gov.admin_token_hash().is_some(),
         "precondition: engine active"
@@ -2970,7 +2988,7 @@ async fn test_governance_active_with_admin_token_rejects_missing_vkey() {
     let server = MockServer::new(state).await;
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .lane(
@@ -3065,10 +3083,12 @@ async fn test_inert_governance_persisted_key_is_not_enforced_static_chain_wins()
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // NO admin token → INERT: the persisted key's controls are bypassed.
-    let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+    let gov = Arc::new(GovState::new(store, None).unwrap());
     assert!(
         gov.admin_token_hash().is_none(),
         "precondition: engine must be inert (no admin token)"
@@ -3181,10 +3201,12 @@ async fn test_active_governance_persisted_key_is_enforced() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
     // Admin token SET → ACTIVE: the key resolves and its pool-ACL is enforced.
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     assert!(
         gov.admin_token_hash().is_some(),
         "precondition: engine active"

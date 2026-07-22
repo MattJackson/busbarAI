@@ -637,10 +637,6 @@ pub(crate) struct EffectiveConfigView {
     pub(crate) global_hooks: Vec<String>,
 }
 
-/// The currency the operator-configured prices (`price_per_request_cents`,
-/// `price_per_1k_tokens_cents`) — and therefore every derived `spend_micros` — are denominated in.
-pub(crate) const USAGE_CURRENCY: &str = "USD";
-
 /// Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle:
 /// busbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token
 /// SPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer
@@ -668,8 +664,6 @@ pub(crate) struct UsageView {
     pub(crate) window: UsageWindow,
     /// Freshness marker: the epoch this read was computed at (counters accumulate live).
     pub(crate) as_of: u64,
-    /// The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`).
-    pub(crate) currency: &'static str,
     pub(crate) total: UsageBreakdown,
     /// Per-(model, provider) aggregation — cost attribution by model (the FinOps unit).
     pub(crate) by_model: Vec<ModelUsageView>,
@@ -705,9 +699,12 @@ pub(crate) struct UsageBreakdown {
     pub(crate) tokens_cache_read: u64,
     pub(crate) tokens_cache_creation: u64,
     pub(crate) requests: u64,
-    /// Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,
-    /// sub-cent precise, no float drift), from the operator's configured global prices. A consumer
-    /// with its own per-model catalog recomputes from the raw token split instead.
+    /// Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -
+    /// integer math, sub-cent precise, no float drift), recomputed at read time from the raw token
+    /// split x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate
+    /// card's numbers are whatever unit the operator priced in; display/denomination is entirely
+    /// the consumer's concern. A consumer with its own per-model catalog recomputes from the raw
+    /// token split instead.
     pub(crate) spend_micros: i64,
 }
 

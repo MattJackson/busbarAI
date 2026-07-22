@@ -146,6 +146,7 @@ impl RoutingPolicy for WebhookPolicy {
         let ctx = RoutingContext {
             pool: req.pool,
             budget_remaining: None,
+            budget: &[],
         };
         match self
             .send(super::wire::OP_TRANSFORM, req, &empty, &ctx, budget)
@@ -336,6 +337,7 @@ mod tests {
         RoutingContext {
             pool: "p",
             budget_remaining: Some(500),
+            budget: &[],
         }
     }
 

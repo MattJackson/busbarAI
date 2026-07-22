@@ -31,7 +31,7 @@ pub(crate) struct HookRequest<'a> {
     pub(crate) op: &'static str,
     pub(crate) request: HookReqProjection<'a>,
     pub(crate) candidates: Vec<HookCandidate<'a>>,
-    pub(crate) context: HookContext,
+    pub(crate) context: HookContext<'a>,
     /// TAP observation-stage payload — present ONLY on stage taps (`at: route|attempt|completion`);
     /// absent on request-stage taps and every gate, so the pre-stages wire is byte-identical
     /// (append-only schema).
@@ -164,10 +164,18 @@ pub(crate) struct HookCandidate<'a> {
 /// The POOL-SCOPED signal bucket (distinct from the per-candidate signals). `request.pool` already
 /// names the pool — it is not duplicated here (contract audit #12).
 #[derive(Serialize)]
-pub(crate) struct HookContext {
+pub(crate) struct HookContext<'a> {
     /// Pool-level remaining request budget; omitted when the pool is uncapped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) budget_remaining: Option<i64>,
+    /// The request's BUDGET-CHAIN state (the caller key's bucket + every ancestor budget group,
+    /// innermost first): `{bucket_id, budget_group?, spend_micros_at_current_rate,
+    /// remaining_micros?, window_start, budget_period}` per bucket, derived at the current rate
+    /// card. Omitted when empty (governance off / no key) so pre-cost-model payloads are
+    /// byte-identical. The budget-aware-routing READ seam: a hook may downshift on it; busbar
+    /// never routes on budget itself.
+    #[serde(skip_serializing_if = "<[busbar_api::BudgetBucketState]>::is_empty")]
+    pub(crate) budget: &'a [busbar_api::BudgetBucketState],
 }
 
 /// The CONFIGURE message (D2) — the FIRST line busbar sends on every socket connection (and the
@@ -689,6 +697,7 @@ pub(crate) fn build<'a>(
         stage: None,
         context: HookContext {
             budget_remaining: ctx.budget_remaining,
+            budget: ctx.budget,
         },
     }
 }
@@ -875,6 +884,7 @@ mod tests {
         RoutingContext {
             pool: "p",
             budget_remaining: None,
+            budget: &[],
         }
     }
 

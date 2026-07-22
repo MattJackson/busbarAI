@@ -16,7 +16,7 @@ use super::*;
 pub(crate) fn record_resp_usage(
     ir: &crate::ir::variant::IrResp,
     usage_sink: &Option<UsageSink>,
-    lane: Option<(&str, &str)>,
+    lane: Option<&crate::state::Lane>,
 ) {
     if let Some(crate::billing::Billing::Tokens(t)) = ir.usage() {
         let usage = crate::ir::IrUsage {
@@ -30,41 +30,63 @@ pub(crate) fn record_resp_usage(
         // A delivered response with NO token usage (a flat-fee op, e.g. moderations) still METERS as
         // one request against the serving model — FinOps consumers count requests per model even
         // when nothing token-bills.
-        if let Some((model, provider)) = lane {
-            sink.gov
-                .record_metering(&sink.key.id, model, provider, None, sink.charged_at);
+        if let Some(lane) = lane {
+            sink.gov.record_metering(
+                &sink.key.id,
+                &lane.model,
+                &lane.provider,
+                None,
+                sink.charged_at,
+            );
         }
     }
 }
 
-/// `lane` is the SERVING lane's `(model, provider)` — the per-model metering attribution. `None`
-/// (an unknown/unresolvable lane) still bills the budget but records no metering row.
+/// Project the IR's normalized usage into the LEDGER'S four pricing tiers. Readers normalize
+/// `input_tokens` to UNCACHED and keep the cache fields ADDITIVE, so the mapping is direct:
+/// cache-creation is the rate card's `cache_write` tier.
+pub(crate) fn tier_tokens(u: &crate::ir::IrUsage) -> busbar_api::TierTokens {
+    busbar_api::TierTokens {
+        input: u.input_tokens,
+        output: u.output_tokens,
+        cache_read: u.cache_read_input_tokens.unwrap_or(0),
+        cache_write: u.cache_creation_input_tokens.unwrap_or(0),
+    }
+}
+
+/// `lane` is the SERVING lane - the model attribution for BOTH the token ledger (its resolved
+/// upstream model, the rate card's key space) and the metering series (its configured model name).
+/// `None` (an unknown/unresolvable lane) can attribute tokens to no model, so nothing is ledgered
+/// or metered (unreachable in production: every delivered response has a serving lane).
 pub(crate) fn record_ir_usage(
     usage: &crate::ir::IrUsage,
     usage_sink: &Option<UsageSink>,
-    lane: Option<(&str, &str)>,
+    lane: Option<&crate::state::Lane>,
 ) {
     if let Some(sink) = usage_sink {
-        // `billable_tokens` saturates internally — operands are UPSTREAM-CONTROLLED token counts, so
-        // an unchecked `+` could panic on overflow in debug / wrap in release (#18). Saturates to
-        // `u64::MAX`, matching the streaming path and the saturating `record_tokens` downstream.
-        let tokens = usage.billable_tokens();
-        if tokens > 0 {
-            // Same window as the flat per-request fee (`sink.charged_at`, header-arrival epoch), so
-            // the buffered-path token fee and the per-request fee never split across windows (#29).
-            sink.gov.record_tokens(
-                &sink.key.id,
-                &sink.key.budget_period,
+        let Some(lane) = lane else { return };
+        let tier = tier_tokens(usage);
+        if !tier.is_zero() {
+            // Ledger the tier split against the key's budget chain, in the SAME window as the flat
+            // per-request fee (`sink.charged_at`, header-arrival epoch), so the buffered-path token
+            // accrual and the per-request fee never split across windows (#29).
+            sink.gov.record_usage(
+                &sink.cost,
+                &sink.key,
+                lane.wire_model(),
+                &tier,
                 sink.charged_at,
-                tokens,
             );
         }
         // Metering (raw per-model consumption series) records the SPLIT — even a zero-token
         // delivered response counts its request. Same pinned epoch as the budget charges (#29).
-        if let Some((model, provider)) = lane {
-            sink.gov
-                .record_metering(&sink.key.id, model, provider, Some(usage), sink.charged_at);
-        }
+        sink.gov.record_metering(
+            &sink.key.id,
+            &lane.model,
+            &lane.provider,
+            Some(usage),
+            sink.charged_at,
+        );
     }
 }
 

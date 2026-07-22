@@ -1,12 +1,7 @@
 use super::*;
 
 impl GovState {
-    pub(crate) fn new(
-        store: Arc<dyn Store>,
-        price_per_request_cents: i64,
-        price_per_1k_tokens_cents: i64,
-        admin_token: Option<String>,
-    ) -> StoreResult<Self> {
+    pub(crate) fn new(store: Arc<dyn Store>, admin_token: Option<String>) -> StoreResult<Self> {
         let by_hash = Self::load(store.as_ref())?;
         let by_access_key_id = Self::load_by_access_key_id(store.as_ref(), &by_hash)?;
         Ok(Self {
@@ -15,10 +10,7 @@ impl GovState {
                 by_hash,
                 by_access_key_id,
             }),
-            price_per_request_cents,
-            price_per_1k_tokens_cents,
             rate: Sharded::new(),
-            token_spend_carry: Sharded::new(),
             admin_token_hash: admin_token
                 .as_ref()
                 .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
@@ -54,130 +46,86 @@ impl GovState {
         }
     }
 
-    /// Accrue token-based usage from a completed response to a key's current budget window: adds
-    /// `tokens/1000 * price_per_1k_tokens_cents` to spend, plus the raw tokens (for TPM). Called
-    /// once per request at stream end from the response usage tap. Spend is added to the AUTHORITATIVE
-    /// in-memory `budget` cell (marked dirty for the write-behind flusher) — NO store round-trip here;
-    /// the in-memory TPM counter is updated inline (it is cheap and must reflect the write order).
-    pub(crate) fn record_tokens(&self, key_id: &str, budget_period: &str, now: u64, tokens: u64) {
-        if tokens == 0 {
-            return; // nothing to spend or count
+    /// Accrue one completed response's TIER-TOKEN split under `model` to EVERY bucket in the key's
+    /// enforcement chain (the key's own bucket + each ancestor budget group, each in ITS OWN
+    /// `budget_period` window), plus the raw total to the TPM window. Called once per request at
+    /// stream end from the response usage tap. Tokens land in the AUTHORITATIVE in-memory ledger
+    /// cells (marked dirty for the write-behind flusher) - NO store round-trip, NO spend math here:
+    /// spend is derived from `ledger x rate_card` at check/read time.
+    ///
+    /// Accrual (unlike the admission charge) does not need cross-bucket atomicity: each bucket's
+    /// cell is updated under its own shard lock, and enforcement always re-derives from whatever
+    /// has landed.
+    ///
+    /// STRADDLE CASE (mirrors `add_rate_tokens`): `now` is the request's pinned `charged_at` (the
+    /// window the request STARTED in), NOT a fresh clock. Per bucket:
+    ///   - `window > cell.window_start` → the cell is genuinely stale: reset it to `window`
+    ///     (zeroed), then add.
+    ///   - `window <= cell.window_start` → same window OR the straddle: credit IN PLACE on the
+    ///     live cell (never rewind/zero a newer window's counters). A straddling request's tokens
+    ///     attribute to the live window rather than being dropped - bounded to one in-flight
+    ///     request, never lost.
+    ///   - no cell → insert fresh (defensive; post-admission the cell exists).
+    pub(crate) fn record_usage(
+        &self,
+        cost: &crate::cost::CostModel,
+        key: &VirtualKey,
+        model: &str,
+        tokens: &TierTokens,
+        now: u64,
+    ) {
+        if tokens.is_zero() {
+            return; // nothing to ledger
         }
-        let window = budget_window(budget_period, now);
-        // Sub-cent precision (no zero-billing of small requests): accrue spend in MILLICENTS. Price is
-        // cents-per-1000-tokens, so `tokens * price_per_1k_cents` is already millicents (= cents*1000).
-        // Add the carried remainder, flush the WHOLE cents, keep the 0..999 millicent remainder.
-        let millicents = tokens.saturating_mul(self.price_per_1k_tokens_cents.max(0) as u64);
-        let whole_cents = {
-            // This key's carry shard (its read-modify-write is atomic within the shard lock, exactly
-            // as under the former global lock — only OTHER keys in other shards no longer serialize).
-            let carry_shard = self.token_spend_carry.shard_for(key_id);
-            let mut carry = carry_shard.map.write().unwrap_or_else(|p| p.into_inner());
-            // Bound the carry map: a key seen once (leaving a <1c remainder) then never again would
-            // keep its entry forever — slow unbounded growth under key churn. Past a threshold, prune
-            // DEFINITELY-stale entries; the dropped sub-cent remainder is the documented acceptable loss.
-            // Staleness must be PERIOD-AGNOSTIC: a deployment can mix daily/monthly/total keys, so their
-            // `window` values differ from THIS request's `window` — the old `retain(w == window)` dropped
-            // valid CURRENT entries for keys on a different budget period (audit 1.4.0). Instead drop only
-            // entries older than the longest bounded window (monthly ≤ 31 d), so no still-current entry for
-            // ANY period is pruned; the all-time window (`w == 0`, `total`) never ages out.
-            //
-            // The O(n) retain is TICKER-GATED (like the `rate` sweep): gating on `len > THRESHOLD` alone
-            // is NOT amortized O(1) when the over-threshold size comes from many permanent `total`-period
-            // keys (`w == 0`) — those never age out, so the map stays above the threshold and the scan
-            // would run under-lock on EVERY flush while removing nothing. Firing the scan only every Nth
-            // over-threshold flush restores the amortized-O(1) hot path; churned ageable entries are still
-            // reclaimed within N flushes. (found: 1.4.0 audit, governance hot-path lock.)
-            // Per-shard threshold: with the carry map sharded ~1/GOV_SHARDS ways, a fixed global
-            // threshold would almost never trip per shard; scale it down so each shard still bounds
-            // its own memory. (1 is the floor so a tiny deployment still eventually sweeps.)
-            const TOKEN_SPEND_CARRY_SWEEP_THRESHOLD: usize = if 4096 / GOV_SHARDS > 1 {
-                4096 / GOV_SHARDS
-            } else {
-                1
-            };
-            let carry_sweep_needed = carry_shard
-                .sweep_ticker
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1)
-                .is_multiple_of(crate::limits::rate_sweep_interval());
-            if carry_sweep_needed && carry.len() > TOKEN_SPEND_CARRY_SWEEP_THRESHOLD {
-                let max_window = 31 * super::SECS_PER_DAY;
-                carry.retain(|_, &mut (w, _)| w == 0 || w.saturating_add(max_window) > now);
+        // A missing budget group cannot block ACCRUAL (the request was already admitted/served);
+        // degrade to the key-only chain so the tokens are never lost.
+        let chain = match cost.chain_for(key) {
+            Ok(c) => c,
+            Err(missing) => {
+                tracing::warn!(key = %key.id, budget_group = missing,
+                    "budget_group missing at accrual; tokens ledgered to the key bucket only");
+                let solo = VirtualKey {
+                    budget_group: None,
+                    ..key.clone()
+                };
+                self.accrue_bucket(&solo.id, &solo.budget_period, model, tokens, now);
+                self.add_rate_tokens(&key.id, now, tokens.total());
+                return;
             }
-            let entry = carry.entry(key_id.to_string()).or_insert((window, 0));
-            // Reset the remainder when the budget window rolls over, so a sub-cent remainder is
-            // attributed to the window it was generated in rather than leaking into the next window's
-            // spend. The <1¢ dropped at the rollover is the documented "sub-1¢ per key is acceptable
-            // to drop" trade-off (same as the on-restart drop).
-            if entry.0 != window {
-                *entry = (window, 0);
-            }
-            let total = entry.1.saturating_add(millicents);
-            entry.1 = total % MILLICENTS_PER_CENT;
-            total / MILLICENTS_PER_CENT
         };
-        // Clamp the whole-cent flush into i64. Defense-in-depth (data-integrity LOW): a bare `as i64`
-        // on a value > i64::MAX wraps NEGATIVE and would DECREMENT the stored counter (defeating the
-        // budget cap). Unreachable from real token counts, but the clamp makes it impossible.
-        let spend = whole_cents.min(i64::MAX as u64) as i64;
-        // Add the accrued spend + raw tokens to the AUTHORITATIVE in-memory cell (write-behind: the
-        // flusher persists it later). No request-count bump here: this accrues token spend for a
-        // request already counted at admission (production: `charge_budget_mem`; tests:
-        // `record_request`), so it must not increment `requests` again.
-        //
-        // STRADDLE CASE (mirrors `add_rate_tokens`): `now` here is the request's pinned `charged_at`
-        // (the window the request STARTED in), NOT a fresh clock. A request that straddles a budget
-        // window boundary is admitted in its start window W0, but by the time its response completes a
-        // LATER admission for the same key may have rolled the live cell forward to W1 — so `window`
-        // (from `charged_at`) can be OLDER than the cell's live window. We must NOT rewind the cell to
-        // W0 and zero it (that would wipe W1's accrued spend/requests → budget under-count → overspend,
-        // the exact bug `add_rate_tokens` documents avoiding). Resolution:
-        //   - `window > cell.window_start` → the cell is genuinely stale (an older window the sweep
-        //     hasn't evicted): reset it to `window` (zeroed), then add.
-        //   - `window <= cell.window_start` → same window OR the straddle: credit IN PLACE on the live
-        //     cell (do not rewind, do not zero). Accepted imprecision: a straddling request's token
-        //     spend is attributed to the live (newer) window rather than dropped — bounded to one
-        //     in-flight request, and never lost.
-        //   - no cell → insert a fresh one for `window` (defensive: post-admission it should exist, but
-        //     an uncapped key or a token-only test path may reach here with none).
-        {
-            let mut map = self.budget.write(key_id);
-            let cell = match map.get_mut(key_id) {
-                Some(c) if window > c.window_start => {
-                    *c = BudgetCell {
-                        window_start: window,
-                        spend_cents: 0,
-                        tokens: 0,
-                        requests: 0,
-                        dirty: false,
-                        flushed_spend_cents: 0,
-                        flushed_tokens: 0,
-                        flushed_requests: 0,
-                    };
-                    c
-                }
-                Some(c) => c, // same window or straddle (cell newer-or-equal) → credit in place
-                None => map.entry(key_id.to_string()).or_insert(BudgetCell {
-                    window_start: window,
-                    spend_cents: 0,
-                    tokens: 0,
-                    requests: 0,
-                    dirty: false,
-                    flushed_spend_cents: 0,
-                    flushed_tokens: 0,
-                    flushed_requests: 0,
-                }),
-            };
-            cell.spend_cents = cell.spend_cents.saturating_add(spend);
-            cell.tokens = cell.tokens.saturating_add(tokens);
-            cell.dirty = true;
+        for bucket in chain.iter() {
+            self.accrue_bucket(bucket.bucket_id, bucket.budget_period, model, tokens, now);
         }
-        // Feed the TPM counter. `add_rate_tokens` is UPDATE-only: it credits an existing entry
-        // (created by `check_rate` for a capped key) but never materialises one — an uncapped key has
-        // no entry and must not gain one here, otherwise the rate map grows unboundedly for caps-free
-        // deployments.
-        self.add_rate_tokens(key_id, now, tokens);
+        // Feed the TPM counter (raw total across tiers). `add_rate_tokens` is UPDATE-only: it
+        // credits an existing entry (created by `check_rate` for a capped key) but never
+        // materialises one, so the rate map stays bounded for caps-free deployments.
+        self.add_rate_tokens(&key.id, now, tokens.total());
+    }
+
+    /// Accrue `tokens` under `model` to ONE bucket's current-window ledger cell (straddle-safe;
+    /// see [`GovState::record_usage`]).
+    fn accrue_bucket(
+        &self,
+        bucket_id: &str,
+        budget_period: &str,
+        model: &str,
+        tokens: &TierTokens,
+        now: u64,
+    ) {
+        let window = budget_window(budget_period, now);
+        let mut map = self.budget.write(bucket_id);
+        let cell = match map.get_mut(bucket_id) {
+            Some(c) if window > c.window_start => {
+                *c = BudgetCell::fresh(window);
+                c
+            }
+            Some(c) => c, // same window or straddle (cell newer-or-equal) → credit in place
+            None => map
+                .entry(bucket_id.to_string())
+                .or_insert_with(|| BudgetCell::fresh(window)),
+        };
+        cell.accrue(model, tokens);
+        cell.dirty = true;
     }
 
     /// Record one completed response's RAW consumption into the per-(key, day-bucket, model,
@@ -217,12 +165,6 @@ impl GovState {
     /// it via `spawn_blocking`.
     pub(crate) fn metering_for(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
         self.store.list_metering(bucket)
-    }
-
-    /// The operator-configured prices `(per_request_cents, per_1k_tokens_cents)` — the inputs of the
-    /// usage read's DERIVED `spend_micros` (raw counts are stored; spend is computed at read time).
-    pub(crate) fn prices(&self) -> (i64, i64) {
-        (self.price_per_request_cents, self.price_per_1k_tokens_cents)
     }
 
     /// READ-ONLY rate-limit headroom for a key: the fraction `[0.0, 1.0]` of the most-constrained
@@ -329,6 +271,8 @@ impl GovState {
             tpm_limit: spec.tpm_limit,
             enabled: true,
             created_at: now,
+            budget_group: spec.budget_group,
+            labels: spec.labels,
         };
         self.store.put_key(&key)?;
         self.refresh()?;
@@ -375,6 +319,8 @@ impl GovState {
             tpm_limit: spec.tpm_limit,
             enabled: true,
             created_at: now,
+            budget_group: spec.budget_group,
+            labels: spec.labels,
         };
         // ATOMIC: persist the bearer key row and its paired AWS credential in ONE transaction (see
         // `put_key_with_aws_credential`). The previous two-call autocommit sequence could orphan an
@@ -487,76 +433,161 @@ impl GovState {
         Ok(Some(key))
     }
 
-    /// BOOT-ONLY crash-recovery of accrued budget spend into the authoritative in-memory cells. For
-    /// each key, read the durable counter for its CURRENT window and, if non-zero, seed a NON-dirty
-    /// `BudgetCell` (non-dirty: the store already holds these values, so the first flush must not
-    /// re-write them). This runs OFF the hot path exactly once per fresh `GovState` (never on a config
-    /// reload/apply — the prior `Arc<GovState>` keeps its live cells), so a restart resumes enforcement
-    /// from the persisted spend instead of a zeroed budget. Best-effort: a store error on any key logs
-    /// and continues (never panics) — a key that fails to hydrate simply starts this run at zero spend,
-    /// the same fail-open posture the old store-error budget path took.
-    pub(crate) fn hydrate_budgets(&self, now: u64) {
+    /// BOOT-ONLY crash-recovery of accrued token ledgers into the authoritative in-memory cells:
+    /// every KEY bucket plus every configured GROUP bucket, each for its own current window. A
+    /// hydrated cell seeds NON-dirty with flush baselines equal to the durable record (the store
+    /// already holds those values, possibly including other nodes' accruals - the first flush must
+    /// send only the LOCAL delta accrued after boot). Runs OFF the hot path exactly once per fresh
+    /// `GovState` (never on a config reload/apply - the prior `Arc<GovState>` keeps its live
+    /// cells). Best-effort: a store error on any bucket logs and continues (never panics).
+    pub(crate) fn hydrate_budgets(&self, cost: &crate::cost::CostModel, now: u64) {
         let keys = match self.store.list_keys() {
             Ok(k) => k,
             Err(e) => {
-                tracing::warn!(error = %e, "budget hydration: list_keys failed; starting with empty budget cells");
-                return;
+                tracing::warn!(error = %e, "budget hydration: list_keys failed; starting with empty ledger cells");
+                Vec::new()
             }
         };
-        // Boot-only (off the hot path): insert each key's hydrated cell into ITS shard. Per-key shard
-        // selection keeps hydration consistent with every runtime access (a key always uses one shard).
-        for key in keys {
-            let window = budget_window(&key.budget_period, now);
-            match self.store.get_usage(&key.id, window) {
-                Ok(u) => {
-                    if u.spend_cents != 0 || u.tokens != 0 || u.requests != 0 {
-                        self.budget.write(&key.id).insert(
-                            key.id,
-                            BudgetCell {
-                                window_start: window,
-                                spend_cents: u.spend_cents,
-                                tokens: u.tokens,
-                                requests: u.requests,
-                                dirty: false,
-                                // The durable record ALREADY holds these values (possibly including
-                                // other nodes' spend): the additive-flush baseline starts here so
-                                // the first flush sends only the LOCAL delta accrued after boot.
-                                flushed_spend_cents: u.spend_cents,
-                                flushed_tokens: u.tokens,
-                                flushed_requests: u.requests,
-                            },
-                        );
+        let key_buckets = keys
+            .iter()
+            .map(|k| (k.id.as_str(), k.budget_period.as_str()));
+        let group_buckets = cost
+            .groups()
+            .iter()
+            .map(|g| (g.bucket_id.as_str(), g.budget_period.as_str()));
+        for (bucket_id, period) in key_buckets.chain(group_buckets) {
+            let window = budget_window(period, now);
+            match self.store.get_usage(bucket_id, window) {
+                Ok(ledger) => {
+                    if ledger.requests == 0 && ledger.models.is_empty() {
+                        continue;
                     }
+                    let mut cell = BudgetCell::fresh(window);
+                    cell.requests = ledger.requests;
+                    cell.flushed_requests = ledger.requests;
+                    cell.models = ledger
+                        .models
+                        .iter()
+                        .map(|m| ModelCell {
+                            model: std::sync::Arc::from(m.model.as_str()),
+                            cur: m.tokens,
+                            flushed: m.tokens,
+                        })
+                        .collect();
+                    self.budget
+                        .write(bucket_id)
+                        .insert(bucket_id.to_string(), cell);
                 }
                 Err(e) => {
-                    tracing::warn!(key = %key.id, error = %e, "budget hydration: get_usage failed; key starts at zero spend");
+                    tracing::warn!(bucket = %bucket_id, error = %e, "budget hydration: get_usage failed; bucket starts at zero");
                 }
             }
         }
     }
 
-    /// Current-window usage for a key (`None` if the key does not exist). The AUTHORITATIVE in-memory
-    /// cell wins for the CURRENT window (it reflects hot-path charges the write-behind flusher may not
-    /// have persisted yet); we fall back to the durable store for historical windows or a key whose
-    /// cell was never materialised (uncapped key with no spend, or a not-yet-touched window).
-    pub(crate) fn usage_for(&self, id: &str, now: u64) -> StoreResult<Option<Usage>> {
+    /// Current-window DERIVED usage for a key (`None` if the key does not exist): spend is
+    /// recomputed at read time from the bucket's token ledger x the CURRENT rate card (+ the flat
+    /// fee x requests) - reprice-on-read. The AUTHORITATIVE in-memory cell wins for the current
+    /// window (it reflects hot-path accruals the write-behind flusher may not have persisted yet);
+    /// falls back to the durable ledger for a bucket whose cell was never materialised.
+    pub(crate) fn usage_for(
+        &self,
+        cost: &crate::cost::CostModel,
+        id: &str,
+        now: u64,
+    ) -> StoreResult<Option<DerivedUsage>> {
         match self.store.get_key(id)? {
-            Some(key) => {
-                let window = budget_window(&key.budget_period, now);
-                // Cell-authoritative for the current window.
-                if let Some(cell) = self.budget.read(id).get(id) {
-                    if cell.window_start == window {
-                        return Ok(Some(Usage {
-                            spend_cents: cell.spend_cents,
-                            tokens: cell.tokens,
-                            requests: cell.requests,
-                        }));
-                    }
-                }
-                Ok(Some(self.store.get_usage(id, window)?))
-            }
+            Some(key) => Ok(Some(self.derived_bucket_usage(
+                cost,
+                id,
+                &key.budget_period,
+                true,
+                now,
+            )?)),
             None => Ok(None),
         }
+    }
+
+    /// The DERIVED current-window usage of one bucket (key or group): cell-authoritative, durable
+    /// fallback, spend recomputed from tokens x current rates. `include_request_fee` is true for a
+    /// KEY bucket only (the flat per-request fee counts against the innermost bucket alone).
+    pub(crate) fn derived_bucket_usage(
+        &self,
+        cost: &crate::cost::CostModel,
+        bucket_id: &str,
+        budget_period: &str,
+        include_request_fee: bool,
+        now: u64,
+    ) -> StoreResult<DerivedUsage> {
+        let window = budget_window(budget_period, now);
+        if let Some(cell) = self.budget.read(bucket_id).get(bucket_id) {
+            if cell.window_start == window {
+                return Ok(DerivedUsage {
+                    spend_cents: cost.derive_spend_cents(
+                        cell.model_views(),
+                        cell.requests,
+                        include_request_fee,
+                    ),
+                    tokens: cell.total_tokens(),
+                    requests: cell.requests,
+                });
+            }
+        }
+        let ledger = self.store.get_usage(bucket_id, window)?;
+        Ok(DerivedUsage {
+            spend_cents: cost.derive_spend_cents(
+                ledger.models.iter().map(|m| (m.model.as_str(), &m.tokens)),
+                ledger.requests,
+                include_request_fee,
+            ),
+            tokens: ledger.total_tokens(),
+            requests: ledger.requests,
+        })
+    }
+
+    /// The HOOK-SEAM projection: per-bucket budget state for the key + every ancestor group -
+    /// `{bucket_id, spend_micros_at_current_rate, remaining_micros, window}`. Read-only, built off
+    /// the default hot path (only routing-policy pools request it). A missing budget group yields
+    /// the key-only view.
+    pub(crate) fn budget_state(
+        &self,
+        cost: &crate::cost::CostModel,
+        key: &VirtualKey,
+        now: u64,
+    ) -> Vec<busbar_api::BudgetBucketState> {
+        let chain = match cost.chain_for(key) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(chain.len());
+        for bucket in chain.iter() {
+            let window = budget_window(bucket.budget_period, now);
+            let (spend_micros, requests) = {
+                let map = self.budget.read(bucket.bucket_id);
+                match map.get(bucket.bucket_id) {
+                    Some(cell) if cell.window_start == window => (
+                        cost.derive_spend_micros(cell.model_views(), cell.requests, bucket.is_key),
+                        cell.requests,
+                    ),
+                    _ => (0, 0),
+                }
+            };
+            let _ = requests;
+            let remaining_micros = bucket.max_budget_cents.map(|cap| {
+                cap.saturating_mul(10_000)
+                    .saturating_sub(spend_micros)
+                    .max(0)
+            });
+            out.push(busbar_api::BudgetBucketState {
+                bucket_id: bucket.bucket_id.to_string(),
+                budget_group: bucket.group_name.map(String::from),
+                spend_micros_at_current_rate: spend_micros,
+                remaining_micros,
+                window_start: window,
+                budget_period: bucket.budget_period.to_string(),
+            });
+        }
+        out
     }
 
     /// check + consume one request slot against the key's RPM/TPM for the current 60s window.
@@ -726,264 +757,175 @@ impl GovState {
         }
     }
 
-    /// Is this key already at/over its budget for the current window? (No cap → never.) Synchronous
-    /// core. The production request-path gate is [`GovState::try_charge_request_within_budget`] (an
-    /// atomic check-and-charge); this read and [`GovState::is_over_budget_async`] are the superseded,
-    /// now test-only budget probes.
+    /// ATOMIC budget CHAIN check-and-charge for the admission path - the HARD-cap primitive.
     ///
-    /// NOTE: the budget cap is BEST-EFFORT (soft) under concurrency. This read and the later
-    /// `record_request` charge are separate, non-atomic store round-trips, so N concurrent in-flight
-    /// requests for the same key can each observe spend < limit, all be admitted, then all charge —
-    /// overshooting `max_budget_cents` by up to (concurrent in-flight) * (per-request + token cost).
-    /// The overshoot is bounded by the caller's parallelism. A hard cap would require an atomic
-    /// check-and-charge (a single UPSERT returning post-charge spend) in the `Store`.
-    // Read-only budget probe. The admission path now uses the ATOMIC `try_charge_request_within_budget`
-    // rather than this read-then-charge pair, so production no longer calls it; it is retained
-    // ONLY as a governance-unit-test helper. Hence `#[cfg(test)]` (compiled out of the release binary)
-    // rather than a dead-code allow.
-    #[cfg(test)]
-    pub(crate) fn is_over_budget(&self, key: &VirtualKey, now: u64) -> bool {
-        let Some(limit) = key.max_budget_cents else {
-            return false;
+    /// Resolves the key's enforcement chain ([key bucket] -> budget_group -> parent -> ... root),
+    /// derives every bucket's CURRENT spend from its token ledger x the rate card (plus the flat
+    /// per-request fee x requests on the key bucket only - pure recompute, no spend cache), and
+    /// admits ONLY if EVERY bucket is under its own cap (AND / most-restrictive). On admit, every
+    /// bucket in the chain is charged one request in the SAME critical section - all-or-nothing;
+    /// on any bucket over cap, NOTHING is charged and the blocking bucket is NAMED in the error.
+    ///
+    /// ATOMICITY: every involved shard lock is acquired in ASCENDING shard-index order before any
+    /// check runs (a canonical order = deadlock-free), so N concurrent requests can never each read
+    /// "under budget" and all charge. The single-bucket case (no budget group - the common fleet)
+    /// degenerates to exactly the old one-shard critical section. Zero heap allocation on the
+    /// admit path: the chain and the guard set live in fixed arrays; the rejection variant (cold)
+    /// may allocate its group-name String.
+    ///
+    /// Residual (documented honestly): token cost is reconciled post-response (`record_usage`), so
+    /// a single ADMITTED request's own tokens can push a bucket marginally past its cap - bounded
+    /// to ONE in-flight request per bucket, NOT N.
+    ///
+    /// SYNCHRONOUS and INFALLIBLE (in-memory cells; no store round-trip, no await). The flat fee is
+    /// charged HERE (as +1 request; spend derives), so the caller must NOT re-charge in `finish`;
+    /// a non-2xx outcome refunds via [`GovState::refund_request`].
+    pub(crate) fn try_charge_request_within_budget(
+        &self,
+        cost: &crate::cost::CostModel,
+        key: &VirtualKey,
+        now: u64,
+    ) -> Result<(), BudgetBlocked> {
+        let chain = match cost.chain_for(key) {
+            Ok(c) => c,
+            // FAIL-CLOSED: a key bound to a group this node's config does not know cannot be
+            // admitted under the chain's caps, so it is not admitted at all.
+            Err(missing) => return Err(BudgetBlocked::MissingGroup(missing.to_string())),
         };
-        let window = budget_window(&key.budget_period, now);
-        self.store
-            .get_usage(&key.id, window)
-            .map(|u| u.spend_cents >= limit)
-            .unwrap_or(false)
-    }
-
-    /// Async budget gate for the request path: the per-request offload now lives in the backend's
-    /// `get_usage_async` (the SQLite impl runs the blocking read on the blocking pool), so this no
-    /// longer hand-rolls a `spawn_blocking`. Falls back to a synchronous read when called outside a
-    /// runtime (defensive — the request path always has one; the default async impl would inline
-    /// anyway, but the explicit sync path keeps behaviour observable in no-runtime tests). On a
-    /// store/join error it fails OPEN (returns `false`, i.e. "not over budget") to match the
-    /// synchronous variant, preserving availability rather than rejecting traffic on a telemetry-store
-    /// hiccup.
-    // Superseded on the request path by the atomic charge; retained ONLY for tests, so `#[cfg(test)]`
-    // (compiled out of the release binary) rather than a dead-code allow.
-    #[cfg(test)]
-    pub(crate) async fn is_over_budget_async(&self, key: &VirtualKey, now: u64) -> bool {
-        if key.max_budget_cents.is_none() {
-            return false;
-        }
-        if tokio::runtime::Handle::try_current().is_err() {
-            return self.is_over_budget(key, now);
-        }
-        let limit = key.max_budget_cents.expect("guarded is_some above");
-        let window = budget_window(&key.budget_period, now);
-        // `get_usage` is a sync read; the former `get_usage_async` blocking-pool offload was removed
-        // with the memory-only budget path (it left the plugin `Store` contract as read-only + flush).
-        match self.store.get_usage(&key.id, window) {
-            Ok(u) => u.spend_cents >= limit,
-            Err(e) => {
-                tracing::warn!(key = %key.id, error = %e, "budget read failed; failing open");
-                false
-            }
-        }
-    }
-
-    /// ATOMIC budget check-and-charge for the admission path — the HARD-cap primitive.
-    ///
-    /// Charge the flat per-request fee + one request to the key's current budget window IFF it stays
-    /// within `max_budget_cents`. The counter is now the AUTHORITATIVE in-memory `budget` cell (SQLite
-    /// is a write-behind durability layer), so this runs entirely under the `budget_write` lock with
-    /// NO await and NO store round-trip — the request hot path never blocks on SQLite. The check and
-    /// the charge are one indivisible critical section, so N concurrent requests for one key can NO
-    /// LONGER each read "under budget" and all charge: the flat fee is a HARD cap (the same guarantee
-    /// the SQL UPSERT gave, now single-node in memory). Replaces the old non-atomic
-    /// `is_over_budget_async` (read) → later `record_request` (write) pair.
-    ///
-    /// Residual (documented honestly): token cost is reconciled post-response (`record_tokens`), so a
-    /// single ADMITTED request's own tokens can push spend marginally past the cap — bounded to ONE
-    /// in-flight request, NOT N. The flat-fee overshoot (the N-way race) is gone.
-    ///
-    /// SYNCHRONOUS and INFALLIBLE: the counter is an in-memory cell, so there is no store round-trip
-    /// to await and no store error to surface — the method is a plain `fn -> bool` (it was `async ->
-    /// StoreResult<bool>` while budget still round-tripped SQLite; that fallibility, and the
-    /// `budget_on_store_error` fail-mode it fed, are gone). Returns:
-    ///   * `true`  — charged and admitted (or uncapped key: always charged),
-    ///   * `false` — would exceed the cap → reject.
-    ///
-    /// The flat fee is charged HERE (atomically), so the caller must NOT also charge it in `finish`;
-    /// `finish` emits metrics, fires the request-log webhook, and (on a non-2xx outcome) refunds the
-    /// flat fee for an admitted request.
-    pub(crate) fn try_charge_request_within_budget(&self, key: &VirtualKey, now: u64) -> bool {
-        self.charge_budget_mem(key, now)
-    }
-
-    /// The in-memory hard-cap check-and-charge (the core of `try_charge_request_within_budget`).
-    /// Runs the amortized stale-cell sweep and the per-key check/charge under ONE `budget_write` guard
-    /// — exactly the shape `check_rate` uses for the rate map — so the whole operation is atomic on
-    /// this single node. Returns `true` when the flat fee was charged (request admitted), `false` when
-    /// charging it would exceed `max_budget_cents` (rejected WITHOUT charging).
-    // pub(crate) for the tests module (same visibility as `check_rate`); not part of any API.
-    pub(crate) fn charge_budget_mem(&self, key: &VirtualKey, now: u64) -> bool {
-        let window = budget_window(&key.budget_period, now);
-        // Clamp the per-request fee >= 0 (symmetric with record_tokens / the old record_request): a
-        // negative misconfigured fee must never DECREMENT accrued spend and defeat the cap.
-        let fee = self.price_per_request_cents.max(0);
-        let max = key.max_budget_cents;
-        // FIRST-REQUEST GUARD (mirrors `charge_within_budget_inner`): a single flat fee that ALONE
-        // exceeds the whole cap can never be admitted, even into a fresh (empty) window. Reject up
-        // front before touching the cell.
-        if let Some(m) = max {
+        let fee = cost.price_per_request_cents();
+        // FIRST-REQUEST GUARD: a flat fee that ALONE exceeds the key's whole cap can never be
+        // admitted, even into a fresh window. (Group caps have no fee component.)
+        if let Some(m) = key.max_budget_cents {
             if fee > m {
-                return false;
+                return Err(BudgetBlocked::Key);
             }
         }
-        // Amortized bounded eviction of stale cells, coalesced with the per-key work under ONE guard —
-        // identical to `check_rate` (see its extended note): the ticker fires the O(active-key) retain
-        // only every Nth admission (POST-increment semantics via `wrapping_add(1)` so the first call
-        // and the u32 wrap boundary are handled correctly), and per-key correctness is independent of
-        // the sweep because the resolution below resets a stale cell in place for `window`.
-        // Per-shard amortized sweep + the atomic check-and-charge under THIS key's shard lock — the
-        // hard-cap guarantee is unchanged (a key is only ever charged under one lock), only different
-        // keys stop serializing. The shard's own ticker sweeps ~1/GOV_SHARDS of the cells.
-        let shard = self.budget.shard_for(&key.id);
-        let sweep_needed = shard
-            .sweep_ticker
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1)
-            .is_multiple_of(crate::limits::rate_sweep_interval());
-        let mut map = shard.map.write().unwrap_or_else(|p| p.into_inner());
-        if sweep_needed {
-            // Staleness must be PERIOD-AGNOSTIC (the same rule the carry-map sweep above earned in
-            // the 1.4.0 audit): keys on different budget periods have different `window` values, so
-            // retaining only `window_start == window` (THIS key's window) evicted valid CURRENT
-            // cells of keys on other periods sharing the shard — silently resetting their accrued
-            // spend (the hard cap!) and dropping any dirty unflushed spend. Age-based retain
-            // instead: drop only cells older than the longest bounded window (monthly ≤ 31 d); the
-            // all-time window (`window_start == 0`, `total` period) never ages out.
-            let max_window = 31 * super::SECS_PER_DAY;
-            map.retain(|_, c| {
-                c.window_start == 0 || c.window_start.saturating_add(max_window) > now
-            });
+
+        // Acquire every involved shard's write lock in ASCENDING shard order (dedup) - fixed-size
+        // scratch, no heap. `guard_slot[i]` = the position in `guards` holding bucket i's shard.
+        let mut shard_idx = [0usize; crate::cost::MAX_CHAIN];
+        let mut n = 0usize;
+        for bucket in chain.iter() {
+            shard_idx[n] = self.budget.shard_index(bucket.bucket_id);
+            n += 1;
         }
-        // Resolve this key's cell for the CURRENT window (three cases mirror `check_rate`):
-        //  - present & current-window -> mutate in place.
-        //  - present but STALE        -> reset in place to the current window (counters back to zero).
-        //  - absent                   -> insert a fresh zeroed cell.
-        let cell = match map.get_mut(&key.id) {
-            Some(c) if c.window_start == window => c,
-            Some(c) => {
-                *c = BudgetCell {
-                    window_start: window,
-                    spend_cents: 0,
-                    tokens: 0,
-                    requests: 0,
-                    dirty: false,
-                    flushed_spend_cents: 0,
-                    flushed_tokens: 0,
-                    flushed_requests: 0,
-                };
-                c
+        let mut order: [usize; crate::cost::MAX_CHAIN] = shard_idx;
+        order[..n].sort_unstable();
+        let mut guards: [Option<std::sync::RwLockWriteGuard<'_, HashMap<String, BudgetCell>>>;
+            crate::cost::MAX_CHAIN] = Default::default();
+        let mut guard_shards = [usize::MAX; crate::cost::MAX_CHAIN];
+        let mut g = 0usize;
+        for &s in order[..n].iter() {
+            if g > 0 && guard_shards[g - 1] == s {
+                continue; // dedup: two buckets sharing a shard use one guard
             }
-            None => map.entry(key.id.clone()).or_insert(BudgetCell {
-                window_start: window,
-                spend_cents: 0,
-                tokens: 0,
-                requests: 0,
-                dirty: false,
-                flushed_spend_cents: 0,
-                flushed_tokens: 0,
-                flushed_requests: 0,
-            }),
+            let shard = self.budget.shard_at(s);
+            // Amortized bounded eviction of stale cells, per acquired shard - identical rationale
+            // to `check_rate` (POST-increment ticker; age-based, period-agnostic retain so no
+            // still-current cell of ANY period is evicted; `window_start == 0` = the all-time
+            // window, never aged out).
+            let sweep_needed = shard
+                .sweep_ticker
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+                .is_multiple_of(crate::limits::rate_sweep_interval());
+            let mut map = shard.map.write().unwrap_or_else(|p| p.into_inner());
+            if sweep_needed {
+                let max_window = 31 * super::SECS_PER_DAY;
+                map.retain(|_, c| {
+                    c.window_start == 0 || c.window_start.saturating_add(max_window) > now
+                });
+            }
+            guards[g] = Some(map);
+            guard_shards[g] = s;
+            g += 1;
+        }
+        let guard_for = |shards: &[usize], target: usize| -> usize {
+            shards[..g]
+                .iter()
+                .position(|&s| s == target)
+                .expect("every bucket's shard was acquired")
         };
-        // CAP CHECK: reject WITHOUT charging if the post-charge spend would exceed the cap. Saturating
-        // add so a near-i64::MAX accrued spend can never wrap negative and sneak a charge past the cap.
-        if let Some(m) = max {
-            if cell.spend_cents.saturating_add(fee) > m {
-                return false;
+
+        // PASS 1 - CHECK every bucket under the held guards: resolve its cell for ITS OWN current
+        // window (stale cells reset in place; missing cells read as empty) and derive spend. The
+        // key bucket includes the flat fee (its prospective post-charge spend adds one more fee);
+        // group buckets derive tokens-only and block when already at/over cap.
+        for (bi, bucket) in chain.iter().enumerate() {
+            let gi = guard_for(&guard_shards, shard_idx[bi]);
+            let Some(cap) = bucket.max_budget_cents else {
+                continue; // uncapped bucket never blocks
+            };
+            let window = budget_window(bucket.budget_period, now);
+            let map = guards[gi].as_deref().expect("guard held");
+            let derived = match map.get(bucket.bucket_id) {
+                Some(cell) if cell.window_start == window => {
+                    cost.derive_spend_cents(cell.model_views(), cell.requests, bucket.is_key)
+                }
+                _ => 0, // stale or absent cell = fresh window = zero spend
+            };
+            let blocked = if bucket.is_key {
+                derived.saturating_add(fee) > cap
+            } else {
+                derived >= cap
+            };
+            if blocked {
+                return Err(match bucket.group_name {
+                    None => BudgetBlocked::Key,
+                    Some(name) => BudgetBlocked::Group(name.to_string()),
+                });
             }
         }
-        cell.spend_cents = cell.spend_cents.saturating_add(fee);
-        cell.requests = cell.requests.saturating_add(1);
-        cell.dirty = true;
-        true
+
+        // PASS 2 - CHARGE every bucket (+1 request, dirty) under the SAME held guards: atomic
+        // all-or-nothing with the checks above.
+        for (bi, bucket) in chain.iter().enumerate() {
+            let gi = guard_for(&guard_shards, shard_idx[bi]);
+            let window = budget_window(bucket.budget_period, now);
+            let map = guards[gi].as_deref_mut().expect("guard held");
+            let cell = match map.get_mut(bucket.bucket_id) {
+                Some(c) if c.window_start == window => c,
+                Some(c) => {
+                    *c = BudgetCell::fresh(window);
+                    c
+                }
+                None => map
+                    .entry(bucket.bucket_id.to_string())
+                    .or_insert_with(|| BudgetCell::fresh(window)),
+            };
+            cell.requests = cell.requests.saturating_add(1);
+            cell.dirty = true;
+        }
+        Ok(())
     }
 
-    /// Refund the flat per-request fee + request count charged at admission, for a request that
-    /// produced no usable upstream result (non-2xx). Keeps the flat-fee policy "bill 2xx only" intact
-    /// even though the hard-cap charge bills every admitted request up front. Decrements the
-    /// AUTHORITATIVE in-memory cell (write-behind: the flusher persists it later) — NO store call.
-    /// `now` MUST be the same `charged_at` epoch the admission charge used, so the refund lands in the
-    /// SAME budget window the charge did (the request could straddle a window boundary): if the cell's
-    /// window has already rolled past `now`, there is nothing in THIS window to refund (a no-op, never
-    /// a negative counter). Spend/requests are floored at 0 so a refund can never drive them negative.
-    pub(crate) fn refund_request(&self, key: &VirtualKey, now: u64) {
-        let window = budget_window(&key.budget_period, now);
-        let fee = self.price_per_request_cents.max(0);
-        let mut map = self.budget.write(&key.id);
-        if let Some(cell) = map.get_mut(&key.id) {
+    /// Refund the request charged at admission across EVERY bucket of the key's chain, for a
+    /// request that produced no usable upstream result (non-2xx). Keeps the flat-fee policy "bill
+    /// 2xx only" intact (the fee derives from the request count, so -1 request = -1 fee on the key
+    /// bucket). `now` MUST be the same `charged_at` epoch the admission charge used so the refund
+    /// lands in the SAME window per bucket; a bucket whose window has rolled past is a no-op.
+    /// Floored at 0 - a refund can never drive a counter negative.
+    pub(crate) fn refund_request(&self, cost: &crate::cost::CostModel, key: &VirtualKey, now: u64) {
+        let Ok(chain) = cost.chain_for(key) else {
+            // The charge failed closed on a missing group, so nothing was charged; refund only the
+            // key bucket defensively (it floors at 0 on a no-op).
+            self.refund_bucket(&key.id, &key.budget_period, now);
+            return;
+        };
+        for bucket in chain.iter() {
+            self.refund_bucket(bucket.bucket_id, bucket.budget_period, now);
+        }
+    }
+
+    fn refund_bucket(&self, bucket_id: &str, budget_period: &str, now: u64) {
+        let window = budget_window(budget_period, now);
+        let mut map = self.budget.write(bucket_id);
+        if let Some(cell) = map.get_mut(bucket_id) {
             if cell.window_start == window {
-                cell.spend_cents = (cell.spend_cents - fee).max(0);
                 cell.requests = cell.requests.saturating_sub(1);
                 cell.dirty = true;
             }
         }
-    }
-
-    /// Charge one request (flat per-request cost + token count) to the key's current window. Now
-    /// writes to the AUTHORITATIVE in-memory `budget` cell (marked dirty for the write-behind flusher)
-    /// so it mirrors the production admission path; the in-memory TPM counter is updated inline. Tests
-    /// that assert DURABLE store state should call `flush_budgets()` first (or read the authoritative
-    /// value via `usage_for`).
-    // Retained ONLY for direct-call governance tests (production charges via the atomic in-memory
-    // hard-cap), so `#[cfg(test)]` — compiled out of the release binary — rather than a dead-code allow.
-    #[cfg(test)]
-    pub(crate) fn record_request(&self, key: &VirtualKey, now: u64, tokens: u64) {
-        let window = budget_window(&key.budget_period, now);
-        // Clamp the per-request fee at >= 0, symmetric with `record_tokens` (which already clamps the
-        // per-1k-token price). A negative `price_per_request_cents` (operator/hostile-admin
-        // misconfiguration; the field is a plain signed i64 with no range check at config load) would
-        // otherwise DECREMENT a key's accrued spend on every successful request, driving spend below
-        // zero and defeating the budget cap (`is_over_budget` compares `spend_cents >= limit`).
-        let fee = self.price_per_request_cents.max(0);
-        // Charge the cell: +fee spend, +1 request, +tokens (count_request semantics = a fresh request).
-        // Straddle-safe resolution matching `record_tokens` (`now` is `charged_at`, so the live cell may
-        // be NEWER than `window`): reset only a genuinely-stale (older) cell; otherwise credit in place.
-        {
-            let mut map = self.budget.write(&key.id);
-            let cell = match map.get_mut(&key.id) {
-                Some(c) if window > c.window_start => {
-                    *c = BudgetCell {
-                        window_start: window,
-                        spend_cents: 0,
-                        tokens: 0,
-                        requests: 0,
-                        dirty: false,
-                        flushed_spend_cents: 0,
-                        flushed_tokens: 0,
-                        flushed_requests: 0,
-                    };
-                    c
-                }
-                Some(c) => c, // same window or straddle (cell newer-or-equal) → credit in place
-                None => map.entry(key.id.clone()).or_insert(BudgetCell {
-                    window_start: window,
-                    spend_cents: 0,
-                    tokens: 0,
-                    requests: 0,
-                    dirty: false,
-                    flushed_spend_cents: 0,
-                    flushed_tokens: 0,
-                    flushed_requests: 0,
-                }),
-            };
-            cell.spend_cents = cell.spend_cents.saturating_add(fee);
-            cell.requests = cell.requests.saturating_add(1);
-            cell.tokens = cell.tokens.saturating_add(tokens);
-            cell.dirty = true;
-        }
-        // Feed the rate window's TPM counter. `add_rate_tokens` is UPDATE-only, so this is a no-op for
-        // an uncapped key (which has no entry — `check_rate` early-returns and never creates one for
-        // it) and credits a capped key's existing entry otherwise. No cap check is needed here because
-        // the update-only behaviour already bounds the map: only capped keys can have an entry to
-        // credit. (Production always passes `tokens = 0` — the per-request fee carries no tokens — so
-        // this returns at the `tokens == 0` guard; the token fee feeds TPM via `record_tokens`.)
-        self.add_rate_tokens(&key.id, now, tokens);
     }
 
     /// WRITE-BEHIND flush of the dirty in-memory budget cells to the durable store — ADDITIVE, so
@@ -1006,65 +948,95 @@ impl GovState {
         fn signed(v: u64) -> i64 {
             i64::try_from(v).unwrap_or(i64::MAX)
         }
+        /// One dirty cell's snapshot: the PER-MODEL TOKEN delta payload for `Store::add_usage`
+        /// plus the current absolute counters that become the acked baseline on success. No dollar
+        /// figure anywhere - only tokens + requests cross the wire.
+        struct DirtySnap {
+            bucket_id: String,
+            window: u64,
+            delta: UsageDelta,
+            cur_requests: u64,
+            cur_models: Vec<(std::sync::Arc<str>, TierTokens)>,
+        }
         // Snapshot dirty cells across ALL shards and clear their flags. One shard is locked at a
-        // time (the `write_all` iterator acquires each guard lazily), so a concurrent per-key
-        // charge blocks only on the single shard the snapshot currently holds, not the whole map.
-        // Tuple: (id, window, delta_spend, delta_tokens, delta_requests, cur_spend, cur_tokens,
-        // cur_requests) — the `cur_*` become the new acked baseline on success.
-        #[allow(clippy::type_complexity)]
-        let mut dirty: Vec<(String, u64, i64, i64, i64, i64, u64, u64)> = Vec::new();
+        // time (the `write_all` iterator acquires each guard lazily), so a concurrent charge
+        // blocks only on the single shard the snapshot currently holds, not the whole map.
+        let mut dirty: Vec<DirtySnap> = Vec::new();
         for mut map in self.budget.write_all() {
             for (id, cell) in map.iter_mut() {
-                if cell.dirty {
-                    dirty.push((
-                        id.clone(),
-                        cell.window_start,
-                        cell.spend_cents - cell.flushed_spend_cents,
-                        signed(cell.tokens) - signed(cell.flushed_tokens),
-                        signed(cell.requests) - signed(cell.flushed_requests),
-                        cell.spend_cents,
-                        cell.tokens,
-                        cell.requests,
-                    ));
-                    cell.dirty = false;
+                if !cell.dirty {
+                    continue;
                 }
+                let models: Vec<busbar_api::ModelTokensDelta> = cell
+                    .models
+                    .iter()
+                    .filter_map(|m| {
+                        let d = busbar_api::TierTokensDelta {
+                            input: signed(m.cur.input) - signed(m.flushed.input),
+                            output: signed(m.cur.output) - signed(m.flushed.output),
+                            cache_read: signed(m.cur.cache_read) - signed(m.flushed.cache_read),
+                            cache_write: signed(m.cur.cache_write) - signed(m.flushed.cache_write),
+                        };
+                        (!d.is_zero()).then(|| busbar_api::ModelTokensDelta {
+                            model: m.model.to_string(),
+                            tokens: d,
+                        })
+                    })
+                    .collect();
+                dirty.push(DirtySnap {
+                    bucket_id: id.clone(),
+                    window: cell.window_start,
+                    delta: UsageDelta {
+                        requests: signed(cell.requests) - signed(cell.flushed_requests),
+                        models,
+                    },
+                    cur_requests: cell.requests,
+                    cur_models: cell
+                        .models
+                        .iter()
+                        .map(|m| (m.model.clone(), m.cur))
+                        .collect(),
+                });
+                cell.dirty = false;
             }
         }
         let mut flushed = 0usize;
-        for (id, window, d_spend, d_tokens, d_requests, cur_spend, cur_tokens, cur_requests) in
-            dirty
-        {
-            let outcome = if d_spend == 0 && d_tokens == 0 && d_requests == 0 {
+        for snap in dirty {
+            let outcome = if snap.delta.is_zero() {
                 // Nothing new since the last acked flush (e.g. a charge fully refunded back to the
                 // baseline): the durable record is already correct; skip the store round-trip.
                 Ok(())
             } else {
                 self.store
-                    .add_usage(&id, window, d_spend, d_tokens, d_requests)
+                    .add_usage(&snap.bucket_id, snap.window, &snap.delta)
             };
             match outcome {
                 Ok(()) => {
                     flushed += 1;
-                    // Advance the acked baseline — only if the cell still holds the SAME window (a
-                    // rollover since the snapshot reset the cell; its zeroed baseline is already
-                    // correct for the new window).
-                    let mut map = self.budget.write(&id);
-                    if let Some(cell) = map.get_mut(&id) {
-                        if cell.window_start == window {
-                            cell.flushed_spend_cents = cur_spend;
-                            cell.flushed_tokens = cur_tokens;
-                            cell.flushed_requests = cur_requests;
+                    // Advance the acked baselines - only if the cell still holds the SAME window
+                    // (a rollover since the snapshot reset the cell; its zeroed baselines are
+                    // already correct for the new window).
+                    let mut map = self.budget.write(&snap.bucket_id);
+                    if let Some(cell) = map.get_mut(&snap.bucket_id) {
+                        if cell.window_start == snap.window {
+                            cell.flushed_requests = snap.cur_requests;
+                            for (model, cur) in &snap.cur_models {
+                                if let Some(mc) = cell.models.iter_mut().find(|m| m.model == *model)
+                                {
+                                    mc.flushed = *cur;
+                                }
+                            }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(key = %id, error = %e, "budget flush failed; will retry next tick");
+                    tracing::warn!(bucket = %snap.bucket_id, error = %e, "budget flush failed; will retry next tick");
                     // RE-MARK dirty so the delta is not lost — only if the cell still exists for
                     // the SAME window (after a rollover the old window's unacked delta is dropped
                     // with the cell, exactly as the pre-additive flusher behaved).
-                    let mut map = self.budget.write(&id);
-                    if let Some(cell) = map.get_mut(&id) {
-                        if cell.window_start == window {
+                    let mut map = self.budget.write(&snap.bucket_id);
+                    if let Some(cell) = map.get_mut(&snap.bucket_id) {
+                        if cell.window_start == snap.window {
                             cell.dirty = true;
                         }
                     }

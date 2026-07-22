@@ -409,7 +409,7 @@ fn refresh_scrape_gauges(app: &App) {
         }
         for key in keys.iter().take(key_gauge_limit) {
             // `usage_for` queries the SQLite store for the key's current-window counters.
-            let usage = match gov.usage_for(&key.id, now) {
+            let usage = match gov.usage_for(&app.cost, &key.id, now) {
                 Ok(Some(u)) => u,
                 Ok(None) => continue, // key vanished between list and get — skip
                 Err(e) => {
@@ -569,7 +569,7 @@ mod tests {
     fn gov_with_key(key: VirtualKey) -> Arc<GovState> {
         let store = Arc::new(MemoryStore::new());
         store.put_key(&key).unwrap();
-        Arc::new(GovState::new(store, 0, 0, None).unwrap())
+        Arc::new(GovState::new(store, None).unwrap())
     }
 
     fn sample_vkey(id: &str) -> VirtualKey {
@@ -584,6 +584,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 1_700_000_000,
+            budget_group: None,
+            labels: Default::default(),
         }
     }
 
@@ -596,12 +598,27 @@ mod tests {
         let key = sample_vkey("vk_spend_test01");
         let gov = gov_with_key(key.clone());
 
-        // Record some spend: charge 200 cents worth of usage.
-        gov.record_request(&key, 1_700_000_000, 0);
-        // Use a price of 0 (set in `gov_with_key`), so spend stays 0 unless we seed it directly.
-        // Seed spend via the store directly for a deterministic test.
+        // Seed a durable ledger directly: 200 requests (derived spend = 200 cents at the
+        // TestApp default `CostModel::flat(1)`) plus 5000 tokens so the tokens gauge is nonzero.
         let usage_store = gov.store();
-        usage_store.put_usage(&key.id, 0, 200, 5000, 0).unwrap();
+        usage_store
+            .put_usage(
+                &key.id,
+                0,
+                &busbar_api::UsageLedger {
+                    requests: 200,
+                    models: vec![busbar_api::ModelTokens {
+                        model: "m".to_string(),
+                        tokens: crate::governance::TierTokens {
+                            input: 5000,
+                            output: 0,
+                            cache_read: 0,
+                            cache_write: 0,
+                        },
+                    }],
+                },
+            )
+            .unwrap();
 
         // Build a minimal App with governance.
         let app = TestApp::new()
@@ -772,14 +789,33 @@ mod tests {
                 tpm_limit: None,
                 enabled: true,
                 created_at: 1_700_000_000,
+                budget_group: None,
+                labels: Default::default(),
             };
             store.put_key(&key).unwrap();
             // Seed minimal usage so the key has a row in usage_counters and the spend gauge is
             // actually emitted (keys with zero usage_for results are skipped).
-            store.put_usage(&id, 0, 1, 10, 0).unwrap();
+            store
+                .put_usage(
+                    &id,
+                    0,
+                    &busbar_api::UsageLedger {
+                        requests: 1,
+                        models: vec![busbar_api::ModelTokens {
+                            model: "m".to_string(),
+                            tokens: crate::governance::TierTokens {
+                                input: 10,
+                                output: 0,
+                                cache_read: 0,
+                                cache_write: 0,
+                            },
+                        }],
+                    },
+                )
+                .unwrap();
         }
 
-        let gov = Arc::new(GovState::new(store, 0, 0, None).unwrap());
+        let gov = Arc::new(GovState::new(store, None).unwrap());
         let app = TestApp::new()
             .lane(LaneSpec::new(
                 "m",

@@ -268,6 +268,8 @@ mod tests {
             tpm_limit: None,
             enabled: true,
             created_at: 1_700_000_000,
+            budget_group: None,
+            labels: Default::default(),
         })
     }
 

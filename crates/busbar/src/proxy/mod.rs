@@ -106,7 +106,7 @@ mod hooks;
 mod lazy_body;
 mod response_body;
 mod select;
-mod usage;
+pub(crate) mod usage;
 mod wire;
 pub(crate) use egress::*;
 pub(crate) use engine::*;

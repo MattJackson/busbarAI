@@ -59,6 +59,7 @@ mod billing;
 mod breaker;
 mod config;
 mod config_validate;
+mod cost;
 mod egress_auth;
 mod endpoints;
 mod eventstream;
@@ -1528,6 +1529,16 @@ pub(crate) fn build_app_from_config(
     // identity that shifts across restarts (a scrape/dashboard annoyance and a flaky-test source).
     // Sorting makes the whole observable surface stable. (Mirrors the deterministic-resolution fix
     // already applied to `model_context_max` below.)
+    // Resolve the COST MODEL from THIS config (rate card + budget groups + flat fee) BEFORE
+    // `cfg.models` is consumed below. Rebuilt on every apply/reload - unlike the GovState ledger,
+    // which survives the swap - so a rate-card correction reprices every derived figure on the
+    // next read (tokens are the truth).
+    let cost = Arc::new(crate::cost::CostModel::resolve_parts(
+        &governance_cfg.clone().unwrap_or_default(),
+        &cfg.models,
+        &cfg.pools,
+    ));
+
     let mut sorted_models: Vec<_> = cfg.models.into_iter().collect();
     sorted_models.sort_by(|a, b| a.0.cmp(&b.0));
     for (model, mc) in sorted_models {
@@ -1904,7 +1915,9 @@ pub(crate) fn build_app_from_config(
                                 idx,
                                 state::MemberMeta {
                                     tier: m.tier.clone(),
-                                    cost_per_mtok: m.cost_per_mtok,
+                                    // The ROUTING scalar projection of either cost shape (a bare
+                                    // per-mtok number, or the blended 4-tier rate override).
+                                    cost_per_mtok: m.cost_per_mtok.as_ref().map(|c| c.per_mtok()),
                                     tags: m.tags.clone(),
                                 },
                             )
@@ -1996,17 +2009,30 @@ pub(crate) fn build_app_from_config(
                 }
             }
         };
-        match governance::GovState::new(
-            store,
-            g.price_per_request_cents,
-            g.price_per_1k_tokens_cents,
-            g.admin_token.clone(),
-        ) {
+        match governance::GovState::new(store, g.admin_token.clone()) {
             Ok(gs) => {
                 let gs = Arc::new(gs);
-                // BOOT-ONLY crash-recovery: hydrate the in-memory budget cells from the durable store
-                // so a restart resumes enforcement from persisted spend. A no-op for the empty RAM store.
-                gs.hydrate_budgets(crate::store::now());
+                // BOOT-ONLY crash-recovery: hydrate the in-memory token-ledger cells (key buckets +
+                // budget-group buckets) from the durable store so a restart resumes enforcement from
+                // the persisted ledger. A no-op for the empty RAM store.
+                gs.hydrate_budgets(&cost, crate::store::now());
+                // BOOT FAIL-CLOSED: every stored key naming a budget_group must resolve in THIS
+                // config (mint validates it; a shared durable store can carry keys minted under a
+                // config another node no longer has). A dangling reference is a boot error naming
+                // the offender with the paste-ready fix.
+                if let Ok(keys) = gs.all_keys() {
+                    for k in &keys {
+                        if let Some(group) = k.budget_group.as_deref() {
+                            if cost.group_named(group).is_none() {
+                                return Err(format!(
+                                    "virtual key '{}' names budget_group '{group}', which does not exist in governance.budget_groups.\n\
+                                     Paste this under governance.budget_groups and set a real cap:\n\n    {group}: {{ max_budget_cents: 0, budget_period: monthly }}\n",
+                                    k.id
+                                ));
+                            }
+                        }
+                    }
+                }
                 // INERT-KEYS GUARD: a durable store may carry virtual keys minted in a prior run
                 // whose admin_token was later REMOVED from config — governance then goes inert and
                 // those keys' per-key controls are silently bypassed (access falls to the static
@@ -2128,6 +2154,7 @@ pub(crate) fn build_app_from_config(
         fallback_pools,
         on_exhausted_cfgs,
         governance,
+        cost,
         plugins_dir: std::path::PathBuf::from(&plugins_cfg.dir),
         plugins_cfg,
         default_max_tokens: cfg.limits.default_max_tokens,

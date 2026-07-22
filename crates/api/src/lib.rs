@@ -23,8 +23,9 @@ mod store;
 
 pub use auth::{constant_time_eq, sha256_hex, AuthModule, AuthOutcome, Principal};
 pub use hooks::{
-    CallerIdentity, Candidate, HookStatus, PolicyError, PolicyResult, PromptProjection,
-    RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest, TransformOutcome,
+    BudgetBucketState, CallerIdentity, Candidate, HookStatus, PolicyError, PolicyResult,
+    PromptProjection, RewriteReply, RoutingContext, RoutingDecision, RoutingPolicy, RoutingRequest,
+    TransformOutcome,
 };
 pub use store::{
     AuditRecord, AwsCredential, AwsKeyEntry, MeteringDelta, MeteringRow, ModelTokens,

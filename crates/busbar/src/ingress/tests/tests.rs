@@ -54,6 +54,7 @@ fn minimal_app() -> Arc<App> {
         fallback_pools: std::collections::HashMap::new(),
         on_exhausted_cfgs: std::collections::HashMap::new(),
         governance: None,
+        cost: std::sync::Arc::new(crate::cost::CostModel::flat(1)),
         plugins_dir: std::path::PathBuf::from("plugins"),
         plugins_cfg: crate::config::PluginsCfg::default(),
         default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
@@ -155,8 +156,8 @@ fn test_affinity_header_session_mode_without_name_uses_default() {
 fn governed_app_with_key() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    // 30 cents flat per request, no per-token fee.
-    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
+    // 30 cents flat per request, no per-token fee (the fee now lives on the CostModel).
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -166,12 +167,16 @@ fn governed_app_with_key() -> (Arc<App>, crate::governance::VirtualKey) {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
     let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+    let inner = Arc::get_mut(&mut app).expect("sole owner");
+    inner.governance = Some(gov);
+    inner.cost = std::sync::Arc::new(crate::cost::CostModel::flat(30));
     (app, key)
 }
 
@@ -179,7 +184,7 @@ fn key_spend(app: &Arc<App>, key_id: &str) -> i64 {
     app.governance
         .as_ref()
         .unwrap()
-        .usage_for(key_id, 1_700_000_000)
+        .usage_for(&app.cost, key_id, 1_700_000_000)
         .unwrap()
         .map(|u| u.spend_cents)
         .unwrap_or(0)
@@ -190,10 +195,10 @@ fn key_spend(app: &Arc<App>, key_id: &str) -> i64 {
 /// non-2xx `finish` (503 / 5xx / 4xx) refunds exactly one flat fee. `finish_rejected` (governance
 /// rejection, never charged) refunds nothing.
 // No-runtime `#[test]`: `refund_request` now decrements the AUTHORITATIVE in-memory cell (no store
-// offload), so it is observable synchronously. The admission charge is seeded via the in-memory
-// `record_request` (the flat-fee analog of `budget_check`'s admission charge) so the charge, the
-// refund, and the `usage_for` read all target the SAME authoritative cell. `at` is the fixed budget
-// window `key_spend` reads.
+// offload), so it is observable synchronously. The admission charge is seeded via the REAL
+// admission charge (`try_charge_request_within_budget`) so the charge, the refund, and the
+// `usage_for` read all target the SAME authoritative cell. `at` is the fixed budget window
+// `key_spend` reads.
 #[test]
 fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
     crate::metrics::init();
@@ -204,9 +209,11 @@ fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
     let govstate = app.governance.as_ref().unwrap().clone();
     let at = 1_700_000_000u64;
 
-    // Seed the admission charge in memory (30c flat fee), mirroring budget_check's admission charge.
+    // Seed the admission charge in memory (30c flat fee) via the real admission charge.
     let charge = || {
-        govstate.record_request(&key, at, 0);
+        govstate
+            .try_charge_request_within_budget(&app.cost, &key, at)
+            .expect("well under the cap");
     };
     charge();
     assert_eq!(
@@ -274,9 +281,11 @@ fn test_pre_routing_failure_does_not_refund_prior_charge() {
     let govstate = app.governance.as_ref().unwrap().clone();
 
     // A prior, legitimately-charged request: seed one flat fee (30c) of spend in the (in-memory,
-    // authoritative) window via the admission analog `record_request`. `key_spend`/`usage_for` and
-    // any (buggy) `refund_request` all target this same cell.
-    govstate.record_request(&key, 1_700_000_000, 0);
+    // authoritative) window via the real admission charge. `key_spend`/`usage_for` and any (buggy)
+    // `refund_request` all target this same cell.
+    govstate
+        .try_charge_request_within_budget(&app.cost, &key, 1_700_000_000)
+        .expect("well under the cap");
     assert_eq!(key_spend(&app, &key.id), 30, "prior charge seeded");
 
     // A malformed-JSON request on the SAME key fails pre-routing (model never resolved) → 400.
@@ -333,16 +342,16 @@ fn test_finish_outcome_mapping_503_is_exhausted() {
 // ever leaks into today's window. (Token-fee side: `proxy::usage_tap_tests::
 // test_nonstream_token_fee_uses_charged_at_window_not_clock`.)
 // No-runtime `#[test]`: the offloaded refund in `finish` runs INLINE and is observable. The
-// admission charge is seeded via the SYNC store path into the charged_at window.
+// admission charge is seeded via the real admission charge into the charged_at window.
 #[test]
 fn test_flat_fee_charge_and_refund_use_charged_at_window() {
     use crate::governance::{GovState, MemoryStore, NewKeySpec, SECS_PER_DAY};
     crate::metrics::init();
 
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(
-        GovState::new(store.clone(), 30, 0, Some("admintok".to_string())).unwrap(),
-    ); // 30c/request
+    let gov =
+        std::sync::Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
+    let cost = std::sync::Arc::new(crate::cost::CostModel::flat(30)); // 30c/request
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -352,12 +361,18 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
                 budget_period: "daily".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
     let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.governance = Some(gov.clone());
+        inner.cost = cost.clone();
+    }
     let govctx = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key.clone())),
     };
@@ -370,11 +385,12 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
         "test precondition: charged_at must be a different day than now"
     );
 
-    // Admission charge into the charged_at day window via the in-memory admission analog
-    // (`record_request` charges the flat fee into `budget_window("daily", charged_at)` = day_window).
-    gov.record_request(&key, charged_at, 0);
+    // Admission charge into the charged_at day window via the real admission charge (it lands the
+    // flat fee into `budget_window("daily", charged_at)` = day_window).
+    gov.try_charge_request_within_budget(&cost, &key, charged_at)
+        .expect("well under the cap");
     assert_eq!(
-        gov.usage_for(&key.id, charged_at)
+        gov.usage_for(&cost, &key.id, charged_at)
             .unwrap()
             .map(|u| u.spend_cents)
             .unwrap_or(0),
@@ -394,7 +410,7 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
         resp,
     );
     assert_eq!(
-        gov.usage_for(&key.id, charged_at)
+        gov.usage_for(&cost, &key.id, charged_at)
             .unwrap()
             .map(|u| u.spend_cents)
             .unwrap_or(0),
@@ -402,7 +418,7 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
         "non-2xx refund must land in the charged_at window (net 0)"
     );
     let in_today = gov
-        .usage_for(&key.id, crate::store::now())
+        .usage_for(&cost, &key.id, crate::store::now())
         .unwrap()
         .map(|u| u.spend_cents)
         .unwrap_or(0);
@@ -437,13 +453,14 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     );
 
     // Seed 30c of spend into the PAST day window through the AUTHORITATIVE in-memory path
-    // (`record_request` charges the flat fee into `budget_window("daily", past_day)` = past_window),
-    // so the deterministic precondition matches what the in-memory admission gate reads. (Enforcement
-    // is now in-memory: seeding via the store alone would be invisible to `budget_check`.)
+    // (the real admission charge lands the flat fee into `budget_window("daily", past_day)` =
+    // past_window), so the deterministic precondition matches what the in-memory admission gate
+    // reads. (Enforcement is in-memory: seeding via the store alone would be invisible to
+    // `budget_check`.)
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(
-        GovState::new(store.clone(), 30, 0, Some("admintok".to_string())).unwrap(),
-    ); // 30c/req
+    let gov =
+        std::sync::Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
+    let cost = std::sync::Arc::new(crate::cost::CostModel::flat(30)); // 30c/req
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -453,20 +470,27 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
                 budget_period: "daily".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
-    gov.record_request(&key, past_day, 0);
+    gov.try_charge_request_within_budget(&cost, &key, past_day)
+        .expect("first request fits the cap exactly");
 
     let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov.clone());
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.governance = Some(gov.clone());
+        inner.cost = cost.clone();
+    }
     let govctx = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key.clone())),
     };
 
     assert_eq!(
-        gov.usage_for(&key.id, past_day)
+        gov.usage_for(&cost, &key.id, past_day)
             .unwrap()
             .map(|u| u.spend_cents)
             .unwrap_or(0),
@@ -1959,7 +1983,7 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
     }
     let server = MockServer::new(state.clone()).await;
     let store = StdArc::new(MemoryStore::new());
-    let gov = StdArc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let auth_cfg = crate::config::AuthCfg {
         chain: vec!["test-groups-module".to_string()],
         upstream_credentials: crate::auth::UpstreamCreds::Own,
@@ -1979,6 +2003,8 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
         .pool("gpool-b", &[(0, 1)])
         .auth(StdArc::new(crate::auth::AuthMiddleware::new(&auth_cfg)))
         .governance(gov)
+        // The old GovState carried fee 0; keep the no-charge semantics under the CostModel.
+        .cost(crate::cost::CostModel::flat(0))
         .build();
     {
         let inner = StdArc::get_mut(&mut app).expect("sole owner");
@@ -2986,7 +3012,7 @@ async fn test_unknown_model_404_uses_canonical_openai_type() {
 fn governed_app_pool_restricted() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -2996,12 +3022,17 @@ fn governed_app_pool_restricted() -> (Arc<App>, crate::governance::VirtualKey) {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
     let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+    let inner = Arc::get_mut(&mut app).expect("sole owner");
+    inner.governance = Some(gov);
+    // The 30c flat fee lives on the CostModel now.
+    inner.cost = std::sync::Arc::new(crate::cost::CostModel::flat(30));
     (app, key)
 }
 
@@ -3093,7 +3124,9 @@ async fn finish_admitted_does_not_refund_an_uncharged_admit() {
     let at = 1_700_000_000;
     // A PRIOR legitimate request charges the flat fee (price=30) into this window.
     let g = app.governance.as_ref().unwrap();
-    assert!(g.try_charge_request_within_budget(&key, at));
+    assert!(g
+        .try_charge_request_within_budget(&app.cost, &key, at)
+        .is_ok());
     let charged_spend = key_spend(&app, &key.id);
     assert_eq!(charged_spend, 30, "prior request charged the flat fee");
 
@@ -3224,7 +3257,7 @@ fn assert_leak_free(body: &str, key_id: &str, pool: &str) {
 fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -3234,12 +3267,17 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
     let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+    let inner = Arc::get_mut(&mut app).expect("sole owner");
+    inner.governance = Some(gov);
+    // 30c flat fee against a 0c cap: the very first request is over budget.
+    inner.cost = std::sync::Arc::new(crate::cost::CostModel::flat(30));
     (app, key)
 }
 
@@ -3247,7 +3285,7 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
 fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 30, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -3257,12 +3295,16 @@ fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
                 budget_period: "total".to_string(),
                 rpm_limit: Some(0),
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
     let mut app = minimal_app();
-    Arc::get_mut(&mut app).expect("sole owner").governance = Some(gov);
+    let inner = Arc::get_mut(&mut app).expect("sole owner");
+    inner.governance = Some(gov);
+    inner.cost = std::sync::Arc::new(crate::cost::CostModel::flat(30));
     (app, key)
 }
 
@@ -4474,9 +4516,11 @@ async fn governed_pool_acl_router(
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new()
         .governance(gov)
         .lane(LaneSpec::new(model, protocol, "http://127.0.0.1:1").provider(provider))
@@ -4732,9 +4776,11 @@ async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     // Lane 0 → pool A (reachable mock). Lane 1 → pool B (the disallowed fallback target).
     let app = TestApp::new()
@@ -4818,9 +4864,11 @@ async fn test_fallback_pool_acl_allows_key_permitted_on_both_pools() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .governance(gov)
@@ -4988,9 +5036,11 @@ async fn test_adhoc_governance_pool_acl_403_via_router() {
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new()
         .governance(gov)
         .lane(
@@ -5305,9 +5355,11 @@ async fn governed_limit_router(
             tpm_limit: None,
             enabled: true,
             created_at: 0,
+            budget_group: None,
+            labels: Default::default(),
         })
         .unwrap();
-    let gov = StdArc::new(GovState::new(store, 1, 0, Some("admintok".to_string())).unwrap());
+    let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let (addr, handle) = serve(app).await;
     (addr, handle, SECRET)

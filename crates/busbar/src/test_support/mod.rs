@@ -650,6 +650,7 @@ pub(crate) struct TestApp {
     pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
     auth: Option<std::sync::Arc<crate::auth::AuthMiddleware>>,
     governance: Option<std::sync::Arc<crate::governance::GovState>>,
+    cost: Option<std::sync::Arc<crate::cost::CostModel>>,
     failover_cfg: Option<crate::config::FailoverCfg>,
     pool_runtime: std::collections::HashMap<String, crate::state::PoolRuntime>,
     fallback_pools: std::collections::HashMap<String, Vec<crate::state::WeightedLane>>,
@@ -670,6 +671,7 @@ impl TestApp {
             pools: std::collections::HashMap::new(),
             auth: None,
             governance: None,
+            cost: None,
             failover_cfg: None,
             pool_runtime: std::collections::HashMap::new(),
             fallback_pools: std::collections::HashMap::new(),
@@ -745,6 +747,14 @@ impl TestApp {
         self.auth = Some(a);
         self
     }
+    /// Install a resolved cost model (rate card / budget groups / flat fee) for tests exercising
+    /// the derived-spend enforcement. Default: `CostModel::flat(1)` - no rate card, no groups,
+    /// the production default 1-cent flat fee.
+    pub(crate) fn cost(mut self, c: crate::cost::CostModel) -> Self {
+        self.cost = Some(std::sync::Arc::new(c));
+        self
+    }
+
     pub(crate) fn governance(mut self, g: std::sync::Arc<crate::governance::GovState>) -> Self {
         self.governance = Some(g);
         self
@@ -813,6 +823,9 @@ impl TestApp {
             fallback_pools: self.fallback_pools,
             on_exhausted_cfgs: self.on_exhausted_cfgs,
             governance: self.governance,
+            cost: self
+                .cost
+                .unwrap_or_else(|| std::sync::Arc::new(crate::cost::CostModel::flat(1))),
             plugins_dir: self
                 .plugins_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("plugins")),

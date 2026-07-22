@@ -218,7 +218,7 @@ fn test_memory_store_cannot_reach_inert_with_keys() {
     // No admin token → engine inert AND the store is empty (RAM starts fresh each boot). There is
     // no keyed-but-inert state to warn about: key_count is 0, so the banner is None regardless.
     let store = Arc::new(MemoryStore::new());
-    let gov = GovState::new(store, 0, 0, None).unwrap();
+    let gov = GovState::new(store, None).unwrap();
     assert!(gov.admin_token_hash().is_none(), "no admin token → inert");
     let key_count = gov.all_keys().map(|k| k.len()).unwrap_or(0);
     assert_eq!(key_count, 0, "a fresh RAM store holds no keys");
@@ -227,7 +227,7 @@ fn test_memory_store_cannot_reach_inert_with_keys() {
 
     // With an admin token the same engine is active — the state a real minted-keys deploy is in.
     let store2 = Arc::new(MemoryStore::new());
-    let gov2 = GovState::new(store2, 0, 0, Some("admintok".to_string())).unwrap();
+    let gov2 = GovState::new(store2, Some("admintok".to_string())).unwrap();
     assert!(gov2.admin_token_hash().is_some(), "admin token → active");
 }
 
@@ -394,7 +394,7 @@ async fn split_admin_listener_no_double_exposure() {
     crate::metrics::init();
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // One configured lane so `/healthz` reports ready (200) rather than "no usable lanes" (503) —
     // the probe URL is never actually dialed here; the test only exercises routing/auth.
     let app = TestApp::new()
@@ -683,7 +683,10 @@ fn plugin_manifest(name: &str, alias: &str, publisher: &str) -> busbar_plugin_si
         kind: "store".into(),
         version: "1.5.0".into(),
         publisher: publisher.into(),
-        abi_version: 1,
+        abi_version: *busbar_plugin_loader::supported_abi("store")
+            .iter()
+            .max()
+            .expect("store abi"),
         sha256: String::new(),
         signature: String::new(),
         description: String::new(),

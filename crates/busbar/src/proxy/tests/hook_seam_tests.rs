@@ -1332,7 +1332,7 @@ async fn max_tokens_saturates_not_wraps() {
 async fn send_user_projects_governance_key_identity() {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = std::sync::Arc::new(MemoryStore::new());
-    let gov = std::sync::Arc::new(GovState::new(store, 0, 0, None).expect("gov state"));
+    let gov = std::sync::Arc::new(GovState::new(store, None).expect("gov state"));
     let (key, secret) = gov
         .create_key(
             NewKeySpec {
@@ -1342,6 +1342,8 @@ async fn send_user_projects_governance_key_identity() {
                 budget_period: "monthly".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1,
         )
@@ -1446,6 +1448,8 @@ async fn send_user_falls_back_to_synthesized_group_key_identity() {
         tpm_limit: None,
         enabled: true,
         created_at: 0,
+        budget_group: None,
+        labels: Default::default(),
     });
     let rc = RequestCtx::new(60);
     let v = body();
@@ -1514,6 +1518,8 @@ async fn forward_with_pool_keyed_threads_group_key_to_pool_policy() {
         tpm_limit: None,
         enabled: true,
         created_at: 0,
+        budget_group: None,
+        labels: Default::default(),
     });
     let body = Bytes::from(serde_json::to_vec(&body()).unwrap());
     let cands = vec![WeightedLane {

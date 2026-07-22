@@ -259,6 +259,7 @@ impl RoutingPolicy for SocketPolicy {
         let ctx = RoutingContext {
             pool: req.pool,
             budget_remaining: None,
+            budget: &[],
         };
         let Ok(mut line) = serde_json::to_vec(&super::wire::build(
             super::wire::OP_TRANSFORM,
@@ -450,6 +451,7 @@ mod tests {
         RoutingContext {
             pool: "p",
             budget_remaining: Some(500),
+            budget: &[],
         }
     }
 

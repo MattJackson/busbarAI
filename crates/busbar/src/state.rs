@@ -260,6 +260,10 @@ pub(crate) struct App {
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
+    /// The resolved COST MODEL (rate card + budget groups + flat fee), rebuilt with the config on
+    /// every apply/reload while `governance` (the token ledger) survives the swap - which is what
+    /// makes a rate-card correction reprice every past and future derived figure on the next read.
+    pub(crate) cost: std::sync::Arc<crate::cost::CostModel>,
     /// The directory the signed plugin tarballs live in (`plugins.dir`, default `plugins`). Carried
     /// on the snapshot so the Admin API plugin catalog (`GET /api/v1/admin/plugins?type=store`) and
     /// the install/remove/reload endpoints operate on the SAME directory the boot store-load

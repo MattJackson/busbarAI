@@ -548,12 +548,28 @@ pub(crate) fn validate_with_unset(
             // and a member can be silently mis-ranked), and a NEGATIVE cost is nonsensical and would
             // sort ahead of every legitimate member. Reject both at boot rather than ship a broken
             // ranking. (An UNSET cost is fine — it's inert and only the `cheapest` policy reads it.)
-            if let Some(cost) = member.cost_per_mtok {
-                if !cost.is_finite() || cost < 0.0 {
+            if let Some(cost) = &member.cost_per_mtok {
+                let scalar = cost.per_mtok();
+                if !scalar.is_finite() || scalar < 0.0 {
                     errors.push(format!(
                         "pool '{}' member '{}' cost_per_mtok must be a finite, non-negative number (got {}); it drives the 'cheapest' policy's sort, which a NaN or negative value corrupts",
-                        pool_name, member.target, cost
+                        pool_name, member.target, scalar
                     ));
+                }
+                if let Some(tiered) = cost.tiered() {
+                    for (tier, v) in [
+                        ("input_utok", tiered.input_utok),
+                        ("output_utok", tiered.output_utok),
+                        ("cache_read_utok", tiered.cache_read_utok),
+                        ("cache_write_utok", tiered.cache_write_utok),
+                    ] {
+                        if !v.is_finite() || v < 0.0 {
+                            errors.push(format!(
+                                "pool '{}' member '{}' cost_per_mtok.{tier} must be a finite, non-negative number (got {v})",
+                                pool_name, member.target
+                            ));
+                        }
+                    }
                 }
             }
             // Member-level `attempt_timeout_ms: 0` — same instant-fail foot-gun as the model-level

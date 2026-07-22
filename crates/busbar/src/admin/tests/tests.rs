@@ -74,7 +74,7 @@ async fn serve_with_gov(gov: Arc<GovState>) -> (std::net::SocketAddr, tokio::tas
 async fn test_admin_v1_info_reports_version_features_and_topology() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -137,7 +137,7 @@ async fn test_admin_v1_topology_reads_pools_models_providers() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let app = TestApp::new()
         .governance(gov)
@@ -219,7 +219,7 @@ async fn test_admin_v1_topology_reads_pools_models_providers() {
 async fn test_api_root_unmatched_paths_speak_the_admin_envelope() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -327,7 +327,7 @@ async fn test_admin_v1_pool_detail_live_status() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new()
         .governance(gov)
         .lane(
@@ -415,7 +415,7 @@ async fn test_admin_v1_pool_detail_live_status() {
 async fn test_admin_v1_admin_auth_read() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -450,7 +450,7 @@ async fn test_admin_v1_get_single_key() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (minted, minted_secret) = gov
         .create_key(
             NewKeySpec {
@@ -460,6 +460,8 @@ async fn test_admin_v1_get_single_key() {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             crate::store::now(),
         )
@@ -503,15 +505,40 @@ async fn test_admin_v1_get_single_key() {
 
 /// `GET /api/v1/admin/usage` is the METERING read: the current UTC-day bucket aggregated per
 /// (model, provider) and per key, each row carrying the raw token SPLIT plus busbar's DERIVED
-/// `spend_micros` (from the configured global prices), under a `window`/`as_of`/`currency`
+/// `spend_micros` (from the configured CostModel rate card + flat fee), under a `window`/`as_of`
 /// header. Never leaks the secret (id/name only).
 #[tokio::test]
 async fn test_admin_v1_usage_meters_by_model_and_key() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    // Prices: 1¢/request + 50¢/1k tokens — the derivation inputs the assertions replay.
-    let gov = Arc::new(GovState::new(store, 1, 50, Some("admintok".to_string())).unwrap());
+    // Prices: 1 cent/request + a rate card of 500 micro-units/token on every tier (the same
+    // blended 50 cents/1k tokens the pre-rate-card assertions were derived from). Spend is now
+    // DERIVED at read time from ledger x rate card, so the CostModel is the derivation input.
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let rate = crate::config::RateEntryCfg {
+        input_utok: 500.0,
+        output_utok: 500.0,
+        cache_read_utok: 500.0,
+        cache_write_utok: 500.0,
+    };
+    let gov_cfg = crate::config::GovernanceCfg {
+        store: "memory".to_string(),
+        db_path: "busbar-governance.db".to_string(),
+        price_per_request_cents: 1,
+        rate_card: Some(
+            [("gpt-x".to_string(), rate), ("claude-z".to_string(), rate)]
+                .into_iter()
+                .collect(),
+        ),
+        budget_groups: Default::default(),
+        admin_token: Some("admintok".to_string()),
+        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
+        rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
+        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
+    };
+    let cost =
+        crate::cost::CostModel::resolve_parts(&gov_cfg, &Default::default(), &Default::default());
     let now = crate::store::now();
     let (minted, minted_secret) = gov
         .create_key(
@@ -522,6 +549,8 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             now,
         )
@@ -547,7 +576,7 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
         .join()
         .unwrap();
     }
-    let app = TestApp::new().governance(gov).build();
+    let app = TestApp::new().governance(gov).cost(cost).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -563,8 +592,9 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
         .json()
         .await
         .unwrap();
-    // Window/freshness/currency header (the audit's #2/#3 findings).
-    assert_eq!(body["currency"], "USD");
+    // Window/freshness header (the audit's #2/#3 findings). No `currency` field anymore: spend
+    // is abstract cost units and currency is the consumer's display concern.
+    assert!(body.get("currency").is_none(), "currency field is gone");
     assert!(body["as_of"].as_u64().unwrap() >= now);
     let (start, end) = (
         body["window"]["start"].as_u64().unwrap(),
@@ -573,8 +603,8 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
     assert_eq!(end - start, 86_400, "one UTC-day metering bucket");
     assert!((start..end).contains(&now));
 
-    // Totals: raw split + derived spend. 3 requests; billable = 2×(700+200+100) = 2000 tokens.
-    // spend = 3 req × 1¢ + 2000 tokens × 50¢/1k = 3¢ + 100¢ = 103¢ = 1_030_000 micro-USD.
+    // Totals: raw split + derived spend. 3 requests; billable = 2x(700+200+100) = 2000 tokens.
+    // spend = 3 req x 10_000 micro + 2000 tokens x 500 utok = 30_000 + 1_000_000 = 1_030_000 micro-units.
     assert_eq!(body["total"]["requests"], 3);
     assert_eq!(body["total"]["tokens_input"], 1400);
     assert_eq!(body["total"]["tokens_output"], 400);
@@ -589,14 +619,17 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
     assert_eq!(x["provider"], "openai");
     assert_eq!(x["requests"], 2);
     assert_eq!(x["tokens_input"], 1400);
-    // 2 req × 1¢ + 2000 × 50¢/1k = 102¢
+    // 2 req x 10_000 micro + 2000 tokens x 500 utok = 1_020_000 micro-units
     assert_eq!(x["spend_micros"], 1_020_000);
     let z = by_model.iter().find(|m| m["model"] == "claude-z").unwrap();
     assert_eq!(
         z["requests"], 1,
         "a flat (zero-token) response still counts"
     );
-    assert_eq!(z["spend_micros"], 10_000, "1 req × 1¢ = 10_000 micro-USD");
+    assert_eq!(
+        z["spend_micros"], 10_000,
+        "1 req x 1 cent = 10_000 micro-units"
+    );
 
     // Per-key attribution names the key; the secret never appears anywhere in the body.
     let by_key = body["by_key"].as_array().unwrap();
@@ -663,7 +696,7 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
     });
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -762,7 +795,7 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
 async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
             "m0",
@@ -895,7 +928,7 @@ pools:
     .unwrap();
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
             "m0",
@@ -1017,7 +1050,7 @@ providers: {}
 async fn test_admin_v1_mutation_rate_limit_config_class() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1066,7 +1099,7 @@ async fn test_admin_v1_mutation_rate_limit_config_class() {
 async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1264,7 +1297,7 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
 async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1413,7 +1446,7 @@ async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
 async fn test_admin_v1_idempotency_key_is_principal_scoped() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1478,7 +1511,7 @@ async fn test_admin_v1_idempotency_key_is_principal_scoped() {
 async fn test_admin_v1_credential_cache_and_flush_endpoint() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1575,7 +1608,7 @@ async fn test_admin_v1_credential_cache_and_flush_endpoint() {
 async fn test_admin_v1_put_auth_dry_run_guard() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1724,7 +1757,7 @@ async fn test_admin_v1_put_auth_dry_run_guard() {
 async fn test_admin_v1_key_idempotent_mint_and_if_match() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1805,7 +1838,7 @@ async fn test_admin_v1_key_idempotent_mint_and_if_match() {
 async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1846,7 +1879,7 @@ async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
 async fn test_admin_v1_key_rotate_and_pagination() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov.clone()).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1965,7 +1998,7 @@ async fn test_admin_v1_key_rotate_and_pagination() {
 async fn test_admin_v1_put_hook_replaces_live_with_guards() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2082,7 +2115,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
 async fn test_admin_v1_config_versions_rollback_and_diff() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2184,7 +2217,7 @@ async fn test_admin_v1_config_versions_rollback_and_diff() {
 async fn test_admin_v1_register_hook_takes_effect_live() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2356,7 +2389,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
 async fn test_admin_v1_audit_records_mutations() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2442,7 +2475,7 @@ async fn test_admin_v1_audit_records_mutations() {
 async fn test_admin_v1_hook_mutation_404_is_audited() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2519,7 +2552,7 @@ async fn test_admin_v1_list_keys_filters() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (minted, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -2529,6 +2562,8 @@ async fn test_admin_v1_list_keys_filters() {
                 budget_period: "total".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             crate::store::now(),
         )
@@ -2583,7 +2618,7 @@ async fn test_admin_v1_list_keys_filters() {
 async fn test_admin_v1_config_plane_golden_path() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("t".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("t".to_string())).unwrap());
     let overlay = std::env::temp_dir().join(format!(
         "busbar-golden-{}-{}.json",
         std::process::id(),
@@ -2697,7 +2732,7 @@ async fn test_admin_v1_config_plane_golden_path() {
 async fn test_admin_v1_hook_register_persists_to_overlay() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let overlay = std::env::temp_dir().join(format!(
         "busbar-persist-test-{}-{}.json",
         std::process::id(),
@@ -2755,7 +2790,7 @@ async fn test_admin_v1_hook_register_persists_to_overlay() {
 async fn test_admin_v1_audit_records_key_mutations() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2806,7 +2841,7 @@ async fn test_admin_v1_audit_records_key_mutations() {
 async fn test_admin_v1_base_hook_is_read_only_via_api() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let base: crate::config::HookCfg = serde_json::from_value(serde_json::json!({
         "kind": "gate", "webhook": "http://127.0.0.1:9990/", "prompt": "no", "global": true
     }))
@@ -2877,7 +2912,7 @@ async fn test_admin_v1_base_hook_is_read_only_via_api() {
 async fn test_admin_v1_delete_hook_takes_effect_live() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2943,7 +2978,7 @@ async fn test_admin_v1_delete_hook_takes_effect_live() {
 async fn test_admin_v1_hooks_read_surface() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
@@ -3027,7 +3062,7 @@ async fn test_admin_v1_hooks_read_surface() {
 async fn test_admin_v1_hook_health_best_effort() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let mk = |socket: Option<&str>, webhook: Option<&str>| crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
         socket: socket.map(str::to_string),
@@ -3100,7 +3135,7 @@ async fn test_admin_v1_hook_health_best_effort() {
 async fn test_admin_v1_plugins_catalog_by_type() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
         socket: Some("/run/busbar/h.sock".to_string()),
@@ -3185,7 +3220,7 @@ async fn test_admin_v1_plugins_catalog_by_type() {
 async fn test_admin_v1_auth_read() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3218,7 +3253,7 @@ async fn test_admin_v1_auth_read() {
 async fn test_admin_v1_config_validate_dry_run() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3280,7 +3315,7 @@ async fn test_admin_v1_config_effective_snapshot_no_secrets() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
         socket: None,
@@ -3371,7 +3406,7 @@ async fn test_admin_v1_config_effective_snapshot_no_secrets() {
 async fn test_admin_v1_openapi_paths_all_resolve() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3441,7 +3476,7 @@ async fn test_admin_v1_openapi_paths_all_resolve() {
 async fn test_admin_v1_all_reads_require_admin_token() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3492,7 +3527,7 @@ async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_re
     // ONCE at creation; neither the AWS secret nor the key_hash is ever returned by a later read.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -3563,7 +3598,7 @@ async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
     // handlers must still return the same responses (no secret/hash leak; usage resolves).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -3647,7 +3682,7 @@ async fn test_create_key_rejects_unknown_budget_period() {
     // valid period (and the default when omitted) must still create the key.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
@@ -3729,7 +3764,7 @@ async fn test_create_key_rejects_unknown_budget_period() {
 async fn test_admin_malformed_body_returns_generic_400_no_input_fragment() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -3792,7 +3827,7 @@ async fn test_create_key_rejects_negative_max_budget_cents() {
     // omitted field (unlimited), must all still create the key.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
@@ -3869,7 +3904,7 @@ async fn test_patch_key_enables_disables_and_validates_at_create_parity() {
     // adjust caps; it is admin-gated and rejects the same invalid values create() does.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1/admin/keys");
@@ -3947,7 +3982,7 @@ async fn test_create_key_rejects_zero_rate_limits() {
     // diagnostic. Both fields must 400; a positive value, and omission (unlimited), must create it.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
@@ -4022,7 +4057,7 @@ async fn test_patch_key_clears_caps_to_unlimited_via_null() {
     // cap could never be cleared once set. Verify the full matrix end-to-end through the handler.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1/admin/keys");
@@ -4148,7 +4183,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
 
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // App has exactly one configured pool, "smart" (lane 0). "smrt" is the typo'd sibling.
     let app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
@@ -4243,7 +4278,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
 async fn test_delete_existing_key_returns_200() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4253,6 +4288,8 @@ async fn test_delete_existing_key_returns_200() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4278,7 +4315,7 @@ async fn test_delete_existing_key_returns_200() {
 async fn test_delete_missing_key_returns_404() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -4305,7 +4342,7 @@ async fn test_delete_key_is_not_idempotent_204() {
     // real revocation, not a no-op masquerading as success).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4315,6 +4352,8 @@ async fn test_delete_key_is_not_idempotent_204() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4347,7 +4386,7 @@ async fn test_concurrent_delete_returns_exactly_one_204() {
     // winner returns 204 and every loser returns 404. Fire a burst and assert exactly one 204.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4357,6 +4396,8 @@ async fn test_concurrent_delete_returns_exactly_one_204() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4409,7 +4450,7 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
     // contract: PATCH on a deleted key 404s and leaves it deleted (a later GET/usage stays 404).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4419,6 +4460,8 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4520,21 +4563,18 @@ impl crate::governance::Store for BarrierStore {
     }
     fn get_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-    ) -> crate::governance::StoreResult<crate::governance::Usage> {
-        self.inner.get_usage(key_id, window_start)
+    ) -> crate::governance::StoreResult<busbar_api::UsageLedger> {
+        self.inner.get_usage(bucket_id, window_start)
     }
     fn put_usage(
         &self,
-        key_id: &str,
+        bucket_id: &str,
         window_start: u64,
-        spend_cents: i64,
-        tokens: u64,
-        requests: u64,
+        ledger: &busbar_api::UsageLedger,
     ) -> crate::governance::StoreResult<()> {
-        self.inner
-            .put_usage(key_id, window_start, spend_cents, tokens, requests)
+        self.inner.put_usage(bucket_id, window_start, ledger)
     }
     fn add_metering(
         &self,
@@ -4574,7 +4614,7 @@ async fn test_patch_interleaved_with_delete_never_resurrects_key() {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     });
-    let gov = Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4584,6 +4624,8 @@ async fn test_patch_interleaved_with_delete_never_resurrects_key() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4669,7 +4711,7 @@ async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     });
-    let gov = Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4679,6 +4721,8 @@ async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4787,7 +4831,7 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     });
-    let gov = Arc::new(GovState::new(store.clone(), 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4797,6 +4841,8 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
                 budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             0,
         )
@@ -4874,7 +4920,7 @@ async fn serve_with_plugins_dir(
     dir: std::path::PathBuf,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // The lifecycle test installs an UNSIGNED plugin tarball, so opt in to unsigned plugins (the
     // trust DEFAULT rejects unsigned artifacts). The trust-default behavior itself is covered by
     // the dedicated trust tests; this test is about the install/list/reload/remove lifecycle.
@@ -4906,7 +4952,10 @@ fn admin_test_tarball(name: &str, alias: &str) -> Vec<u8> {
         kind: "store".into(),
         version: "1.0.0".into(),
         publisher: "acme".into(),
-        abi_version: 1,
+        abi_version: *busbar_plugin_loader::supported_abi("store")
+            .iter()
+            .max()
+            .expect("store abi"),
         sha256: busbar_plugin_sign::sha256_hex(lib),
         signature: String::new(),
         description: String::new(),
@@ -5092,7 +5141,7 @@ async fn test_admin_v1_plugin_install_rejections() {
     // TRUST NO-BYPASS: a STRICT-posture server rejects an unsigned upload as 409 conflict.
     {
         let store = Arc::new(MemoryStore::new());
-        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
         let strict_dir = std::env::temp_dir().join(format!(
             "busbar-admin-plugins-strict-{}",
             std::process::id()

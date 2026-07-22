@@ -198,21 +198,24 @@ async fn apply_global_rewrites_chains_in_order() {
     assert_eq!(v["messages"][0]["content"], "B");
 }
 
-// Regression for #29: the token fee charged at response completion must be attributed to the
+// Regression for #29: the token accrual at response completion must be attributed to the
 // SAME budget window the request was admitted in (`UsageSink::charged_at`, the header-arrival
 // epoch), NOT a fresh `store::now()` read at completion time. With a `daily` budget period, a
 // request that arrives on day N but whose (buffered or streamed) response is accounted "now" on
-// day N+1 would, under the old `now()`-based code, charge the token fee into day N+1's window —
-// splitting it from the flat per-request fee (charged into day N by `ingress::budget_check`→`try_charge_request_within_budget`). The fix
-// threads `charged_at` so both land in day N. We pin `charged_at` to a fixed past day and assert
-// the spend lands in THAT day's window regardless of the real wall clock (which is always later).
+// day N+1 would, under the old `now()`-based code, ledger the tokens into day N+1's window -
+// splitting them from the flat per-request fee (charged into day N by `ingress::budget_check`→
+// `try_charge_request_within_budget`). The fix threads `charged_at` so both land in day N. We pin
+// `charged_at` to a fixed past day and assert the tokens land in THAT day's window regardless of
+// the real wall clock (which is always later). (Spend is DERIVED now; with a flat cost model the
+// window-attribution intent is asserted on the token ledger itself.)
 #[test]
 fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
     use crate::governance::{GovState, MemoryStore, NewKeySpec, SECS_PER_DAY};
 
     let store = Arc::new(MemoryStore::new());
-    // 0c per request, 100c per 1k tokens → a 1000-token response costs 100c.
-    let gov = Arc::new(GovState::new(store, 0, 100, None).expect("gov"));
+    let gov = Arc::new(GovState::new(store, None).expect("gov"));
+    // No per-request fee, no rate card: token accrual changes `tokens`, never `spend_cents`.
+    let cost = Arc::new(crate::cost::CostModel::flat(0));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -222,6 +225,8 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
                 budget_period: "daily".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
@@ -239,9 +244,24 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
 
     let sink = Some(UsageSink {
         gov: gov.clone(),
+        cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
     });
+
+    // `record_ir_usage` ledgers per-model tokens keyed by the lane's wire model, so it needs a
+    // real Lane; build one through the TestApp lane machinery (the upstream is never contacted).
+    let lane_app = crate::test_support::TestApp::new()
+        .lane(
+            crate::test_support::LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            )
+            .provider("zai"),
+        )
+        .build();
+    let lane = lane_app.lanes[0].clone();
 
     // A buffered completion carrying 600 input + 400 output = 1000 tokens, sourced from IrUsage
     // (Change A: billing now reads the IR usage the egress reader decoded, not a byte-scan).
@@ -251,27 +271,27 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
         cache_creation_input_tokens: None,
         cache_read_input_tokens: None,
     };
-    record_ir_usage(&usage, &sink, None);
+    record_ir_usage(&usage, &sink, Some(&lane));
 
-    // The 100c token fee must be in the charged_at day's window...
+    // The 1000 tokens must be ledgered in the charged_at day's window...
     let in_window = gov
-        .usage_for(&key.id, charged_at)
+        .usage_for(&cost, &key.id, charged_at)
         .expect("usage read")
-        .map(|u| u.spend_cents)
+        .map(|u| u.tokens)
         .unwrap_or(0);
     assert_eq!(
-        in_window, 100,
-        "token fee must be attributed to the charged_at (header-arrival) day window"
+        in_window, 1000,
+        "token accrual must be attributed to the charged_at (header-arrival) day window"
     );
     // ...and NOT in today's window (which the old `now()`-based code would have used).
     let in_today = gov
-        .usage_for(&key.id, crate::store::now())
+        .usage_for(&cost, &key.id, crate::store::now())
         .expect("usage read")
-        .map(|u| u.spend_cents)
+        .map(|u| u.tokens)
         .unwrap_or(0);
     assert_eq!(
         in_today, 0,
-        "token fee must NOT leak into the wall-clock 'now' window (the #29 split bug)"
+        "token accrual must NOT leak into the wall-clock 'now' window (the #29 split bug)"
     );
 }
 
@@ -285,8 +305,9 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
 
     let store = Arc::new(MemoryStore::new());
-    // 0c/request, 0c/1k tokens → the gov spend math can't overflow, isolating the SUM under test.
-    let gov = Arc::new(GovState::new(store, 0, 0, None).expect("gov"));
+    // No fee, no rate card → the derived-spend math can't overflow, isolating the SUM under test.
+    let gov = Arc::new(GovState::new(store, None).expect("gov"));
+    let cost = Arc::new(crate::cost::CostModel::flat(0));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -296,15 +317,32 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
                 budget_period: "daily".to_string(),
                 rpm_limit: None,
                 tpm_limit: None,
+                budget_group: None,
+                labels: Default::default(),
             },
             1_700_000_000,
         )
         .expect("create key");
     let sink = Some(UsageSink {
         gov: gov.clone(),
+        cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at: 1_700_000_000,
     });
+
+    // The accrual path only runs with a serving lane (no lane = nothing to attribute), so build
+    // one through the TestApp lane machinery; the upstream is never contacted.
+    let lane_app = crate::test_support::TestApp::new()
+        .lane(
+            crate::test_support::LaneSpec::new(
+                "m",
+                crate::proto::Protocol::openai(),
+                "http://127.0.0.1:1",
+            )
+            .provider("zai"),
+        )
+        .build();
+    let lane = lane_app.lanes[0].clone();
 
     // input_tokens + output_tokens overflows u64: u64::MAX + 5 would panic under an unchecked `+`.
     let usage = IrUsage {
@@ -314,7 +352,7 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
         cache_read_input_tokens: None,
     };
     // Must NOT panic (the assertion is reaching this line at all under a debug-overflow build).
-    record_ir_usage(&usage, &sink, None);
+    record_ir_usage(&usage, &sink, Some(&lane));
 }
 
 #[test]
