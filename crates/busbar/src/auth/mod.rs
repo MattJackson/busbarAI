@@ -806,8 +806,12 @@ pub(crate) async fn auth_middleware(
     // other route. Operators scraping from a localhost sidecar use a configured token (or run under
     // `none`/`passthrough` mode, where `validate_token` admits unconditionally). Clone the path so
     // no immutable borrow of `req` is held while we later mutate its extensions.
+    // Stage timer for the middleware's OWN work; taken (recording) before every `next.run` below so
+    // downstream handler time is never attributed to auth. No-op unless `BUSBAR_PROFILE` is set.
+    let mut _mw = crate::profile::start(crate::profile::Stage::MwAuth);
     let path = req.uri().path().to_owned();
     if path == HEALTHZ_PATH {
+        drop(_mw.take());
         return Ok(next.run(req).await);
     }
 
@@ -957,6 +961,7 @@ pub(crate) async fn auth_middleware(
         // through to the governance resolution below and is fully governed.
         req.extensions_mut()
             .insert(crate::governance::GovCtx::default());
+        drop(_mw.take());
         return Ok(next.run(req).await);
     }
 
@@ -1083,6 +1088,7 @@ pub(crate) async fn auth_middleware(
                     req.extensions_mut().insert(crate::governance::GovCtx {
                         key: Some(std::sync::Arc::new(key)),
                     });
+                    drop(_mw.take());
                     Ok(next.run(req).await)
                 }
                 // EVERY failure (missing/malformed header, unknown AccessKeyId, expired date,
@@ -1160,6 +1166,7 @@ pub(crate) async fn auth_middleware(
             .insert(crate::governance::GovCtx { key: synth });
     }
 
+    drop(_mw.take());
     Ok(next.run(req).await)
 }
 

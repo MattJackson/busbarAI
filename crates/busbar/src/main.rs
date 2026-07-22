@@ -422,6 +422,15 @@ fn main() {
             spawn_jemalloc_idle_purge_fallback();
         }
     }
+    // BUSBAR_PROFILE set → periodically dump the per-stage breakdown to stderr (every 20 s), so a
+    // live benchmark run reports stage timings without the in-process test driver. Measurement-only
+    // opt-in, absent from any production deployment; zero cost when the env is unset.
+    if crate::profile::enabled() {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            crate::profile::dump();
+        });
+    }
     // Worker-thread count. `BUSBAR_WORKER_THREADS` is the operator override; the DEFAULT is one worker
     // per available core (`available_parallelism`, which respects CPU affinity and cgroup cpuset — but
     // NOT the CFS bandwidth quota `cpu.max`, which it cannot see). So on a quota-limited pod (e.g. 2 CPUs

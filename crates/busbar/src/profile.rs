@@ -32,6 +32,9 @@ use std::time::Instant;
 /// sync with the `start`/`record` call sites; a stage with no call site simply reports zero samples.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stage {
+    /// `auth_middleware` pre-handler work: carrier token extract + chain/cache verdict + extension
+    /// inserts (the span ends BEFORE `next.run`, so downstream time is not attributed here).
+    MwAuth,
     /// Body already-parsed handling + candidate op-support filter + wants_stream/affinity derivation
     /// (the pre-dispatch bookkeeping in `forward_with_pool_parsed_inner` before the failover loop).
     Prepare,
@@ -70,6 +73,7 @@ impl Stage {
     #[cfg_attr(not(test), allow(dead_code))]
     fn name(self) -> &'static str {
         match self {
+            Stage::MwAuth => "mw_auth",
             Stage::Prepare => "prepare",
             Stage::LanePick => "lane_pick",
             Stage::TranslateReq => "translate_req",
@@ -92,7 +96,7 @@ impl Stage {
 }
 
 /// Number of `Stage` variants (the bucket-array length). Must equal the number of enum arms above.
-const STAGE_COUNT: usize = 12;
+const STAGE_COUNT: usize = 13;
 
 /// One-shot env read: profiling is ON iff `BUSBAR_PROFILE` is present (any value) in the environment.
 /// Read exactly once and cached in an `AtomicBool` so the hot-path check is a single relaxed load.
@@ -181,6 +185,7 @@ pub(crate) fn dump() {
     let mut b = buckets().lock().unwrap_or_else(|p| p.into_inner());
     // Iterate in enum order for a stable, readable report.
     let stages = [
+        Stage::MwAuth,
         Stage::Prepare,
         Stage::LanePick,
         Stage::TranslateReq,
