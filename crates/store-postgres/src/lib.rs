@@ -273,6 +273,38 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    fn add_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        delta_spend_cents: i64,
+        delta_tokens: i64,
+        delta_requests: i64,
+    ) -> StoreResult<()> {
+        // ADDITIVE fleet-honest accumulate: one atomic UPSERT adding each signed delta, floored at
+        // 0 (a refund can never drive a durable counter negative). N nodes flushing deltas sum to
+        // the true fleet total, where `put_usage`'s absolute overwrite is last-writer-wins.
+        let ws = clamp(window_start);
+        self.lock()
+            .execute(
+                "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
+                 VALUES ($1,$2,GREATEST(0,$3),GREATEST(0,$4),GREATEST(0,$5))
+                 ON CONFLICT (key_id, window_start) DO UPDATE SET
+                    spend_cents = GREATEST(0, usage_counters.spend_cents + $3),
+                    tokens      = GREATEST(0, usage_counters.tokens + $4),
+                    requests    = GREATEST(0, usage_counters.requests + $5)",
+                &[
+                    &key_id,
+                    &ws,
+                    &delta_spend_cents,
+                    &delta_tokens,
+                    &delta_requests,
+                ],
+            )
+            .store()?;
+        Ok(())
+    }
+
     fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
         let (bucket, ti, to, tcr, tcc) = (
             clamp(d.bucket),
@@ -523,6 +555,22 @@ mod tests {
         store.put_usage("vk_pg", 100, 42, 9, 3).unwrap();
         let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 9, 3));
+
+        // ADDITIVE fleet flush primitive: add_usage accumulates signed deltas on top (and a
+        // negative delta refunds, floored at 0).
+        store.add_usage("vk_pg", 100, 8, 1, 2).unwrap();
+        let u = store.get_usage("vk_pg", 100).unwrap();
+        assert_eq!(
+            (u.spend_cents, u.tokens, u.requests),
+            (50, 10, 5),
+            "add_usage accumulates deltas"
+        );
+        store.add_usage("vk_pg", 100, -100, 0, 0).unwrap();
+        assert_eq!(
+            store.get_usage("vk_pg", 100).unwrap().spend_cents,
+            0,
+            "an over-refund floors at 0, never negative"
+        );
 
         // METERING: the billing-critical raw-consumption UPSERT. Two deltas for the SAME
         // (key, bucket, model, provider) must ACCUMULATE (ON CONFLICT DO UPDATE), not overwrite -

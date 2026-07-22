@@ -203,6 +203,40 @@ impl Store for DynStore {
         }
     }
 
+    fn add_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        delta_spend_cents: i64,
+        delta_tokens: i64,
+        delta_requests: i64,
+    ) -> StoreResult<()> {
+        // A plugin built against an OLDER SDK never learned this variant and rejects it (a
+        // protocol/decode error). Fall back to the trait-default read-modify-write (get + put) so
+        // the flush still lands against old plugins - with the documented single-writer caveat; a
+        // new plugin performs the native atomic accumulate.
+        match self.call_raw(StoreRequest::AddUsage {
+            key_id: key_id.to_string(),
+            window_start,
+            delta_spend_cents,
+            delta_tokens,
+            delta_requests,
+        }) {
+            Ok(StoreResponse::Unit) => Ok(()),
+            Ok(other) => Err(unexpected(other)),
+            Err(_) => {
+                let cur = self.get_usage(key_id, window_start)?;
+                self.put_usage(
+                    key_id,
+                    window_start,
+                    cur.spend_cents.saturating_add(delta_spend_cents).max(0),
+                    cur.tokens.saturating_add_signed(delta_tokens),
+                    cur.requests.saturating_add_signed(delta_requests),
+                )
+            }
+        }
+    }
+
     fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
         match self.call_raw(StoreRequest::AddMetering(delta.clone()))? {
             StoreResponse::Unit => Ok(()),

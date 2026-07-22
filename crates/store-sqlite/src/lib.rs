@@ -565,6 +565,37 @@ impl Store for SqliteStore {
         )
     }
 
+    fn add_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        delta_spend_cents: i64,
+        delta_tokens: i64,
+        delta_requests: i64,
+    ) -> StoreResult<()> {
+        // ADDITIVE fleet-honest accumulate: adds each signed delta atomically (one UPSERT), floored
+        // at 0 so a refund can never drive a durable counter negative. Distinct from `put_usage`'s
+        // absolute overwrite (single-writer) and the legacy `add_usage_inner` charge path.
+        let conn = Self::lock_conn_raw(&self.conn);
+        conn.execute(
+            "INSERT INTO usage_counters (key_id, window_start, spend_cents, tokens, requests)
+             VALUES (?1,?2,MAX(0,?3),MAX(0,?4),MAX(0,?5))
+             ON CONFLICT(key_id, window_start) DO UPDATE SET
+                spend_cents = MAX(0, spend_cents + ?3),
+                tokens      = MAX(0, tokens + ?4),
+                requests    = MAX(0, requests + ?5)",
+            params![
+                key_id,
+                window_start as i64,
+                delta_spend_cents,
+                delta_tokens,
+                delta_requests
+            ],
+        )
+        .store()?;
+        Ok(())
+    }
+
     fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
         Self::add_metering_inner(&self.conn, delta)
     }
@@ -741,6 +772,26 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The TRAIT `add_usage` (fleet-additive flush primitive) accumulates signed deltas atomically
+    /// and floors at 0 on an over-refund — distinct from `put_usage`'s absolute overwrite.
+    #[test]
+    fn trait_add_usage_accumulates_and_floors() {
+        use busbar_api::Store as _;
+        let s = SqliteStore::open(":memory:", 5000).unwrap();
+        s.put_usage("k_add", 100, 42, 9, 3).unwrap();
+        Store::add_usage(&s, "k_add", 100, 8, 1, 2).unwrap();
+        let u = s.get_usage("k_add", 100).unwrap();
+        assert_eq!((u.spend_cents, u.tokens, u.requests), (50, 10, 5));
+        // Negative (refund) delta lands; an over-refund floors at 0.
+        Store::add_usage(&s, "k_add", 100, -60, -20, -10).unwrap();
+        let u = s.get_usage("k_add", 100).unwrap();
+        assert_eq!((u.spend_cents, u.tokens, u.requests), (0, 0, 0));
+        // Fresh row via add alone (INSERT arm), floored on a negative first delta.
+        Store::add_usage(&s, "k_new", 100, -5, 7, 1).unwrap();
+        let u = s.get_usage("k_new", 100).unwrap();
+        assert_eq!((u.spend_cents, u.tokens, u.requests), (0, 7, 1));
+    }
     use super::*;
     use busbar_api::{Store, VirtualKey};
     use rusqlite::params;

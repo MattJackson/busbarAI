@@ -86,6 +86,15 @@ struct BudgetCell {
     tokens: u64,
     requests: u64,
     dirty: bool,
+    /// The last DURABLY-ACKNOWLEDGED values for this window — the additive-flush baseline. Each
+    /// flush writes only the DELTA (current - flushed) via `Store::add_usage`, then advances these
+    /// on success, so a shared store accumulates the TRUE fleet total across nodes instead of
+    /// being last-writer-wins overwritten. On a failed flush the baseline does not advance and the
+    /// cell is re-marked dirty, so the unacked delta is retried (at-least-once: an ack lost after
+    /// the write landed can double-count at most one flush interval — documented).
+    flushed_spend_cents: i64,
+    flushed_tokens: u64,
+    flushed_requests: u64,
 }
 
 /// Number of shards for the per-key enforcement maps (`rate`, `budget`, `token_spend_carry`). A

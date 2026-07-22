@@ -95,6 +95,23 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    fn add_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        delta_spend_cents: i64,
+        delta_tokens: i64,
+        delta_requests: i64,
+    ) -> StoreResult<()> {
+        // ADDITIVE accumulate under the write lock (atomic within this process), floored at 0.
+        let mut usage = self.usage();
+        let u = usage.entry((key_id.to_string(), window_start)).or_default();
+        u.spend_cents = u.spend_cents.saturating_add(delta_spend_cents).max(0);
+        u.tokens = u.tokens.saturating_add_signed(delta_tokens);
+        u.requests = u.requests.saturating_add_signed(delta_requests);
+        Ok(())
+    }
+
     fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
         let mut m = self.metering();
         let e = m

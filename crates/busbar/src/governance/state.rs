@@ -151,6 +151,9 @@ impl GovState {
                         tokens: 0,
                         requests: 0,
                         dirty: false,
+                        flushed_spend_cents: 0,
+                        flushed_tokens: 0,
+                        flushed_requests: 0,
                     };
                     c
                 }
@@ -161,6 +164,9 @@ impl GovState {
                     tokens: 0,
                     requests: 0,
                     dirty: false,
+                    flushed_spend_cents: 0,
+                    flushed_tokens: 0,
+                    flushed_requests: 0,
                 }),
             };
             cell.spend_cents = cell.spend_cents.saturating_add(spend);
@@ -512,6 +518,12 @@ impl GovState {
                                 tokens: u.tokens,
                                 requests: u.requests,
                                 dirty: false,
+                                // The durable record ALREADY holds these values (possibly including
+                                // other nodes' spend): the additive-flush baseline starts here so
+                                // the first flush sends only the LOCAL delta accrued after boot.
+                                flushed_spend_cents: u.spend_cents,
+                                flushed_tokens: u.tokens,
+                                flushed_requests: u.requests,
                             },
                         );
                     }
@@ -862,6 +874,9 @@ impl GovState {
                     tokens: 0,
                     requests: 0,
                     dirty: false,
+                    flushed_spend_cents: 0,
+                    flushed_tokens: 0,
+                    flushed_requests: 0,
                 };
                 c
             }
@@ -871,6 +886,9 @@ impl GovState {
                 tokens: 0,
                 requests: 0,
                 dirty: false,
+                flushed_spend_cents: 0,
+                flushed_tokens: 0,
+                flushed_requests: 0,
             }),
         };
         // CAP CHECK: reject WITHOUT charging if the post-charge spend would exceed the cap. Saturating
@@ -936,6 +954,9 @@ impl GovState {
                         tokens: 0,
                         requests: 0,
                         dirty: false,
+                        flushed_spend_cents: 0,
+                        flushed_tokens: 0,
+                        flushed_requests: 0,
                     };
                     c
                 }
@@ -946,6 +967,9 @@ impl GovState {
                     tokens: 0,
                     requests: 0,
                     dirty: false,
+                    flushed_spend_cents: 0,
+                    flushed_tokens: 0,
+                    flushed_requests: 0,
                 }),
             };
             cell.spend_cents = cell.spend_cents.saturating_add(fee);
@@ -962,24 +986,42 @@ impl GovState {
         self.add_rate_tokens(&key.id, now, tokens);
     }
 
-    /// WRITE-BEHIND flush of the dirty in-memory budget cells to the durable store. Runs OFF the
-    /// request hot path (the periodic flusher + the graceful-shutdown arm). Under `budget_write`, snap
-    /// each dirty cell's absolute values and clear its dirty flag; then OFF the lock, `put_usage`
-    /// (ABSOLUTE set, idempotent) each snapshot. On a store error, log and RE-MARK that cell dirty (if
-    /// it still holds the same window) so the accrued increment is retried on the next flush rather
-    /// than lost. Snapshotting under the lock but writing off it keeps the hot-path lock hold O(dirty)
-    /// and never blocks a charge on SQLite. Returns the number of cells flushed.
+    /// WRITE-BEHIND flush of the dirty in-memory budget cells to the durable store — ADDITIVE, so
+    /// the shared store reflects the TRUE FLEET TOTAL. Runs OFF the request hot path (the periodic
+    /// flusher + the graceful-shutdown arm).
+    ///
+    /// Under each shard lock, snapshot every dirty cell's DELTA since its last acknowledged flush
+    /// (current - flushed baseline) and clear its dirty flag; then OFF the lock, `add_usage`
+    /// (atomic accumulate in the store) each delta and advance the cell's acked baseline on
+    /// success. With N nodes sharing one store, each node's deltas SUM into the durable record —
+    /// where the old absolute `put_usage` overwrite made the record whichever node flushed last.
+    ///
+    /// On a store error, log, RE-MARK the cell dirty, and do NOT advance the baseline, so the
+    /// unacked delta is retried next tick (at-least-once: an ack lost after the write landed can
+    /// double-count at most one flush interval — the honest trade for fleet additivity; the
+    /// in-memory admission cap is unaffected). Snapshotting under the lock but writing off it keeps
+    /// the hot-path lock hold O(dirty). Returns the number of cells flushed.
     pub(crate) fn flush_budgets(&self) -> usize {
-        // Snapshot dirty cells across ALL shards and clear their flags. One shard is locked at a time
-        // (the `write_all` iterator acquires each guard lazily), so a concurrent per-key charge blocks
-        // only on the single shard the snapshot currently holds, not the whole map.
-        let mut dirty: Vec<(String, u64, i64, u64, u64)> = Vec::new();
+        /// Clamp a u64 counter into the signed delta domain.
+        fn signed(v: u64) -> i64 {
+            i64::try_from(v).unwrap_or(i64::MAX)
+        }
+        // Snapshot dirty cells across ALL shards and clear their flags. One shard is locked at a
+        // time (the `write_all` iterator acquires each guard lazily), so a concurrent per-key
+        // charge blocks only on the single shard the snapshot currently holds, not the whole map.
+        // Tuple: (id, window, delta_spend, delta_tokens, delta_requests, cur_spend, cur_tokens,
+        // cur_requests) — the `cur_*` become the new acked baseline on success.
+        #[allow(clippy::type_complexity)]
+        let mut dirty: Vec<(String, u64, i64, i64, i64, i64, u64, u64)> = Vec::new();
         for mut map in self.budget.write_all() {
             for (id, cell) in map.iter_mut() {
                 if cell.dirty {
                     dirty.push((
                         id.clone(),
                         cell.window_start,
+                        cell.spend_cents - cell.flushed_spend_cents,
+                        signed(cell.tokens) - signed(cell.flushed_tokens),
+                        signed(cell.requests) - signed(cell.flushed_requests),
                         cell.spend_cents,
                         cell.tokens,
                         cell.requests,
@@ -989,14 +1031,37 @@ impl GovState {
             }
         }
         let mut flushed = 0usize;
-        for (id, window, spend, tokens, requests) in dirty {
-            match self.store.put_usage(&id, window, spend, tokens, requests) {
-                Ok(()) => flushed += 1,
+        for (id, window, d_spend, d_tokens, d_requests, cur_spend, cur_tokens, cur_requests) in
+            dirty
+        {
+            let outcome = if d_spend == 0 && d_tokens == 0 && d_requests == 0 {
+                // Nothing new since the last acked flush (e.g. a charge fully refunded back to the
+                // baseline): the durable record is already correct; skip the store round-trip.
+                Ok(())
+            } else {
+                self.store
+                    .add_usage(&id, window, d_spend, d_tokens, d_requests)
+            };
+            match outcome {
+                Ok(()) => {
+                    flushed += 1;
+                    // Advance the acked baseline — only if the cell still holds the SAME window (a
+                    // rollover since the snapshot reset the cell; its zeroed baseline is already
+                    // correct for the new window).
+                    let mut map = self.budget.write(&id);
+                    if let Some(cell) = map.get_mut(&id) {
+                        if cell.window_start == window {
+                            cell.flushed_spend_cents = cur_spend;
+                            cell.flushed_tokens = cur_tokens;
+                            cell.flushed_requests = cur_requests;
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(key = %id, error = %e, "budget flush failed; will retry next tick");
-                    // RE-MARK dirty so the increment is not lost — only if the cell still exists for the
-                    // SAME window (a rollover since the snapshot means those values are already stale and
-                    // must not resurrect an old window's spend).
+                    // RE-MARK dirty so the delta is not lost — only if the cell still exists for
+                    // the SAME window (after a rollover the old window's unacked delta is dropped
+                    // with the cell, exactly as the pre-additive flusher behaved).
                     let mut map = self.budget.write(&id);
                     if let Some(cell) = map.get_mut(&id) {
                         if cell.window_start == window {

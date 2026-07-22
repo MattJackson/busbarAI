@@ -242,8 +242,10 @@ pub trait Store: Send + Sync + 'static {
     fn delete_key(&self, id: &str) -> StoreResult<()>;
     fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage>;
 
-    /// Write-behind ABSOLUTE set of a key's window counter (memory is authoritative). SETS (not adds)
-    /// spend/tokens/requests to the given values. Used only by the budget flusher.
+    /// Write-behind ABSOLUTE set of a key's window counter. SETS (not adds) spend/tokens/requests
+    /// to the given values. Single-writer semantics only: with multiple busbar nodes sharing one
+    /// store, an absolute overwrite loses the other nodes' accruals — the fleet flush path uses
+    /// [`Store::add_usage`] instead.
     fn put_usage(
         &self,
         key_id: &str,
@@ -252,6 +254,32 @@ pub trait Store: Send + Sync + 'static {
         tokens: u64,
         requests: u64,
     ) -> StoreResult<()>;
+
+    /// Write-behind ADDITIVE accumulate of a key's window counter: adds each (possibly negative,
+    /// e.g. a refund) DELTA to the durable record. This is the FLEET-HONEST flush primitive: N
+    /// nodes each flushing their delta-since-last-flush sum to the true fleet total, where
+    /// `put_usage`'s absolute overwrite would be last-writer-wins. Counters are floored at 0.
+    ///
+    /// DEFAULT: a read-modify-write fallback (get + put) for stores without a native atomic add —
+    /// correct for a single writer; a real shared backend overrides with an atomic accumulate
+    /// (SQL `UPDATE x = x + delta` UPSERT / redis `HINCRBY`).
+    fn add_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        delta_spend_cents: i64,
+        delta_tokens: i64,
+        delta_requests: i64,
+    ) -> StoreResult<()> {
+        let cur = self.get_usage(key_id, window_start)?;
+        self.put_usage(
+            key_id,
+            window_start,
+            cur.spend_cents.saturating_add(delta_spend_cents).max(0),
+            cur.tokens.saturating_add_signed(delta_tokens),
+            cur.requests.saturating_add_signed(delta_requests),
+        )
+    }
 
     /// Accumulate one completed response's RAW consumption into the per-(key, bucket, model,
     /// provider) metering row (UPSERT/add; +1 request). Metering is observability — best-effort,

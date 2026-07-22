@@ -658,6 +658,159 @@ fn legacy_test_is_over_budget_and_record() {
     assert!(!gov.is_over_budget(&unlimited, 1_700_000_000));
 }
 
+/// FLEET-ADDITIVE FLUSH (1.5.0): TWO GovStates ("nodes") sharing ONE durable store each accrue
+/// spend and flush — the durable record must hold the SUM of both nodes' accruals, not whichever
+/// node flushed last (the lost-update the old absolute `put_usage` overwrite caused). Also: a
+/// re-flush with nothing new is a no-op (the acked baseline advances), so nothing double-counts.
+#[test]
+fn test_two_node_flush_is_additive_no_lost_update() {
+    let store = Arc::new(MemoryStore::new());
+    let mut k = sample_key("k_fleet", "h_fleet");
+    k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
+    store.put_key(&k).unwrap();
+
+    // Two independent GovStates over the SAME store = two busbar nodes sharing a cluster store.
+    let node_a = GovState::new(store.clone(), 10, 0, None).unwrap(); // 10c flat fee
+    let node_b = GovState::new(store.clone(), 10, 0, None).unwrap();
+
+    // Node A charges 3 requests (30c), node B charges 2 (20c); both flush (either order).
+    for _ in 0..3 {
+        assert!(node_a.try_charge_request_within_budget(&k, 1_700_000_000));
+    }
+    for _ in 0..2 {
+        assert!(node_b.try_charge_request_within_budget(&k, 1_700_000_000));
+    }
+    node_a.flush_budgets();
+    node_b.flush_budgets();
+
+    let u = store.get_usage("k_fleet", 0).unwrap();
+    assert_eq!(
+        u.spend_cents, 50,
+        "the durable record is the FLEET SUM (30 + 20), not last-writer-wins"
+    );
+    assert_eq!(u.requests, 5, "request counts sum across nodes too");
+
+    // Re-flushing with nothing new must not double-count (the acked baseline advanced).
+    node_a.flush_budgets();
+    node_b.flush_budgets();
+    let u = store.get_usage("k_fleet", 0).unwrap();
+    assert_eq!(u.spend_cents, 50, "an idle re-flush adds nothing");
+
+    // More spend on one node keeps accumulating correctly.
+    assert!(node_a.try_charge_request_within_budget(&k, 1_700_000_000));
+    node_a.flush_budgets();
+    assert_eq!(store.get_usage("k_fleet", 0).unwrap().spend_cents, 60);
+}
+
+/// A REFUND between flushes produces a NEGATIVE delta that the additive flush carries through: the
+/// durable record ends at the true net spend, never below zero.
+#[test]
+fn test_additive_flush_carries_refund_deltas() {
+    let store = Arc::new(MemoryStore::new());
+    let mut k = sample_key("k_refund", "h_refund");
+    k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
+    store.put_key(&k).unwrap();
+    let gov = GovState::new(store.clone(), 10, 0, None).unwrap();
+
+    // Charge 2 (20c), flush (durable 20c), then refund one and flush again: net 10c.
+    assert!(gov.try_charge_request_within_budget(&k, 1_700_000_000));
+    assert!(gov.try_charge_request_within_budget(&k, 1_700_000_000));
+    gov.flush_budgets();
+    assert_eq!(store.get_usage("k_refund", 0).unwrap().spend_cents, 20);
+
+    gov.refund_request(&k, 1_700_000_000);
+    gov.flush_budgets();
+    let u = store.get_usage("k_refund", 0).unwrap();
+    assert_eq!(
+        u.spend_cents, 10,
+        "the refund's negative delta lands durably"
+    );
+    assert_eq!(u.requests, 1);
+}
+
+/// A FAILED flush re-marks the cell dirty WITHOUT advancing the acked baseline, so the unacked
+/// delta is retried (not lost) on the next tick once the store recovers.
+#[test]
+fn test_failed_flush_retries_the_unacked_delta() {
+    /// A store whose add_usage fails until `healthy` flips true.
+    struct FlakyStore {
+        inner: MemoryStore,
+        healthy: std::sync::atomic::AtomicBool,
+    }
+    impl busbar_api::Store for FlakyStore {
+        fn put_key(&self, k: &busbar_api::VirtualKey) -> busbar_api::StoreResult<()> {
+            self.inner.put_key(k)
+        }
+        fn get_key(&self, id: &str) -> busbar_api::StoreResult<Option<busbar_api::VirtualKey>> {
+            self.inner.get_key(id)
+        }
+        fn list_keys(&self) -> busbar_api::StoreResult<Vec<busbar_api::VirtualKey>> {
+            self.inner.list_keys()
+        }
+        fn delete_key(&self, id: &str) -> busbar_api::StoreResult<()> {
+            self.inner.delete_key(id)
+        }
+        fn get_usage(&self, id: &str, w: u64) -> busbar_api::StoreResult<busbar_api::Usage> {
+            self.inner.get_usage(id, w)
+        }
+        fn put_usage(
+            &self,
+            id: &str,
+            w: u64,
+            s: i64,
+            t: u64,
+            r: u64,
+        ) -> busbar_api::StoreResult<()> {
+            self.inner.put_usage(id, w, s, t, r)
+        }
+        fn add_usage(
+            &self,
+            id: &str,
+            w: u64,
+            ds: i64,
+            dt: i64,
+            dr: i64,
+        ) -> busbar_api::StoreResult<()> {
+            if !self.healthy.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(busbar_api::StoreError("store down".into()));
+            }
+            self.inner.add_usage(id, w, ds, dt, dr)
+        }
+        fn add_metering(&self, d: &busbar_api::MeteringDelta) -> busbar_api::StoreResult<()> {
+            self.inner.add_metering(d)
+        }
+        fn list_metering(&self, b: u64) -> busbar_api::StoreResult<Vec<busbar_api::MeteringRow>> {
+            self.inner.list_metering(b)
+        }
+        fn append_audit(&self, e: &busbar_api::AuditRecord) -> busbar_api::StoreResult<()> {
+            self.inner.append_audit(e)
+        }
+        fn list_audit(&self) -> busbar_api::StoreResult<Vec<busbar_api::AuditRecord>> {
+            self.inner.list_audit()
+        }
+    }
+    let store = Arc::new(FlakyStore {
+        inner: MemoryStore::new(),
+        healthy: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut k = sample_key("k_flaky", "h_flaky");
+    k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
+    store.inner.put_key(&k).unwrap();
+    let gov = GovState::new(store.clone(), 10, 0, None).unwrap();
+
+    assert!(gov.try_charge_request_within_budget(&k, 1_700_000_000));
+    gov.flush_budgets(); // store down: delta stays unacked, cell re-marked dirty
+    assert_eq!(store.inner.get_usage("k_flaky", 0).unwrap().spend_cents, 0);
+
+    store
+        .healthy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    gov.flush_budgets(); // retried: the full unacked delta lands exactly once
+    assert_eq!(store.inner.get_usage("k_flaky", 0).unwrap().spend_cents, 10);
+    gov.flush_budgets(); // and does not double-count afterwards
+    assert_eq!(store.inner.get_usage("k_flaky", 0).unwrap().spend_cents, 10);
+}
+
 #[test]
 fn test_record_tokens_cost() {
     let store = Arc::new(MemoryStore::new());
@@ -1085,6 +1238,9 @@ fn test_budget_sweep_is_period_agnostic_across_cotenants() {
                 tokens: 10,
                 requests: 7,
                 dirty: true,
+                flushed_spend_cents: 0,
+                flushed_tokens: 0,
+                flushed_requests: 0,
             },
         );
         // A `monthly`-period key in its CURRENT window: also evicted by the buggy sweep
@@ -1097,6 +1253,9 @@ fn test_budget_sweep_is_period_agnostic_across_cotenants() {
                 tokens: 5,
                 requests: 3,
                 dirty: true,
+                flushed_spend_cents: 0,
+                flushed_tokens: 0,
+                flushed_requests: 0,
             },
         );
         // A genuinely stale bounded-window cell (older than 31 d): the sweep SHOULD evict this.
@@ -1108,6 +1267,9 @@ fn test_budget_sweep_is_period_agnostic_across_cotenants() {
                 tokens: 1,
                 requests: 1,
                 dirty: false,
+                flushed_spend_cents: 0,
+                flushed_tokens: 0,
+                flushed_requests: 0,
             },
         );
     }

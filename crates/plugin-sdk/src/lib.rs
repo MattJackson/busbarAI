@@ -70,6 +70,22 @@ pub fn dispatch(store: &dyn Store, req: StoreRequest) -> Result<StoreResponse, S
             store.put_usage(&key_id, window_start, spend_cents, tokens, requests)?;
             R::Unit
         }
+        Q::AddUsage {
+            key_id,
+            window_start,
+            delta_spend_cents,
+            delta_tokens,
+            delta_requests,
+        } => {
+            store.add_usage(
+                &key_id,
+                window_start,
+                delta_spend_cents,
+                delta_tokens,
+                delta_requests,
+            )?;
+            R::Unit
+        }
         Q::AddMetering(d) => {
             store.add_metering(&d)?;
             R::Unit

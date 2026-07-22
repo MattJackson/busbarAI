@@ -20,7 +20,7 @@
 use libloading::Library;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Prefix for the per-process private staging directory (and the dead-pid sweep match).
 const STAGING_PREFIX: &str = "busbar-plugins-";
@@ -45,13 +45,11 @@ impl Drop for Staged {
             #[cfg(target_os = "linux")]
             Staged::Memfd { .. } => {} // the OwnedFd closes itself
             Staged::TempFile { path } => {
-                // Unload happened first (field order in the holder). Remove the file, then try to
-                // remove the now-possibly-empty per-process directory (fails harmlessly while other
-                // staged libraries remain).
-                let _ = std::fs::remove_file(&*path);
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::remove_dir(dir);
-                }
+                // Unload happened first (field order in the holder). Release under the shared
+                // staging lock: remove the file, and remove the per-process directory only when
+                // this was the LAST live staged file — the refcount makes release atomic with any
+                // concurrent stage, so a drop can never yank the directory out from under a load.
+                release_temp_file(path);
             }
         }
     }
@@ -66,30 +64,57 @@ fn random_hex(n: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The per-process private staging directory, created exactly ONCE (lazily) as
-/// `<temp>/busbar-plugins-<pid>-<random>` with mode `0700` on unix. `create_dir` (not
-/// `create_dir_all`) fails if the path exists, so a pre-planted directory is never adopted.
-fn process_staging_dir() -> Result<&'static PathBuf, String> {
-    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let name = format!("{STAGING_PREFIX}{}-{}", std::process::id(), random_hex(8));
-        let dir = std::env::temp_dir().join(name);
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
+/// Shared staging state: the per-process private directory (created lazily, re-created if the
+/// last release removed it) plus a LIVE-FILE REFCOUNT. All creates and releases run under this one
+/// lock, so "remove the dir when the last staged file goes" can never race a concurrent stage.
+struct StagingState {
+    dir: Option<PathBuf>,
+    live: usize,
+}
+
+fn staging_state() -> &'static Mutex<StagingState> {
+    static STATE: OnceLock<Mutex<StagingState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(StagingState { dir: None, live: 0 }))
+}
+
+/// Ensure the per-process private staging directory exists (caller holds the staging lock):
+/// `<temp>/busbar-plugins-<pid>-<random>`, mode `0700` on unix. `create_dir` (not
+/// `create_dir_all`) fails if the path already exists, so a pre-planted directory is never adopted.
+fn ensure_staging_dir(state: &mut StagingState) -> Result<PathBuf, String> {
+    if let Some(dir) = &state.dir {
+        if dir.is_dir() {
+            return Ok(dir.clone());
         }
-        builder.create(&dir).map_err(|e| {
-            format!(
-                "cannot create private plugin staging dir {}: {e}",
-                dir.display()
-            )
-        })?;
-        Ok(dir)
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
+    }
+    let name = format!("{STAGING_PREFIX}{}-{}", std::process::id(), random_hex(8));
+    let dir = std::env::temp_dir().join(name);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(&dir).map_err(|e| {
+        format!(
+            "cannot create private plugin staging dir {}: {e}",
+            dir.display()
+        )
+    })?;
+    state.dir = Some(dir.clone());
+    Ok(dir)
+}
+
+/// Release one staged file (drop path): remove the file and, when it was the LAST live one, the
+/// per-process directory too (clean-shutdown delete). Runs entirely under the staging lock.
+fn release_temp_file(path: &PathBuf) {
+    let mut state = staging_state().lock().unwrap_or_else(|p| p.into_inner());
+    let _ = std::fs::remove_file(path);
+    state.live = state.live.saturating_sub(1);
+    if state.live == 0 {
+        if let Some(dir) = state.dir.take() {
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
 }
 
 /// Monotonic per-process staging-file sequence (concurrent loads never collide on a name).
@@ -112,9 +137,11 @@ fn dylib_suffix() -> &'static str {
 }
 
 /// Stage `bytes` into the per-process private directory and return the created file path. The file
-/// is opened `create_new` (never adopting a pre-planted file) and `0600` on unix.
+/// is opened `create_new` (never adopting a pre-planted file) and `0600` on unix. Runs under the
+/// staging lock so a concurrent last-file release cannot remove the directory mid-create.
 fn stage_temp_file(bytes: &[u8]) -> Result<PathBuf, String> {
-    let dir = process_staging_dir()?;
+    let mut state = staging_state().lock().unwrap_or_else(|p| p.into_inner());
+    let dir = ensure_staging_dir(&mut state)?;
     let path = dir.join(format!("lib-{}{}", next_seq(), dylib_suffix()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -136,6 +163,7 @@ fn stage_temp_file(bytes: &[u8]) -> Result<PathBuf, String> {
     }
     // Close before dlopen (Windows dislikes an open writable handle racing the loader's read).
     drop(f);
+    state.live += 1;
     Ok(path)
 }
 
@@ -257,10 +285,12 @@ pub fn sweep_dead_staging() -> usize {
 mod tests {
     use super::*;
 
-    /// The per-process staging dir is created once, private (0700 on unix), and named with the pid.
+    /// The per-process staging dir is private (0700 on unix), named with the pid, and stable
+    /// while staged files are live.
     #[test]
     fn staging_dir_is_private_and_pid_named() {
-        let dir = process_staging_dir().expect("staging dir");
+        let mut state = staging_state().lock().unwrap_or_else(|p| p.into_inner());
+        let dir = ensure_staging_dir(&mut state).expect("staging dir");
         assert!(dir.exists());
         let name = dir.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with(STAGING_PREFIX));
@@ -268,11 +298,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "staging dir must be 0700, got {mode:o}");
         }
-        // A second call returns the SAME directory (once per process).
-        assert_eq!(process_staging_dir().unwrap(), dir);
+        // A second call returns the SAME directory while it exists.
+        assert_eq!(ensure_staging_dir(&mut state).unwrap(), dir);
     }
 
     /// Dropping a `Staged::TempFile` removes the file (unload-then-remove is enforced by holder
@@ -296,10 +326,18 @@ mod tests {
         std::fs::create_dir_all(dead.join("sub")).unwrap();
         std::fs::write(dead.join("sub/lib.so"), b"junk").unwrap();
 
-        // Our own live dir must survive the sweep. Drop a marker file inside so a concurrently
-        // running staging test's empty-dir cleanup cannot remove it under us.
-        let own = process_staging_dir().expect("own staging dir").clone();
-        std::fs::write(own.join("marker"), b"live").unwrap();
+        // Our own live dir must survive the sweep: hold a real staged file so the shared state
+        // keeps the directory alive for the duration of this test.
+        let held = Staged::TempFile {
+            path: stage_temp_file(b"keepalive bytes").expect("stage keepalive"),
+        };
+        let own = {
+            let state = staging_state().lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .dir
+                .clone()
+                .expect("staging dir exists while a file is live")
+        };
 
         let removed = sweep_dead_staging();
         assert!(removed >= 1, "the dead-pid dir must be swept");
@@ -308,6 +346,7 @@ mod tests {
             own.exists(),
             "own (live-pid) staging dir survives the sweep"
         );
+        drop(held);
     }
 
     /// pid_alive is true for ourselves and false for an absurd pid (unix).

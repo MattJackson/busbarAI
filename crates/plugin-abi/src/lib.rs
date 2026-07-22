@@ -82,6 +82,17 @@ pub enum StoreRequest {
         tokens: u64,
         requests: u64,
     },
+    /// `add_usage` — ADDITIVE accumulate of a key's window counter (signed deltas; the
+    /// fleet-honest flush). ADDITIVE (ABI stays v1): a plugin built against an older SDK never
+    /// learned this variant and rejects it; the loader falls back to a read-modify-write
+    /// (get + put) with documented single-writer semantics.
+    AddUsage {
+        key_id: String,
+        window_start: u64,
+        delta_spend_cents: i64,
+        delta_tokens: i64,
+        delta_requests: i64,
+    },
     AddMetering(MeteringDelta),
     ListMetering(u64),
     PutAwsCredential(AwsCredential),
