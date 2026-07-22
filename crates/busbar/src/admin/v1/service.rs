@@ -1714,8 +1714,12 @@ mod tests {
                 &bytes,
             )
         };
+        // The anti-downgrade floor keys on the LOAD IDENTITY (the library filename the engine
+        // resolves the plugin by), not the manifest's self-declared name, so a renamed or
+        // absent manifest cannot dodge it. Key the floor on that filename.
+        let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
         let mut floors = std::collections::BTreeMap::new();
-        floors.insert("sqlite-store".to_string(), "2.0.0".to_string());
+        floors.insert(file.clone(), "2.0.0".to_string());
         let trust = crate::config::PluginTrustCfg {
             on_untrusted: OnUntrusted::Halt,
             publishers: vec![crate::config::PluginPublisher {
@@ -1726,7 +1730,6 @@ mod tests {
         };
         let dir = tmp_plugins_dir("downgrade");
         let svc = svc_with(dir.clone(), trust);
-        let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
 
         // A validly-signed 1.9.0 is below the 2.0.0 floor -> rejected, nothing published.
         let old_mb = serde_json::to_vec(&signed("1.9.0")).unwrap();
