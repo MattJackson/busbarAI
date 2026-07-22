@@ -415,14 +415,21 @@ impl ProtocolWriter for AnthropicWriter {
             }
             IrStreamEvent::BlockStart { index, block } => {
                 let content_block = match block {
+                    // Anthropic's native `content_block_start` carries the block's SEED value so an
+                    // SDK accumulator initializes the field before any delta arrives: a text block
+                    // start ships `text:""`, a tool_use start ships `input:{}`, and a thinking start
+                    // ships `thinking:""` + `signature:""`. Omitting the seed leaves the SDK's
+                    // accumulator field `undefined`, so the first `..._delta` concatenates onto
+                    // `undefined` (`"undefined" + chunk` / a `KeyError`) and streaming accumulation
+                    // breaks on the client. Emit the seeds to match native.
                     IrBlockMeta::Text => {
-                        serde_json::json!({ "type": "text" })
+                        serde_json::json!({ "type": "text", "text": "" })
                     }
                     IrBlockMeta::Thinking => {
-                        serde_json::json!({ "type": "thinking" })
+                        serde_json::json!({ "type": "thinking", "thinking": "", "signature": "" })
                     }
                     IrBlockMeta::ToolUse { id, name } => {
-                        serde_json::json!({ "type": STOP_TOOL_USE, "id": id, "name": name })
+                        serde_json::json!({ "type": STOP_TOOL_USE, "id": id, "name": name, "input": {} })
                     }
                     IrBlockMeta::Image => {
                         serde_json::json!({ "type": "image" })

@@ -966,10 +966,18 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
     };
     // REQUEST-side filter (write_message feeds write_request only; write_response/_event call
     // write_block directly, so response reasoning still surfaces). Anthropic's Messages API rejects
-    // an assistant `thinking` block that lacks a `signature` with a 400 — a signature is mandatory
-    // on the request path. A cross-protocol IR may carry a Thinking block whose signature is None
-    // (e.g. reasoning translated from a provider that emits no signature), so drop those blocks here
-    // rather than forward an egress that the upstream will 400. Other block types pass through.
+    // an assistant PLAINTEXT `thinking` block that lacks a `signature` with a 400 — a signature is
+    // mandatory on the request path for a `thinking` block. A cross-protocol IR may carry such a
+    // block whose signature is None (e.g. reasoning translated from a provider that emits no
+    // signature), so drop those rather than forward an egress that the upstream will 400.
+    //
+    // A REDACTED thinking block (`redacted: true`) is a DIFFERENT wire shape: it re-emits as a
+    // native `redacted_thinking` block carrying opaque `data` bytes and NO `signature` — Anthropic
+    // accepts it without one (the signature requirement is specific to plaintext `thinking`). So the
+    // `redacted: false` guard below is load-bearing: WITHOUT it, every redacted block (which always
+    // has `signature: None`) is silently dropped here before `write_block` can re-emit it, losing
+    // the encrypted reasoning that lets a multi-turn extended-thinking conversation replay. Only
+    // drop UNSIGNED PLAINTEXT thinking. Other block types pass through.
     let mut dropped_unsigned_thinking = 0usize;
     let mut dropped_file_id_image = 0usize;
     let blocks: Vec<&crate::ir::IrBlock> = msg
@@ -977,7 +985,9 @@ fn write_message(msg: &crate::ir::IrMessage) -> serde_json::Value {
         .iter()
         .filter(|block| {
             if let crate::ir::IrBlock::Thinking {
-                signature: None, ..
+                signature: None,
+                redacted: false,
+                ..
             } = block
             {
                 dropped_unsigned_thinking += 1;
