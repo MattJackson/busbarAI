@@ -24,7 +24,7 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
 }
 
 /// Store schema version, kept in SQLite's `PRAGMA user_version`. v2 = the 1.5.0 cost-model schema:
-/// the scalar `usage_counters` table (stored `spend_cents` — a derived dollar persisted as truth)
+/// the scalar `usage_counters` table (stored `spend_cents` - a derived dollar persisted as truth)
 /// is REPLACED by the per-(bucket, window[, model]) token-ledger pair `usage_windows` +
 /// `usage_ledger`, and `virtual_keys` grows `budget_group` + `labels`. 1.5.0 is UNRELEASED, so the
 /// bump is destructive (drop + recreate), never a migration: a pre-v2 dev database is recreated
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS aws_credentials (
 );
 CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id);
 -- The TOKEN LEDGER (v2): per-(bucket, window) request counts + per-(bucket, window, model) tier
--- token counts. `bucket_id` is a virtual key's id OR a budget-group bucket id — key buckets and
+-- token counts. `bucket_id` is a virtual key's id OR a budget-group bucket id - key buckets and
 -- group buckets share the shape. NO spend column: dollars are derived at read time from
 -- `ledger x rate_card` in the engine, so correcting a rate is a config edit, never a data fix.
 CREATE TABLE IF NOT EXISTS usage_windows (
@@ -173,7 +173,7 @@ impl SqliteStore {
         let conn = self.lock_conn();
         // SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model). 1.5.0 is unreleased, so a
         // pre-v2 database (user_version < 2 with any governance table already present) is DROPPED
-        // and recreated — a bump, not a migration. A fresh database (no tables) simply creates the
+        // and recreated - a bump, not a migration. A fresh database (no tables) simply creates the
         // v2 schema; a v2 database is untouched (idempotent CREATE IF NOT EXISTS).
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -216,8 +216,8 @@ impl SqliteStore {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> StoreResult<()> {
-        // ABSOLUTE overwrite (memory is authoritative): replace the whole (bucket, window) record —
-        // the requests row AND every model row — in ONE transaction, so a re-flush of the same cell
+        // ABSOLUTE overwrite (memory is authoritative): replace the whole (bucket, window) record -
+        // the requests row AND every model row - in ONE transaction, so a re-flush of the same cell
         // is idempotent and a reader never sees half a ledger. Clamp u64 counts into i64 (a value
         // above i64::MAX pins, never wraps).
         let mut conn = Self::lock_conn_raw(conn);
@@ -718,7 +718,7 @@ impl Store for SqliteStore {
 }
 
 // Hash-lookup primitive retained for the governance unit tests that pin the by-hash resolution
-// semantics. (The legacy direct-SQL charge/refund/add primitives died with `usage_counters` — v2
+// semantics. (The legacy direct-SQL charge/refund/add primitives died with `usage_counters` - v2
 // production enforcement is the in-memory chain charge in `GovState`; the store is a pure
 // write-behind ledger.)
 impl SqliteStore {

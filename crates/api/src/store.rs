@@ -144,7 +144,7 @@ impl std::fmt::Debug for AwsKeyEntry {
     }
 }
 
-/// Per-model token counts split by PRICING TIER (input / output / cache-read / cache-write) — the
+/// Per-model token counts split by PRICING TIER (input / output / cache-read / cache-write) - the
 /// four token classes providers price differently. RAW counts, never money: every dollar figure is
 /// DERIVED at read time as `tokens x current rate card` (tokens are the ledger; dollars are always
 /// derived, never stored as truth).
@@ -162,7 +162,7 @@ impl TierTokens {
         self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
     }
 
-    /// Total tokens across all tiers (saturating — counts are upstream-controlled).
+    /// Total tokens across all tiers (saturating - counts are upstream-controlled).
     pub fn total(&self) -> u64 {
         self.input
             .saturating_add(self.output)
@@ -179,7 +179,7 @@ pub struct ModelTokens {
 }
 
 /// The TOKEN LEDGER for one (bucket, window): the request count plus per-(model, tier) token
-/// counts. This replaces the old scalar `Usage { spend_cents, tokens, requests }` — no dollar
+/// counts. This replaces the old scalar `Usage { spend_cents, tokens, requests }` - no dollar
 /// field crosses the store boundary; spend is recomputed from `ledger x rate_card` at read time,
 /// so correcting a rate is a config edit, never a data migration.
 ///
@@ -262,7 +262,7 @@ pub struct ModelTokensDelta {
 }
 
 /// The additive cross-node reconciliation payload for one (bucket, window): a signed requests
-/// delta plus per-(model, tier) signed TOKEN deltas. No dollar delta crosses the wire — each node
+/// delta plus per-(model, tier) signed TOKEN deltas. No dollar delta crosses the wire - each node
 /// derives spend locally from its own rate card.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageDelta {
@@ -380,14 +380,14 @@ pub trait Store: Send + Sync + 'static {
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>>;
     fn delete_key(&self, id: &str) -> StoreResult<()>;
     /// The TOKEN LEDGER for one (bucket, window). `bucket_id` is a key's own budget bucket (its
-    /// key id) OR a budget-group bucket — same shape either way. An untouched (bucket, window)
+    /// key id) OR a budget-group bucket - same shape either way. An untouched (bucket, window)
     /// reads as the empty ledger. NO dollar field crosses this seam: spend is derived at read time
     /// from `ledger x rate_card`.
     fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger>;
 
     /// Write-behind ABSOLUTE set of a bucket's window ledger. SETS (replaces) the whole
     /// requests + per-model token record. Single-writer semantics only: with multiple busbar nodes
-    /// sharing one store, an absolute overwrite loses the other nodes' accruals — the fleet flush
+    /// sharing one store, an absolute overwrite loses the other nodes' accruals - the fleet flush
     /// path uses [`Store::add_usage`] instead.
     fn put_usage(
         &self,
@@ -403,7 +403,7 @@ pub trait Store: Send + Sync + 'static {
     /// would be last-writer-wins. Counters are floored at 0. No dollar delta crosses the wire.
     ///
     /// DEFAULT: a read-modify-write fallback (get + apply + put) for stores without a native
-    /// atomic add — correct for a single writer; a real shared backend overrides with an atomic
+    /// atomic add - correct for a single writer; a real shared backend overrides with an atomic
     /// accumulate (SQL `UPDATE x = x + delta` UPSERT / redis `HINCRBY`).
     fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
         let mut cur = self.get_usage(bucket_id, window_start)?;
@@ -587,7 +587,7 @@ mod tests {
     }
 
     /// A persisted `VirtualKey` row written BEFORE the cost model (no `budget_group` / `labels`
-    /// fields in its JSON) still deserializes — the new fields default. Guards the redis-style
+    /// fields in its JSON) still deserializes - the new fields default. Guards the redis-style
     /// JSON persistence across the 1.5.0 schema growth.
     #[test]
     fn virtual_key_pre_cost_model_json_still_deserializes() {

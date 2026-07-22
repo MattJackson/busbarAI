@@ -79,19 +79,19 @@ pub enum StoreRequest {
     GetKey(String),
     ListKeys,
     DeleteKey(String),
-    /// `get_usage` — the (bucket, window) token ledger. `bucket_id` is a key id or a budget-group
+    /// `get_usage` - the (bucket, window) token ledger. `bucket_id` is a key id or a budget-group
     /// bucket id; no dollar field crosses this wire (spend derives from ledger x rate card).
     GetUsage {
         bucket_id: String,
         window_start: u64,
     },
-    /// `put_usage` — ABSOLUTE set of a (bucket, window) ledger (single-writer write-behind).
+    /// `put_usage` - ABSOLUTE set of a (bucket, window) ledger (single-writer write-behind).
     PutUsage {
         bucket_id: String,
         window_start: u64,
         ledger: UsageLedger,
     },
-    /// `add_usage` — ADDITIVE accumulate of a (bucket, window) ledger: a signed requests delta plus
+    /// `add_usage` - ADDITIVE accumulate of a (bucket, window) ledger: a signed requests delta plus
     /// per-(model, tier) signed token deltas (the fleet-honest flush; counters floor at 0).
     AddUsage {
         bucket_id: String,
@@ -130,7 +130,7 @@ pub enum StoreResponse {
     Key(Option<VirtualKey>),
     /// `list_keys` — every key.
     Keys(Vec<VirtualKey>),
-    /// `get_usage` — the (bucket, window) token ledger.
+    /// `get_usage` - the (bucket, window) token ledger.
     Usage(UsageLedger),
     /// `list_metering` — the bucket's rows.
     Metering(Vec<MeteringRow>),

@@ -200,7 +200,7 @@ impl Store for DynStore {
     }
 
     fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
-        // ABI v2 makes `AddUsage` part of the base wire (every v2 plugin knows it — the v1-era
+        // ABI v2 makes `AddUsage` part of the base wire (every v2 plugin knows it - the v1-era
         // "older SDK never learned this variant" fallback is gone with the version bump), so an
         // error here is a REAL store error and propagates: silently degrading the fleet-additive
         // accumulate to a read-modify-write against a live shared backend would be a correctness
