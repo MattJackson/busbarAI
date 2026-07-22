@@ -101,7 +101,7 @@ const STAGE_COUNT: usize = 13;
 /// Per-stage sample CAP. Buckets are bounded so a long-lived enabled binary cannot grow them without
 /// limit (and re-sort an ever-larger `Vec` under the global `Mutex` on every [`dump`]). Once a bucket
 /// is full, further samples are admitted by RESERVOIR sampling (see [`Bucket::record`]) so the retained
-/// set stays a uniform sample of ALL observations — p50/p99 remain representative rather than being
+/// set stays a uniform sample of ALL observations - p50/p99 remain representative rather than being
 /// biased toward the first N. 4096 u32s per stage is ~16 KiB/stage, ~208 KiB across all stages: plenty
 /// for stable percentiles, trivially bounded memory. This is a dev-only tool; the cap is a safety net.
 const BUCKET_CAP: usize = 4096;
@@ -144,7 +144,7 @@ impl Bucket {
             self.samples.push(n);
             return;
         }
-        // Full: replace slot j (0..seen) with prob cap/seen — i.e. keep only when j < cap.
+        // Full: replace slot j (0..seen) with prob cap/seen - i.e. keep only when j < cap.
         let j = next_rand() % self.seen;
         if let Some(slot) = usize::try_from(j)
             .ok()
@@ -172,7 +172,7 @@ fn next_rand() -> u64 {
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
 }
 
-/// Per-stage sample store. Behind a single `Mutex` — the profiler is a single-threaded measurement
+/// Per-stage sample store. Behind a single `Mutex` - the profiler is a single-threaded measurement
 /// tool (the capture test drives one request at a time), so contention is nil; the lock is only ever
 /// taken on the enabled path. Buckets are bounded (see [`BUCKET_CAP`]) so a long-running enabled
 /// binary cannot grow them without limit.
@@ -327,7 +327,7 @@ mod tests {
     fn reservoir_stays_representative_of_the_range() {
         // Reservoir sampling keeps a uniform subset, so the retained min/max should still span most of
         // the offered range (a first-N cap would freeze the max near BUCKET_CAP). Feed a large ramp and
-        // check the retained max lands in the upper reaches — a smoke test that late samples are admitted.
+        // check the retained max lands in the upper reaches - a smoke test that late samples are admitted.
         let mut b = Bucket::default();
         let offered = BUCKET_CAP * 10;
         for i in 0..offered {
