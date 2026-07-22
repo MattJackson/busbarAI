@@ -517,7 +517,7 @@ impl StreamTranslate {
             // agnostic emitter names no wire event-type of its own.
             self.framing
                 .inject_streaming_metrics(&out_et, &mut out_data, self.started_at);
-            let payload = serde_json::to_vec(&out_data).unwrap_or_default();
+            let payload = crate::json::to_vec(&out_data).unwrap_or_default();
             // Bedrock-INGRESS usage (Change A): the usage carried by this frame was already accumulated
             // into `last_usage` by `translate_event`/`extract_usage_only` from the structured IR event,
             // BEFORE this writer ran — so billing reads `usage()` and no longer needs the pre-encode

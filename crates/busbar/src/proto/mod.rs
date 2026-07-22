@@ -753,7 +753,7 @@ pub(crate) trait ProtocolWriter: Send + Sync {
         };
         let mut body = self.write_request(&ir);
         let _ = self.rewrite_model_if_needed(&mut body, model);
-        serde_json::to_vec(&body).unwrap_or_default()
+        crate::json::to_vec(&body).unwrap_or_default()
     }
 
     /// Build the per-stream framing state for THIS protocol as an INGRESS (client-facing) writer.

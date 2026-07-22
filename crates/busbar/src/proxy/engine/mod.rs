@@ -2221,7 +2221,7 @@ fn fire_global_taps(
     let build_proj = |with_prompt: bool| {
         let req =
             build_rewrite_request(body, pool_name, ingress_protocol, wants_stream, with_prompt);
-        serde_json::to_vec(&crate::hooks::wire::build(
+        crate::json::to_vec(&crate::hooks::wire::build(
             crate::hooks::wire::OP_NOTIFY,
             &req,
             &[],

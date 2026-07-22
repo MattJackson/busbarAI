@@ -970,7 +970,7 @@ pub(crate) fn fire_stage_taps(
         },
         stage: Some(stage),
     };
-    let Ok(bytes) = serde_json::to_vec(&hook_req) else {
+    let Ok(bytes) = crate::json::to_vec(&hook_req) else {
         return;
     };
     let bytes = std::sync::Arc::new(bytes);
