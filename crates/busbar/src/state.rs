@@ -260,15 +260,16 @@ pub(crate) struct App {
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
-    /// The directory loadable plugins live in (`governance.plugins_dir`, default `plugins`). Carried
-    /// on the snapshot so the Admin API plugin catalog (`GET /api/v1/admin/plugins?type=store`) and the
-    /// install/remove/reload endpoints operate on the SAME directory the boot store-load resolves
-    /// against — one source of truth, and it survives config swaps (`App::clone` copies it).
+    /// The directory the signed plugin tarballs live in (`plugins.dir`, default `plugins`). Carried
+    /// on the snapshot so the Admin API plugin catalog (`GET /api/v1/admin/plugins?type=store`) and
+    /// the install/remove/reload endpoints operate on the SAME directory the boot store-load
+    /// resolves against — one source of truth, and it survives config swaps (`App::clone` copies it).
     pub(crate) plugins_dir: std::path::PathBuf,
-    /// The plugin signing/trust posture (`governance.trust`) — re-used at admin-install to RE-VERIFY an
-    /// uploaded plugin server-side (the client is never trusted) and to project each catalog entry's
-    /// trust verdict. Carried on the snapshot (not a global) so it is testable and survives swaps.
-    pub(crate) plugin_trust: crate::config::PluginTrustCfg,
+    /// The whole `plugins.*` block (master switch + trust + floors) — re-used at admin-install to
+    /// RE-VERIFY an uploaded plugin server-side (the client is never trusted) and to project each
+    /// catalog entry's trust verdict. Carried on the snapshot (not a global) so it is testable and
+    /// survives swaps.
+    pub(crate) plugins_cfg: crate::config::PluginsCfg,
     /// Global fallback for the translation-injected `max_tokens` (`limits.default_max_tokens`), used
     /// at the cross-protocol seam when a lane has no per-lane `default_max_tokens`. Defaults to
     /// `proto::DEFAULT_MAX_TOKENS` (4096). Read by `IrReq::prepare_for_egress` at the cross-protocol seam.

@@ -84,23 +84,22 @@ pub(crate) async fn list_plugins(
     respond(StatusCode::OK, service(&handle).list_plugins(ptype).await)
 }
 
-/// The `POST /api/v1/admin/plugins` request body: install a dynamic-library store plugin. The
-/// library bytes ride as base64 (`library_b64`) — a plugin is an opaque binary, so base64 keeps it a
-/// clean JSON field; the optional signed `manifest` is an inline JSON object (the engine RE-VERIFIES
-/// it server-side against the running trust posture — the client is never trusted). `file` is the
-/// bare, platform-native library filename to write (`.so`/`.dll`/`.dylib`).
+/// The `POST /api/v1/admin/plugins` request body: install a SIGNED plugin tarball. The tarball
+/// bytes ride as base64 (`tarball_b64`) — a plugin artifact is opaque binary, so base64 keeps it a
+/// clean JSON field. The engine RE-VERIFIES the contained signed manifest server-side against the
+/// running `plugins.*` trust posture (the client is never trusted). `file` is the bare `.tar.gz`
+/// filename to store it under (storage only — identity comes from the signed manifest inside).
 #[derive(serde::Deserialize)]
 pub(crate) struct InstallPluginReq {
     file: String,
-    library_b64: String,
-    #[serde(default)]
-    manifest: Option<serde_json::Value>,
+    tarball_b64: String,
 }
 
-/// `POST /api/v1/admin/plugins` — INSTALL a dynamic-library store plugin (Full scope). Decodes the
-/// uploaded library, RE-VERIFIES it against the running `governance.trust` posture, validates the
-/// store ABI handshake, and atomically writes it (+ its manifest sidecar) into the plugins directory.
-/// `201 Created` with the install result. The store change takes effect on the next store (re)load,
+/// `POST /api/v1/admin/plugins` — INSTALL a signed plugin tarball (Full scope). Decodes the upload,
+/// unpacks + structurally validates it IN MEMORY, RE-VERIFIES trust against the running `plugins.*`
+/// posture, checks name/alias conflicts, and atomically writes the tarball into the plugins
+/// directory. The uploaded code is NEVER executed by this endpoint (manifest-only inspection).
+/// `201 Created` with the install result. The change takes effect on the next plugin (re)load,
 /// not as a hot swap. Every attempt (success AND failure) is audited.
 pub(crate) async fn install_plugin(
     State(handle): State<Arc<AppHandle>>,
@@ -124,39 +123,22 @@ pub(crate) async fn install_plugin(
         }
     };
     let resource = format!("plugin:{}", req.file);
-    let library = match base64::engine::general_purpose::STANDARD.decode(req.library_b64.as_bytes())
+    let tarball = match base64::engine::general_purpose::STANDARD.decode(req.tarball_b64.as_bytes())
     {
         Ok(b) => b,
         Err(e) => {
             audit::AUDIT.record_by("plugin.install", &resource, audit::OUTCOME_REJECTED, &actor);
             return err_json(&AdminError::Validation(format!(
-                "library_b64 is not valid base64: {e}"
+                "tarball_b64 is not valid base64: {e}"
             )));
         }
     };
-    // Serialize the inline manifest back to bytes for the sidecar (canonical verification re-sorts
-    // keys, so the on-disk byte order is irrelevant to trust — this is the DISPLAY/store copy).
-    let manifest_bytes: Option<Vec<u8>> = match req.manifest.as_ref() {
-        None => None,
-        Some(v) => match serde_json::to_vec(v) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                audit::AUDIT.record_by(
-                    "plugin.install",
-                    &resource,
-                    audit::OUTCOME_REJECTED,
-                    &actor,
-                );
-                return err_json(&AdminError::Validation(format!("invalid manifest: {e}")));
-            }
-        },
-    };
-    // The install itself is filesystem I/O + a `dlopen` for the ABI probe — run it off the async
-    // runtime's worker so a slow disk / large library can't stall the reactor.
+    // The install itself is in-memory verification + filesystem I/O — run it off the async
+    // runtime's worker so a slow disk / large tarball can't stall the reactor.
     let svc_handle = handle.clone();
     let file = req.file.clone();
     let result = tokio::task::spawn_blocking(move || {
-        service(&svc_handle).install_store_plugin(&file, &library, manifest_bytes.as_deref())
+        service(&svc_handle).install_store_plugin(&file, &tarball)
     })
     .await;
     match result {
@@ -1025,6 +1007,7 @@ pub(crate) async fn reload_config(
         crate::build_app_from_config(
             cfg,
             loaded.deploy.governance.clone(),
+            loaded.deploy.plugins.clone(),
             loaded.overlay_path,
             loaded.base_hook_names,
             (Some(config_path), Some(providers_path)),
@@ -1125,6 +1108,7 @@ pub(crate) async fn apply_config(
             crate::build_app_from_config(
                 cfg,
                 req.config.governance.clone(),
+                req.config.plugins.clone(),
                 current.overlay_path.clone(),
                 base_hook_names,
                 (current.config_path.clone(), current.providers_path.clone()),

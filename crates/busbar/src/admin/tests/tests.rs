@@ -4868,30 +4868,23 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
 
 // ── plugin admin endpoints (#13), end-to-end over the live router ─────────────────────────────────
 
-/// Serve a router whose App points its plugin surface at `dir` (log posture, no publishers), with a
-/// known admin token — for the install/list/remove/reload plugin endpoints.
+/// Serve a router whose App points its plugin surface at `dir` (allow_unsigned posture, no
+/// publishers), with a known admin token — for the install/list/remove/reload plugin endpoints.
 async fn serve_with_plugins_dir(
     dir: std::path::PathBuf,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
-    // This lifecycle test installs an UNSIGNED plugin, so opt in to unsigned plugins (the trust
-    // DEFAULT now rejects unsigned artifacts). The trust-default behavior itself is covered by the
-    // dedicated trust tests; this test is about the install/list/reload/remove lifecycle.
-    let trust = crate::config::PluginTrustCfg {
-        allow_unsigned_plugins: true,
-        ..Default::default()
-    };
+    // The lifecycle test installs an UNSIGNED plugin tarball, so opt in to unsigned plugins (the
+    // trust DEFAULT rejects unsigned artifacts). The trust-default behavior itself is covered by
+    // the dedicated trust tests; this test is about the install/list/reload/remove lifecycle.
+    let mut plugins_cfg = crate::config::PluginsCfg::default();
+    plugins_cfg.trust.allow_unsigned = true;
     let app = TestApp::new()
         .governance(gov)
         .plugins_dir(dir)
-        .plugin_trust(trust)
+        .plugins_cfg(plugins_cfg)
         .build();
-    // Explicit 256 MiB body cap: the install test uploads the REAL sqlite-plugin cdylib as base64,
-    // and a DEBUG build of that library (CI runs tests unoptimized) can exceed the 32 MiB default
-    // on some platforms - Windows in particular, where the early 413 close surfaces to the client
-    // as a deterministic WSAECONNABORTED instead of a readable status. The production default is
-    // exercised by the config tests; THIS test is about the plugin lifecycle, not the body cap.
     let (router, _handle) = crate::build_router_with_limits(
         app,
         256 * 1024 * 1024,
@@ -4904,43 +4897,35 @@ async fn serve_with_plugins_dir(
     (addr, handle)
 }
 
-/// Locate the sqlite plugin cdylib in the build's target dir (like the loader/service tests).
-fn admin_sqlite_plugin_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let profile_dir = exe.parent()?.parent()?;
-    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
-    let candidate = profile_dir.join(&name);
-    candidate.exists().then_some(candidate)
+/// Build an UNSIGNED (structurally valid) plugin tarball in memory for the HTTP lifecycle tests.
+fn admin_test_tarball(name: &str, alias: &str) -> Vec<u8> {
+    let lib = b"junk library bytes (never dlopened by the admin surface)";
+    let m = busbar_plugin_sign::Manifest {
+        name: name.into(),
+        alias: alias.into(),
+        kind: "store".into(),
+        version: "1.0.0".into(),
+        publisher: "acme".into(),
+        abi_version: 1,
+        sha256: busbar_plugin_sign::sha256_hex(lib),
+        signature: String::new(),
+        description: String::new(),
+        homepage: String::new(),
+        license: String::new(),
+    };
+    busbar_plugin_loader::tarball::package(&m, "lib.so", lib).unwrap()
 }
 
-/// FULL LIFECYCLE over the wire: `POST /plugins` installs a real (unsigned, log-posture) store plugin
-/// → `GET /plugins?type=store` lists it as a valid dynamic-library row → `POST /plugins/reload`
-/// reports it → `DELETE /plugins/{file}` removes it (204) → a second DELETE is 404. Every mutation is
-/// admin-token guarded and audited.
+/// FULL LIFECYCLE over the wire: `POST /plugins` installs an (unsigned, allow_unsigned-posture)
+/// plugin tarball → `GET /plugins?type=store` lists it as a dynamic-library row → `POST
+/// /plugins/reload` reports it → `DELETE /plugins/{file}` removes it (204) → a second DELETE is
+/// 404. Every mutation is admin-token guarded and audited; the uploaded code is never executed.
 #[tokio::test]
-#[cfg_attr(
-    windows,
-    ignore = "ENVIRONMENTAL, not a plugin defect (investigated for the 1.5.0 security backlog): the \
-ignore is scoped to the HTTP TRANSPORT, not the install/loading logic. This test drives a multi-MB \
-library upload over a real loopback POST, and Windows' loopback stack deterministically resets the \
-connection (WSAECONNABORTED 10053) when the server's response races the client's still-in-flight \
-large-body writes — a known winsock large-body-on-127.0.0.1 quirk, reproduced independent of busbar. \
-The plugin INSTALL LOGIC that carries the security guarantees (filename/path-traversal validation, \
-server-side trust re-verify, ABI validate on a temp copy, atomic publish, signed/anti-downgrade \
-paths) is exercised cross-platform (Windows included) by the service-level unit tests \
-`install_store_plugin` round-trips in admin/v1/service.rs — none of which are windows-gated. Only \
-this end-to-end HTTP wrapper is skipped on Windows; un-ignoring it would flake on the transport, not \
-find a bug. It stays covered fully on unix."
-)]
 async fn test_admin_v1_plugin_install_list_reload_remove() {
     use base64::Engine as _;
     crate::metrics::init();
-    let Some(src) = admin_sqlite_plugin_path() else {
-        eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
-        return;
-    };
-    let bytes = std::fs::read(&src).unwrap();
-    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+    let tarball = admin_test_tarball("acme-store-junk", "junkstore");
+    let file = "acme-store-junk.tar.gz";
     let dir =
         std::env::temp_dir().join(format!("busbar-admin-plugins-http-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -4948,37 +4933,27 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
     let (addr, handle) = serve_with_plugins_dir(dir.clone()).await;
     let client = reqwest::Client::new();
 
-    // INSTALL — 201 with a trust verdict of "unverified" (unsigned under the log posture).
+    // INSTALL — 201 with a trust verdict of "unverified" (unsigned under allow_unsigned).
     let body = serde_json::json!({
         "file": file,
-        "library_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball),
     });
-    // One retry on a TRANSPORT error only: this POST carries a multi-megabyte body over loopback,
-    // and Windows occasionally aborts the connection mid-exchange (WSAECONNABORTED 10053) when the
-    // server's response races the client's still-in-flight writes — a platform quirk of large
-    // bodies on 127.0.0.1, not a product behavior. An HTTP status (any status) is NEVER retried;
-    // only a failed send. If the abort were deterministic the retry would fail identically, so
-    // this cannot mask a real regression.
-    let install = || async {
-        client
-            .post(format!("http://{addr}/api/v1/admin/plugins"))
-            .header("x-admin-token", "admintok")
-            .json(&body)
-            .send()
-            .await
-    };
-    let resp = match install().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("install POST transport error, retrying once: {e}");
-            install().await.unwrap()
-        }
-    };
+    let resp = client
+        .post(format!("http://{addr}/api/v1/admin/plugins"))
+        .header("x-admin-token", "admintok")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status().as_u16(), 201, "install returns 201 Created");
     let v: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(v["file"], file);
     assert_eq!(v["trust"], "unverified");
-    assert!(dir.join(&file).exists(), "library published to disk");
+    assert_eq!(
+        v["name"], "acme-store-junk",
+        "identity from the signed manifest"
+    );
+    assert!(dir.join(file).exists(), "tarball published to disk");
 
     // A mutation WITHOUT the admin token is rejected (401) — the whole surface is guarded.
     let unauth = client
@@ -4989,7 +4964,7 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
         .unwrap();
     assert_eq!(unauth.status().as_u16(), 401);
 
-    // LIST — the store catalog reports the memory head + our dynamic plugin (valid).
+    // LIST — the store catalog reports the memory head + our dynamic plugin (ready).
     let list: serde_json::Value = client
         .get(format!("http://{addr}/api/v1/admin/plugins?type=store"))
         .header("x-admin-token", "admintok")
@@ -5007,6 +4982,7 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
         .expect("dynamic-library row present");
     assert_eq!(dyn_row["valid"], true);
     assert_eq!(dyn_row["target"], file);
+    assert_eq!(dyn_row["name"], "acme-store-junk");
 
     // RELOAD — reports the reconciled dynamic set (no memory head).
     let reload: serde_json::Value = client
@@ -5028,7 +5004,7 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
         .await
         .unwrap();
     assert_eq!(del.status().as_u16(), 204);
-    assert!(!dir.join(&file).exists(), "library removed from disk");
+    assert!(!dir.join(file).exists(), "tarball removed from disk");
 
     let del2 = client
         .delete(format!("http://{addr}/api/v1/admin/plugins/{file}"))
@@ -5069,29 +5045,25 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
     handle.abort();
 }
 
-/// A malformed install body (bad base64) is a `400 invalid_request` in the frozen envelope, and a
-/// non-plugin upload is a `400` too — nothing is published.
+/// A malformed install body (bad base64) is a `400 invalid_request` in the frozen envelope, a
+/// non-tarball upload is a `400`, and an UNSIGNED upload under the STRICT default posture is a
+/// `409 conflict` (the trust gate cannot be bypassed by pushing over the API) — nothing is
+/// published in any case, and the rejects are audited.
 #[tokio::test]
 async fn test_admin_v1_plugin_install_rejections() {
+    use base64::Engine as _;
     crate::metrics::init();
     let dir = std::env::temp_dir().join(format!("busbar-admin-plugins-rej-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (addr, handle) = serve_with_plugins_dir(dir.clone()).await;
     let client = reqwest::Client::new();
-    let ext = if cfg!(target_os = "windows") {
-        ".dll"
-    } else if cfg!(target_os = "macos") {
-        ".dylib"
-    } else {
-        ".so"
-    };
 
     // Bad base64.
     let bad = client
         .post(format!("http://{addr}/api/v1/admin/plugins"))
         .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({"file": format!("libx{ext}"), "library_b64": "!!!not base64!!!"}))
+        .json(&serde_json::json!({"file": "x.tar.gz", "tarball_b64": "!!!not base64!!!"}))
         .send()
         .await
         .unwrap();
@@ -5099,14 +5071,13 @@ async fn test_admin_v1_plugin_install_rejections() {
     let b: serde_json::Value = bad.json().await.unwrap();
     assert_eq!(b["error"]["code"], "invalid_request");
 
-    // Valid base64 but not a plugin → ABI validation fails (400).
-    use base64::Engine as _;
+    // Valid base64 but not a plugin tarball → structural validation fails (400).
     let notplugin = client
         .post(format!("http://{addr}/api/v1/admin/plugins"))
         .header("x-admin-token", "admintok")
         .json(&serde_json::json!({
-            "file": format!("libnope{ext}"),
-            "library_b64": base64::engine::general_purpose::STANDARD.encode(b"not a real library"),
+            "file": "nope.tar.gz",
+            "tarball_b64": base64::engine::general_purpose::STANDARD.encode(b"not a tarball"),
         }))
         .send()
         .await
@@ -5117,6 +5088,58 @@ async fn test_admin_v1_plugin_install_rejections() {
         0,
         "nothing published"
     );
+
+    // TRUST NO-BYPASS: a STRICT-posture server rejects an unsigned upload as 409 conflict.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
+        let strict_dir = std::env::temp_dir().join(format!(
+            "busbar-admin-plugins-strict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&strict_dir);
+        std::fs::create_dir_all(&strict_dir).unwrap();
+        let app = TestApp::new()
+            .governance(gov)
+            .plugins_dir(strict_dir.clone())
+            .plugins_cfg(crate::config::PluginsCfg::default())
+            .build();
+        let (router, _h) = crate::build_router_with_limits(
+            app,
+            256 * 1024 * 1024,
+            0,
+            crate::config::DEFAULT_EMIT_SERVER_TIMING,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let strict_addr = listener.local_addr().unwrap();
+        let strict_handle =
+            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let tarball = admin_test_tarball("acme-store-x", "acmex");
+        let resp = client
+            .post(format!("http://{strict_addr}/api/v1/admin/plugins"))
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({
+                "file": "x.tar.gz",
+                "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            409,
+            "the strict default posture rejects an unsigned upload over the API"
+        );
+        let b: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(b["error"]["code"], "conflict");
+        assert_eq!(
+            std::fs::read_dir(&strict_dir).unwrap().count(),
+            0,
+            "nothing published on a trust rejection"
+        );
+        let _ = std::fs::remove_dir_all(&strict_dir);
+        strict_handle.abort();
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
     handle.abort();

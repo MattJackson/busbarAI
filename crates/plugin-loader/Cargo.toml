@@ -4,15 +4,26 @@ version = "1.5.0"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.87"
-description = "Loads a busbar store backend from a dynamic library over the store C ABI (libloading). All FFI unsafe is isolated here so the engine crate keeps its forbid(unsafe_code) invariant."
+description = "The busbar plugin subsystem: signed-tarball discovery, in-memory unpack + verification, the three-phase (structural/trust/conflict) load validation, the name/alias registry, and the memfd/private-temp dynamic loader over the plugin C ABI. All FFI unsafe is isolated here so the engine crate keeps its forbid(unsafe_code) invariant."
 license = "Apache-2.0"
 
 [dependencies]
 busbar-api = { path = "../api" }
 busbar-plugin-abi = { path = "../plugin-abi" }
+busbar-plugin-sign = { path = "../plugin-sign" }
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Tarball packaging/unpacking for the one-file-per-plugin `.tar.gz` format. flate2 with its
+# pure-Rust backend (miniz_oxide) so static musl release builds need no C zlib.
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Random staging-directory suffix (a pid alone is predictable to a pre-planter).
+getrandom = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+# memfd_create (Linux zero-disk loads) + kill(pid, 0) liveness for the dead-pid staging sweep.
+libc = "0.2"
 
 # NOTE: the end-to-end test loads the SQLite plugin cdylib, but a cdylib crate cannot be a Rust
 # dependency (no rlib to link). The test instead locates the artifact in the target dir and skips if

@@ -1492,14 +1492,12 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
     // rejects them.
     for blank in [" ", "   ", "\t", "\n", " \t\n "] {
         let gov = config::GovernanceCfg {
-            store: crate::config::GovernanceStore::Memory,
+            store: "memory".to_string(),
             db_path: "busbar-governance.db".to_string(),
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some(blank.to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            plugins_dir: "plugins".to_string(),
-            trust: Default::default(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
@@ -1516,14 +1514,12 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
     // A token with surrounding whitespace but a real non-blank core is usable and must NOT error
     // (we only reject ALL-blank, not trim the stored secret).
     let gov = config::GovernanceCfg {
-        store: crate::config::GovernanceStore::Memory,
+        store: "memory".to_string(),
         db_path: "busbar-governance.db".to_string(),
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("  real-secret  ".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        plugins_dir: "plugins".to_string(),
-        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1539,7 +1535,7 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
 #[test]
 fn test_validate_governance_rejects_admin_token_without_module() {
     let gov = crate::config::GovernanceCfg {
-        store: crate::config::GovernanceStore::Memory,
+        store: "memory".to_string(),
         admin_token: Some("tok".to_string()),
         ..Default::default()
     };
@@ -1555,14 +1551,12 @@ fn test_validate_governance_rejects_admin_token_without_module() {
 #[test]
 fn test_validate_governance_ok_when_enabled_with_admin_token() {
     let gov = config::GovernanceCfg {
-        store: crate::config::GovernanceStore::Memory,
+        store: "memory".to_string(),
         db_path: "busbar-governance.db".to_string(),
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("an-operator-secret".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        plugins_dir: "plugins".to_string(),
-        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1577,14 +1571,12 @@ fn test_validate_governance_rejects_zero_rate_sweep_interval() {
     // `rate_sweep_interval: 0` is rejected fail-loud rather than silently disabling the rate-map
     // eviction sweep (which would ride on the non-obvious `u32::is_multiple_of(0) == false`).
     let gov = config::GovernanceCfg {
-        store: crate::config::GovernanceStore::Memory,
+        store: "memory".to_string(),
         db_path: "busbar-governance.db".to_string(),
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: Some("an-operator-secret".to_string()),
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        plugins_dir: "plugins".to_string(),
-        trust: Default::default(),
         rate_sweep_interval: 0,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1600,14 +1592,12 @@ fn test_validate_governance_rejects_zero_rate_sweep_interval() {
 fn test_validate_governance_disabled_carries_no_requirement() {
     // A disabled governance block (the admin surface is inert) must not require an admin_token.
     let gov = config::GovernanceCfg {
-        store: crate::config::GovernanceStore::Memory,
+        store: "memory".to_string(),
         db_path: "busbar-governance.db".to_string(),
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: None,
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        plugins_dir: "plugins".to_string(),
-        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };
@@ -1643,14 +1633,12 @@ fn test_validate_governance_rejects_passthrough_combination() {
     {
         let mode = "passthrough";
         let gov = config::GovernanceCfg {
-            store: crate::config::GovernanceStore::Memory,
+            store: "memory".to_string(),
             db_path: "busbar-governance.db".to_string(),
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("an-operator-secret".to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            plugins_dir: "plugins".to_string(),
-            trust: Default::default(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
@@ -1673,14 +1661,12 @@ fn test_validate_governance_allows_token_and_none_modes() {
     // on the passthrough ground.
     for mode in ["token", "none"] {
         let gov = config::GovernanceCfg {
-            store: crate::config::GovernanceStore::Memory,
+            store: "memory".to_string(),
             db_path: "busbar-governance.db".to_string(),
             price_per_request_cents: 1,
             price_per_1k_tokens_cents: 0,
             admin_token: Some("an-operator-secret".to_string()),
             sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            plugins_dir: "plugins".to_string(),
-            trust: Default::default(),
             rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
             usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
         };
@@ -1696,14 +1682,12 @@ fn test_validate_governance_passthrough_ignored_when_disabled() {
     // A DISABLED governance block carries no requirement, so even auth.mode=passthrough is fine
     // (governance is inert — passthrough semantics apply unchanged).
     let gov = config::GovernanceCfg {
-        store: crate::config::GovernanceStore::Memory,
+        store: "memory".to_string(),
         db_path: "busbar-governance.db".to_string(),
         price_per_request_cents: 1,
         price_per_1k_tokens_cents: 0,
         admin_token: None,
         sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        plugins_dir: "plugins".to_string(),
-        trust: Default::default(),
         rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
         usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
     };

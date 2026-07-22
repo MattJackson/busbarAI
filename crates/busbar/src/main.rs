@@ -76,7 +76,6 @@ mod metrics;
 mod net_guard;
 mod observability;
 mod operation;
-mod plugin_trust;
 mod profile;
 mod proto;
 mod proxy;
@@ -172,6 +171,7 @@ fn handle_cli_flags() -> Option<i32> {
             Some(0)
         }
         Some("--validate") => Some(validate_config_command()),
+        Some("--list-plugins") => Some(list_plugins_command()),
         Some("--help" | "-h") => {
             println!(
                 "busbar {ver} — native-protocol LLM gateway
@@ -180,8 +180,13 @@ USAGE:
     busbar              run the gateway (configured entirely via environment + YAML)
     busbar --help       print this help
     busbar --version    print the version
-    busbar --validate   parse + validate config.yaml/providers.yaml and exit (0 = valid, 1 = errors);
-                        no server, no network, no state — safe in CI and before a reload
+    busbar --validate   parse + validate config.yaml/providers.yaml AND every plugin manifest
+                        (structure, signature/trust, conflicts, abi, version floors) and exit
+                        (0 = valid, 1 = errors); no server, no network, no state, no dlopen —
+                        safe in CI and before a reload; a clean --validate means boot succeeds
+    busbar --list-plugins
+                        manifest-only inventory of the plugins dir (name/alias/kind/version,
+                        signature verdict, load status + exact reason); never loads plugin code
     busbar --print-metadata-blocklist
                         print the effective cloud-metadata SSRF denylist and exit
 
@@ -262,6 +267,19 @@ fn validate_config_command() -> i32 {
         );
         return 1;
     }
+    // PLUGIN PRE-FLIGHT — the EXACT pipeline boot runs (`plugins_preflight` is shared with
+    // `build_app_from_config`), so a clean `--validate` means the plugin half of boot succeeds too:
+    // consistency (plugins.enabled vs governance.store), trust-policy resolution, the three-phase
+    // scan of every tarball (structural -> trust -> conflict), and store resolution. Manifest-only:
+    // nothing is `dlopen`ed, no store is opened — zero side effects.
+    let registry =
+        match plugins_preflight(loaded.deploy.governance.as_ref(), &loaded.deploy.plugins) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[error] {e}");
+                return 1;
+            }
+        };
     println!(
         "ok: config valid — {} provider(s), {} model(s), {} pool(s)\n  config:    {}\n  providers: {}",
         cfg.providers.len(),
@@ -270,11 +288,117 @@ fn validate_config_command() -> i32 {
         config_path.display(),
         providers_path.display(),
     );
+    if loaded.deploy.plugins.enabled {
+        println!(
+            "  plugins:   enabled — {} validated, {} skipped (untrusted) in '{}'",
+            registry.loadable().len(),
+            registry.skipped().len(),
+            loaded.deploy.plugins.dir,
+        );
+        for s in registry.skipped() {
+            println!(
+                "    skipped: {} ({}) — {}",
+                s.manifest.name, s.file, s.reason
+            );
+        }
+    } else {
+        println!("  plugins:   disabled (plugins.enabled is false; no plugin will load)");
+    }
     if !unset_env_vars.is_empty() {
         println!(
             "  note: {} env var(s) referenced but unset here — required at runtime: {}",
             unset_env_vars.len(),
             unset_env_vars.join(", "),
+        );
+    }
+    0
+}
+
+/// `--list-plugins`: MANIFEST-ONLY inventory of every plugin tarball in `plugins.dir` — name,
+/// alias, kind, version, signature verdict, and load status (including the exact skip/invalid
+/// reason and which one `governance.store` selects). NEVER `dlopen`s anything, so an untrusted
+/// plugin's code cannot run from listing it. Exit 0 (informational; `--validate` is the gate).
+fn list_plugins_command() -> i32 {
+    let providers_path = std::path::PathBuf::from(
+        std::env::var(ENV_PROVIDERS).unwrap_or_else(|_| DEFAULT_PROVIDERS_PATH.into()),
+    );
+    let config_path = std::path::PathBuf::from(
+        std::env::var(ENV_CONFIG).unwrap_or_else(|_| DEFAULT_CONFIG_PATH.into()),
+    );
+    // Best-effort config read (lenient env): a missing/broken config falls back to the default
+    // plugins block so the inventory still works pre-deployment.
+    let (plugins_cfg, store_ref) = match load_config_from_disk(
+        &config_path,
+        &providers_path,
+        false,
+        config::EnvSubst::Lenient,
+    ) {
+        Ok(l) => {
+            let store = l
+                .deploy
+                .governance
+                .as_ref()
+                .map(|g| g.store.clone())
+                .unwrap_or_else(|| config::GOVERNANCE_STORE_MEMORY.to_string());
+            (l.deploy.plugins, store)
+        }
+        Err(e) => {
+            eprintln!("[warn] config not readable ({e}); using the default plugins block");
+            (
+                config::PluginsCfg::default(),
+                config::GOVERNANCE_STORE_MEMORY.to_string(),
+            )
+        }
+    };
+    let policy = match plugins_cfg.to_policy() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[error] plugins.trust is invalid: {e}");
+            return 1;
+        }
+    };
+    let dir = std::path::PathBuf::from(&plugins_cfg.dir);
+    println!(
+        "plugins dir: {} (plugins.enabled: {})",
+        dir.display(),
+        plugins_cfg.enabled
+    );
+    let rows = busbar_plugin_loader::inventory_tarballs(&dir, &policy);
+    if rows.is_empty() {
+        println!("no plugin tarballs found");
+        return 0;
+    }
+    println!(
+        "{:<34} {:<24} {:<12} {:<6} {:<9} {:<24} STATUS",
+        "FILE", "NAME", "ALIAS", "KIND", "VERSION", "SIGNATURE"
+    );
+    for row in rows {
+        let (name, alias, kind, version) = row
+            .manifest
+            .as_ref()
+            .map(|m| {
+                (
+                    m.name.clone(),
+                    m.alias.clone(),
+                    m.kind.clone(),
+                    m.version.clone(),
+                )
+            })
+            .unwrap_or_else(|| ("-".into(), "-".into(), "-".into(), "-".into()));
+        // Which row the configured governance store selects (only meaningful when it would load).
+        let selected = plugins_cfg.enabled
+            && row.status == "ready"
+            && (name == store_ref || alias == store_ref);
+        let status = if selected {
+            format!("LOADS (governance.store: {store_ref})")
+        } else if !plugins_cfg.enabled && row.status == "ready" {
+            "ready (inert: plugins.enabled is false)".to_string()
+        } else {
+            row.status.clone()
+        };
+        println!(
+            "{:<34} {:<24} {:<12} {:<6} {:<9} {:<24} {status}",
+            row.file, name, alias, kind, version, row.signature
         );
     }
     0
@@ -518,6 +642,18 @@ async fn run() {
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
     // Governance config; grab before `deploy` is borrowed by resolve.
     let governance_cfg = deploy.governance.clone();
+    // The top-level `plugins:` block (master switch + dir + trust). Absent = disabled defaults.
+    let plugins_cfg = deploy.plugins.clone();
+
+    // BOOT-TIME dead-pid sweep: remove any orphaned plugin staging directory a CRASHED prior busbar
+    // left behind (a clean shutdown removes its own; a dead pid's files are unlocked). Runs even
+    // when plugins are disabled — the orphan may predate a config change.
+    let swept = busbar_plugin_loader::sweep_dead_staging();
+    if swept > 0 {
+        eprintln!(
+            "[info] removed {swept} orphaned plugin staging dir(s) left by a crashed prior run"
+        );
+    }
 
     // Install the tracing subscriber now (stderr fmt always; OTLP export if configured) so all
     // subsequent startup and request-path logging is captured.
@@ -562,6 +698,7 @@ async fn run() {
         build_app_from_config(
             cfg,
             governance_cfg,
+            plugins_cfg,
             overlay_path,
             base_hook_names,
             (Some(config_path.clone()), Some(providers_path.clone())),
@@ -1203,40 +1340,144 @@ pub(crate) fn load_config_from_disk(
 /// boot maps them to `die`, the apply endpoints to `invalid_request` — an invalid apply changes
 /// nothing.
 ///
-/// Verify a store plugin's signed manifest against `governance.trust` before it is loaded. Returns
-/// `Err` (aborting boot) only when the trust posture is `halt` and the plugin isn't validly signed by
-/// an allowlisted publisher; `log`/`alert`/`allow` postures return `Ok` (the load proceeds, and
-/// `plugin_trust::verify` has already logged the decision).
+/// PLUGIN PRE-FLIGHT — the ONE pipeline shared byte-for-byte by BOOT (`build_app_from_config`),
+/// config APPLY/RELOAD, and `busbar --validate`, so the pre-flight gate can never drift from real
+/// boot behavior. Fail-closed at every step:
 ///
-/// Returns the EXACT bytes that were verified so the caller loads THOSE bytes via
-/// [`busbar_plugin_loader::load_store_from_bytes`] rather than re-reading `lib_path` — closing the
-/// time-of-check/time-of-use gap in which an attacker with write access to `plugins_dir` could swap
-/// the file between this verification and the `dlopen`.
-fn verify_plugin_trust(
-    g: &config::GovernanceCfg,
-    lib_path: &std::path::Path,
-    store: &str,
-) -> Result<Vec<u8>, String> {
-    let policy = g
-        .trust
+/// 1. CONSISTENCY: a non-`memory` `governance.store` with `plugins.enabled: false` (or the block
+///    absent) is an error NAMING THE FLAG — a dropped-in tarball is inert until the switch is on.
+/// 2. POLICY: `plugins.trust` resolves (embedded first-party key + third-party publishers + the
+///    explicit opt-ins + anti-downgrade floors); a malformed key is an error.
+/// 3. SCAN: when enabled, every tarball in `plugins.dir` runs the three-phase pipeline
+///    (structural -> trust -> conflict) via [`busbar_plugin_loader::scan_and_validate`]. ANY
+///    invalid tarball/manifest or ANY name/alias conflict aborts with every problem named; an
+///    untrusted plugin is SKIPPED (warn-logged, never `dlopen`ed).
+/// 4. RESOLUTION: the configured `governance.store` (alias OR canonical name, resolved against the
+///    manifest registry — never a filename) must resolve to a loadable `kind: store` plugin.
+///
+/// Returns the validated registry (empty when plugins are disabled and no plugin is referenced).
+/// NO plugin code runs in this function (manifest-only; `dlopen` happens later, at store open).
+pub(crate) fn plugins_preflight(
+    governance_cfg: Option<&config::GovernanceCfg>,
+    plugins_cfg: &config::PluginsCfg,
+) -> Result<busbar_plugin_loader::PluginRegistry, String> {
+    let store_ref = governance_cfg
+        .map(|g| g.store.as_str())
+        .unwrap_or(config::GOVERNANCE_STORE_MEMORY);
+    let store_is_plugin = store_ref != config::GOVERNANCE_STORE_MEMORY;
+
+    // 1. Consistency: referencing a plugin store while the master switch is off is a NAMED error.
+    if store_is_plugin && !plugins_cfg.enabled {
+        return Err(format!(
+            "governance.store: '{store_ref}' requires the plugin subsystem, but plugins.enabled is \
+             false (the default). Set plugins.enabled: true and place the signed \
+             '{store_ref}' store plugin tarball in the plugins directory ('{}'), or set \
+             governance.store: memory.",
+            plugins_cfg.dir
+        ));
+    }
+
+    // 2. Policy resolution (embedded first-party key + configured third-party trust).
+    let policy = plugins_cfg
         .to_policy()
-        .map_err(|e| format!("governance.trust is invalid: {e}"))?;
-    // FAIL BOOT (never silently skip the store the operator asked for) if the CONFIGURED store's
-    // plugin is untrusted and not opted-in. The `evaluate` reason already names the plugin and the
-    // exact flag to set (allow_unsigned_plugins / allow_third_party), so surface it verbatim.
-    let (_note, bytes) = plugin_trust::verify_read(lib_path, &policy).map_err(|reason| {
-        format!(
-            "governance store '{store}' plugin rejected by the trust policy: {reason} \
-             (sign it with an allowlisted publisher, add the publisher to governance.trust.publishers, \
-             or set the matching governance.trust opt-in flag)."
-        )
-    })?;
-    Ok(bytes)
+        .map_err(|e| format!("plugins.trust is invalid: {e}"))?;
+
+    // Disabled and nothing referenced: the registry is empty and NOTHING in the directory is even
+    // read (drop-is-inert).
+    if !plugins_cfg.enabled {
+        return Ok(busbar_plugin_loader::PluginRegistry::empty());
+    }
+
+    // 3. Three-phase scan over the plugins directory. Fail-closed on invalid/conflict.
+    let dir = std::path::Path::new(&plugins_cfg.dir);
+    let registry = busbar_plugin_loader::scan_and_validate(dir, &policy)
+        .map_err(|errs| format!("plugin validation failed:\n  - {}", errs.join("\n  - ")))?;
+    for s in registry.skipped() {
+        tracing::warn!(
+            plugin = %s.manifest.name,
+            file = %s.file,
+            reason = %s.reason,
+            "plugin present but NOT loaded (trust policy)"
+        );
+    }
+    for p in registry.loadable() {
+        match &p.verdict {
+            busbar_plugin_sign::Verdict::Trusted {
+                publisher,
+                first_party,
+            } => tracing::info!(
+                plugin = %p.manifest.name,
+                alias = %p.manifest.alias,
+                kind = %p.manifest.kind,
+                version = %p.manifest.version,
+                publisher = %publisher,
+                first_party,
+                "plugin validated"
+            ),
+            busbar_plugin_sign::Verdict::Allowed { reason, .. } => tracing::warn!(
+                plugin = %p.manifest.name,
+                alias = %p.manifest.alias,
+                kind = %p.manifest.kind,
+                reason = %reason,
+                "plugin validated as UNVERIFIED (permitted by an explicit plugins.trust opt-in)"
+            ),
+        }
+    }
+
+    // 4. The configured store must resolve to a loadable store plugin.
+    if store_is_plugin {
+        match registry.resolve(store_ref) {
+            Some(p) if p.manifest.kind == "store" => {}
+            Some(p) => {
+                return Err(format!(
+                    "governance.store: '{store_ref}' resolves to plugin '{}' of kind '{}', not a \
+                     store plugin",
+                    p.manifest.name, p.manifest.kind
+                ));
+            }
+            None => {
+                return Err(match registry.unresolved_reason(store_ref) {
+                    Some(s) => format!(
+                        "governance.store: '{store_ref}' matches plugin '{}' ({}) but it was not \
+                         loaded: {}",
+                        s.manifest.name, s.file, s.reason
+                    ),
+                    None => format!(
+                        "governance.store: '{store_ref}' does not match any plugin in '{}' (by \
+                         alias or canonical name; loadable: [{}]). Install the store plugin \
+                         tarball, or set governance.store: memory.",
+                        plugins_cfg.dir,
+                        registry
+                            .loadable()
+                            .iter()
+                            .map(|p| p.manifest.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
+    Ok(registry)
+}
+
+/// The JSON config blob handed to a store plugin's `open`. A SUPERSET across the shipped stores
+/// (each plugin reads the keys it needs and ignores the rest): `db_path` (sqlite file path),
+/// `url` (postgres/redis connection URL — carried in `governance.db_path`), `busy_timeout_ms`
+/// (sqlite).
+fn store_plugin_cfg_json(g: &config::GovernanceCfg) -> String {
+    serde_json::json!({
+        "db_path": g.db_path,
+        "url": g.db_path,
+        "busy_timeout_ms": g.sqlite_busy_timeout_ms,
+    })
+    .to_string()
 }
 
 pub(crate) fn build_app_from_config(
     cfg: config::RootCfg,
     governance_cfg: Option<config::GovernanceCfg>,
+    plugins_cfg: config::PluginsCfg,
     overlay_path: Option<std::path::PathBuf>,
     base_hook_names: std::collections::HashSet<String>,
     config_paths: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
@@ -1720,26 +1961,11 @@ pub(crate) fn build_app_from_config(
         }
     }
 
-    // Capture the plugin-directory + trust posture for the Admin API plugin surface BEFORE
-    // `governance_cfg` is consumed by the store-load branch below. These ride on the `App` snapshot so
-    // the catalog/install/remove/reload endpoints resolve the SAME directory + posture the boot
-    // store-load uses. Absent `governance:` ⇒ the defaults (`plugins`, strict trust: untrusted
-    // plugins are logged and skipped unless allow_unsigned_plugins / allow_third_party is set).
-    let (plugins_dir, plugin_trust) = governance_cfg.as_ref().map_or_else(
-        || {
-            let d = config::GovernanceCfg::default();
-            (
-                std::path::PathBuf::from(d.plugins_dir),
-                config::PluginTrustCfg::default(),
-            )
-        },
-        |g| {
-            (
-                std::path::PathBuf::from(g.plugins_dir.clone()),
-                g.trust.clone(),
-            )
-        },
-    );
+    // PLUGIN PRE-FLIGHT: the same fail-closed pipeline `--validate` runs (consistency -> policy ->
+    // three-phase scan -> store resolution). Runs on EVERY construction path (boot, apply, reload),
+    // so a bad plugin state can never produce a partial App. When plugins are disabled and nothing
+    // references one, this is a no-op empty registry.
+    let plugin_registry = plugins_preflight(governance_cfg.as_ref(), &plugins_cfg)?;
 
     // open the governance store + load the virtual-key cache when enabled.
     let governance = if let Some(p) = prior {
@@ -1747,95 +1973,27 @@ pub(crate) fn build_app_from_config(
         p.governance.clone()
     } else {
         // Governance is ALWAYS available (it is inert until an admin token is set and virtual keys are
-        // minted). Only the STORE backend is a choice: ephemeral RAM by default, or a durable store the
-        // operator configures. An absent `governance:` section is the RAM default.
+        // minted). Only the STORE backend is a choice: ephemeral RAM by default, or a store PLUGIN
+        // (resolved by alias or canonical name from the validated registry — the engine sees only the
+        // returned `dyn Store`, exactly like a compiled-in backend).
         let g = governance_cfg.unwrap_or_default();
-        let store: Arc<dyn governance::Store> = match g.store {
-            crate::config::GovernanceStore::Sqlite => {
-                // The SQLite store is a dynamic-library plugin loaded from the plugins directory (no
-                // longer compiled in). Resolve the platform-native library name, pass the store's
-                // config as JSON, and load it over the C ABI.
-                let libname =
-                    busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
-                let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
-                let cfg_json = serde_json::json!({
-                    "db_path": g.db_path,
-                    "busy_timeout_ms": g.sqlite_busy_timeout_ms,
-                })
-                .to_string();
-                let verified = verify_plugin_trust(&g, &lib_path, "sqlite")?;
-                match busbar_plugin_loader::load_store_from_bytes(
-                    &verified,
-                    &cfg_json,
-                    &lib_path.display().to_string(),
-                ) {
-                    Ok(s) => Arc::from(s),
-                    Err(e) => {
-                        return Err(format!(
-                            "governance store 'sqlite' plugin load failed: {e}. Install the SQLite \
-                             store plugin ({libname}) into the plugins directory ({}), or set \
-                             governance.store: memory.",
-                            g.plugins_dir
-                        ))
-                    }
+        let store: Arc<dyn governance::Store> = if g.store == crate::config::GOVERNANCE_STORE_MEMORY
+        {
+            tracing::warn!(
+                "governance store: in-memory (ephemeral) — keys, budgets, and usage reset on \
+                     restart; configure a durable store plugin for persistence"
+            );
+            Arc::new(governance::MemoryStore::new())
+        } else {
+            let cfg_json = store_plugin_cfg_json(&g);
+            match plugin_registry.open_store(&g.store, &cfg_json) {
+                Ok(s) => Arc::from(s),
+                Err(e) => {
+                    return Err(format!(
+                        "governance store '{}' plugin load failed: {e}",
+                        g.store
+                    ))
                 }
-            }
-            crate::config::GovernanceStore::Postgres => {
-                // Postgres is the shared, multi-node store — also a plugin. `db_path` carries the
-                // libpq connection URL here (see config), passed to the plugin as its `url`.
-                let libname =
-                    busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
-                let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
-                let cfg_json = serde_json::json!({ "url": g.db_path }).to_string();
-                let verified = verify_plugin_trust(&g, &lib_path, "postgres")?;
-                match busbar_plugin_loader::load_store_from_bytes(
-                    &verified,
-                    &cfg_json,
-                    &lib_path.display().to_string(),
-                ) {
-                    Ok(s) => Arc::from(s),
-                    Err(e) => {
-                        return Err(format!(
-                            "governance store 'postgres' plugin load failed: {e}. Install the \
-                             Postgres store plugin ({libname}) into the plugins directory ({}), set \
-                             governance.db_path to your postgres:// URL, or set governance.store: \
-                             memory.",
-                            g.plugins_dir
-                        ))
-                    }
-                }
-            }
-            crate::config::GovernanceStore::Redis => {
-                // Redis is the shared, multi-node KV store — also a plugin. `db_path` carries the
-                // redis:// connection URL here (see config), passed to the plugin as its `url`.
-                let libname =
-                    busbar_plugin_loader::plugin_library_filename("busbar_store_redis_plugin");
-                let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
-                let cfg_json = serde_json::json!({ "url": g.db_path }).to_string();
-                let verified = verify_plugin_trust(&g, &lib_path, "redis")?;
-                match busbar_plugin_loader::load_store_from_bytes(
-                    &verified,
-                    &cfg_json,
-                    &lib_path.display().to_string(),
-                ) {
-                    Ok(s) => Arc::from(s),
-                    Err(e) => {
-                        return Err(format!(
-                            "governance store 'redis' plugin load failed: {e}. Install the Redis \
-                             store plugin ({libname}) into the plugins directory ({}), set \
-                             governance.db_path to your redis:// URL, or set governance.store: \
-                             memory.",
-                            g.plugins_dir
-                        ))
-                    }
-                }
-            }
-            crate::config::GovernanceStore::Memory => {
-                tracing::warn!(
-                    "governance store: in-memory (ephemeral) — keys, budgets, and usage reset on \
-                     restart; configure a durable store for persistence"
-                );
-                Arc::new(governance::MemoryStore::new())
             }
         };
         match governance::GovState::new(
@@ -1857,7 +2015,7 @@ pub(crate) fn build_app_from_config(
                 // it. RAM stores can't reach this state, so `key_count` there is 0 (or the store is
                 // non-durable) and the banner is None. `all_keys()` failure is non-fatal — treat as 0
                 // keys (the enforcement gate is unaffected; we only lose the advisory).
-                let store_is_durable = g.store != crate::config::GovernanceStore::Memory;
+                let store_is_durable = g.store != crate::config::GOVERNANCE_STORE_MEMORY;
                 let key_count = gs.all_keys().map(|k| k.len()).unwrap_or(0);
                 let admin_token_set = g
                     .admin_token
@@ -1970,8 +2128,8 @@ pub(crate) fn build_app_from_config(
         fallback_pools,
         on_exhausted_cfgs,
         governance,
-        plugins_dir,
-        plugin_trust,
+        plugins_dir: std::path::PathBuf::from(&plugins_cfg.dir),
+        plugins_cfg,
         default_max_tokens: cfg.limits.default_max_tokens,
         reasoning_effort_budgets: {
             let b = cfg.limits.reasoning_effort_budgets;

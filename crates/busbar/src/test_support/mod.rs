@@ -659,7 +659,7 @@ pub(crate) struct TestApp {
     base_hook_names: std::collections::HashSet<String>,
     overlay_path: Option<std::path::PathBuf>,
     plugins_dir: Option<std::path::PathBuf>,
-    plugin_trust: Option<crate::config::PluginTrustCfg>,
+    plugins_cfg: Option<crate::config::PluginsCfg>,
 }
 
 #[allow(dead_code)]
@@ -679,7 +679,7 @@ impl TestApp {
             base_hook_names: std::collections::HashSet::new(),
             overlay_path: None,
             plugins_dir: None,
-            plugin_trust: None,
+            plugins_cfg: None,
         }
     }
 
@@ -689,9 +689,10 @@ impl TestApp {
         self.plugins_dir = Some(path);
         self
     }
-    /// Set the plugin trust posture (for install re-verification tests). Defaults to the `log` posture.
-    pub(crate) fn plugin_trust(mut self, trust: crate::config::PluginTrustCfg) -> Self {
-        self.plugin_trust = Some(trust);
+    /// Set the whole `plugins.*` posture (for install re-verification tests). Defaults to the
+    /// strict disabled default.
+    pub(crate) fn plugins_cfg(mut self, cfg: crate::config::PluginsCfg) -> Self {
+        self.plugins_cfg = Some(cfg);
         self
     }
 
@@ -815,7 +816,7 @@ impl TestApp {
             plugins_dir: self
                 .plugins_dir
                 .unwrap_or_else(|| std::path::PathBuf::from("plugins")),
-            plugin_trust: self.plugin_trust.unwrap_or_default(),
+            plugins_cfg: self.plugins_cfg.unwrap_or_default(),
             default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
             reasoning_effort_budgets: [1024, 4096, 8192, 16384],
         });

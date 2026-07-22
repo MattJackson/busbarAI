@@ -1428,6 +1428,10 @@ pub(crate) struct DeployCfg {
     /// optional governance (virtual keys, budgets, rate limits). Absent = disabled.
     #[serde(default)]
     pub(crate) governance: Option<GovernanceCfg>,
+    /// The dynamic plugin subsystem (`plugins:` block, top-level). Absent = disabled (the default
+    /// `enabled: false` master switch): no plugin is ever discovered or loaded.
+    #[serde(default)]
+    pub(crate) plugins: PluginsCfg,
     /// Optional security controls. Today this carries only `blocked_metadata_hosts`, the operator
     /// extension to the hardcoded cloud-metadata SSRF denylist. Absent ⇒ only the hardcoded denylist
     /// applies.
@@ -1472,55 +1476,67 @@ pub(crate) struct SecurityCfg {
     pub(crate) allow_all_metadata: bool,
 }
 
-/// Governance config. When present + enabled, callers authenticate with virtual keys
-/// (not the static auth token) and are subject to per-key allowed-pools / budgets / rate limits.
-// deny_unknown_fields: a typo in a security-relevant governance key (e.g. `admin_tokn:`) must be a
-// loud startup error, not a silent default (which would leave the admin API unreachable / a budget
-// unset). Mirrors the same guard on AuthCfg.
-/// The governance durable-store backend. Governance is ALWAYS available; this only chooses where its
-/// (bounded) keys + counters live. `memory` (default) is RAM — ephemeral, zero-setup. `sqlite`
-/// (single-node durable), `postgres`, and `redis` (both shared across a cluster) are dynamic-library
-/// plugins loaded from `plugins_dir`; each reads its connection target from `db_path` (a file path for
-/// sqlite, a libpq URL for postgres, a `redis://` URL for redis).
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum GovernanceStore {
-    #[default]
-    Memory,
-    Sqlite,
-    Postgres,
-    Redis,
-}
-
-/// Plugin signing/trust policy (`governance.trust`). Governs how the engine treats a loadable
-/// plugin's signed manifest at boot-load and admin-install: a plugin whose `plugin.json` verifies
-/// against an allowlisted publisher is TRUSTED; anything else (unsigned, unknown/third-party
-/// publisher, tampered) is UNTRUSTED and, by DEFAULT, logged and SKIPPED (never loaded/executed)
-/// unless the matching `allow_unsigned_plugins` / `allow_third_party` opt-in is set.
-#[derive(Deserialize, Clone, Default, Debug)]
+/// The top-level `plugins:` block — the ONLY configuration surface of the dynamic plugin subsystem.
+/// A plugin is a plugin: store, auth, and hook plugins share this one block (one directory, one
+/// trust model, one master switch); the manifest `kind` inside each signed tarball selects which
+/// engine subsystem consumes it.
+#[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct PluginTrustCfg {
-    /// EXPLICIT opt-in: load plugins that carry NO valid signature (unsigned / tampered / no
-    /// manifest). Default `false` - an unsigned plugin found in `plugins_dir` is LOGGED and SKIPPED
-    /// (never `dlopen`ed / executed), at boot and in the admin catalog. Set `true` to permit unsigned
-    /// plugins (with a warning). This is the safe-by-default replacement for the old `on_untrusted`
-    /// posture, which loaded unsigned plugins by default.
+pub(crate) struct PluginsCfg {
+    /// MASTER SWITCH, default FALSE. When false (or the whole `plugins:` block is absent), NO
+    /// plugin is ever loaded — a tarball dropped into the directory is INERT. Referencing a plugin
+    /// while disabled (`governance.store:` other than `memory`) is a BOOT ERROR naming this flag.
     #[serde(default)]
-    pub(crate) allow_unsigned_plugins: bool,
-    /// EXPLICIT opt-in: load plugins that ARE validly signed but by a publisher NOT in `publishers`.
-    /// Default `false` - a third-party-signed plugin is LOGGED and SKIPPED (never `dlopen`ed). Set
-    /// `true` to permit third-party plugins (with a warning).
+    pub(crate) enabled: bool,
+    /// Directory the signed plugin tarballs live in. Default `plugins` (relative to the working
+    /// directory).
+    #[serde(default = "default_plugins_dir")]
+    pub(crate) dir: String,
+    /// Trust policy for plugin signatures. busbar's OWN release key is EMBEDDED in the binary —
+    /// first-party plugins verify with zero configuration; this block is for THIRD-PARTY keys and
+    /// the explicit untrusted opt-ins.
     #[serde(default)]
-    pub(crate) allow_third_party: bool,
-    /// Allowlisted publishers whose signatures mark a plugin TRUSTED. Each maps a publisher name to a
-    /// hex ed25519 public key; a plugin manifest's `publisher` must resolve here.
-    #[serde(default)]
-    pub(crate) publishers: Vec<PluginPublisher>,
-    /// ANTI-DOWNGRADE floors: plugin `name` -> minimum acceptable `version`. A manifest whose version
-    /// is below its floor is rejected even with a valid signature, blocking a rollback/replay of an
-    /// older (possibly vulnerable) validly-signed release. Empty pins nothing.
+    pub(crate) trust: PluginsTrustCfg,
+    /// ANTI-DOWNGRADE floors: plugin canonical `name` -> minimum acceptable `version`. Third-party
+    /// only in practice — first-party plugins are automatically floored at the running binary's
+    /// version. A floored plugin must prove (trusted signature, version at/above the floor) that it
+    /// meets the floor; nothing else loads it. Sibling of `trust` (a version axis, not a trust axis).
     #[serde(default)]
     pub(crate) min_versions: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for PluginsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_plugins_dir(),
+            trust: PluginsTrustCfg::default(),
+            min_versions: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+/// `plugins.trust` — how the engine treats plugin signatures. A first-party (busbar-signed) plugin
+/// verifies against the EMBEDDED release key; a third-party plugin verifies against `publishers`;
+/// anything else (unsigned, tampered, unknown publisher) is UNTRUSTED and, by DEFAULT, logged and
+/// SKIPPED (never `dlopen`ed) unless the matching opt-in flag is set.
+#[derive(Deserialize, Clone, Default, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PluginsTrustCfg {
+    /// THIRD-PARTY allowlist: publishers whose signatures mark a plugin TRUSTED. Each maps a
+    /// publisher name to a hex ed25519 public key. The first-party `busbar` key is embedded in the
+    /// binary and never configured here.
+    #[serde(default)]
+    pub(crate) publishers: Vec<PluginPublisher>,
+    /// EXPLICIT opt-in: load plugins that carry NO valid signature (unsigned / tampered). Default
+    /// `false` — an unsigned plugin found in `plugins.dir` is LOGGED and SKIPPED (never `dlopen`ed
+    /// / executed), at boot and in the admin catalog.
+    #[serde(default)]
+    pub(crate) allow_unsigned: bool,
+    /// EXPLICIT opt-in: load plugins that ARE validly signed but by a publisher NOT in
+    /// `publishers`. Default `false` — a third-party-signed plugin is LOGGED and SKIPPED.
+    #[serde(default)]
+    pub(crate) allow_third_party: bool,
 }
 
 /// One allowlisted plugin publisher: a name and its hex ed25519 public key.
@@ -1531,34 +1547,52 @@ pub(crate) struct PluginPublisher {
     pub(crate) public_key: String,
 }
 
-impl PluginTrustCfg {
-    /// Resolve into the `busbar-plugin-sign` policy (parsing each publisher's public key). A malformed
-    /// key is a boot error, not a silent skip (a skipped trust anchor could wrongly reject a good
-    /// plugin, or with an opt-in flag set load an unverified one).
+impl PluginsCfg {
+    /// Resolve into the `busbar-plugin-sign` trust policy: the EMBEDDED first-party release key +
+    /// the binary's own version (the automatic first-party anti-downgrade floor) + the configured
+    /// third-party publishers/opt-ins/floors. A malformed publisher key is a boot error, not a
+    /// silent skip (a skipped trust anchor could wrongly reject a good plugin).
     pub(crate) fn to_policy(&self) -> Result<busbar_plugin_sign::TrustPolicy, String> {
         let mut publishers = std::collections::BTreeMap::new();
-        for p in &self.publishers {
+        for p in &self.trust.publishers {
+            if p.name == busbar_plugin_sign::FIRST_PARTY_PUBLISHER {
+                return Err(format!(
+                    "plugins.trust.publishers['{}']: the publisher name '{}' is reserved for \
+                     busbar's embedded release key and cannot be configured",
+                    p.name,
+                    busbar_plugin_sign::FIRST_PARTY_PUBLISHER
+                ));
+            }
             let key = busbar_plugin_sign::public_key_from_hex(&p.public_key)
-                .map_err(|e| format!("governance.trust.publishers['{}']: {e}", p.name))?;
+                .map_err(|e| format!("plugins.trust.publishers['{}']: {e}", p.name))?;
             publishers.insert(p.name.clone(), key);
         }
         Ok(busbar_plugin_sign::TrustPolicy {
+            first_party_key: busbar_plugin_sign::embedded_release_pubkey(),
+            binary_version: env!("CARGO_PKG_VERSION").to_string(),
             publishers,
-            allow_unsigned: self.allow_unsigned_plugins,
-            allow_third_party: self.allow_third_party,
+            allow_unsigned: self.trust.allow_unsigned,
+            allow_third_party: self.trust.allow_third_party,
             min_versions: self.min_versions.clone(),
         })
     }
 }
 
+/// The compiled-in governance store name (`governance.store: memory`) — the only store that is not
+/// a plugin.
+pub(crate) const GOVERNANCE_STORE_MEMORY: &str = "memory";
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GovernanceCfg {
-    /// Governance store backend. `memory` (default) is ephemeral RAM (keys/budgets reset on restart);
-    /// `sqlite` persists to `db_path`. Governance itself is always on — it is simply inert until an
-    /// admin token is set and virtual keys are minted.
-    #[serde(default)]
-    pub(crate) store: GovernanceStore,
+    /// Governance store backend, by plugin ALIAS or CANONICAL NAME. `memory` (default) is the
+    /// compiled-in ephemeral RAM store (keys/budgets reset on restart). Anything else names a
+    /// STORE PLUGIN resolved from the `plugins.*` registry — the shipped first-party stores
+    /// (`sqlite` / `postgres` / `redis`, canonically `busbar-store-<x>`) or a third-party store by
+    /// its manifest name (e.g. `acme-store-dynamo`). A non-`memory` store REQUIRES
+    /// `plugins.enabled: true`; anything else is a boot error naming the flag.
+    #[serde(default = "default_governance_store")]
+    pub(crate) store: String,
     /// Connection target for a durable governance store: a SQLite file path when `store: sqlite`
     /// (default `busbar-governance.db`), a Postgres libpq URL (`postgres://user:pass@host/db`) when
     /// `store: postgres`, or a Redis URL (`redis://host:port/db`) when `store: redis`. Unused for the
@@ -1578,17 +1612,6 @@ pub(crate) struct GovernanceCfg {
     /// SQLite `busy_timeout` (ms) applied to each governance connection (default 5000).
     #[serde(default = "default_sqlite_busy_timeout_ms")]
     pub(crate) sqlite_busy_timeout_ms: i64,
-    /// Directory the engine loads store (and other) plugins from. A durable `store` other than
-    /// `memory` is a plugin library dropped here — e.g. `store: sqlite` loads the SQLite store
-    /// plugin from this directory. Default `plugins` (relative to the working directory).
-    #[serde(default = "default_plugins_dir")]
-    pub(crate) plugins_dir: String,
-    /// Plugin signing/trust policy — how the engine treats a plugin's signed manifest at load. Default
-    /// posture: only plugins signed by an allowlisted publisher load; any untrusted plugin is logged
-    /// and SKIPPED. Set `trust.allow_unsigned_plugins: true` to permit unsigned plugins, and/or
-    /// `trust.allow_third_party: true` to permit validly-signed plugins from a non-allowlisted publisher.
-    #[serde(default)]
-    pub(crate) trust: PluginTrustCfg,
     /// Amortization interval for the rate-limiter stale-entry sweep: every Nth `check_rate` pays the
     /// full retain (default 256).
     #[serde(default = "default_rate_sweep_interval")]
@@ -1605,14 +1628,12 @@ impl Default for GovernanceCfg {
         // Route the limit fields through the serde-default fns. Governance is always available;
         // the default store is ephemeral RAM (inert until an admin token + keys exist).
         Self {
-            store: GovernanceStore::Memory,
+            store: default_governance_store(),
             db_path: default_gov_db_path(),
             price_per_request_cents: default_price_per_request_cents(),
             price_per_1k_tokens_cents: 0,
             admin_token: None,
             sqlite_busy_timeout_ms: default_sqlite_busy_timeout_ms(),
-            plugins_dir: default_plugins_dir(),
-            trust: PluginTrustCfg::default(),
             rate_sweep_interval: default_rate_sweep_interval(),
             usage_flush_interval_ms: default_usage_flush_interval_ms(),
         }
@@ -1646,6 +1667,10 @@ const DEFAULT_GOVERNANCE_DB: &str = "busbar-governance.db";
 
 fn default_gov_db_path() -> String {
     DEFAULT_GOVERNANCE_DB.to_string()
+}
+
+fn default_governance_store() -> String {
+    GOVERNANCE_STORE_MEMORY.to_string()
 }
 
 fn default_price_per_request_cents() -> i64 {

@@ -661,52 +661,191 @@ async fn test_axum_marker_413_is_reshaped_even_as_plain_text() {
     assert!(v.get("error").is_some());
 }
 
-/// SECURITY (FIX 2): if the CONFIGURED governance store needs a plugin that is UNTRUSTED and NOT
-/// opted-in, boot must FAIL with a clear error that NAMES the plugin and the exact opt-in flag - never
-/// silently skip the store the operator asked for. We point a strict (default) trust policy at a
-/// plugins dir holding an unsigned library and assert `verify_plugin_trust` errors accordingly. With
-/// `allow_unsigned_plugins` set, the same bytes verify (unverified, but permitted).
-#[test]
-fn configured_store_with_untrusted_plugin_fails_boot_with_naming_error() {
+/// Helpers for the plugin pre-flight regression tests: a fresh temp plugins dir and an in-memory
+/// signed/unsigned tarball builder.
+fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "busbar-boot-trust-{}-{:p}",
+        "busbar-boot-plugins-{}-{tag}-{}",
         std::process::id(),
-        &"" as *const _
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let ext = if cfg!(target_os = "windows") {
-        ".dll"
-    } else if cfg!(target_os = "macos") {
-        ".dylib"
-    } else {
-        ".so"
-    };
-    let lib = dir.join(format!("libstore{ext}"));
-    std::fs::write(&lib, b"\x7fELF unsigned untrusted plugin bytes").unwrap();
+    dir
+}
 
-    // DEFAULT strict trust: no opt-ins, no publishers.
-    let mut g = crate::config::GovernanceCfg {
-        plugins_dir: dir.to_string_lossy().into_owned(),
+fn plugin_manifest(name: &str, alias: &str, publisher: &str) -> busbar_plugin_sign::Manifest {
+    busbar_plugin_sign::Manifest {
+        name: name.into(),
+        alias: alias.into(),
+        kind: "store".into(),
+        version: "1.5.0".into(),
+        publisher: publisher.into(),
+        abi_version: 1,
+        sha256: String::new(),
+        signature: String::new(),
+        description: String::new(),
+        homepage: String::new(),
+        license: String::new(),
+    }
+}
+
+/// An UNSIGNED (but structurally valid) tarball: sha256 set, signature empty.
+fn unsigned_tarball(mut m: busbar_plugin_sign::Manifest, lib: &[u8]) -> Vec<u8> {
+    m.sha256 = busbar_plugin_sign::sha256_hex(lib);
+    busbar_plugin_loader::tarball::package(&m, "lib.so", lib).unwrap()
+}
+
+fn plugins_cfg(dir: &std::path::Path, enabled: bool) -> crate::config::PluginsCfg {
+    crate::config::PluginsCfg {
+        enabled,
+        dir: dir.to_string_lossy().into_owned(),
         ..Default::default()
-    };
+    }
+}
 
-    // Boot verification REFUSES the unsigned plugin, and the error names the plugin + the opt-in flag.
-    let err = verify_plugin_trust(&g, &lib, "sqlite").unwrap_err();
+fn gov_with_store(store: &str) -> crate::config::GovernanceCfg {
+    crate::config::GovernanceCfg {
+        store: store.to_string(),
+        ..Default::default()
+    }
+}
+
+/// FAIL-CLOSED (hard requirement 1): `governance.store: <plugin>` with `plugins.enabled: false`
+/// (or the block absent) is a BOOT ERROR that NAMES the flag — the drop-is-inert failsafe.
+#[test]
+fn store_plugin_with_plugins_disabled_is_boot_error_naming_the_flag() {
+    let dir = tmp_plugin_dir("disabled-store");
+    let err = crate::plugins_preflight(Some(&gov_with_store("redis")), &plugins_cfg(&dir, false))
+        .unwrap_err();
+    assert!(err.contains("plugins.enabled"), "names the flag: {err}");
+    assert!(err.contains("redis"), "names the store: {err}");
+    // The ABSENT-block default behaves identically.
+    let err = crate::plugins_preflight(
+        Some(&gov_with_store("redis")),
+        &crate::config::PluginsCfg::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("plugins.enabled"), "absent block: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DROP-IS-INERT: plugins present in the directory but `plugins.enabled: false` (store: memory) —
+/// boot succeeds with an EMPTY registry; nothing in the dir is even considered.
+#[test]
+fn disabled_plugins_are_inert_even_when_present() {
+    let dir = tmp_plugin_dir("inert");
+    let tarball = unsigned_tarball(plugin_manifest("acme-store-x", "x", "acme"), b"lib");
+    std::fs::write(dir.join("x.tar.gz"), tarball).unwrap();
+    // Even an INVALID tarball must not matter while disabled.
+    std::fs::write(dir.join("junk.tar.gz"), b"not a tarball").unwrap();
+    let reg = crate::plugins_preflight(None, &plugins_cfg(&dir, false)).expect("inert");
+    assert!(reg.loadable().is_empty() && reg.skipped().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SECURITY: if the CONFIGURED governance store resolves to a plugin that is UNTRUSTED and NOT
+/// opted-in, boot must FAIL with a clear error that NAMES the plugin and carries the exact trust
+/// reason - never silently skip the store the operator asked for. With `allow_unsigned` set, the
+/// same tarball passes preflight and resolves by alias AND canonical name.
+#[test]
+fn configured_store_with_untrusted_plugin_fails_boot_with_naming_error() {
+    let dir = tmp_plugin_dir("untrusted-store");
+    let tarball = unsigned_tarball(
+        plugin_manifest("busbar-store-sqlite", "sqlite", "busbar"),
+        b"unsigned lib bytes",
+    );
+    std::fs::write(dir.join("sqlite.tar.gz"), tarball).unwrap();
+
+    // STRICT default trust: the referenced store plugin is skipped -> preflight fails, naming it.
+    let err = crate::plugins_preflight(Some(&gov_with_store("sqlite")), &plugins_cfg(&dir, true))
+        .unwrap_err();
     assert!(
-        err.contains("sqlite") && err.contains("rejected by the trust policy"),
-        "boot error names the store and the trust rejection: {err}"
+        err.contains("busbar-store-sqlite") || err.contains("'sqlite'"),
+        "names the plugin: {err}"
     );
     assert!(
-        err.contains("allow_unsigned_plugins"),
-        "boot error names the exact opt-in flag to set: {err}"
+        err.contains("allow_unsigned"),
+        "carries the exact opt-in flag to set: {err}"
     );
 
-    // With the opt-in flag set, the same bytes pass verification (unsigned but permitted).
-    g.trust.allow_unsigned_plugins = true;
+    // Opt in to unsigned: preflight passes and the store resolves by alias AND canonical name.
+    let mut cfg = plugins_cfg(&dir, true);
+    cfg.trust.allow_unsigned = true;
+    let reg = crate::plugins_preflight(Some(&gov_with_store("sqlite")), &cfg)
+        .expect("allow_unsigned permits the unsigned store plugin at boot");
+    assert!(reg.resolve("sqlite").is_some(), "alias resolves");
     assert!(
-        verify_plugin_trust(&g, &lib, "sqlite").is_ok(),
-        "allow_unsigned_plugins permits the unsigned store plugin at boot"
+        reg.resolve("busbar-store-sqlite").is_some(),
+        "canonical name resolves"
     );
+    let reg2 = crate::plugins_preflight(Some(&gov_with_store("busbar-store-sqlite")), &cfg)
+        .expect("the canonical name is equally valid as governance.store");
+    assert!(reg2.resolve("busbar-store-sqlite").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
+/// An UNKNOWN `governance.store` name (no plugin matches by alias or name) is a clear boot error
+/// listing what IS available.
+#[test]
+fn unknown_store_name_is_a_clear_boot_error() {
+    let dir = tmp_plugin_dir("unknown-store");
+    let mut cfg = plugins_cfg(&dir, true);
+    cfg.trust.allow_unsigned = true;
+    let tarball = unsigned_tarball(plugin_manifest("acme-store-x", "x", "acme"), b"lib");
+    std::fs::write(dir.join("x.tar.gz"), tarball).unwrap();
+    let err = crate::plugins_preflight(Some(&gov_with_store("dynamo")), &cfg).unwrap_err();
+    assert!(err.contains("'dynamo'"), "names the missing store: {err}");
+    assert!(
+        err.contains("acme-store-x"),
+        "lists what is available: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FAIL-CLOSED (hard requirement 1): ANY invalid tarball/manifest in an ENABLED plugins dir aborts
+/// preflight (and therefore boot) with the file + reason named — never a partial boot, even when
+/// the invalid plugin is not the configured store.
+#[test]
+fn invalid_manifest_in_enabled_dir_fails_boot() {
+    let dir = tmp_plugin_dir("invalid-any");
+    std::fs::write(dir.join("junk.tar.gz"), b"not a tarball at all").unwrap();
+    let err = crate::plugins_preflight(None, &plugins_cfg(&dir, true)).unwrap_err();
+    assert!(err.contains("junk.tar.gz"), "names the file: {err}");
+    assert!(err.contains("plugin validation failed"), "got {err}");
+
+    // A structurally-broken manifest (bad sha256 binding) equally aborts.
+    std::fs::remove_file(dir.join("junk.tar.gz")).unwrap();
+    let mut m = plugin_manifest("acme-store-x", "x", "acme");
+    m.sha256 = busbar_plugin_sign::sha256_hex(b"OTHER bytes");
+    let tarball = busbar_plugin_loader::tarball::package(&m, "lib.so", b"real bytes").unwrap();
+    std::fs::write(dir.join("sha.tar.gz"), tarball).unwrap();
+    let err = crate::plugins_preflight(None, &plugins_cfg(&dir, true)).unwrap_err();
+    assert!(err.contains("integrity"), "names the sha mismatch: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CONFLICT (hard requirement 3): two loadable plugins claiming the same alias abort boot naming
+/// BOTH — "you can't use redis and a third-party redis".
+#[test]
+fn alias_conflict_fails_boot_naming_both() {
+    let dir = tmp_plugin_dir("conflict");
+    let mut cfg = plugins_cfg(&dir, true);
+    cfg.trust.allow_unsigned = true;
+    let a = unsigned_tarball(
+        plugin_manifest("busbar-store-redis", "redis", "busbar"),
+        b"a",
+    );
+    let b = unsigned_tarball(plugin_manifest("acme-store-redis", "redis", "acme"), b"b");
+    std::fs::write(dir.join("a.tar.gz"), a).unwrap();
+    std::fs::write(dir.join("b.tar.gz"), b).unwrap();
+    let err = crate::plugins_preflight(None, &cfg).unwrap_err();
+    assert!(
+        err.contains("busbar-store-redis") && err.contains("acme-store-redis"),
+        "names both plugins: {err}"
+    );
+    assert!(err.contains("alias conflict"), "got {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }

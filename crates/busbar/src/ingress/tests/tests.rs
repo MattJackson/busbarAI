@@ -55,7 +55,7 @@ fn minimal_app() -> Arc<App> {
         on_exhausted_cfgs: std::collections::HashMap::new(),
         governance: None,
         plugins_dir: std::path::PathBuf::from("plugins"),
-        plugin_trust: crate::config::PluginTrustCfg::default(),
+        plugins_cfg: crate::config::PluginsCfg::default(),
         default_max_tokens: crate::config::DEFAULT_DEFAULT_MAX_TOKENS,
         reasoning_effort_budgets: [1024, 4096, 8192, 16384],
     })
