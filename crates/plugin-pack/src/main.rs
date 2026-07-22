@@ -71,7 +71,10 @@ fn keygen() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let key = SigningKey::from_bytes(&seed);
-    println!("private (BUSBAR_SIGN_KEY, keep secret): {}", hex::encode(seed));
+    println!(
+        "private (BUSBAR_SIGN_KEY, keep secret): {}",
+        hex::encode(seed)
+    );
     println!(
         "public  (publishers allowlist / BUSBAR_RELEASE_PUBKEY): {}",
         hex::encode(key.verifying_key().to_bytes())
@@ -228,18 +231,12 @@ mod tests {
             license: String::new(),
         };
         let signed = sign(&key, m, lib);
-        busbar_plugin_sign::validate_structure(
-            &signed,
-            lib,
-            &busbar_plugin_loader::supported_abi,
-        )
-        .expect("structural");
+        busbar_plugin_sign::validate_structure(&signed, lib, &busbar_plugin_loader::supported_abi)
+            .expect("structural");
         let tarball = busbar_plugin_loader::tarball::package(&signed, "lib.so", lib).unwrap();
         let up = busbar_plugin_loader::tarball::unpack(&tarball).unwrap();
         let mut policy = busbar_plugin_sign::TrustPolicy::default();
-        policy
-            .publishers
-            .insert("acme".into(), key.verifying_key());
+        policy.publishers.insert("acme".into(), key.verifying_key());
         assert!(matches!(
             busbar_plugin_sign::evaluate(&up.lib_bytes, &up.manifest, &policy).unwrap(),
             busbar_plugin_sign::Verdict::Trusted { .. }
