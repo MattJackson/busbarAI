@@ -257,13 +257,23 @@ pools:
 #   emit_server_timing: true
 
 # ── Governance (optional) ────────────────────────────────────────────────────────────────────────
-# When enabled, clients authenticate with busbar-issued VIRTUAL KEYS (managed via the admin API)
+# Governance is ALWAYS available but INERT until you set an admin_token (and mint keys via the admin
+# API). Once active, clients authenticate with busbar-issued VIRTUAL KEYS (managed via the admin API)
 # instead of the static `auth` tokens above. Each key carries allowed-pools (403), a spend budget
-# (429 when exceeded, or 400 for Bedrock ingress), and RPM/TPM rate limits (429). Enforcement state
-# persists in embedded SQLite.
+# (429 when exceeded, or 400 for Bedrock ingress), and RPM/TPM rate limits (429). There is no `enabled`
+# switch. The store defaults to ephemeral RAM (keys/budgets reset on restart); choose a durable `store`
+# for persistence — each durable backend is a plugin dropped in `plugins_dir`.
 # governance:
-#   enabled: true
-#   db_path: /var/lib/busbar/governance.db
-#   admin_token: "$BUSBAR_ADMIN_TOKEN"        # guards the /api/v1/admin/keys API; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
+#   admin_token: "$BUSBAR_ADMIN_TOKEN"        # ACTIVATES enforcement; guards /api/v1/admin/keys; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
 #   price_per_request_cents: 1                # flat per-request budget charge
 #   price_per_1k_tokens_cents: 50             # plus per-1000-token charge (from response usage)
+#   # store: memory                          # default — ephemeral RAM; omit for the default
+#   # For persistence, pick a durable store (a loadable plugin in plugins_dir) and its db_path target:
+#   # store: sqlite                          # single-node durable
+#   # db_path: /var/lib/busbar/governance.db
+#   # store: postgres                        # shared across a cluster; db_path is a postgres:// URL
+#   # store: redis                           # shared across a cluster; db_path is a redis:// URL
+#   # plugins_dir: plugins                   # where store plugins load from (default: plugins)
+#   # usage_flush_interval_ms: 100           # write-behind flush cadence (ms) for durable stores
+#   # trust:                                 # plugin signing policy
+#   #   on_untrusted: log                    # halt | alert | log (default) | allow
