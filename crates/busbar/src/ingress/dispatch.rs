@@ -333,11 +333,15 @@ pub(crate) async fn protocol_dispatch(
     }
     match proto {
         // Path-model protocols keep their full arms (streaming variants, native action errors).
+        // Their ingress futures are Box::pin'd: in a match every arm's future is inlined into the
+        // dispatch coroutine's union, so the gemini/bedrock arms (~5.7 KB each) inflate the future
+        // EVERY request carries even when the traffic is another dialect. Boxing moves that weight
+        // behind one allocation paid only by requests that actually take the arm.
         PROTO_GEMINI => {
             // axum's {*rest} wildcard percent-decoded the tail before the collapse; match it.
             let rest =
                 crate::observability::percent_decode(path.split("/models/").nth(1).unwrap_or(""));
-            gemini_ingress(
+            Box::pin(gemini_ingress(
                 crate::state::CurrentApp(app),
                 Path(rest),
                 OriginalUri(uri),
@@ -345,7 +349,7 @@ pub(crate) async fn protocol_dispatch(
                 axum::extract::Extension(caller),
                 headers,
                 body,
-            )
+            ))
             .await
         }
         PROTO_BEDROCK => {
@@ -355,27 +359,27 @@ pub(crate) async fn protocol_dispatch(
                 .map(|m| crate::observability::percent_decode(&m))
                 .unwrap_or_default();
             if path.ends_with("/converse") {
-                bedrock_converse(
+                Box::pin(bedrock_converse(
                     crate::state::CurrentApp(app),
                     Path(model),
                     axum::extract::Extension(gov),
                     axum::extract::Extension(caller),
                     headers,
                     body,
-                )
+                ))
                 .await
             } else if path.ends_with("/converse-stream") {
-                bedrock_converse_stream(
+                Box::pin(bedrock_converse_stream(
                     crate::state::CurrentApp(app),
                     Path(model),
                     axum::extract::Extension(gov),
                     axum::extract::Extension(caller),
                     headers,
                     body,
-                )
+                ))
                 .await
             } else if path.ends_with("/invoke") {
-                bedrock_invoke(
+                Box::pin(bedrock_invoke(
                     crate::state::CurrentApp(app),
                     Path(model),
                     OriginalUri(uri),
@@ -383,7 +387,7 @@ pub(crate) async fn protocol_dispatch(
                     axum::extract::Extension(caller),
                     headers,
                     body,
-                )
+                ))
                 .await
             } else {
                 crate::fallback_error_response(
