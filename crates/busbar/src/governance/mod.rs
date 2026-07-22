@@ -619,10 +619,10 @@ pub(crate) fn spawn_budget_flusher(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let interval = std::time::Duration::from_millis(crate::limits::usage_flush_interval_ms());
-    // SERIALIZE flushes: `flush_budgets` snapshots dirty cells and then `put_usage`-writes each with
-    // ABSOLUTE (overwrite) semantics. If a slow flush outlasts a tick, a second flush can start
-    // concurrently and the two `put_usage` streams can COMPLETE out of order - an older snapshot's
-    // write landing AFTER a newer one silently rolls the durable spend BACKWARD (a lost update). A
+    // SERIALIZE flushes: `flush_budgets` snapshots each dirty cell's DELTA against its acked
+    // baseline and `add_usage`-accumulates it, advancing the baseline only on success. If a slow
+    // flush outlasts a tick, a second concurrent flush would snapshot against the SAME un-advanced
+    // baseline and re-send the first flush's still-in-flight delta - a durable DOUBLE-COUNT. A
     // single-permit async gate makes at most one flush in flight at a time: the periodic tick SKIPS
     // if a flush is still running (`try_lock`), and the shutdown arm WAITS for the in-flight flush to
     // drain (`lock().await`) before its final flush, so shutdown never overlaps and never loses the

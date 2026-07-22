@@ -2172,6 +2172,57 @@ fn test_group_token_spend_blocks_chain_admission() {
     );
 }
 
+/// REGRESSION (audit cost-1.5.0 #1): a boundary-STRADDLING admission - pinned `charged_at` in the
+/// OLD window, arriving after a concurrent admission already rolled the live cell to the NEW
+/// window - must charge the live cell IN PLACE. The pre-fix charge arm rewound the live cell to
+/// the straddler's older window (`BudgetCell::fresh(old_window)`), wiping the new window's
+/// accrued tokens/requests AND flush baselines; and the pre-fix check arm derived the straddler's
+/// spend as 0 (fresh window), admitting past an exhausted cap.
+#[test]
+fn test_boundary_straddle_charge_never_rewinds_the_live_cell() {
+    let store = Arc::new(MemoryStore::new());
+    let gov = GovState::new(store, None).unwrap();
+    // 100 micro-units/token, no flat fee: 10_000 tokens = 100 cents of derived spend.
+    let cost = card_cost("m", 100.0);
+    let mut k = sample_key("vk_straddle", "h_s");
+    k.max_budget_cents = Some(150);
+    k.budget_period = BUDGET_PERIOD_DAILY.to_string();
+    let w0_late = 3 * crate::governance::SECS_PER_DAY - 5; // just before the day boundary
+    let w1_early = 3 * crate::governance::SECS_PER_DAY + 5; // just after (the LIVE window)
+
+    // A W1 admission rolls the cell to the new day and accrues real spend there.
+    gov.try_charge_request_within_budget(&cost, &k, w1_early)
+        .expect("fresh window admits");
+    gov.record_usage(&cost, &k, "m", &tt(10_000), w1_early);
+    let before = gov
+        .derived_bucket_usage(&cost, &k.id, &k.budget_period, false, w1_early)
+        .unwrap();
+    assert_eq!((before.tokens, before.requests), (10_000, 1));
+
+    // The straddler (charged_at still in W0) is admitted - 100c < 150c cap - and must charge the
+    // LIVE cell without rewinding it.
+    gov.try_charge_request_within_budget(&cost, &k, w0_late)
+        .expect("under-cap straddler admits");
+    let after = gov
+        .derived_bucket_usage(&cost, &k.id, &k.budget_period, false, w1_early)
+        .unwrap();
+    assert_eq!(
+        (after.tokens, after.requests),
+        (10_000, 2),
+        "the live window's ledger survives a straddling charge (no rewind); the straddler's \
+         request lands in the live cell"
+    );
+
+    // Exhaust the live window's cap; a further STRADDLING admission must SEE that spend and
+    // reject (pre-fix it derived 0 for the 'stale' window and admitted).
+    gov.record_usage(&cost, &k, "m", &tt(10_000), w1_early); // now 200c > 150c cap
+    assert_eq!(
+        gov.try_charge_request_within_budget(&cost, &k, w0_late),
+        Err(BudgetBlocked::Key),
+        "a straddler is checked against the live cell's derived spend, not a phantom fresh window"
+    );
+}
+
 /// FAIL-CLOSED: a key bound to a budget_group this node's config does not know is NOT admitted
 /// (MissingGroup named), and accrual degrades to the key bucket only (tokens never lost).
 #[test]

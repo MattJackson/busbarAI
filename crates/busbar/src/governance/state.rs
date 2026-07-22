@@ -806,8 +806,11 @@ impl GovState {
     /// may allocate its group-name String.
     ///
     /// Residual (documented honestly): token cost is reconciled post-response (`record_usage`), so
-    /// a single ADMITTED request's own tokens can push a bucket marginally past its cap - bounded
-    /// to ONE in-flight request per bucket, NOT N.
+    /// an admitted request's tokens are invisible to admissions that race it. The FEE component is
+    /// hard (charged atomically at admission), but the token overshoot past a cap is bounded by
+    /// the token cost of EVERY in-flight admitted request for the bucket (i.e. by the concurrency
+    /// in flight when the cap is reached), not by a single request. A hard token cap would require
+    /// reserving estimated tokens at admit time - out of scope, as with TPM.
     ///
     /// SYNCHRONOUS and INFALLIBLE (in-memory cells; no store round-trip, no await). The flat fee is
     /// charged HERE (as +1 request; spend derives), so the caller must NOT re-charge in `finish`;
@@ -890,8 +893,14 @@ impl GovState {
             };
             let window = budget_window(bucket.budget_period, now);
             let map = guards[gi].as_deref().expect("guard held");
+            // Derive from the LIVE cell when it holds this window OR a NEWER one (the straddle:
+            // `now` is the pinned `charged_at`, so a request admitted just before a boundary can
+            // arrive after a concurrent admission already rolled the cell forward - its charge
+            // lands on the live cell in PASS 2, so the check must read that same cell's spend,
+            // never treat it as a fresh window). Only a genuinely STALE (older-window) or absent
+            // cell reads as zero spend.
             let derived = match map.get(bucket.bucket_id) {
-                Some(cell) if cell.window_start == window => {
+                Some(cell) if cell.window_start >= window => {
                     cost.derive_spend_cents(cell.model_views(), cell.requests, bucket.is_key)
                 }
                 _ => 0, // stale or absent cell = fresh window = zero spend
@@ -915,12 +924,21 @@ impl GovState {
             let gi = guard_for(&guard_shards, shard_idx[bi]);
             let window = budget_window(bucket.budget_period, now);
             let map = guards[gi].as_deref_mut().expect("guard held");
+            // STRADDLE-SAFE cell resolution (mirrors `accrue_bucket` / `add_rate_tokens`): reset
+            // ONLY a genuinely stale cell (this window strictly newer). A cell holding the SAME or
+            // a NEWER window is charged IN PLACE - rewinding a newer live cell to this request's
+            // older `charged_at` window (the pre-fix `!=` arm) zeroed the live window's accrued
+            // tokens/requests AND its flush baselines, wiping real spend at every window boundary
+            // with a straddling admission. The µs-race residual: a straddle-charged fee whose
+            // refund later arrives carrying the older window is dropped by `refund_bucket`
+            // (bounded to one boundary-racing request; the safe direction - never a blind
+            // decrement of another window's charge).
             let cell = match map.get_mut(bucket.bucket_id) {
-                Some(c) if c.window_start == window => c,
-                Some(c) => {
+                Some(c) if window > c.window_start => {
                     *c = BudgetCell::fresh(window);
                     c
                 }
+                Some(c) => c, // same window or straddle (cell newer) - charge the live cell
                 None => map
                     .entry(bucket.bucket_id.to_string())
                     .or_insert_with(|| BudgetCell::fresh(window)),
