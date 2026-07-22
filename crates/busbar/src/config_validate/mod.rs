@@ -1341,16 +1341,17 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
 /// cannot ride along in `validate(&RootCfg)`). Called from `config::resolve`, whose `Err(Vec<String>)`
 /// is surfaced as a fail-loud boot error — the same channel `validate` uses.
 ///
-/// When `governance.enabled` is true but `admin_token` is unset, `GovState::admin_token_hash()` returns
-/// `None`, so the `/admin` auth branch's `authorized` is permanently `false`: the admin API is
-/// SILENTLY locked (every admin call 401s) with no startup diagnostic. An operator who enabled
-/// governance to manage virtual keys discovers this only at runtime. Mirror the `token` mode with no
-/// `client_tokens` fail-loud pattern and reject it at boot. A disabled governance block carries no
-/// requirement (the admin surface is inert anyway).
+/// A blank/whitespace-only `admin_token` leaves `GovState::admin_token_hash()` returning `None`, so
+/// the `/admin` auth branch's `authorized` is permanently `false`: the admin API is SILENTLY locked
+/// (every admin call 401s) with no startup diagnostic. An operator who set an (expanded-to-blank)
+/// token to manage virtual keys discovers this only at runtime. Mirror the `token` mode with no
+/// `client_tokens` fail-loud pattern and reject it at boot. An unset `admin_token` carries no
+/// requirement (governance is always available but inert, the admin surface off).
 ///
 /// `auth` is the deployment's auth block (read separately, like governance, so neither lands on
-/// `RootCfg`). `governance.enabled` combined with `upstream_credentials: passthrough` is a self-contradictory
-/// deployment: governance requires every request to resolve to an enabled virtual key, which
+/// `RootCfg`). Active governance (an `admin_token` is set) combined with `upstream_credentials:
+/// passthrough` is a self-contradictory deployment: governance requires every request to resolve to
+/// an enabled virtual key, which
 /// supersedes passthrough's "accept any caller credential and forward it upstream" intent — so a
 /// server an operator believes is in passthrough silently rejects every caller lacking a virtual
 /// key (a behaviour inversion that could cause a production outage). The auth runtime emits a

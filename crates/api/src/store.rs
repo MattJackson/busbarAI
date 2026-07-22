@@ -2,9 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The durable-store CONTRACT — the data types a `db` plugin (SQLite built-in, Postgres, Redis, …)
-//! reads and writes. The `Store` trait itself and its error type join this module in a following
-//! step; this file holds the plain records that cross the seam, so a plugin crate can name them
-//! without depending on the engine.
+//! reads and writes, plus the `Store` trait itself and its error type. The plain records that cross
+//! the seam live here too, so a plugin crate can name them without depending on the engine.
 //!
 //! These are the same records the admin API and governance enforcement speak, moved here so the
 //! contract — not the engine — owns them. No I/O, no engine state: pure data.
