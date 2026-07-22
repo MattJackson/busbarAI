@@ -9,14 +9,15 @@
 //! [`busbar_plugin_sign::TrustPolicy`]:
 //!
 //! - **Trusted** — a valid signature from an allowlisted publisher → load, log at info.
-//! - **Allowed** — untrusted (unsigned / unknown publisher / tampered) but the `on_untrusted` posture
-//!   permits it (`log`/`alert`/`allow`) → load, log a warning (the operator chose a loose posture).
-//! - **Rejected** — the posture is `halt` → do NOT load; the caller aborts (boot fails / install 4xx).
+//! - **Allowed** - untrusted (unsigned or third-party-signed) but the matching EXPLICIT opt-in flag
+//!   (`allow_unsigned_plugins` / `allow_third_party`) permits it → load, log a warning.
+//! - **Rejected** - untrusted with no matching opt-in (the DEFAULT), or an anti-downgrade violation →
+//!   do NOT load; the caller aborts (boot fails / install 4xx) and NO library code runs.
 //!
 //! The manifest is read WITHOUT loading the library (a sidecar file), so untrusted code is never
 //! `dlopen`ed just to inspect it. This module is pure verification + policy; no `unsafe`.
 
-use busbar_plugin_sign::{evaluate, Manifest, TrustPolicy, Verdict};
+use busbar_plugin_sign::{evaluate, AllowReason, Manifest, TrustPolicy, Verdict};
 use std::path::{Path, PathBuf};
 
 /// The sidecar manifest path for a plugin library: `<library>.manifest.json`.
@@ -72,12 +73,16 @@ pub(crate) fn verify_read(
             tracing::info!(plugin = name, publisher = %publisher, "plugin trust: signed by an allowlisted publisher");
             Ok((format!("signed by '{publisher}'"), bytes))
         }
-        Ok(Verdict::Allowed { reason, action }) => {
+        Ok(Verdict::Allowed { reason, allow }) => {
+            let flag = match allow {
+                AllowReason::Unsigned => "allow_unsigned_plugins",
+                AllowReason::ThirdParty => "allow_third_party",
+            };
             tracing::warn!(
                 plugin = name,
-                posture = ?action,
+                opt_in = flag,
                 reason = %reason,
-                "plugin trust: loading an UNVERIFIED plugin (allowed by policy posture)"
+                "plugin trust: loading an UNVERIFIED plugin (permitted by an explicit opt-in flag)"
             );
             Ok((format!("unverified — {reason}"), bytes))
         }
@@ -88,7 +93,7 @@ pub(crate) fn verify_read(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use busbar_plugin_sign::{sign, Manifest, OnUntrusted, SigningKey, TrustPolicy};
+    use busbar_plugin_sign::{sign, Manifest, SigningKey, TrustPolicy};
     use std::collections::BTreeMap;
 
     fn write_plugin(dir: &Path, name: &str, bytes: &[u8], manifest: Option<&Manifest>) -> PathBuf {
@@ -137,46 +142,53 @@ mod tests {
         publishers.insert("acme".to_string(), key.verifying_key());
         let policy = TrustPolicy {
             publishers,
-            on_untrusted: OnUntrusted::Halt,
+            allow_unsigned: false,
+            allow_third_party: false,
             min_versions: BTreeMap::new(),
         };
         assert!(verify(&lib, &policy).unwrap().contains("signed by 'acme'"));
     }
 
     #[test]
-    fn unsigned_is_rejected_under_halt_but_loaded_under_log() {
+    fn unsigned_is_rejected_by_default_but_loaded_with_allow_unsigned() {
         let dir = tmp();
         let lib = write_plugin(&dir, "libun.so", b"bytes", None);
 
-        let halt = TrustPolicy {
+        // DEFAULT (no opt-in): an unsigned plugin is rejected, and the error names the opt-in flag.
+        let strict = TrustPolicy {
             publishers: BTreeMap::new(),
-            on_untrusted: OnUntrusted::Halt,
+            allow_unsigned: false,
+            allow_third_party: false,
             min_versions: BTreeMap::new(),
         };
-        assert!(verify(&lib, &halt).is_err());
+        let err = verify(&lib, &strict).unwrap_err();
+        assert!(err.contains("allow_unsigned_plugins"), "got {err}");
 
-        let log = TrustPolicy {
+        // With allow_unsigned set, the same unsigned plugin loads (unverified).
+        let allow = TrustPolicy {
             publishers: BTreeMap::new(),
-            on_untrusted: OnUntrusted::Log,
+            allow_unsigned: true,
+            allow_third_party: false,
             min_versions: BTreeMap::new(),
         };
-        assert!(verify(&lib, &log).unwrap().contains("unverified"));
+        assert!(verify(&lib, &allow).unwrap().contains("unverified"));
     }
 
     /// FIX 1 at the engine boundary: the anti-downgrade floor keys on the LIBRARY FILENAME (the
     /// identity the engine resolves the plugin by), so deleting the sidecar manifest cannot slip old
-    /// vulnerable bytes past a floor even under a loose `allow` posture. Without a floor the unsigned
-    /// bytes load; with a floor pinned on the filename, a manifest-less load is a HARD reject.
+    /// vulnerable bytes past a floor even with the opt-in flags set. Without a floor the unsigned bytes
+    /// load (allow_unsigned); with a floor pinned on the filename, a manifest-less load is a HARD reject.
     #[test]
     fn missing_manifest_cannot_bypass_the_floor_keyed_on_filename() {
         let dir = tmp();
         // No sidecar manifest at all.
         let lib = write_plugin(&dir, "libfloored.so", b"old vulnerable bytes", None);
 
-        // Loose posture, no floor: an unsigned artifact loads.
+        // Opt-in to unsigned, no floor: an unsigned artifact loads.
         let loose = TrustPolicy {
             publishers: BTreeMap::new(),
-            on_untrusted: OnUntrusted::Allow,
+            allow_unsigned: true,
+            allow_third_party: false,
             min_versions: BTreeMap::new(),
         };
         assert!(verify(&lib, &loose).unwrap().contains("unverified"));

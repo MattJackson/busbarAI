@@ -4,7 +4,7 @@ version = "1.5.0"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.87"
-description = "Plugin artifact signing + trust evaluation for busbar: ed25519 detached signatures over the artifact SHA-256, a signed manifest, and the plugins.trust posture (require_signed / allow_publishers / on_untrusted)."
+description = "Plugin artifact signing + trust evaluation for busbar: ed25519 detached signatures over the artifact SHA-256, a signed manifest, and the governance.trust policy (allowlisted publishers, allow_unsigned / allow_third_party opt-ins, anti-downgrade floors)."
 license = "Apache-2.0"
 
 [dependencies]

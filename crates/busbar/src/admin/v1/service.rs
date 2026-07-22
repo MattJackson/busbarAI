@@ -738,10 +738,17 @@ impl AdminService {
     }
 
     /// The DYNAMIC-LIBRARY store catalog (`GET /api/v1/admin/plugins?type=store`): the compiled-in
-    /// `memory` default plus every loadable library in `plugins_dir`, each with its ABI-validity and
-    /// signed-manifest metadata + re-evaluated trust verdict. Pure read (no library is `open`ed — the
-    /// ABI handshake `dlopen`s to inspect but never constructs a store, and the manifest is a sidecar
-    /// file). Sorted by filename after the `memory` head.
+    /// `memory` default plus every library in `plugins_dir`, each with its signed-manifest metadata and
+    /// a re-evaluated trust verdict. Sorted by filename after the `memory` head.
+    ///
+    /// TRUST-GATED INSPECTION (security): this endpoint NEVER `dlopen`s an UNTRUSTED library. It scans
+    /// the directory for filenames only ([`list_plugin_files`], no `dlopen`), reads each library's
+    /// signed sidecar manifest, and re-evaluates trust against the RUNNING policy from those bytes - all
+    /// WITHOUT loading any library. Only a library that PASSES the trust gate (trusted, or permitted by
+    /// an explicit `allow_*` opt-in) is then `dlopen`ed for the ABI validity handshake. A library that
+    /// fails the trust gate is reported present + untrusted from its manifest metadata ALONE - its
+    /// init/constructor code never runs. This closes the catalog-`dlopen` trust bypass: no library's
+    /// code executes until it passes trust, even via this inspection endpoint.
     fn store_plugin_catalog(&self) -> Vec<PluginView> {
         // The compiled-in RAM default is always present. Which store backend is ACTIVE is a
         // `governance.store` config concern (read via `GET /config`), not summarized per-row here —
@@ -754,27 +761,47 @@ impl AdminService {
             None,
         )];
         let policy = self.app.plugin_trust.to_policy().ok();
-        for info in busbar_plugin_loader::inventory(&self.app.plugins_dir) {
-            let lib_path = self.app.plugins_dir.join(&info.file);
+        // Filenames ONLY - no library is opened by this scan.
+        for file in busbar_plugin_loader::list_plugin_files(&self.app.plugins_dir) {
+            let lib_path = self.app.plugins_dir.join(&file);
             // The signed sidecar manifest (`<lib>.manifest.json`) — the displayed metadata (all
-            // signature-covered fields, so the "install X by Y" card can't be spoofed).
+            // signature-covered fields, so the "install X by Y" card can't be spoofed). Read WITHOUT
+            // touching the library.
             let manifest = read_sidecar_manifest(&lib_path);
-            // The trust verdict is re-evaluated server-side against the RUNNING posture (never a
-            // stored value): `verify` reads the library bytes + sidecar manifest and judges them. A
-            // `halt`-posture rejection reports `"rejected"`; a permissive posture reports
+            // Re-evaluate trust server-side against the RUNNING policy from the library bytes + sidecar
+            // (never a stored value, and WITHOUT `dlopen`): `verify` reads and judges the bytes. A
+            // rejection (untrusted, no opt-in) reports `"rejected"`; an opt-in-permitted load reports
             // `"unverified"`; an allowlisted signature reports `"trusted"`. Unresolvable policy ⇒ None.
-            let trust = policy
+            let verdict = policy
                 .as_ref()
-                .map(|p| match crate::plugin_trust::verify(&lib_path, p) {
-                    Ok(note) if note.starts_with("signed by") => "trusted",
-                    Ok(_) => "unverified",
-                    Err(_) => "rejected",
-                });
+                .map(|p| crate::plugin_trust::verify(&lib_path, p));
+            let trust = verdict.as_ref().map(|v| match v {
+                Ok(note) if note.starts_with("signed by") => "trusted",
+                Ok(_) => "unverified",
+                Err(_) => "rejected",
+            });
+            // ONLY if trust permits do we `dlopen` the library for the ABI validity handshake. An
+            // untrusted (rejected) library is NEVER opened - its init code never runs - and its ABI
+            // validity is left unknown (`valid: None`) with the trust-rejection reason surfaced.
+            let trust_permits = matches!(verdict, Some(Ok(_)));
+            let (valid, error) = if trust_permits {
+                match busbar_plugin_loader::validate_plugin(&lib_path) {
+                    Ok(_) => (Some(true), None),
+                    Err(e) => (Some(false), Some(e)),
+                }
+            } else {
+                // Surface the trust-rejection reason (if any) instead of an ABI error; no dlopen.
+                let reason = match &verdict {
+                    Some(Err(rejected)) => Some(rejected.clone()),
+                    _ => None,
+                };
+                (None, reason)
+            };
             // The plugin NAME is the manifest name when present, else the library filename.
             let name = manifest
                 .as_ref()
                 .map(|m| m.name.clone())
-                .unwrap_or_else(|| info.file.clone());
+                .unwrap_or_else(|| file.clone());
             out.push(PluginView {
                 name,
                 r#type: "store",
@@ -784,13 +811,13 @@ impl AdminService {
                 // activation is left unsummarized here (the configured backend shows on the `memory`
                 // row or is inferable from `governance.store`); dynamic rows report `None`.
                 active: None,
-                target: Some(info.file.clone()),
+                target: Some(file.clone()),
                 version: manifest.as_ref().map(|m| m.version.clone()),
                 publisher: manifest.as_ref().map(|m| m.publisher.clone()),
                 interface_version: manifest.as_ref().map(|m| m.interface_version),
                 trust,
-                valid: Some(info.valid),
-                error: info.error.clone(),
+                valid,
+                error,
             });
         }
         out
@@ -851,12 +878,12 @@ impl AdminService {
                 manifest.as_ref().map(|m| m.publisher.clone()),
                 manifest.as_ref().map(|m| m.version.clone()),
             ),
-            // `halt` posture forbids an untrusted upload — a terminal state conflict (retrying the same
-            // bytes can't fix it; sign it, or relax the posture). The reason is safe to surface.
+            // An untrusted upload with no matching opt-in is forbidden - a terminal state conflict
+            // (retrying the same bytes can't fix it; sign it, or set the opt-in). The `evaluate` reason
+            // already names the exact flag to set and is safe to surface.
             Err(rejected) => {
                 return Err(AdminError::Conflict(format!(
-                    "plugin rejected by the trust policy: {}. Sign it with an allowlisted publisher, \
-                     or relax governance.trust.on_untrusted.",
+                    "plugin rejected by the trust policy: {}",
                     rejected.0
                 )));
             }
@@ -1459,7 +1486,7 @@ mod tests {
 
     // ── plugin admin surface (#13) ───────────────────────────────────────────────────────────────
 
-    use busbar_plugin_sign::{sign, Manifest, OnUntrusted, SigningKey};
+    use busbar_plugin_sign::{sign, Manifest, SigningKey};
 
     /// A unique temp plugins directory for one test (isolated so parallel tests never collide).
     fn tmp_plugins_dir(tag: &str) -> std::path::PathBuf {
@@ -1489,10 +1516,11 @@ mod tests {
         AdminService::new(app)
     }
 
-    /// A permissive (`log`) posture with no publishers — an unsigned upload loads "unverified".
+    /// A permissive posture (allow_unsigned_plugins) with no publishers - an unsigned upload loads
+    /// "unverified" rather than being rejected.
     fn log_posture() -> crate::config::PluginTrustCfg {
         crate::config::PluginTrustCfg {
-            on_untrusted: OnUntrusted::Log,
+            allow_unsigned_plugins: true,
             publishers: Vec::new(),
             ..Default::default()
         }
@@ -1561,7 +1589,6 @@ mod tests {
     fn install_halt_posture_rejects_unsigned() {
         let dir = tmp_plugins_dir("halt");
         let trust = crate::config::PluginTrustCfg {
-            on_untrusted: OnUntrusted::Halt,
             publishers: Vec::new(),
             ..Default::default()
         };
@@ -1622,6 +1649,43 @@ mod tests {
         ));
     }
 
+    /// SECURITY (catalog-dlopen trust bypass): under the DEFAULT (strict) posture, an UNSIGNED library
+    /// present in `plugins_dir` must be reported present + `rejected` by the catalog WITHOUT ever being
+    /// `dlopen`ed - so its init/constructor code never runs during inspection. We assert `valid: None`:
+    /// the catalog only sets `valid: Some(_)` when it ABI-validates (which `dlopen`s), so `None` proves
+    /// no library was opened. The old code called `inventory()`, which `dlopen`ed EVERY library before
+    /// any trust check, and would have reported `valid: Some(false)` (an ABI error) here instead.
+    #[test]
+    fn catalog_does_not_dlopen_an_untrusted_library() {
+        let dir = tmp_plugins_dir("untrusted-catalog");
+        // DEFAULT strict posture: no opt-in flags, no publishers => an unsigned plugin is untrusted.
+        let svc = svc_with(dir.clone(), crate::config::PluginTrustCfg::default());
+
+        // Drop an UNSIGNED "library" (bytes that are NOT a loadable cdylib) with the platform lib ext.
+        // If the catalog dlopened it, that dlopen would fail and set valid: Some(false); it must not.
+        let file = lib_name("libuntrusted");
+        std::fs::write(
+            dir.join(&file),
+            b"\x7fELF definitely not a real busbar plugin",
+        )
+        .unwrap();
+
+        let cat = svc.store_plugin_catalog();
+        let row = cat
+            .iter()
+            .find(|p| p.target.as_deref() == Some(file.as_str()))
+            .expect("the untrusted library is listed in the catalog");
+        assert_eq!(
+            row.trust,
+            Some("rejected"),
+            "an unsigned library under the strict default posture is reported rejected"
+        );
+        assert_eq!(
+            row.valid, None,
+            "the untrusted library was NOT dlopened (valid is only Some(_) after ABI validation)"
+        );
+    }
+
     /// A SIGNED upload from an allowlisted publisher installs as `trusted`, and its manifest sidecar
     /// is written so the catalog reports the signed metadata + trusted verdict.
     #[test]
@@ -1651,7 +1715,6 @@ mod tests {
             &bytes,
         );
         let trust = crate::config::PluginTrustCfg {
-            on_untrusted: OnUntrusted::Halt,
             publishers: vec![crate::config::PluginPublisher {
                 name: "acme".into(),
                 public_key: hex::encode(key.verifying_key().to_bytes()),
@@ -1721,7 +1784,8 @@ mod tests {
         let mut floors = std::collections::BTreeMap::new();
         floors.insert(file.clone(), "2.0.0".to_string());
         let trust = crate::config::PluginTrustCfg {
-            on_untrusted: OnUntrusted::Halt,
+            allow_unsigned_plugins: false,
+            allow_third_party: false,
             publishers: vec![crate::config::PluginPublisher {
                 name: "acme".into(),
                 public_key: hex::encode(key.verifying_key().to_bytes()),
@@ -1780,7 +1844,6 @@ mod tests {
         );
         let dir = tmp_plugins_dir("unknownpub");
         let trust = crate::config::PluginTrustCfg {
-            on_untrusted: OnUntrusted::Halt,
             publishers: Vec::new(),
             ..Default::default()
         };

@@ -1221,10 +1221,14 @@ fn verify_plugin_trust(
         .trust
         .to_policy()
         .map_err(|e| format!("governance.trust is invalid: {e}"))?;
+    // FAIL BOOT (never silently skip the store the operator asked for) if the CONFIGURED store's
+    // plugin is untrusted and not opted-in. The `evaluate` reason already names the plugin and the
+    // exact flag to set (allow_unsigned_plugins / allow_third_party), so surface it verbatim.
     let (_note, bytes) = plugin_trust::verify_read(lib_path, &policy).map_err(|reason| {
         format!(
-            "governance store '{store}' plugin rejected by the trust policy: {reason}. Sign it with \
-             an allowlisted publisher, or relax governance.trust.on_untrusted."
+            "governance store '{store}' plugin rejected by the trust policy: {reason} \
+             (sign it with an allowlisted publisher, add the publisher to governance.trust.publishers, \
+             or set the matching governance.trust opt-in flag)."
         )
     })?;
     Ok(bytes)
@@ -1719,7 +1723,8 @@ pub(crate) fn build_app_from_config(
     // Capture the plugin-directory + trust posture for the Admin API plugin surface BEFORE
     // `governance_cfg` is consumed by the store-load branch below. These ride on the `App` snapshot so
     // the catalog/install/remove/reload endpoints resolve the SAME directory + posture the boot
-    // store-load uses. Absent `governance:` ⇒ the defaults (`plugins`, `on_untrusted: log`).
+    // store-load uses. Absent `governance:` ⇒ the defaults (`plugins`, strict trust: untrusted
+    // plugins are logged and skipped unless allow_unsigned_plugins / allow_third_party is set).
     let (plugins_dir, plugin_trust) = governance_cfg.as_ref().map_or_else(
         || {
             let d = config::GovernanceCfg::default();

@@ -660,3 +660,53 @@ async fn test_axum_marker_413_is_reshaped_even_as_plain_text() {
         serde_json::from_slice(&bytes).expect("reshaped 413 body must be valid JSON");
     assert!(v.get("error").is_some());
 }
+
+/// SECURITY (FIX 2): if the CONFIGURED governance store needs a plugin that is UNTRUSTED and NOT
+/// opted-in, boot must FAIL with a clear error that NAMES the plugin and the exact opt-in flag - never
+/// silently skip the store the operator asked for. We point a strict (default) trust policy at a
+/// plugins dir holding an unsigned library and assert `verify_plugin_trust` errors accordingly. With
+/// `allow_unsigned_plugins` set, the same bytes verify (unverified, but permitted).
+#[test]
+fn configured_store_with_untrusted_plugin_fails_boot_with_naming_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "busbar-boot-trust-{}-{:p}",
+        std::process::id(),
+        &"" as *const _
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ext = if cfg!(target_os = "windows") {
+        ".dll"
+    } else if cfg!(target_os = "macos") {
+        ".dylib"
+    } else {
+        ".so"
+    };
+    let lib = dir.join(format!("libstore{ext}"));
+    std::fs::write(&lib, b"\x7fELF unsigned untrusted plugin bytes").unwrap();
+
+    // DEFAULT strict trust: no opt-ins, no publishers.
+    let mut g = crate::config::GovernanceCfg {
+        plugins_dir: dir.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+
+    // Boot verification REFUSES the unsigned plugin, and the error names the plugin + the opt-in flag.
+    let err = verify_plugin_trust(&g, &lib, "sqlite").unwrap_err();
+    assert!(
+        err.contains("sqlite") && err.contains("rejected by the trust policy"),
+        "boot error names the store and the trust rejection: {err}"
+    );
+    assert!(
+        err.contains("allow_unsigned_plugins"),
+        "boot error names the exact opt-in flag to set: {err}"
+    );
+
+    // With the opt-in flag set, the same bytes pass verification (unsigned but permitted).
+    g.trust.allow_unsigned_plugins = true;
+    assert!(
+        verify_plugin_trust(&g, &lib, "sqlite").is_ok(),
+        "allow_unsigned_plugins permits the unsigned store plugin at boot"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

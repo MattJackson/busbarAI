@@ -20,8 +20,10 @@
 //! library has no valid signature, and a good manifest on a swapped library fails the hash check.
 //!
 //! "Approved" = the signature verifies against an allowlisted publisher. Anything else — unsigned,
-//! unknown publisher, tampered — is UNTRUSTED, and the [`OnUntrusted`] posture decides `Halt` (only
-//! approved plugins), `Alert`/`Log` (load but flag), or `Allow` (dev). A signature — not a bare
+//! unknown (third-party) publisher, tampered - is UNTRUSTED. By DEFAULT an untrusted plugin is
+//! REJECTED (logged and skipped, never `dlopen`ed); an operator opts in EXPLICITLY per category via
+//! [`TrustPolicy::allow_unsigned`] (permit unsigned plugins) and [`TrustPolicy::allow_third_party`]
+//! (permit validly-signed plugins from a publisher not in the allowlist). A signature - not a bare
 //! checksum — is what holds against a MITM: bytes and a request-supplied hash can both be rewritten
 //! in transit, but the signature can't be forged.
 //!
@@ -100,30 +102,36 @@ pub struct Manifest {
     pub signature: String,
 }
 
-/// What to do with a plugin that is not trusted (no valid signature from an allowlisted publisher).
-/// This is the `plugins.trust.on_untrusted` posture; `require_signed=true` is equivalent to `Halt`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum OnUntrusted {
-    /// Refuse to install/load it. The strict "only approved plugins" mode (`allow3rdparties=false`).
-    Halt,
-    /// Install/load it, but emit a security event + audit entry.
-    Alert,
-    /// Install/load it, logging a warning. A safe-ish default: nothing is silent.
-    #[default]
-    Log,
-    /// Install/load it with no fuss (`allow3rdparties=true`; dev/loose).
-    Allow,
+/// How a plugin was permitted to load when it is NOT signed by an allowlisted publisher - the
+/// operator's EXPLICIT opt-in (never a silent default). Rides in [`Verdict::Allowed`] so the caller
+/// can log which opt-in let an untrusted artifact through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllowReason {
+    /// The artifact carries no valid signature (unsigned / tampered / no manifest) and
+    /// `allow_unsigned_plugins` is set.
+    Unsigned,
+    /// The artifact is VALIDLY signed but by a publisher NOT in the allowlist, and `allow_third_party`
+    /// is set.
+    ThirdParty,
 }
 
-/// The resolved trust policy: the allowlisted publisher public keys plus the posture. Built from
-/// `plugins.trust` config (plus the embedded Busbar release key) by the engine.
+/// The resolved trust policy: the allowlisted publisher public keys plus the EXPLICIT opt-in flags.
+/// Built from `governance.trust` config (plus the embedded Busbar release key) by the engine.
+///
+/// DEFAULT posture (both flags `false`): an untrusted plugin (unsigned OR signed by a non-allowlisted
+/// publisher) is REJECTED - the engine logs that it found an untrusted plugin and does NOTHING else
+/// with it (no `dlopen`, no init code runs), at boot AND in the admin catalog. An operator opts in
+/// per category with the flags below.
 #[derive(Clone, Default)]
 pub struct TrustPolicy {
     /// publisher name -> ed25519 public key.
     pub publishers: BTreeMap<String, VerifyingKey>,
-    /// Posture for an untrusted artifact.
-    pub on_untrusted: OnUntrusted,
+    /// Opt-in: load plugins that carry NO valid signature (unsigned / tampered / no manifest). Default
+    /// `false` - an unsigned plugin is logged and SKIPPED (never loaded/executed) unless this is set.
+    pub allow_unsigned: bool,
+    /// Opt-in: load plugins that ARE validly signed but by a publisher NOT in `publishers`. Default
+    /// `false` - a third-party-signed plugin is logged and SKIPPED unless this is set.
+    pub allow_third_party: bool,
     /// ANTI-DOWNGRADE floor: plugin `name` -> the minimum acceptable `version`. A manifest whose
     /// `version` parses BELOW the pinned floor is REJECTED even when its signature verifies against an
     /// allowlisted publisher — this stops a replay/rollback of an older, validly-signed (possibly
@@ -137,8 +145,9 @@ pub struct TrustPolicy {
 pub enum Verdict {
     /// A valid signature from an allowlisted publisher. Always safe to install/load.
     Trusted { publisher: String },
-    /// Not trusted, but the posture permits proceeding — the caller should log/alert per `action`.
-    Allowed { reason: String, action: OnUntrusted },
+    /// Not trusted, but an EXPLICIT opt-in flag permits proceeding - the caller should log a warning
+    /// naming `reason`. Only produced when the matching `allow_*` flag is set.
+    Allowed { reason: String, allow: AllowReason },
 }
 
 /// Signing/trust failure. `Rejected` means the posture (or `require_signed`) forbids installing this
@@ -242,24 +251,47 @@ pub fn version_at_least(have: &str, floor: &str) -> bool {
     version_components(have) >= version_components(floor)
 }
 
+/// The untrusted category of an artifact that is NOT signed by an allowlisted publisher - decides
+/// which explicit opt-in flag (if any) could permit it.
+enum Untrusted {
+    /// No valid signature: no manifest, OR a manifest whose `publisher` IS allowlisted but whose
+    /// signature does not verify (tamper). Opt-in is `allow_unsigned`. A tamper of a KNOWN publisher's
+    /// signature is still "unsigned" for opt-in purposes - it never counts as third-party.
+    Unsigned { reason: String },
+    /// A manifest whose `publisher` is NOT in the allowlist. Its signature can't be verified here (we
+    /// hold no key for that publisher), so it is taken as a third-party artifact. Opt-in is
+    /// `allow_third_party`.
+    ThirdParty { publisher: String },
+}
+
 /// Evaluate an artifact against the trust policy. `manifest` is `None` when the artifact arrived
 /// unsigned. `load_identity` is the identity the engine will actually LOAD this artifact by (the
 /// library filename such as `libx.so`), NOT the manifest's self-declared `name`. Returns [`Verdict`]
-/// when it may proceed (trusted, or untrusted-but-posture-permits), or [`Rejected`] when the posture
-/// (or the anti-downgrade floor) forbids it.
+/// when it may proceed (trusted, or untrusted-but-an-explicit-opt-in-flag-permits), or [`Rejected`]
+/// when it must NOT load - the DEFAULT for any untrusted artifact with no matching opt-in, and always
+/// for an anti-downgrade violation.
+///
+/// TRUST MODEL (the operator opts in explicitly; nothing untrusted loads silently):
+///   * Signed by an allowlisted publisher (signature verifies) and at/above any anti-downgrade floor
+///     => [`Verdict::Trusted`] => load.
+///   * Unsigned (no manifest, or a known publisher's signature fails) => [`Verdict::Allowed`] only if
+///     `allow_unsigned`; else [`Rejected`] (log + skip, never `dlopen`ed).
+///   * Signed by a non-allowlisted publisher => [`Verdict::Allowed`] only if `allow_third_party`; else
+///     [`Rejected`] (log + skip, never `dlopen`ed).
 ///
 /// Anti-downgrade (hard reject, un-bypassable): if `policy.min_versions` pins a floor for
 /// `load_identity`, the load must PROVE (via a valid signature from an allowlisted publisher over a
 /// manifest whose `version` is at or above the floor) that it meets the floor. A load that cannot
-/// prove this is REJECTED regardless of `on_untrusted`. This closes three bypasses that keying the
+/// prove this is REJECTED regardless of the opt-in flags. This closes three bypasses that keying the
 /// floor on the manifest's self-declared `name` (and only checking it when a manifest was present)
 /// left open:
 ///   * NO-MANIFEST: deleting the sidecar makes `manifest = None`; the floor still fires on
 ///     `load_identity` and rejects (an unsigned artifact cannot prove it meets the floor).
 ///   * NAME-MISMATCH: `manifest.name` is attacker-controlled; keying on `load_identity` (the engine's
 ///     resolved filename) means renaming the manifest's `name` no longer dodges the floor.
-///   * LOOSE POSTURE: the floor is checked BEFORE any posture relaxation and requires a *trusted*
-///     manifest, so `log`/`alert`/`allow` cannot launder a stripped-signature downgrade past it.
+///   * OPT-IN LAUNDERING: the floor is checked BEFORE any opt-in relaxation and requires a *trusted*
+///     manifest, so `allow_unsigned` / `allow_third_party` cannot launder a stripped-signature
+///     downgrade past it.
 ///
 /// The `version` field is signature-covered, so an attacker cannot forge a higher one to clear a floor.
 pub fn evaluate(
@@ -271,28 +303,34 @@ pub fn evaluate(
     // Trust determination first: a manifest is TRUSTED only when a signature from an allowlisted
     // publisher verifies over these exact bytes. That verification is the sole thing that makes
     // `version` (and any other manifest field) trustworthy, so the floor below leans on it rather than
-    // on unverified self-declared fields.
-    let trusted_or_reason: Result<&Manifest, String> = match manifest {
-        None => Err("artifact is unsigned (no manifest)".to_string()),
+    // on unverified self-declared fields. Otherwise CATEGORIZE the untrusted artifact so the opt-in
+    // flags can be applied by category.
+    let trusted_or_untrusted: Result<&Manifest, Untrusted> = match manifest {
+        None => Err(Untrusted::Unsigned {
+            reason: "artifact is unsigned (no manifest)".to_string(),
+        }),
         Some(m) => match policy.publishers.get(&m.publisher) {
-            None => Err(format!(
-                "publisher '{}' is not in the allowlist",
-                m.publisher
-            )),
+            // Publisher not allowlisted: a third-party artifact (signature unverifiable here).
+            None => Err(Untrusted::ThirdParty {
+                publisher: m.publisher.clone(),
+            }),
+            // Publisher allowlisted: the signature decides trusted vs tampered (tamper == unsigned).
             Some(key) => match signature_ok(m, bytes, key) {
                 Ok(()) => Ok(m),
-                Err(reason) => Err(reason),
+                Err(reason) => Err(Untrusted::Unsigned {
+                    reason: format!("signature from allowlisted publisher failed: {reason}"),
+                }),
             },
         },
     };
 
-    // Anti-downgrade floor (hard reject, BEFORE any posture relaxation). Keyed on `load_identity` (the
+    // Anti-downgrade floor (hard reject, BEFORE any opt-in relaxation). Keyed on `load_identity` (the
     // engine's resolved library filename), NOT the manifest's self-declared `name`. If a floor is
     // pinned for this identity, the load must be TRUSTED and its now-verified version must clear the
-    // floor. Anything else (no manifest, an untrusted manifest, or a trusted-but-too-old version) is a
-    // hard reject that no `on_untrusted` posture can relax.
+    // floor. Anything else (untrusted, or a trusted-but-too-old version) is a hard reject that no
+    // opt-in flag can relax.
     if let Some(floor) = policy.min_versions.get(load_identity) {
-        match &trusted_or_reason {
+        match &trusted_or_untrusted {
             Ok(m) if version_at_least(&m.version, floor) => { /* proven at/above floor; proceed */ }
             Ok(m) => {
                 return Err(Rejected(format!(
@@ -301,24 +339,47 @@ pub fn evaluate(
                     m.version
                 )));
             }
-            Err(reason) => {
+            Err(_) => {
                 return Err(Rejected(format!(
                     "plugin '{load_identity}' has a pinned minimum version {floor} but the load could \
-                     not prove it meets the floor ({reason}); a signed manifest at or above the floor \
-                     is required (anti-downgrade)"
+                     not prove it meets the floor (not signed by an allowlisted publisher); a signed \
+                     manifest at or above the floor is required (anti-downgrade)"
                 )));
             }
         }
     }
 
-    match trusted_or_reason {
+    match trusted_or_untrusted {
         Ok(m) => Ok(Verdict::Trusted {
             publisher: m.publisher.clone(),
         }),
-        Err(reason) => match policy.on_untrusted {
-            OnUntrusted::Halt => Err(Rejected(reason)),
-            action => Ok(Verdict::Allowed { reason, action }),
-        },
+        Err(Untrusted::Unsigned { reason }) => {
+            if policy.allow_unsigned {
+                Ok(Verdict::Allowed {
+                    reason,
+                    allow: AllowReason::Unsigned,
+                })
+            } else {
+                Err(Rejected(format!(
+                    "{reason}; refusing to load an unsigned plugin. Set \
+                     governance.trust.allow_unsigned_plugins=true to permit unsigned plugins."
+                )))
+            }
+        }
+        Err(Untrusted::ThirdParty { publisher }) => {
+            if policy.allow_third_party {
+                Ok(Verdict::Allowed {
+                    reason: format!("signed by non-allowlisted publisher '{publisher}'"),
+                    allow: AllowReason::ThirdParty,
+                })
+            } else {
+                Err(Rejected(format!(
+                    "publisher '{publisher}' is not in the allowlist; refusing to load a third-party \
+                     plugin. Add the publisher to governance.trust.publishers, or set \
+                     governance.trust.allow_third_party=true to permit third-party plugins."
+                )))
+            }
+        }
     }
 }
 
@@ -349,10 +410,26 @@ mod tests {
         }
     }
 
-    fn policy(pairs: &[(&str, &VerifyingKey)], on_untrusted: OnUntrusted) -> TrustPolicy {
+    /// A strict (default) policy: no opt-ins, so anything untrusted is rejected.
+    fn policy(pairs: &[(&str, &VerifyingKey)]) -> TrustPolicy {
         TrustPolicy {
             publishers: pairs.iter().map(|(n, k)| (n.to_string(), **k)).collect(),
-            on_untrusted,
+            allow_unsigned: false,
+            allow_third_party: false,
+            min_versions: BTreeMap::new(),
+        }
+    }
+
+    /// A policy with the given opt-in flags.
+    fn policy_flags(
+        pairs: &[(&str, &VerifyingKey)],
+        allow_unsigned: bool,
+        allow_third_party: bool,
+    ) -> TrustPolicy {
+        TrustPolicy {
+            publishers: pairs.iter().map(|(n, k)| (n.to_string(), **k)).collect(),
+            allow_unsigned,
+            allow_third_party,
             min_versions: BTreeMap::new(),
         }
     }
@@ -367,7 +444,7 @@ mod tests {
         let j = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<Manifest>(&j).unwrap(), m);
 
-        let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
+        let pol = policy(&[("busbar", &pubk)]);
         assert_eq!(
             evaluate(artifact, Some(&m), "libstore.so", &pol).unwrap(),
             Verdict::Trusted {
@@ -382,7 +459,7 @@ mod tests {
         let pubk = key.verifying_key();
         let artifact = b"bytes";
         let m = sign(&key, manifest("p", "busbar"), artifact);
-        let pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
+        let pol = policy(&[("busbar", &pubk)]);
 
         // Flip a DISPLAY field the confirm-card shows: signature must break (card can't be spoofed).
         let mut forged = m.clone();
@@ -399,7 +476,7 @@ mod tests {
         let attacker = test_key(2);
         let artifact = b"bytes";
         let m = sign(&key, manifest("p", "busbar"), artifact);
-        let pol = policy(&[("busbar", &attacker.verifying_key())], OnUntrusted::Halt);
+        let pol = policy(&[("busbar", &attacker.verifying_key())]);
         assert!(evaluate(artifact, Some(&m), "libp.so", &pol).is_err());
     }
 
@@ -408,25 +485,63 @@ mod tests {
         let key = test_key(1);
         let artifact = b"bytes";
         let m = sign(&key, manifest("p", "acme"), artifact);
-        let pol = policy(&[("busbar", &key.verifying_key())], OnUntrusted::Halt);
+        let pol = policy(&[("busbar", &key.verifying_key())]);
         let err = evaluate(artifact, Some(&m), "libp.so", &pol).unwrap_err();
         assert!(err.0.contains("not in the allowlist"), "got {err:?}");
     }
 
     #[test]
-    fn posture_allow_and_log_permit_unsigned_but_halt_refuses() {
+    fn allow_unsigned_permits_unsigned_but_default_refuses() {
+        // allow_unsigned=true permits an unsigned artifact (as an Unsigned allow-reason).
         assert!(matches!(
-            evaluate(b"x", None, "libp.so", &policy(&[], OnUntrusted::Allow)).unwrap(),
+            evaluate(b"x", None, "libp.so", &policy_flags(&[], true, false)).unwrap(),
             Verdict::Allowed {
-                action: OnUntrusted::Allow,
+                allow: AllowReason::Unsigned,
                 ..
             }
         ));
+        // The DEFAULT (no opt-in) REFUSES an unsigned artifact - the whole point of the new posture.
+        let err = evaluate(b"x", None, "libp.so", &policy(&[])).unwrap_err();
+        assert!(
+            err.0.contains("allow_unsigned_plugins"),
+            "the refusal names the opt-in flag: {err:?}"
+        );
+    }
+
+    #[test]
+    fn third_party_signed_needs_allow_third_party() {
+        // A validly-signed manifest whose publisher is NOT allowlisted is THIRD-PARTY, not unsigned.
+        let key = test_key(3);
+        let artifact = b"third-party bytes";
+        let m = sign(&key, manifest("p", "acme"), artifact);
+
+        // Default: refused, and the refusal names allow_third_party (NOT allow_unsigned).
+        let err = evaluate(artifact, Some(&m), "libp.so", &policy(&[])).unwrap_err();
+        assert!(err.0.contains("allow_third_party"), "got {err:?}");
+
+        // allow_unsigned alone does NOT permit a third-party-signed plugin.
+        assert!(evaluate(
+            artifact,
+            Some(&m),
+            "libp.so",
+            &policy_flags(&[], true, false)
+        )
+        .is_err());
+
+        // allow_third_party permits it (as a ThirdParty allow-reason).
         assert!(matches!(
-            evaluate(b"x", None, "libp.so", &policy(&[], OnUntrusted::Log)).unwrap(),
-            Verdict::Allowed { .. }
+            evaluate(
+                artifact,
+                Some(&m),
+                "libp.so",
+                &policy_flags(&[], false, true)
+            )
+            .unwrap(),
+            Verdict::Allowed {
+                allow: AllowReason::ThirdParty,
+                ..
+            }
         ));
-        assert!(evaluate(b"x", None, "libp.so", &policy(&[], OnUntrusted::Halt)).is_err());
     }
 
     #[test]
@@ -480,7 +595,7 @@ mod tests {
         let old = sign(&key, old, artifact);
 
         // With NO floor it verifies as trusted (baseline).
-        let mut pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
+        let mut pol = policy(&[("busbar", &pubk)]);
         assert!(matches!(
             evaluate(artifact, Some(&old), "libstore.so", &pol).unwrap(),
             Verdict::Trusted { .. }
@@ -503,7 +618,7 @@ mod tests {
     }
 
     /// The floor is a HARD reject that a loose posture cannot bypass: a stripped-signature (untrusted)
-    /// older manifest under `on_untrusted: allow` is STILL refused when the load identity is floored,
+    /// older manifest with the opt-in flags set is STILL refused when the load identity is floored,
     /// so a downgrade can't be laundered through a relaxed posture.
     #[test]
     fn downgrade_floor_is_not_bypassable_by_loose_posture() {
@@ -516,10 +631,10 @@ mod tests {
         let mut stripped = old.clone();
         stripped.signature = String::new();
 
-        let mut pol = policy(&[], OnUntrusted::Allow);
+        let mut pol = policy_flags(&[], true, true);
         pol.min_versions
             .insert("libstore.so".to_string(), "1.4.0".to_string());
-        // Even under `allow`, the floored downgrade is rejected outright.
+        // Even with BOTH opt-ins set, the floored downgrade is rejected outright.
         assert!(evaluate(artifact, Some(&stripped), "libstore.so", &pol).is_err());
     }
 
@@ -530,8 +645,8 @@ mod tests {
     #[test]
     fn floor_rejects_missing_manifest_even_under_loose_posture() {
         let artifact = b"old vulnerable bytes, no manifest";
-        // Loose posture (`allow`) would load an unsigned artifact with no floor...
-        let mut pol = policy(&[], OnUntrusted::Allow);
+        // allow_unsigned would load an unsigned artifact with no floor...
+        let mut pol = policy_flags(&[], true, false);
         assert!(matches!(
             evaluate(artifact, None, "libstore.so", &pol).unwrap(),
             Verdict::Allowed { .. }
@@ -561,7 +676,7 @@ mod tests {
         let mut m = sign(&key, m, artifact);
         m.signature = String::new(); // untrusted
 
-        let mut pol = policy(&[], OnUntrusted::Allow);
+        let mut pol = policy_flags(&[], true, true);
         // Floor is pinned on the LOAD IDENTITY, which the attacker cannot rename.
         pol.min_versions
             .insert("libstore.so".to_string(), "1.4.0".to_string());
@@ -569,8 +684,8 @@ mod tests {
         assert!(err.0.contains("anti-downgrade"), "got {err:?}");
         // And with NO floor on the load identity, the renamed manifest name is irrelevant: the floor
         // pinned under the OLD (self-declared) key does not fire, confirming the floor no longer keys
-        // on `manifest.name`.
-        let mut pol2 = policy(&[], OnUntrusted::Allow);
+        // on `manifest.name`. (The manifest's publisher is not allowlisted here => third-party opt-in.)
+        let mut pol2 = policy_flags(&[], true, true);
         pol2.min_versions
             .insert("totally-different-name".to_string(), "1.4.0".to_string());
         assert!(
@@ -594,7 +709,7 @@ mod tests {
         cur.version = "1.4.0".into();
         let cur = sign(&key, cur, artifact);
 
-        let mut pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
+        let mut pol = policy(&[("busbar", &pubk)]);
         pol.min_versions
             .insert("libstore.so".to_string(), "1.4.0".to_string());
         assert!(matches!(

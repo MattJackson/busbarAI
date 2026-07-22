@@ -1494,15 +1494,24 @@ pub(crate) enum GovernanceStore {
 
 /// Plugin signing/trust policy (`governance.trust`). Governs how the engine treats a loadable
 /// plugin's signed manifest at boot-load and admin-install: a plugin whose `plugin.json` verifies
-/// against an allowlisted publisher is TRUSTED; anything else (unsigned, unknown publisher, tampered)
-/// is untrusted and handled per `on_untrusted`.
+/// against an allowlisted publisher is TRUSTED; anything else (unsigned, unknown/third-party
+/// publisher, tampered) is UNTRUSTED and, by DEFAULT, logged and SKIPPED (never loaded/executed)
+/// unless the matching `allow_unsigned_plugins` / `allow_third_party` opt-in is set.
 #[derive(Deserialize, Clone, Default, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PluginTrustCfg {
-    /// What to do with an untrusted plugin: `halt` (only approved plugins load — the
-    /// `allow3rdparties=false` posture), `alert`, `log` (default — loads with a warning), or `allow`.
+    /// EXPLICIT opt-in: load plugins that carry NO valid signature (unsigned / tampered / no
+    /// manifest). Default `false` - an unsigned plugin found in `plugins_dir` is LOGGED and SKIPPED
+    /// (never `dlopen`ed / executed), at boot and in the admin catalog. Set `true` to permit unsigned
+    /// plugins (with a warning). This is the safe-by-default replacement for the old `on_untrusted`
+    /// posture, which loaded unsigned plugins by default.
     #[serde(default)]
-    pub(crate) on_untrusted: busbar_plugin_sign::OnUntrusted,
+    pub(crate) allow_unsigned_plugins: bool,
+    /// EXPLICIT opt-in: load plugins that ARE validly signed but by a publisher NOT in `publishers`.
+    /// Default `false` - a third-party-signed plugin is LOGGED and SKIPPED (never `dlopen`ed). Set
+    /// `true` to permit third-party plugins (with a warning).
+    #[serde(default)]
+    pub(crate) allow_third_party: bool,
     /// Allowlisted publishers whose signatures mark a plugin TRUSTED. Each maps a publisher name to a
     /// hex ed25519 public key; a plugin manifest's `publisher` must resolve here.
     #[serde(default)]
@@ -1525,7 +1534,7 @@ pub(crate) struct PluginPublisher {
 impl PluginTrustCfg {
     /// Resolve into the `busbar-plugin-sign` policy (parsing each publisher's public key). A malformed
     /// key is a boot error, not a silent skip (a skipped trust anchor could wrongly reject a good
-    /// plugin, or under a loose posture load an unverified one).
+    /// plugin, or with an opt-in flag set load an unverified one).
     pub(crate) fn to_policy(&self) -> Result<busbar_plugin_sign::TrustPolicy, String> {
         let mut publishers = std::collections::BTreeMap::new();
         for p in &self.publishers {
@@ -1535,7 +1544,8 @@ impl PluginTrustCfg {
         }
         Ok(busbar_plugin_sign::TrustPolicy {
             publishers,
-            on_untrusted: self.on_untrusted,
+            allow_unsigned: self.allow_unsigned_plugins,
+            allow_third_party: self.allow_third_party,
             min_versions: self.min_versions.clone(),
         })
     }
@@ -1573,8 +1583,9 @@ pub(crate) struct GovernanceCfg {
     #[serde(default = "default_plugins_dir")]
     pub(crate) plugins_dir: String,
     /// Plugin signing/trust policy — how the engine treats a plugin's signed manifest at load. Default
-    /// posture `log` (unsigned plugins load with a warning); set `on_untrusted: halt` for "only
-    /// approved (signed by an allowlisted publisher) plugins load".
+    /// posture: only plugins signed by an allowlisted publisher load; any untrusted plugin is logged
+    /// and SKIPPED. Set `trust.allow_unsigned_plugins: true` to permit unsigned plugins, and/or
+    /// `trust.allow_third_party: true` to permit validly-signed plugins from a non-allowlisted publisher.
     #[serde(default)]
     pub(crate) trust: PluginTrustCfg,
     /// Amortization interval for the rate-limiter stale-entry sweep: every Nth `check_rate` pays the

@@ -821,7 +821,8 @@ governance:
   # plugins_dir: plugins                     # where store plugins are loaded from (default: plugins)
   # usage_flush_interval_ms: 100             # write-behind flush cadence for durable stores
   # trust:                                   # plugin signing policy (see "Plugin trust" below)
-  #   on_untrusted: log                      # halt | alert | log (default) | allow
+  #   allow_unsigned_plugins: false          # default false: unsigned plugins are logged + skipped
+  #   allow_third_party: false               # default false: non-allowlisted-publisher plugins skipped
 ```
 
 | Field | Type | Required | Default | Validation | Notes |
@@ -832,7 +833,7 @@ governance:
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
 | `plugins_dir` | string | no | `plugins` | n/a | Directory the engine loads store (and other) plugins from. A durable `store` other than `memory` is a plugin library dropped here (e.g. `store: sqlite` loads `libbusbar_store_sqlite_plugin` from this directory). Path is relative to the working directory. |
-| `trust` | table | no | see below | n/a | Plugin signing/trust policy applied to each plugin's signed manifest at load. Sub-keys: `on_untrusted` (`halt` \| `alert` \| `log` (default) \| `allow`), `publishers` (a list of `{ name, public_key }` allowlisted ed25519 publishers), and `min_versions` (optional anti-downgrade floors, plugin name -> minimum version). See [Plugin trust](#plugin-trust) below. |
+| `trust` | table | no | see below | n/a | Plugin signing/trust policy applied to each plugin's signed manifest at load. By default an untrusted plugin is logged and skipped (never loaded). Sub-keys: `allow_unsigned_plugins` (bool, default `false` - permit unsigned plugins), `allow_third_party` (bool, default `false` - permit validly-signed plugins from a non-allowlisted publisher), `publishers` (a list of `{ name, public_key }` allowlisted ed25519 publishers), and `min_versions` (optional anti-downgrade floors, plugin name -> minimum version). See [Plugin trust](#plugin-trust) below. |
 | `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. Applies to `store: sqlite`. |
 | `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
 | `usage_flush_interval_ms` | integer | no | `100` | n/a | Write-behind flush cadence (milliseconds) for the in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this many ms of accrued spend/requests can be lost; a graceful shutdown flushes fully. Only relevant with a durable `store`. |
@@ -874,20 +875,27 @@ If the configured store's plugin is not present in `plugins_dir`, busbar fails t
 
 #### Plugin trust
 
-A plugin ships a signed sidecar manifest (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library `sha256`, and an ed25519 signature over the whole manifest). At boot-load busbar verifies it against `governance.trust`. A valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED; anything else (unsigned, unknown publisher, or tampered) is handled per `trust.on_untrusted`:
+A plugin ships a signed sidecar manifest (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library `sha256`, and an ed25519 signature over the whole manifest). At boot-load busbar verifies it against `governance.trust`. A valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED and loads. Anything else is UNTRUSTED, and one of two categories:
 
-| `on_untrusted` | Behavior |
-|---|---|
-| `halt` | Only approved (signed by an allowlisted publisher) plugins load; an untrusted plugin is a boot error. |
-| `alert` | Loads the untrusted plugin but flags it. |
-| `log` (default) | Loads the untrusted plugin with a warning. Keeps unsigned plugins working out of the box. |
-| `allow` | Loads without flagging (development). |
+- **unsigned** - no manifest, a tampered manifest, or a failed signature from an allowlisted publisher; or
+- **third-party** - a valid-looking manifest whose `publisher` is NOT in `trust.publishers`.
+
+**Safe by default: an untrusted plugin is NOT loaded.** With no opt-in flag set, busbar simply LOGS that it found an untrusted plugin (naming the file and the flag to set) and does nothing else with it - it is never `dlopen`ed and its initialization code never runs, at boot AND in the `GET /api/v1/admin/plugins` catalog. Two explicit opt-ins relax this per category:
+
+| `governance.trust` flag | Default | Effect |
+|---|---|---|
+| `allow_unsigned_plugins` | `false` | Permit loading plugins that carry NO valid signature (unsigned / tampered). Without it, an unsigned plugin in `plugins_dir` is logged and skipped (never loaded/executed). Security implication: an unsigned plugin's code is not signature-verified, so enabling this trusts whatever bytes are on disk. |
+| `allow_third_party` | `false` | Permit loading plugins that ARE validly signed but by a publisher not in `trust.publishers`. Without it, a third-party-signed plugin is logged and skipped. |
+
+If the CONFIGURED store (`governance.store: sqlite` / `postgres` / `redis`) needs a plugin that is untrusted and NOT opted-in, busbar **fails to start** with an error naming the plugin and the exact flag to set - it never silently skips the store you asked for and never silently falls back.
 
 ```yaml
 governance:
   store: sqlite
   trust:
-    on_untrusted: halt
+    # Both default to false; an untrusted plugin is logged and skipped unless a flag is set.
+    allow_unsigned_plugins: false   # set true to load unsigned plugins (with a warning)
+    allow_third_party: false        # set true to load validly-signed plugins from a non-allowlisted publisher
     publishers:
       - name: busbar
         public_key: "<hex ed25519 public key>"
@@ -895,7 +903,7 @@ governance:
       sqlite-store: "1.5.0"
 ```
 
-Because the signature covers the whole manifest and the manifest pins the library by `sha256`, neither the manifest nor the library can be altered or swapped independently. A malformed publisher key is a boot error, not a silent skip. The verified bytes are also the exact bytes loaded (they are never re-read from disk between verification and `dlopen`), so a file swap in the plugins directory cannot slip an unverified library past the check.
+Because the signature covers the whole manifest and the manifest pins the library by `sha256`, neither the manifest nor the library can be altered or swapped independently. A malformed publisher key is a boot error, not a silent skip. The verified bytes are also the exact bytes loaded (they are never re-read from disk between verification and `dlopen`), so a file swap in the plugins directory cannot slip an unverified library past the check. The anti-downgrade floor (`min_versions`) is a hard reject that neither opt-in flag can bypass.
 
 `trust.min_versions` pins an optional minimum `version` per plugin name (an anti-downgrade / anti-replay floor). A manifest whose `version` is below its floor is rejected even with a valid signature, so an older validly-signed (and possibly vulnerable) release cannot be rolled back in. Version comparison is numeric on the leading `major.minor.patch` components. Empty (the default) pins nothing.
 

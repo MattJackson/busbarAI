@@ -4875,7 +4875,18 @@ async fn serve_with_plugins_dir(
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
-    let app = TestApp::new().governance(gov).plugins_dir(dir).build();
+    // This lifecycle test installs an UNSIGNED plugin, so opt in to unsigned plugins (the trust
+    // DEFAULT now rejects unsigned artifacts). The trust-default behavior itself is covered by the
+    // dedicated trust tests; this test is about the install/list/reload/remove lifecycle.
+    let trust = crate::config::PluginTrustCfg {
+        allow_unsigned_plugins: true,
+        ..Default::default()
+    };
+    let app = TestApp::new()
+        .governance(gov)
+        .plugins_dir(dir)
+        .plugin_trust(trust)
+        .build();
     // Explicit 256 MiB body cap: the install test uploads the REAL sqlite-plugin cdylib as base64,
     // and a DEBUG build of that library (CI runs tests unoptimized) can exceed the 32 MiB default
     // on some platforms - Windows in particular, where the early 413 close surfaces to the client
