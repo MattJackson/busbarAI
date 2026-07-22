@@ -143,6 +143,14 @@ impl AuditLog {
             return Ok(0);
         }
         let entries: Vec<AuditEntry> = records.into_iter().map(from_record).collect();
+        // FLOOR the sequence to the store's max BEFORE verification, so even a chain-verification
+        // failure (where the caller falls back to a possibly-stale file snapshot) can never leave
+        // the counter rewound below what the store already holds. The durable write-through is
+        // keyed on `seq`, so a rewound counter would silently OVERWRITE existing durable history on
+        // the next mutation; flooring here makes new entries always append past the durable max.
+        let durable_max = entries.iter().map(|e| e.seq).max().unwrap_or(0);
+        self.seq
+            .fetch_max(durable_max + 1, std::sync::atomic::Ordering::Relaxed);
         // Verify the full restored chain BEFORE trusting it (tamper-evidence across restart): every
         // entry's digest recomputes, and each links to its predecessor. The first restored entry's
         // predecessor may pre-date what we hold, so only its self-digest is checked.
@@ -165,14 +173,12 @@ impl AuditLog {
             prev = Some(&e.hash);
         }
         let total = entries.len();
-        let max_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
         // Seed the ring with the most-recent MAX_AUDIT_ENTRIES (the durable store keeps the rest).
+        // The sequence was already floored past the durable max above.
         let tail_start = total.saturating_sub(MAX_AUDIT_ENTRIES);
         let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         q.clear();
         q.extend(entries.into_iter().skip(tail_start));
-        self.seq
-            .store(max_seq + 1, std::sync::atomic::Ordering::Relaxed);
         Ok(total)
     }
 
@@ -243,14 +249,17 @@ impl AuditLog {
 
     /// Seed the ring from a persisted snapshot (boot restore). Replaces the current contents and
     /// resumes the sequence AFTER the highest restored seq, so post-restart entries chain onto the
-    /// restored history without seq reuse.
+    /// restored history without seq reuse. FLOOR semantics (fetch_max, never store): a file
+    /// snapshot can lag the durable store, and the durable write-through is keyed on `seq` — a
+    /// blind store here would rewind the counter below the store's max and the next mutation would
+    /// silently OVERWRITE durable history. The snapshot only ever RAISES the counter.
     pub(crate) fn load(&self, entries: Vec<AuditEntry>) {
         let mut q = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let max_seq = entries.iter().map(|e| e.seq).max().unwrap_or(0);
         q.clear();
         q.extend(entries);
         self.seq
-            .store(max_seq + 1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(max_seq + 1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Verify the tamper-evidence chain over the RETAINED entries: every entry's `hash` recomputes
@@ -417,6 +426,66 @@ mod tests {
         );
         // And the store now has 4 (the write-through of the post-restore entry landed).
         assert_eq!(store.list_audit().unwrap().len(), 4);
+    }
+
+    /// A REWOUND sequence counter must never clobber durable history. The durable write-through is
+    /// keyed on `seq` (idempotent-replay upsert in the store), so if a boot path seeds the counter
+    /// from a STALE file snapshot (fewer entries than the store holds — e.g. after a failed
+    /// durable restore), the next mutation would reuse a durable seq and silently overwrite that
+    /// entry. Both hydration paths floor instead: `restore_from_store` floors past the durable max
+    /// even when chain verification fails, and `load` only ever raises the counter.
+    #[test]
+    fn rewound_seq_cannot_overwrite_durable_history() {
+        let store: Arc<dyn Store> =
+            Arc::new(busbar_store_sqlite::SqliteStore::open_in_memory().unwrap());
+
+        // Process 1: three durable entries (seq 1..=3).
+        let log1 = AuditLog::new();
+        log1.set_sink(store.clone());
+        log1.record_by("hook.register", "hook:a", OUTCOME_APPLIED, "admin");
+        log1.record_by("hook.register", "hook:b", OUTCOME_APPLIED, "admin");
+        log1.record_by("hook.delete", "hook:a", OUTCOME_APPLIED, "admin");
+        assert_eq!(store.list_audit().unwrap().len(), 3);
+
+        // Tamper the durable chain so the restart's durable restore FAILS and the boot path falls
+        // back to a stale file snapshot holding only seq 1 (the rewind scenario).
+        {
+            let mut tampered = store.list_audit().unwrap();
+            tampered[1].resource = "hook:evil".to_string();
+            store.append_audit(&tampered[1]).unwrap();
+        }
+        let stale_snapshot: Vec<AuditEntry> = store
+            .list_audit()
+            .unwrap()
+            .into_iter()
+            .take(1)
+            .map(from_record)
+            .collect();
+
+        // Process 2 (the restart): sink attached, durable restore fails on the broken chain, and
+        // the stale snapshot is loaded — exactly the boot fallback ordering in main.rs.
+        let log2 = AuditLog::new();
+        log2.set_sink(store.clone());
+        assert!(
+            log2.restore_from_store(store.as_ref()).is_err(),
+            "the tampered chain must fail verification"
+        );
+        log2.load(stale_snapshot);
+
+        // The next mutation must APPEND past the durable max (seq 4), not reuse seq 2 and clobber
+        // the existing durable entry.
+        log2.record_by("hook.register", "hook:c", OUTCOME_APPLIED, "admin");
+        let persisted = store.list_audit().unwrap();
+        assert_eq!(persisted.len(), 4, "durable history grew; nothing replaced");
+        assert_eq!(
+            persisted.last().unwrap().seq,
+            4,
+            "the new entry appended past the durable max"
+        );
+        assert_eq!(
+            persisted[2].action, "hook.delete",
+            "the pre-existing seq-3 entry is untouched"
+        );
     }
 
     /// The RAM ring is bounded to `MAX_AUDIT_ENTRIES`, but a durable store keeps the FULL history — so
