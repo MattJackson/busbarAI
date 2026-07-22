@@ -122,4 +122,4 @@ The wire format is documented in the [routing guide](https://getbusbar.com/docs/
 
 ## Benchmark
 
-Numbers and how to reproduce them are in [`bench/`](bench/).
+Numbers and how to reproduce them are in the [GetBusbar/benchmarking](https://github.com/GetBusbar/benchmarking) harness.

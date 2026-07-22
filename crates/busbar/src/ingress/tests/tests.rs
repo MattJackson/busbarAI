@@ -2042,7 +2042,8 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
 /// and gates the measured p50/p99 full-request latency under DELIBERATELY GENEROUS bounds —
 /// busbar's real added overhead is microseconds, so these only trip on a GROSS hot-path
 /// regression (accidental sync I/O, a stray sleep, an O(n²) body walk), never on runner noise.
-/// Fine-grained overhead numbers stay the latency bench's job (bench/latency/).
+/// Fine-grained overhead numbers stay the latency bench's job (the external
+/// GetBusbar/benchmarking harness).
 #[tokio::test]
 #[ignore = "timing gate — run explicitly (CI: cargo test --release -- --ignored timing_gate)"]
 async fn timing_gate_hot_path_p50_p99() {
