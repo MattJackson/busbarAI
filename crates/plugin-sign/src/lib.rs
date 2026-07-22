@@ -611,6 +611,75 @@ mod tests {
         ));
     }
 
+    /// FIRST-PARTY IMPERSONATION is impossible: an attacker signs a plugin with their OWN key and
+    /// sets `publisher: busbar` to masquerade as first-party. Even with the real release key
+    /// EMBEDDED, evaluation routes a `publisher: busbar` manifest ONLY to the embedded key, so the
+    /// attacker's signature fails and the plugin is UNSIGNED (rejected by default; never third-party
+    /// laundered, and never trusted). Setting the publisher name buys nothing.
+    #[test]
+    fn first_party_publisher_name_cannot_be_forged_with_another_key() {
+        let release = test_key(1); // the REAL embedded release key
+        let attacker = test_key(9); // a key the operator never trusted
+        let artifact = b"malicious plugin claiming to be busbar";
+        // Attacker signs a busbar-branded manifest with their own key.
+        let m = sign(
+            &attacker,
+            manifest("busbar-store-redis", "redis", FIRST_PARTY_PUBLISHER),
+            artifact,
+        );
+        // Embedded key present, attacker NOT in publishers. Default posture: rejected as unsigned
+        // (the signature does not verify against the embedded first-party key).
+        let pol = policy(Some(&release), &[], false, false);
+        let err = evaluate(artifact, &m, &pol).unwrap_err();
+        assert!(
+            err.0.contains("first-party signature failed"),
+            "impersonation must be reported as a first-party signature failure, got {err:?}"
+        );
+        // Even allow_third_party cannot launder it: a `busbar` publisher never routes to the
+        // third-party path, so the third-party opt-in is irrelevant. It stays UNSIGNED-category,
+        // permitted ONLY by allow_unsigned (which is "load anything unsigned" by definition).
+        let third_party_open = policy(Some(&release), &[], false, true);
+        assert!(
+            evaluate(artifact, &m, &third_party_open).is_err(),
+            "allow_third_party must NOT permit a forged first-party plugin"
+        );
+        // And the attacker cannot get themselves allowlisted UNDER the name `busbar` to reach the
+        // first-party branch: even if such a policy existed, the `publisher == busbar` branch only
+        // consults the embedded key, never `publishers`. Prove the routing directly.
+        let mut mislead = policy(Some(&release), &[], false, false);
+        mislead
+            .publishers
+            .insert(FIRST_PARTY_PUBLISHER.to_string(), attacker.verifying_key());
+        assert!(
+            evaluate(artifact, &m, &mislead).is_err(),
+            "a 'busbar' entry in publishers must never override the embedded first-party key"
+        );
+    }
+
+    /// STRIPPED-SIGNATURE first-party downgrade: an attacker takes an OLD first-party release,
+    /// strips its signature, and hopes the automatic first-party anti-downgrade (which only guards
+    /// VERIFIED first-party manifests) no longer applies. Under the DEFAULT posture it is rejected
+    /// as unsigned - the downgrade never lands. (Under allow_unsigned the operator has already
+    /// opted into loading arbitrary unsigned code, so this is out of scope of the anti-downgrade
+    /// guarantee, which is specifically about REPLAYING a still-VALIDLY-SIGNED old release.)
+    #[test]
+    fn stripped_signature_old_first_party_is_rejected_by_default() {
+        let release = test_key(1);
+        let artifact = b"old vulnerable first-party build";
+        let mut old = manifest("busbar-store-redis", "redis", FIRST_PARTY_PUBLISHER);
+        old.version = "1.0.0".into(); // below the 1.5.0 binary
+        let old = sign(&release, old, artifact);
+        // Strip the (valid) signature: now it is an unsigned artifact claiming to be busbar.
+        let mut stripped = old.clone();
+        stripped.signature = String::new();
+        let pol = policy(Some(&release), &[], false, false);
+        let err = evaluate(artifact, &stripped, &pol).unwrap_err();
+        assert!(
+            err.0.contains("unsigned") || err.0.contains("no signature"),
+            "a stripped-signature old first-party plugin must be rejected as unsigned, got {err:?}"
+        );
+    }
+
     #[test]
     fn third_party_allowlisted_publisher_is_trusted() {
         let acme = test_key(2);
