@@ -24,7 +24,7 @@ crates/
 Dependency direction is one-way: `busbar` → `api` ← plugins. A plugin depends only on `api`, never on
 the engine, so a built-in is structured exactly like a third-party plugin would be (no privileged
 access). Each plugin is an `optional` dependency gated by a feature, so `--no-default-features` compiles
-it out entirely. Non-Rust lives at the root: `examples/`, `scripts/`, `docs/`, `bench/`, `config.yaml`,
+it out entirely. Non-Rust lives at the root: `examples/`, `scripts/`, `docs/`, `config.yaml`,
 `providers.yaml`, `Dockerfile`. The `[profile.release]` and `[workspace]` table are in the root
 `Cargo.toml`; each crate's `[package]` is in its own `crates/<name>/Cargo.toml`.
 
