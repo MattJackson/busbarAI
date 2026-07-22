@@ -205,6 +205,10 @@ impl ProtocolReader for BedrockReader {
         // cachePoint capture; see `GUARD_CONTENT_SENTINEL`.
         let mut system_guard_content: Vec<serde_json::Value> = Vec::new();
         let mut message_guard_content: Vec<serde_json::Value> = Vec::new();
+        // Captured native top-level `document` / `video` content blocks, same positional stash shape
+        // as the guardContent capture; see `DOC_VIDEO_SENTINEL`. These appear only inside a message
+        // `content` array (there is no `document`/`video` in the Converse `system` array).
+        let mut message_doc_video: Vec<serde_json::Value> = Vec::new();
 
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
         if let Some(system_arr) = obj.get("system").and_then(|s| s.as_array()) {
@@ -442,6 +446,26 @@ impl ProtocolReader for BedrockReader {
                                 "i": block_idx,
                                 "block": { "guardContent": guard_content.clone() },
                             }));
+                        } else if let Some(document) = content_val.get("document") {
+                            // A native Converse `document` block (a PDF/CSV/etc. the model reasons
+                            // over) has no IR counterpart; stash it verbatim with its (message, block)
+                            // index so the writer re-emits it at the same position on a same-protocol
+                            // passthrough instead of silently dropping the attachment. See
+                            // `DOC_VIDEO_SENTINEL`.
+                            message_doc_video.push(serde_json::json!({
+                                "m": msg_idx,
+                                "i": block_idx,
+                                "block": { "document": document.clone() },
+                            }));
+                        } else if let Some(video) = content_val.get("video") {
+                            // A native Converse `video` block likewise has no IR counterpart; stash it
+                            // verbatim so the writer re-emits it at the same position on a same-protocol
+                            // passthrough. See `DOC_VIDEO_SENTINEL`.
+                            message_doc_video.push(serde_json::json!({
+                                "m": msg_idx,
+                                "i": block_idx,
+                                "block": { "video": video.clone() },
+                            }));
                         }
                     }
                 }
@@ -619,6 +643,22 @@ impl ProtocolReader for BedrockReader {
             );
         }
 
+        // Stash any captured top-level `document` / `video` markers (with their original positions)
+        // under the sentinel so `write_request` re-emits them at the same spots on a same-protocol
+        // passthrough. Only inserted when at least one was present, so a request that carried no
+        // document/video block does not gain a stray key (preserving the byte-exact round-trip).
+        if !message_doc_video.is_empty() {
+            let mut doc_video = serde_json::Map::new();
+            doc_video.insert(
+                "messages".to_string(),
+                serde_json::Value::Array(message_doc_video),
+            );
+            extra.insert(
+                DOC_VIDEO_SENTINEL.to_string(),
+                serde_json::Value::Object(doc_video),
+            );
+        }
+
         // Stamp the source-spelling hint when top_k arrived as camelCase `topK`, so the writer
         // re-emits `topK` on a same-protocol passthrough (else the canonical `top_k`). `extra` is
         // cleared on the cross-protocol seam, so the sentinel naturally vanishes there and a
@@ -768,6 +808,24 @@ impl ProtocolReader for BedrockReader {
                             .and_then(|t| t.as_str())
                             .unwrap_or("")
                             .to_string();
+
+                        // Lazily open the Text block on the FIRST text delta, mirroring the
+                        // reasoningContent arm below. The native AWS Bedrock ConverseStream
+                        // `ContentBlockStart$start` union only models `toolUse`, so a real AWS stream
+                        // sends NO `contentBlockStart` for a text block; the block is implied by the
+                        // first `contentBlockDelta` carrying `text`. Without this lazy-open a plain
+                        // text response produced an orphaned `content_block_delta` at index 0 with no
+                        // preceding BlockStart, violating the block-event contract (every delta must
+                        // sit inside an opened block). When the backend DID send an explicit
+                        // `contentBlockStart` (empty-`start` shape) the flag is already set and we do
+                        // not re-open.
+                        if state.started && !state.text_block_open {
+                            state.text_block_open = true;
+                            out.push(IrStreamEvent::BlockStart {
+                                index: idx,
+                                block: crate::ir::IrBlockMeta::Text,
+                            });
+                        }
 
                         out.push(IrStreamEvent::BlockDelta {
                             index: idx,

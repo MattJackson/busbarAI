@@ -220,6 +220,28 @@ const CACHE_POINTS_SENTINEL: &str = "__busbar_bedrock_cache_points";
 /// extra-merge), so the sentinel never appears on the wire.
 const GUARD_CONTENT_SENTINEL: &str = "__busbar_bedrock_guard_content";
 
+/// `extra` key under which the Bedrock reader stashes the positions of native Converse `document`
+/// and `video` content blocks that appear INSIDE each message's `content` array (a `{"document":
+/// {...}}` or `{"video": {...}}` member of the Converse `ContentBlock` union).
+///
+/// A top-level `document`/`video` block has NO IR `IrBlock` counterpart (the IR models only
+/// Text/Thinking/ToolUse/ToolResult/Image/Json): a Converse document (a PDF/CSV/etc. the model
+/// reasons over) and a video reference carry format + source (`bytes`/`s3Location`) that no neutral
+/// IR block expresses. Without this capture the reader silently DROPPED every top-level document and
+/// video block on a same-protocol Bedrock passthrough, making the proxy diverge from a direct AWS
+/// call (a caller uploading a PDF for analysis had it vanish). It is a Bedrock-NATIVE block with no
+/// cross-protocol meaning, so stashing it in `extra` is exactly right: it survives a same-protocol
+/// round-trip and is correctly dropped on the cross-protocol seam (where `extra` is cleared) rather
+/// than leaking a Bedrock-only block onto a foreign wire.
+///
+/// The stash records each block's ORIGINAL absolute index in its message `content` array (the same
+/// `{ "m": <usize>, "i": <usize>, "block": <value> }` shape as the `guardContent` stash) so
+/// `write_request` splices it back at the same position via the shared `splice_cache_points` helper.
+/// The leading `__busbar` prefix keeps it from colliding with any real Bedrock key, and
+/// `write_request` consumes it (never re-emitting it via the trailing extra-merge), so the sentinel
+/// never appears on the wire.
+const DOC_VIDEO_SENTINEL: &str = "__busbar_bedrock_doc_video";
+
 /// AWS Bedrock ConverseStream wire event-type names — the discriminator on every stream frame (the
 /// SDK's `:event-type` header, surfaced as the `"type"` tag on busbar's decoded JSON). Named once here
 /// so no bare wire literal is scattered across the reader / writer / framing, and so a typo is a

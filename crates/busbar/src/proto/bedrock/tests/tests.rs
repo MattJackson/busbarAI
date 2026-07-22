@@ -5517,3 +5517,128 @@ fn write_response_exception_folds_to_stream_union_members() {
         "message prefers the upstream provider_signal"
     );
 }
+
+/// FINDING 3 [P1] REGRESSION: The native AWS Bedrock ConverseStream `ContentBlockStart$start`
+/// union only models `toolUse`, so a real AWS stream sends NO `contentBlockStart` for a text
+/// block; the block is implied by the first `contentBlockDelta` carrying `text`. The reader's
+/// text-delta arm previously emitted a `BlockDelta` with NO preceding `BlockStart`, producing an
+/// orphaned `content_block_delta` at index 0 (breaking the block-event contract when translating
+/// Bedrock ConverseStream -> Anthropic-style block events). The text arm must lazily open a Text
+/// BlockStart on the first text delta, exactly like the reasoningContent arm.
+#[test]
+fn test_stream_text_delta_lazily_opens_block_start() {
+    use crate::ir::IrStreamEvent;
+
+    let mut state = crate::ir::StreamDecodeState::default();
+    let reader = BedrockReader;
+
+    // Native AWS text sequence: messageStart, then text deltas with NO contentBlockStart.
+    let events: Vec<_> = vec![
+        serde_json::json!({"type": "messageStart", "role": "assistant"}),
+        serde_json::json!({
+            "type": "contentBlockDelta",
+            "contentBlockIndex": 0,
+            "delta": {"text": "Hello"}
+        }),
+        serde_json::json!({
+            "type": "contentBlockDelta",
+            "contentBlockIndex": 0,
+            "delta": {"text": ", world!"}
+        }),
+        serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+        serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+        serde_json::json!({
+            "type": "metadata",
+            "usage": {"inputTokens": 10, "outputTokens": 5}
+        }),
+    ]
+    .into_iter()
+    .flat_map(|data| reader.read_response_events("", &data, &mut state))
+    .collect();
+
+    // A Text BlockStart at index 0 must precede any TextDelta.
+    let first_block_start = events.iter().position(|e| {
+        matches!(
+            e,
+            IrStreamEvent::BlockStart {
+                block: crate::ir::IrBlockMeta::Text,
+                ..
+            }
+        )
+    });
+    let first_text_delta = events.iter().position(|e| {
+        matches!(
+            e,
+            IrStreamEvent::BlockDelta {
+                delta: crate::ir::IrDelta::TextDelta(_),
+                ..
+            }
+        )
+    });
+    let bs = first_block_start.expect("a Text BlockStart must be emitted for lazy text open");
+    let bd = first_text_delta.expect("a TextDelta must be present");
+    assert!(
+        bs < bd,
+        "the Text BlockStart (idx {bs}) must precede the first TextDelta (idx {bd}); \
+         an orphaned content_block_delta with no BlockStart is the defect"
+    );
+    // The lazily-opened block must be indexed 0 (matching the delta index).
+    if let IrStreamEvent::BlockStart { index, .. } = &events[bs] {
+        assert_eq!(*index, 0, "lazily-opened Text block must be at index 0");
+    }
+}
+
+/// FINDING 4 [P1] REGRESSION: The AWS Bedrock Converse `ContentBlock` union includes top-level
+/// `document` and `video` members (a PDF/CSV the model reasons over, and a video reference). The
+/// reader previously handled only text/image/toolUse/toolResult/reasoningContent/cachePoint/
+/// guardContent, so a top-level `document` or `video` block was silently DROPPED on a same-protocol
+/// Bedrock passthrough (the proxy diverged from a direct AWS call). This asserts both survive a
+/// WIRE->IR->WIRE round-trip byte-identically, INTERLEAVED with text so positional splicing holds.
+#[test]
+fn test_roundtrip_preserves_document_and_video_blocks() {
+    let reader = BedrockReader;
+    let writer = BedrockWriter;
+
+    let wire = serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"text": "Summarize the attachment."},
+                {"document": {
+                    "format": "pdf",
+                    "name": "report",
+                    "source": {"bytes": "JVBERi0xLjQK"}
+                }},
+                {"text": "and describe the clip"},
+                {"video": {
+                    "format": "mp4",
+                    "source": {"s3Location": {"uri": "s3://bucket/clip.mp4"}}
+                }}
+            ]
+        }],
+        "inferenceConfig": {"maxTokens": 256}
+    });
+
+    let ir = reader
+        .read_request(&wire)
+        .expect("read round-trip should succeed");
+    let wire_after = writer.write_request(&ir);
+
+    assert_eq!(
+        wire, wire_after,
+        "same-protocol wire round-trip must preserve document/video blocks at their original \
+         positions, byte-identically"
+    );
+
+    // Belt-and-suspenders: the written body must actually contain both blocks (guards against a
+    // future change that makes the equality hold only because both sides dropped them).
+    let content = wire_after["messages"][0]["content"].as_array().unwrap();
+    assert!(
+        content.iter().any(|b| b.get("document").is_some()),
+        "the document block must be present on Bedrock egress"
+    );
+    assert!(
+        content.iter().any(|b| b.get("video").is_some()),
+        "the video block must be present on Bedrock egress"
+    );
+}

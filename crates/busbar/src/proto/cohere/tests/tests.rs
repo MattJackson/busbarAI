@@ -4512,3 +4512,64 @@ fn test_stream_tool_plan_to_anthropic_writer_is_balanced() {
          got {starts} start(s) and {stops} stop(s)"
     );
 }
+
+/// FINDING 1 [P0] REGRESSION: Anthropic and Gemini carry `tool_result` blocks on a USER-role
+/// message in the IR (Anthropic's Messages API puts `tool_result` content parts inside a
+/// `role:"user"` message). The Cohere v2 `/chat` API represents every tool result as its own
+/// `role:"tool"` message with a `tool_call_id`; a Cohere user message cannot carry tool results.
+/// The writer previously gated tool-result emission on `IrRole::Tool` ONLY, so translating
+/// Anthropic -> Cohere silently DROPPED tool results and broke cross-protocol multi-turn tool use.
+/// This asserts the tool result survives as a Cohere `tool` message.
+#[test]
+fn test_anthropic_user_tool_result_survives_to_cohere() {
+    let anthropic_body = serde_json::json!({
+        "model": "x",
+        "max_tokens": 10,
+        "messages": [
+            {"role": "user", "content": "Weather in Paris?"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_01AAA", "name": "get_weather", "input": {"city": "Paris"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_01AAA",
+                 "content": [{"type": "text", "text": "18C sunny"}]}
+            ]}
+        ]
+    });
+    let ir = AnthropicReader
+        .read_request(&anthropic_body)
+        .expect("anthropic read_request");
+    // The IR must carry the tool_result on a USER-role message (this is the crux of the bug).
+    let tr_msg = ir
+        .messages
+        .iter()
+        .find(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, crate::ir::IrBlock::ToolResult { .. }))
+        })
+        .expect("IR must contain a ToolResult block");
+    assert_eq!(
+        tr_msg.role,
+        crate::ir::IrRole::User,
+        "Anthropic carries tool_result on a User-role message in the IR"
+    );
+
+    let writer = CohereWriter;
+    let cohere = writer.write_request(&ir);
+    let msgs = cohere.get("messages").unwrap().as_array().unwrap();
+    let tool_msg = msgs
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .expect("Cohere output MUST include a tool message for the tool_result");
+    assert_eq!(
+        tool_msg.get("tool_call_id").and_then(|c| c.as_str()),
+        Some("toolu_01AAA"),
+        "Cohere tool message must carry the originating tool_call_id"
+    );
+    assert_eq!(
+        tool_msg.get("content").and_then(|c| c.as_str()),
+        Some("18C sunny"),
+        "Cohere tool message must carry the tool-result text"
+    );
+}
