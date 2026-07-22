@@ -1004,6 +1004,51 @@ fn server_timing_dur_ms(total_us: u64, upstream_us: u64) -> f64 {
     internal_us as f64 / 1000.0
 }
 
+/// Busbar's own internal microseconds (total wall-clock minus upstream RTT), the integer that
+/// `server_timing_dur_ms` divides by 1000. Kept separate so the fast header writer can render
+/// `<ms>.<µs>` directly from the integer without a float round-trip.
+fn server_timing_internal_us(total_us: u64, upstream_us: u64) -> u64 {
+    if upstream_us == NO_UPSTREAM_RTT {
+        total_us
+    } else {
+        total_us.saturating_sub(upstream_us)
+    }
+}
+
+/// Render `busbar;dur=<ms>.<3-digit µs frac>` into a stack buffer with NO float formatting and NO
+/// intermediate `String` — the value is `internal_us / 1000` whole milliseconds and `internal_us %
+/// 1000` as the exact 3-digit fractional part, which is byte-for-byte identical to
+/// `format!("busbar;dur={:.3}", internal_us as f64 / 1000.0)` (µs is an exact multiple of 1e-3 ms,
+/// so `{:.3}` neither rounds nor loses precision). Returns the written length. The 40-byte buffer
+/// holds the 11-byte prefix + up to 20 whole-ms digits + `.` + 3 frac digits (max 35).
+fn write_server_timing_value(buf: &mut [u8; 40], internal_us: u64) -> usize {
+    const PREFIX: &[u8] = b"busbar;dur=";
+    buf[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut n = PREFIX.len();
+    let whole = internal_us / 1000;
+    let frac = (internal_us % 1000) as usize; // 0..=999
+    // Whole milliseconds, itoa-lite into a scratch buffer written back-to-front.
+    let mut scratch = [0u8; 20];
+    let mut si = scratch.len();
+    let mut w = whole;
+    loop {
+        si -= 1;
+        scratch[si] = b'0' + (w % 10) as u8;
+        w /= 10;
+        if w == 0 {
+            break;
+        }
+    }
+    let wlen = scratch.len() - si;
+    buf[n..n + wlen].copy_from_slice(&scratch[si..]);
+    n += wlen;
+    buf[n] = b'.';
+    buf[n + 1] = b'0' + (frac / 100) as u8;
+    buf[n + 2] = b'0' + ((frac / 10) % 10) as u8;
+    buf[n + 3] = b'0' + (frac % 10) as u8;
+    n + 4
+}
+
 /// Outermost middleware: stamps a standard `Server-Timing: busbar;dur=<ms>` response header
 /// reporting the latency Busbar itself added — total request wall-clock MINUS the upstream
 /// round-trip — so operators (and browser DevTools / APM tools) can see the gateway's own cost
@@ -1037,6 +1082,34 @@ async fn server_timing(
             resp.headers_mut()
                 .insert(axum::http::HeaderName::from_static(HEADER_SERVER_TIMING), v);
         }
+    }
+    resp
+}
+
+/// Fast variant of [`server_timing`] with byte-identical output and behavior. It renders the header
+/// value from the integer internal-µs via [`write_server_timing_value`] into a stack buffer and
+/// builds the `HeaderValue` in one `from_bytes` — dropping the `format!` `String` allocation and the
+/// `{:.3}` float format the original does per response, keeping only the single unavoidable
+/// `HeaderValue` allocation. `emit` is always true here (the selector only routes to this fn when the
+/// header is enabled), so the branch is elided. Used when `BUSBAR_SERVER_TIMING_IMPL=fast`.
+async fn server_timing_fast(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use std::sync::atomic::Ordering;
+    REQUEST_ACTIVITY_TICKS.fetch_add(1, Ordering::Relaxed);
+    let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_UPSTREAM_RTT));
+    let start = std::time::Instant::now();
+    let mut resp = proxy::UPSTREAM_RTT_US
+        .scope(slot.clone(), next.run(req))
+        .await;
+    let total_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let internal_us = server_timing_internal_us(total_us, slot.load(Ordering::Relaxed));
+    let mut buf = [0u8; 40];
+    let n = write_server_timing_value(&mut buf, internal_us);
+    if let Ok(v) = axum::http::HeaderValue::from_bytes(&buf[..n]) {
+        resp.headers_mut()
+            .insert(axum::http::HeaderName::from_static(HEADER_SERVER_TIMING), v);
     }
     resp
 }
@@ -2012,7 +2085,7 @@ fn apply_common_layers(
     request_body_max_bytes: usize,
     emit_server_timing: bool,
 ) -> Router {
-    router
+    let router = router
         // The router's state is a swappable `AppHandle` (the config-apply hot-swap seam). Every
         // handler reads the CURRENT snapshot via the `CurrentApp` extractor; the auth middleware
         // loads it too. Until an admin apply calls `swap()`, this is identical to a fixed `Arc<App>`.
@@ -2029,16 +2102,45 @@ fn apply_common_layers(
         // envelope. Must wrap the `DefaultBodyLimit` layer above, so it is applied LAST (the last
         // `.layer()` is the outermost on the response path) and therefore sees that layer's 413.
         .layer(axum::middleware::from_fn(reshape_body_limit_413))
-        // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
-        // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
-        // Gated on `observability.emit_server_timing` (default false): when false the header is fully
-        // suppressed (see `server_timing`). The `bool` state is independent of the router's `App`
-        // state, so it is wired with its own `from_fn_with_state`.
-        .layer(axum::middleware::from_fn_with_state(
+        ;
+    // Outermost: stamp the `Server-Timing: busbar;dur=<ms>` gateway-overhead header on every
+    // response (times the full inner stack). Must be the LAST `.layer()` so it wraps everything.
+    // Gated on `observability.emit_server_timing` (default false): when false the header is fully
+    // suppressed (see `server_timing`). The `bool` state is independent of the router's `App`
+    // state, so it is wired with its own `from_fn_with_state`.
+    //
+    // `BUSBAR_SERVER_TIMING_IMPL` is a perf-measurement selector (default `full` = shipped behavior):
+    //   full — the original `server_timing` middleware.
+    //   fast — `server_timing_fast`, byte-identical output with no per-response float format / String.
+    //   off  — do not attach the layer at all (measures the middleware's full cost as a floor); the
+    //          header is absent regardless of `emit_server_timing`.
+    let router = match server_timing_impl() {
+        ServerTimingImpl::Off => router,
+        ServerTimingImpl::Fast if emit_server_timing => {
+            router.layer(axum::middleware::from_fn(server_timing_fast))
+        }
+        _ => router.layer(axum::middleware::from_fn_with_state(
             emit_server_timing,
             server_timing,
-        ))
-        .with_state(handle.clone())
+        )),
+    };
+    router.with_state(handle.clone())
+}
+
+/// Which server-timing middleware `apply_common_layers` attaches. A perf-measurement selector read
+/// once per router build from `BUSBAR_SERVER_TIMING_IMPL`; unset/unknown → `Full` (shipped behavior).
+enum ServerTimingImpl {
+    Full,
+    Fast,
+    Off,
+}
+
+fn server_timing_impl() -> ServerTimingImpl {
+    match std::env::var("BUSBAR_SERVER_TIMING_IMPL").as_deref() {
+        Ok("fast") => ServerTimingImpl::Fast,
+        Ok("off") => ServerTimingImpl::Off,
+        _ => ServerTimingImpl::Full,
+    }
 }
 
 /// Build SEPARATE data-plane and admin-plane routers sharing ONE `AppHandle`, for the split-listener
