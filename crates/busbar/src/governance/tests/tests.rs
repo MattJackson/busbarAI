@@ -1604,3 +1604,132 @@ fn test_poisoned_by_hash_lock_recovers_not_panics() {
         .expect("refresh recovers the poisoned cache lock");
     assert_eq!(gov.lookup(secret).unwrap().id, "k1");
 }
+
+/// A `Store` decorator that (1) RECORDS every `put_usage` spend value in call-COMPLETION order and
+/// (2) can BLOCK the first `put_usage` until the test releases it. This lets the test hold one flush
+/// in flight (its ABSOLUTE `put_usage` paused) while it accrues a NEWER spend, so it can prove the
+/// write-behind flusher never lets an older, slower flush overwrite a newer one (the lost-update the
+/// serialization gate closes). All other methods delegate to an inner `MemoryStore`.
+struct RecordingBarrierStore {
+    inner: MemoryStore,
+    block_first: std::sync::atomic::AtomicBool,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    writes: std::sync::Mutex<Vec<i64>>,
+}
+
+impl Store for RecordingBarrierStore {
+    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
+        self.inner.put_key(key)
+    }
+    fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
+        self.inner.get_key(id)
+    }
+    fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+        self.inner.list_keys()
+    }
+    fn delete_key(&self, id: &str) -> StoreResult<()> {
+        self.inner.delete_key(id)
+    }
+    fn get_usage(&self, key_id: &str, window_start: u64) -> StoreResult<Usage> {
+        self.inner.get_usage(key_id, window_start)
+    }
+    fn put_usage(
+        &self,
+        key_id: &str,
+        window_start: u64,
+        spend_cents: i64,
+        tokens: u64,
+        requests: u64,
+    ) -> StoreResult<()> {
+        // The FIRST flush's put_usage signals it has entered, then blocks until the test releases it
+        // - pinning that flush "in flight" so the test can attempt an overlapping flush.
+        if self
+            .block_first
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+        }
+        let r = self
+            .inner
+            .put_usage(key_id, window_start, spend_cents, tokens, requests);
+        // Record in COMPLETION order, so the test can assert the last durable write is the NEWER value.
+        self.writes.lock().unwrap().push(spend_cents);
+        r
+    }
+    fn add_metering(&self, delta: &MeteringDelta) -> StoreResult<()> {
+        self.inner.add_metering(delta)
+    }
+    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+        self.inner.list_metering(bucket)
+    }
+}
+
+/// Regression (write-behind lost update): the periodic flusher must never let two `flush_budgets`
+/// runs overlap, because `put_usage` is an ABSOLUTE overwrite - an older, slower flush completing
+/// AFTER a newer one would roll the durable spend BACKWARD. We hold the first flush's `put_usage`
+/// paused, accrue a NEWER spend, and drive a second flush attempt. With the serialization gate the
+/// second attempt is SKIPPED while the first is in flight, so the durable spend ends at the NEWER
+/// value; without the gate a second flush could snapshot-and-write the newer value first, then the
+/// released older flush would overwrite it back to the OLDER value (the lost update).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_write_behind_flush_does_not_lose_a_newer_spend() {
+    crate::metrics::init();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let store = Arc::new(RecordingBarrierStore {
+        inner: MemoryStore::new(),
+        block_first: std::sync::atomic::AtomicBool::new(true),
+        entered: entered_tx,
+        release: std::sync::Mutex::new(release_rx),
+        writes: std::sync::Mutex::new(Vec::new()),
+    });
+    // 1c per request, so each `record_request` accrues exactly 1c to the cell.
+    let gov = Arc::new(GovState::new(store.clone(), 1, 0, None).unwrap());
+    let at = 1_700_000_000u64;
+    let mut key = sample_key("k1", "h1");
+    key.budget_period = BUDGET_PERIOD_TOTAL.to_string(); // window 0, so the durable read is unambiguous
+
+    // Accrue an OLDER spend of 3c, then start the flusher: its first tick snapshots that cell and
+    // its `put_usage` BLOCKS mid-write (holding the flush in flight).
+    for _ in 0..3 {
+        gov.record_request(&key, at, 0); // 3 x 1c = 3c
+    }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    crate::governance::spawn_budget_flusher(gov.clone(), shutdown_rx);
+
+    // Wait until the first flush is paused inside put_usage.
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    // While that older flush is pinned, accrue a NEWER spend (up to 5c) and re-mark the cell dirty.
+    gov.record_request(&key, at, 0);
+    gov.record_request(&key, at, 0); // 3 + 2 = 5c newer total
+
+    // Give the flusher time to fire (and SKIP) several overlapping ticks while the first is blocked.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Release the first (older) flush; it completes writing 3c.
+    release_tx.send(()).unwrap();
+
+    // Shut down: the final flush WAITS for any in-flight flush to drain, then flushes the newer 5c.
+    shutdown_tx.send(()).unwrap();
+    // Let the shutdown flush complete.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The durable spend must reflect the NEWER value - the older flush's 3c must not win.
+    let durable = store.inner.get_usage("k1", 0).unwrap().spend_cents;
+    assert_eq!(
+        durable, 5,
+        "the newer spend (5c) must be the final durable value; a stale flush must not overwrite it"
+    );
+    // And the LAST completed write must be the newer value, never an older one landing last.
+    let writes = store.writes.lock().unwrap().clone();
+    assert_eq!(
+        *writes.last().unwrap(),
+        5,
+        "the last durable write is the newer spend, not a stale overwrite"
+    );
+}

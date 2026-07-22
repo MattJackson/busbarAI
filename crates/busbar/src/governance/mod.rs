@@ -529,6 +529,15 @@ pub(crate) fn spawn_budget_flusher(
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) {
     let interval = std::time::Duration::from_millis(crate::limits::usage_flush_interval_ms());
+    // SERIALIZE flushes: `flush_budgets` snapshots dirty cells and then `put_usage`-writes each with
+    // ABSOLUTE (overwrite) semantics. If a slow flush outlasts a tick, a second flush can start
+    // concurrently and the two `put_usage` streams can COMPLETE out of order - an older snapshot's
+    // write landing AFTER a newer one silently rolls the durable spend BACKWARD (a lost update). A
+    // single-permit async gate makes at most one flush in flight at a time: the periodic tick SKIPS
+    // if a flush is still running (`try_lock`), and the shutdown arm WAITS for the in-flight flush to
+    // drain (`lock().await`) before its final flush, so shutdown never overlaps and never loses the
+    // last window's spend.
+    let flush_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -539,21 +548,35 @@ pub(crate) fn spawn_budget_flusher(
                     // requests. `gov` is an Arc, so clone the handle into the blocking task; we do not
                     // await the join (write-behind is fire-and-forget - a store error re-marks the cell
                     // dirty and the next tick retries).
+                    //
+                    // SKIP-IF-STILL-FLUSHING: acquire the flush gate with `try_lock`; if a prior flush
+                    // is still in flight, this tick is a no-op (its dirty cells stay dirty and the next
+                    // free tick flushes them) rather than racing a second overlapping flush. The guard
+                    // is moved INTO the blocking task and dropped when the flush returns, releasing the
+                    // gate for the next tick.
+                    let Ok(guard) = flush_gate.clone().try_lock_owned() else {
+                        continue;
+                    };
                     let gov = gov.clone();
                     tokio::task::spawn_blocking(move || {
                         gov.flush_budgets();
+                        drop(guard);
                     });
                 }
                 _ = shutdown.recv() => {
                     // Graceful shutdown: one FINAL flush so no accrued spend/requests is lost, then exit.
-                    // This one is AWAITED (via spawn_blocking + join) rather than fire-and-forget: the
-                    // task is about to break and stop ticking, so the final durable write must COMPLETE
-                    // before we exit or the last window's accrued spend is lost. It still runs on the
-                    // blocking pool (not inline on the worker), and a join error falls back to nothing
-                    // flushed - best-effort, matching the periodic path.
+                    // WAIT for any in-flight periodic flush to drain first (`lock().await`) so the final
+                    // flush never overlaps one - otherwise the final flush's newer snapshot could be
+                    // overwritten by the older in-flight flush completing after it. This one is AWAITED
+                    // (via spawn_blocking + join) rather than fire-and-forget: the task is about to break
+                    // and stop ticking, so the final durable write must COMPLETE before we exit or the
+                    // last window's accrued spend is lost. It still runs on the blocking pool (not inline
+                    // on the worker), and a join error falls back to nothing flushed - best-effort.
+                    let guard = flush_gate.clone().lock_owned().await;
                     let gov = gov.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         gov.flush_budgets();
+                        drop(guard);
                     })
                     .await;
                     break;
