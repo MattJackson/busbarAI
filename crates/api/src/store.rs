@@ -101,7 +101,14 @@ impl std::fmt::Debug for AwsCredential {
 /// A resolved AWS-credential cache entry: the owning `VirtualKey` plus the secret access key needed to
 /// verify the inbound SigV4 signature. Returned by `GovState::lookup_by_access_key_id`. Carries a
 /// manual redacting `Debug` for the same reason as `AwsCredential` — the secret must never reach a log.
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// NOT `Serialize`/`Deserialize` — deliberately. Unlike `VirtualKey`/`AwsCredential` (which the redis
+/// store round-trips as JSON, so their derives are a load-bearing PERSISTENCE contract that must stay
+/// faithful), this is a purely in-memory lookup return type built fresh from the store on each hydrate
+/// (`GovState::hydrate_aws_index`). It is never persisted or wire-encoded, so a serde derive would add
+/// no capability — only a latent way for a future `serde_json::to_*` on it to emit the plaintext
+/// `secret_access_key`. Withholding the derive makes that leak a COMPILE error, not a runtime footgun.
+#[derive(Clone, PartialEq)]
 pub struct AwsKeyEntry {
     pub key: VirtualKey,
     /// The symmetric SigV4 secret access key — SECRET-EQUIVALENT (never log it).
@@ -310,5 +317,92 @@ pub trait Store: Send + Sync + 'static {
     /// (the RAM default) rather than forcing every backend to implement it.
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_key() -> VirtualKey {
+        VirtualKey {
+            id: "vk_1".to_string(),
+            key_hash: "deadbeefdeadbeef".to_string(),
+            name: "test".to_string(),
+            allowed_pools: vec!["p".to_string()],
+            max_budget_cents: Some(100),
+            budget_period: "total".to_string(),
+            rpm_limit: Some(60),
+            tpm_limit: None,
+            enabled: true,
+            created_at: 42,
+        }
+    }
+
+    /// REGRESSION (P2): the redacting `Debug` — the guard for the structured-logging surface, since
+    /// `tracing` records fields via `Debug`/`Display`, never serde — must NEVER emit the secret-
+    /// equivalent `key_hash` / `secret_access_key`. This is the leak the finding is about: any place a
+    /// record reaches a log must show presence only.
+    #[test]
+    fn debug_redacts_secret_equivalents() {
+        let key = sample_key();
+        let key_dbg = format!("{key:?}");
+        assert!(
+            !key_dbg.contains("deadbeefdeadbeef"),
+            "VirtualKey Debug leaked key_hash: {key_dbg}"
+        );
+        assert!(key_dbg.contains("<redacted; present>"));
+
+        let cred = AwsCredential {
+            access_key_id: "AKIA_TEST".to_string(),
+            key_id: "vk_1".to_string(),
+            secret_access_key: "s3cr3t-signing-key".to_string(),
+        };
+        let cred_dbg = format!("{cred:?}");
+        assert!(
+            !cred_dbg.contains("s3cr3t-signing-key"),
+            "AwsCredential Debug leaked secret_access_key: {cred_dbg}"
+        );
+        // The AccessKeyId is NOT secret and stays visible for diagnosability.
+        assert!(cred_dbg.contains("AKIA_TEST"));
+
+        let entry = AwsKeyEntry {
+            key: sample_key(),
+            secret_access_key: "s3cr3t-signing-key".to_string(),
+        };
+        let entry_dbg = format!("{entry:?}");
+        assert!(
+            !entry_dbg.contains("s3cr3t-signing-key"),
+            "AwsKeyEntry Debug leaked secret_access_key: {entry_dbg}"
+        );
+        // The embedded VirtualKey's hash is redacted transitively through its own Debug.
+        assert!(!entry_dbg.contains("deadbeefdeadbeef"));
+    }
+
+    /// The `Serialize`/`Deserialize` on `VirtualKey` and `AwsCredential` is a load-bearing PERSISTENCE
+    /// contract (the redis store round-trips them as JSON): it MUST stay faithful, so it is emphatically
+    /// NOT redacted. This pins that contract so a well-meaning "redact the Serialize too" change (which
+    /// would silently corrupt every redis-persisted key/credential) fails loudly here instead. The
+    /// logging-surface leak is closed by the redacting `Debug` above, not by lossy serialization.
+    #[test]
+    fn serialize_roundtrip_is_faithful_for_persistence() {
+        let key = sample_key();
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(json.contains("deadbeefdeadbeef"), "persistence must keep key_hash");
+        let back: VirtualKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(key, back);
+
+        let cred = AwsCredential {
+            access_key_id: "AKIA_TEST".to_string(),
+            key_id: "vk_1".to_string(),
+            secret_access_key: "s3cr3t-signing-key".to_string(),
+        };
+        let json = serde_json::to_string(&cred).unwrap();
+        assert!(
+            json.contains("s3cr3t-signing-key"),
+            "persistence must keep secret_access_key for SigV4 HMAC verification"
+        );
+        let back: AwsCredential = serde_json::from_str(&json).unwrap();
+        assert_eq!(cred, back);
     }
 }
