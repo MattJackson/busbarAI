@@ -374,10 +374,10 @@ mod tests {
     use super::*;
 
     /// End-to-end against a REAL Redis, gated on `REDIS_URL` (a docker `redis:7` service in CI).
-    /// Skips cleanly when unset LOCALLY so the default `cargo test` needs no server — but MUST NOT
+    /// Skips cleanly when unset LOCALLY so the default `cargo test` needs no server - but MUST NOT
     /// silently skip in CI: CI provisions the service and sets `REDIS_URL` (see
     /// .github/workflows/ci.yml), so when `CI` is set the missing URL is a HARD FAILURE rather than a
-    /// silent skip (P1 #6 — same discipline as the Postgres backend's `BUSBAR_TEST_POSTGRES_URL`).
+    /// silent skip (P1 #6 - same discipline as the Postgres backend's `BUSBAR_TEST_POSTGRES_URL`).
     #[test]
     fn roundtrip_against_live_redis() {
         let url = match std::env::var("REDIS_URL") {
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!((audit[0].seq, audit[1].seq), (1, 2), "oldest-first by seq");
         assert_eq!(audit[1].prev_hash, "h1");
 
-        // Attach an AWS credential so the delete cascade over credentials is actually exercised —
+        // Attach an AWS credential so the delete cascade over credentials is actually exercised -
         // the credential-cleanup path P1 #6 flagged as untested.
         let cred = AwsCredential {
             access_key_id: "AKIA_REDIS_TEST".into(),

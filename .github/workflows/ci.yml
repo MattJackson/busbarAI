@@ -17,7 +17,7 @@ jobs:
     # the roundtrip tests skip (their URLs are unset) and the two 1.5.0 store backends ship with ZERO
     # CI coverage of the delete_key cascade + credential cleanup. The tests read BUSBAR_TEST_POSTGRES_URL
     # / REDIS_URL (set on the Test step below) and, because `CI` is set in Actions, HARD-FAIL rather
-    # than silently skip if a service is misconfigured — so this coverage cannot vanish unnoticed.
+    # than silently skip if a service is misconfigured - so this coverage cannot vanish unnoticed.
     services:
       postgres:
         image: postgres:16

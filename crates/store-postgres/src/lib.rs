@@ -453,7 +453,7 @@ mod tests {
 
     /// End-to-end against a REAL Postgres, gated on `BUSBAR_TEST_POSTGRES_URL` (a docker
     /// `postgres:16` service in CI). Skips cleanly when unset LOCALLY so the default `cargo test`
-    /// needs no database — but MUST NOT silently skip in CI: CI provisions the service and sets the
+    /// needs no database - but MUST NOT silently skip in CI: CI provisions the service and sets the
     /// URL (see .github/workflows/ci.yml), so when `CI` is set the missing URL is a HARD FAILURE
     /// rather than a silent skip. Otherwise a broken CI service block would let the only coverage of
     /// the delete_key cascade / credential cleanup vanish unnoticed (P1 #6).
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 9, 3));
 
         // Attach an AWS credential so delete_key's CASCADE (key + usage + credentials) can be
-        // verified end to end — the credential-cleanup path P1 #6 flagged as untested.
+        // verified end to end - the credential-cleanup path P1 #6 flagged as untested.
         let cred = AwsCredential {
             access_key_id: "AKIA_PG_TEST".into(),
             key_id: "vk_pg".into(),
