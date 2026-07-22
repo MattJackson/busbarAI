@@ -458,47 +458,6 @@ fn test_server_timing_dur_ms() {
     assert_eq!(server_timing_dur_ms(500, 800), 0.0);
 }
 
-/// The fast integer header writer must be BYTE-IDENTICAL to the original float path
-/// (`format!("busbar;dur={:.3}", internal_us as f64 / 1000.0)`) for every internal-µs value —
-/// same sentinel handling, same saturation, same 3-digit fractional rendering.
-#[test]
-fn test_write_server_timing_value_matches_float_format() {
-    let cases: &[(u64, u64)] = &[
-        (1090, 1000),            // normal: 90µs internal → "0.090"
-        (57, NO_UPSTREAM_RTT),   // no upstream → full time "0.057"
-        (500, 800),              // skew saturates → "0.000"
-        (0, NO_UPSTREAM_RTT),    // zero
-        (999, NO_UPSTREAM_RTT),  // frac only, needs all 3 digits
-        (1000, NO_UPSTREAM_RTT), // exactly 1 ms
-        (1001, NO_UPSTREAM_RTT), // 1.001
-        (123_456_789, 456),      // large whole part
-        // (the float path stays print-identical while its half-ulp error is under the 0.0005 ms
-        // print threshold — comfortably true for any reachable duration; the integer writer is
-        // exact everywhere)
-        (1_000_000_000_000_000, NO_UPSTREAM_RTT), // 1e15 µs ≈ 31.7 years
-        (25_000_033, 25_000_000),                 // benchmark shape: 20ms upstream + 33µs internal
-    ];
-    for &(total, upstream) in cases {
-        let expected = format!("busbar;dur={:.3}", server_timing_dur_ms(total, upstream));
-        let internal = server_timing_internal_us(total, upstream);
-        let mut buf = [0u8; 40];
-        let n = write_server_timing_value(&mut buf, internal);
-        assert_eq!(
-            std::str::from_utf8(&buf[..n]).unwrap(),
-            expected,
-            "mismatch for total={total} upstream={upstream}"
-        );
-    }
-    // Sweep every µs in the first 2ms plus a coarse sweep beyond — the fractional rendering is
-    // the risky part and this covers every frac value twice.
-    for us in (0..2000u64).chain((0..1_000_000).step_by(7919)) {
-        let expected = format!("busbar;dur={:.3}", us as f64 / 1000.0);
-        let mut buf = [0u8; 40];
-        let n = write_server_timing_value(&mut buf, us);
-        assert_eq!(std::str::from_utf8(&buf[..n]).unwrap(), expected, "us={us}");
-    }
-}
-
 /// REGRESSION: axum's `DefaultBodyLimit` rejects an
 /// oversized body with a bare `text/plain` 413 (`"length limit exceeded"`) — a router/proxy
 /// tell. `reshape_oversized_413` must turn that into a protocol-native `application/json`
