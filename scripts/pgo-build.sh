@@ -12,18 +12,41 @@
 #
 #   scripts/pgo-build.sh                # binary at target/pgo/release/busbar
 #   PGO_REQS=5000 scripts/pgo-build.sh  # more training requests per traffic shape
+#   PGO_TARGET=x86_64-unknown-linux-musl scripts/pgo-build.sh
+#                                       # cargo --target build; binary at
+#                                       # target/pgo/<target>/release/busbar. The instrumented
+#                                       # binary must be host-executable (native-arch runners;
+#                                       # musl-static runs fine on its build host) - if it
+#                                       # isn't, the fail-open rule below kicks in.
+#
+# FAIL-OPEN RULE: PGO is an optimization, never a release blocker. If ANY pgo phase fails
+# (instrumented build, training, profile merge, optimized build), the script logs loudly and
+# falls back to a plain `cargo build --release`, so it ALWAYS produces a binary (exit 0) at
+# the SAME deterministic path, echoed on the last line:
+#
+#   target/pgo/release/busbar                 (no PGO_TARGET)
+#   target/pgo/<PGO_TARGET>/release/busbar    (with PGO_TARGET)
 #
 # Knobs: PGO_REQS (per-shape request count, default 2000), PGO_STREAMS (streamed requests,
-# default 200), PGO_PORT / PGO_MOCK_PORT (defaults 18080/18000). Requires: cargo, rustup
-# (llvm-tools is installed on demand), python3, curl. The training mix mirrors the benchmark
-# suites (perf / xlate / stream); keep the shapes in sync when the product grows a new hot path.
-set -euo pipefail
-cd "$(dirname "$0")/.."
+# default 200), PGO_PORT / PGO_MOCK_PORT (defaults 18080/18000), PGO_TARGET (cargo --target).
+# Requires: cargo, rustup (llvm-tools is installed on demand), python3, curl. The training mix
+# mirrors the benchmark suites (perf / xlate / stream); keep the shapes in sync when the
+# product grows a new hot path.
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 1
 
 REQS="${PGO_REQS:-2000}"
 STREAMS="${PGO_STREAMS:-200}"
 PORT="${PGO_PORT:-18080}"
 MOCK_PORT="${PGO_MOCK_PORT:-18000}"
+TARGET="${PGO_TARGET:-}"
+# Unquoted on use (deliberate - a target triple has no spaces); empty = no --target flag,
+# which keeps the historical no-target behavior byte-identical.
+TARGET_FLAG="${TARGET:+--target $TARGET}"
+# The target-triple path segment cargo inserts under --target-dir when --target is used.
+TARGET_SEG="${TARGET:+$TARGET/}"
+# THE deterministic output path (PGO and fallback both land here - see fail-open rule above).
+OUT="target/pgo/${TARGET_SEG}release/busbar"
 PROF_DIR="$(pwd)/target/pgo-profiles"
 WORK="$(mktemp -d)"
 cleanup() {
@@ -35,11 +58,37 @@ cleanup() {
 trap cleanup EXIT
 log() { echo "[pgo-build] $*"; }
 
+# The fail-open arm: log LOUDLY why PGO was abandoned, produce a plain release binary at the
+# SAME deterministic path ($OUT, via the same --target-dir), and exit 0. A missing binary is
+# the only remaining fatal outcome (plain release build broken = a real build failure).
+fail_open() {
+  echo "[pgo-build] ############################################################" >&2
+  echo "[pgo-build] # PGO FAILED: $*" >&2
+  echo "[pgo-build] # falling back to a plain 'cargo build --release' (fail-open:" >&2
+  echo "[pgo-build] # PGO is an optimization, never a release blocker)." >&2
+  echo "[pgo-build] ############################################################" >&2
+  # Stop any training processes a mid-phase failure left behind before rebuilding.
+  [ -n "${BUSBAR_PID:-}" ] && kill "$BUSBAR_PID" 2>/dev/null || true
+  [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null || true
+  BUSBAR_PID=""; MOCK_PID=""
+  if ! cargo build --release -p busbar $TARGET_FLAG --target-dir target/pgo; then
+    echo "[pgo-build] plain release build ALSO failed - this is a real build failure" >&2
+    exit 1
+  fi
+  [ -x "$OUT" ] || { echo "[pgo-build] expected binary missing at $OUT" >&2; exit 1; }
+  log "done (fail-open, NO pgo): $OUT"
+  echo "$OUT"
+  exit 0
+}
+
 # ---- phase 1: instrumented build ------------------------------------------------------------
 log "phase 1/3: instrumented build"
 rm -rf "$PROF_DIR"; mkdir -p "$PROF_DIR"
 RUSTFLAGS="-Cprofile-generate=$PROF_DIR" \
-  cargo build --release -p busbar --target-dir target/pgo-gen
+  cargo build --release -p busbar $TARGET_FLAG --target-dir target/pgo-gen \
+  || fail_open "instrumented build failed"
+INSTRUMENTED="target/pgo-gen/${TARGET_SEG}release/busbar"
+[ -x "$INSTRUMENTED" ] || fail_open "instrumented binary missing at $INSTRUMENTED"
 
 # ---- embedded mock upstream (zero deps: python3 stdlib) --------------------------------------
 # Speaks just enough OpenAI chat-completions for training: fixed JSON reply, and a paced SSE
@@ -120,10 +169,14 @@ YAML
 log "phase 2/3: training ($REQS reqs x 3 shapes + $STREAMS streams)"
 python3 "$WORK/mock.py" "$MOCK_PORT" & MOCK_PID=$!
 BUSBAR_CONFIG="$WORK/config.yaml" BUSBAR_PROVIDERS="$WORK/providers.yaml" PGO_MOCK_KEY=x \
-  ./target/pgo-gen/release/busbar & BUSBAR_PID=$!
+  "./$INSTRUMENTED" & BUSBAR_PID=$!
 for _ in $(seq 1 50); do
   curl -sf -o /dev/null "http://127.0.0.1:$PORT/healthz" && break; sleep 0.2
 done
+# The instrumented binary must actually be serving (it may not even be host-executable under a
+# cross PGO_TARGET) - a dead trainer means no profile, so fail open now rather than merge-fail.
+curl -sf -o /dev/null "http://127.0.0.1:$PORT/healthz" \
+  || fail_open "instrumented busbar never became healthy (not host-executable, or crashed)"
 
 OPENAI_BODY='{"model":"gpt-4o-mini","messages":[{"role":"user","content":"profile training request with a moderately sized body to exercise the parser"}]}'
 ANTH_BODY='{"model":"gpt-4o-mini","max_tokens":64,"messages":[{"role":"user","content":"profile training request for the translation path"}]}'
@@ -131,16 +184,19 @@ STREAM_BODY='{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","co
 
 # shape 1: openai chat passthrough (the volume path)
 seq 1 "$REQS" | xargs -P 8 -I{} curl -s -o /dev/null -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
-  -H "content-type: application/json" -H "authorization: Bearer pgo-token" -d "$OPENAI_BODY"
+  -H "content-type: application/json" -H "authorization: Bearer pgo-token" -d "$OPENAI_BODY" \
+  || fail_open "training shape 1 (openai chat) failed"
 log "  shape 1 (openai chat) done"
 # shape 2: anthropic ingress -> openai upstream (the translation path)
 seq 1 "$REQS" | xargs -P 8 -I{} curl -s -o /dev/null -X POST "http://127.0.0.1:$PORT/v1/messages" \
   -H "content-type: application/json" -H "anthropic-version: 2023-06-01" \
-  -H "authorization: Bearer pgo-token" -d "$ANTH_BODY"
+  -H "authorization: Bearer pgo-token" -d "$ANTH_BODY" \
+  || fail_open "training shape 2 (anthropic translation) failed"
 log "  shape 2 (anthropic translation) done"
 # shape 3: SSE streaming relay
 seq 1 "$STREAMS" | xargs -P 8 -I{} curl -s -o /dev/null -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
-  -H "content-type: application/json" -H "authorization: Bearer pgo-token" -d "$STREAM_BODY"
+  -H "content-type: application/json" -H "authorization: Bearer pgo-token" -d "$STREAM_BODY" \
+  || fail_open "training shape 3 (SSE streaming) failed"
 log "  shape 3 (SSE streaming) done"
 
 # graceful stop so the runtime flushes .profraw files
@@ -151,9 +207,15 @@ kill "$MOCK_PID" 2>/dev/null || true; MOCK_PID=""
 log "phase 3/3: merge profiles + optimized build"
 rustup component add llvm-tools >/dev/null 2>&1 || true
 PROFDATA="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -1)"
-[ -n "$PROFDATA" ] || { echo "[pgo-build] llvm-profdata not found (rustup component add llvm-tools)"; exit 1; }
-"$PROFDATA" merge -o "$PROF_DIR/merged.profdata" "$PROF_DIR"/*.profraw
+[ -n "$PROFDATA" ] || fail_open "llvm-profdata not found (rustup component add llvm-tools)"
+ls "$PROF_DIR"/*.profraw >/dev/null 2>&1 \
+  || fail_open "no .profraw files produced (instrumented run flushed nothing)"
+"$PROFDATA" merge -o "$PROF_DIR/merged.profdata" "$PROF_DIR"/*.profraw \
+  || fail_open "llvm-profdata merge failed"
 RUSTFLAGS="-Cprofile-use=$PROF_DIR/merged.profdata" \
-  cargo build --release -p busbar --target-dir target/pgo
+  cargo build --release -p busbar $TARGET_FLAG --target-dir target/pgo \
+  || fail_open "optimized (-Cprofile-use) build failed"
+[ -x "$OUT" ] || fail_open "optimized binary missing at $OUT"
 
-log "done: target/pgo/release/busbar (profile: $PROF_DIR/merged.profdata)"
+log "done: $OUT (profile: $PROF_DIR/merged.profdata)"
+echo "$OUT"

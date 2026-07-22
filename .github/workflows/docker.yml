@@ -114,8 +114,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build static binary
+      # PGO release build (scripts/pgo-build.sh): instrumented build → on-host training (native-arch
+      # runner, so the musl-static instrumented binary executes locally) → optimized build. FAIL-OPEN:
+      # if any PGO phase fails the script logs loudly and falls back to a plain
+      # `cargo build --release`, always producing a binary at target/pgo/<target>/release/busbar.
+      - name: Build static binary (PGO, fail-open)
         env:
+          PGO_TARGET: ${{ matrix.target }}
           # musl-gcc drives both the C compiles (bundled SQLite) and the final link.
           CC: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
@@ -133,17 +138,17 @@ jobs:
           je_cv_gcc_sync_atomics: "yes"
           je_cv_gcc_u8_sync_atomics: "yes"
         run: |
-          cargo build --release --target ${{ matrix.target }}
-          file "target/${{ matrix.target }}/release/busbar"
+          scripts/pgo-build.sh
+          file "target/pgo/${{ matrix.target }}/release/busbar"
           # Fail loudly if the binary is not fully static — FROM scratch has no loader.
-          if ldd "target/${{ matrix.target }}/release/busbar" 2>&1 | grep -qv 'not a dynamic\|statically linked'; then
+          if ldd "target/pgo/${{ matrix.target }}/release/busbar" 2>&1 | grep -qv 'not a dynamic\|statically linked'; then
             echo "binary is dynamically linked; refusing to ship in FROM scratch" && exit 1
           fi
 
       - uses: actions/upload-artifact@v7
         with:
           name: busbar-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/busbar
+          path: target/pgo/${{ matrix.target }}/release/busbar
           if-no-files-found: error
 
   publish:
