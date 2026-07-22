@@ -4876,7 +4876,17 @@ async fn serve_with_plugins_dir(
     let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, 0, 0, Some("admintok".to_string())).unwrap());
     let app = TestApp::new().governance(gov).plugins_dir(dir).build();
-    let router = crate::build_router(app);
+    // Explicit 256 MiB body cap: the install test uploads the REAL sqlite-plugin cdylib as base64,
+    // and a DEBUG build of that library (CI runs tests unoptimized) can exceed the 32 MiB default
+    // on some platforms - Windows in particular, where the early 413 close surfaces to the client
+    // as a deterministic WSAECONNABORTED instead of a readable status. The production default is
+    // exercised by the config tests; THIS test is about the plugin lifecycle, not the body cap.
+    let (router, _handle) = crate::build_router_with_limits(
+        app,
+        256 * 1024 * 1024,
+        0,
+        crate::config::DEFAULT_EMIT_SERVER_TIMING,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
