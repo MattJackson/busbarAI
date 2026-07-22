@@ -1,0 +1,1 @@
+{"max_tokens":64,"messages":[{"content":"late system turn","role":"system"},{"content":[{"text":"","type":"text"}],"role":"assistant"},{"content":[{"text":"","type":"text"},{"text":"escape\" \\ ✓\nnewline","type":"text"}],"role":"user"}],"model":"gpt-4o-mini","stream":false}

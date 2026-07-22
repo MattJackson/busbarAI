@@ -1,0 +1,1 @@
+{"content":[{"text":"part one ","type":"text"},{"text":"part two","type":"text"},{"text":"no thanks","type":"text"}],"id":"msg_01GOLDENGOLDENGOLDENGOLD","model":"gpt-4o-mini","role":"assistant","stop_reason":"max_tokens","stop_sequence":null,"type":"message","usage":{"input_tokens":7,"output_tokens":7}}

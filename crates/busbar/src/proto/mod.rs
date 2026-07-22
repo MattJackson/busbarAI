@@ -1550,3 +1550,7 @@ mod stop_reason_matrix_tests;
 #[cfg(test)]
 #[path = "tests/image_source_matrix_tests.rs"]
 mod image_source_matrix_tests;
+
+#[cfg(test)]
+#[path = "tests/translate_parity_golden_tests.rs"]
+mod translate_parity_golden_tests;

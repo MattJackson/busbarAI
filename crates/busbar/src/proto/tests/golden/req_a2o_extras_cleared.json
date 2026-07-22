@@ -1,0 +1,1 @@
+{"max_tokens":128,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"model":"gpt-4o-mini","stream":false}

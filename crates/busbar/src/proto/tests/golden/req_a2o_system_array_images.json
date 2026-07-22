@@ -1,0 +1,1 @@
+{"max_tokens":512,"messages":[{"content":"Be helpful.","role":"system"},{"content":"Cite sources.","role":"system"},{"content":[{"text":"Describe these.","type":"text"},{"image_url":{"url":"data:image/png;base64,aGVsbG8="},"type":"image_url"},{"image_url":{"url":"https://example.com/cat.png"},"type":"image_url"}],"role":"user"}],"model":"gpt-4o-mini","stream":false}

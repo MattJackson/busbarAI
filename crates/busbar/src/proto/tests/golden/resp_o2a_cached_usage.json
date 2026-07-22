@@ -1,0 +1,1 @@
+{"content":[{"text":"Cached reply","type":"text"}],"id":"msg_01GOLDENGOLDENGOLDENGOLD","model":"gpt-4o-mini","role":"assistant","stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"cache_read_input_tokens":80,"input_tokens":20,"output_tokens":10}}

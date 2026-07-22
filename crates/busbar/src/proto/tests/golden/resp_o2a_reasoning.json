@@ -1,0 +1,1 @@
+{"content":[{"thinking":"Let me think...","type":"thinking"},{"text":"42","type":"text"}],"id":"msg_01GOLDENGOLDENGOLDENGOLD","model":"deepseek-r1","role":"assistant","stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"input_tokens":9,"output_tokens":33}}

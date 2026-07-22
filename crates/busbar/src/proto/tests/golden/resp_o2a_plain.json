@@ -1,0 +1,1 @@
+{"content":[{"text":"Hello there!","type":"text"}],"id":"msg_01GOLDENGOLDENGOLDENGOLD","model":"gpt-4o-mini","role":"assistant","stop_reason":"end_turn","stop_sequence":null,"type":"message","usage":{"input_tokens":12,"output_tokens":4}}
