@@ -2435,4 +2435,119 @@ mod ir_property_tests {
             Some("boom")
         );
     }
+
+    // Indistinguishability fix (same-proto `usage:null` tell): the byte-level top-level `usage` member
+    // remover must delete exactly the `usage` member (with the right adjacent comma) and leave every
+    // other byte intact, AND must NEVER corrupt a frame where the literal text `"usage":null` appears
+    // inside string content. These exercise the stripper directly on representative frame shapes.
+
+    // Re-parse both sides and assert JSON equality with `usage` gone, plus assert the raw output has no
+    // top-level `usage` key. Parsing both proves the splice stayed well-formed.
+    fn assert_stripped_ok(input: &str) -> String {
+        let out = crate::proto::strip_top_level_usage_member(input)
+            .unwrap_or_else(|| panic!("expected a byte-level strip for: {input}"));
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("stripped output invalid: {e}: {out}"));
+        assert!(
+            parsed.get("usage").is_none(),
+            "top-level usage must be gone: {out}"
+        );
+        out
+    }
+
+    #[test]
+    fn strip_usage_last_key() {
+        // `usage` as the LAST member: the preceding comma must be removed too.
+        let input = r#"{"id":"x","choices":[{"delta":{"content":"hi"}}],"usage":null}"#;
+        let out = assert_stripped_ok(input);
+        assert_eq!(out, r#"{"id":"x","choices":[{"delta":{"content":"hi"}}]}"#);
+    }
+
+    #[test]
+    fn strip_usage_first_key() {
+        // `usage` as the FIRST member: the trailing comma must be removed instead.
+        let input = r#"{"usage":null,"id":"x","choices":[]}"#;
+        let out = assert_stripped_ok(input);
+        assert_eq!(out, r#"{"id":"x","choices":[]}"#);
+    }
+
+    #[test]
+    fn strip_usage_middle_key() {
+        // `usage` in the MIDDLE: exactly one adjacent comma removed, both neighbors intact.
+        let input = r#"{"id":"x","usage":null,"choices":[{"delta":{}}]}"#;
+        let out = assert_stripped_ok(input);
+        assert_eq!(out, r#"{"id":"x","choices":[{"delta":{}}]}"#);
+    }
+
+    #[test]
+    fn strip_usage_whitespace_variants() {
+        // Whitespace around the key, colon, and comma must be handled without leaving a dangling comma.
+        let input = "{ \"id\" : \"x\" , \"usage\" : null , \"model\":\"m\" }";
+        let out = assert_stripped_ok(input);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed.get("id").and_then(|v| v.as_str()), Some("x"));
+        assert_eq!(parsed.get("model").and_then(|v| v.as_str()), Some("m"));
+    }
+
+    #[test]
+    fn strip_usage_object_value() {
+        // A `usage` that is an OBJECT (real counts), not null - the whole nested object is removed.
+        let input =
+            r#"{"id":"x","choices":[{"delta":{}}],"usage":{"prompt_tokens":10,"total_tokens":25}}"#;
+        let out = assert_stripped_ok(input);
+        assert_eq!(out, r#"{"id":"x","choices":[{"delta":{}}]}"#);
+    }
+
+    #[test]
+    fn strip_usage_only_member() {
+        // `usage` as the SOLE member leaves an empty object.
+        let input = r#"{"usage":null}"#;
+        let out = assert_stripped_ok(input);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn strip_usage_never_corrupts_string_content() {
+        // The literal text `"usage":null` appears INSIDE a message-content string. The stripper must
+        // NOT touch it: there is no top-level `usage` key, so it returns None (no byte edit).
+        let input =
+            r#"{"id":"x","choices":[{"delta":{"content":"the json \"usage\":null tell"}}]}"#;
+        assert!(
+            crate::proto::strip_top_level_usage_member(input).is_none(),
+            "must not match `usage` inside a string value"
+        );
+    }
+
+    #[test]
+    fn strip_usage_string_content_plus_real_key() {
+        // A frame that BOTH mentions `"usage":null` inside content AND carries a real top-level
+        // `usage` member: only the top-level member is removed; the string content is preserved verbatim.
+        let input = r#"{"choices":[{"delta":{"content":"see \"usage\":null here"}}],"usage":null}"#;
+        let out = assert_stripped_ok(input);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["choices"][0]["delta"]["content"].as_str(),
+            Some("see \"usage\":null here"),
+            "string content must survive the strip byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn strip_usage_nested_usage_key_not_matched() {
+        // A `usage` key nested inside another object is NOT top-level - the stripper must not remove it,
+        // and with no TOP-LEVEL usage it returns None.
+        let input = r#"{"id":"x","meta":{"usage":null},"choices":[]}"#;
+        assert!(
+            crate::proto::strip_top_level_usage_member(input).is_none(),
+            "nested usage must not be treated as the top-level member"
+        );
+    }
+
+    #[test]
+    fn strip_usage_no_usage_key_returns_none() {
+        // A content chunk with no `usage` key at all - nothing to do.
+        let input = r#"{"id":"x","choices":[{"delta":{"content":"hi"}}]}"#;
+        assert!(crate::proto::strip_top_level_usage_member(input).is_none());
+    }
 }

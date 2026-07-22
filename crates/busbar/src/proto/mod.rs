@@ -975,6 +975,27 @@ pub(crate) trait StreamFraming: Send {
     fn suppress_same_proto_frame(&self, _data: &serde_json::Value) -> bool {
         false
     }
+
+    /// SAME-PROTOCOL INTERMEDIATE-USAGE STRIP seam (OpenAI ingress). On the same-protocol verbatim path
+    /// busbar re-emits each upstream frame BYTE-FOR-BYTE. Because busbar forces
+    /// `stream_options.include_usage` on the UPSTREAM request (to bill), an OpenAI upstream stamps
+    /// `"usage":null` on EVERY intermediate `chat.completion.chunk` (and the finish chunk). A native
+    /// OpenAI stream for a client that did NOT request `include_usage` OMITS the `usage` key entirely on
+    /// those content chunks, so re-emitting `"usage":null` on every chunk is a wire-shape TELL that
+    /// distinguishes a busbar-proxied stream from a direct one. Returning `true` for a content/finish
+    /// chunk that carries a `usage` field tells the same-proto feed loop to STRIP the top-level `usage`
+    /// member from that frame's bytes before re-emitting it (a targeted byte-level edit, NOT a full DOM
+    /// re-serialize of the fast path). Billing is unaffected - the A-tap read the frame's usage before
+    /// the strip. The trailing usage-ONLY chunk (empty `choices`) is handled by
+    /// [`suppress_same_proto_frame`] (dropped whole), not here; the opted-IN client sees every frame
+    /// verbatim. Distinct from `suppress_same_proto_frame` (which drops a whole frame) - this one KEEPS
+    /// the frame and only removes its `usage` member.
+    ///
+    /// Default ([`PassthroughFraming`] and every non-OpenAI ingress): `false` - no frame is rewritten
+    /// on the verbatim path.
+    fn strip_same_proto_usage(&self, _data: &serde_json::Value) -> bool {
+        false
+    }
 }
 
 /// Inert default [`StreamFraming`]: every method takes the trait's no-op default. Used by every
@@ -1402,6 +1423,221 @@ pub(crate) fn parse_sse_frame(frame: &[u8]) -> Option<(String, String)> {
         return None;
     }
     Some((event_type, data_lines.join("\n")))
+}
+
+/// Byte-level removal of a TOP-LEVEL `"usage"` member from a JSON object string, preserving every
+/// other byte exactly. Returns `Some(stripped)` when a single top-level `"usage"` member was found
+/// and removed (with the correct adjacent comma and no other reshaping), or `None` when a safe
+/// byte-level edit is NOT possible for this input - a malformed/non-object body, a `"usage"` that
+/// only appears nested inside a value or inside a string, more than one top-level `"usage"`, or any
+/// shape the scanner does not fully understand. On `None` the caller falls back to parse-reserialize
+/// for THAT frame only (correctness over speed for the rare shape).
+///
+/// This exists for the same-protocol OpenAI verbatim path: busbar forces `include_usage` UPSTREAM to
+/// bill, so an OpenAI upstream stamps `"usage":null` on EVERY intermediate `chat.completion.chunk`.
+/// A native OpenAI stream for a client that did NOT request `include_usage` omits the `usage` key
+/// entirely on those chunks, so re-emitting the `"usage":null` verbatim is a wire-shape TELL. This
+/// deletes exactly that key without a full DOM re-serialize of the (common, non-suppressed) frame.
+///
+/// SAFETY: the scan is a structural single pass that tracks JSON string state (honoring `\`-escapes)
+/// and brace/bracket nesting depth, so the `"usage"` KEY is only matched when it appears as a member
+/// name at object depth 1 - never when the literal text `"usage"` (or even `"usage":null`) appears
+/// inside a string VALUE or a nested object. A key match is confirmed only when the identifier is a
+/// complete quoted string `"usage"` immediately followed (modulo whitespace) by a `:`. Anything the
+/// scanner cannot classify with certainty yields `None` (fall back), never a blind splice.
+pub(crate) fn strip_top_level_usage_member(json: &str) -> Option<String> {
+    let bytes = json.as_bytes();
+    let n = bytes.len();
+    // Skip leading whitespace; the body must be a JSON object.
+    let mut i = 0usize;
+    while i < n && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= n || bytes[i] != b'{' {
+        return None;
+    }
+    let obj_open = i;
+    i += 1;
+
+    // Scan the top-level object's members. `depth` counts nesting BELOW the top object (0 == directly
+    // inside the top object). We only inspect keys at depth 0. `member_start` marks the byte offset
+    // where the current member begins (the first non-whitespace, non-comma byte after `{` or `,`), so
+    // a matched `usage` member can be removed together with its trailing/leading comma.
+    let mut depth = 0usize;
+    // Byte range of the top-level `usage` member to remove, if found: [start, end) where `start` is
+    // the first byte of the key's opening quote and `end` is one past the member's value.
+    let mut usage_range: Option<(usize, usize)> = None;
+    // `true` once we are positioned at the start of a member (just after `{` or a top-level `,`) and
+    // expect a key next; used to only treat a string at depth 0 as a KEY, never a value.
+    let mut expect_key = true;
+
+    while i < n {
+        let b = bytes[i];
+        match b {
+            b'"' => {
+                // A string. At depth 0 with `expect_key`, this is a member KEY - capture its span and
+                // check whether it is exactly `usage`. Otherwise skip the string body.
+                let key_start = i;
+                let str_end = scan_json_string_end(bytes, i)?; // one past the closing quote
+                if depth == 0 && expect_key {
+                    let is_usage = &bytes[key_start..str_end] == b"\"usage\"";
+                    // Advance past the string, then whitespace, then the mandatory `:`.
+                    let mut j = str_end;
+                    while j < n && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j >= n || bytes[j] != b':' {
+                        return None; // not a well-formed member - bail to reserialize
+                    }
+                    j += 1;
+                    // Find the end of this member's value (a full scan that respects nesting/strings).
+                    let value_end = scan_json_value_end(bytes, j)?;
+                    if is_usage {
+                        if usage_range.is_some() {
+                            return None; // duplicate top-level usage - refuse to guess
+                        }
+                        usage_range = Some((key_start, value_end));
+                    }
+                    i = value_end;
+                    expect_key = false;
+                    continue;
+                }
+                // A nested string (value or below top level) - already fully consumed.
+                i = str_end;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                expect_key = false;
+                i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    // Closing the top-level object. Done scanning.
+                    if b == b']' {
+                        return None; // shape mismatch - top level was not an object after all
+                    }
+                    break;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            b',' => {
+                if depth == 0 {
+                    expect_key = true;
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    let (start, end) = usage_range?;
+    // Remove the member together with exactly ONE adjacent comma so the object stays well-formed:
+    // prefer the comma BEFORE the member (and any whitespace between that comma and the key); if the
+    // member is the FIRST one, take the comma AFTER it instead. Whitespace immediately around the
+    // removed span is trimmed so no dangling `, ` or `  ` is left, matching a native chunk's shape.
+    let mut cut_start = start;
+    let mut cut_end = end;
+    // Look left for a preceding comma (skipping whitespace back to it).
+    let mut k = start;
+    while k > obj_open + 1 && bytes[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    if k > obj_open + 1 && bytes[k - 1] == b',' {
+        // There is a preceding comma: remove from it through the member's value.
+        cut_start = k - 1;
+    } else {
+        // `usage` is the first member: remove the member through a trailing comma (and its whitespace).
+        let mut m = end;
+        while m < n && bytes[m].is_ascii_whitespace() {
+            m += 1;
+        }
+        if m < n && bytes[m] == b',' {
+            cut_end = m + 1;
+        }
+        // If there is NO trailing comma either, `usage` was the sole member - removing just the member
+        // leaves `{}` (with whatever interior whitespace remained), which is still valid.
+    }
+
+    let mut out = String::with_capacity(n - (cut_end - cut_start));
+    out.push_str(&json[..cut_start]);
+    out.push_str(&json[cut_end..]);
+    Some(out)
+}
+
+/// Given `bytes` and the index of an opening `"`, return the index ONE PAST the matching closing
+/// quote, honoring `\`-escapes. `None` if the string is unterminated.
+fn scan_json_string_end(bytes: &[u8], open_quote: usize) -> Option<usize> {
+    debug_assert_eq!(bytes[open_quote], b'"');
+    let n = bytes.len();
+    let mut i = open_quote + 1;
+    while i < n {
+        match bytes[i] {
+            b'\\' => i += 2, // skip the escaped byte
+            b'"' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Given `bytes` and the index of the first byte of a JSON value (after any whitespace), return the
+/// index ONE PAST the value, respecting nested objects/arrays and strings. `None` if the value is
+/// malformed/unterminated. Leading whitespace before the value is tolerated.
+fn scan_json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let n = bytes.len();
+    let mut i = start;
+    while i < n && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= n {
+        return None;
+    }
+    match bytes[i] {
+        b'"' => scan_json_string_end(bytes, i),
+        b'{' | b'[' => {
+            // Balanced-nesting scan that skips over strings so a `}`/`]` inside a string never closes
+            // the structure.
+            let mut depth = 0usize;
+            while i < n {
+                match bytes[i] {
+                    b'"' => i = scan_json_string_end(bytes, i)?,
+                    b'{' | b'[' => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' => {
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            // A scalar: number / true / false / null. It ends at the next structural byte
+            // (`,`, `}`, `]`) or whitespace at this level.
+            let value_start = i;
+            while i < n {
+                match bytes[i] {
+                    b',' | b'}' | b']' => break,
+                    c if c.is_ascii_whitespace() => break,
+                    _ => i += 1,
+                }
+            }
+            if i == value_start {
+                None
+            } else {
+                Some(i)
+            }
+        }
+    }
 }
 
 /// Re-frame an IR-derived `(event_type, data)` as INGRESS SSE bytes. A non-empty `event_type`

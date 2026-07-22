@@ -705,6 +705,27 @@ impl StreamTranslate {
                                 out.extend_from_slice(&self.buf[emit_from..frame_start]);
                             }
                             emit_from = end;
+                        } else if self.framing.strip_same_proto_usage(&data) {
+                            // Indistinguishability fix: busbar forces `include_usage` UPSTREAM to bill,
+                            // so an OpenAI upstream stamps `"usage":null` on EVERY intermediate content
+                            // chunk. A native opted-out OpenAI stream omits `usage` on those chunks, so
+                            // re-emitting the frame verbatim is a wire-shape tell. Strip the top-level
+                            // `usage` member from THIS frame's bytes before re-emitting it - flushing the
+                            // verbatim run up to it, emitting the rewritten frame, and resuming the run
+                            // AFTER it. Billing already A-tapped this frame's usage above. The strip is a
+                            // targeted byte-level edit of the frame bytes on the common path; if that edit
+                            // cannot be done safely for a given frame shape, fall back to
+                            // parse-modify-reserialize for THAT frame only (`rewrite_frame_strip_usage`
+                            // returns the original bytes when even the fallback declines, so nothing is
+                            // ever corrupted).
+                            if frame_start > emit_from {
+                                out.extend_from_slice(&self.buf[emit_from..frame_start]);
+                            }
+                            out.extend_from_slice(&rewrite_frame_strip_usage(
+                                &self.buf[frame_start..end],
+                                &data_str,
+                            ));
+                            emit_from = end;
                         }
                     } else {
                         self.translate_event(&event_type, &data, &mut out);
@@ -888,6 +909,57 @@ impl StreamTranslate {
             out.extend_from_slice(SSE_DONE_FRAME);
         }
         out
+    }
+}
+
+/// Rewrite a same-protocol OpenAI SSE frame's bytes with its top-level `usage` member removed,
+/// preserving every other byte (the `data:` prefix, the exact terminator, and the rest of the JSON).
+/// `frame` is the ORIGINAL complete frame bytes (including the `data:` line and terminator);
+/// `data_str` is the JSON payload `parse_sse_frame` already extracted from it.
+///
+/// Fast path: byte-level strip. `strip_top_level_usage_member` removes the `usage` member from the
+/// JSON string without a DOM round-trip, and because for an OpenAI bare-`data:` chunk the JSON is a
+/// single line that appears verbatim as a substring of the frame, the stripped JSON is spliced back
+/// in place of the original JSON substring, leaving the frame's framing bytes untouched.
+///
+/// Fallback (rare shapes only): if the byte-level strip declines (`None`), or the JSON is not a clean
+/// single-substring of the frame (e.g. a multi-`data:`-line frame), parse the JSON, remove `usage`
+/// from the DOM, re-serialize, and reframe as a bare `data:` frame. This is correctness-over-speed for
+/// the uncommon shape and only ever runs for THAT frame. If even the fallback cannot parse, the
+/// ORIGINAL frame bytes are returned unchanged (never a corrupt splice) - the strip is best-effort but
+/// the stream is never damaged.
+fn rewrite_frame_strip_usage(frame: &[u8], data_str: &str) -> Vec<u8> {
+    // Fast path: byte-level strip spliced back into the frame in place of the JSON substring.
+    if let Some(stripped) = crate::proto::strip_top_level_usage_member(data_str) {
+        // Locate the exact JSON substring within the frame. For an OpenAI bare `data: {json}\n\n`
+        // frame the JSON is present verbatim and unique, so a single-substring find is exact.
+        if let Ok(frame_str) = std::str::from_utf8(frame) {
+            if let Some(pos) = frame_str.find(data_str) {
+                // Confirm the JSON appears exactly once so the splice is unambiguous. (A second
+                // occurrence would mean the payload text also lives elsewhere in the frame - refuse
+                // the byte splice and fall through to reserialize.)
+                if frame_str[pos + data_str.len()..].find(data_str).is_none() {
+                    let mut out =
+                        Vec::with_capacity(frame.len() - (data_str.len() - stripped.len()));
+                    out.extend_from_slice(&frame[..pos]);
+                    out.extend_from_slice(stripped.as_bytes());
+                    out.extend_from_slice(&frame[pos + data_str.len()..]);
+                    return out;
+                }
+            }
+        }
+    }
+    // Fallback: parse-modify-reserialize for this frame only. Reframe as a bare `data:` frame (the
+    // OpenAI shape). If the JSON will not parse, re-emit the original bytes verbatim rather than risk
+    // corruption.
+    match crate::json::parse_str::<serde_json::Value>(data_str) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("usage");
+            }
+            format!("data: {v}\n\n").into_bytes()
+        }
+        Err(_) => frame.to_vec(),
     }
 }
 

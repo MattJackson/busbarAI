@@ -3486,3 +3486,150 @@ fn same_proto_openai_opted_in_keeps_trailing_usage_chunk() {
     assert_eq!(u.output_tokens, 2);
     assert_eq!(u.input_tokens, 7);
 }
+
+/// INDISTINGUISHABILITY (same-proto OpenAI->OpenAI, OPTED-OUT client): busbar forces
+/// `stream_options.include_usage` UPSTREAM to bill, so an OpenAI upstream stamps `"usage":null` on
+/// EVERY intermediate `chat.completion.chunk` AND the finish chunk. A native OpenAI stream for a client
+/// that did NOT request `include_usage` OMITS the `usage` key entirely on those chunks, so re-emitting
+/// `"usage":null` on every chunk is a wire-shape TELL that a byte-identity test must catch. The
+/// same-proto path re-emits verbatim, so before the fix the opted-out client saw `usage:null` on every
+/// content/finish chunk. After the fix: NO `usage` key on ANY client-visible chunk (intermediate or
+/// trailing), yet the billing A-tap still holds the real token counts.
+#[test]
+fn same_proto_openai_opted_out_strips_usage_from_every_chunk() {
+    let mut st = StreamTranslate::new_same_proto("openai").expect("same-proto translator");
+    st.set_client_include_usage(false);
+    // Native forced-include_usage upstream wire: TWO content chunks (each `usage:null`), a finish
+    // chunk (`usage:null`), a trailing usage-only chunk (empty choices, real usage), then [DONE].
+    let frames = [
+        "data: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-9\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let mut raw: Vec<u8> = Vec::new();
+    for f in frames {
+        raw.extend(st.feed(f.as_bytes()));
+    }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // THE TELL CHECK: not one client-visible chunk may carry a `usage` key (present-as-null on the
+    // content/finish chunks would be the divergence a native opted-out stream never shows).
+    for data in out.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value =
+            crate::json::parse(data.as_bytes()).expect("each SSE chunk is valid JSON");
+        assert!(
+            v.get("usage").is_none(),
+            "opted-out client must see NO `usage` key on any chunk; got:\n{data}"
+        );
+    }
+    // The raw bytes must not contain the literal tell anywhere either.
+    assert!(
+        !out.contains("\"usage\""),
+        "no `usage` key byte-substring may remain in the client stream:\n{out}"
+    );
+    // Content survived byte-for-byte and identity fields are untouched.
+    assert!(
+        out.contains("\"content\":\"Hel\""),
+        "content 1 kept:\n{out}"
+    );
+    assert!(out.contains("\"content\":\"lo\""), "content 2 kept:\n{out}");
+    assert!(
+        out.contains("\"finish_reason\":\"stop\""),
+        "finish kept:\n{out}"
+    );
+    assert!(out.contains("\"model\":\"gpt-4o\""), "model kept:\n{out}");
+    assert!(out.contains("[DONE]"), "terminator kept:\n{out}");
+
+    // BILLING invariant: the A-tap still captured the upstream usage despite the client-side strip.
+    let u = st
+        .usage()
+        .expect("A-tap usage must be populated for billing");
+    assert_eq!(u.output_tokens, 3, "billing output tokens from A-tap");
+    assert_eq!(u.input_tokens, 11, "billing input tokens from A-tap");
+}
+
+/// INDISTINGUISHABILITY (same-proto OpenAI->OpenAI, OPTED-IN client): a client that DID request
+/// `stream_options.include_usage:true` must see the native wire exactly - `usage:null` on the
+/// intermediate/finish chunks and the real `usage` object on the trailing chunk, all byte-for-byte, so
+/// nothing is stripped when the client opted in.
+#[test]
+fn same_proto_openai_opted_in_keeps_usage_on_every_chunk() {
+    let mut st = StreamTranslate::new_same_proto("openai").expect("same-proto translator");
+    st.set_client_include_usage(true);
+    let frames = [
+        "data: {\"id\":\"chatcmpl-8\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Yo\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-8\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-8\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let mut raw: Vec<u8> = Vec::new();
+    for f in frames {
+        raw.extend(st.feed(f.as_bytes()));
+    }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // Every original frame reaches the opted-in client byte-for-byte: intermediate `usage:null` and the
+    // trailing usage object are BOTH present, exactly as OpenAI would send them under include_usage.
+    for f in &frames[..3] {
+        assert!(
+            out.contains(f.trim_end()),
+            "opted-in client must receive frame verbatim: {f}\nout:\n{out}"
+        );
+    }
+    // The trailing usage OBJECT chunk is present.
+    assert!(
+        out.contains("\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}"),
+        "opted-in client MUST receive the trailing usage object verbatim:\n{out}"
+    );
+    // Billing A-tap still populated.
+    let u = st.usage().expect("A-tap usage");
+    assert_eq!(u.output_tokens, 2);
+    assert_eq!(u.input_tokens, 7);
+}
+
+/// INDISTINGUISHABILITY (byte-safety, string-content corruption guard): a content chunk whose message
+/// text literally contains the substring `"usage":null` must be re-emitted with its message text
+/// intact - the stripper only removes the TOP-LEVEL `usage` member, never the substring inside a string
+/// value. The chunk here ALSO carries a real top-level `usage:null` (forced include_usage), so the
+/// top-level key is removed while the in-string text survives byte-for-byte.
+#[test]
+fn same_proto_openai_opted_out_preserves_usage_text_in_content() {
+    let mut st = StreamTranslate::new_same_proto("openai").expect("same-proto translator");
+    st.set_client_include_usage(false);
+    let frames = [
+        "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the tell is \\\"usage\\\":null on every chunk\"},\"finish_reason\":null}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-7\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let mut raw: Vec<u8> = Vec::new();
+    for f in frames {
+        raw.extend(st.feed(f.as_bytes()));
+    }
+    raw.extend(st.finish());
+    let out = String::from_utf8(raw).expect("utf8 SSE");
+
+    // The content string (which contains the literal `"usage":null` text) must survive intact.
+    for data in out.lines().filter_map(|l| l.strip_prefix("data: ")) {
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let v: serde_json::Value = crate::json::parse(data.as_bytes()).expect("valid JSON");
+        // No TOP-LEVEL usage key on any client chunk.
+        assert!(
+            v.get("usage").is_none(),
+            "top-level usage stripped:\n{data}"
+        );
+    }
+    // The in-string tell text is preserved verbatim (proves no corruption of string content).
+    assert!(
+        out.contains("the tell is \\\"usage\\\":null on every chunk"),
+        "message content containing the literal `usage:null` text must survive:\n{out}"
+    );
+}

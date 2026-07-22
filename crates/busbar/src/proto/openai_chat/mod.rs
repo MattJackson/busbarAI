@@ -659,6 +659,37 @@ impl super::StreamFraming for OpenAiStreamFraming {
             .is_some_and(|arr| arr.is_empty());
         has_usage_obj && choices_empty
     }
+
+    /// SAME-PROTOCOL intermediate `usage:null` strip (indistinguishability fix). On OpenAI->OpenAI the
+    /// translator re-emits frames byte-for-byte, so the opted-out `strip_folded_usage` in
+    /// `on_egress_chunk` never runs. Busbar forces `include_usage` UPSTREAM (to bill), so the OpenAI
+    /// upstream stamps `"usage":null` on EVERY intermediate content chunk (and the finish chunk) - a key
+    /// a native opted-out OpenAI stream never carries, hence a wire-shape tell. When the CLIENT did not
+    /// opt in, request a byte-level strip of the top-level `usage` member from any `chat.completion.chunk`
+    /// that carries a `usage` FIELD alongside a NON-EMPTY `choices` array (a content/finish chunk). The
+    /// trailing usage-ONLY chunk (empty `choices`, a usage OBJECT) is dropped whole by
+    /// `suppress_same_proto_frame` instead, so it is deliberately NOT matched here. The opted-in case
+    /// returns `false` (the client asked for usage; re-emit verbatim). The A-tap already captured usage
+    /// for billing before this seam.
+    fn strip_same_proto_usage(&self, data: &serde_json::Value) -> bool {
+        if self.client_include_usage {
+            return false;
+        }
+        let Some(obj) = data.as_object() else {
+            return false;
+        };
+        if obj.get("object").and_then(|v| v.as_str()) != Some(OBJ_CHUNK) {
+            return false;
+        }
+        // Only content/finish chunks (non-empty choices). The empty-choices usage-only trailer is
+        // suppressed wholesale by `suppress_same_proto_frame`, so exclude it here.
+        let choices_non_empty = obj
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .is_some_and(|arr| !arr.is_empty());
+        // Only act when a top-level `usage` key is actually present (the forced-include_usage tell).
+        obj.contains_key("usage") && choices_non_empty
+    }
 }
 
 impl OpenAiStreamFraming {
