@@ -1133,6 +1133,11 @@ Busbar validates the merged config before accepting any traffic. Fatal errors ab
 | `path` malformed | `path` does not begin with `/` |
 | Model name reserved | Model named `admin` |
 | `provider` reference missing | `models.<name>.provider` does not name a configured provider |
+| Unknown top-level key | Any unrecognized top-level key in `config.yaml` (typo fail-closed; every nested block already rejects unknown keys) |
+| Plugin store without plugins | `governance.store` names a plugin (anything but `memory`) while `plugins.enabled` is `false`/absent; the error names the flag |
+| Invalid plugin artifact | With plugins enabled: any tarball in `plugins.dir` that fails structural validation (unreadable/hostile archive, malformed or incomplete manifest, `sha256` mismatch, unsupported `abi_version`); the error names the file and reason |
+| Plugin conflict | Two loadable plugins share a `name` or `alias`, or an alias collides with another plugin's name; the error names both |
+| Plugin store unresolved | `governance.store` does not resolve to a loadable `kind: store` plugin (missing, skipped by trust with the reason attached, or the wrong kind) |
 | `max_concurrent: 0` | A concurrency semaphore of 0 never grants a permit (omit the field for unbounded; `0` is the only rejected value) |
 | `max_requests: 0` | Zero lifetime budget = permanently unusable lane |
 | `default_max_tokens: 0` | Would be injected upstream and rejected |
