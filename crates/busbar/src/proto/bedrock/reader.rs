@@ -769,6 +769,24 @@ impl ProtocolReader for BedrockReader {
                             .unwrap_or("")
                             .to_string();
 
+                        // Lazily open the Text block on the FIRST text delta, mirroring the
+                        // reasoningContent arm below. The native AWS Bedrock ConverseStream
+                        // `ContentBlockStart$start` union only models `toolUse`, so a real AWS stream
+                        // sends NO `contentBlockStart` for a text block — the block is implied by the
+                        // first `contentBlockDelta` carrying `text`. Without this lazy-open a plain
+                        // text response produced an orphaned `content_block_delta` at index 0 with no
+                        // preceding BlockStart, violating the block-event contract (every delta must
+                        // sit inside an opened block). When the backend DID send an explicit
+                        // `contentBlockStart` (empty-`start` shape) the flag is already set and we do
+                        // not re-open.
+                        if state.started && !state.text_block_open {
+                            state.text_block_open = true;
+                            out.push(IrStreamEvent::BlockStart {
+                                index: idx,
+                                block: crate::ir::IrBlockMeta::Text,
+                            });
+                        }
+
                         out.push(IrStreamEvent::BlockDelta {
                             index: idx,
                             delta: crate::ir::IrDelta::TextDelta(text_val),

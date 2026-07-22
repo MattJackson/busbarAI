@@ -5517,3 +5517,73 @@ fn write_response_exception_folds_to_stream_union_members() {
         "message prefers the upstream provider_signal"
     );
 }
+
+/// FINDING 3 [P1] REGRESSION: The native AWS Bedrock ConverseStream `ContentBlockStart$start`
+/// union only models `toolUse`, so a real AWS stream sends NO `contentBlockStart` for a text
+/// block — the block is implied by the first `contentBlockDelta` carrying `text`. The reader's
+/// text-delta arm previously emitted a `BlockDelta` with NO preceding `BlockStart`, producing an
+/// orphaned `content_block_delta` at index 0 (breaking the block-event contract when translating
+/// Bedrock ConverseStream -> Anthropic-style block events). The text arm must lazily open a Text
+/// BlockStart on the first text delta, exactly like the reasoningContent arm.
+#[test]
+fn test_stream_text_delta_lazily_opens_block_start() {
+    use crate::ir::IrStreamEvent;
+
+    let mut state = crate::ir::StreamDecodeState::default();
+    let reader = BedrockReader;
+
+    // Native AWS text sequence: messageStart, then text deltas with NO contentBlockStart.
+    let events: Vec<_> = vec![
+        serde_json::json!({"type": "messageStart", "role": "assistant"}),
+        serde_json::json!({
+            "type": "contentBlockDelta",
+            "contentBlockIndex": 0,
+            "delta": {"text": "Hello"}
+        }),
+        serde_json::json!({
+            "type": "contentBlockDelta",
+            "contentBlockIndex": 0,
+            "delta": {"text": ", world!"}
+        }),
+        serde_json::json!({"type": "contentBlockStop", "contentBlockIndex": 0}),
+        serde_json::json!({"type": "messageStop", "stopReason": "end_turn"}),
+        serde_json::json!({
+            "type": "metadata",
+            "usage": {"inputTokens": 10, "outputTokens": 5}
+        }),
+    ]
+    .into_iter()
+    .flat_map(|data| reader.read_response_events("", &data, &mut state))
+    .collect();
+
+    // A Text BlockStart at index 0 must precede any TextDelta.
+    let first_block_start = events.iter().position(|e| {
+        matches!(
+            e,
+            IrStreamEvent::BlockStart {
+                block: crate::ir::IrBlockMeta::Text,
+                ..
+            }
+        )
+    });
+    let first_text_delta = events.iter().position(|e| {
+        matches!(
+            e,
+            IrStreamEvent::BlockDelta {
+                delta: crate::ir::IrDelta::TextDelta(_),
+                ..
+            }
+        )
+    });
+    let bs = first_block_start.expect("a Text BlockStart must be emitted for lazy text open");
+    let bd = first_text_delta.expect("a TextDelta must be present");
+    assert!(
+        bs < bd,
+        "the Text BlockStart (idx {bs}) must precede the first TextDelta (idx {bd}); \
+         an orphaned content_block_delta with no BlockStart is the defect"
+    );
+    // The lazily-opened block must be indexed 0 (matching the delta index).
+    if let IrStreamEvent::BlockStart { index, .. } = &events[bs] {
+        assert_eq!(*index, 0, "lazily-opened Text block must be at index 0");
+    }
+}
