@@ -332,7 +332,7 @@ where
                             error = %e,
                             "pre-first-byte upstream transport error; terminating body stream generically"
                         );
-                        // Transport failure on the streaming path — reached for a PRE-first-byte failure
+                        // Transport failure on the streaming path - reached for a PRE-first-byte failure
                         // (either SSE or non-SSE) and for a post-first-byte NON-SSE mid-body failure
                         // (the post-first-byte SSE case is handled by the if-branch above). In ALL of
                         // these the 2xx headers already recorded an optimistic breaker SUCCESS (via
@@ -340,11 +340,11 @@ where
                         // wrong. Record a COMPENSATING transient so the failure counts against the lane.
                         //
                         // P2 #2 FIX: this transient is now recorded UNCONDITIONALLY on the transport
-                        // failure — it is NO LONGER gated on `had_first`. Previously a pre-first-byte
+                        // failure - it is NO LONGER gated on `had_first`. Previously a pre-first-byte
                         // failure recorded nothing (treated as "refund-only, no body content emitted"),
                         // which meant a lane that connects, returns headers, then dies before the first
                         // byte on EVERY attempt kept accruing optimistic successes and NEVER tripped its
-                        // circuit breaker — traffic pinned to a black-hole lane. A pre-first-byte
+                        // circuit breaker - traffic pinned to a black-hole lane. A pre-first-byte
                         // transport death IS a lane fault (the connection was accepted then broke with
                         // zero usable bytes), exactly like the buffered `ReadEnd::TransportError` paths,
                         // which already record a transient with no first-byte gate. Budget is still

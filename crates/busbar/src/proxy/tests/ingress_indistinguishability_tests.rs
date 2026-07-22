@@ -2446,7 +2446,7 @@ async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
 
     // P2 #2: the pre-first-byte transport failure must ALSO record a breaker transient, reversing
     // the optimistic 2xx success and tripping the cell Closed→Open. Before the fix the transient
-    // was gated on `had_first` and this stayed Closed — a lane that always fails before the first
+    // was gated on `had_first` and this stayed Closed - a lane that always fails before the first
     // byte would never trip.
     assert!(
         matches!(
@@ -2462,7 +2462,7 @@ async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
 /// transport failure now records a breaker transient (no longer gated on `had_first`), so REPEATED
 /// pre-first-byte failures accumulate toward the trip threshold instead of silently recording
 /// nothing. This drives a cell to Open after the configured number of consecutive pre-first-byte
-/// failures. (Isolating the transient count — no intervening headers-success — so the consecutive
+/// failures. (Isolating the transient count - no intervening headers-success - so the consecutive
 /// streak reflects exactly the pre-first-byte failures: the point is that they ARE counted at all,
 /// which before the fix they were not.)
 #[tokio::test]
@@ -2482,7 +2482,7 @@ async fn test_repeated_pre_first_byte_failures_trip_breaker() {
         .build();
 
     // Trip only after 3 consecutive failures, so we can watch the cell stay Closed for the first
-    // two pre-first-byte failures and flip to Open on the third — proving each one is counted.
+    // two pre-first-byte failures and flip to Open on the third - proving each one is counted.
     let breaker_cfg = std::sync::Arc::new(BreakerCfg {
         trip: TripConfig {
             mode: TripMode::Consecutive,
