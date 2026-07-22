@@ -94,8 +94,11 @@ pools:
     on_exhausted:
       action: least_bad        # degraded but available; never hard-503
 
+plugins:
+  enabled: true                          # the durable store is a signed plugin tarball in plugins/
+
 governance:
-  store: sqlite                          # durable (a loadable plugin); omit for the RAM default
+  store: sqlite                          # durable (the busbar-store-sqlite plugin); omit for the RAM default
   db_path: /var/lib/busbar/governance.db
   admin_token: "${BUSBAR_ADMIN_TOKEN}"   # setting this ACTIVATES enforcement
   price_per_request_cents: 0

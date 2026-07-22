@@ -118,7 +118,7 @@ The live endpoint requires a booted, authenticated instance. So that tooling can
 | `GET /hooks/{name}/health` | Best-effort transport reachability (a short-timeout socket connect probe; `reachable` is `null` for webhooks/non-unix, with a `detail` note). Never fires the hook |
 | `GET /hooks/{name}/schema` | The hook's **self-described settings schema** (the `describe` wire message, proxied verbatim; `{"name", "schema": null}` when the hook doesn't answer) |
 | `GET /hooks/{name}/status` | The hook's **observed** state, live-queried over its transport: `{name, desired, reported, drift, metrics, as_of, source}`, the settings it is actually running + their version vs busbar's desired copy, with a **`drift`** verdict (a differing settings version, or a desired key missing/changed in the observed settings; extra self-managed keys are not drift). Self-reported metrics are validated and bounded. `reported`/`drift` are `null` when the hook doesn't answer (fail-open: the desired view still serves) |
-| `GET /plugins?type=auth\|hooks` | The plugin catalog for one type (required parameter): compiled-in plugins (feature-gated, from the binary) and external plugins (registered over socket/webhook) |
+| `GET /plugins?type=auth\|hooks\|store` | The plugin catalog for one type (required parameter). `auth`/`hooks`: compiled-in plugins (feature-gated, from the binary) and external plugins (registered over socket/webhook). `store`: the compiled-in `memory` head plus every signed plugin tarball in `plugins.dir`, each with its manifest metadata (`name`, `version`, `publisher`, `interface_version`) and a re-evaluated trust verdict (`trusted` / `unverified` / `rejected`). MANIFEST-ONLY: listing never `dlopen`s anything, so an untrusted plugin's code cannot run from inspection |
 
 No hook definition ever includes a secret, only the operator-configured transport target.
 
@@ -226,6 +226,54 @@ curl -s -H "x-admin-token: $TOK" http://localhost:8080/api/v1/admin/hooks/compre
 
 # Remove it
 curl -s -X DELETE -H "x-admin-token: $TOK" http://localhost:8080/api/v1/admin/hooks/compress
+```
+
+## Dynamic plugins: install, list, remove, reload
+
+The admin API can push a signed plugin tarball into `plugins.dir` remotely, the same artifact you
+would otherwise copy by hand (see [plugins.md](plugins.md)). Full scope, audited, and it CANNOT
+bypass the trust model:
+
+- The upload goes through the SAME gates as a boot-time load: in-memory structural validation
+  (tarball shape, manifest completeness, `sha256` binding, `abi_version`), the SAME trust
+  evaluation (embedded first-party key / `plugins.trust.publishers` / the explicit `allow_unsigned`
+  and `allow_third_party` opt-ins / anti-downgrade floors), and a name/alias conflict check against
+  the already-installed loadable set. An untrusted upload is a `409 conflict` naming the exact
+  reason and flag; a malformed one is a `400`; nothing is written in either case.
+- The endpoint is MANIFEST-ONLY: the uploaded code is never executed during install or listing.
+  Loading only ever happens through the boot pipeline (restart / config apply), which re-runs the
+  identical three-phase validation. Pushing over the API therefore grants nothing that dropping a
+  file in the directory would not; both are inert until the trust gates pass at load.
+- Admin-scoped and audited: every attempt (accept AND reject) lands in the hash-chained audit log
+  as `plugin.install` / `plugin.remove` with the acting principal.
+
+| Endpoint | Effect |
+|---|---|
+| `POST /plugins` | Install a signed plugin tarball. Body: `{"file": "<name>.tar.gz", "tarball_b64": "<base64 tarball>"}` (`file` is storage-only; identity comes from the signed manifest inside). `201 Created` with `{file, name, interface_version, trust, version, publisher, note}` |
+| `DELETE /plugins/{file}` | Remove a tarball from `plugins.dir` (`204`; `404` if absent). A currently-loaded store keeps running on its loaded handle; removal affects the NEXT load (folder = source of truth) |
+| `POST /plugins/reload` | Re-scan `plugins.dir` and report the reconciled dynamic inventory (manifest-only, same projection as the catalog) |
+
+```bash
+# Install a signed store plugin tarball (takes effect on the next plugin (re)load)
+curl -s -X POST -H "x-admin-token: $TOK" -H 'content-type: application/json' \
+  -d "{\"file\": \"busbar-store-redis-1.5.0.tar.gz\",
+       \"tarball_b64\": \"$(base64 < busbar-store-redis-1.5.0-x86_64-linux.tar.gz | tr -d '\n')\"}" \
+  http://localhost:8081/api/v1/admin/plugins
+# -> 201 {"file":"busbar-store-redis-1.5.0.tar.gz","name":"busbar-store-redis",
+#         "interface_version":1,"trust":"trusted","version":"1.5.0","publisher":"busbar",
+#         "note":"installed durably in the plugins directory; ..."}
+
+# An UNSIGNED tarball against the strict default posture is refused, nothing written:
+# -> 409 {"error":{"code":"conflict","message":"plugin rejected by the trust policy: manifest
+#         carries no signature; refusing to load an unsigned plugin. Set
+#         plugins.trust.allow_unsigned=true to permit unsigned plugins."}}
+
+# Inspect the store-plugin catalog (manifest-only; never executes plugin code)
+curl -s -H "x-admin-token: $TOK" 'http://localhost:8081/api/v1/admin/plugins?type=store'
+
+# Remove it
+curl -s -X DELETE -H "x-admin-token: $TOK" \
+  http://localhost:8081/api/v1/admin/plugins/busbar-store-redis-1.5.0.tar.gz
 ```
 
 ## Example

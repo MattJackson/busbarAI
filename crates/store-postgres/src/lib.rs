@@ -14,6 +14,17 @@
 //!
 //! Like SQLite, it is a **single mutex-guarded connection** used off the request hot path (key CRUD
 //! + the write-behind usage flush), so serializing access on one connection is correct and simple.
+//!
+//! ## Known limitations (documented honestly, not papered over)
+//!
+//! - **No TLS in this build (`NoTls`).** Run the connection over a trusted network segment, a local
+//!   socket, or a TLS-terminating proxy (pgbouncer/stunnel). The Redis store, by contrast, speaks
+//!   `rediss://` natively.
+//! - **No automatic reconnect.** A persistently dropped connection surfaces as store errors on the
+//!   (write-behind, retried-per-tick) flush path and on admin operations; the budget flusher
+//!   re-marks unflushed deltas dirty and retries every tick, so accrued spend is not lost across a
+//!   brief outage, but a permanently broken connection requires a process restart (let your
+//!   supervisor handle it). The Redis store implements one-shot transparent reconnect.
 
 use busbar_api::{
     AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,

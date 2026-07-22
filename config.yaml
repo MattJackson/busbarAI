@@ -262,18 +262,36 @@ pools:
 # instead of the static `auth` tokens above. Each key carries allowed-pools (403), a spend budget
 # (429 when exceeded, or 400 for Bedrock ingress), and RPM/TPM rate limits (429). There is no `enabled`
 # switch. The store defaults to ephemeral RAM (keys/budgets reset on restart); choose a durable `store`
-# for persistence; each durable backend is a plugin dropped in `plugins_dir`.
+# for persistence; each durable backend is a signed plugin tarball (see the `plugins:` block below).
 # governance:
 #   admin_token: "$BUSBAR_ADMIN_TOKEN"        # ACTIVATES enforcement; guards /api/v1/admin/keys; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
 #   price_per_request_cents: 1                # flat per-request budget charge
 #   price_per_1k_tokens_cents: 50             # plus per-1000-token charge (from response usage)
 #   # store: memory                          # default (ephemeral RAM); omit for the default
-#   # For persistence, pick a durable store (a loadable plugin in plugins_dir) and its db_path target:
-#   # store: sqlite                          # single-node durable
+#   # For persistence, pick a durable store PLUGIN (requires plugins.enabled below) by ALIAS or
+#   # CANONICAL NAME, plus its db_path target:
+#   # store: sqlite                          # single-node durable (busbar-store-sqlite)
 #   # db_path: /var/lib/busbar/governance.db
-#   # store: postgres                        # shared across a cluster; db_path is a postgres:// URL
-#   # store: redis                           # shared across a cluster; db_path is a redis:// URL
-#   # plugins_dir: plugins                   # where store plugins load from (default: plugins)
+#   # store: postgres                        # cluster-shared keys/usage/audit; db_path is a postgres:// URL
+#   # store: redis                           # cluster-shared keys/usage/audit; db_path is a redis:// (or rediss://) URL
+#   # store: acme-store-dynamo               # or any third-party store plugin by manifest name
 #   # usage_flush_interval_ms: 100           # write-behind flush cadence (ms) for durable stores
-#   # trust:                                 # plugin signing policy
-#   #   on_untrusted: log                    # halt | alert | log (default) | allow
+
+# ── Plugins (optional; OFF by default) ───────────────────────────────────────────────────────────
+# The dynamic plugin subsystem: signed plugin tarballs ({cdylib + manifest.json} as one .tar.gz)
+# that busbar verifies and loads at boot. With `enabled: false` (or this block absent) NO plugin
+# ever loads - a tarball dropped in the directory is inert. busbar's own release key is EMBEDDED in
+# the binary, so busbar-signed plugins verify with zero configuration; the trust block is for
+# third-party publishers and explicit opt-ins. Validate ahead of boot with `busbar --validate`;
+# inspect with `busbar --list-plugins`. See docs/plugins.md.
+# plugins:
+#   enabled: true                            # MASTER SWITCH (default false)
+#   dir: plugins                             # where the signed .tar.gz tarballs live
+#   trust:
+#     publishers:                            # third-party ed25519 signing keys (allowlist)
+#       - name: acme
+#         public_key: "<64-hex ed25519 public key>"
+#     allow_unsigned: false                  # explicit opt-in for unsigned plugins (default false)
+#     allow_third_party: false               # explicit opt-in for non-allowlisted publishers
+#   min_versions:                            # anti-downgrade floors by manifest name (third-party;
+#     acme-store-dynamo: "2.0.0"             # first-party is auto-floored at the binary version)

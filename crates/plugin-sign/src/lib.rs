@@ -24,7 +24,7 @@
 //! ## Trust model
 //!
 //! - **First-party**: a manifest whose `publisher` is `busbar` verifies against the release public
-//!   key EMBEDDED in the binary ([`embedded_release_pubkey`]) — trusted with ZERO configuration.
+//!   key EMBEDDED in the binary ([`embedded_release_pubkey`]) - trusted with ZERO configuration.
 //!   First-party anti-downgrade is AUTOMATIC: the plugin `version` must be at or above the running
 //!   binary's version (no `min_versions` entry needed), so a validly-signed but OLD first-party
 //!   release cannot be replayed against a newer binary.
@@ -37,9 +37,9 @@
 //!
 //! This crate is pure data + policy: no I/O, no engine state. Discovery, unpacking, and loading
 //! live in `busbar-plugin-loader`; the engine sees neither. [`sign`] exists for the release
-//! pipeline / packaging tooling — OSS ships verification, not a signing service.
+//! pipeline / packaging tooling - OSS ships verification, not a signing service.
 //!
-//! ## Why NOT Sigstore keyless yet (1.5.0 spike outcome — deferred)
+//! ## Why NOT Sigstore keyless yet (1.5.0 spike outcome - deferred)
 //!
 //! A 1.5.0 spike of the `sigstore` crate (v0.14) found it cannot be adopted without regressing the
 //! security gates: its tree carries `rsa 0.9.10` with RUSTSEC-2023-0071 (the Marvin RSA timing
@@ -55,7 +55,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// The reserved first-party publisher name. A manifest carrying this publisher verifies against the
-/// EMBEDDED release key ([`TrustPolicy::first_party_key`]), never against `publishers` — an operator
+/// EMBEDDED release key ([`TrustPolicy::first_party_key`]), never against `publishers` - an operator
 /// cannot (and need not) allowlist a key named `busbar`.
 pub const FIRST_PARTY_PUBLISHER: &str = "busbar";
 
@@ -88,7 +88,7 @@ pub fn embedded_release_pubkey() -> Option<VerifyingKey> {
 pub struct Manifest {
     /// Canonical plugin name, e.g. `busbar-store-redis`. Lowercase `[a-z0-9-]+`.
     pub name: String,
-    /// Short config alias, e.g. `redis` — what `governance.store:` may reference. Lowercase
+    /// Short config alias, e.g. `redis` - what `governance.store:` may reference. Lowercase
     /// `[a-z0-9-]+`. May equal `name`.
     pub alias: String,
     /// Plugin category: `store` | `auth` | `hook`. Selects the C ABI the cdylib exports and the
@@ -102,7 +102,7 @@ pub struct Manifest {
     pub publisher: String,
     /// Which version of busbar's C plugin ABI (for this `kind`) the cdylib was built against.
     pub abi_version: u32,
-    /// Lowercase hex SHA-256 of the library bytes — binds this manifest to that exact binary.
+    /// Lowercase hex SHA-256 of the library bytes - binds this manifest to that exact binary.
     pub sha256: String,
     /// Lowercase hex ed25519 signature over [`canonical_manifest_bytes`] (every field but this one).
     #[serde(default)]
@@ -140,7 +140,7 @@ pub struct TrustPolicy {
     /// The embedded busbar release public key ([`embedded_release_pubkey`]). `None` in a build with
     /// no embedded key: first-party plugins then cannot verify (they are treated as unsigned).
     pub first_party_key: Option<VerifyingKey>,
-    /// The running binary's version (`CARGO_PKG_VERSION`) — the AUTOMATIC first-party
+    /// The running binary's version (`CARGO_PKG_VERSION`) - the AUTOMATIC first-party
     /// anti-downgrade floor: a `publisher: busbar` plugin whose `version` is below this is rejected
     /// even with a valid signature. Empty disables the automatic floor (tests only).
     pub binary_version: String,
@@ -153,7 +153,7 @@ pub struct TrustPolicy {
     pub allow_third_party: bool,
     /// ANTI-DOWNGRADE floors: plugin `name` -> minimum acceptable `version`. A floored name must
     /// PROVE (via a trusted signature over a manifest at/above the floor) that it meets the floor;
-    /// anything else is a hard reject no opt-in flag can relax. Third-party only in practice —
+    /// anything else is a hard reject no opt-in flag can relax. Third-party only in practice -
     /// first-party is automatic via `binary_version`.
     pub min_versions: BTreeMap<String, String>,
 }
@@ -183,7 +183,7 @@ impl std::fmt::Display for Rejected {
 }
 impl std::error::Error for Rejected {}
 
-/// Lowercase-hex SHA-256 of `bytes` — the library digest stored in the manifest.
+/// Lowercase-hex SHA-256 of `bytes` - the library digest stored in the manifest.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
@@ -209,7 +209,7 @@ pub fn canonical_manifest_bytes(m: &Manifest) -> Vec<u8> {
 
 /// Sign a manifest with a publisher's key: set `sha256` from the artifact, clear any existing
 /// `signature`, sign the canonical bytes, and return the completed [`Manifest`]. For the release
-/// pipeline / packaging tooling — never runs in the engine (which only verifies).
+/// pipeline / packaging tooling - never runs in the engine (which only verifies).
 pub fn sign(key: &SigningKey, mut manifest: Manifest, artifact: &[u8]) -> Manifest {
     manifest.sha256 = sha256_hex(artifact);
     manifest.signature = String::new();
@@ -290,7 +290,7 @@ pub fn valid_semver(v: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// PHASE 1 — STRUCTURAL validation of a manifest + its library bytes, INDEPENDENT of trust: a
+/// PHASE 1 - STRUCTURAL validation of a manifest + its library bytes, INDEPENDENT of trust: a
 /// signed-but-malformed manifest still fails here. Checks every required field is present and
 /// well-formed, the `sha256` integrity binding holds against `lib_bytes`, and the declared
 /// `abi_version` is one this binary supports for the declared `kind` (`supported_abi`). Returns the
@@ -362,9 +362,9 @@ enum Untrusted {
     ThirdParty { publisher: String },
 }
 
-/// PHASE 2 — TRUST evaluation of a structurally-valid manifest + its exact library bytes against
+/// PHASE 2 - TRUST evaluation of a structurally-valid manifest + its exact library bytes against
 /// the policy. Returns [`Verdict`] when the plugin may proceed (trusted, or
-/// untrusted-but-explicitly-opted-in), or [`Rejected`] when it must NOT load — the DEFAULT for any
+/// untrusted-but-explicitly-opted-in), or [`Rejected`] when it must NOT load - the DEFAULT for any
 /// untrusted artifact, and ALWAYS for an anti-downgrade violation (which no opt-in can relax).
 ///
 /// TRUST MODEL:
@@ -377,7 +377,7 @@ enum Untrusted {
 ///     [`Rejected`].
 ///
 /// Anti-downgrade floors (`min_versions`, keyed by manifest `name`) are checked BEFORE any opt-in
-/// relaxation and require a TRUSTED manifest at/above the floor — so a stripped-signature or
+/// relaxation and require a TRUSTED manifest at/above the floor - so a stripped-signature or
 /// unknown-publisher downgrade cannot be laundered through a loose posture. The `version` field is
 /// signature-covered, so it cannot be forged upward.
 pub fn evaluate(
@@ -386,7 +386,7 @@ pub fn evaluate(
     policy: &TrustPolicy,
 ) -> Result<Verdict, Rejected> {
     // Trust determination first: which key (if any) proves this manifest? A manifest with NO
-    // signature at all is UNSIGNED regardless of its (unverifiable, self-declared) publisher —
+    // signature at all is UNSIGNED regardless of its (unverifiable, self-declared) publisher -
     // only a PRESENT signature from a non-allowlisted publisher counts as third-party.
     let trusted_or_untrusted: Result<bool, Untrusted> = if manifest.signature.trim().is_empty() {
         Err(Untrusted::Unsigned {

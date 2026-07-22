@@ -3,8 +3,8 @@
 
 //! The one-file-per-plugin **signed tarball** format: a `.tar.gz` containing EXACTLY
 //!
-//! - `manifest.json` — the signed [`busbar_plugin_sign::Manifest`];
-//! - one library file — the cdylib the manifest's `sha256` pins.
+//! - `manifest.json` - the signed [`busbar_plugin_sign::Manifest`];
+//! - one library file - the cdylib the manifest's `sha256` pins.
 //!
 //! [`unpack`] extracts FULLY IN MEMORY on every platform (the manifest never touches disk; the
 //! library bytes only ever reach disk as loader staging output, never as trusted input), with hard
@@ -18,17 +18,17 @@ use std::io::Read as _;
 /// The manifest member name inside every plugin tarball.
 pub const MANIFEST_FILE: &str = "manifest.json";
 
-/// Hard cap on the DECOMPRESSED library member — matches the loader's own response cap scale; far
+/// Hard cap on the DECOMPRESSED library member - matches the loader's own response cap scale; far
 /// beyond any real cdylib (the shipped store plugins are single-digit MiB).
 const MAX_LIB_BYTES: u64 = 256 * 1024 * 1024;
-/// Hard cap on the DECOMPRESSED manifest member — a manifest is well under 4 KiB.
+/// Hard cap on the DECOMPRESSED manifest member - a manifest is well under 4 KiB.
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// A plugin tarball unpacked in memory: the parsed signed manifest plus the exact library bytes.
 #[derive(Debug)]
 pub struct UnpackedPlugin {
     pub manifest: Manifest,
-    /// The library member's archived filename (display only — identity comes from the manifest).
+    /// The library member's archived filename (display only - identity comes from the manifest).
     pub lib_name: String,
     pub lib_bytes: Vec<u8>,
 }
@@ -40,7 +40,7 @@ pub fn is_plugin_tarball(file: &str) -> bool {
 
 /// Build a plugin tarball: gzip'd tar with `manifest.json` (serialized from `manifest`) and the
 /// library under `lib_name`. Deterministic enough for tests; the release pipeline signs the
-/// manifest BEFORE packaging (the tarball itself carries no outer signature — the manifest inside
+/// manifest BEFORE packaging (the tarball itself carries no outer signature - the manifest inside
 /// is the signed unit and it pins the library by sha256).
 pub fn package(manifest: &Manifest, lib_name: &str, lib_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let manifest_json = serde_json::to_vec_pretty(manifest)
@@ -91,11 +91,11 @@ fn read_entry_bounded<R: std::io::Read>(
 }
 
 /// Unpack a plugin tarball FULLY IN MEMORY, fail-closed: the archive must contain EXACTLY one
-/// `manifest.json` and EXACTLY one other regular file (the library), nothing else — no
+/// `manifest.json` and EXACTLY one other regular file (the library), nothing else - no
 /// directories, links, absolute paths, or parent references. Returns the parsed manifest + the
 /// exact library bytes; every failure names the specific violation.
 ///
-/// NOTE: this performs NO signature/trust/structure checks — it is pure decoding. The caller runs
+/// NOTE: this performs NO signature/trust/structure checks - it is pure decoding. The caller runs
 /// phase 1 (structural) and phase 2 (trust) over the returned parts.
 pub fn unpack(bytes: &[u8]) -> Result<UnpackedPlugin, String> {
     let gz = flate2::read::GzDecoder::new(bytes);

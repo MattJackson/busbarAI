@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! `busbar-plugin-pack` — the packaging + signing tool for busbar plugins.
+//! `busbar-plugin-pack` - the packaging + signing tool for busbar plugins.
 //!
 //! A busbar plugin ships as ONE signed `.tar.gz` containing exactly the cdylib and its signed
 //! `manifest.json`. This tool builds that artifact:
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The ed25519 SIGNING key is read from the `BUSBAR_SIGN_KEY` environment variable (64 hex chars:
-//! the 32-byte seed) — in CI this is the release secret; a third-party publisher uses their own.
+//! the 32-byte seed) - in CI this is the release secret; a third-party publisher uses their own.
 //! With no key set, `--allow-unsigned` produces an UNSIGNED tarball (dev only: busbar loads it
 //! solely under `plugins.trust.allow_unsigned: true`).
 //!
@@ -30,7 +30,7 @@ use std::process::ExitCode;
 const SIGN_KEY_ENV: &str = "BUSBAR_SIGN_KEY";
 
 fn usage() -> &'static str {
-    "busbar-plugin-pack — package + sign a busbar plugin tarball
+    "busbar-plugin-pack - package + sign a busbar plugin tarball
 
 USAGE:
     busbar-plugin-pack pack --lib <cdylib> --name <name> --alias <alias> --kind <store|auth|hook>

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Platform staging for loading VERIFIED library bytes — the "bytes verified == bytes loaded"
+//! Platform staging for loading VERIFIED library bytes - the "bytes verified == bytes loaded"
 //! (TOCTOU-safe) half of the loader.
 //!
-//! - **Linux**: `memfd_create` — the verified bytes are written to an anonymous in-memory fd and
+//! - **Linux**: `memfd_create` - the verified bytes are written to an anonymous in-memory fd and
 //!   `dlopen`ed via `/proc/self/fd/N`. ZERO disk files, nothing to sweep, nothing to swap.
 //! - **macOS / Windows** (and any non-Linux unix): the verified bytes are written to a file inside
 //!   a PER-PROCESS private staging directory (`<temp>/busbar-plugins-<pid>-<random>`, `0700` on
 //!   unix, created exactly once per process) and loaded from there. On clean shutdown the library
-//!   is unloaded FIRST, then the file (and, when empty, the directory) is removed — the order
+//!   is unloaded FIRST, then the file (and, when empty, the directory) is removed - the order
 //!   Windows requires, since a mapped DLL's file cannot be deleted. A crash leaves the directory
 //!   behind; [`sweep_dead_staging`] removes any `busbar-plugins-<pid>-*` directory whose pid is no
 //!   longer alive at the next boot.
@@ -47,7 +47,7 @@ impl Drop for Staged {
             Staged::TempFile { path } => {
                 // Unload happened first (field order in the holder). Release under the shared
                 // staging lock: remove the file, and remove the per-process directory only when
-                // this was the LAST live staged file — the refcount makes release atomic with any
+                // this was the LAST live staged file - the refcount makes release atomic with any
                 // concurrent stage, so a drop can never yank the directory out from under a load.
                 release_temp_file(path);
             }
@@ -167,7 +167,7 @@ fn stage_temp_file(bytes: &[u8]) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Load a dynamic library from EXACTLY the in-memory `bytes` supplied — the verified-bytes ==
+/// Load a dynamic library from EXACTLY the in-memory `bytes` supplied - the verified-bytes ==
 /// loaded-bytes entrypoint. On Linux this uses `memfd_create` + `/proc/self/fd/N` (zero disk
 /// files); elsewhere (or if memfd fails) the bytes are staged into the per-process private `0700`
 /// directory and loaded from there. `display` labels errors. Returns the mapped [`Library`] plus
@@ -192,7 +192,7 @@ pub(crate) fn load_library_from_bytes(
         }
     }
     let path = stage_temp_file(bytes)?;
-    // SAFETY: running an operator-trusted plugin's init code — the same trust as compiling it in.
+    // SAFETY: running an operator-trusted plugin's init code - the same trust as compiling it in.
     // The file was created by us, in a directory we created 0700, from already-verified bytes.
     let lib = unsafe { Library::new(&path) }.map_err(|e| {
         let msg = format!("failed to load plugin '{display}': {e}");
@@ -232,7 +232,7 @@ fn load_via_memfd(bytes: &[u8], display: &str) -> Result<(Library, Staged), Stri
 }
 
 /// Is the process with `pid` alive? Unix: `kill(pid, 0)` (EPERM still means alive). Non-unix:
-/// unknown — report alive so the sweep stays conservative (Windows removal of a live dir fails
+/// unknown - report alive so the sweep stays conservative (Windows removal of a live dir fails
 /// naturally on the locked DLL anyway).
 fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
@@ -252,7 +252,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 /// BOOT-TIME sweep of orphaned staging directories: any `busbar-plugins-<pid>-*` under the temp
-/// base whose pid is DEAD (a prior busbar crashed before its clean-shutdown cleanup) is removed —
+/// base whose pid is DEAD (a prior busbar crashed before its clean-shutdown cleanup) is removed -
 /// the files are unlocked once the process died. The current process's own directory and any
 /// live process's directory are left alone. Returns the number of directories removed.
 pub fn sweep_dead_staging() -> usize {

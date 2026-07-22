@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The **Redis** backend for busbar's durable governance store — the shared, multi-node `db` plugin
+//! The **Redis** backend for busbar's durable governance store - the shared, multi-node `db` plugin
 //! over a KEY-VALUE data model. Implements `busbar_api::Store` on a mutex-guarded SYNCHRONOUS redis
 //! connection, depending only on the `busbar-api` contract (plus the `redis` driver), never on the
 //! engine.
 //!
 //! Redis has no tables, so the relational schema the SQLite/Postgres backends use is modeled in KV:
 //!
-//! - **virtual keys** — `busbar:key:<id>` holds the JSON [`VirtualKey`]; the set `busbar:keys` indexes
+//! - **virtual keys** - `busbar:key:<id>` holds the JSON [`VirtualKey`]; the set `busbar:keys` indexes
 //!   every id so `list_keys` is a SMEMBERS + per-id GET.
-//! - **AWS credentials** — `busbar:awscred:<access_key_id>` holds the JSON credential; `busbar:awscreds`
+//! - **AWS credentials** - `busbar:awscred:<access_key_id>` holds the JSON credential; `busbar:awscreds`
 //!   indexes them; `busbar:awscred_ids:<key_id>` maps a virtual key to its AccessKeyIds so a key delete
-//!   removes them (a revoked key's SigV4 credential must never outlive it — the same guarantee the SQL
+//!   removes them (a revoked key's SigV4 credential must never outlive it - the same guarantee the SQL
 //!   backends enforce with a `DELETE … WHERE key_id`).
-//! - **usage counters** — `busbar:usage:<key_id>:<window_start>` is a HASH `{spend_cents, tokens,
+//! - **usage counters** - `busbar:usage:<key_id>:<window_start>` is a HASH `{spend_cents, tokens,
 //!   requests}`. `put_usage` HSETs absolute values; `add_usage` HINCRBYs deltas (the fleet-additive
 //!   flush, so concurrent nodes accumulate instead of overwriting each other); `get_usage` HGETALLs.
-//! - **metering** — `busbar:metering:<bucket>` is a SET of row keys; each row is a HASH accumulated
+//! - **metering** - `busbar:metering:<bucket>` is a SET of row keys; each row is a HASH accumulated
 //!   with HINCRBY (add), so concurrent responses accumulate without a read-modify-write race.
-//! - **audit** — `busbar:audit` is a SORTED SET scored by `seq`, each member the JSON [`AuditRecord`].
+//! - **audit** - `busbar:audit` is a SORTED SET scored by `seq`, each member the JSON [`AuditRecord`].
 //!
 //! ## Atomicity
 //!
@@ -27,7 +27,7 @@
 //! ([`redis::Pipeline::atomic`]): `put_key_with_aws_credential` (key + credential + all three
 //! indexes) and the `delete_key` cascade (key row, key index, usage windows, credentials, credential
 //! indexes). A mid-cascade failure therefore can NEVER orphan a SigV4 credential behind a deleted
-//! key or publish a credential for a key that was not stored — the transactional parity of the SQL
+//! key or publish a credential for a key that was not stored - the transactional parity of the SQL
 //! backends' `BEGIN`/`COMMIT`.
 //!
 //! ## Connections, TLS, reconnect
@@ -42,7 +42,7 @@
 //! ## Data growth (documented, deliberate)
 //!
 //! Rows are written WITHOUT a TTL: usage windows, metering buckets, and audit entries accumulate
-//! unboundedly by design — the store is the durable system of record and busbar never silently
+//! unboundedly by design - the store is the durable system of record and busbar never silently
 //! expires governance data. Operators who want bounded growth should reap old
 //! `busbar:usage:*`/`busbar:metering:*` keys (or apply `EXPIRE` out-of-band) on their own retention
 //! schedule; the audit zset should be archived, not expired.
@@ -74,20 +74,20 @@ fn metering_row(bucket: u64, key_id: &str, model: &str, provider: &str) -> Strin
     format!("busbar:metering:{bucket}:{key_id}|{model}|{provider}")
 }
 
-/// Clamp a `u64` into `i64` for Redis integer ops (HINCRBY is signed) — a value above `i64::MAX` pins
+/// Clamp a `u64` into `i64` for Redis integer ops (HINCRBY is signed) - a value above `i64::MAX` pins
 /// to `i64::MAX`, never wraps. Mirrors the SQL backends.
 fn clamp(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 /// Read a signed counter back as a `u64`, clamping a (corrupt / direct-DB) negative to 0 instead of
-/// wrapping via `as` — mirrors the SQL backends' DI-3 posture.
+/// wrapping via `as` - mirrors the SQL backends' DI-3 posture.
 fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
 /// Extract the PASSWORD component from a redis URL (`redis://user:pass@host/...` or
-/// `redis://:pass@host/...`), if any — the secret that must never appear in an error string.
+/// `redis://:pass@host/...`), if any - the secret that must never appear in an error string.
 fn url_password(url: &str) -> Option<String> {
     let rest = url.split("://").nth(1)?;
     let userinfo = rest.rsplit_once('@').map(|(u, _)| u)?;
@@ -98,7 +98,7 @@ fn url_password(url: &str) -> Option<String> {
     (!pass.is_empty()).then(|| pass.to_string())
 }
 
-/// Replace every occurrence of `secret` in `msg` with `<redacted>` — the password-in-error scrub.
+/// Replace every occurrence of `secret` in `msg` with `<redacted>` - the password-in-error scrub.
 fn scrub(msg: String, secret: Option<&str>) -> String {
     match secret {
         Some(s) if !s.is_empty() && msg.contains(s) => msg.replace(s, "<redacted>"),
@@ -114,7 +114,7 @@ fn is_connection_error(e: &redis::RedisError) -> bool {
 }
 
 /// Redis `Store` backend (durable, shared across a cluster). A single mutex-guarded synchronous
-/// connection with one-shot reconnect — governance is off the request hot path, so serializing
+/// connection with one-shot reconnect - governance is off the request hot path, so serializing
 /// access is fine.
 pub struct RedisStore {
     client: redis::Client,
@@ -192,7 +192,7 @@ impl RedisStore {
     }
 }
 
-// `allowed_pools` encoding — identical to the SQL backends: the whole key rides as JSON, so pool
+// `allowed_pools` encoding - identical to the SQL backends: the whole key rides as JSON, so pool
 // names with commas are delimiter-safe.
 fn key_to_json(key: &VirtualKey) -> StoreResult<String> {
     serde_json::to_string(key).map_err(|e| StoreError(format!("key encode failed: {e}")))
@@ -204,7 +204,7 @@ fn key_from_json(raw: &str) -> StoreResult<VirtualKey> {
 impl Store for RedisStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         let json = key_to_json(key)?;
-        // Row + index as ONE atomic MULTI/EXEC — a re-put is idempotent (SET overwrites, SADD is a
+        // Row + index as ONE atomic MULTI/EXEC - a re-put is idempotent (SET overwrites, SADD is a
         // set member).
         self.with_conn(|c| {
             redis::pipe()
@@ -244,7 +244,7 @@ impl Store for RedisStore {
 
     fn delete_key(&self, id: &str) -> StoreResult<()> {
         // READ phase: collect everything the cascade must remove (usage windows via a non-blocking
-        // SCAN; the key's AccessKeyIds via SMEMBERS). Reads are outside the transaction — the
+        // SCAN; the key's AccessKeyIds via SMEMBERS). Reads are outside the transaction - the
         // in-memory engine is the sole writer for a key's lifecycle, and a concurrent write after
         // the read would at worst leave a benign dangling index member that list paths skip.
         let pattern = format!("busbar:usage:{id}:*");
@@ -257,7 +257,7 @@ impl Store for RedisStore {
 
         // WRITE phase: the ENTIRE delete cascade as ONE atomic MULTI/EXEC. Either everything goes
         // (key row, key index, usage windows, every credential + its index memberships, the id map)
-        // or nothing does — a mid-cascade failure can never orphan a SigV4 credential behind a
+        // or nothing does - a mid-cascade failure can never orphan a SigV4 credential behind a
         // deleted key (the bug this replaces: N independent commands).
         self.with_conn(|c| {
             let mut pipe = redis::pipe();
@@ -322,7 +322,7 @@ impl Store for RedisStore {
         delta_requests: i64,
     ) -> StoreResult<()> {
         // ADDITIVE accumulate: HINCRBY each field by the caller's DELTA, atomically as one
-        // MULTI/EXEC — the fleet-honest write: N nodes flushing deltas sum to the true fleet total
+        // MULTI/EXEC - the fleet-honest write: N nodes flushing deltas sum to the true fleet total
         // instead of last-writer-wins overwriting each other.
         let k = usage_key(key_id, window_start);
         self.with_conn(|c| {
@@ -403,7 +403,7 @@ impl Store for RedisStore {
         for row_key in rows {
             let fields: Vec<(String, String)> = self.with_conn(|c| c.hgetall(&row_key))?;
             if fields.is_empty() {
-                continue; // a stale index member with no hash — skip
+                continue; // a stale index member with no hash - skip
             }
             let mut m = MeteringRow {
                 key_id: String::new(),
@@ -459,7 +459,7 @@ impl Store for RedisStore {
         key: &VirtualKey,
         cred: &AwsCredential,
     ) -> StoreResult<()> {
-        // The WHOLE key+credential publish as ONE atomic MULTI/EXEC — either both the key and its
+        // The WHOLE key+credential publish as ONE atomic MULTI/EXEC - either both the key and its
         // SigV4 credential (with every index) exist, or neither does. This replaces the old
         // sequential put_key-then-put_aws_credential, whose mid-sequence failure could mint a key
         // with no credential (or, reversed, a credential for a key that failed to store).
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(scrub("plain".into(), Some("zz")), "plain");
     }
 
-    /// A `rediss://` (TLS) URL parses into a client without connecting — the TLS feature is
+    /// A `rediss://` (TLS) URL parses into a client without connecting - the TLS feature is
     /// compiled in and the scheme is accepted (a live TLS round-trip needs a TLS redis, which the
     /// live test covers when REDIS_URL is rediss).
     #[test]
@@ -694,7 +694,7 @@ mod tests {
             .iter()
             .any(|c| c.access_key_id == "AKIA_REDIS_TEST"));
 
-        // Delete removes the key, its usage, and its AWS creds — atomically (one MULTI/EXEC).
+        // Delete removes the key, its usage, and its AWS creds - atomically (one MULTI/EXEC).
         store.delete_key("vk_redis").unwrap();
         assert!(store.get_key("vk_redis").unwrap().is_none());
         assert_eq!(store.get_usage("vk_redis", 100).unwrap(), Usage::default());
@@ -709,7 +709,7 @@ mod tests {
     }
 
     /// ATOMIC key+credential publish: `put_key_with_aws_credential` writes both (and all three
-    /// indexes) in ONE MULTI/EXEC, and the delete cascade removes every trace in ONE MULTI/EXEC —
+    /// indexes) in ONE MULTI/EXEC, and the delete cascade removes every trace in ONE MULTI/EXEC -
     /// no orphaned SigV4 credential, no dangling index member.
     #[test]
     fn atomic_key_with_credential_and_cascade_against_live_redis() {

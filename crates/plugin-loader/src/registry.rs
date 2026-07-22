@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Plugin **discovery, three-phase load validation, and the name/alias registry** — the single
+//! Plugin **discovery, three-phase load validation, and the name/alias registry** - the single
 //! pipeline behind boot, `--validate`, and `--list-plugins`, so the pre-flight gate can never
 //! drift from real boot behavior.
 //!
@@ -9,18 +9,18 @@
 //!
 //! 1. **STRUCTURAL** (trust-independent): the tarball unpacks, the manifest parses, every required
 //!    field is present and well-formed, `sha256(lib) == manifest.sha256`, and the `abi_version` is
-//!    supported for the `kind`. A failure here is INVALID — at boot/`--validate` it is a HARD
+//!    supported for the `kind`. A failure here is INVALID - at boot/`--validate` it is a HARD
 //!    error naming the file and the reason (never a partial boot).
 //! 2. **TRUST**: the signature verifies against the embedded busbar release key (first-party) or an
-//!    allowlisted publisher — else the plugin loads only under the matching explicit opt-in flag
+//!    allowlisted publisher - else the plugin loads only under the matching explicit opt-in flag
 //!    (`allow_unsigned` / `allow_third_party`), otherwise it is logged and SKIPPED (never
 //!    `dlopen`ed). Anti-downgrade floors are hard rejects inside this phase.
 //! 3. **CONFLICT** (over the loadable set): no two plugins share a `name`, no two share an `alias`,
 //!    and no alias collides with another plugin's `name`. Any collision is a HARD error naming
-//!    both plugins — "you can't use redis and a third-party redis".
+//!    both plugins - "you can't use redis and a third-party redis".
 //!
 //! Only after all three phases does a plugin enter the [`PluginRegistry`], addressable by BOTH its
-//! canonical name and its alias. Identity comes exclusively from the signed manifest — the tarball
+//! canonical name and its alias. Identity comes exclusively from the signed manifest - the tarball
 //! filename is irrelevant.
 
 use crate::tarball;
@@ -41,9 +41,9 @@ pub fn supported_abi(kind: &str) -> &'static [u32] {
 }
 
 /// A plugin that passed phases 1 + 2 and MAY load: its signed manifest, the trust verdict, and the
-/// exact verified library bytes (what the loader will map — never re-read from disk).
+/// exact verified library bytes (what the loader will map - never re-read from disk).
 pub struct LoadablePlugin {
-    /// The tarball filename (diagnostics only — identity is the manifest).
+    /// The tarball filename (diagnostics only - identity is the manifest).
     pub file: String,
     pub manifest: Manifest,
     pub verdict: Verdict,
@@ -111,7 +111,7 @@ impl PluginRegistry {
             .map(|&i| &self.loadable[i])
     }
 
-    /// Why a reference cannot be resolved: if a SKIPPED plugin matches it, name the skip reason —
+    /// Why a reference cannot be resolved: if a SKIPPED plugin matches it, name the skip reason -
     /// "the plugin you asked for is here, but trust refused it" is the actionable message.
     pub fn unresolved_reason(&self, name_or_alias: &str) -> Option<&SkippedPlugin> {
         self.skipped
@@ -156,7 +156,7 @@ impl PluginRegistry {
         };
         if p.manifest.kind != "store" {
             return Err(format!(
-                "plugin '{}' has kind '{}', not 'store' — it cannot back the governance store",
+                "plugin '{}' has kind '{}', not 'store' - it cannot back the governance store",
                 p.manifest.name, p.manifest.kind
             ));
         }
@@ -219,7 +219,7 @@ fn examine(path: &Path, policy: &TrustPolicy) -> FileOutcome {
     {
         return FileOutcome::Invalid { file, reason };
     }
-    // Phase 2: trust. A rejection here is a SKIP (logged, never dlopen'ed) — unless the plugin is
+    // Phase 2: trust. A rejection here is a SKIP (logged, never dlopen'ed) - unless the plugin is
     // actually referenced, in which case resolution fails loudly with this reason attached.
     match evaluate(&unpacked.lib_bytes, &unpacked.manifest, policy) {
         Ok(verdict) => FileOutcome::Loadable(LoadablePlugin {
@@ -244,7 +244,7 @@ fn conflicts(loadable: &[LoadablePlugin]) -> Vec<String> {
     for p in loadable {
         if let Some(prev) = name_owner.get(p.manifest.name.as_str()) {
             errors.push(format!(
-                "plugin name conflict: '{}' is claimed by both {} and {} — remove one \
+                "plugin name conflict: '{}' is claimed by both {} and {} - remove one \
                  (\"you can't use redis and a third-party redis\")",
                 p.manifest.name, prev.file, p.file
             ));
@@ -256,7 +256,7 @@ fn conflicts(loadable: &[LoadablePlugin]) -> Vec<String> {
     for p in loadable {
         if let Some(prev) = alias_owner.get(p.manifest.alias.as_str()) {
             errors.push(format!(
-                "plugin alias conflict: '{}' is claimed by both {} ({}) and {} ({}) — remove one",
+                "plugin alias conflict: '{}' is claimed by both {} ({}) and {} ({}) - remove one",
                 p.manifest.alias, prev.file, prev.manifest.name, p.file, p.manifest.name
             ));
         } else {
@@ -267,7 +267,7 @@ fn conflicts(loadable: &[LoadablePlugin]) -> Vec<String> {
             if other.manifest.name != p.manifest.name {
                 errors.push(format!(
                     "plugin alias/name conflict: alias '{}' of {} ({}) collides with the canonical \
-                     name of {} ({}) — remove one",
+                     name of {} ({}) - remove one",
                     p.manifest.alias, p.file, p.manifest.name, other.file, other.manifest.name
                 ));
             }
@@ -278,7 +278,7 @@ fn conflicts(loadable: &[LoadablePlugin]) -> Vec<String> {
 
 /// The full boot/validate pipeline: discover -> phase 1 -> phase 2 -> phase 3 -> registry.
 /// FAIL-CLOSED: any unreadable/invalid tarball (phase 1) or any conflict (phase 3) returns
-/// `Err(errors)` with every problem named — the caller (boot / `--validate`) aborts; there is no
+/// `Err(errors)` with every problem named - the caller (boot / `--validate`) aborts; there is no
 /// partial result. Untrusted plugins (phase 2) are SKIPPED into the registry's skip list (the
 /// caller logs them); they only become fatal if actually referenced.
 pub fn scan_and_validate(dir: &Path, policy: &TrustPolicy) -> Result<PluginRegistry, Vec<String>> {
@@ -316,7 +316,7 @@ pub fn scan_and_validate(dir: &Path, policy: &TrustPolicy) -> Result<PluginRegis
 
 /// One row of the MANIFEST-ONLY inventory behind `busbar --list-plugins` and the admin catalog:
 /// every tarball in the directory with its identity (when decodable) and its trust/status verdict.
-/// NEVER `dlopen`s anything — untrusted code cannot run from listing the directory.
+/// NEVER `dlopen`s anything - untrusted code cannot run from listing the directory.
 pub struct InventoryEntry {
     pub file: String,
     /// `None` when the tarball/manifest is invalid (see `status`).
@@ -482,7 +482,7 @@ mod tests {
             manifest("busbar-store-postgres", "postgres", "busbar"),
             b"pg lib",
         );
-        // Filenames lie on purpose — identity must come from the signed manifest.
+        // Filenames lie on purpose - identity must come from the signed manifest.
         write_tarball(&dir, "totally-not-redis.tar.gz", &redis, b"redis lib");
         write_tarball(&dir, "misc.tgz", &pg, b"pg lib");
 
@@ -499,7 +499,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// FAIL-CLOSED: one invalid tarball in the dir fails the WHOLE scan with a named reason —
+    /// FAIL-CLOSED: one invalid tarball in the dir fails the WHOLE scan with a named reason -
     /// never a partial registry.
     #[test]
     fn one_invalid_tarball_fails_the_whole_scan() {
@@ -538,7 +538,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Phase 2: an untrusted (third-party, no opt-in) plugin is SKIPPED — the scan succeeds, the
+    /// Phase 2: an untrusted (third-party, no opt-in) plugin is SKIPPED - the scan succeeds, the
     /// plugin is not loadable, and referencing it fails with the skip reason.
     #[test]
     fn untrusted_is_skipped_not_fatal_but_reference_fails_loud() {
@@ -565,7 +565,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Phase 3: two loadable plugins claiming the same ALIAS is a hard error naming both — the
+    /// Phase 3: two loadable plugins claiming the same ALIAS is a hard error naming both - the
     /// "can't use redis and a third-party redis" case (third-party allowed via opt-in).
     #[test]
     fn alias_conflict_is_a_hard_error_naming_both() {
@@ -673,7 +673,7 @@ mod tests {
     }
 
     /// The inventory is MANIFEST-ONLY and covers every row class: ready, skipped (unknown
-    /// publisher), and invalid — with the exact reason.
+    /// publisher), and invalid - with the exact reason.
     #[test]
     fn inventory_reports_every_row_class_without_loading() {
         let release = key(1);
@@ -722,7 +722,7 @@ mod tests {
 
     /// END-TO-END, REAL CODE: package the actual sqlite store cdylib into a SIGNED tarball, run
     /// the full three-phase pipeline, resolve by ALIAS, and open a live `dyn Store` through the
-    /// memfd (Linux) / private-temp loader — exercising put/get over the C ABI. This is the exact
+    /// memfd (Linux) / private-temp loader - exercising put/get over the C ABI. This is the exact
     /// seam the engine sees: verified bytes in, `Box<dyn Store>` out, indistinguishable from a
     /// compiled-in backend.
     #[test]

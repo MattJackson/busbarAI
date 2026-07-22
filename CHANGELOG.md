@@ -41,33 +41,66 @@ item under **Changed**.
   its `forbid(unsafe_code)` guarantee). A store call is JSON over the C ABI, off the request hot path
   (write-behind), so it never touches latency. The same store crate also links statically, so a build can
   compile a backend straight in, no `cfg` sprawl.
-- **`governance.plugins_dir` (default `plugins`)**: the directory busbar loads store plugins from. A
-  `store` other than `memory` is a library dropped here.
-- **Plugin signing & trust, `governance.trust`.** A plugin ships a signed sidecar manifest
-  (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library
-  `sha256`, and a signature over the whole manifest). At boot-load busbar verifies it against
-  `governance.trust`: a valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED;
-  anything else (unsigned / unknown publisher / tampered) is handled per `trust.on_untrusted`:
-  `halt` (only approved plugins load), `alert`, `log` (default, loads with a warning), or `allow`.
-  Because the signature covers the whole manifest and the manifest pins the library by hash, neither
-  can be altered or swapped independently. The default `log` posture keeps unsigned plugins working
-  out of the box; enterprises set `halt`.
+- **The dynamic plugin system: one signed tarball per plugin, a top-level `plugins.*` block, and a
+  three-phase fail-closed load pipeline.** A plugin is a plugin: store, auth, and hook plugins share
+  ONE artifact format, ONE trust model, ONE loader, discriminated only by the manifest `kind` field.
+  Each plugin ships as a single signed `.tar.gz` containing exactly the cdylib and its signed
+  `manifest.json` (`name`, `alias`, `kind`, `version`, `publisher`, `abi_version`, `sha256` of the
+  library, and an ed25519 `signature` over the whole manifest) — identity comes from the SIGNED
+  manifest, never the filename. Configuration moved OUT of `governance` into a top-level block:
+
+  - **`plugins.enabled` (MASTER SWITCH, default `false`)**: with it off (or the block absent) NO
+    plugin is ever loaded — a dropped-in tarball is inert. Referencing a plugin store while it is
+    off (`governance.store: redis` etc.) is a boot error naming the flag.
+  - **`plugins.dir` (default `plugins`)**: where the tarballs live.
+  - **`plugins.trust`**: busbar's own release PUBLIC key is EMBEDDED in the binary — first-party
+    (busbar-signed) plugins verify with ZERO configuration, and their versions are automatically
+    floored at the running binary's version (a validly-signed but old first-party release cannot be
+    replayed). `trust.publishers` allowlists THIRD-PARTY ed25519 keys; `trust.allow_unsigned` /
+    `trust.allow_third_party` (both default `false`) are the explicit opt-ins for everything else.
+  - **`plugins.min_versions`**: per-plugin anti-downgrade floors (third-party; first-party is
+    automatic), keyed by the manifest name.
+
+  Loading is three-phase and FAIL-CLOSED: (1) STRUCTURAL — the tarball unpacks fully in memory
+  (bounded, hardened), the manifest parses and is complete/well-formed, `sha256(lib)` matches, and
+  the `abi_version` is supported; ANY invalid tarball in an enabled plugins dir aborts boot with the
+  file and reason named. (2) TRUST — signature vs the embedded key / allowlist / opt-ins;
+  untrusted plugins are logged and SKIPPED (never `dlopen`ed). (3) CONFLICT — no two loadable
+  plugins may share a name or alias (you cannot run `redis` and a third-party `redis` at once); any
+  collision aborts boot naming both. Only then is a plugin registered, addressable by canonical
+  name AND alias. The loader maps EXACTLY the verified bytes: `memfd_create` on Linux (zero disk
+  files) or a per-process private `0700` staging dir elsewhere (unload-then-remove on shutdown,
+  dead-pid sweep at boot); a pre-existing on-disk library is never loaded.
+- **`busbar --validate` now validates the plugin surface too**, running the SAME pre-flight
+  pipeline boot runs (consistency, trust policy, three-phase scan, store resolution) with zero side
+  effects and no `dlopen` — if `--validate` passes, boot's plugin half succeeds; if it fails, it
+  names exactly what is wrong. New **`busbar --list-plugins`** prints a manifest-only inventory
+  (name/alias/kind/version, signature verdict, load status with the exact skip/invalid reason)
+  without ever loading plugin code.
+- **Distribution pipeline.** The release workflow builds, signs (with the `BUSBAR_SIGN_KEY` CI
+  secret), and packages one store-plugin tarball per (plugin, target) and attaches them to the
+  GitHub Release with build-provenance attestations; release binaries embed the matching public key
+  (`BUSBAR_RELEASE_PUBKEY`). New `busbar-plugin-pack` CLI (`pack` / `keygen`) for the pipeline and
+  for third-party plugin authors.
 - **Postgres store plugin (`governance.store: postgres`)**: the shared, multi-node durable store:
-  one Postgres behind a fleet of busbar nodes, so virtual keys, budgets, and usage are shared across
-  the cluster. Drop in the Postgres store plugin (`libbusbar_store_postgres_plugin.{so,dll,dylib}`) and
-  set `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite, drop-in
-  interchangeable. Ships as the crate pair `busbar-store-postgres` (the store) and
-  `busbar-store-postgres-plugin` (the `cdylib` wrapping it).
-- **Redis store plugin (`governance.store: redis`)**: a second shared, multi-node durable store,
-  backed by Redis: point a fleet of busbar nodes at one Redis and virtual keys, budgets, and usage
-  are shared across the cluster. Drop in the Redis store plugin
-  (`libbusbar_store_redis_plugin.{so,dll,dylib}`) and set `governance.db_path` to a `redis://` URL.
-  Same `Store` contract, drop-in interchangeable with the memory/sqlite/postgres backends. Ships as
-  the crate pair `busbar-store-redis` (the store) and `busbar-store-redis-plugin` (the `cdylib`
-  wrapping it).
-- **Migration.** If you set `governance.store: sqlite`, install the SQLite store plugin into
-  `governance.plugins_dir` (drop `libbusbar_store_sqlite_plugin` there), or busbar fails to start with a
-  message naming the expected file. The default `store: memory` needs no plugin.
+  one Postgres behind a fleet of busbar nodes, so virtual keys, accumulated usage, and the audit
+  log are shared across the cluster. Install the `busbar-store-postgres` plugin tarball and set
+  `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite, drop-in
+  interchangeable. **Fleet-budget honesty:** the budget HARD CAP is enforced PER NODE from each
+  node's in-memory counters (the 1.5.0 admission perf win) and reconciled durably via additive
+  flushes — the shared store holds the true fleet total, but with N nodes splitting traffic the
+  effective cap is up to ~N times the configured value until flushes reconcile. Keys, usage, and
+  audit are genuinely cluster-shared; the hard cap is not a synchronous cluster-wide gate.
+- **Redis store plugin (`governance.store: redis`)**: a second shared, multi-node durable store
+  with the same contract and the same per-node-cap / cluster-shared-data semantics as Postgres.
+  Install the `busbar-store-redis` plugin tarball and set `governance.db_path` to a `redis://`
+  (or TLS `rediss://`) URL.
+- **Migration.** A durable store (`governance.store: sqlite` / `postgres` / `redis`, or any
+  third-party store by its manifest name) now requires `plugins.enabled: true` and its signed
+  plugin tarball in `plugins.dir`, or busbar fails to start with a message naming the flag/plugin.
+  The default `store: memory` needs no plugin. The 1.5.0-dev `governance.plugins_dir` and
+  `governance.trust.*` keys moved to the top-level `plugins.*` block (`plugins.dir`,
+  `plugins.trust.allow_unsigned` / `allow_third_party` / `publishers`, `plugins.min_versions`).
 - **`governance.usage_flush_interval_ms` (default 100)**: write-behind flush cadence (ms) for the
   in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this
   window of accrued spend/requests can be lost; a graceful shutdown flushes fully.
@@ -196,6 +229,17 @@ item under **Changed**.
   `auth.upstream_credentials: passthrough`) instead of a bare serde "unknown field" error. Still fail-closed.
 
 ### Fixed
+
+- **Redis store atomicity.** `delete_key`'s cascade (key row, index, usage windows, SigV4
+  credentials and their indexes) and `put_key_with_aws_credential` now run as single atomic
+  `MULTI`/`EXEC` transactions — a mid-cascade failure can no longer orphan a SigV4 credential
+  behind a deleted key. The Redis store also gains transparent one-shot reconnect after a dropped
+  connection, `rediss://` TLS support (rustls), and password scrubbing in error strings; its
+  unbounded no-TTL growth posture is documented (retention is the operator's schedule).
+- **Fleet-budget flushes are ADDITIVE.** The write-behind usage flush now writes the DELTA since
+  the last acknowledged flush (`Store::add_usage`, atomic accumulate in every backend) instead of
+  an absolute overwrite, so multiple nodes sharing one durable store SUM to the true fleet total
+  instead of last-writer-wins clobbering each other.
 
 - **Security: OAuth egress SSRF hardening (config-time AND runtime):** the `token_url` a
   `oauth-client-credentials` provider POSTs the client secret to now runs through the SAME SSRF/cloud-metadata

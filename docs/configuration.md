@@ -37,6 +37,7 @@ Both files support `${VAR}` environment interpolation before YAML is parsed. A m
   - [`limits`](#limits)
   - [`observability`](#observability)
   - [`governance`](#governance)
+  - [`plugins`](#plugins)
   - [`security`](#security)
 - [Minimal working example](#minimal-working-example)
 - [Full annotated example](#full-annotated-example)
@@ -811,29 +812,25 @@ governance:
   admin_token: "${BUSBAR_ADMIN_TOKEN}"   # set this to ACTIVATE enforcement
   price_per_request_cents: 1
   price_per_1k_tokens_cents: 50
-  # For persistence, choose a durable store (a loadable plugin dropped in plugins_dir):
-  # store: sqlite                            # single-node durable
+  # For persistence, choose a durable store PLUGIN (requires the top-level `plugins.enabled: true`
+  # and the store's signed tarball in `plugins.dir` - see the "Plugins" section):
+  # store: sqlite                            # single-node durable (alias of busbar-store-sqlite)
   # db_path: /var/lib/busbar/governance.db
-  # store: postgres                          # shared across a cluster
+  # store: postgres                          # cluster-shared keys/usage/audit
   # db_path: "postgres://user:pass@host/busbar"
-  # store: redis                             # shared across a cluster
+  # store: redis                             # cluster-shared keys/usage/audit (rediss:// for TLS)
   # db_path: "redis://host:6379"
-  # plugins_dir: plugins                     # where store plugins are loaded from (default: plugins)
+  # store: acme-store-dynamo                 # or any third-party store plugin by its manifest name
   # usage_flush_interval_ms: 100             # write-behind flush cadence for durable stores
-  # trust:                                   # plugin signing policy (see "Plugin trust" below)
-  #   allow_unsigned_plugins: false          # default false: unsigned plugins are logged + skipped
-  #   allow_third_party: false               # default false: non-allowlisted-publisher plugins skipped
 ```
 
 | Field | Type | Required | Default | Validation | Notes |
 |---|---|---|---|---|---|
-| `store` | string | no | `memory` | one of `memory` \| `sqlite` \| `postgres` \| `redis` | Backend for keys + counters. `memory` (default) is ephemeral RAM (resets on restart). `sqlite`/`postgres`/`redis` are durable, each loaded as a plugin from `plugins_dir`. |
+| `store` | string | no | `memory` | `memory`, or a plugin ALIAS or CANONICAL NAME | Backend for keys + counters. `memory` (default) is the compiled-in ephemeral RAM store (resets on restart). Anything else names a STORE PLUGIN resolved from the `plugins.*` registry: the shipped first-party stores by alias (`sqlite`, `postgres`, `redis`) or canonical name (`busbar-store-<x>`), or a third-party store by its manifest name. A non-`memory` store requires `plugins.enabled: true` (else a boot error naming the flag). |
 | `admin_token` | string | no | none (governance INERT, admin API disabled) | Must be non-empty (non-whitespace) when present | The activation gate. Absent = governance inert (static `auth` chain applies, no admin API). Present = enforcement on; guards the `/api/v1/admin/keys` API. A blank/whitespace-only value is a startup error. |
 | `db_path` | string | no | `busbar-governance.db` | n/a | Connection target for a durable store: a SQLite file path (`store: sqlite`), or a libpq/redis URL (`store: postgres` / `redis`). Unused for `store: memory`. |
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
-| `plugins_dir` | string | no | `plugins` | n/a | Directory the engine loads store (and other) plugins from. A durable `store` other than `memory` is a plugin library dropped here (e.g. `store: sqlite` loads `libbusbar_store_sqlite_plugin` from this directory). Path is relative to the working directory. |
-| `trust` | table | no | see below | n/a | Plugin signing/trust policy applied to each plugin's signed manifest at load. By default an untrusted plugin is logged and skipped (never loaded). Sub-keys: `allow_unsigned_plugins` (bool, default `false` - permit unsigned plugins), `allow_third_party` (bool, default `false` - permit validly-signed plugins from a non-allowlisted publisher), `publishers` (a list of `{ name, public_key }` allowlisted ed25519 publishers), and `min_versions` (optional anti-downgrade floors, plugin name -> minimum version). See [Plugin trust](#plugin-trust) below. |
 | `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. Applies to `store: sqlite`. |
 | `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
 | `usage_flush_interval_ms` | integer | no | `100` | n/a | Write-behind flush cadence (milliseconds) for the in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this many ms of accrued spend/requests can be lost; a graceful shutdown flushes fully. Only relevant with a durable `store`. |
@@ -863,51 +860,60 @@ See [operations.md](operations.md) for the full admin API payload schemas and vi
 
 #### Durable stores
 
-The default `store: memory` is ephemeral RAM (keys, budgets, and usage reset on restart) and needs no plugin. Every durable backend ships as a droppable dynamic-library plugin that busbar loads at boot from `plugins_dir` over a stable store C ABI:
+The default `store: memory` is ephemeral RAM (keys, budgets, and usage reset on restart) and needs no plugin. Every durable backend ships as a signed plugin tarball that busbar's plugin subsystem verifies and loads at boot (see [plugins.md](plugins.md) and the [Plugins](#plugins) section):
 
-| `store` | Plugin library | `db_path` target |
+| `store` (alias or canonical name) | Plugin tarball | `db_path` target |
 |---|---|---|
-| `sqlite` | `libbusbar_store_sqlite_plugin.{so,dll,dylib}` | SQLite file path (default `busbar-governance.db`); single-node durable. |
-| `postgres` | `libbusbar_store_postgres_plugin.{so,dll,dylib}` | `postgres://` libpq URL; shared across a cluster. |
-| `redis` | `libbusbar_store_redis_plugin.{so,dll,dylib}` | `redis://` URL; shared across a cluster. |
+| `sqlite` / `busbar-store-sqlite` | `busbar-store-sqlite-<ver>-<target>.tar.gz` | SQLite file path (default `busbar-governance.db`); single-node durable. |
+| `postgres` / `busbar-store-postgres` | `busbar-store-postgres-<ver>-<target>.tar.gz` | `postgres://` libpq URL; cluster-shared. |
+| `redis` / `busbar-store-redis` | `busbar-store-redis-<ver>-<target>.tar.gz` | `redis://` URL (`rediss://` for TLS); cluster-shared. |
 
-If the configured store's plugin is not present in `plugins_dir`, busbar fails to start with a message naming the expected library file. Set `store: memory` (no plugin) to run without a durable backend.
+A non-`memory` store requires **`plugins.enabled: true`** and the store's tarball in `plugins.dir`; anything else is a boot error that names the missing flag or plugin. Run `busbar --validate` to pre-flight the whole chain (config + every plugin manifest + store resolution) and `busbar --list-plugins` to inspect the directory.
+
+**Fleet semantics (honest):** with a cluster-shared store (postgres/redis) behind N busbar nodes, virtual keys, accumulated usage, and the audit log are genuinely shared. The budget **hard cap is enforced per node** from each node's in-memory counters (the admission-path performance win) and reconciled durably through ADDITIVE flushes, so the shared store converges on the true fleet total - but between flushes, N nodes splitting traffic can admit up to ~N times the configured cap. The hard cap is not a synchronous cluster-wide gate.
+
+**Backend caveats:** the Redis store supports TLS (`rediss://`), transparent reconnect, and atomic multi-key cascades (MULTI/EXEC), and scrubs the URL password from error strings; it writes WITHOUT TTLs (usage/metering/audit grow unboundedly by design - apply your own retention). The Postgres store currently connects `NoTls` and without automatic reconnect: run it over a trusted network segment (or a TLS-terminating proxy such as pgbouncer/stunnel) and let your supervisor restart busbar on a persistent connection loss.
 
 #### Plugin trust
 
-A plugin ships a signed sidecar manifest (`<library>.manifest.json`: name, version, kind, author/homepage/source_url, publisher, the library `sha256`, and an ed25519 signature over the whole manifest). At boot-load busbar verifies it against `governance.trust`. A valid signature from an allowlisted publisher (`trust.publishers`) is TRUSTED and loads. Anything else is UNTRUSTED, and one of two categories:
-
-- **unsigned** - no manifest, a tampered manifest, or a failed signature from an allowlisted publisher; or
-- **third-party** - a valid-looking manifest whose `publisher` is NOT in `trust.publishers`.
-
-**Safe by default: an untrusted plugin is NOT loaded.** With no opt-in flag set, busbar simply LOGS that it found an untrusted plugin (naming the file and the flag to set) and does nothing else with it - it is never `dlopen`ed and its initialization code never runs, at boot AND in the `GET /api/v1/admin/plugins` catalog. Two explicit opt-ins relax this per category:
-
-| `governance.trust` flag | Default | Effect |
-|---|---|---|
-| `allow_unsigned_plugins` | `false` | Permit loading plugins that carry NO valid signature (unsigned / tampered). Without it, an unsigned plugin in `plugins_dir` is logged and skipped (never loaded/executed). Security implication: an unsigned plugin's code is not signature-verified, so enabling this trusts whatever bytes are on disk. |
-| `allow_third_party` | `false` | Permit loading plugins that ARE validly signed but by a publisher not in `trust.publishers`. Without it, a third-party-signed plugin is logged and skipped. |
-
-If the CONFIGURED store (`governance.store: sqlite` / `postgres` / `redis`) needs a plugin that is untrusted and NOT opted-in, busbar **fails to start** with an error naming the plugin and the exact flag to set - it never silently skips the store you asked for and never silently falls back.
-
-```yaml
-governance:
-  store: sqlite
-  trust:
-    # Both default to false; an untrusted plugin is logged and skipped unless a flag is set.
-    allow_unsigned_plugins: false   # set true to load unsigned plugins (with a warning)
-    allow_third_party: false        # set true to load validly-signed plugins from a non-allowlisted publisher
-    publishers:
-      - name: busbar
-        public_key: "<hex ed25519 public key>"
-    min_versions:            # optional anti-downgrade floors (plugin name -> minimum version)
-      sqlite-store: "1.5.0"
-```
+Plugin signing/trust configuration lives in the top-level [`plugins`](#plugins) block (not under `governance`). Summary: busbar's own release public key is EMBEDDED in the binary, so busbar-signed store plugins verify with zero configuration; third-party publishers are allowlisted under `plugins.trust.publishers`; unsigned or unknown-publisher plugins are logged and skipped unless the explicit `plugins.trust.allow_unsigned` / `allow_third_party` opt-ins are set; `plugins.min_versions` pins anti-downgrade floors. See [plugins.md](plugins.md) for the full trust model and threat analysis.
 
 Because the signature covers the whole manifest and the manifest pins the library by `sha256`, neither the manifest nor the library can be altered or swapped independently. A malformed publisher key is a boot error, not a silent skip. The verified bytes are also the exact bytes loaded (they are never re-read from disk between verification and `dlopen`), so a file swap in the plugins directory cannot slip an unverified library past the check. The anti-downgrade floor (`min_versions`) is a hard reject that neither opt-in flag can bypass.
 
 `trust.min_versions` pins an optional minimum `version` per plugin name (an anti-downgrade / anti-replay floor). A manifest whose `version` is below its floor is rejected even with a valid signature, so an older validly-signed (and possibly vulnerable) release cannot be rolled back in. Version comparison is numeric on the leading `major.minor.patch` components. Empty (the default) pins nothing.
 
 ---
+
+### `plugins`
+
+The dynamic plugin subsystem: signed plugin tarballs (durable governance stores today; auth and hook plugins share the same machinery) that busbar verifies and loads at boot. **Off by default**: with `plugins.enabled: false` (or the whole block absent) no plugin is ever discovered or loaded, and a tarball dropped into the directory is inert. See [plugins.md](plugins.md) for the plugin author guide, the artifact format, and the full trust model.
+
+```yaml
+plugins:
+  enabled: true                 # MASTER SWITCH, default false. Off = no plugin ever loads.
+  dir: plugins                  # where the signed .tar.gz plugin tarballs live (default: plugins)
+  trust:
+    # busbar's own release key is EMBEDDED in the binary: busbar-signed plugins verify with
+    # zero configuration. This block is for THIRD-PARTY publishers and explicit opt-ins.
+    publishers:                 # third-party ed25519 signing keys (allowlist)
+      - name: acme
+        public_key: "<64-hex ed25519 public key>"
+    allow_unsigned: false       # default false: unsigned/tampered plugins are logged + skipped
+    allow_third_party: false    # default false: signed-but-unknown-publisher plugins are skipped
+  min_versions:                 # anti-downgrade floors, keyed by manifest name (third-party;
+    acme-store-dynamo: "2.0.0"  # first-party is automatically floored at the binary's version)
+```
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `enabled` | bool | no | `false` | Master switch. `false`/absent = NO plugin loads (drop-is-inert). A non-`memory` `governance.store` with plugins disabled is a boot error naming this flag. |
+| `dir` | string | no | `plugins` | Directory holding the signed plugin tarballs (`*.tar.gz`), relative to the working directory. Filenames are irrelevant: identity comes from each tarball's signed manifest. |
+| `trust.publishers` | list | no | empty | Third-party publishers: `{ name, public_key }` pairs (hex ed25519). The name `busbar` is reserved for the embedded release key and cannot be configured. |
+| `trust.allow_unsigned` | bool | no | `false` | EXPLICIT opt-in to load plugins with no valid signature (unsigned/tampered). Without it they are logged and skipped, never `dlopen`ed. |
+| `trust.allow_third_party` | bool | no | `false` | EXPLICIT opt-in to load validly-signed plugins from a publisher NOT in `publishers`. |
+| `min_versions` | map | no | empty | Anti-downgrade floors: manifest `name` -> minimum `version`. A floored plugin must prove (trusted signature at/above the floor) that it meets it; no opt-in flag can bypass a floor. First-party plugins are automatically floored at the running binary's version. |
+
+**Fail-closed guarantees:** with plugins enabled, ANY invalid tarball or manifest in `dir` (unparseable, missing/malformed fields, sha256 mismatch, unsupported `abi_version`) aborts boot naming the file and reason; any name/alias conflict between loadable plugins aborts boot naming both. `busbar --validate` runs the exact same pipeline ahead of time (zero side effects, nothing loaded), and `busbar --list-plugins` prints the manifest-only inventory with each plugin's signature verdict and load status.
 
 ### `security`
 
