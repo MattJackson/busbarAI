@@ -1507,6 +1507,11 @@ pub(crate) struct PluginTrustCfg {
     /// hex ed25519 public key; a plugin manifest's `publisher` must resolve here.
     #[serde(default)]
     pub(crate) publishers: Vec<PluginPublisher>,
+    /// ANTI-DOWNGRADE floors: plugin `name` -> minimum acceptable `version`. A manifest whose version
+    /// is below its floor is rejected even with a valid signature, blocking a rollback/replay of an
+    /// older (possibly vulnerable) validly-signed release. Empty pins nothing.
+    #[serde(default)]
+    pub(crate) min_versions: std::collections::BTreeMap<String, String>,
 }
 
 /// One allowlisted plugin publisher: a name and its hex ed25519 public key.
@@ -1531,6 +1536,7 @@ impl PluginTrustCfg {
         Ok(busbar_plugin_sign::TrustPolicy {
             publishers,
             on_untrusted: self.on_untrusted,
+            min_versions: self.min_versions.clone(),
         })
     }
 }

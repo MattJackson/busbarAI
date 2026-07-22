@@ -1491,6 +1491,7 @@ mod tests {
         crate::config::PluginTrustCfg {
             on_untrusted: OnUntrusted::Log,
             publishers: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1559,6 +1560,7 @@ mod tests {
         let trust = crate::config::PluginTrustCfg {
             on_untrusted: OnUntrusted::Halt,
             publishers: Vec::new(),
+            ..Default::default()
         };
         let svc = svc_with(dir.clone(), trust);
         let file = lib_name("libanything");
@@ -1651,6 +1653,7 @@ mod tests {
                 name: "acme".into(),
                 public_key: hex::encode(key.verifying_key().to_bytes()),
             }],
+            ..Default::default()
         };
         let dir = tmp_plugins_dir("signed");
         let svc = svc_with(dir.clone(), trust);
@@ -1675,6 +1678,74 @@ mod tests {
         assert_eq!(row.publisher.as_deref(), Some("acme"));
         assert_eq!(row.version.as_deref(), Some("2.1.0"));
         assert_eq!(row.name, "sqlite-store");
+    }
+
+    /// ANTI-DOWNGRADE at the ADMIN INSTALL boundary: a `min_versions` floor in `governance.trust`
+    /// rejects a VALIDLY-SIGNED but older release of the same plugin — a rollback/replay is a `409`,
+    /// and nothing is written to `plugins_dir`. The current release (>= floor) still installs.
+    #[test]
+    fn install_downgraded_version_is_rejected_by_floor() {
+        let Some(src) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&src).unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let signed = |version: &str| {
+            sign(
+                &key,
+                Manifest {
+                    name: "sqlite-store".into(),
+                    version: version.into(),
+                    kind: "store".into(),
+                    author: String::new(),
+                    homepage: String::new(),
+                    source_url: String::new(),
+                    description: String::new(),
+                    license: String::new(),
+                    publisher: "acme".into(),
+                    interface_version: TEST_ABI_VERSION,
+                    sha256: String::new(),
+                    signature: String::new(),
+                },
+                &bytes,
+            )
+        };
+        let mut floors = std::collections::BTreeMap::new();
+        floors.insert("sqlite-store".to_string(), "2.0.0".to_string());
+        let trust = crate::config::PluginTrustCfg {
+            on_untrusted: OnUntrusted::Halt,
+            publishers: vec![crate::config::PluginPublisher {
+                name: "acme".into(),
+                public_key: hex::encode(key.verifying_key().to_bytes()),
+            }],
+            min_versions: floors,
+        };
+        let dir = tmp_plugins_dir("downgrade");
+        let svc = svc_with(dir.clone(), trust);
+        let file = busbar_plugin_loader::plugin_library_filename("busbar_store_sqlite_plugin");
+
+        // A validly-signed 1.9.0 is below the 2.0.0 floor -> rejected, nothing published.
+        let old_mb = serde_json::to_vec(&signed("1.9.0")).unwrap();
+        assert!(
+            matches!(
+                svc.install_store_plugin(&file, &bytes, Some(&old_mb)),
+                Err(AdminError::Conflict(_))
+            ),
+            "a signed downgrade below the floor must be a conflict"
+        );
+        assert!(
+            !dir.join(&file).exists(),
+            "nothing written on a rejected downgrade"
+        );
+
+        // The current 2.1.0 clears the floor and installs as trusted.
+        let cur_mb = serde_json::to_vec(&signed("2.1.0")).unwrap();
+        let view = svc
+            .install_store_plugin(&file, &bytes, Some(&cur_mb))
+            .expect("a signed release at/above the floor installs");
+        assert_eq!(view.trust, "trusted");
+        assert_eq!(view.version.as_deref(), Some("2.1.0"));
     }
 
     /// A signed upload whose publisher is NOT allowlisted is untrusted; under `halt` it is a conflict
@@ -1705,6 +1776,7 @@ mod tests {
         let trust = crate::config::PluginTrustCfg {
             on_untrusted: OnUntrusted::Halt,
             publishers: Vec::new(),
+            ..Default::default()
         };
         let svc = svc_with(dir.clone(), trust);
         let file = lib_name("libx");

@@ -124,6 +124,12 @@ pub struct TrustPolicy {
     pub publishers: BTreeMap<String, VerifyingKey>,
     /// Posture for an untrusted artifact.
     pub on_untrusted: OnUntrusted,
+    /// ANTI-DOWNGRADE floor: plugin `name` -> the minimum acceptable `version`. A manifest whose
+    /// `version` parses BELOW the pinned floor is REJECTED even when its signature verifies against an
+    /// allowlisted publisher — this stops a replay/rollback of an older, validly-signed (possibly
+    /// vulnerable) release of the SAME plugin. Empty (the default) pins nothing, so behaviour is
+    /// unchanged until an operator sets a floor. See [`version_at_least`] for the comparison.
+    pub min_versions: BTreeMap<String, String>,
 }
 
 /// The verdict for one artifact.
@@ -211,9 +217,39 @@ fn signature_ok(manifest: &Manifest, bytes: &[u8], key: &VerifyingKey) -> Result
         .map_err(|_| "signature does not verify".to_string())
 }
 
+/// Parse a dotted version into its leading numeric components (`major.minor.patch`), ignoring any
+/// pre-release/build suffix (`-rc1`, `+meta`) for the floor comparison. Dependency-free on purpose —
+/// the crate deliberately keeps a minimal surface — and sufficient for an anti-downgrade floor, which
+/// only needs a monotonic numeric ordering of releases. A component that isn't a number stops the
+/// parse (later components are treated as 0), so a garbage version compares as `0.0.0` and can never
+/// slip past a non-zero floor.
+fn version_components(v: &str) -> [u64; 3] {
+    let mut out = [0u64; 3];
+    // Cut off any pre-release / build metadata before parsing the numeric core.
+    let core = v.trim().split(['-', '+']).next().unwrap_or("");
+    for (i, part) in core.split('.').take(3).enumerate() {
+        match part.parse::<u64>() {
+            Ok(n) => out[i] = n,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// True when `have` is greater-than-or-equal-to `floor` under [`version_components`] ordering. Used to
+/// enforce the anti-downgrade floor: a manifest version below the pinned floor is a rollback attempt.
+pub fn version_at_least(have: &str, floor: &str) -> bool {
+    version_components(have) >= version_components(floor)
+}
+
 /// Evaluate an artifact against the trust policy. `manifest` is `None` when the artifact arrived
 /// unsigned. Returns [`Verdict`] when it may proceed (trusted, or untrusted-but-posture-permits), or
 /// [`Rejected`] when the posture forbids it.
+///
+/// Anti-downgrade: even after a signature verifies, a manifest whose `version` is below the policy's
+/// pinned `min_versions[name]` floor is REJECTED unconditionally (not subject to `on_untrusted`) — a
+/// rollback of an older validly-signed release must never be accepted once a floor is set. The
+/// `version` field is signature-covered, so an attacker cannot forge a higher one to clear the floor.
 pub fn evaluate(
     bytes: &[u8],
     manifest: Option<&Manifest>,
@@ -224,6 +260,23 @@ pub fn evaluate(
     // shape re-`map`ped `manifest` with an `unwrap_or_default()` fallback, whose `None` arm was dead:
     // a `None` manifest yields `Some(reason)` here and can never reach the trusted verdict. Carrying
     // the verified manifest through removes that misleading empty-publisher-Trusted dead branch.)
+    // ── anti-downgrade floor (hard reject, BEFORE any posture relaxation) ──
+    // A pinned floor for this plugin name refuses any presented manifest whose version is below it —
+    // whether trusted or not — so a loose `on_untrusted` posture cannot be used to sneak an older,
+    // stripped-signature manifest past a floor either. The floor keys on `name`; a downgrade attack
+    // must reuse a name (a store plugin the engine resolves by name), and `version` is signed, so a
+    // trusted manifest's version cannot be forged upward to clear the floor.
+    if let Some(m) = manifest {
+        if let Some(floor) = policy.min_versions.get(&m.name) {
+            if !version_at_least(&m.version, floor) {
+                return Err(Rejected(format!(
+                    "plugin '{}' version {} is below the pinned minimum {} (anti-downgrade)",
+                    m.name, m.version, floor
+                )));
+            }
+        }
+    }
+
     let trusted_or_reason: Result<&Manifest, String> = match manifest {
         None => Err("artifact is unsigned (no manifest)".to_string()),
         Some(m) => match policy.publishers.get(&m.publisher) {
@@ -280,6 +333,7 @@ mod tests {
         TrustPolicy {
             publishers: pairs.iter().map(|(n, k)| (n.to_string(), **k)).collect(),
             on_untrusted,
+            min_versions: BTreeMap::new(),
         }
     }
 
@@ -375,5 +429,76 @@ mod tests {
         let hex = hex::encode(key.verifying_key().to_bytes());
         assert_eq!(public_key_from_hex(&hex).unwrap(), key.verifying_key());
         assert!(public_key_from_hex("zz").is_err());
+    }
+
+    #[test]
+    fn version_ordering_is_numeric_not_lexical() {
+        assert!(version_at_least("1.10.0", "1.9.0"), "10 > 9 numerically");
+        assert!(version_at_least("2.0.0", "1.99.99"));
+        assert!(version_at_least("1.4.0", "1.4.0"), "equal clears the floor");
+        assert!(!version_at_least("1.3.9", "1.4.0"));
+        // Pre-release / build metadata is ignored for the floor core.
+        assert!(version_at_least("1.4.0-rc1", "1.4.0"));
+        // Garbage parses as 0.0.0 and cannot clear a non-zero floor.
+        assert!(!version_at_least("not-a-version", "0.0.1"));
+    }
+
+    /// ANTI-DOWNGRADE: an OLDER but validly-signed manifest for the SAME plugin name is REJECTED once
+    /// a floor is pinned — even though its signature verifies against the allowlisted publisher. This
+    /// is the rollback/replay attack: re-presenting a known-vulnerable prior release the vendor really
+    /// did sign. Bumping the version to meet the floor is impossible without re-signing (version is a
+    /// signed field), so the floor holds.
+    #[test]
+    fn signed_but_downgraded_version_is_rejected() {
+        let key = test_key(1);
+        let pubk = key.verifying_key();
+        let artifact = b"older vulnerable build";
+        // A genuinely, validly-signed v1.0.0 of "store-sqlite".
+        let mut old = manifest("store-sqlite", "busbar");
+        old.version = "1.0.0".into();
+        let old = sign(&key, old, artifact);
+
+        // With NO floor it verifies as trusted (baseline).
+        let mut pol = policy(&[("busbar", &pubk)], OnUntrusted::Halt);
+        assert!(matches!(
+            evaluate(artifact, Some(&old), &pol).unwrap(),
+            Verdict::Trusted { .. }
+        ));
+
+        // Pin the floor to 1.4.0 — the old validly-signed 1.0.0 is now a rejected downgrade.
+        pol.min_versions
+            .insert("store-sqlite".to_string(), "1.4.0".to_string());
+        let err = evaluate(artifact, Some(&old), &pol).unwrap_err();
+        assert!(err.0.contains("anti-downgrade"), "got {err:?}");
+
+        // A current, validly-signed 1.4.0 of the same plugin still passes the floor.
+        let mut cur = manifest("store-sqlite", "busbar");
+        cur.version = "1.4.0".into();
+        let cur = sign(&key, cur, artifact);
+        assert!(matches!(
+            evaluate(artifact, Some(&cur), &pol).unwrap(),
+            Verdict::Trusted { .. }
+        ));
+    }
+
+    /// The floor is a HARD reject that a loose posture cannot bypass: a stripped-signature (untrusted)
+    /// older manifest under `on_untrusted: allow` is STILL refused when it names a floored plugin, so
+    /// a downgrade can't be laundered through a relaxed posture.
+    #[test]
+    fn downgrade_floor_is_not_bypassable_by_loose_posture() {
+        let key = test_key(1);
+        let artifact = b"older build";
+        let mut old = manifest("store-sqlite", "busbar");
+        old.version = "1.0.0".into();
+        let old = sign(&key, old, artifact);
+        // Strip the signature to make it "untrusted" — a loose posture would normally allow it.
+        let mut stripped = old.clone();
+        stripped.signature = String::new();
+
+        let mut pol = policy(&[], OnUntrusted::Allow);
+        pol.min_versions
+            .insert("store-sqlite".to_string(), "1.4.0".to_string());
+        // Even under `allow`, the floored downgrade is rejected outright.
+        assert!(evaluate(artifact, Some(&stripped), &pol).is_err());
     }
 }

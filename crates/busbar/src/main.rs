@@ -1207,22 +1207,27 @@ pub(crate) fn load_config_from_disk(
 /// `Err` (aborting boot) only when the trust posture is `halt` and the plugin isn't validly signed by
 /// an allowlisted publisher; `log`/`alert`/`allow` postures return `Ok` (the load proceeds, and
 /// `plugin_trust::verify` has already logged the decision).
+///
+/// Returns the EXACT bytes that were verified so the caller loads THOSE bytes via
+/// [`busbar_plugin_loader::load_store_from_bytes`] rather than re-reading `lib_path` — closing the
+/// time-of-check/time-of-use gap in which an attacker with write access to `plugins_dir` could swap
+/// the file between this verification and the `dlopen`.
 fn verify_plugin_trust(
     g: &config::GovernanceCfg,
     lib_path: &std::path::Path,
     store: &str,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let policy = g
         .trust
         .to_policy()
         .map_err(|e| format!("governance.trust is invalid: {e}"))?;
-    plugin_trust::verify(lib_path, &policy).map_err(|reason| {
+    let (_note, bytes) = plugin_trust::verify_read(lib_path, &policy).map_err(|reason| {
         format!(
             "governance store '{store}' plugin rejected by the trust policy: {reason}. Sign it with \
              an allowlisted publisher, or relax governance.trust.on_untrusted."
         )
     })?;
-    Ok(())
+    Ok(bytes)
 }
 
 pub(crate) fn build_app_from_config(
@@ -1753,8 +1758,12 @@ pub(crate) fn build_app_from_config(
                     "busy_timeout_ms": g.sqlite_busy_timeout_ms,
                 })
                 .to_string();
-                verify_plugin_trust(&g, &lib_path, "sqlite")?;
-                match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
+                let verified = verify_plugin_trust(&g, &lib_path, "sqlite")?;
+                match busbar_plugin_loader::load_store_from_bytes(
+                    &verified,
+                    &cfg_json,
+                    &lib_path.display().to_string(),
+                ) {
                     Ok(s) => Arc::from(s),
                     Err(e) => {
                         return Err(format!(
@@ -1773,8 +1782,12 @@ pub(crate) fn build_app_from_config(
                     busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
                 let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
                 let cfg_json = serde_json::json!({ "url": g.db_path }).to_string();
-                verify_plugin_trust(&g, &lib_path, "postgres")?;
-                match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
+                let verified = verify_plugin_trust(&g, &lib_path, "postgres")?;
+                match busbar_plugin_loader::load_store_from_bytes(
+                    &verified,
+                    &cfg_json,
+                    &lib_path.display().to_string(),
+                ) {
                     Ok(s) => Arc::from(s),
                     Err(e) => {
                         return Err(format!(
@@ -1794,8 +1807,12 @@ pub(crate) fn build_app_from_config(
                     busbar_plugin_loader::plugin_library_filename("busbar_store_redis_plugin");
                 let lib_path = std::path::Path::new(&g.plugins_dir).join(&libname);
                 let cfg_json = serde_json::json!({ "url": g.db_path }).to_string();
-                verify_plugin_trust(&g, &lib_path, "redis")?;
-                match busbar_plugin_loader::load_store(&lib_path, &cfg_json) {
+                let verified = verify_plugin_trust(&g, &lib_path, "redis")?;
+                match busbar_plugin_loader::load_store_from_bytes(
+                    &verified,
+                    &cfg_json,
+                    &lib_path.display().to_string(),
+                ) {
                     Ok(s) => Arc::from(s),
                     Err(e) => {
                         return Err(format!(

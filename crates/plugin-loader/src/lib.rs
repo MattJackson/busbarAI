@@ -13,6 +13,10 @@
 //!
 //! The loaded library is kept alive inside the `DynStore` for as long as the store lives — unloading
 //! it while the handle is in use would dangle — and the handle is `close`d before the library drops.
+//!
+//! For the TRUSTED load path, [`load_store_from_bytes`] takes the already-verified library BYTES (not
+//! a path) so the bytes that were hash/signature-checked are byte-for-byte the bytes loaded — closing
+//! the time-of-check/time-of-use gap a `verify(path)` + `dlopen(path)` pair would leave open.
 
 use busbar_api::{
     AuditRecord, AwsCredential, MeteringDelta, MeteringRow, Store, StoreError, StoreResult, Usage,
@@ -25,6 +29,12 @@ use libloading::Library;
 use std::os::raw::c_void;
 use std::path::Path;
 
+/// Hard cap on the byte length the engine will materialize from a single plugin `call` response —
+/// defense-in-depth against a plugin (buggy or adversarial) declaring a huge `out_len` and forcing an
+/// unbounded engine allocation (OOM). 256 MiB is orders of magnitude past any real governance
+/// response (key lists / audit logs are KBs–MBs), so a legitimate reply never trips it.
+const MAX_PLUGIN_RESPONSE_LEN: usize = 256 * 1024 * 1024;
+
 /// A `Store` backend loaded from a dynamic library. Holds the resolved C fn pointers, the opaque
 /// per-instance handle, and — crucially — the [`Library`] itself so the code the fn pointers point
 /// into stays mapped for the store's whole life.
@@ -35,9 +45,32 @@ pub struct DynStore {
     close: CloseFn,
     /// The plugin path, for diagnostics.
     path: String,
+    /// A private temp file backing this load, when the library was loaded from in-memory verified
+    /// bytes ([`load_store_from_bytes`]) rather than a path. On unix it is already unlinked (the
+    /// mapping outlives the dir entry); on Windows the file is locked while mapped, so it is removed
+    /// on drop. `None` for a plain path load.
+    _backing: Option<BackingFile>,
     /// Kept last so it drops LAST (fields drop in declaration order): the fn pointers and handle
     /// remain valid until after `Drop` has `close`d the handle.
     _lib: Library,
+}
+
+/// A private, per-load temp file that backs a from-bytes load. Removed on drop (best-effort) so a
+/// from-bytes load never leaves an artifact behind — and on Windows, where the file cannot be
+/// deleted while the DLL is mapped, this deferral is the ONLY time it can be removed.
+struct BackingFile {
+    path: std::path::PathBuf,
+    /// True once the on-disk entry has already been unlinked (unix, immediately after `dlopen`) — so
+    /// `Drop` does not try to remove it a second time.
+    already_unlinked: bool,
+}
+
+impl Drop for BackingFile {
+    fn drop(&mut self) {
+        if !self.already_unlinked {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 // SAFETY: the backend behind the handle is a `Box<dyn Store>`, which the `Store` contract requires to
@@ -62,6 +95,18 @@ impl DynStore {
                 &mut out_len,
             )
         };
+        // DEFENSE-IN-DEPTH cap on the plugin-declared response length. The plugin is trusted
+        // operator-placed code, but a bug (or an adversarial build) that returns a huge `out_len`
+        // would have the engine `to_vec()` an unbounded allocation and OOM. Refuse an over-cap length
+        // BEFORE allocating — but still hand the buffer back to the plugin to `free` so we never leak
+        // its allocation. The cap is far past any real governance response (a full key/audit list is
+        // KBs–MBs), so it never rejects a legitimate reply.
+        if let Err(msg) = response_len_ok(out_len, &self.path) {
+            if !out.is_null() {
+                unsafe { (self.free)(out, out_len) };
+            }
+            return Err(StoreError(msg));
+        }
         // Copy the out buffer into engine-owned memory, then hand it back to the plugin to free (the
         // plugin allocated it; only the plugin may free it).
         let bytes = if out.is_null() || out_len == 0 {
@@ -83,6 +128,19 @@ impl DynStore {
                 msg
             }))
         }
+    }
+}
+
+/// Enforce [`MAX_PLUGIN_RESPONSE_LEN`] on a plugin-declared response length before the engine
+/// allocates a buffer for it. Pure so the bound is unit-testable without a live plugin.
+fn response_len_ok(out_len: usize, path: &str) -> Result<(), String> {
+    if out_len > MAX_PLUGIN_RESPONSE_LEN {
+        Err(format!(
+            "plugin '{path}' returned an oversized response ({out_len} bytes, max \
+             {MAX_PLUGIN_RESPONSE_LEN})"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -239,7 +297,108 @@ pub fn load_store(lib_path: &Path, cfg_json: &str) -> Result<Box<dyn Store>, Str
     // plugins dir, not the request path.
     let lib = unsafe { Library::new(lib_path) }
         .map_err(|e| format!("failed to load plugin '{display}': {e}"))?;
+    wire_up_store(lib, cfg_json, display, None)
+}
 
+/// Load a store backend from EXACTLY the library `bytes` supplied — the TOCTOU-safe entrypoint.
+///
+/// The engine's boot/reload path verifies a plugin's hash/signature over the bytes it read from disk,
+/// then must load THOSE SAME bytes. Handing `load_store` a path re-opens the file, leaving a window in
+/// which an attacker with write access to the plugins directory could swap the file between the
+/// verify-read and the `dlopen` (a classic time-of-check/time-of-use gap). This function closes it:
+/// the caller reads + verifies the bytes ONCE, then passes them here; we materialize them into a
+/// PRIVATE, freshly-created temp file (owner-only, `create_new` so it is never an attacker's
+/// pre-planted path) and `dlopen` that. The bytes loaded are byte-for-byte the bytes verified — no
+/// on-disk path the caller verified is ever re-read, so nothing can be swapped underneath it.
+///
+/// On unix the temp file is unlinked immediately after `dlopen` (the mapping outlives the directory
+/// entry), so it is never visible for a swap; on Windows it is removed when the store drops.
+/// `display` is a human label for diagnostics (typically the real plugin path).
+pub fn load_store_from_bytes(
+    bytes: &[u8],
+    cfg_json: &str,
+    display: &str,
+) -> Result<Box<dyn Store>, String> {
+    let (path, backing) = write_private_temp(bytes)
+        .map_err(|e| format!("failed to stage plugin '{display}' for load: {e}"))?;
+    // SAFETY: same trust as `load_store` — we run operator-placed library init code — but here the
+    // file we open is one WE just created from already-verified bytes in a private location, so its
+    // contents cannot have been substituted between the caller's verification and this load.
+    let lib = unsafe { Library::new(&path) }
+        .map_err(|e| format!("failed to load plugin '{display}': {e}"))?;
+    // On unix the file is mapped; unlink it now so it is never exposed for a swap or left behind. On
+    // Windows the file is locked while loaded, so defer removal to `BackingFile`'s drop.
+    #[cfg(unix)]
+    let backing = {
+        let mut backing = backing;
+        if std::fs::remove_file(&path).is_ok() {
+            backing.already_unlinked = true;
+        }
+        backing
+    };
+    wire_up_store(lib, cfg_json, display.to_string(), Some(backing))
+}
+
+/// Write `bytes` to a fresh, private (owner-only), uniquely-named temp file and return its path plus a
+/// [`BackingFile`] guard that removes it on drop. `create_new` guarantees we never adopt a path an
+/// attacker pre-planted (the create fails if it already exists).
+fn write_private_temp(bytes: &[u8]) -> std::io::Result<(std::path::PathBuf, BackingFile)> {
+    use std::io::Write as _;
+    // A unique basename in the process temp dir. Uniqueness comes from pid + an atomic counter, so
+    // concurrent loads (multiple stores) never collide, and `create_new` fails closed if they did.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "busbar-plugin-{}-{}{}",
+        std::process::id(),
+        seq,
+        dylib_suffix()
+    );
+    let path = std::env::temp_dir().join(name);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o700);
+    }
+    let mut f = opts.open(&path)?;
+    f.write_all(bytes)?;
+    f.flush()?;
+    // Drop the handle so the file is closed before we `dlopen` it (Windows in particular dislikes an
+    // open writable handle racing the loader's read).
+    drop(f);
+    Ok((
+        path.clone(),
+        BackingFile {
+            path,
+            already_unlinked: false,
+        },
+    ))
+}
+
+/// The platform dynamic-library suffix, used only to give the staged temp file a plausible extension
+/// (some loaders key off it). Load correctness does not depend on it.
+fn dylib_suffix() -> &'static str {
+    if cfg!(target_os = "windows") {
+        ".dll"
+    } else if cfg!(target_os = "macos") {
+        ".dylib"
+    } else {
+        ".so"
+    }
+}
+
+/// Shared core: given an already-opened [`Library`], run the ABI handshake, resolve the operational
+/// symbols, call `open` with the config, and assemble the [`DynStore`]. `backing` is the temp-file
+/// guard for a from-bytes load (kept alive for the store's life), or `None` for a path load.
+fn wire_up_store(
+    lib: Library,
+    cfg_json: &str,
+    display: String,
+    backing: Option<BackingFile>,
+) -> Result<Box<dyn Store>, String> {
     // ── ABI handshake: refuse anything that isn't a matching-version busbar store plugin ──
     let abi_version = unsafe {
         let f = lib
@@ -301,6 +460,7 @@ pub fn load_store(lib_path: &Path, cfg_json: &str) -> Result<Box<dyn Store>, Str
         free,
         close,
         path: display,
+        _backing: backing,
         _lib: lib,
     }))
 }
@@ -552,5 +712,84 @@ mod tests {
     #[test]
     fn inventory_missing_dir_is_empty() {
         assert!(inventory(Path::new("/no/such/plugins/dir")).is_empty());
+    }
+
+    /// The response-length cap accepts a normal reply and REFUSES an over-cap length before any
+    /// allocation — defense-in-depth against a plugin declaring a huge `out_len` and OOMing the engine.
+    #[test]
+    fn response_len_cap_refuses_oversized() {
+        assert!(response_len_ok(0, "p").is_ok());
+        assert!(response_len_ok(1024, "p").is_ok());
+        assert!(
+            response_len_ok(MAX_PLUGIN_RESPONSE_LEN, "p").is_ok(),
+            "the exact cap is allowed"
+        );
+        let err = response_len_ok(MAX_PLUGIN_RESPONSE_LEN + 1, "sqlite").unwrap_err();
+        assert!(err.contains("oversized response"), "got {err}");
+        assert!(err.contains("sqlite"), "names the offending plugin: {err}");
+    }
+
+    /// TOCTOU-safe load: `load_store_from_bytes` loads EXACTLY the bytes handed to it — the same bytes
+    /// the caller hash/signature-verified — and exercises the store over the ABI to prove the load is
+    /// live. This is the path the engine boot uses so the verified bytes and the loaded bytes are one
+    /// and the same, with no path re-read in between.
+    #[test]
+    fn load_store_from_bytes_loads_the_given_bytes() {
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read sqlite cdylib");
+        let store =
+            load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "sqlite-from-bytes")
+                .expect("load from verified bytes");
+        let key = VirtualKey {
+            id: "vk_b".into(),
+            key_hash: "h".into(),
+            name: "b".into(),
+            allowed_pools: vec!["p".into()],
+            max_budget_cents: Some(1),
+            budget_period: "total".into(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 1,
+        };
+        store.put_key(&key).expect("put_key over from-bytes load");
+        assert_eq!(
+            store.get_key("vk_b").expect("get").expect("present").id,
+            "vk_b"
+        );
+    }
+
+    /// The TOCTOU guarantee, demonstrated end-to-end: verify a set of bytes, then SWAP the on-disk file
+    /// at the original path for hostile content — and the from-bytes load is UNAFFECTED, because it
+    /// never re-reads that path. Under the old `verify(path)` + `load_store(path)` shape this swap would
+    /// have loaded the attacker's file; here the loaded library is the verified `bytes`, full stop.
+    #[test]
+    fn on_disk_swap_after_verify_does_not_change_what_loads() {
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        // "Verify" step: read the good bytes (in the engine these are hash/signature-checked here).
+        let verified = std::fs::read(&path).expect("read good cdylib");
+
+        // Attacker swaps the file at `path` for junk AFTER we verified — a classic TOCTOU swap.
+        let dir = std::env::temp_dir().join(format!("busbar-toctou-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join(plugin_library_filename("busbar_store_sqlite_plugin"));
+        std::fs::write(&victim, &verified).unwrap();
+        // Confirm loading the victim PATH would pick up whatever is on disk...
+        std::fs::write(&victim, b"\x7fELF hostile junk, not a plugin").unwrap();
+        assert!(
+            load_store(&victim, r#"{"db_path": ":memory:"}"#).is_err(),
+            "the swapped-in junk is not a loadable plugin (path load sees the swap)"
+        );
+        // ...but the from-bytes load, fed the bytes we verified BEFORE the swap, loads fine.
+        let store = load_store_from_bytes(&verified, r#"{"db_path": ":memory:"}"#, "toctou")
+            .expect("verified bytes still load despite the on-disk swap");
+        assert!(store.list_keys().expect("list over the ABI").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
