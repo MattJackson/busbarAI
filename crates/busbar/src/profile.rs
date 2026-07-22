@@ -98,6 +98,14 @@ impl Stage {
 /// Number of `Stage` variants (the bucket-array length). Must equal the number of enum arms above.
 const STAGE_COUNT: usize = 13;
 
+/// Per-stage sample CAP. Buckets are bounded so a long-lived enabled binary cannot grow them without
+/// limit (and re-sort an ever-larger `Vec` under the global `Mutex` on every [`dump`]). Once a bucket
+/// is full, further samples are admitted by RESERVOIR sampling (see [`Bucket::record`]) so the retained
+/// set stays a uniform sample of ALL observations — p50/p99 remain representative rather than being
+/// biased toward the first N. 4096 u32s per stage is ~16 KiB/stage, ~208 KiB across all stages: plenty
+/// for stable percentiles, trivially bounded memory. This is a dev-only tool; the cap is a safety net.
+const BUCKET_CAP: usize = 4096;
+
 /// One-shot env read: profiling is ON iff `BUSBAR_PROFILE` is present (any value) in the environment.
 /// Read exactly once and cached in an `AtomicBool` so the hot-path check is a single relaxed load.
 fn enabled_cell() -> &'static AtomicBool {
@@ -112,13 +120,65 @@ pub(crate) fn enabled() -> bool {
     enabled_cell().load(Ordering::Relaxed)
 }
 
-/// Per-stage sample store. Each bucket is a `Vec<u32>` of per-record nanosecond durations; a
-/// `u32` holds up to ~4.29 s, far beyond any per-stage in-process span. Behind a single `Mutex` —
-/// the profiler is a single-threaded measurement tool (the capture test drives one request at a
-/// time), so contention is nil; the lock is only ever taken on the enabled path.
-fn buckets() -> &'static Mutex<Vec<Vec<u32>>> {
-    static BUCKETS: OnceLock<Mutex<Vec<Vec<u32>>>> = OnceLock::new();
-    BUCKETS.get_or_init(|| Mutex::new(vec![Vec::new(); STAGE_COUNT]))
+/// One stage's bounded sample store: up to [`BUCKET_CAP`] retained nanosecond durations plus a count
+/// of ALL observations ever offered (`seen`). A `u32` holds up to ~4.29 s, far beyond any per-stage
+/// in-process span. Bounding the retained `Vec` keeps memory and the per-[`dump`] sort cost fixed no
+/// matter how long the (enabled) binary runs; `seen` drives the reservoir admission below.
+#[derive(Default)]
+struct Bucket {
+    samples: Vec<u32>,
+    /// Total number of samples ever offered to this bucket (NOT the retained length). Reported by
+    /// [`dump`] as `n=` so the report still reflects the true observation count, and used as the
+    /// running index for Algorithm-R reservoir replacement once the bucket is full.
+    seen: u64,
+}
+
+impl Bucket {
+    /// Admit one sample under a fixed [`BUCKET_CAP`] via Algorithm-R reservoir sampling: while below
+    /// the cap, append; once full, replace a uniformly random existing slot with probability
+    /// `cap / seen`. This keeps `samples` a uniform random subset of all observations, so p50/p99 stay
+    /// representative rather than frozen to the first `cap` samples. No allocation once the cap is hit.
+    fn record(&mut self, n: u32) {
+        self.seen += 1;
+        if self.samples.len() < BUCKET_CAP {
+            self.samples.push(n);
+            return;
+        }
+        // Full: replace slot j (0..seen) with prob cap/seen — i.e. keep only when j < cap.
+        let j = next_rand() % self.seen;
+        if let Some(slot) = usize::try_from(j)
+            .ok()
+            .and_then(|j| self.samples.get_mut(j))
+        {
+            *slot = n;
+        }
+    }
+}
+
+/// Cheap process-local xorshift64* PRNG for reservoir admission. Deterministic seed is fine: the goal
+/// is a uniform sample, not cryptographic randomness, and this path is dev-only and single-purpose.
+/// Behind the global bucket `Mutex` (record is the only caller), so the non-atomic state is safe.
+fn next_rand() -> u64 {
+    static STATE: OnceLock<Mutex<u64>> = OnceLock::new();
+    let mut s = STATE
+        .get_or_init(|| Mutex::new(0x9E37_79B9_7F4A_7C15))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut x = *s;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *s = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+/// Per-stage sample store. Behind a single `Mutex` — the profiler is a single-threaded measurement
+/// tool (the capture test drives one request at a time), so contention is nil; the lock is only ever
+/// taken on the enabled path. Buckets are bounded (see [`BUCKET_CAP`]) so a long-running enabled
+/// binary cannot grow them without limit.
+fn buckets() -> &'static Mutex<Vec<Bucket>> {
+    static BUCKETS: OnceLock<Mutex<Vec<Bucket>>> = OnceLock::new();
+    BUCKETS.get_or_init(|| Mutex::new((0..STAGE_COUNT).map(|_| Bucket::default()).collect()))
 }
 
 /// Record `nanos` into `stage`'s bucket. No-op when profiling is disabled.
@@ -129,7 +189,7 @@ pub(crate) fn record(stage: Stage, nanos: u64) {
     }
     let n = u32::try_from(nanos).unwrap_or(u32::MAX);
     let mut b = buckets().lock().unwrap_or_else(|p| p.into_inner());
-    b[stage.idx()].push(n);
+    b[stage.idx()].record(n);
 }
 
 /// A running stage timer: records its elapsed time into `stage` when dropped. Cheap to construct even
@@ -200,25 +260,84 @@ pub(crate) fn dump() {
         Stage::Finish,
     ];
     for stage in stages {
-        let samples = &mut b[stage.idx()];
+        let bucket = &mut b[stage.idx()];
+        let samples = &mut bucket.samples;
         if samples.is_empty() {
             continue;
         }
         samples.sort_unstable();
-        let n = samples.len();
+        // `retained` drives the percentile math; `seen` is the TRUE observation count reported as `n=`
+        // (they diverge once the bucket saturates and reservoir sampling kicks in).
+        let retained = samples.len();
+        let seen = bucket.seen;
         let sum: u64 = samples.iter().map(|&x| x as u64).sum();
-        let mean_us = (sum as f64 / n as f64) / 1000.0;
+        let mean_us = (sum as f64 / retained as f64) / 1000.0;
         let pct = |p: f64| -> f64 {
-            let i = (((n - 1) as f64) * p).round() as usize;
+            let i = (((retained - 1) as f64) * p).round() as usize;
             samples[i] as f64 / 1000.0
         };
         eprintln!(
             "BUSBAR_PROFILE stage={} n={} mean={:.3} p50={:.3} p99={:.3}",
             stage.name(),
-            n,
+            seen,
             mean_us,
             pct(0.50),
             pct(0.99),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_is_bounded_and_tracks_true_count() {
+        // Offer far more samples than the cap; the retained set must never exceed BUCKET_CAP, but the
+        // `seen` count must reflect EVERY observation (so the report's `n=` stays truthful).
+        let mut b = Bucket::default();
+        let offered = BUCKET_CAP * 4 + 123;
+        for i in 0..offered {
+            b.record(i as u32);
+        }
+        assert_eq!(
+            b.samples.len(),
+            BUCKET_CAP,
+            "retained samples must be capped at BUCKET_CAP, not grow unbounded"
+        );
+        assert_eq!(
+            b.seen, offered as u64,
+            "seen must count all offered samples, not just the retained ones"
+        );
+    }
+
+    #[test]
+    fn bucket_under_cap_keeps_everything() {
+        // Below the cap it behaves exactly like the old unbounded Vec: every sample retained, in order.
+        let mut b = Bucket::default();
+        for i in 0..10u32 {
+            b.record(i);
+        }
+        assert_eq!(b.samples.len(), 10);
+        assert_eq!(b.seen, 10);
+        assert_eq!(b.samples, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reservoir_stays_representative_of_the_range() {
+        // Reservoir sampling keeps a uniform subset, so the retained min/max should still span most of
+        // the offered range (a first-N cap would freeze the max near BUCKET_CAP). Feed a large ramp and
+        // check the retained max lands in the upper reaches — a smoke test that late samples are admitted.
+        let mut b = Bucket::default();
+        let offered = BUCKET_CAP * 10;
+        for i in 0..offered {
+            b.record(i as u32);
+        }
+        let max = *b.samples.iter().max().unwrap();
+        assert!(
+            max as usize > offered / 2,
+            "reservoir must admit late/high samples (max {max} should exceed half of {offered}); a \
+             first-N cap would freeze the retained max near BUCKET_CAP"
         );
     }
 }

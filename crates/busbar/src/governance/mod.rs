@@ -533,11 +533,29 @@ pub(crate) fn spawn_budget_flusher(
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
-                    gov.flush_budgets();
+                    // `flush_budgets` runs SYNCHRONOUS SQLite writes (store `*_inner` on a std Mutex);
+                    // calling it inline here would block a Tokio worker thread for the duration of the
+                    // durable write. Offload to the blocking pool so the async runtime keeps serving
+                    // requests. `gov` is an Arc, so clone the handle into the blocking task; we do not
+                    // await the join (write-behind is fire-and-forget - a store error re-marks the cell
+                    // dirty and the next tick retries).
+                    let gov = gov.clone();
+                    tokio::task::spawn_blocking(move || {
+                        gov.flush_budgets();
+                    });
                 }
                 _ = shutdown.recv() => {
                     // Graceful shutdown: one FINAL flush so no accrued spend/requests is lost, then exit.
-                    gov.flush_budgets();
+                    // This one is AWAITED (via spawn_blocking + join) rather than fire-and-forget: the
+                    // task is about to break and stop ticking, so the final durable write must COMPLETE
+                    // before we exit or the last window's accrued spend is lost. It still runs on the
+                    // blocking pool (not inline on the worker), and a join error falls back to nothing
+                    // flushed - best-effort, matching the periodic path.
+                    let gov = gov.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        gov.flush_budgets();
+                    })
+                    .await;
                     break;
                 }
             }

@@ -332,33 +332,39 @@ where
                             error = %e,
                             "pre-first-byte upstream transport error; terminating body stream generically"
                         );
-                        // Mid-BODY transport failure AFTER the first byte on a NON-SSE same-protocol
-                        // passthrough (e.g. OpenAI→OpenAI /chat/completions, content-type
-                        // application/json): the 2xx headers already recorded an optimistic breaker
-                        // SUCCESS (via `record_success_in`), but the body never arrived intact, so that
-                        // success is wrong — exactly the case the SSE if-branch above and BOTH buffered
-                        // `ReadEnd::TransportError` paths compensate. The SSE
-                        // branch couldn't fire here (this path is reached only when `!this.is_sse`), and
-                        // without this the optimistic success is NEVER reversed → repeated mid-body
-                        // failures accumulate as successes and the lane never trips. Record a compensating
-                        // transient. Gate on `had_first`: a PRE-first-byte failure (had_first == false) is
-                        // the original symmetric-with-#21 refund-only case (no streamed body content was
-                        // ever emitted to the client) and must NOT additionally record a transient — that
-                        // would be a sibling over-broad fix. Only a post-first-byte mid-body failure both
-                        // refunds budget AND records the failed transfer.
-                        if had_first {
-                            if let Some(ref app) = this.app {
-                                let tripped = app.store.record_transient_in(
-                                    &this.pool,
-                                    this.lane_idx,
-                                    "mid-body-transport",
-                                    &this.breaker_cfg,
-                                    None,
-                                );
-                                // A threshold-based Closed→Open trip here is a breaker trip (#29).
-                                if tripped {
-                                    emit_breaker_trip(app, &this.pool, this.lane_idx);
-                                }
+                        // Transport failure on the streaming path — reached for a PRE-first-byte failure
+                        // (either SSE or non-SSE) and for a post-first-byte NON-SSE mid-body failure
+                        // (the post-first-byte SSE case is handled by the if-branch above). In ALL of
+                        // these the 2xx headers already recorded an optimistic breaker SUCCESS (via
+                        // `record_success_in`), but the response never arrived intact, so that success is
+                        // wrong. Record a COMPENSATING transient so the failure counts against the lane.
+                        //
+                        // P2 #2 FIX: this transient is now recorded UNCONDITIONALLY on the transport
+                        // failure — it is NO LONGER gated on `had_first`. Previously a pre-first-byte
+                        // failure recorded nothing (treated as "refund-only, no body content emitted"),
+                        // which meant a lane that connects, returns headers, then dies before the first
+                        // byte on EVERY attempt kept accruing optimistic successes and NEVER tripped its
+                        // circuit breaker — traffic pinned to a black-hole lane. A pre-first-byte
+                        // transport death IS a lane fault (the connection was accepted then broke with
+                        // zero usable bytes), exactly like the buffered `ReadEnd::TransportError` paths,
+                        // which already record a transient with no first-byte gate. Budget is still
+                        // refunded below (no usable response was delivered); the two are independent.
+                        if let Some(ref app) = this.app {
+                            let what = if had_first {
+                                "mid-body-transport"
+                            } else {
+                                "pre-first-byte-transport"
+                            };
+                            let tripped = app.store.record_transient_in(
+                                &this.pool,
+                                this.lane_idx,
+                                what,
+                                &this.breaker_cfg,
+                                None,
+                            );
+                            // A threshold-based Closed→Open trip here is a breaker trip (#29).
+                            if tripped {
+                                emit_breaker_trip(app, &this.pool, this.lane_idx);
                             }
                         }
                         // Symmetric with the buffered `ReadEnd::TransportError` path (#21): the 2xx

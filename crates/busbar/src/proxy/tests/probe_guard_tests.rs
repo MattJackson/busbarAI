@@ -58,6 +58,7 @@ fn dropping_armed_guard_releases_probe() {
             pool: "",
             lane: 0,
             armed: true,
+            probe_epoch: store.probe_epoch_in("", 0),
         };
         // guard drops here (simulating the dropped `pick_among` future).
     }
@@ -79,6 +80,7 @@ fn disarmed_guard_leaves_probe_held() {
             pool: "",
             lane: 0,
             armed: true,
+            probe_epoch: store.probe_epoch_in("", 0),
         };
         guard.armed = false; // the try_acquire / Ok(Ok(permit)) dispatch paths disarm before return.
                              // guard drops here as a no-op.
@@ -86,5 +88,42 @@ fn disarmed_guard_leaves_probe_held() {
     assert!(
         matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
         "a disarmed guard must NOT release the probe — the owning dispatched request holds it"
+    );
+}
+
+/// REGRESSION (P2 #4): a STALLED armed guard — one that won an earlier probe, then dropped LATE after
+/// the cell already recorded an outcome AND a NEW probe was won — must NOT revert the fresh winner's
+/// probe. Its owner-checked Drop keys on the epoch captured at acquisition, so once that epoch is
+/// superseded the release is a strict no-op and the current probe owner keeps its HalfOpen cell.
+#[test]
+fn stalled_guard_does_not_release_a_newer_probe() {
+    let store = Arc::new(InMemoryStore::new(vec![lane(1)]));
+    // Guard A wins the first probe and captures its (older) epoch.
+    win_probe(&store);
+    let guard_a = ProbeGuard {
+        store: store.as_ref(),
+        pool: "",
+        lane: 0,
+        armed: true,
+        probe_epoch: store.probe_epoch_in("", 0),
+    };
+    // The probe A won is CONSUMED by a recorded outcome (success → cell_closed), then the lane trips
+    // Open and expires again so a fresh probe can be won — bumping the epoch past A's captured value.
+    store.record_success_in("", 0);
+    store.force_open_in("", 0, 0);
+    assert!(
+        store.acquire_for_dispatch_in("", 0, crate::store::now().saturating_add(86_400)),
+        "a NEW probe must be won on the re-opened lane"
+    );
+    assert!(
+        matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
+        "precondition: the fresh probe leaves the cell HalfOpen"
+    );
+    // Now the STALE guard A finally drops (late). With the owner check it must be a no-op.
+    drop(guard_a);
+    assert!(
+        matches!(store.breaker_state_in("", 0), BreakerState::HalfOpen),
+        "a stalled guard from a superseded probe must NOT revert the current probe owner's HalfOpen \
+         cell — the owner check makes its late Drop a no-op"
     );
 }

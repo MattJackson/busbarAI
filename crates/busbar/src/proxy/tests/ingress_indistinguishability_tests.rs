@@ -2356,6 +2356,7 @@ async fn test_unparseable_json_400_carries_no_serde_internals() {
 #[tokio::test]
 async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
     use super::FirstByteBody;
+    use crate::store::{BreakerCfg, BreakerState, TripConfig, TripMode};
     use bytes::Bytes;
     use futures::StreamExt as _;
 
@@ -2395,6 +2396,23 @@ async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
     let inner = Box::pin(futures::stream::once(async move {
         Err::<Bytes, reqwest::Error>(reqwest_err)
     }));
+    // The 2xx headers recorded an optimistic breaker SUCCESS; simulate that so the pre-first-byte
+    // failure below has something to reverse (P2 #2). A consecutive n:1 trip config makes one
+    // recorded transient observable as Closed→Open.
+    app.store.record_success_in("p", 0);
+    let breaker_cfg = std::sync::Arc::new(BreakerCfg {
+        trip: TripConfig {
+            mode: TripMode::Consecutive,
+            consecutive_n: 1,
+            ..TripConfig::default()
+        },
+        ..BreakerCfg::default()
+    });
+    assert!(
+        matches!(app.store.breaker_state_in("p", 0), BreakerState::Closed),
+        "precondition: the pool cell is Closed after the optimistic success"
+    );
+
     let body = FirstByteBody::new(
         inner,
         true, // is_sse: streaming path
@@ -2403,7 +2421,7 @@ async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
         (), // permit: a unit placeholder is sufficient for the Stream bounds
         app.clone(),
         0,
-        std::sync::Arc::new(crate::store::BreakerCfg::default()),
+        breaker_cfg,
         "p",
         None,
         None,
@@ -2425,6 +2443,101 @@ async fn test_streaming_pre_first_byte_transport_error_refunds_budget() {
         app.store.spend_budget(0),
         "streaming pre-first-byte transport failure must refund the spent budget unit (MED #3)"
     );
+
+    // P2 #2: the pre-first-byte transport failure must ALSO record a breaker transient, reversing
+    // the optimistic 2xx success and tripping the cell Closed→Open. Before the fix the transient
+    // was gated on `had_first` and this stayed Closed — a lane that always fails before the first
+    // byte would never trip.
+    assert!(
+        matches!(
+            app.store.breaker_state_in("p", 0),
+            BreakerState::Open { .. }
+        ),
+        "pre-first-byte transport failure must record a breaker transient (P2 #2)"
+    );
+}
+
+/// REGRESSION (P2 #2): a lane whose upstream connects and returns 2xx headers but then dies BEFORE
+/// the first streamed byte on EVERY attempt must still trip its circuit breaker. Each pre-first-byte
+/// transport failure now records a breaker transient (no longer gated on `had_first`), so REPEATED
+/// pre-first-byte failures accumulate toward the trip threshold instead of silently recording
+/// nothing. This drives a cell to Open after the configured number of consecutive pre-first-byte
+/// failures. (Isolating the transient count — no intervening headers-success — so the consecutive
+/// streak reflects exactly the pre-first-byte failures: the point is that they ARE counted at all,
+/// which before the fix they were not.)
+#[tokio::test]
+async fn test_repeated_pre_first_byte_failures_trip_breaker() {
+    use super::FirstByteBody;
+    use crate::store::{BreakerCfg, BreakerState, TripConfig, TripMode};
+    use bytes::Bytes;
+    use futures::StreamExt as _;
+
+    let app = TestApp::new()
+        .lane(LaneSpec::new(
+            "m",
+            crate::proto::Protocol::anthropic(),
+            "http://127.0.0.1:1",
+        ))
+        .pool("p", &[(0, 1)])
+        .build();
+
+    // Trip only after 3 consecutive failures, so we can watch the cell stay Closed for the first
+    // two pre-first-byte failures and flip to Open on the third — proving each one is counted.
+    let breaker_cfg = std::sync::Arc::new(BreakerCfg {
+        trip: TripConfig {
+            mode: TripMode::Consecutive,
+            consecutive_n: 3,
+            ..TripConfig::default()
+        },
+        ..BreakerCfg::default()
+    });
+
+    for attempt in 1..=3u32 {
+        // The upstream dies before the first byte. A fresh connect-refused error is the pre-first-
+        // byte failure shape.
+        let reqwest_err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/never")
+            .send()
+            .await
+            .expect_err("connect to a closed port must fail");
+        let inner = Box::pin(futures::stream::once(async move {
+            Err::<Bytes, reqwest::Error>(reqwest_err)
+        }));
+        let body = FirstByteBody::new(
+            inner,
+            true, // is_sse
+            "anthropic",
+            crate::handlers::CHAT,
+            (),
+            app.clone(),
+            0,
+            breaker_cfg.clone(),
+            "p",
+            None,
+            None,
+            None,
+            false, // no budget spent on this unlimited lane
+        );
+        futures::pin_mut!(body);
+        let item = body.next().await;
+        assert!(
+            matches!(item, Some(Err(_))),
+            "attempt {attempt}: pre-first-byte failure terminates the body with an error"
+        );
+
+        if attempt < 3 {
+            assert!(
+                matches!(app.store.breaker_state_in("p", 0), BreakerState::Closed),
+                "attempt {attempt}: below the threshold the cell stays Closed but the failure is \
+                 counted"
+            );
+        } else {
+            assert!(
+                matches!(app.store.breaker_state_in("p", 0), BreakerState::Open { .. }),
+                "the 3rd consecutive pre-first-byte failure must trip the breaker Closed→Open (P2 #2)"
+            );
+        }
+    }
 }
 
 /// REGRESSION (R25 MED #1, breaker symmetry): on a NON-SSE same-protocol passthrough (e.g.

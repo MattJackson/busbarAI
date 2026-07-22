@@ -290,6 +290,15 @@ pub(crate) trait StateStore: Send + Sync + 'static {
     /// re-win the probe. No-op when the cell is no longer HalfOpen (a concurrent success/failure
     /// already transitioned it) or when the probe flag was already clear.
     fn release_probe_in(&self, pool: &str, lane: usize);
+    /// Read a (pool, lane) cell's current single-flight probe epoch (owner token). A probe winner
+    /// captures this immediately after `acquire_for_dispatch_in` succeeds and later passes it to
+    /// `release_probe_owned_in` so a STALLED, late release cannot revert a newer probe (P2 #4).
+    fn probe_epoch_in(&self, pool: &str, lane: usize) -> u64;
+    /// OWNER-CHECKED variant of `release_probe_in`: reverts the undispatched probe ONLY when the cell's
+    /// probe epoch still equals `owned_epoch`. Used by the `ProbeGuard` drop path (the one release site
+    /// that can outlive its acquisition across an await, so the one that can be stale). A strict no-op
+    /// when the epoch has moved on — the probe we won was already consumed or superseded.
+    fn release_probe_owned_in(&self, pool: &str, lane: usize, owned_epoch: u64);
     // The bare lane-default breaker mutators below are exercised by the unit tests; in release,
     // ALL dispatch (including the degraded `forward_once` fallback/least-bad path) now routes through
     // the `_in(pool, …)` variants against the ROUTING POOL cell — recording on the default `""` cell

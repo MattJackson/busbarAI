@@ -59,6 +59,15 @@ pub(crate) struct BreakerCell {
     pub(crate) streak: AtomicU32,
     pub(crate) cooldown_until: AtomicU64,
     pub(crate) probe_in_flight: AtomicBool,
+    // MONOTONIC single-flight probe generation, bumped each time a probe is WON (Open→HalfOpen CAS in
+    // `cell_acquire_breaker`). It is the probe's OWNER TOKEN: the winner captures the post-bump value
+    // and passes it back to `cell_release_probe`, which reverts the cell ONLY if the epoch still
+    // matches. Without it, a stalled undispatched-probe release (a `ProbeGuard` dropped LATE, after the
+    // cell already recorded an outcome AND a NEW probe was won) would CAS the fresh winner's HalfOpen
+    // back to Open and clear its `probe_in_flight`, so a third caller could win a DUPLICATE concurrent
+    // probe on a lane already being probed. Benign (an extra recovery probe, no correctness loss) but
+    // real; the epoch check makes release a strict no-op for any but the current probe owner.
+    pub(crate) probe_epoch: AtomicU64,
     pub(crate) err: AtomicU64,
     pub(crate) outcome_window: std::sync::Mutex<OutcomeWindow>,
     pub(crate) current_weight: AtomicI64, // SWRR state (per pool — selection runs over a pool's set)
@@ -157,6 +166,7 @@ impl BreakerCell {
             streak: AtomicU32::new(0),
             cooldown_until: AtomicU64::new(0),
             probe_in_flight: AtomicBool::new(false),
+            probe_epoch: AtomicU64::new(0),
             err: AtomicU64::new(0),
             outcome_window: std::sync::Mutex::new(OutcomeWindow::new(OUTCOME_WINDOW_CAPACITY)),
             current_weight: AtomicI64::new(0),
@@ -172,6 +182,8 @@ pub(crate) trait BreakerCellAccess {
     fn streak(&self) -> &AtomicU32;
     fn cooldown_until(&self) -> &AtomicU64;
     fn probe_in_flight(&self) -> &AtomicBool;
+    /// Monotonic single-flight probe owner token (see `BreakerCell::probe_epoch`).
+    fn probe_epoch(&self) -> &AtomicU64;
     fn err(&self) -> &AtomicU64;
     fn outcome_window(&self) -> &std::sync::Mutex<OutcomeWindow>;
     fn current_weight(&self) -> &AtomicI64;
@@ -191,6 +203,9 @@ impl BreakerCellAccess for BreakerCell {
     }
     fn probe_in_flight(&self) -> &AtomicBool {
         &self.probe_in_flight
+    }
+    fn probe_epoch(&self) -> &AtomicU64 {
+        &self.probe_epoch
     }
     fn err(&self) -> &AtomicU64 {
         &self.err
@@ -218,6 +233,9 @@ impl BreakerCellAccess for LaneState {
     }
     fn probe_in_flight(&self) -> &AtomicBool {
         &self.probe_in_flight
+    }
+    fn probe_epoch(&self) -> &AtomicU64 {
+        &self.probe_epoch
     }
     fn err(&self) -> &AtomicU64 {
         &self.err
@@ -328,6 +346,8 @@ pub(crate) struct LaneState {
     // FSM state per lane
     pub(crate) breaker_state: AtomicU64, // stored as u64 (ST_CLOSED/ST_OPEN/ST_HALF_OPEN) so it can be CAS'd
     pub(crate) probe_in_flight: AtomicBool,
+    // Single-flight probe owner token — see `BreakerCell::probe_epoch`.
+    pub(crate) probe_epoch: AtomicU64,
     // SWRR state per lane
     pub(crate) current_weight: AtomicI64,
     pub(crate) cooldown_until: AtomicU64,
@@ -411,6 +431,7 @@ impl InMemoryStore {
                     client_fault: AtomicU64::new(ld.client_fault),
                     breaker_state: AtomicU64::new(ST_CLOSED),
                     probe_in_flight: AtomicBool::new(false),
+                    probe_epoch: AtomicU64::new(0),
                     outcome_window: std::sync::Mutex::new(OutcomeWindow::new(
                         OUTCOME_WINDOW_CAPACITY,
                     )),
@@ -867,6 +888,31 @@ impl InMemoryStore {
         c.probe_in_flight().store(false, Ordering::Release);
     }
 
+    /// OWNER-CHECKED probe release: the same revert as [`cell_release_probe`], but a strict NO-OP
+    /// unless `owned_epoch` still equals the cell's current `probe_epoch`. This closes the stalled-
+    /// release duplication (P2 finding #4): a `ProbeGuard` can outlive its acquisition across the
+    /// permit-wait await, so it may drop LATE — after the cell already recorded an outcome (advancing
+    /// past the probe) and a NEW probe was won (bumping the epoch). The un-owned `cell_release_probe`
+    /// would then CAS the FRESH winner's HalfOpen back to Open and clear its `probe_in_flight`, letting
+    /// a third caller win a duplicate concurrent probe on an already-probing lane. Checking the epoch
+    /// under the transition lock — the epoch is bumped under the same lock in `cell_acquire_breaker` —
+    /// makes a late release affect only the probe it actually won, and nothing once that probe is gone.
+    pub(crate) fn cell_release_probe_owned(c: &dyn BreakerCellAccess, owned_epoch: u64) {
+        let _tx = lock_recover(c.transition_lock());
+        // Not (still) the owner: the probe we won has already been consumed/superseded. Do nothing —
+        // reverting here would clobber whatever transition or newer probe now holds the cell.
+        if c.probe_epoch().load(Ordering::Acquire) != owned_epoch {
+            return;
+        }
+        let _ = c.breaker_state().compare_exchange(
+            ST_HALF_OPEN,
+            ST_OPEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        c.probe_in_flight().store(false, Ordering::Release);
+    }
+
     /// Side-effect-FREE readiness check (the breaker portion of `usable`): true if the cell would
     /// admit a request right now, WITHOUT mutating any state. Closed honors any pending cooldown; an
     /// Open lane whose cooldown has expired is "ready" (a probe could be admitted) but is NOT yet
@@ -937,6 +983,12 @@ impl InMemoryStore {
                         )
                         .is_ok()
                     {
+                        // Won the single-flight probe: bump the owner-token epoch BEFORE publishing the
+                        // in-flight flag. The winner will read `probe_epoch` (synchronously, before any
+                        // await — the cell is HalfOpen so no peer can win a new probe in between) and
+                        // pass it to `cell_release_probe_owned`, which reverts ONLY on an epoch match.
+                        // Bumping under the transition lock keeps it paired with the state store.
+                        c.probe_epoch().fetch_add(1, Ordering::AcqRel);
                         c.probe_in_flight().store(true, Ordering::Release);
                         true
                     } else {
@@ -1693,6 +1745,14 @@ impl StateStore for InMemoryStore {
         Self::cell_release_probe(self.cell(pool, lane).as_ref());
     }
 
+    fn probe_epoch_in(&self, pool: &str, lane: usize) -> u64 {
+        self.cell(pool, lane).probe_epoch().load(Ordering::Acquire)
+    }
+
+    fn release_probe_owned_in(&self, pool: &str, lane: usize, owned_epoch: u64) {
+        Self::cell_release_probe_owned(self.cell(pool, lane).as_ref(), owned_epoch);
+    }
+
     #[cfg(test)]
     fn breaker_state(&self, lane: usize) -> BreakerState {
         self.breaker_state_for("", lane)
@@ -2079,42 +2139,71 @@ impl StateStore for InMemoryStore {
         self.lanes
             .iter()
             .enumerate()
-            .map(|(idx, ls)| LaneHealthSnapshot {
-                model: ls.model.clone(),
-                provider: ls.provider.clone(),
-                budget: if ls.limited {
-                    ls.budget.load(Ordering::Relaxed)
-                } else {
-                    -1
-                },
-                breaker_state: ls.breaker_state.load(Ordering::Relaxed),
-                cooldown_until: ls.cooldown_until.load(Ordering::Relaxed),
-                streak: ls.streak.load(Ordering::Relaxed),
-                dead: ls.dead.load(Ordering::Relaxed),
-                dead_reason: lock_recover(&ls.dead_reason).clone(),
-                ok: ls.ok.load(Ordering::Relaxed),
-                err: ls.err.load(Ordering::Relaxed),
-                client_fault: ls.client_fault.load(Ordering::Relaxed),
-                latency_ewma_bits: ls.latency_ewma_bits.load(Ordering::Relaxed),
-                trips: ls.trips.load(Ordering::Relaxed),
-                last_trip_at: ls.last_trip_at.load(Ordering::Relaxed),
-                cells: {
-                    let map = self.pool_cells.read().unwrap_or_else(|e| e.into_inner());
-                    map.get(&idx)
-                        .map(|cells| {
-                            cells
-                                .iter()
-                                .map(|(pool, cell)| PoolCellHealthSnapshot {
-                                    pool: pool.to_string(),
-                                    breaker_state: cell.breaker_state.load(Ordering::Relaxed),
-                                    cooldown_until: cell.cooldown_until.load(Ordering::Relaxed),
-                                    streak: cell.streak.load(Ordering::Relaxed),
-                                    err: cell.err.load(Ordering::Relaxed),
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                },
+            .map(|(idx, ls)| {
+                // Read (breaker_state, cooldown_until) as a CONSISTENT PAIR under a SINGLE hold of the
+                // transition lock. They are two separate atomics that a trip/close/probe writes
+                // together; a lock-free pair of loads can straddle a concurrent transition and observe
+                // an INCONSISTENT pair (e.g. Open with a cleared/short cooldown), which this snapshot
+                // then PERSISTS — on restore a hard-down lane would be revived as receiving traffic.
+                // Holding the same lock the write path holds, for BOTH loads at once, makes the pair
+                // move as a unit (P2 finding #5). Released immediately; the remaining fields are
+                // independent counters with no cross-field invariant.
+                let (breaker_state, cooldown_until) = {
+                    let _tx = lock_recover(&ls.transition_lock);
+                    (
+                        ls.breaker_state.load(Ordering::Relaxed),
+                        ls.cooldown_until.load(Ordering::Relaxed),
+                    )
+                };
+                LaneHealthSnapshot {
+                    model: ls.model.clone(),
+                    provider: ls.provider.clone(),
+                    budget: if ls.limited {
+                        ls.budget.load(Ordering::Relaxed)
+                    } else {
+                        -1
+                    },
+                    breaker_state,
+                    cooldown_until,
+                    streak: ls.streak.load(Ordering::Relaxed),
+                    dead: ls.dead.load(Ordering::Relaxed),
+                    dead_reason: lock_recover(&ls.dead_reason).clone(),
+                    ok: ls.ok.load(Ordering::Relaxed),
+                    err: ls.err.load(Ordering::Relaxed),
+                    client_fault: ls.client_fault.load(Ordering::Relaxed),
+                    latency_ewma_bits: ls.latency_ewma_bits.load(Ordering::Relaxed),
+                    trips: ls.trips.load(Ordering::Relaxed),
+                    last_trip_at: ls.last_trip_at.load(Ordering::Relaxed),
+                    cells: {
+                        let map = self.pool_cells.read().unwrap_or_else(|e| e.into_inner());
+                        map.get(&idx)
+                            .map(|cells| {
+                                cells
+                                    .iter()
+                                    .map(|(pool, cell)| {
+                                        // Same consistent-pair read as the default cell above — the
+                                        // per-pool cell's (state, cooldown) is written together under its
+                                        // own transition lock, so snapshot both under one hold (P2 #5).
+                                        let (breaker_state, cooldown_until) = {
+                                            let _tx = lock_recover(&cell.transition_lock);
+                                            (
+                                                cell.breaker_state.load(Ordering::Relaxed),
+                                                cell.cooldown_until.load(Ordering::Relaxed),
+                                            )
+                                        };
+                                        PoolCellHealthSnapshot {
+                                            pool: pool.to_string(),
+                                            breaker_state,
+                                            cooldown_until,
+                                            streak: cell.streak.load(Ordering::Relaxed),
+                                            err: cell.err.load(Ordering::Relaxed),
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    },
+                }
             })
             .collect()
     }

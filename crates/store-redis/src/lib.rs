@@ -373,14 +373,26 @@ impl Store for RedisStore {
 mod tests {
     use super::*;
 
-    /// End-to-end against a REAL Redis, gated on `REDIS_URL` (e.g. a docker `redis:7` in CI). Skips
-    /// cleanly when unset so the default `cargo test` needs no server — untestable locally without a
-    /// live Redis, exactly like the Postgres backend's `BUSBAR_TEST_POSTGRES_URL` gate.
+    /// End-to-end against a REAL Redis, gated on `REDIS_URL` (a docker `redis:7` service in CI).
+    /// Skips cleanly when unset LOCALLY so the default `cargo test` needs no server — but MUST NOT
+    /// silently skip in CI: CI provisions the service and sets `REDIS_URL` (see
+    /// .github/workflows/ci.yml), so when `CI` is set the missing URL is a HARD FAILURE rather than a
+    /// silent skip (P1 #6 — same discipline as the Postgres backend's `BUSBAR_TEST_POSTGRES_URL`).
     #[test]
     fn roundtrip_against_live_redis() {
-        let Ok(url) = std::env::var("REDIS_URL") else {
-            eprintln!("skip: set REDIS_URL to run the Redis store test");
-            return;
+        let url = match std::env::var("REDIS_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var_os("CI").is_some() => {
+                panic!(
+                    "REDIS_URL is unset under CI: the Redis service container must provision it (see \
+                     .github/workflows/ci.yml). Refusing to silently skip the only live-DB coverage \
+                     in CI."
+                );
+            }
+            Err(_) => {
+                eprintln!("skip: set REDIS_URL to run the Redis store test");
+                return;
+            }
         };
         let store = RedisStore::connect(&url).expect("connect");
         // Isolate from any prior run.
@@ -455,9 +467,34 @@ mod tests {
         assert_eq!((audit[0].seq, audit[1].seq), (1, 2), "oldest-first by seq");
         assert_eq!(audit[1].prev_hash, "h1");
 
+        // Attach an AWS credential so the delete cascade over credentials is actually exercised —
+        // the credential-cleanup path P1 #6 flagged as untested.
+        let cred = AwsCredential {
+            access_key_id: "AKIA_REDIS_TEST".into(),
+            key_id: "vk_redis".into(),
+            secret_access_key: "s3cr3t".into(),
+        };
+        store.put_aws_credential(&cred).unwrap();
+        assert!(
+            store
+                .list_aws_credentials()
+                .unwrap()
+                .iter()
+                .any(|c| c.access_key_id == "AKIA_REDIS_TEST"),
+            "the AWS credential must be present before delete_key"
+        );
+
         // Delete removes the key, its usage, and its AWS creds.
         store.delete_key("vk_redis").unwrap();
         assert!(store.get_key("vk_redis").unwrap().is_none());
         assert_eq!(store.get_usage("vk_redis", 100).unwrap(), Usage::default());
+        assert!(
+            !store
+                .list_aws_credentials()
+                .unwrap()
+                .iter()
+                .any(|c| c.access_key_id == "AKIA_REDIS_TEST"),
+            "delete_key must cascade to the AWS credentials (credential cleanup, P1 #6)"
+        );
     }
 }
