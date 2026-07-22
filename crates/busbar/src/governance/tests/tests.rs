@@ -1055,6 +1055,92 @@ fn test_check_rate_sweep_evicts_silent_keys_to_bound_map() {
     );
 }
 
+/// REGRESSION: the budget shard sweep must be PERIOD-AGNOSTIC.
+/// The original sweep retained only cells matching THIS key's `window`, so a daily-period key's
+/// Nth admission evicted the valid CURRENT cells of `total`/`monthly` keys sharing the shard —
+/// silently resetting their accrued spend (the hard cap) and dropping dirty unflushed spend.
+/// The fix mirrors the carry-map rule (audit 1.4.0): age-based retain, `total` (window 0) never
+/// ages out. This test seeds current-window co-tenants of BOTH other periods plus one genuinely
+/// stale cell into the daily key's shard, fires the sweep, and asserts only the stale cell dies.
+#[test]
+fn test_budget_sweep_is_period_agnostic_across_cotenants() {
+    let store = Arc::new(MemoryStore::new());
+    let gov = GovState::new(store, 1, 0, None).unwrap(); // 1c flat fee
+    let now = 1_700_000_040u64;
+
+    let mut daily = sample_key("survivor", "hs");
+    daily.budget_period = BUDGET_PERIOD_DAILY.to_string();
+    daily.max_budget_cents = Some(5000);
+
+    // Seed co-tenants directly INTO the survivor's shard (same idiom as the rate sweep test).
+    {
+        let mut map = gov.budget.write("survivor");
+        // A `total`-period key: window_start == 0, accrued spend 4999 of a 5000 cap. The buggy
+        // sweep evicted this cell (0 != daily window) — resetting a nearly-exhausted hard cap.
+        map.insert(
+            "total-cotenant".to_string(),
+            BudgetCell {
+                window_start: 0,
+                spend_cents: 4999,
+                tokens: 10,
+                requests: 7,
+                dirty: true,
+            },
+        );
+        // A `monthly`-period key in its CURRENT window: also evicted by the buggy sweep
+        // (monthly window != daily window) despite being live and authoritative.
+        map.insert(
+            "monthly-cotenant".to_string(),
+            BudgetCell {
+                window_start: budget_window(BUDGET_PERIOD_MONTHLY, now),
+                spend_cents: 1234,
+                tokens: 5,
+                requests: 3,
+                dirty: true,
+            },
+        );
+        // A genuinely stale bounded-window cell (older than 31 d): the sweep SHOULD evict this.
+        map.insert(
+            "stale-cotenant".to_string(),
+            BudgetCell {
+                window_start: now - 32 * SECS_PER_DAY,
+                spend_cents: 1,
+                tokens: 1,
+                requests: 1,
+                dirty: false,
+            },
+        );
+    }
+
+    // Force the survivor's next admission to run this shard's sweep (post-increment semantics).
+    gov.budget
+        .sweep_ticker_for("survivor")
+        .store(RATE_SWEEP_INTERVAL - 1, Ordering::Relaxed);
+    assert!(gov.charge_budget_mem(&daily, now), "daily key admits");
+
+    let map = gov.budget.read("survivor");
+    let total = map
+        .get("total-cotenant")
+        .expect("total-period cell must survive the sweep (window 0 never ages out)");
+    assert_eq!(
+        (total.spend_cents, total.dirty),
+        (4999, true),
+        "total-period accrued spend + dirty flag intact"
+    );
+    let monthly = map
+        .get("monthly-cotenant")
+        .expect("current monthly cell must survive the sweep");
+    assert_eq!(monthly.spend_cents, 1234, "monthly accrued spend intact");
+    assert!(
+        !map.contains_key("stale-cotenant"),
+        "genuinely stale (>31 d) bounded-window cell is still evicted"
+    );
+    assert!(
+        map.contains_key("survivor"),
+        "the charging key's own cell exists"
+    );
+}
+
 #[test]
 fn test_check_rate_sweep_cadence_post_increment_no_off_by_one() {
     // Regression for the sweep-cadence off-by-one. The sweep must use POST-increment semantics:

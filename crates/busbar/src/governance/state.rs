@@ -806,7 +806,8 @@ impl GovState {
     /// — exactly the shape `check_rate` uses for the rate map — so the whole operation is atomic on
     /// this single node. Returns `true` when the flat fee was charged (request admitted), `false` when
     /// charging it would exceed `max_budget_cents` (rejected WITHOUT charging).
-    fn charge_budget_mem(&self, key: &VirtualKey, now: u64) -> bool {
+    // pub(crate) for the tests module (same visibility as `check_rate`); not part of any API.
+    pub(crate) fn charge_budget_mem(&self, key: &VirtualKey, now: u64) -> bool {
         let window = budget_window(&key.budget_period, now);
         // Clamp the per-request fee >= 0 (symmetric with record_tokens / the old record_request): a
         // negative misconfigured fee must never DECREMENT accrued spend and defeat the cap.
@@ -836,7 +837,17 @@ impl GovState {
             .is_multiple_of(crate::limits::rate_sweep_interval());
         let mut map = shard.map.write().unwrap_or_else(|p| p.into_inner());
         if sweep_needed {
-            map.retain(|_, c| c.window_start == window);
+            // Staleness must be PERIOD-AGNOSTIC (the same rule the carry-map sweep above earned in
+            // the 1.4.0 audit): keys on different budget periods have different `window` values, so
+            // retaining only `window_start == window` (THIS key's window) evicted valid CURRENT
+            // cells of keys on other periods sharing the shard — silently resetting their accrued
+            // spend (the hard cap!) and dropping any dirty unflushed spend. Age-based retain
+            // instead: drop only cells older than the longest bounded window (monthly ≤ 31 d); the
+            // all-time window (`window_start == 0`, `total` period) never ages out.
+            let max_window = 31 * super::SECS_PER_DAY;
+            map.retain(|_, c| {
+                c.window_start == 0 || c.window_start.saturating_add(max_window) > now
+            });
         }
         // Resolve this key's cell for the CURRENT window (three cases mirror `check_rate`):
         //  - present & current-window -> mutate in place.
