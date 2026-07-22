@@ -2308,21 +2308,49 @@ fn inject_openai_stream_include_usage(payload: Bytes) -> Bytes {
     }
 }
 
+/// Cheap forward substring scan (needle is a short constant `"stream_options"` key literal). Avoids
+/// pulling a dependency for the one idempotency check below; the haystack is a request body scanned
+/// at most once, so the naive O(n*m) walk is well within the byte-level path's budget.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return needle.is_empty();
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// PRISTINE-PRESERVING variant of [`inject_openai_stream_include_usage`] for a body the head
 /// projection already proved carries NO top-level `stream_options` key (R3-A-a). Splices
 /// `"stream_options":{"include_usage":true},` in immediately after the opening `{` instead of
 /// parsing + re-serializing the whole DOM, so a same-protocol pristine passthrough body stays
 /// parse-free while still forcing the upstream to emit billable token usage.
 ///
-/// SOUNDNESS: only ever called when `!client_has_stream_options`, i.e. the head point-read on the
-/// captured `stream_options` key returned `None` - so the splice cannot produce a DUPLICATE key (a
-/// duplicate would let last-wins semantics silently override a caller value). The splice is a
-/// LEADING member, so it never lands after the object's final key without a comma, and the object is
-/// known non-empty on the streaming path (`stream` at minimum). Any body that is not a JSON object
-/// starting with `{` (or the degenerate empty `{}`) falls back to the DOM injector, which itself
-/// returns the bytes unchanged on a non-object - so a malformed/edge body is never corrupted.
+/// SOUNDNESS: the caller gates entry on `!client_has_stream_options`, but that decision was captured
+/// off the PRE-rewrite ingress body; a `prompt: rw` hook that injects a top-level `stream_options`
+/// key leaves it STALE (`false`), and a blind leading-member splice would then produce a DUPLICATE
+/// top-level `stream_options`. Under JSON last-wins the rewrite's copy would be honored and busbar's
+/// injected `include_usage` silently discarded, so the upstream emits no usage and busbar bills ZERO
+/// tokens for the stream. To stay correct regardless of what a rewrite did, this injector is itself
+/// IDEMPOTENT: it first scans the (post-any-rewrite) body being sent for the `"stream_options"` key
+/// bytes and, if present, defers to the DOM injector [`inject_openai_stream_include_usage`], which is
+/// duplicate-safe via `entry()` (it upgrades the existing object in place). The substring scan is
+/// conservative: a body that merely mentions `stream_options` inside a string value would also defer
+/// (a rare, harmless extra DOM parse, never a correctness or duplicate-key issue). The common
+/// no-rewrite pristine path carries no such bytes, so it still takes the cheap byte-splice with no
+/// DOM parse. The splice is a LEADING member, so it never lands after the object's final key without
+/// a comma, and the object is known non-empty on the streaming path (`stream` at minimum). Any body
+/// that is not a JSON object starting with `{` (or the degenerate empty `{}`) falls back to the DOM
+/// injector, which itself returns the bytes unchanged on a non-object - so a malformed/edge body is
+/// never corrupted.
 fn inject_openai_stream_include_usage_pristine(payload: Bytes) -> Bytes {
     const INSERT: &[u8] = br#""stream_options":{"include_usage":true},"#;
+    // IDEMPOTENCY GUARD: if the body being sent already carries a `stream_options` key (e.g. a rewrite
+    // hook injected one after the caller's has-stream_options decision was captured), a blind splice
+    // would duplicate the top-level key and last-wins would drop busbar's include_usage, billing
+    // zero. Defer to the duplicate-safe DOM injector. Cheap byte scan; the no-rewrite fast path (no
+    // such bytes present) is unaffected and still takes the splice below.
+    if contains_subslice(&payload, br#""stream_options""#) {
+        return inject_openai_stream_include_usage(payload);
+    }
     // Find the first `{`, skipping only leading ASCII whitespace (the sole bytes JSON permits before
     // the top-level value). Anything else at the front is not a plain object body - defer to the DOM
     // injector rather than splice blindly.
@@ -2460,6 +2488,41 @@ mod inject_include_usage_tests {
             v.pointer("/messages/0/content"),
             Some(&serde_json::json!("hi")),
             "original keys must survive the splice: {v}"
+        );
+    }
+
+    /// BILLING-SAFETY: the pristine injector's `!client_has_stream_options` gate is decided off the
+    /// PRE-rewrite ingress body, so a `prompt: rw` hook that injects a top-level `stream_options` can
+    /// leave that decision stale and route a body that ALREADY has `stream_options` into the pristine
+    /// splice. A blind splice would then produce a DUPLICATE top-level key and last-wins would discard
+    /// busbar's injected include_usage - billing zero for the stream. The injector must instead be
+    /// idempotent: detect the existing key and defer to the duplicate-safe DOM injector, so the body
+    /// ends up with a SINGLE `stream_options` whose `include_usage` is honored true.
+    #[test]
+    fn pristine_injector_idempotent_when_stream_options_already_present() {
+        // As if a rewrite hook injected `stream_options` after the has-stream_options decision was
+        // captured false: the pristine injector is (wrongly, per the stale flag) selected.
+        let body = br#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":false},"messages":[]}"#;
+        let out = inject_openai_stream_include_usage_pristine(Bytes::from_static(body));
+        let v: serde_json::Value = crate::json::parse(&out).expect("body must remain valid JSON");
+        // No duplicate top-level key: a single stream_options object survives.
+        assert_eq!(
+            v.pointer("/stream_options/include_usage"),
+            Some(&serde_json::json!(true)),
+            "include_usage must be forced true and honored (no duplicate key): {v}"
+        );
+        // Guard against the duplicate-key regression directly: the raw bytes must contain the
+        // `"stream_options"` key exactly ONCE (a duplicate would appear twice).
+        let occurrences = out
+            .windows(br#""stream_options""#.len())
+            .filter(|w| *w == br#""stream_options""#)
+            .count();
+        assert_eq!(
+            occurrences,
+            1,
+            "exactly one top-level stream_options key must exist, found {occurrences}: \
+             {}",
+            String::from_utf8_lossy(&out)
         );
     }
 
