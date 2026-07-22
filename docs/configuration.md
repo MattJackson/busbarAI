@@ -832,7 +832,7 @@ governance:
 | `price_per_request_cents` | integer | no | `1` | Negative values clamped to 0 | Flat per-request charge against each virtual key's budget (in cents). |
 | `price_per_1k_tokens_cents` | integer | no | `0` | Negative values clamped to 0 | Per-1,000-token charge (input + output tokens from response usage metadata). |
 | `plugins_dir` | string | no | `plugins` | n/a | Directory the engine loads store (and other) plugins from. A durable `store` other than `memory` is a plugin library dropped here (e.g. `store: sqlite` loads `libbusbar_store_sqlite_plugin` from this directory). Path is relative to the working directory. |
-| `trust` | table | no | see below | n/a | Plugin signing/trust policy applied to each plugin's signed manifest at load. Sub-keys: `on_untrusted` (`halt` \| `alert` \| `log` (default) \| `allow`) and `publishers` (a list of `{ name, public_key }` allowlisted ed25519 publishers). See [Plugin trust](#plugin-trust) below. |
+| `trust` | table | no | see below | n/a | Plugin signing/trust policy applied to each plugin's signed manifest at load. Sub-keys: `on_untrusted` (`halt` \| `alert` \| `log` (default) \| `allow`), `publishers` (a list of `{ name, public_key }` allowlisted ed25519 publishers), and `min_versions` (optional anti-downgrade floors, plugin name -> minimum version). See [Plugin trust](#plugin-trust) below. |
 | `sqlite_busy_timeout_ms` | integer | no | `5000` | n/a | SQLite `busy_timeout` (milliseconds) for the governance store under write contention. Applies to `store: sqlite`. |
 | `rate_sweep_interval` | integer | no | `256` | Must be ≥ 1 | How often (every N admissions) the in-memory rate-limit map evicts idle entries. Correctness does not depend on it (per-key windows reset on lookup); it only bounds memory. `0` is rejected at startup. |
 | `usage_flush_interval_ms` | integer | no | `100` | n/a | Write-behind flush cadence (milliseconds) for the in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this many ms of accrued spend/requests can be lost; a graceful shutdown flushes fully. Only relevant with a durable `store`. |
@@ -891,9 +891,13 @@ governance:
     publishers:
       - name: busbar
         public_key: "<hex ed25519 public key>"
+    min_versions:            # optional anti-downgrade floors (plugin name -> minimum version)
+      sqlite-store: "1.5.0"
 ```
 
-Because the signature covers the whole manifest and the manifest pins the library by `sha256`, neither the manifest nor the library can be altered or swapped independently. A malformed publisher key is a boot error, not a silent skip.
+Because the signature covers the whole manifest and the manifest pins the library by `sha256`, neither the manifest nor the library can be altered or swapped independently. A malformed publisher key is a boot error, not a silent skip. The verified bytes are also the exact bytes loaded (they are never re-read from disk between verification and `dlopen`), so a file swap in the plugins directory cannot slip an unverified library past the check.
+
+`trust.min_versions` pins an optional minimum `version` per plugin name (an anti-downgrade / anti-replay floor). A manifest whose `version` is below its floor is rejected even with a valid signature, so an older validly-signed (and possibly vulnerable) release cannot be rolled back in. Version comparison is numeric on the leading `major.minor.patch` components. Empty (the default) pins nothing.
 
 ---
 

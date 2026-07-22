@@ -28,11 +28,28 @@ pub(crate) fn manifest_path_for(lib_path: &Path) -> PathBuf {
 
 /// Verify a plugin library at `lib_path` against `policy`. On success returns a short human note about
 /// the trust outcome (for the caller's log line); on the `halt` posture with an untrusted artifact,
-/// returns `Err(reason)` and the caller MUST NOT load it.
+/// returns `Err(reason)` and the caller MUST NOT load it. This is the DISPLAY/inventory path — it does
+/// not load the library, so it discards the bytes it read.
+///
+/// A load path must NOT re-read the file afterwards (that would reopen a TOCTOU window). It calls
+/// [`verify_read`] instead and loads the returned bytes verbatim via
+/// [`busbar_plugin_loader::load_store_from_bytes`].
+pub(crate) fn verify(lib_path: &Path, policy: &TrustPolicy) -> Result<String, String> {
+    verify_read(lib_path, policy).map(|(note, _bytes)| note)
+}
+
+/// Verify a plugin library at `lib_path` against `policy` AND return the exact bytes that were
+/// verified, so a caller can load THOSE bytes (never re-reading the path). This is the TOCTOU-safe
+/// half: the hash/signature is checked over these bytes, and the same `Vec<u8>` is what gets loaded —
+/// nothing on disk is read a second time between check and use, so a file swap in `plugins_dir`
+/// cannot slip an unverified library past the gate.
 ///
 /// Emits the trust decision to tracing itself (info for trusted, warn for loaded-but-unverified) so
 /// every load path logs consistently — this is the "log all of this" surface.
-pub(crate) fn verify(lib_path: &Path, policy: &TrustPolicy) -> Result<String, String> {
+pub(crate) fn verify_read(
+    lib_path: &Path,
+    policy: &TrustPolicy,
+) -> Result<(String, Vec<u8>), String> {
     let bytes =
         std::fs::read(lib_path).map_err(|e| format!("cannot read {}: {e}", lib_path.display()))?;
 
@@ -53,7 +70,7 @@ pub(crate) fn verify(lib_path: &Path, policy: &TrustPolicy) -> Result<String, St
     match evaluate(&bytes, manifest.as_ref(), policy) {
         Ok(Verdict::Trusted { publisher }) => {
             tracing::info!(plugin = name, publisher = %publisher, "plugin trust: signed by an allowlisted publisher");
-            Ok(format!("signed by '{publisher}'"))
+            Ok((format!("signed by '{publisher}'"), bytes))
         }
         Ok(Verdict::Allowed { reason, action }) => {
             tracing::warn!(
@@ -62,7 +79,7 @@ pub(crate) fn verify(lib_path: &Path, policy: &TrustPolicy) -> Result<String, St
                 reason = %reason,
                 "plugin trust: loading an UNVERIFIED plugin (allowed by policy posture)"
             );
-            Ok(format!("unverified — {reason}"))
+            Ok((format!("unverified — {reason}"), bytes))
         }
         Err(rejected) => Err(rejected.0),
     }
@@ -121,6 +138,7 @@ mod tests {
         let policy = TrustPolicy {
             publishers,
             on_untrusted: OnUntrusted::Halt,
+            min_versions: BTreeMap::new(),
         };
         assert!(verify(&lib, &policy).unwrap().contains("signed by 'acme'"));
     }
@@ -133,12 +151,14 @@ mod tests {
         let halt = TrustPolicy {
             publishers: BTreeMap::new(),
             on_untrusted: OnUntrusted::Halt,
+            min_versions: BTreeMap::new(),
         };
         assert!(verify(&lib, &halt).is_err());
 
         let log = TrustPolicy {
             publishers: BTreeMap::new(),
             on_untrusted: OnUntrusted::Log,
+            min_versions: BTreeMap::new(),
         };
         assert!(verify(&lib, &log).unwrap().contains("unverified"));
     }
