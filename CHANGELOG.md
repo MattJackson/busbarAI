@@ -19,9 +19,10 @@ item under **Changed**.
   on/off switch. It is always present and simply INERT until an admin token is set and virtual keys are
   minted (a default deploy with no admin token behaves exactly as "off" did, with identical RAM). The
   durable-store backend is now the choice, via **`governance.store`**: `memory` (default, ephemeral RAM,
-  zero-setup) or `sqlite` (persists to `db_path`). The engine names storage only through the `Store`
-  contract; SQLite and the RAM store are swappable plugin crates (`busbar-store-sqlite`,
-  `busbar-store-memory`).
+  zero-setup) or a durable backend (`sqlite`, `postgres`, or `redis`) that persists to `db_path`. The
+  engine names storage only through the `Store` contract; every backend is a swappable crate
+  (`busbar-store-memory`, `busbar-store-sqlite`, `busbar-store-postgres`, `busbar-store-redis`), the
+  durable ones also shipping as loadable plugins (see **Added**).
 - **Migration.** A config that sets `governance.enabled` will fail to start (unknown field). Remove it.
   **If you relied on SQLite persistence, you must now set `governance.store: sqlite`**, otherwise
   governance defaults to the ephemeral in-memory store and keys/budgets reset on restart. On the RAM
@@ -55,7 +56,15 @@ item under **Changed**.
   one Postgres behind a fleet of busbar nodes, so virtual keys, budgets, and usage are shared across
   the cluster. Drop in the Postgres store plugin (`libbusbar_store_postgres_plugin.{so,dll,dylib}`) and
   set `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite, drop-in
-  interchangeable.
+  interchangeable. Ships as the crate pair `busbar-store-postgres` (the store) and
+  `busbar-store-postgres-plugin` (the `cdylib` wrapping it).
+- **Redis store plugin (`governance.store: redis`)**: a second shared, multi-node durable store,
+  backed by Redis: point a fleet of busbar nodes at one Redis and virtual keys, budgets, and usage
+  are shared across the cluster. Drop in the Redis store plugin
+  (`libbusbar_store_redis_plugin.{so,dll,dylib}`) and set `governance.db_path` to a `redis://` URL.
+  Same `Store` contract, drop-in interchangeable with the memory/sqlite/postgres backends. Ships as
+  the crate pair `busbar-store-redis` (the store) and `busbar-store-redis-plugin` (the `cdylib`
+  wrapping it).
 - **Migration.** If you set `governance.store: sqlite`, install the SQLite store plugin into
   `governance.plugins_dir` (drop `libbusbar_store_sqlite_plugin` there), or busbar fails to start with a
   message naming the expected file. The default `store: memory` needs no plugin.
@@ -69,8 +78,10 @@ item under **Changed**.
   check-and-charge is an atomic in-memory hard cap (mirroring the existing rate limiter); SQLite became a
   write-behind durability layer (boot-hydrate, a background flush every `usage_flush_interval_ms`, and a
   final flush on graceful shutdown). Admission no longer performs (or awaits) a SQLite write, removing the
-  per-request fsync from the hot path (on local SSD this lifts the single-node governed-throughput ceiling by
-  ~5.6×). The flat-fee cap remains a hard cap; token cost is still reconciled post-response, bounded to one
+  per-request fsync from the hot path, which lifts the single-node governed-throughput ceiling by a
+  large multiple (the exact factor depends on storage and workload; see the external benchmark harness at
+  [`GetBusbar/benchmarking`](https://github.com/GetBusbar/benchmarking) for the reproducible measurement).
+  The flat-fee cap remains a hard cap; token cost is still reconciled post-response, bounded to one
   in-flight request.
 - **Migration.** The `governance.budget_on_store_error` key has been **removed** and the governance config
   rejects unknown fields, so a config that still sets it will fail to start. Delete the key. The guarantee it
@@ -152,8 +163,8 @@ item under **Changed**.
   change. For back-compat, an operator who pinned the standard `TOKIO_WORKER_THREADS` on 1.3.0 (honored
   by 1.3.0's `#[tokio::main]` runtime) still gets that pool size: it is read as a fallback when
   `BUSBAR_WORKER_THREADS` is unset; an explicitly-set-but-invalid value warns instead of being silently
-  ignored. The reproducible throughput/scaling harness and raw per-core data are checked in under
-  `bench/scaling/`.
+  ignored. The reproducible throughput/scaling harness and raw per-core data live in the external
+  benchmark repo [`GetBusbar/benchmarking`](https://github.com/GetBusbar/benchmarking).
 - **Allocator: jemalloc with a background purge thread.** The request hot path holds a few copies of each
   request body while it is parsed and forwarded, so peak RSS tracks `peak concurrency × payload size`. The
   system allocator (glibc) almost never returns freed pages to the OS, so after a big-payload burst RSS
@@ -163,7 +174,7 @@ item under **Changed**.
   subsides (measured: a ~1.2 GB plateau under a 5-minute 150 KB-payload soak drops to ~250 MB within ~30 s of
   the load stopping). It remains bounded, a function of in-flight work, never unbounded growth. Cost: ~450 KB
   of binary and four new dependency crates (`tikv-jemallocator` / `tikv-jemalloc-ctl` / `tikv-jemalloc-sys`
-  plus the `paste` build-macro dep), all vendored under the Apache-2.0/MIT compatible set. Reproduction harness in `bench/memory/`. **Windows (`msvc` target) keeps the system allocator:**
+  plus the `paste` build-macro dep), all vendored under the Apache-2.0/MIT compatible set. Reproduction harness in the external benchmark repo [`GetBusbar/benchmarking`](https://github.com/GetBusbar/benchmarking). **Windows (`msvc` target) keeps the system allocator:**
   jemalloc's C build is incompatible with the MSVC toolchain, so it is compiled in only for non-msvc targets
   (Linux/macOS, incl. the published container and static musl builds). Windows binaries build and run
   unchanged on the system allocator and do not get the plateau/fall-back-to-idle behavior.
