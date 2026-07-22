@@ -70,6 +70,46 @@ fn synthesize_principal_key_union_semantics() {
     p.groups = vec![];
     assert!(synthesize_principal_key(&p, &gm).is_none());
 }
+
+/// REGRESSION (audit cost-1.5.0, bucket-namespace hardening): a principal whose id literally
+/// starts with `group:` must NEVER get a synthetic key. The synthetic key's `id` is its ledger
+/// bucket id, and budget-group buckets share that namespace as `group:<name>` - an IdP-supplied
+/// id like `group:acme` would otherwise charge/read/alias the `acme` budget group's cell.
+/// Fail closed: no key, no data-plane access, no collision.
+#[test]
+fn group_prefixed_principal_id_cannot_alias_a_budget_group_bucket() {
+    use crate::config::GroupMapEntry;
+    let mut gm = std::collections::HashMap::new();
+    gm.insert(
+        "eng".to_string(),
+        GroupMapEntry {
+            allowed_pools: Some(vec![]),
+            ..Default::default()
+        },
+    );
+
+    // Control: the same grants under a benign id DO synthesize, and the bucket id is the
+    // principal id - which is exactly why the reserved prefix must be rejected.
+    let mut ok = crate::auth::Principal::from_id("sso:alice");
+    ok.groups = vec!["eng".to_string()];
+    let k = synthesize_principal_key(&ok, &gm).expect("benign id synthesizes");
+    assert_eq!(k.id, "sso:alice", "the key id IS the ledger bucket id");
+
+    // The attack shape: identical grants, but the id sits in the budget-group bucket namespace.
+    // It must produce NO key at all (fail closed), so no ledger cell keyed `group:acme` can ever
+    // be created or charged on behalf of this principal.
+    let mut evil = crate::auth::Principal::from_id("group:acme");
+    evil.groups = vec!["eng".to_string()];
+    assert!(
+        synthesize_principal_key(&evil, &gm).is_none(),
+        "a group:-prefixed principal id must be refused, never keyed into the ledger"
+    );
+
+    // The bare prefix is equally reserved.
+    let mut bare = crate::auth::Principal::from_id("group:");
+    bare.groups = vec!["eng".to_string()];
+    assert!(synthesize_principal_key(&bare, &gm).is_none());
+}
 use super::*;
 
 fn sample_key(id: &str, hash: &str) -> VirtualKey {

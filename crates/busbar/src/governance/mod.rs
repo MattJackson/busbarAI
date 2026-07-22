@@ -368,6 +368,19 @@ pub(crate) fn synthesize_principal_key(
     principal: &crate::auth::Principal,
     group_map: &std::collections::HashMap<String, crate::config::GroupMapEntry>,
 ) -> Option<Arc<VirtualKey>> {
+    // BUCKET-NAMESPACE GUARD (audit cost-1.5.0): the synthesized key's `id` becomes its LEDGER
+    // BUCKET id, and budget-group buckets live in the same store namespace as `group:<name>`. A
+    // principal id (attacker-influenced at the IdP) literally starting with `group:` would alias a
+    // budget group's cell - charging it, reading it, and corrupting group enforcement. Fail closed:
+    // such a principal gets NO synthetic key (no data-plane access), never a colliding bucket.
+    if principal.id.starts_with(crate::cost::GROUP_BUCKET_PREFIX) {
+        tracing::warn!(
+            principal = %principal.id,
+            "refusing to synthesize a governance key: principal id collides with the reserved \
+             budget-group bucket namespace (group:)"
+        );
+        return None;
+    }
     let granting: Vec<&crate::config::GroupMapEntry> = principal
         .groups
         .iter()
