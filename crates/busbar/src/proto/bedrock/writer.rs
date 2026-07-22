@@ -176,6 +176,18 @@ impl ProtocolWriter for BedrockWriter {
             .and_then(|gc| gc.get("messages"))
             .and_then(|v| v.as_array());
 
+        // The captured native top-level `document` / `video` markers (see `DOC_VIDEO_SENTINEL`);
+        // same positional stash shape as the guardContent markers and spliced back via the same
+        // shared helper. Consumed here and SKIPPED by the trailing extra-merge so the sentinel never
+        // reaches the wire. Only messages carry document/video (no `system` sub-array).
+        let doc_video = req
+            .extra
+            .get(DOC_VIDEO_SENTINEL)
+            .and_then(|v| v.as_object());
+        let message_doc_video = doc_video
+            .and_then(|dv| dv.get("messages"))
+            .and_then(|v| v.as_array());
+
         // When the positional cachePoint stash is present (same-protocol Bedrock passthrough) it is
         // the authority for cachePoint placement (spliced below at the recorded indices for a
         // byte-identical round-trip), so the inline `cache_control`-driven emission is SUPPRESSED to
@@ -362,18 +374,20 @@ impl ProtocolWriter for BedrockWriter {
                 }
             }
 
-            // Re-emit any captured `cachePoint` / `guardContent` markers for THIS message at their
-            // original positions so prompt caching and inline guardrails survive a same-protocol
-            // round-trip. Spliced BEFORE the empty-content placeholder below so a message whose only
-            // block was a `cachePoint`/`guardContent` re-emits the marker rather than a bare `""`
-            // placeholder. `msg_idx` matches the reader's recorded message index on the Bedrock
-            // passthrough path (the Bedrock reader only emits User/Assistant turns, so no System-role
-            // `continue` desyncs the count). BOTH classes are collected for this message and spliced
-            // as ONE sorted batch (see `merge_marker_entries`) so cachePoint insertions cannot shift
-            // guardContent's recorded indices.
+            // Re-emit any captured `cachePoint` / `guardContent` / `document` / `video` markers for
+            // THIS message at their original positions so prompt caching, inline guardrails and
+            // document/video attachments survive a same-protocol round-trip. Spliced BEFORE the
+            // empty-content placeholder below so a message whose only block was one of these re-emits
+            // the marker rather than a bare `""` placeholder. `msg_idx` matches the reader's recorded
+            // message index on the Bedrock passthrough path (the Bedrock reader only emits
+            // User/Assistant turns, so no System-role `continue` desyncs the count). ALL classes are
+            // collected for this message and spliced as ONE sorted batch (they recorded indices
+            // against the SAME original content array) so one class's insertions cannot shift
+            // another's recorded indices.
             let for_this_msg: Vec<serde_json::Value> = message_cache_points
                 .into_iter()
                 .chain(message_guard_content)
+                .chain(message_doc_video)
                 .flatten()
                 .filter(|e| e.get("m").and_then(|v| v.as_u64()) == Some(msg_idx as u64))
                 .cloned()
@@ -648,6 +662,11 @@ impl ProtocolWriter for BedrockWriter {
             // The guardContent stash is likewise a busbar-internal sentinel, already consumed above
             // (spliced back into `system`/`messages`). Skip it so it never leaks onto the wire.
             if key == GUARD_CONTENT_SENTINEL {
+                continue;
+            }
+            // The document/video stash is likewise a busbar-internal sentinel, already consumed above
+            // (spliced back into `messages`). Skip it so it never leaks onto the wire.
+            if key == DOC_VIDEO_SENTINEL {
                 continue;
             }
             // The top_k source-spelling hint is a busbar-internal sentinel, already consumed above

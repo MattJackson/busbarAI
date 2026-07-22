@@ -5587,3 +5587,58 @@ fn test_stream_text_delta_lazily_opens_block_start() {
         assert_eq!(*index, 0, "lazily-opened Text block must be at index 0");
     }
 }
+
+/// FINDING 4 [P1] REGRESSION: The AWS Bedrock Converse `ContentBlock` union includes top-level
+/// `document` and `video` members (a PDF/CSV the model reasons over, and a video reference). The
+/// reader previously handled only text/image/toolUse/toolResult/reasoningContent/cachePoint/
+/// guardContent, so a top-level `document` or `video` block was silently DROPPED on a same-protocol
+/// Bedrock passthrough (the proxy diverged from a direct AWS call). This asserts both survive a
+/// WIRE->IR->WIRE round-trip byte-identically, INTERLEAVED with text so positional splicing holds.
+#[test]
+fn test_roundtrip_preserves_document_and_video_blocks() {
+    let reader = BedrockReader;
+    let writer = BedrockWriter;
+
+    let wire = serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"text": "Summarize the attachment."},
+                {"document": {
+                    "format": "pdf",
+                    "name": "report",
+                    "source": {"bytes": "JVBERi0xLjQK"}
+                }},
+                {"text": "and describe the clip"},
+                {"video": {
+                    "format": "mp4",
+                    "source": {"s3Location": {"uri": "s3://bucket/clip.mp4"}}
+                }}
+            ]
+        }],
+        "inferenceConfig": {"maxTokens": 256}
+    });
+
+    let ir = reader
+        .read_request(&wire)
+        .expect("read round-trip should succeed");
+    let wire_after = writer.write_request(&ir);
+
+    assert_eq!(
+        wire, wire_after,
+        "same-protocol wire round-trip must preserve document/video blocks at their original \
+         positions, byte-identically"
+    );
+
+    // Belt-and-suspenders: the written body must actually contain both blocks (guards against a
+    // future change that makes the equality hold only because both sides dropped them).
+    let content = wire_after["messages"][0]["content"].as_array().unwrap();
+    assert!(
+        content.iter().any(|b| b.get("document").is_some()),
+        "the document block must be present on Bedrock egress"
+    );
+    assert!(
+        content.iter().any(|b| b.get("video").is_some()),
+        "the video block must be present on Bedrock egress"
+    );
+}

@@ -205,6 +205,10 @@ impl ProtocolReader for BedrockReader {
         // cachePoint capture; see `GUARD_CONTENT_SENTINEL`.
         let mut system_guard_content: Vec<serde_json::Value> = Vec::new();
         let mut message_guard_content: Vec<serde_json::Value> = Vec::new();
+        // Captured native top-level `document` / `video` content blocks, same positional stash shape
+        // as the guardContent capture; see `DOC_VIDEO_SENTINEL`. These appear only inside a message
+        // `content` array (there is no `document`/`video` in the Converse `system` array).
+        let mut message_doc_video: Vec<serde_json::Value> = Vec::new();
 
         let mut system_blocks: Vec<crate::ir::IrBlock> = Vec::new();
         if let Some(system_arr) = obj.get("system").and_then(|s| s.as_array()) {
@@ -442,6 +446,26 @@ impl ProtocolReader for BedrockReader {
                                 "i": block_idx,
                                 "block": { "guardContent": guard_content.clone() },
                             }));
+                        } else if let Some(document) = content_val.get("document") {
+                            // A native Converse `document` block (a PDF/CSV/etc. the model reasons
+                            // over) has no IR counterpart; stash it verbatim with its (message, block)
+                            // index so the writer re-emits it at the same position on a same-protocol
+                            // passthrough instead of silently dropping the attachment. See
+                            // `DOC_VIDEO_SENTINEL`.
+                            message_doc_video.push(serde_json::json!({
+                                "m": msg_idx,
+                                "i": block_idx,
+                                "block": { "document": document.clone() },
+                            }));
+                        } else if let Some(video) = content_val.get("video") {
+                            // A native Converse `video` block likewise has no IR counterpart; stash it
+                            // verbatim so the writer re-emits it at the same position on a same-protocol
+                            // passthrough. See `DOC_VIDEO_SENTINEL`.
+                            message_doc_video.push(serde_json::json!({
+                                "m": msg_idx,
+                                "i": block_idx,
+                                "block": { "video": video.clone() },
+                            }));
                         }
                     }
                 }
@@ -616,6 +640,22 @@ impl ProtocolReader for BedrockReader {
             extra.insert(
                 GUARD_CONTENT_SENTINEL.to_string(),
                 serde_json::Value::Object(guard_content),
+            );
+        }
+
+        // Stash any captured top-level `document` / `video` markers (with their original positions)
+        // under the sentinel so `write_request` re-emits them at the same spots on a same-protocol
+        // passthrough. Only inserted when at least one was present, so a request that carried no
+        // document/video block does not gain a stray key (preserving the byte-exact round-trip).
+        if !message_doc_video.is_empty() {
+            let mut doc_video = serde_json::Map::new();
+            doc_video.insert(
+                "messages".to_string(),
+                serde_json::Value::Array(message_doc_video),
+            );
+            extra.insert(
+                DOC_VIDEO_SENTINEL.to_string(),
+                serde_json::Value::Object(doc_video),
             );
         }
 
