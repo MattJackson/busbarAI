@@ -1057,7 +1057,14 @@ mod tests {
 
         let huge_event_type = "e".repeat(u16::MAX as usize + 1);
         let frame = tracing::subscriber::with_default(subscriber, || {
-            encode_frame(&huge_event_type, br#"{"x":1}"#)
+            // Emit twice: tracing caches per-callsite interest globally, and a concurrent test
+            // installing/dropping another dispatcher can race the cache rebuild so the FIRST
+            // emission through this scoped subscriber is occasionally invisible (seen as a CI-only
+            // flake). The second emission always follows the rebuilt interest, making the capture
+            // deterministic; the returned frame is from the first call (identical inputs).
+            let f = encode_frame(&huge_event_type, br#"{"x":1}"#);
+            let _ = encode_frame(&huge_event_type, br#"{"x":1}"#);
+            f
         });
 
         assert!(
