@@ -300,7 +300,12 @@ impl CostModel {
                 nanos = nanos.saturating_add(rate.cost_nanos(tokens));
             }
         }
-        let mut cents = (nanos / NANOS_PER_CENT) as i64;
+        // SATURATE into i64 (never `as`-cast): an adversarially large ledger (u64-scale token
+        // counts x a large configured rate) can push the cent total past i64::MAX, and a wrapping
+        // cast would land NEGATIVE - which `.max(0)` below then floors to 0, i.e. an over-the-top
+        // ledger would derive as FREE and bypass every budget cap. Pin at i64::MAX instead (an
+        // astronomically over-cap spend that blocks, fail-closed).
+        let mut cents = i64::try_from(nanos / NANOS_PER_CENT).unwrap_or(i64::MAX);
         if include_request_fee {
             let fee = self
                 .price_per_request_cents
@@ -523,6 +528,28 @@ mod tests {
             fixed.derive_spend_cents([("m", &t)].into_iter(), 0, false),
             500,
             "same tokens, corrected rate: derived spend halves on next read"
+        );
+    }
+
+    /// REGRESSION (audit cost-1.5.0 #2): a cent total past i64::MAX SATURATES at i64::MAX
+    /// (fail-closed: an astronomical ledger blocks). The pre-fix `as i64` cast wrapped - a large
+    /// (u64-scale tokens x large configured rate) ledger could land NEGATIVE, be floored to 0 by
+    /// `.max(0)`, and derive as FREE, bypassing every budget cap.
+    #[test]
+    fn derive_spend_cents_saturates_never_wraps_free() {
+        // 1e15 micro-units/token -> 1e18 nano-units/token; x u64::MAX tokens ~= 1.8e37 nanos
+        // -> ~1.8e30 cents, far past i64::MAX.
+        let cm = resolve(&gov_with_card(&[("m", 1e15, 0.0)]));
+        let t = toks(u64::MAX, 0);
+        assert_eq!(
+            cm.derive_spend_cents([("m", &t)].into_iter(), 0, false),
+            i64::MAX,
+            "an over-i64 cent total must pin at i64::MAX (blocks), never wrap toward 0 (free)"
+        );
+        // The micro projection already saturated correctly; pin it too.
+        assert_eq!(
+            cm.derive_spend_micros([("m", &t)].into_iter(), 0, false),
+            i64::MAX
         );
     }
 
