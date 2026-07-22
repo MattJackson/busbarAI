@@ -63,9 +63,9 @@ Always enabled; no config needed.
 |---|---|---|---|
 | `busbar_requests_total` | counter | `ingress_protocol`, `pool`, `outcome` | `outcome=exhausted` rising → pools running out of healthy members. `outcome=error` → 5xx-class problems reaching the client; `outcome=client_error` → 4xx relayed to callers. |
 | `busbar_upstream_attempts_total` | counter | `pool`, `lane` | Real upstream calls, re-counted per failover hop. Ratio to `busbar_requests_total` > 1 indicates failovers are happening. |
-| `busbar_upstream_failures_total` | counter | `pool`, `lane`, `disposition` | `disposition` is `transient_upstream`, `hard_down`, or `context_length`. `hard_down` requires intervention (auth/billing problem). |
+| `busbar_upstream_failures_total` | counter | `pool`, `lane`, `disposition` | `disposition` is `transient_upstream`, `attempt_timeout`, `hard_down`, or `context_length`. `hard_down` requires intervention (auth/billing problem). |
 | `busbar_breaker_trips_total` | counter | `pool`, `lane` | One per Closed→Open trip (reopens don't count). A spike means a backend just went down. |
-| `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout`, `connect`, `transient_upstream`, `hard_down`, or `context_length`. A high rate on one pool indicates a flapping member. |
+| `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout`, `connect`, `transient_upstream`, `attempt_timeout`, `hard_down`, or `context_length`. A high rate on one pool indicates a flapping member. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. Useful for auditing unexpected protocol conversion. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency including failover hops. |
 | `busbar_key_spend_cents` | gauge | `key` | Per-virtual-key spend in cents for the current budget window (scrape-time). Only emitted when governance is enabled. Use for burn-rate alerting. |

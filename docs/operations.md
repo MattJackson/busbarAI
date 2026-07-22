@@ -169,9 +169,9 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 |---|---|---|---|
 | `busbar_requests_total` | counter | `ingress_protocol`, `pool`, `outcome` | `outcome` is `ok` / `client_error` / `exhausted` (503) / `error`. A rising `exhausted` means pools are running out of healthy members. |
 | `busbar_upstream_attempts_total` | counter | `pool`, `lane` | Real upstream calls (re-counted per failover hop). |
-| `busbar_upstream_failures_total` | counter | `pool`, `lane`, `disposition` | `disposition` is `transient_upstream` / `hard_down` / `context_length`. Concentration on one lane points at a sick backend. |
+| `busbar_upstream_failures_total` | counter | `pool`, `lane`, `disposition` | `disposition` is `transient_upstream` / `attempt_timeout` / `hard_down` / `context_length`. Concentration on one lane points at a sick backend. |
 | `busbar_breaker_trips_total` | counter | `pool`, `lane` | Each hard-down/trip. Spikes = a backend going down. |
-| `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout` / `connect` / `transient_upstream` / `hard_down` / `context_length`. |
+| `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout` / `connect` / `transient_upstream` / `attempt_timeout` / `hard_down` / `context_length`. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency. |
 | `busbar_key_spend_cents` | gauge | `key` | Per-virtual-key spend in cents for the current budget window. Only emitted when governance is enabled. |
