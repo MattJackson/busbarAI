@@ -681,14 +681,29 @@ mod tests {
 
     /// Locate the SQLite plugin cdylib in the build's target dir, derived from the test binary's own
     /// path (robust to a custom CARGO_TARGET_DIR). Returns None if it hasn't been built — a
-    /// `-p busbar`-only run may not have built it, so the test skips rather than fails; under
-    /// `cargo test --workspace` (preflight/CI) the cdylib is always present and the test runs.
+    /// `-p busbar`-only run may not have built it, so the caller skips rather than fails; under
+    /// `cargo test --workspace` (preflight/CI) the cdylib is always present and the caller runs.
+    ///
+    /// CI HARDENING (mirrors the store-postgres live-DB test): CI runs `cargo test --workspace`, so
+    /// the cdylib MUST be present. If it is absent while `CI` is set, that is a broken build - a HARD
+    /// FAILURE here, not a silent skip, so the only over-the-ABI coverage of the durable store path
+    /// cannot quietly vanish. Locally (no `CI`) a missing cdylib still skips cleanly.
     fn sqlite_plugin_path() -> Option<std::path::PathBuf> {
-        let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/busbar-<hash>
-        let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
-        let name = plugin_library_filename("busbar_store_sqlite_plugin");
-        let candidate = profile_dir.join(&name);
-        candidate.exists().then_some(candidate)
+        let candidate = (|| {
+            let exe = std::env::current_exe().ok()?; // .../target/<profile>/deps/busbar-<hash>
+            let profile_dir = exe.parent()?.parent()?; // .../target/<profile>
+            let name = plugin_library_filename("busbar_store_sqlite_plugin");
+            let candidate = profile_dir.join(&name);
+            candidate.exists().then_some(candidate)
+        })();
+        if candidate.is_none() && std::env::var_os("CI").is_some() {
+            panic!(
+                "the sqlite plugin cdylib is not built under CI: `cargo test --workspace` must build \
+                 busbar_store_sqlite_plugin. Refusing to silently skip the only over-the-ABI \
+                 coverage of the durable store path."
+            );
+        }
+        candidate
     }
 
     /// End-to-end: load the REAL SQLite plugin cdylib over the C ABI and exercise the Store surface

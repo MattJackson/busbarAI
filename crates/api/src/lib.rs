@@ -10,8 +10,8 @@
 //!   plus the constant-time credential primitives every module compares with.
 //! - **hooks** — the [`RoutingPolicy`] trait (decide/transform/notify + configure/describe) and
 //!   the read-only projections it is invoked with.
-//! - **store** — the durable-store records ([`VirtualKey`], [`Usage`], [`AwsCredential`], …) a `db`
-//!   plugin reads and writes (the `Store` trait itself joins them in a following step).
+//! - **store** — the [`Store`] trait a `db` plugin implements, plus the durable-store records
+//!   ([`VirtualKey`], [`Usage`], [`AwsCredential`], …) it reads and writes.
 //!
 //! Everything here is a CONTRACT, not machinery: no I/O, no engine state, no transport. A
 //! third-party plugin crate that depends only on `busbar-api` is architecturally identical to a

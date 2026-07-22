@@ -524,6 +524,110 @@ mod tests {
         let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!((u.spend_cents, u.tokens, u.requests), (42, 9, 3));
 
+        // METERING: the billing-critical raw-consumption UPSERT. Two deltas for the SAME
+        // (key, bucket, model, provider) must ACCUMULATE (ON CONFLICT DO UPDATE), not overwrite -
+        // this is what a third party's cost reconstruction reads back. Use a private bucket so the
+        // read-back is isolated from any other row in the table.
+        let m_bucket = 20_260_722_u64;
+        let delta = |ti, to, tcr, tcc| MeteringDelta {
+            key_id: "vk_pg".into(),
+            bucket: m_bucket,
+            model: "gpt-x".into(),
+            provider: "special".into(),
+            tokens_input: ti,
+            tokens_output: to,
+            tokens_cache_read: tcr,
+            tokens_cache_creation: tcc,
+        };
+        store.add_metering(&delta(10, 5, 2, 1)).unwrap();
+        store.add_metering(&delta(30, 15, 4, 3)).unwrap();
+        let rows: Vec<MeteringRow> = store
+            .list_metering(m_bucket)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.key_id == "vk_pg")
+            .collect();
+        assert_eq!(rows.len(), 1, "the two deltas UPSERT into ONE row");
+        let r = &rows[0];
+        assert_eq!(
+            (
+                r.model.as_str(),
+                r.provider.as_str(),
+                r.tokens_input,
+                r.tokens_output,
+                r.tokens_cache_read,
+                r.tokens_cache_creation,
+                r.requests,
+            ),
+            ("gpt-x", "special", 40, 20, 6, 4, 2),
+            "the UPSERT accumulates every token class plus the request count"
+        );
+        // Cleanup so the test is re-runnable against a persistent CI database.
+        store
+            .lock()
+            .execute(
+                "DELETE FROM usage_metering WHERE key_id='vk_pg' AND bucket=$1",
+                &[&(m_bucket as i64)],
+            )
+            .expect("metering cleanup");
+
+        // AUDIT: the tamper-evidence chain must round-trip through the store verbatim, oldest-first
+        // by seq (the store never interprets the hash chain - it is a dumb durable sink). Isolate on a
+        // high seq band so a persistent CI table does not collide, and clean up afterward.
+        let a_base = 900_000_000_u64;
+        let mk = |seq: u64, prev: &str, hash: &str| AuditRecord {
+            seq,
+            ts: 1000 + seq,
+            action: "plugin.install".into(),
+            resource: format!("plugin:{seq}"),
+            outcome: "applied".into(),
+            principal: "admin".into(),
+            prev_hash: prev.into(),
+            hash: hash.into(),
+        };
+        // Append OUT of seq order to prove the ORDER BY seq on read.
+        store.append_audit(&mk(a_base + 2, "h1", "h2")).unwrap();
+        store.append_audit(&mk(a_base + 1, "", "h1")).unwrap();
+        store.append_audit(&mk(a_base + 3, "h2", "h3")).unwrap();
+        let chain: Vec<AuditRecord> = store
+            .list_audit()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.seq >= a_base)
+            .collect();
+        assert_eq!(chain.len(), 3);
+        assert_eq!(
+            (chain[0].seq, chain[1].seq, chain[2].seq),
+            (a_base + 1, a_base + 2, a_base + 3),
+            "audit records return oldest-first by seq"
+        );
+        assert_eq!(chain[0].prev_hash, "", "chain head links to nothing");
+        assert_eq!(chain[1].prev_hash, "h1");
+        assert_eq!(
+            (chain[2].prev_hash.as_str(), chain[2].hash.as_str()),
+            ("h2", "h3"),
+            "the prev_hash -> hash links survive the round-trip verbatim"
+        );
+        assert_eq!(chain[2].resource, format!("plugin:{}", a_base + 3));
+        // A re-append of the same seq UPSERTs (idempotent replay), never a UNIQUE violation.
+        store.append_audit(&mk(a_base + 2, "h1", "h2b")).unwrap();
+        let replayed: Vec<AuditRecord> = store
+            .list_audit()
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.seq >= a_base)
+            .collect();
+        assert_eq!(replayed.len(), 3, "re-append of an existing seq upserts");
+        assert_eq!(
+            replayed[1].hash, "h2b",
+            "the replayed record overwrites the prior digest"
+        );
+        // Cleanup so the test is re-runnable against a persistent CI database.
+        store
+            .lock()
+            .execute("DELETE FROM audit_log WHERE seq >= $1", &[&(a_base as i64)])
+            .expect("audit cleanup");
+
         // Attach an AWS credential so delete_key's CASCADE (key + usage + credentials) can be
         // verified end to end - the credential-cleanup path P1 #6 flagged as untested.
         let cred = AwsCredential {

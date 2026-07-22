@@ -1560,8 +1560,9 @@ pub(crate) struct GovernanceCfg {
     #[serde(default)]
     pub(crate) store: GovernanceStore,
     /// Connection target for a durable governance store: a SQLite file path when `store: sqlite`
-    /// (default `busbar-governance.db`), or a Postgres libpq URL (`postgres://user:pass@host/db`)
-    /// when `store: postgres`. Unused for the default `store: memory`.
+    /// (default `busbar-governance.db`), a Postgres libpq URL (`postgres://user:pass@host/db`) when
+    /// `store: postgres`, or a Redis URL (`redis://host:port/db`) when `store: redis`. Unused for the
+    /// default `store: memory`.
     #[serde(default = "default_gov_db_path")]
     pub(crate) db_path: String,
     /// Flat cents charged per request for budget accounting. Defaults to 1.

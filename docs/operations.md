@@ -35,7 +35,7 @@ protocol or auth mode, or an invalid `on_exhausted` action stops the process wit
 diagnostic. A provider whose key env var is empty logs a warning and runs (its lane
 will fail auth on first use). `auth.chain: []` prints a loud open-relay warning.
 
-The HTTP client uses a 300s request timeout and pools up to 64 idle keep-alive connections per upstream host.
+The HTTP client uses a 300s request timeout and pools up to 1024 idle keep-alive connections per upstream host.
 
 ### Validating configuration (`busbar --validate`)
 

@@ -1634,7 +1634,8 @@ fn auth_cfg(mode: &str) -> config::AuthCfg {
 
 #[test]
 fn test_validate_governance_rejects_passthrough_combination() {
-    // Regression: governance.enabled + upstream_credentials: passthrough is self-contradictory.
+    // Regression: active governance (admin_token set) + upstream_credentials: passthrough is
+    // self-contradictory.
     // Governance supersedes passthrough (every request must resolve to an enabled virtual key),
     // so an operator who believes they are in passthrough silently rejects every caller lacking
     // a virtual key — a behaviour inversion that must fail loud at boot, not pass to a runtime
