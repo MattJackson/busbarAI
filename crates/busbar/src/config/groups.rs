@@ -41,6 +41,37 @@ pub(crate) struct GroupCfg {
     /// The group's limits, enforced together (AND). Order preserved (C9: ordered list).
     #[serde(default)]
     pub(crate) limits: Vec<LimitCfg>,
+    /// Template limits stamped onto any CHILD group auto-provisioned under this one (e.g. a
+    /// `user:<sub>` leaf created on first self-mint). Lookup is nearest-ancestor-wins: provisioning
+    /// walks up from the immediate parent and uses the first `child_default` it finds; none anywhere
+    /// -> the new child is inherit-only (no own limits, capped by the parent chain). Absent when a
+    /// group sets no template. Does NOT affect enforcement of THIS group — provisioning-time only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_default: Option<ChildDefault>,
+}
+
+impl Default for GroupCfg {
+    /// Matches the serde defaults of a bare `groups:` entry (enabled, no parent, no limits, no
+    /// child_default), so construction sites can use `..Default::default()` and a future field
+    /// addition touches ONE place instead of every literal.
+    fn default() -> Self {
+        GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: Vec::new(),
+            child_default: None,
+        }
+    }
+}
+
+/// The limit template a group hands to its auto-provisioned children (see `GroupCfg::child_default`).
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChildDefault {
+    /// Limits copied onto a newly auto-created child group. Same `{ <metric>: <amount>, per: <window> }`
+    /// shape as any group's `limits`.
+    #[serde(default)]
+    pub(crate) limits: Vec<LimitCfg>,
 }
 
 fn default_true() -> bool {
@@ -290,19 +321,65 @@ limits:
   - { requests: 500, per: minute }
   - { tokens: 20000000, per: day }
   - { concurrent: 5 }
+child_default:
+  limits:
+    - { budget: 2000, per: month }
 ";
         let g1: GroupCfg = serde_yaml::from_str(src).expect("parse group");
+        assert!(
+            g1.child_default
+                .as_ref()
+                .is_some_and(|c| c.limits.len() == 1),
+            "child_default template parses"
+        );
         // Serialize back out, then parse again — the two parsed values must be identical.
         let out = serde_yaml::to_string(&g1).expect("serialize group");
         let g2: GroupCfg = serde_yaml::from_str(&out).expect("re-parse serialized group");
-        assert_eq!(g1, g2, "group must survive a serialize/deserialize round-trip");
+        assert_eq!(
+            g1, g2,
+            "group must survive a serialize/deserialize round-trip"
+        );
 
         // Spot-check the serialized shape is the canonical `{ <metric>: <amount>, per: <window> }`,
         // not some derived tagged form — a drift here would silently corrupt the overlay format.
-        assert!(out.contains("budget: 1000"), "budget metric key preserved: {out}");
+        assert!(
+            out.contains("budget: 1000"),
+            "budget metric key preserved: {out}"
+        );
         assert!(out.contains("per: month"), "window preserved: {out}");
-        assert!(out.contains("concurrent: 5"), "windowless concurrent preserved: {out}");
-        assert!(!out.contains("per: null"), "concurrent must not emit a null `per`: {out}");
+        assert!(
+            out.contains("concurrent: 5"),
+            "windowless concurrent preserved: {out}"
+        );
+        assert!(
+            !out.contains("per: null"),
+            "concurrent must not emit a null `per`: {out}"
+        );
+        assert!(
+            out.contains("child_default"),
+            "child_default preserved: {out}"
+        );
+    }
+
+    /// A group with no `child_default` omits it from the serialized form (skip_serializing_if) — an
+    /// overlay-written group must not carry a spurious `child_default: null` that then fails re-parse.
+    #[test]
+    fn group_without_child_default_omits_it() {
+        let g: GroupCfg = serde_yaml::from_str("limits: [ { budget: 10, per: day } ]").unwrap();
+        let out = serde_yaml::to_string(&g).unwrap();
+        assert!(
+            !out.contains("child_default"),
+            "no spurious child_default key: {out}"
+        );
+        // ..Default::default() construction matches a bare parse (the anti-smell property).
+        assert_eq!(
+            GroupCfg {
+                limits: g.limits.clone(),
+                ..Default::default()
+            },
+            g,
+            "Default-based construction equals the parsed bare group"
+        );
     }
 
     /// The windowless `concurrent` limit serializes WITHOUT a `per` key (len 1 map), and windowed
@@ -310,7 +387,10 @@ limits:
     #[test]
     fn limit_serialize_shape_matches_deserialize() {
         let concurrent: LimitCfg = serde_yaml::from_str("{ concurrent: 3 }").unwrap();
-        assert_eq!(serde_yaml::to_string(&concurrent).unwrap().trim(), "concurrent: 3");
+        assert_eq!(
+            serde_yaml::to_string(&concurrent).unwrap().trim(),
+            "concurrent: 3"
+        );
 
         let budget: LimitCfg = serde_yaml::from_str("{ budget: 5000, per: month }").unwrap();
         let out = serde_yaml::to_string(&budget).unwrap();

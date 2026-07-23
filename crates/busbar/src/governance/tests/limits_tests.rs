@@ -28,6 +28,7 @@ fn group_cfg(parent: Option<&str>, enabled: bool, limits: Vec<LimitCfg>) -> Grou
         parent: parent.map(str::to_string),
         enabled,
         limits,
+        ..Default::default()
     }
 }
 

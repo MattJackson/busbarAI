@@ -227,6 +227,7 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
                 amount: 1_000_000,
                 per: Some(crate::config::groups::LimitWindow::Day),
             }],
+            ..Default::default()
         },
     )]);
     let cost = Arc::new(crate::cost::CostModel::resolve_parts(None, 0, &groups));

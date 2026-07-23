@@ -3626,6 +3626,7 @@ fn group(parent: Option<&str>, limits: Vec<crate::config::groups::LimitCfg>) -> 
         parent: parent.map(String::from),
         enabled: true,
         limits,
+        ..Default::default()
     }
 }
 
@@ -3686,6 +3687,7 @@ fn test_validate_groups_faults_are_named_with_fixes() {
                 parent,
                 enabled: true,
                 limits: vec![],
+                ..Default::default()
             },
         );
     }

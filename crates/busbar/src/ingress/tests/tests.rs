@@ -464,6 +464,7 @@ async fn test_admit_check_uses_charged_at_window_not_clock() {
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Day),
             }],
+            ..Default::default()
         },
     )]);
     let cost = std::sync::Arc::new(crate::cost::CostModel::resolve_parts(None, 30, &groups));
@@ -3286,6 +3287,7 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Total),
             }],
+            ..Default::default()
         },
     )]);
     inner.cost = std::sync::Arc::new(crate::cost::CostModel::resolve_parts(None, 30, &groups));
@@ -3322,6 +3324,7 @@ fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Minute),
             }],
+            ..Default::default()
         },
     )]);
     inner.cost = std::sync::Arc::new(crate::cost::CostModel::resolve_parts(None, 30, &groups));
@@ -5381,6 +5384,7 @@ async fn governed_limit_router(
             parent: None,
             enabled: true,
             limits: vec![tripping],
+            ..Default::default()
         },
     )]);
     let app = TestApp::new()
@@ -5697,6 +5701,7 @@ fn governed_app_group_blocked() -> (Arc<App>, crate::governance::VirtualKey) {
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Total),
             }],
+            ..Default::default()
         },
     )]);
     let cost = crate::cost::CostModel::resolve_parts(None, 30, &groups);

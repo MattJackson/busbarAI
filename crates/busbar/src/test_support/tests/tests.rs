@@ -401,6 +401,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Minute),
             }],
+            ..Default::default()
         },
     )]);
 
@@ -522,6 +523,7 @@ async fn test_cross_protocol_stream_records_tokens_for_tpm() {
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Minute),
             }],
+            ..Default::default()
         },
     )]);
 
@@ -1022,6 +1024,7 @@ async fn test_governance_budget_over_quota() {
                 amount: 100,
                 per: Some(crate::config::groups::LimitWindow::Total),
             }],
+            ..Default::default()
         },
     )]);
     let cost = crate::cost::CostModel::resolve_parts(None, 1, &groups);
@@ -1129,6 +1132,7 @@ async fn over_budget_router() -> (
                 amount: 100,
                 per: Some(crate::config::groups::LimitWindow::Total),
             }],
+            ..Default::default()
         },
     )]);
     let cost = crate::cost::CostModel::resolve_parts(None, 1, &groups);
@@ -1346,6 +1350,7 @@ async fn test_governance_rate_limit_429() {
                 amount: 2,
                 per: Some(crate::config::groups::LimitWindow::Minute),
             }],
+            ..Default::default()
         },
     )]);
     let app = TestApp::new()
@@ -1448,6 +1453,7 @@ async fn over_rpm_router() -> (
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Minute),
             }],
+            ..Default::default()
         },
     )]);
     let app = TestApp::new()

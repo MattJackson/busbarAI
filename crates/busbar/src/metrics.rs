@@ -787,6 +787,7 @@ mod tests {
                         amount: 100,
                         per: Some(crate::config::groups::LimitWindow::Minute),
                     }],
+                    ..Default::default()
                 },
             )]);
         let app = TestApp::new()
@@ -850,6 +851,7 @@ mod tests {
                     amount: 1_000,
                     per: Some(crate::config::groups::LimitWindow::Total),
                 }],
+                ..Default::default()
             },
         )]);
         let cost = crate::cost::CostModel::resolve_parts(None, 1, &groups);

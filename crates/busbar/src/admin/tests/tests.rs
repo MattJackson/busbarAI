@@ -4103,6 +4103,7 @@ async fn test_patch_key_three_state_group_and_enabled() {
                 amount: 100,
                 per: Some(crate::config::groups::LimitWindow::Minute),
             }],
+            ..Default::default()
         },
     )]);
     let app = crate::test_support::TestApp::new()
@@ -5359,6 +5360,7 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
                     amount: 1_000_000,
                     per: Some(crate::config::groups::LimitWindow::Month),
                 }],
+                ..Default::default()
             },
         )]);
         crate::cost::CostModel::resolve_parts(None, 0, &groups)

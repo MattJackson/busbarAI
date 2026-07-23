@@ -48,6 +48,7 @@ fn group(parent: Option<&str>, limits: Vec<LimitCfg>) -> GroupCfg {
         parent: parent.map(str::to_string),
         enabled: true,
         limits,
+        ..Default::default()
     }
 }
 

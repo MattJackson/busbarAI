@@ -188,6 +188,7 @@ fn budget_group_cfg(cap: i64, period: &str, parent: Option<&str>) -> crate::conf
             amount: u64::try_from(cap).unwrap_or(0),
             per: Some(per),
         }],
+        ..Default::default()
     }
 }
 
@@ -1188,6 +1189,7 @@ fn test_rate_headroom_reports_fraction_remaining() {
                     amount: 0,
                     per: Some(LimitWindow::Minute),
                 }],
+                ..Default::default()
             },
         )]);
     let zero = crate::cost::CostModel::resolve_parts(None, 0, &zero_cfg);
@@ -1219,6 +1221,7 @@ fn test_rate_headroom_reports_fraction_remaining() {
                         per: Some(LimitWindow::Minute),
                     },
                 ],
+                ..Default::default()
             },
         )]);
     let cost = crate::cost::CostModel::resolve_parts(None, 0, &cfg);
