@@ -52,6 +52,69 @@ fn is_undefined_table(e: &postgres::Error) -> bool {
     e.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
 }
 
+/// Extract the PASSWORD from a Postgres DSN (L2). Supports both the URL form
+/// (`postgres://user:pass@host:5432/db`) and the libpq keyword form (`... password=secret ...`), so
+/// a connect-error string can be scrubbed of the secret regardless of which shape the operator used.
+fn dsn_password(dsn: &str) -> Option<String> {
+    // URL form: `scheme://[user[:pass]@]host...`.
+    if let Some(rest) = dsn.split("://").nth(1) {
+        if let Some((userinfo, _)) = rest.rsplit_once('@') {
+            if let Some((_, pass)) = userinfo.split_once(':') {
+                if !pass.is_empty() {
+                    return Some(pass.to_string());
+                }
+            }
+        }
+    }
+    // libpq keyword form: whitespace-separated `key=value` pairs; find `password=...`.
+    for tok in dsn.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("password=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Percent-DECODE a URL component (`%40` -> `@`). A malformed escape is left verbatim. So the scrub
+/// redacts BOTH the raw and decoded forms of a URL-embedded password.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Replace every occurrence of `secret` (in BOTH raw and percent-decoded forms) with `<redacted>`.
+fn scrub(msg: String, secret: Option<&str>) -> String {
+    let Some(s) = secret.filter(|s| !s.is_empty()) else {
+        return msg;
+    };
+    let mut out = msg;
+    if out.contains(s) {
+        out = out.replace(s, "<redacted>");
+    }
+    let decoded = percent_decode(s);
+    if decoded != s && !decoded.is_empty() && out.contains(&decoded) {
+        out = out.replace(&decoded, "<redacted>");
+    }
+    out
+}
+
 /// Store schema version, mirrored from the SQLite backend's `PRAGMA user_version` in a tiny
 /// `busbar_schema` table. v2 = the 1.5.0 token-ledger cost model (see the SQLite backend's
 /// `SCHEMA_VERSION` doc). 1.5.0 is unreleased, so a pre-v2 database is dropped and recreated - a
@@ -160,7 +223,13 @@ impl PostgresStore {
     /// `postgres://user:pass@host:5432/dbname`) and ensure the schema. TLS is not wired in this
     /// build (`NoTls`); front the database with a TLS-terminating proxy or a local socket.
     pub fn connect(conn_str: &str) -> StoreResult<Self> {
-        let client = Client::connect(conn_str, NoTls).store()?;
+        // L2: a connect error's string can embed the DSN (and thus the password). Scrub it before it
+        // leaves the crate, matching the Redis backend. Handles both the URL form
+        // (`postgres://user:pass@host/db`) and the libpq keyword form (`password=secret`), in raw and
+        // percent-decoded shapes.
+        let secret = dsn_password(conn_str);
+        let client = Client::connect(conn_str, NoTls)
+            .map_err(|e| StoreError(scrub(e.to_string(), secret.as_deref())))?;
         let store = Self {
             client: Mutex::new(client),
         };
@@ -655,6 +724,42 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L2: a connect-error string must never leak the DSN password. `dsn_password` extracts it from
+    /// both the URL and libpq keyword forms, and `scrub` redacts BOTH raw and percent-decoded forms.
+    #[test]
+    fn dsn_password_extraction_and_scrub() {
+        // URL form.
+        assert_eq!(
+            dsn_password("postgres://user:s3cr3t@host:5432/db").as_deref(),
+            Some("s3cr3t")
+        );
+        // URL form, percent-encoded password.
+        assert_eq!(
+            dsn_password("postgresql://u:p%40ss@host/db").as_deref(),
+            Some("p%40ss")
+        );
+        // libpq keyword form.
+        assert_eq!(
+            dsn_password("host=db user=u password=kwsecret dbname=x").as_deref(),
+            Some("kwsecret")
+        );
+        // No password.
+        assert_eq!(dsn_password("postgres://host:5432/db"), None);
+        assert_eq!(dsn_password("host=db user=u"), None);
+
+        // A connect error embedding the DSN is scrubbed of the raw AND decoded password.
+        let raw = dsn_password("postgresql://u:p%40ss@host/db").unwrap();
+        let leak = "could not connect: postgresql://u:p%40ss@host/db (auth p@ss)".to_string();
+        let s = scrub(leak, Some(&raw));
+        assert!(
+            !s.contains("p%40ss") && !s.contains("p@ss") && s.contains("<redacted>"),
+            "both raw and decoded password forms must be scrubbed; got {s}"
+        );
+        assert_eq!(scrub("plain".into(), None), "plain");
+        assert_eq!(percent_decode("p%40ss"), "p@ss");
+        assert_eq!(percent_decode("bad%zz"), "bad%zz");
+    }
 
     /// DI-2: a BIGINT rate-limit column above `u32::MAX` (or negative) must SATURATE to `u32::MAX`,
     /// not wrap to a wrong (lower) cap via `as u32`. Matches the SQLite backend's semantics exactly.

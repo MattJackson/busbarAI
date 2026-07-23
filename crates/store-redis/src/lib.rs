@@ -123,12 +123,45 @@ fn url_password(url: &str) -> Option<String> {
     (!pass.is_empty()).then(|| pass.to_string())
 }
 
-/// Replace every occurrence of `secret` in `msg` with `<redacted>` - the password-in-error scrub.
-fn scrub(msg: String, secret: Option<&str>) -> String {
-    match secret {
-        Some(s) if !s.is_empty() && msg.contains(s) => msg.replace(s, "<redacted>"),
-        _ => msg,
+/// Percent-DECODE a URL component (`%40` -> `@`, `%25` -> `%`). A malformed escape is left verbatim.
+/// Used so the scrub redacts BOTH the raw (as-written-in-URL) and decoded forms of the password -
+/// the redis driver may surface either in an error string (L1).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Replace every occurrence of `secret` (in BOTH its raw and percent-decoded forms) in `msg` with
+/// `<redacted>` - the password-in-error scrub. Scrubbing both forms means a secret that appears
+/// percent-encoded in the URL but DECODED in a driver error string (or vice-versa) is still caught.
+fn scrub(msg: String, secret: Option<&str>) -> String {
+    let Some(s) = secret.filter(|s| !s.is_empty()) else {
+        return msg;
+    };
+    let mut out = msg;
+    if out.contains(s) {
+        out = out.replace(s, "<redacted>");
+    }
+    let decoded = percent_decode(s);
+    if decoded != s && !decoded.is_empty() && out.contains(&decoded) {
+        out = out.replace(&decoded, "<redacted>");
+    }
+    out
 }
 
 /// Is this a CONNECTION-LEVEL error worth one reconnect-and-retry (dropped socket, IO failure,
@@ -743,6 +776,33 @@ mod tests {
         // No secret / secret absent: untouched.
         assert_eq!(scrub("plain".into(), None), "plain");
         assert_eq!(scrub("plain".into(), Some("zz")), "plain");
+
+        // L1: the scrub redacts BOTH the raw (percent-encoded) and DECODED forms of the password.
+        // `url_password` returns the raw `p%40ss`; a driver error may print either the raw form or
+        // the decoded `p@ss`. Both must be redacted.
+        let raw = url_password("rediss://user:p%40ss@host:6380").expect("password");
+        assert_eq!(raw, "p%40ss");
+        // Decoded form leaking in an error string is scrubbed.
+        let decoded_leak = "auth failed with password p@ss".to_string();
+        let s = scrub(decoded_leak, Some(&raw));
+        assert!(
+            !s.contains("p@ss") && s.contains("<redacted>"),
+            "the DECODED password form must be scrubbed too; got {s}"
+        );
+        // Raw form leaking is also scrubbed.
+        let raw_leak = "dsn rediss://user:p%40ss@host:6380".to_string();
+        let s2 = scrub(raw_leak, Some(&raw));
+        assert!(
+            !s2.contains("p%40ss"),
+            "the raw password form is scrubbed; got {s2}"
+        );
+        assert_eq!(percent_decode("p%40ss"), "p@ss");
+        assert_eq!(percent_decode("no-escape"), "no-escape");
+        assert_eq!(
+            percent_decode("bad%zz"),
+            "bad%zz",
+            "a malformed escape is left verbatim"
+        );
     }
 
     /// A `rediss://` (TLS) URL parses into a client without connecting - the TLS feature is
