@@ -42,7 +42,7 @@ The ONE limit tree. Keys carry no limits; every cap lives here.
 ```yaml
 groups:
   <name>:
-    parent: <group>          # optional; acyclic, depth <= 8
+    parent: <group>          # optional; acyclic
     enabled: true            # false = freeze this group (and every descendant's traffic)
     limits:
       - { requests: 500, per: minute }   # requests|tokens|budget need a per: window

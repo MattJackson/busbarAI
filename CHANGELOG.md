@@ -36,7 +36,7 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   canonical example lives at `examples/clean-config-1.5.0.yaml` and boots under `busbar
   --validate`.
 - **`groups:` - the ONE limit tree.** A group is a named enforcement bucket: `{ parent?, enabled,
-  limits: [...] }`, forming an acyclic chain (depth <= 8). A limit is generic:
+  limits: [...] }`, forming an acyclic chain (any depth). A limit is generic:
   `{ requests|tokens|budget: <amount>, per: <window> }`, or `{ concurrent: <n> }` (instantaneous
   in-flight gauge, no window). Admission walks the chain UP through `parent` and ANDs EVERY limit
   of EVERY group atomically (all-or-nothing charging); the rejection NAMES the exact blocking

@@ -3635,12 +3635,14 @@ fn limit_requests_per_minute(amount: u64) -> crate::config::groups::LimitCfg {
         metric: crate::config::groups::LimitMetric::Requests,
         amount,
         per: Some(crate::config::groups::LimitWindow::Minute),
+        pool: None,
     }
 }
 
 /// groups faults are named with fixes: a missing parent gets a PASTE-READY stub; a cycle names
-/// the exact path; depth > 8 is rejected; a zero-amount limit is rejected (it rejects every
-/// request); a valid nested hierarchy passes. (Heir of the budget_groups validation family.)
+/// the exact path; a zero-amount limit is rejected (it rejects every request); a valid nested
+/// hierarchy passes, at ANY depth (no arbitrary depth ceiling - the cycle check is what bounds
+/// the walk). (Heir of the budget_groups validation family.)
 #[test]
 fn test_validate_groups_faults_are_named_with_fixes() {
     // Missing parent -> paste-ready stub of the missing group.
@@ -3673,7 +3675,8 @@ fn test_validate_groups_faults_are_named_with_fixes() {
         "the cycle diagnostic must name the path: {errs:?}"
     );
 
-    // Depth > 8 rejected (a 10-deep chain).
+    // Deep chains are LEGAL: hierarchy depth is the operator's structure, not our policy (only a
+    // cycle is a fault). A 10-deep acyclic chain validates clean.
     let mut cfg = cost_cfg(&["m"]);
     for i in 0..10 {
         let parent = if i == 9 {
@@ -3691,8 +3694,39 @@ fn test_validate_groups_faults_are_named_with_fixes() {
             },
         );
     }
-    let errs = validate(&cfg).expect_err("a 10-deep chain must fail the depth cap");
-    assert!(errs.join("\n").contains("maximum depth"), "{errs:?}");
+    validate(&cfg).expect("an acyclic chain of any depth must validate");
+
+    // A `pool:` qualifier must name a real pool - a dangling one is an unenforced budget and
+    // fails loud, naming the group, the field, and the bogus pool. Both the group's own limits
+    // and its child_default template are covered; a valid pool passes.
+    let mut cfg = cost_cfg(&["m"]);
+    let mut bad = limit_requests_per_minute(5);
+    bad.pool = Some("nope".to_string());
+    cfg.groups
+        .insert("team".to_string(), group(None, vec![bad]));
+    let errs = validate(&cfg).expect_err("a dangling pool qualifier must fail");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("groups.team.limits") && e.contains("`pool: nope`")),
+        "the dangling pool is named: {errs:?}"
+    );
+    let mut cfg = cost_cfg(&["m"]);
+    let mut tmpl = limit_requests_per_minute(5);
+    tmpl.pool = Some("nope".to_string());
+    let mut g = group(None, vec![limit_requests_per_minute(5)]);
+    g.child_default = Some(config::groups::ChildDefault { limits: vec![tmpl] });
+    cfg.groups.insert("team".to_string(), g);
+    let errs = validate(&cfg).expect_err("a dangling pool in child_default must fail");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("groups.team.child_default.limits") && e.contains("`pool: nope`")),
+        "the dangling child_default pool is named: {errs:?}"
+    );
+    let mut cfg = cost_cfg(&["m"]);
+    let mut ok = limit_requests_per_minute(5);
+    ok.pool = Some("pool1".to_string());
+    cfg.groups.insert("team".to_string(), group(None, vec![ok]));
+    validate(&cfg).expect("a pool qualifier naming a real pool must pass");
 
     // Zero-amount limit -> rejects every request through the group; must fail loud, and the
     // message must name the metric and teach the `enabled: false` freeze alternative.

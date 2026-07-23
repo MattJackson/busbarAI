@@ -32,19 +32,6 @@ use busbar_api::TierTokens;
 
 use crate::config::groups::LimitMetric;
 
-/// Maximum group chain depth (a key's own bucket not counted). Validated at boot; the runtime walk
-/// also clamps here so a corrupt store/config can never loop.
-pub(crate) const MAX_GROUP_DEPTH: usize = 8;
-
-/// Distinct accounting windows a group's windowed limits can use (minute|hour|day|month|total) -
-/// the per-group ceiling on enforcement buckets.
-pub(crate) const MAX_WINDOWS: usize = 5;
-
-/// Maximum enforcement-chain length in BUCKETS: the key's own attribution bucket + every ancestor
-/// group's per-window buckets. Sizes the fixed (no-heap) scratch arrays of the atomic admission
-/// check.
-pub(crate) const MAX_CHAIN: usize = 1 + MAX_GROUP_DEPTH * MAX_WINDOWS;
-
 /// Nano-units (1e-9 abstract cost unit) per cent (1e-2 unit): the divisor that lands a derived
 /// nano-unit total in whole cents.
 const NANOS_PER_CENT: u128 = 10_000_000;
@@ -137,8 +124,7 @@ pub(crate) struct GroupRuntime {
     pub(crate) parent: Option<usize>,
 }
 
-/// One bucket of a resolved enforcement chain (borrowed views into the key / the `CostModel`; the
-/// chain walk allocates nothing).
+/// One bucket of a resolved enforcement chain (borrowed views into the key / the `CostModel`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChainBucket<'a> {
     /// The store/ledger bucket id (the key id, or `group:<name>@<window>`).
@@ -155,29 +141,28 @@ pub(crate) struct ChainBucket<'a> {
 }
 
 /// A resolved enforcement chain: the key's attribution bucket plus every ancestor group's
-/// per-window buckets, innermost group first. Fixed-capacity (no heap) - depth is validated
-/// <= [`MAX_GROUP_DEPTH`] and windows <= [`MAX_WINDOWS`]. Also carries the GROUP INDICES walked
-/// (for the `enabled` freeze check and the `concurrent` gauges, which are per group, not per
-/// window bucket).
+/// per-window buckets, innermost group first. Sized by the chain actually walked (the tree is
+/// unbounded by policy; a chain can never exceed the number of groups — cycles are a validate
+/// error and the walk clamps there defensively). Also carries the GROUP INDICES walked (for the
+/// `enabled` freeze check and the `concurrent` gauges, which are per group, not per window
+/// bucket).
 pub(crate) struct Chain<'a> {
-    buckets: [Option<ChainBucket<'a>>; MAX_CHAIN],
-    len: usize,
-    groups: [usize; MAX_GROUP_DEPTH],
-    groups_len: usize,
+    buckets: Vec<ChainBucket<'a>>,
+    groups: Vec<usize>,
 }
 
 impl<'a> Chain<'a> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &ChainBucket<'a>> {
-        self.buckets[..self.len].iter().filter_map(|b| b.as_ref())
+        self.buckets.iter()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.buckets.len()
     }
 
     /// The `CostModel::groups()` indices of the chain's groups, innermost first.
     pub(crate) fn group_indices(&self) -> &[usize] {
-        &self.groups[..self.groups_len]
+        &self.groups
     }
 }
 
@@ -441,8 +426,8 @@ impl CostModel {
     }
 
     /// Resolve the ENFORCEMENT CHAIN for a key: [key's attribution bucket] -> key.group's window
-    /// buckets -> parent's -> ... root, innermost first. Zero-allocation (borrows the key + this
-    /// model's group table).
+    /// buckets -> parent's -> ... root, innermost first. Borrows the key + this model's group
+    /// table; allocates only the chain vectors themselves.
     ///
     /// `Err(missing)` when the key names a `group` that does not exist in config - the
     /// FAIL-CLOSED outcome (mint validates the group; boot re-checks; this arm covers a shared
@@ -451,8 +436,8 @@ impl CostModel {
         &'a self,
         key: &'a busbar_api::VirtualKey,
     ) -> Result<Chain<'a>, &'a str> {
-        let mut buckets: [Option<ChainBucket<'a>>; MAX_CHAIN] = [const { None }; MAX_CHAIN];
-        buckets[0] = Some(ChainBucket {
+        let mut buckets: Vec<ChainBucket<'a>> = Vec::with_capacity(8);
+        buckets.push(ChainBucket {
             bucket_id: &key.id,
             group_name: None,
             window: crate::governance::WINDOW_TOTAL,
@@ -460,9 +445,7 @@ impl CostModel {
             tokens_cap: None,
             budget_cap: None,
         });
-        let mut len = 1;
-        let mut groups = [0usize; MAX_GROUP_DEPTH];
-        let mut groups_len = 0usize;
+        let mut groups: Vec<usize> = Vec::new();
         let mut next = match key.group.as_deref() {
             None => None,
             Some(name) => match self.group_idx.get(name) {
@@ -471,18 +454,15 @@ impl CostModel {
             },
         };
         while let Some(i) = next {
-            if groups_len >= MAX_GROUP_DEPTH {
-                // Validation caps depth at MAX_GROUP_DEPTH; clamp defensively (never loop).
+            if groups.len() >= self.groups.len() {
+                // A distinct-node walk cannot exceed the group count without revisiting one, i.e.
+                // a cycle. Cycles are a validate error; clamp defensively (never loop).
                 break;
             }
             let g = &self.groups[i];
-            groups[groups_len] = i;
-            groups_len += 1;
+            groups.push(i);
             for b in &g.buckets {
-                if len >= MAX_CHAIN {
-                    break; // unreachable by construction (depth x windows bounds); defensive
-                }
-                buckets[len] = Some(ChainBucket {
+                buckets.push(ChainBucket {
                     bucket_id: &b.bucket_id,
                     group_name: Some(&g.name),
                     window: b.window,
@@ -490,16 +470,10 @@ impl CostModel {
                     tokens_cap: b.tokens_cap,
                     budget_cap: b.budget_cap,
                 });
-                len += 1;
             }
             next = g.parent;
         }
-        Ok(Chain {
-            buckets,
-            len,
-            groups,
-            groups_len,
-        })
+        Ok(Chain { buckets, groups })
     }
 }
 

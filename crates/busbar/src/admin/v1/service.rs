@@ -402,7 +402,11 @@ pub(crate) fn build_with_group(
     let mut groups = current.groups_registry.clone();
     groups.insert(name.to_string(), cfg);
     let mut errors = Vec::new();
-    crate::config::groups::validate_groups(&groups, &mut errors);
+    crate::config::groups::validate_groups(
+        &groups,
+        &|p| current.pools.contains_key(p),
+        &mut errors,
+    );
     if !errors.is_empty() {
         return Err(AdminError::Validation(format!(
             "invalid group `{name}`: {}",
@@ -431,7 +435,11 @@ pub(crate) fn build_without_group(current: &App, name: &str) -> Result<App, Admi
     // as a state CONFLICT (something still references this group) so the caller distinguishes it from
     // a malformed request.
     let mut errors = Vec::new();
-    crate::config::groups::validate_groups(&groups, &mut errors);
+    crate::config::groups::validate_groups(
+        &groups,
+        &|p| current.pools.contains_key(p),
+        &mut errors,
+    );
     if !errors.is_empty() {
         return Err(AdminError::Conflict(format!(
             "cannot delete group `{name}`: {} (re-parent or remove the referencing group first)",
@@ -1913,6 +1921,7 @@ mod tests {
             metric: LimitMetric::Budget,
             amount: cents,
             per: Some(per),
+            pool: None,
         }
     }
 

@@ -465,6 +465,7 @@ async fn test_admit_check_uses_charged_at_window_not_clock() {
                 metric: crate::config::groups::LimitMetric::Budget,
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Day),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -3288,6 +3289,7 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
                 metric: crate::config::groups::LimitMetric::Budget,
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Total),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -3325,6 +3327,7 @@ fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
                 metric: crate::config::groups::LimitMetric::Requests,
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Minute),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -5372,12 +5375,14 @@ async fn governed_limit_router(
             metric: LimitMetric::Requests,
             amount: 0,
             per: Some(LimitWindow::Minute),
+            pool: None,
         }
     } else {
         LimitCfg {
             metric: LimitMetric::Budget,
             amount: 0,
             per: Some(LimitWindow::Total),
+            pool: None,
         }
     };
     let groups = std::collections::BTreeMap::from([(
@@ -5702,6 +5707,7 @@ fn governed_app_group_blocked() -> (Arc<App>, crate::governance::VirtualKey) {
                 metric: crate::config::groups::LimitMetric::Budget,
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Total),
+                pool: None,
             }],
             ..Default::default()
         },

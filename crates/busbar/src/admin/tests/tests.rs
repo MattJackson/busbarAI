@@ -4102,6 +4102,7 @@ async fn test_patch_key_three_state_group_and_enabled() {
                 metric: crate::config::groups::LimitMetric::Requests,
                 amount: 100,
                 per: Some(crate::config::groups::LimitWindow::Minute),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -5359,6 +5360,7 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
                     metric: crate::config::groups::LimitMetric::Budget,
                     amount: 1_000_000,
                     per: Some(crate::config::groups::LimitWindow::Month),
+                    pool: None,
                 }],
                 ..Default::default()
             },

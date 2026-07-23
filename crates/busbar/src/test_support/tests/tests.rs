@@ -400,6 +400,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
                 metric: crate::config::groups::LimitMetric::Tokens,
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Minute),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -522,6 +523,7 @@ async fn test_cross_protocol_stream_records_tokens_for_tpm() {
                 metric: crate::config::groups::LimitMetric::Tokens,
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Minute),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -1023,6 +1025,7 @@ async fn test_governance_budget_over_quota() {
                 metric: crate::config::groups::LimitMetric::Budget,
                 amount: 100,
                 per: Some(crate::config::groups::LimitWindow::Total),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -1131,6 +1134,7 @@ async fn over_budget_router() -> (
                 metric: crate::config::groups::LimitMetric::Budget,
                 amount: 100,
                 per: Some(crate::config::groups::LimitWindow::Total),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -1349,6 +1353,7 @@ async fn test_governance_rate_limit_429() {
                 metric: crate::config::groups::LimitMetric::Requests,
                 amount: 2,
                 per: Some(crate::config::groups::LimitWindow::Minute),
+                pool: None,
             }],
             ..Default::default()
         },
@@ -1452,6 +1457,7 @@ async fn over_rpm_router() -> (
                 metric: crate::config::groups::LimitMetric::Requests,
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Minute),
+                pool: None,
             }],
             ..Default::default()
         },

@@ -1432,7 +1432,7 @@ fn validate_cost_model(cfg: &RootCfg, errors: &mut Vec<String>) {
 
     // groups (S3): parents exist, acyclic, depth <= 8 (shared with the parse-time module), plus
     // value-level checks the tree walk does not cover.
-    crate::config::groups::validate_groups(&cfg.groups, errors);
+    crate::config::groups::validate_groups(&cfg.groups, &|p| cfg.pools.contains_key(p), errors);
     for (name, g) in &cfg.groups {
         for limit in &g.limits {
             if limit.amount == 0 {

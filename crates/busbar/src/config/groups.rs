@@ -3,7 +3,7 @@
 
 //! The top-level `groups:` block - THE one limit tree (CLEAN-CONFIG S3). A group is a named
 //! enforcement bucket: an ordered list of generic LIMITS plus an optional `parent` forming an
-//! acyclic chain (depth <= 8, validated). Enforcement (P4) walks the chain and ANDs every bucket;
+//! acyclic chain (validated). Enforcement (P4) walks the chain and ANDs every bucket;
 //! `enabled: false` freezes a group (history kept). Keys are PURE AUTH and carry no limits - a key
 //! binds to at most one group (`group:` at mint), and a key with no group is authed + unlimited.
 //!
@@ -19,6 +19,12 @@
 //! metrics: `requests` | `tokens` | `budget` | `concurrent`. windows (C8, nouns):
 //! `minute` | `hour` | `day` | `month` | `total`. `concurrent` is an in-flight gauge and takes NO
 //! `per`; the three windowed metrics REQUIRE one (a windowless cap is ambiguous - fail loudly).
+//!
+//! A windowed limit may additionally carry `pool: <name>` - the limit then accounts and enforces
+//! per `(group, pool)` instead of group-wide, which is how a budget splits across model tiers
+//! (`{ budget: 5000, per: month, pool: frontier }` + `{ budget: 5000, per: month, pool: value }`).
+//! The named pool must exist (validated at boot / `--validate` / Admin API). `concurrent` takes no
+//! `pool` (the in-flight gauge is per group).
 
 use std::fmt;
 
@@ -32,7 +38,7 @@ use serde::{Deserialize, Serialize, Serializer};
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupCfg {
-    /// Optional parent group, forming the enforcement chain (acyclic, depth <= 8; validated at
+    /// Optional parent group, forming the enforcement chain (acyclic; validated at
     /// boot / `--validate`).
     #[serde(default)]
     pub(crate) parent: Option<String>,
@@ -133,12 +139,16 @@ impl LimitWindow {
 /// One parsed limit: exactly one metric key + its amount, plus the window for windowed metrics.
 /// The `{ <metric>: amount, per: window }` shape is enforced at DESERIALIZE time (not a later
 /// validation pass), so a malformed limit fails with a precise error at parse.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LimitCfg {
     pub(crate) metric: LimitMetric,
     pub(crate) amount: u64,
     /// `Some` for `requests`/`tokens`/`budget` (required); ALWAYS `None` for `concurrent`.
     pub(crate) per: Option<LimitWindow>,
+    /// `Some(pool)` scopes the limit to traffic dispatched through that pool - accounting becomes
+    /// per `(group, pool)`. `None` = group-wide (every request charges it). ALWAYS `None` for
+    /// `concurrent`. The pool's existence is validated against the config's `pools:` at the door.
+    pub(crate) pool: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for LimitCfg {
@@ -153,9 +163,10 @@ impl<'de> Deserialize<'de> for LimitCfg {
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
-                    "a limit map `{ <metric>: <amount>, per: <window> }` where <metric> is one of \
-                     requests|tokens|budget|concurrent and <window> one of \
-                     minute|hour|day|month|total (omit `per` for concurrent)",
+                    "a limit map `{ <metric>: <amount>, per: <window>, pool: <name> }` where \
+                     <metric> is one of requests|tokens|budget|concurrent and <window> one of \
+                     minute|hour|day|month|total (omit `per` for concurrent; `pool` is optional \
+                     and scopes the limit to one pool's traffic)",
                 )
             }
 
@@ -165,6 +176,7 @@ impl<'de> Deserialize<'de> for LimitCfg {
             {
                 let mut metric: Option<(LimitMetric, u64)> = None;
                 let mut per: Option<LimitWindow> = None;
+                let mut pool: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     let named = match key.as_str() {
@@ -179,10 +191,17 @@ impl<'de> Deserialize<'de> for LimitCfg {
                             per = Some(map.next_value()?);
                             None
                         }
+                        "pool" => {
+                            if pool.is_some() {
+                                return Err(de::Error::duplicate_field("pool"));
+                            }
+                            pool = Some(map.next_value()?);
+                            None
+                        }
                         other => {
                             return Err(de::Error::unknown_field(
                                 other,
-                                &["requests", "tokens", "budget", "concurrent", "per"],
+                                &["requests", "tokens", "budget", "concurrent", "per", "pool"],
                             ));
                         }
                     };
@@ -205,6 +224,12 @@ impl<'de> Deserialize<'de> for LimitCfg {
                     ));
                 };
 
+                if metric == LimitMetric::Concurrent && pool.is_some() {
+                    return Err(de::Error::custom(
+                        "`concurrent` is a per-group in-flight gauge and takes NO `pool:` \
+                         qualifier; remove `pool`",
+                    ));
+                }
                 match (metric, per) {
                     (LimitMetric::Concurrent, Some(_)) => Err(de::Error::custom(
                         "`concurrent` is an instantaneous in-flight cap and takes NO `per:` \
@@ -214,6 +239,7 @@ impl<'de> Deserialize<'de> for LimitCfg {
                         metric,
                         amount,
                         per: None,
+                        pool: None,
                     }),
                     (_, None) => Err(de::Error::custom(format!(
                         "a `{}` limit requires a `per:` window \
@@ -224,6 +250,7 @@ impl<'de> Deserialize<'de> for LimitCfg {
                         metric,
                         amount,
                         per: Some(window),
+                        pool,
                     }),
                 }
             }
@@ -244,29 +271,48 @@ impl Serialize for LimitCfg {
     where
         S: Serializer,
     {
-        let len = if self.per.is_some() { 2 } else { 1 };
+        let len = 1 + usize::from(self.per.is_some()) + usize::from(self.pool.is_some());
         let mut map = serializer.serialize_map(Some(len))?;
         map.serialize_entry(self.metric.as_str(), &self.amount)?;
         if let Some(window) = self.per {
             map.serialize_entry("per", window.as_str())?;
         }
+        if let Some(pool) = &self.pool {
+            map.serialize_entry("pool", pool)?;
+        }
         map.end()
     }
 }
 
-/// Validate the whole `groups:` tree: parents exist, acyclic, depth <= 8. Returns paste-ready
-/// errors in the config_validate style. Pure - shared verbatim by boot and `--validate` so the two
-/// cannot drift.
+/// Validate the whole `groups:` tree: parents exist, acyclic, and every `pool:`
+/// qualifier on a limit (own `limits` and `child_default.limits` alike) names a pool that exists.
+/// `pool_exists` abstracts the pool namespace so boot (`cfg.pools`), `--validate`, and the Admin
+/// API (`App.pools`) share this verbatim and cannot drift. Returns paste-ready errors in the
+/// config_validate style.
 pub(crate) fn validate_groups(
     groups: &std::collections::BTreeMap<String, GroupCfg>,
+    pool_exists: &dyn Fn(&str) -> bool,
     errors: &mut Vec<String>,
 ) {
-    // A policy ceiling on hierarchy depth (root counts as 1). NOT what makes the walk terminate — the
-    // visited-path check below detects cycles regardless. It bounds per-request chain-walk cost and
-    // rejects absurd trees; the exact value is a product choice, not a correctness constant.
-    const MAX_GROUP_DEPTH: usize = 8;
-
     for (name, group) in groups {
+        // A pool-qualified limit against a pool that doesn't exist would silently never match any
+        // traffic (an unenforced budget) - reject it at the door instead.
+        let own = group.limits.iter().map(|l| (l, "limits"));
+        let tmpl = group
+            .child_default
+            .iter()
+            .flat_map(|cd| cd.limits.iter().map(|l| (l, "child_default.limits")));
+        for (limit, field) in own.chain(tmpl) {
+            if let Some(pool) = &limit.pool {
+                if !pool_exists(pool) {
+                    errors.push(format!(
+                        "groups.{name}.{field} has `pool: {pool}`, but no such pool exists; \
+                         name a pool from the top-level `pools:` section or drop the qualifier \
+                         for a group-wide limit"
+                    ));
+                }
+            }
+        }
         if let Some(parent) = &group.parent {
             if !groups.contains_key(parent) {
                 errors.push(format!(
@@ -277,9 +323,8 @@ pub(crate) fn validate_groups(
                 continue;
             }
         }
-        // Walk the parent chain from this node: a repeat visit is a cycle; a walk past the depth
-        // ceiling is too deep. Bounded by MAX_GROUP_DEPTH+1 steps, so no visited-set allocation.
-        let mut depth = 1usize;
+        // Walk the parent chain from this node: a repeat visit is a cycle. The visited-path check
+        // is what makes the walk terminate; the path can never exceed the number of groups.
         let mut cursor = group.parent.as_deref();
         let mut path = vec![name.as_str()];
         while let Some(cur) = cursor {
@@ -292,15 +337,6 @@ pub(crate) fn validate_groups(
                 break;
             }
             path.push(cur);
-            depth += 1;
-            if depth > MAX_GROUP_DEPTH {
-                errors.push(format!(
-                    "groups chain starting at '{name}' exceeds the maximum depth of \
-                     {MAX_GROUP_DEPTH} ({})",
-                    path.join(" -> ")
-                ));
-                break;
-            }
             cursor = groups.get(cur).and_then(|g| g.parent.as_deref());
         }
     }

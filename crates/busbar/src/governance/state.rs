@@ -906,22 +906,22 @@ impl GovState {
         }
 
         // 3. WINDOWED limits: acquire every involved shard's write lock in ASCENDING shard order
-        // (dedup) - fixed-size scratch, no heap. `guard_slot[i]` = the position in `guards`
-        // holding bucket i's shard.
+        // (dedup) - scratch sized by the chain actually resolved. `guard_shards[j]` = the shard
+        // whose guard sits at position j in `guards`.
         let fee = cost.price_per_request_cents();
-        let mut shard_idx = [0usize; crate::cost::MAX_CHAIN];
-        let mut n = 0usize;
+        let n = chain.len();
+        let mut shard_idx: Vec<usize> = Vec::with_capacity(n);
         for bucket in chain.iter() {
-            shard_idx[n] = self.budget.shard_index(bucket.bucket_id);
-            n += 1;
+            shard_idx.push(self.budget.shard_index(bucket.bucket_id));
         }
-        let mut order: [usize; crate::cost::MAX_CHAIN] = shard_idx;
-        order[..n].sort_unstable();
-        let mut guards: [Option<std::sync::RwLockWriteGuard<'_, HashMap<String, BudgetCell>>>;
-            crate::cost::MAX_CHAIN] = [const { None }; crate::cost::MAX_CHAIN];
-        let mut guard_shards = [usize::MAX; crate::cost::MAX_CHAIN];
+        let mut order = shard_idx.clone();
+        order.sort_unstable();
+        let mut guards: Vec<Option<std::sync::RwLockWriteGuard<'_, HashMap<String, BudgetCell>>>> =
+            Vec::new();
+        guards.resize_with(n, || None);
+        let mut guard_shards = vec![usize::MAX; n];
         let mut g = 0usize;
-        for &sh in order[..n].iter() {
+        for &sh in order.iter() {
             if g > 0 && guard_shards[g - 1] == sh {
                 continue; // dedup: two buckets sharing a shard use one guard
             }

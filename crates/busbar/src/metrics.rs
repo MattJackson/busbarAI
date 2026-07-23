@@ -786,6 +786,7 @@ mod tests {
                         metric: crate::config::groups::LimitMetric::Requests,
                         amount: 100,
                         per: Some(crate::config::groups::LimitWindow::Minute),
+                        pool: None,
                     }],
                     ..Default::default()
                 },
@@ -850,6 +851,7 @@ mod tests {
                     metric: crate::config::groups::LimitMetric::Budget,
                     amount: 1_000,
                     per: Some(crate::config::groups::LimitWindow::Total),
+                    pool: None,
                 }],
                 ..Default::default()
             },

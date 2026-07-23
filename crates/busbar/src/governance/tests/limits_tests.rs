@@ -20,6 +20,7 @@ fn limit(metric: LimitMetric, amount: u64, per: Option<LimitWindow>) -> LimitCfg
         metric,
         amount,
         per,
+        pool: None,
     }
 }
 

@@ -1664,6 +1664,35 @@ fn test_group_limits_malformed_rejected() {
     assert!(err.to_string().contains("unknown field"), "{err}");
 }
 
+/// The optional `pool:` qualifier: parses on a windowed limit (scoping it to one pool's traffic),
+/// round-trips exactly through the overlay Serialize (with and without), and is rejected on
+/// `concurrent` (the in-flight gauge is per group, not per pool).
+#[test]
+fn test_group_limit_pool_qualifier() {
+    use crate::config::groups::LimitCfg;
+
+    let l: LimitCfg = serde_yaml::from_str("{ budget: 5000, per: month, pool: frontier }")
+        .expect("pool-qualified budget parses");
+    assert_eq!(l.pool.as_deref(), Some("frontier"));
+
+    // Round-trip: serialize -> reparse must be identical (the overlay persistence contract),
+    // both with and without the qualifier.
+    let plain: LimitCfg = serde_yaml::from_str("{ tokens: 9, per: day }").expect("parses");
+    for orig in [&l, &plain] {
+        let yaml = serde_yaml::to_string(orig).expect("serializes");
+        let back: LimitCfg = serde_yaml::from_str(&yaml).expect("reparses");
+        assert_eq!(&back, orig, "round-trip must be exact: {yaml}");
+    }
+
+    let err = serde_yaml::from_str::<LimitCfg>("{ concurrent: 5, pool: frontier }")
+        .expect_err("concurrent + pool must error");
+    assert!(err.to_string().contains("takes NO `pool:`"), "{err}");
+
+    let err = serde_yaml::from_str::<LimitCfg>("{ budget: 5, per: month, pool: a, pool: b }")
+        .expect_err("a duplicate pool key must error");
+    assert!(err.to_string().contains("duplicate"), "{err}");
+}
+
 // ── top-level DeployCfg surface (S3/S5/S6) ───────────────────────────────────────────────────────
 
 /// The REMOVED top-level blocks are rejected by deny_unknown_fields: `governance:` (split into

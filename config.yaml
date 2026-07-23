@@ -264,7 +264,7 @@ pools:
 #   emit_server_timing: true
 
 # ── Groups: the ONE limit tree (optional) ────────────────────────────────────────────────────────
-# Named enforcement buckets forming an acyclic tree (parent chains AND together; depth <= 8). A
+# Named enforcement buckets forming an acyclic tree (parent chains AND together). A
 # minted key binds to at most one group; a key with no group is authed + unlimited. Generic limits:
 # each is `{ <metric>: <amount>, per: <window> }` with metric one of requests|tokens|budget|
 # concurrent and window one of minute|hour|day|month|total (`concurrent` is instantaneous: no per).

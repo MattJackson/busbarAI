@@ -289,7 +289,7 @@ OR the `admin-tokens` operator token. The admin chain is live-mutable over the A
 ### `groups`
 
 The ONE limit tree. A group is a named enforcement bucket: an ordered list of generic limits plus
-an optional `parent` forming an acyclic chain (depth <= 8). Keys are pure auth and carry no limits;
+an optional `parent` forming an acyclic chain (any depth). Keys are pure auth and carry no limits;
 a key binds to at most one group at mint, and every request walks the chain UP through `parent`,
 enforcing EVERY limit of EVERY group (AND, atomically, all-or-nothing charging).
 

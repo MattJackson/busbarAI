@@ -2805,6 +2805,7 @@ mod patch_tests {
             metric: LimitMetric::Budget,
             amount: cents,
             per: Some(LimitWindow::Month),
+            pool: None,
         }
     }
 

@@ -187,6 +187,7 @@ fn budget_group_cfg(cap: i64, period: &str, parent: Option<&str>) -> crate::conf
             metric: LimitMetric::Budget,
             amount: u64::try_from(cap).unwrap_or(0),
             per: Some(per),
+            pool: None,
         }],
         ..Default::default()
     }
@@ -1188,6 +1189,7 @@ fn test_rate_headroom_reports_fraction_remaining() {
                     metric: LimitMetric::Requests,
                     amount: 0,
                     per: Some(LimitWindow::Minute),
+                    pool: None,
                 }],
                 ..Default::default()
             },
@@ -1214,11 +1216,13 @@ fn test_rate_headroom_reports_fraction_remaining() {
                         metric: LimitMetric::Requests,
                         amount: 4,
                         per: Some(LimitWindow::Minute),
+                        pool: None,
                     },
                     LimitCfg {
                         metric: LimitMetric::Tokens,
                         amount: 100_000,
                         per: Some(LimitWindow::Minute),
+                        pool: None,
                     },
                 ],
                 ..Default::default()
