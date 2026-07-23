@@ -476,6 +476,27 @@ pub trait Store: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Add `sub` to the REVOCATION DENYLIST (1.5.0 signed-token keys): a minted token is stateless,
+    /// so revoking it means recording its subject id here. The verify path reads the denylist
+    /// (`list_denylist` hydrates an in-memory set at boot; `add_denylist` updates it live) and
+    /// rejects any token whose `sub` is present. Idempotent (adding an already-denied sub is a
+    /// no-op). `reason` is operator metadata (audit only), never a secret.
+    ///
+    /// DEFAULTED to a no-op error so a store predating denylist support fails LOUD if asked to
+    /// revoke (a silent success would leave a "revoked" token still valid). A real backend
+    /// overrides this + `list_denylist`.
+    fn add_denylist(&self, _sub: &str, _reason: &str) -> StoreResult<()> {
+        Err(StoreError(
+            "this Store does not support the revocation denylist".to_string(),
+        ))
+    }
+
+    /// Every denied subject id (for the boot hydrate of the in-memory denylist set). DEFAULTED to
+    /// empty so a store with no denylist support has nothing to deny.
+    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// The most-recent `limit` audit records, oldest-first - the BOUNDED boot restore source. The
     /// engine's ring is size-bounded, so restoring the whole (never-pruned) durable history is
     /// wasteful and, over the plugin ABI, can exceed the response size cap or OOM on a large log.

@@ -117,6 +117,13 @@ pub enum StoreRequest {
     /// variant, so the engine's loader FALLS BACK to `ListAudit` + tail-truncation. Bounds the restore
     /// read so a large durable history cannot exceed the ABI response cap or OOM the ring.
     ListAuditTail(u64),
+    /// `add_denylist` - revoke a signed-token key by subject id (1.5.0). ADDITIVE.
+    AddDenylist {
+        sub: String,
+        reason: String,
+    },
+    /// `list_denylist` - every denied subject id (boot hydrate). ADDITIVE.
+    ListDenylist,
 }
 
 /// The success payload for a `call`, matched to the request variant. Store-level errors do NOT ride
@@ -138,6 +145,8 @@ pub enum StoreResponse {
     AwsCreds(Vec<AwsCredential>),
     /// `list_audit` — every persisted audit record, oldest-first. ADDITIVE (ABI stays v1).
     Audit(Vec<AuditRecord>),
+    /// `list_denylist` - every denied subject id (1.5.0 signed-token revocation). ADDITIVE.
+    Denylist(Vec<String>),
 }
 
 // ── SECRET-plugin wire (`kind: secret`) ─────────────────────────────────────────────────────────

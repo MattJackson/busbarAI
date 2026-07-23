@@ -70,6 +70,12 @@ const AWSCRED_PREFIX: &str = "busbar:awscred:";
 const AWSCRED_INDEX: &str = "busbar:awscreds";
 const AWSCRED_IDS_PREFIX: &str = "busbar:awscred_ids:";
 const AUDIT_ZSET: &str = "busbar:audit";
+/// The signed-token REVOCATION denylist (1.5.0). `busbar:denylist:<sub>` holds the operator reason
+/// (a plain string), and `busbar:denylist` is a SET indexing every denied sub so `list_denylist` is
+/// a SMEMBERS. Both live under the `busbar:*` namespace, so the legacy migration SCAN wipe already
+/// accounts for them.
+const DENYLIST_PREFIX: &str = "busbar:denylist:";
+const DENYLIST_INDEX: &str = "busbar:denylist";
 /// The schema-version marker key (mirrors the SQLite `PRAGMA user_version`). v2 = the 1.5.0
 /// token-ledger cost model. A pre-v2 namespace is WIPED on connect (1.5.0 unreleased: bump, not
 /// migrate).
@@ -747,6 +753,25 @@ impl Store for RedisStore {
         }
         Ok(out)
     }
+
+    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+        // Revoke a signed-token key by subject id: SET the reason string + SADD the sub to the index,
+        // as ONE atomic MULTI/EXEC. Idempotent (SET overwrites the reason, SADD is a set member), so
+        // the one-shot reconnect-retry of `with_conn` is safe here.
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .set(format!("{DENYLIST_PREFIX}{sub}"), reason)
+                .ignore()
+                .sadd(DENYLIST_INDEX, sub)
+                .ignore()
+                .query(c)
+        })
+    }
+
+    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+        self.with_conn(|c| c.smembers(DENYLIST_INDEX))
+    }
 }
 
 #[cfg(test)]
@@ -1015,6 +1040,41 @@ mod tests {
             replayed[1].hash, "h2b",
             "the replayed record overwrites the prior digest (SQL-backend parity)"
         );
+
+        // DENYLIST (P3, signed-token revocation): add a subject, list it back, and prove idempotency
+        // (a repeat add leaves exactly one member). Isolate on a unique sub and clean up afterward.
+        let dsub = "sub_redis_test";
+        let _ = store.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(format!("{DENYLIST_PREFIX}{dsub}"))
+                .ignore()
+                .srem(DENYLIST_INDEX, dsub)
+                .ignore()
+                .query::<()>(c)
+        });
+        store.add_denylist(dsub, "compromised").unwrap();
+        store.add_denylist(dsub, "still compromised").unwrap();
+        let denied = store.list_denylist().unwrap();
+        assert_eq!(
+            denied.iter().filter(|s| *s == dsub).count(),
+            1,
+            "add_denylist is idempotent: the sub is denied exactly once"
+        );
+        // Confirm the denylist survives the with_conn path: the reason string is durably readable.
+        let reason: Option<String> = store
+            .with_conn(|c| c.get(format!("{DENYLIST_PREFIX}{dsub}")))
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("still compromised"));
+        let _ = store.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .del(format!("{DENYLIST_PREFIX}{dsub}"))
+                .ignore()
+                .srem(DENYLIST_INDEX, dsub)
+                .ignore()
+                .query::<()>(c)
+        });
 
         // Attach an AWS credential so the delete cascade over credentials is actually exercised.
         let cred = AwsCredential {

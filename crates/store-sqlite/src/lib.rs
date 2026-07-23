@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
     prev_hash TEXT NOT NULL,
     hash      TEXT NOT NULL
 );
+-- The signed-token REVOCATION denylist (1.5.0): a minted token is stateless, so revoking it means
+-- recording its subject id here. `sub` is the PRIMARY KEY (idempotent add); `reason` is operator
+-- audit metadata; `created_at` is unused-for-now bookkeeping. The verify path hydrates an in-memory
+-- set from `list_denylist` at boot and updates it live via `add_denylist`.
+CREATE TABLE IF NOT EXISTS denylist (
+    sub        TEXT PRIMARY KEY,
+    reason     TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// Embedded SQLite `Store` backend (durable; opt-in via `governance.store: sqlite`). The single
@@ -195,7 +204,8 @@ impl SqliteStore {
                      DROP TABLE IF EXISTS usage_windows;
                      DROP TABLE IF EXISTS usage_ledger;
                      DROP TABLE IF EXISTS usage_metering;
-                     DROP TABLE IF EXISTS audit_log;",
+                     DROP TABLE IF EXISTS audit_log;
+                     DROP TABLE IF EXISTS denylist;",
                 )
                 .store()?;
             }
@@ -684,6 +694,30 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
+    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+        // Idempotent revoke: INSERT the subject, and on a repeat refresh its reason (either arm is
+        // idempotent for the denylist's purpose - the sub stays denied exactly once).
+        self.lock_conn()
+            .execute(
+                "INSERT INTO denylist (sub, reason, created_at) VALUES (?1, ?2, 0)
+                 ON CONFLICT(sub) DO UPDATE SET reason = excluded.reason",
+                params![sub, reason],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare("SELECT sub FROM denylist").store()?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .store()?
+            .collect::<Result<Vec<_>, _>>()
+            .store()?;
+        Ok(rows)
+    }
+
     fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
         // BOUNDED restore read (audit issue): select only the most-recent `limit` rows at the SOURCE
         // (a `LIMIT` on a descending scan), then reverse into oldest-first. This keeps the ABI
@@ -1134,6 +1168,24 @@ mod tests {
         let got2 = s.list_audit().unwrap();
         assert_eq!(got2.len(), 3);
         assert_eq!(got2[1].hash, "h2b");
+    }
+
+    /// The signed-token revocation denylist (P3): `add_denylist` records a subject, `list_denylist`
+    /// returns it, and adding the same sub twice is idempotent (the list holds it exactly once).
+    #[test]
+    fn test_denylist_add_and_list_idempotent() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        assert!(s.list_denylist().unwrap().is_empty());
+        s.add_denylist("sub-abc", "compromised").unwrap();
+        s.add_denylist("sub-def", "rotation").unwrap();
+        let mut got = s.list_denylist().unwrap();
+        got.sort();
+        assert_eq!(got, vec!["sub-abc".to_string(), "sub-def".to_string()]);
+        // Adding the same sub again (even with a new reason) is idempotent - one entry, not two.
+        s.add_denylist("sub-abc", "still compromised").unwrap();
+        let got = s.list_denylist().unwrap();
+        assert_eq!(got.iter().filter(|x| *x == "sub-abc").count(), 1);
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

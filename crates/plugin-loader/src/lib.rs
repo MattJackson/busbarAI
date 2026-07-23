@@ -294,6 +294,26 @@ impl Store for DynStore {
             }
         }
     }
+
+    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+        match self.call_raw(StoreRequest::AddDenylist {
+            sub: sub.to_string(),
+            reason: reason.to_string(),
+        })? {
+            StoreResponse::Unit => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+        // A plugin built against an older SDK rejects the unknown variant; fall back to the trait
+        // default (empty) so an old durable plugin hydrates nothing rather than failing boot.
+        match self.call_raw(StoreRequest::ListDenylist) {
+            Ok(StoreResponse::Denylist(d)) => Ok(d),
+            Ok(other) => Err(unexpected(other)),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
 }
 
 impl Drop for DynStore {

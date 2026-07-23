@@ -191,6 +191,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
     prev_hash TEXT NOT NULL,
     hash      TEXT NOT NULL
 );
+-- The signed-token REVOCATION denylist (1.5.0), mirroring the SQLite backend: a stateless minted
+-- token is revoked by recording its subject id here. `sub` is the PRIMARY KEY (idempotent add).
+CREATE TABLE IF NOT EXISTS denylist (
+    sub        TEXT PRIMARY KEY,
+    reason     TEXT NOT NULL DEFAULT '',
+    created_at BIGINT NOT NULL DEFAULT 0
+);
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster). A single mutex-guarded connection —
@@ -285,7 +292,8 @@ impl PostgresStore {
                          DROP TABLE IF EXISTS usage_windows;
                          DROP TABLE IF EXISTS usage_ledger;
                          DROP TABLE IF EXISTS usage_metering;
-                         DROP TABLE IF EXISTS audit_log;",
+                         DROP TABLE IF EXISTS audit_log;
+                         DROP TABLE IF EXISTS denylist;",
                 )
                 .store()?;
             }
@@ -710,6 +718,24 @@ impl Store for PostgresStore {
             })
             .collect())
     }
+
+    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+        // Idempotent revoke (mirrors the SQLite backend): the subject stays denied exactly once; a
+        // repeat refreshes the operator reason.
+        self.lock()
+            .execute(
+                "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, 0)
+                 ON CONFLICT (sub) DO UPDATE SET reason = EXCLUDED.reason",
+                &[&sub, &reason],
+            )
+            .store()?;
+        Ok(())
+    }
+
+    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+        let rows = self.lock().query("SELECT sub FROM denylist", &[]).store()?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
 }
 
 // A tiny compile-time assertion that the param binding types line up (keeps ToSql import used even
@@ -992,6 +1018,26 @@ mod tests {
             .lock()
             .execute("DELETE FROM audit_log WHERE seq >= $1", &[&(a_base as i64)])
             .expect("audit cleanup");
+
+        // DENYLIST (P3, signed-token revocation): add a subject, list it back, and prove idempotency
+        // (a repeat add leaves exactly one entry). Isolate on a unique sub and clean up afterward.
+        let dsub = format!("sub_pg_{}", std::process::id());
+        store
+            .lock()
+            .execute("DELETE FROM denylist WHERE sub=$1", &[&dsub])
+            .expect("denylist pre-clean");
+        store.add_denylist(&dsub, "compromised").unwrap();
+        store.add_denylist(&dsub, "still compromised").unwrap();
+        let denied = store.list_denylist().unwrap();
+        assert_eq!(
+            denied.iter().filter(|s| **s == dsub).count(),
+            1,
+            "add_denylist is idempotent: the sub is denied exactly once"
+        );
+        store
+            .lock()
+            .execute("DELETE FROM denylist WHERE sub=$1", &[&dsub])
+            .expect("denylist cleanup");
 
         // Attach an AWS credential so delete_key's CASCADE (key + usage + credentials) can be
         // verified end to end - the credential-cleanup path P1 #6 flagged as untested.

@@ -21,6 +21,9 @@ pub struct MemoryStore {
     creds: RwLock<HashMap<String, AwsCredential>>,
     usage: RwLock<HashMap<(String, u64), UsageLedger>>,
     metering: RwLock<HashMap<(String, u64, String, String), MeteringRow>>,
+    /// The revocation DENYLIST: denied subject ids (1.5.0 signed-token keys). A set (the reason is
+    /// audit-only and not needed for the enforcement read).
+    denylist: RwLock<std::collections::HashSet<String>>,
 }
 
 impl MemoryStore {
@@ -144,6 +147,24 @@ impl Store for MemoryStore {
 
     fn list_aws_credentials(&self) -> StoreResult<Vec<AwsCredential>> {
         Ok(self.creds().values().cloned().collect())
+    }
+
+    fn add_denylist(&self, sub: &str, _reason: &str) -> StoreResult<()> {
+        self.denylist
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sub.to_string());
+        Ok(())
+    }
+
+    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+        Ok(self
+            .denylist
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect())
     }
 }
 
