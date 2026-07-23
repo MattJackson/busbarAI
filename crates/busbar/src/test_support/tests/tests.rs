@@ -382,18 +382,27 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
             id: "ktpm".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "tpm".to_string(),
-            allowed_pools: vec!["pa".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: Some(100), // high, so RPM doesn't interfere — TPM is what we exercise
-            tpm_limit: Some(30),
+            allowed_pools: Some(vec!["pa".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            // The TPM cap lives on the bound GROUP now (keys are pure auth): 30 tokens/minute.
+            group: Some("tpmgrp".to_string()),
             labels: Default::default(),
         })
         .unwrap();
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let groups = std::collections::BTreeMap::from([(
+        "tpmgrp".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Tokens,
+                amount: 30,
+                per: Some(crate::config::groups::LimitWindow::Minute),
+            }],
+        },
+    )]);
 
     let app = TestApp::new()
         .lane(
@@ -406,6 +415,7 @@ async fn test_cross_protocol_nonstream_records_tokens_for_tpm() {
         )
         .pool("pa", &[(0, 1)])
         .governance(gov)
+        .cost(crate::cost::CostModel::resolve_parts(None, 0, &groups))
         .build();
 
     let router = crate::build_router(app);
@@ -493,18 +503,27 @@ async fn test_cross_protocol_stream_records_tokens_for_tpm() {
             id: "ktpmstream".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "tpm-stream".to_string(),
-            allowed_pools: vec!["pas".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: Some(100), // high, so RPM doesn't interfere — TPM is what we exercise
-            tpm_limit: Some(30),
+            allowed_pools: Some(vec!["pas".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            // The TPM cap lives on the bound GROUP now (keys are pure auth): 30 tokens/minute.
+            group: Some("tpmsgrp".to_string()),
             labels: Default::default(),
         })
         .unwrap();
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let groups = std::collections::BTreeMap::from([(
+        "tpmsgrp".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Tokens,
+                amount: 30,
+                per: Some(crate::config::groups::LimitWindow::Minute),
+            }],
+        },
+    )]);
 
     // Lane speaks OpenAI; ingress below is Anthropic streaming → cross-protocol SSE reframe.
     let app = TestApp::new()
@@ -518,6 +537,7 @@ async fn test_cross_protocol_stream_records_tokens_for_tpm() {
         )
         .pool("pas", &[(0, 1)])
         .governance(gov)
+        .cost(crate::cost::CostModel::resolve_parts(None, 0, &groups))
         .build();
 
     let router = crate::build_router(app);
@@ -899,14 +919,10 @@ async fn test_governance_vkey_auth_and_pool_acl() {
             id: "k1".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "tester".to_string(),
-            allowed_pools: vec!["allowedpool".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["allowedpool".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -974,37 +990,47 @@ async fn test_governance_budget_over_quota() {
             id: "kb".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "broke".to_string(),
-            allowed_pools: vec![], // all pools
-            max_budget_cents: Some(100),
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: None, // all pools
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            // The 100c budget cap lives on the bound GROUP (keys are pure auth).
+            group: Some("bgrp".to_string()),
             labels: Default::default(),
         })
         .unwrap();
-    // Pre-seed usage past the 100c budget (window 0 = "total") in the DURABLE store: 250 requests
-    // at the TestApp default `CostModel::flat(1)` derive to 250 cents of spend.
+    // Pre-seed usage past the group's 100c budget (window 0 = "total") in the DURABLE store:
+    // 250 requests at a 1c flat fee derive to 250 cents of spend on the group's total bucket.
     store
         .put_usage(
-            "kb",
+            "group:bgrp@total",
             0,
             &busbar_api::UsageLedger {
                 requests: 250,
+                billable_requests: 250,
                 models: vec![],
             },
         )
         .unwrap();
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let groups = std::collections::BTreeMap::from([(
+        "bgrp".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 100,
+                per: Some(crate::config::groups::LimitWindow::Total),
+            }],
+        },
+    )]);
+    let cost = crate::cost::CostModel::resolve_parts(None, 1, &groups);
     // Enforcement is now IN-MEMORY (authoritative): hydrate the budget cells from the store — exactly
     // as boot does — so the admission gate sees the pre-seeded over-budget spend. (Without this the
     // store seed would be invisible to the in-memory gate and the request would be admitted.)
-    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0)
-        .expect("hydrate");
+    gov.hydrate_budgets(&cost, 0).expect("hydrate");
 
-    let app = TestApp::new().governance(gov).build();
+    let app = TestApp::new().governance(gov).cost(cost).build();
 
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1071,36 +1097,46 @@ async fn over_budget_router() -> (
             id: "kbm".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "broke-multi".to_string(),
-            allowed_pools: vec![], // all pools
-            max_budget_cents: Some(100),
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: None, // all pools
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            // The 100c budget cap lives on the bound GROUP (keys are pure auth).
+            group: Some("bgrpm".to_string()),
             labels: Default::default(),
         })
         .unwrap();
-    // Seed 250 requests: at the TestApp default `CostModel::flat(1)` the DERIVED spend is
-    // 250 cents, past the 100-cent cap, so admission rejects before any forwarding.
+    // Seed 250 requests on the GROUP's total bucket: at a 1c flat fee the DERIVED spend is
+    // 250 cents, past the group's 100-cent cap, so admission rejects before any forwarding.
     store
         .put_usage(
-            "kbm",
+            "group:bgrpm@total",
             0,
             &busbar_api::UsageLedger {
                 requests: 250,
+                billable_requests: 250,
                 models: vec![],
             },
         )
         .unwrap();
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let groups = std::collections::BTreeMap::from([(
+        "bgrpm".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 100,
+                per: Some(crate::config::groups::LimitWindow::Total),
+            }],
+        },
+    )]);
+    let cost = crate::cost::CostModel::resolve_parts(None, 1, &groups);
     // Enforcement is IN-MEMORY (authoritative): hydrate the budget cells from the durable store — as
     // boot does — so the pre-seeded over-budget spend is visible to the admission gate.
-    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0)
-        .expect("hydrate");
+    gov.hydrate_budgets(&cost, 0).expect("hydrate");
 
-    let app = TestApp::new().governance(gov).build();
+    let app = TestApp::new().governance(gov).cost(cost).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1290,20 +1326,32 @@ async fn test_governance_rate_limit_429() {
             id: "krl".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "rl".to_string(),
-            allowed_pools: vec![],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: Some(2),
-            tpm_limit: None,
+            allowed_pools: None,
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            // The 2-requests-per-minute limit lives on the bound GROUP (keys are pure auth).
+            group: Some("rl2".to_string()),
             labels: Default::default(),
         })
         .unwrap();
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
-    let app = TestApp::new().governance(gov).build();
+    let groups = std::collections::BTreeMap::from([(
+        "rl2".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Requests,
+                amount: 2,
+                per: Some(crate::config::groups::LimitWindow::Minute),
+            }],
+        },
+    )]);
+    let app = TestApp::new()
+        .governance(gov)
+        .cost(crate::cost::CostModel::resolve_parts(None, 0, &groups))
+        .build();
 
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1312,7 +1360,7 @@ async fn test_governance_rate_limit_429() {
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/anypool/v1/messages");
 
-    // `check_rate` buckets by a 60s WALL-CLOCK window (`now / 60 * 60`), so if the three requests
+    // The limit engine buckets by a 60s WALL-CLOCK minute window, so if the three requests
     // below straddle a minute boundary the per-window counter resets and the 3rd is admitted (404)
     // instead of rate-limited (429) — a rare timing flake on a loaded CI runner. Deterministic fix:
     // if we're in the last few seconds of the current window, wait for the next one to start so all
@@ -1359,14 +1407,14 @@ async fn test_governance_rate_limit_429() {
     handle.abort();
 }
 
-/// Build a router whose ONLY virtual key has `rpm_limit: Some(0)`, so EVERY request is
-/// rate-limited (429) by `rate_check` before any forwarding (`check_rate` rejects on the first
-/// request when `requests >= rpm` with `rpm == 0`). Returns the bound address, the serve handle,
-/// and the secret to present. The 429 mirror of `over_budget_router`: shared by the per-protocol
-/// `test_rate_limit_429_*_native_envelope` tests below — the rejection fires before resolution, so
-/// no lane/pool/backend is needed, only a parseable body that carries `model` where the protocol
-/// expects it. `allowed_pools: vec![]` admits every pool so the ACL never short-circuits the rate
-/// gate.
+/// Build a router whose ONLY virtual key binds to a group with `{ requests: 0, per: minute }`, so
+/// EVERY request is rate-limited (429) by the admission engine before any forwarding (the check
+/// rejects on the first request when `requests + 1 > cap` with cap 0). Returns the bound address,
+/// the serve handle, and the secret to present. The 429 mirror of `over_budget_router`: shared by
+/// the per-protocol `test_rate_limit_429_*_native_envelope` tests below: the rejection fires
+/// before resolution, so no lane/pool/backend is needed, only a parseable body that carries
+/// `model` where the protocol expects it. An omitted `allowed_pools` admits every pool so the ACL
+/// never short-circuits the rate gate.
 async fn over_rpm_router() -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
@@ -1381,20 +1429,31 @@ async fn over_rpm_router() -> (
             id: "krlm".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "rl-multi".to_string(),
-            allowed_pools: vec![], // all pools
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: Some(0), // 0 ⇒ rate-limited on the first request
-            tpm_limit: None,
+            allowed_pools: None, // all pools
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: Some("rl0".to_string()),
             labels: Default::default(),
         })
         .unwrap();
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
 
-    let app = TestApp::new().governance(gov).build();
+    let groups = std::collections::BTreeMap::from([(
+        "rl0".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Requests,
+                amount: 0,
+                per: Some(crate::config::groups::LimitWindow::Minute),
+            }],
+        },
+    )]);
+    let app = TestApp::new()
+        .governance(gov)
+        .cost(crate::cost::CostModel::resolve_parts(None, 0, &groups))
+        .build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

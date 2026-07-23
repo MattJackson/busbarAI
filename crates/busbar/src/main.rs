@@ -173,6 +173,7 @@ fn handle_cli_flags() -> Option<i32> {
         }
         Some("--validate") => Some(validate_config_command()),
         Some("--list-plugins") => Some(list_plugins_command()),
+        Some("--migrate-config") => Some(migrate_config_command(args.next())),
         Some("--help" | "-h") => {
             println!(
                 "busbar {ver} — native-protocol LLM gateway
@@ -188,6 +189,10 @@ USAGE:
     busbar --list-plugins
                         manifest-only inventory of the plugins dir (name/alias/kind/version,
                         signature verdict, load status + exact reason); never loads plugin code
+    busbar --migrate-config <old-config.yaml>
+                        mechanically convert a 1.4.x config to the 1.5.0 shape: prints the new
+                        YAML to stdout (with TODO/WARNING comments where a human must decide)
+                        and a change summary to stderr; ZERO side effects, nothing is written
     busbar --print-metadata-blocklist
                         print the effective cloud-metadata SSRF denylist and exit
 
@@ -275,7 +280,7 @@ fn validate_config_command() -> i32 {
     }
     // PLUGIN PRE-FLIGHT — the EXACT pipeline boot runs (`plugins_preflight` is shared with
     // `build_app_from_config`), so a clean `--validate` means the plugin half of boot succeeds too:
-    // consistency (plugins.enabled vs governance.store), trust-policy resolution, the three-phase
+    // consistency (plugins.enabled vs store.module), trust-policy resolution, the three-phase
     // scan of every tarball (structural -> trust -> conflict), and store resolution. Manifest-only:
     // nothing is `dlopen`ed, no store is opened — zero side effects.
     let registry = match plugins_preflight(loaded.deploy.store.as_ref(), &loaded.deploy.plugins) {
@@ -321,7 +326,7 @@ fn validate_config_command() -> i32 {
 
 /// `--list-plugins`: MANIFEST-ONLY inventory of every plugin tarball in `plugins.dir` — name,
 /// alias, kind, version, signature verdict, and load status (including the exact skip/invalid
-/// reason and which one `governance.store` selects). NEVER `dlopen`s anything, so an untrusted
+/// reason and which one `store.module` selects). NEVER `dlopen`s anything, so an untrusted
 /// plugin's code cannot run from listing it. Exit 0 (informational; `--validate` is the gate).
 fn list_plugins_command() -> i32 {
     let providers_path = std::path::PathBuf::from(
@@ -449,7 +454,7 @@ fn inert_durable_keys_banner(
             "durable governance store contains {key_count} key(s) but no admin_token is set — \
              governance is INERT and those keys are NOT enforced (per-key budget / RPM / TPM / \
              allowed_pools are bypassed and access falls through to the static auth.chain). Set \
-             governance.admin_token to enforce them."
+             an admin token (auth.admin_auth admin-tokens module) to enforce them."
         ))
     } else {
         None
@@ -1271,6 +1276,72 @@ pub(crate) struct LoadedConfig {
 /// boot-time environment — a live reload cannot see edited env files; documented), capture the
 /// BASE hook names, then merge the persisted overlay (opt-in, fail-soft). Shared verbatim by boot
 /// and `POST /api/v1/admin/config/reload`, so a reload IS a boot-equivalent read of disk truth.
+/// `--migrate-config <old.yaml>`: mechanically convert a 1.4.x config to the 1.5.0 shape (P9.2).
+/// Prints the migrated YAML (with a TODO/WARNING comment header) to STDOUT and the change summary
+/// to STDERR - zero side effects, nothing is written, no env interpolation (a `${VAR}` reference
+/// passes through verbatim so the output stays a template). Exit 0 on success (even with TODOs -
+/// they are review items, not errors), 1 on unreadable/unparseable input, 2 on a missing path.
+fn migrate_config_command(path: Option<String>) -> i32 {
+    let Some(path) = path else {
+        eprintln!(
+            "busbar: --migrate-config requires a path: busbar --migrate-config <old-config.yaml>"
+        );
+        return 2;
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("busbar: cannot read '{path}': {e}");
+            return 1;
+        }
+    };
+    match config::migrate::migrate_config(&raw) {
+        Ok(out) => {
+            print!("{}", out.yaml);
+            eprintln!("migrated '{path}' to the 1.5.0 config shape.");
+            if !out.changes.is_empty() {
+                eprintln!(
+                    "
+CHANGES ({}):",
+                    out.changes.len()
+                );
+                for c in &out.changes {
+                    eprintln!("  - {c}");
+                }
+            }
+            if !out.warnings.is_empty() {
+                eprintln!(
+                    "
+WARNINGS ({}) - semantic flips needing review:",
+                    out.warnings.len()
+                );
+                for w in &out.warnings {
+                    eprintln!("  ! {w}");
+                }
+            }
+            if !out.todos.is_empty() {
+                eprintln!(
+                    "
+TODO ({}) - a human must decide:",
+                    out.todos.len()
+                );
+                for t in &out.todos {
+                    eprintln!("  * {t}");
+                }
+            }
+            eprintln!(
+                "
+Review the output, then run `busbar --validate` on it before deploying.                  NOTE: 1.x virtual keys do not carry over - mint fresh signed keys (the 1.5.0                  security headline: keys now expire)."
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("busbar: --migrate-config failed: {e}");
+            1
+        }
+    }
+}
+
 pub(crate) fn load_config_from_disk(
     config_path: &std::path::Path,
     providers_path: &std::path::Path,
@@ -1299,6 +1370,19 @@ pub(crate) fn load_config_from_disk(
     let interpolated_config =
         config::interpolate_env_with(&raw_config, env_mode, &mut unset_env_vars)
             .map_err(|e| format!("config.yaml: {e}"))?;
+    // LOUD FAIL-CLOSED on a 1.x config (P9.3): detect the 1.x structural markers BEFORE the
+    // typed parse, so an outdated config gets the NAMED "run --migrate-config" error instead of
+    // a pile of unknown-field messages - and, critically, so nothing from 1.x can half-parse
+    // into 1.5.0 semantics (the `allowed_pools: []` all->none flip, vanished budgets).
+    if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&interpolated_config) {
+        let markers = config::migrate::detect_legacy_markers(&doc);
+        if !markers.is_empty() {
+            return Err(format!(
+                "config.yaml: {}",
+                config::migrate::legacy_config_error(&markers)
+            ));
+        }
+    }
     let deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config).map_err(|e| {
         format!(
             "config.yaml: invalid YAML: {}",
@@ -1362,7 +1446,7 @@ pub(crate) fn load_config_from_disk(
 /// config APPLY/RELOAD, and `busbar --validate`, so the pre-flight gate can never drift from real
 /// boot behavior. Fail-closed at every step:
 ///
-/// 1. CONSISTENCY: a non-`memory` `governance.store` with `plugins.enabled: false` (or the block
+/// 1. CONSISTENCY: a non-`memory` `store.module` with `plugins.enabled: false` (or the block
 ///    absent) is an error NAMING THE FLAG — a dropped-in tarball is inert until the switch is on.
 /// 2. POLICY: `plugins.trust` resolves (embedded first-party key + third-party publishers + the
 ///    explicit opt-ins + anti-downgrade floors); a malformed key is an error.
@@ -1370,7 +1454,7 @@ pub(crate) fn load_config_from_disk(
 ///    (structural -> trust -> conflict) via [`busbar_plugin_loader::scan_and_validate`]. ANY
 ///    invalid tarball/manifest or ANY name/alias conflict aborts with every problem named; an
 ///    untrusted plugin is SKIPPED (warn-logged, never `dlopen`ed).
-/// 4. RESOLUTION: the configured `governance.store` (alias OR canonical name, resolved against the
+/// 4. RESOLUTION: the configured `store.module` (alias OR canonical name, resolved against the
 ///    manifest registry — never a filename) must resolve to a loadable `kind: store` plugin.
 ///
 /// Returns the validated registry (empty when plugins are disabled and no plugin is referenced).
@@ -2205,7 +2289,7 @@ pub(crate) fn build_app_from_config(
                     )
                 })?;
                 for k in &keys {
-                    if let Some(group) = k.budget_group.as_deref() {
+                    if let Some(group) = k.group.as_deref() {
                         if cost.group_named(group).is_none() {
                             return Err(format!(
                                 "virtual key '{}' names group '{group}', which does not exist in the top-level groups block.\n\
