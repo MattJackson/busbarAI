@@ -12,8 +12,10 @@ Report anything this model misses per [SECURITY.md](SECURITY.md).
 Busbar is a single static binary that sits between your applications and upstream LLM providers. It
 speaks six wire protocols on both sides (OpenAI, Anthropic, Gemini, Bedrock, Cohere, Responses),
 holds the provider credentials, and enforces routing, failover, rate/budget governance, and TLS. It
-has **no hosted tier**, makes **no outbound calls except to the providers you configure**, and stores
-nothing off-box (in-memory state plus an optional local SQLite file for governance).
+has **no hosted tier** and makes **no outbound calls except to the providers you configure** (and any
+hook endpoints you point it at). Governance state is **in-memory by default**; the durable store is a
+choice, and selecting `postgres` or `redis` means virtual keys, usage, and the audit log live off-box
+in a backend you run (a local SQLite file keeps state on the same host).
 
 ## Trust boundaries
 
@@ -40,14 +42,16 @@ nothing off-box (in-memory state plus an optional local SQLite file for governan
 ## Threats and mitigations
 
 ### T1 — SSRF via a config-controlled upstream (boundary 2, 4)
-A `base_url` / `path` / `path_base` / OAuth `token_url` that resolves to a cloud-metadata endpoint
-would send credential-bearing traffic to IMDS. **Mitigation:** a load-time SSRF denylist
-(`config_validate::ssrf_blocked_host`) blocks cloud-metadata/IMDS hosts, and normalizes the authority
-the way the connecting stack does — backslash→slash, userinfo stripping, percent-decoding,
-trailing-dot, and alternate IPv4 encodings (decimal/hex/octal `inet_aton`, IPv4-mapped IPv6) — so an
-obfuscated host can't slip past. `path`/`path_base` must begin with `/` (an override can only extend
-the path, never re-home the authority), the composed URL is re-checked, and `token_url` gets the same
-guard because it carries the client secret. The runtime HTTP client also **refuses redirects**, so a
+A `base_url` / `path` / `path_base` / OAuth `token_url` / hook `webhook:` URL that resolves to a
+cloud-metadata endpoint would send credential-bearing traffic to IMDS. **Mitigation:** a load-time
+SSRF denylist (`config_validate::ssrf_blocked_host`) blocks cloud-metadata/IMDS hosts, and normalizes
+the authority the way the connecting stack does — backslash→slash, userinfo stripping,
+percent-decoding, trailing-dot, and alternate IPv4 encodings (decimal/hex/octal `inet_aton`,
+IPv4-mapped IPv6) — so an obfuscated host can't slip past. `path`/`path_base` must begin with `/` (an
+override can only extend the path, never re-home the authority), the composed URL is re-checked, and
+`token_url` gets the same guard because it carries the client secret. A hook `webhook:` URL is
+validated the same way at load (`observability::validate_routing_webhook_url`) so a gate or tap
+endpoint cannot be pointed at IMDS. The runtime HTTP client also **refuses redirects**, so a
 hostile upstream can't 30x-redirect vetted traffic to an internal address.
 
 ### T2 — Front-door authentication bypass (boundary 1)
@@ -105,6 +109,21 @@ release ships a CycloneDX SBOM and a signed Sigstore build-provenance attestatio
 the binaries and both container images, plus a cosign-signed GHCR image. Release artifacts are built
 only from a signed version tag by a public workflow. See the
 [Security page](https://getbusbar.com/security/) for verification recipes.
+
+### T9 — Malicious dynamic plugin (boundary 4)
+A dynamic store/auth/hook plugin is native code loaded with `dlopen` — it runs in-process with full
+engine privileges, so a hostile or tampered plugin is a code-execution foothold. **Mitigation:** the
+whole subsystem is **off by default** (`plugins.enabled: false`; with it off, a tarball dropped in
+`plugins.dir` is inert). When enabled, every plugin's signed `manifest.json` is verified against the
+ed25519 **release key embedded in the binary**: first-party (busbar-signed) plugins pass with zero
+config, third-party keys must be allowlisted under `plugins.trust.publishers`, and loading anything
+unsigned or third-party requires the explicit `allow_unsigned` / `allow_third_party` opt-ins (both
+default `false`). `plugins.min_versions` floors block replaying an older signed build (first-party
+versions are auto-floored at the running binary's version). The loader maps **only the verified bytes**
+(`memfd_create` on Linux, a private staging file elsewhere); a pre-existing on-disk library is never
+loaded, so the bytes that pass the signature check are the bytes that run. An untrusted plugin is
+logged and skipped, never `dlopen`ed. This narrows but does not eliminate the risk: a plugin you
+choose to trust and load is trusted code by definition (see out-of-scope below).
 
 ## Explicitly out of scope
 
