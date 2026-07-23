@@ -33,7 +33,7 @@ fn usage() -> &'static str {
     "busbar-plugin-pack - package + sign a busbar plugin tarball
 
 USAGE:
-    busbar-plugin-pack pack --lib <cdylib> --name <name> --alias <alias> --kind <store|auth|hook>
+    busbar-plugin-pack pack --lib <cdylib> --name <name> --alias <alias> --kind <store|auth|hook|secret>
                             --version <semver> --publisher <publisher> --out <file.tar.gz>
                             [--description <text>] [--homepage <url>] [--license <spdx>]
                             [--allow-unsigned]

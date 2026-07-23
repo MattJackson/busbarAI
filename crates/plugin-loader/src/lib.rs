@@ -314,6 +314,184 @@ impl std::fmt::Debug for DynStore {
     }
 }
 
+// ── SECRET plugins (`kind: secret`) ─────────────────────────────────────────────────────────────
+
+/// A [`busbar_api::SecretModule`] loaded from a dynamic library. Mirrors [`DynStore`]: resolved C
+/// fn pointers + opaque handle + the mapped [`Library`] (declared before `_backing`; see DynStore's
+/// field-order contract).
+pub struct DynSecret {
+    handle: *mut c_void,
+    call: CallFn,
+    free: FreeFn,
+    close: CloseFn,
+    /// The plugin name/path, for diagnostics.
+    path: String,
+    _lib: Library,
+    _backing: Option<stage::Staged>,
+}
+
+// SAFETY: the backend behind the handle is a `Box<dyn SecretModule>` (`Send + Sync` by contract);
+// the handle is an opaque pointer to it and the raw fn pointers are plain code addresses.
+unsafe impl Send for DynSecret {}
+unsafe impl Sync for DynSecret {}
+
+impl DynSecret {
+    /// Serialize a request, ship it across the C ABI, copy + free the response buffer, and decode.
+    fn call_raw(
+        &self,
+        req: busbar_plugin_abi::SecretRequest,
+    ) -> Result<busbar_plugin_abi::SecretResponse, busbar_api::SecretError> {
+        let payload = serde_json::to_vec(&req)
+            .map_err(|e| busbar_api::SecretError(format!("plugin request encode failed: {e}")))?;
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let status = unsafe {
+            (self.call)(
+                self.handle,
+                payload.as_ptr(),
+                payload.len(),
+                &mut out,
+                &mut out_len,
+            )
+        };
+        // Same defense-in-depth response-length cap as the store wire (see DynStore::call_raw).
+        if let Err(msg) = response_len_ok(out_len, &self.path) {
+            if !out.is_null() {
+                unsafe { (self.free)(out, out_len) };
+            }
+            return Err(busbar_api::SecretError(msg));
+        }
+        let bytes = if out.is_null() || out_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec()
+        };
+        if !out.is_null() {
+            unsafe { (self.free)(out, out_len) };
+        }
+        if status == STATUS_OK {
+            serde_json::from_slice(&bytes)
+                .map_err(|e| busbar_api::SecretError(format!("plugin response decode failed: {e}")))
+        } else {
+            let msg = String::from_utf8_lossy(&bytes).into_owned();
+            Err(busbar_api::SecretError(if msg.is_empty() {
+                format!("plugin '{}' call failed (status {status})", self.path)
+            } else {
+                msg
+            }))
+        }
+    }
+}
+
+impl busbar_api::SecretModule for DynSecret {
+    fn resolve(
+        &self,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> busbar_api::SecretResult<Vec<u8>> {
+        match self.call_raw(busbar_plugin_abi::SecretRequest::Resolve {
+            settings: settings.clone(),
+        })? {
+            busbar_plugin_abi::SecretResponse::Bytes(b) => Ok(b),
+        }
+    }
+}
+
+impl Drop for DynSecret {
+    fn drop(&mut self) {
+        // Close while the library is still mapped (fields drop after this; `_lib` before `_backing`).
+        unsafe { (self.close)(self.handle) };
+    }
+}
+
+impl std::fmt::Debug for DynSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynSecret")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+/// Load a SECRET module from EXACTLY the verified library `bytes` (the TOCTOU-safe entrypoint;
+/// see [`load_store_from_bytes`] for the staging contract). `cfg_json` is the module-level config
+/// passed to its `open` (usually `{}`; per-reference settings ride each `resolve`).
+pub fn load_secret_from_bytes(
+    bytes: &[u8],
+    cfg_json: &str,
+    display: &str,
+) -> Result<Box<dyn busbar_api::SecretModule>, String> {
+    let (lib, staged) = stage::load_library_from_bytes(bytes, display)?;
+    wire_up_secret(lib, cfg_json, display.to_string(), Some(staged))
+}
+
+/// Shared core for a secret plugin: ABI handshake, symbol resolution, `open`, assemble [`DynSecret`].
+fn wire_up_secret(
+    lib: Library,
+    cfg_json: &str,
+    display: String,
+    backing: Option<stage::Staged>,
+) -> Result<Box<dyn busbar_api::SecretModule>, String> {
+    use busbar_plugin_abi::{secret_symbol, SECRET_ABI_VERSION};
+    let abi_version = unsafe {
+        let f = lib
+            .get::<busbar_plugin_abi::AbiVersionFn>(secret_symbol::ABI_VERSION)
+            .map_err(|_| format!("'{display}' is not a busbar secret plugin (no ABI symbol)"))?;
+        (*f)()
+    };
+    if abi_version != SECRET_ABI_VERSION {
+        return Err(format!(
+            "plugin '{display}' targets secret ABI v{abi_version}, engine speaks \
+             v{SECRET_ABI_VERSION}"
+        ));
+    }
+    let (open, call, free, close) = unsafe {
+        let open = *lib
+            .get::<busbar_plugin_abi::OpenFn>(secret_symbol::OPEN)
+            .map_err(|e| format!("plugin '{display}' missing open: {e}"))?;
+        let call = *lib
+            .get::<CallFn>(secret_symbol::CALL)
+            .map_err(|e| format!("plugin '{display}' missing call: {e}"))?;
+        let free = *lib
+            .get::<FreeFn>(secret_symbol::FREE)
+            .map_err(|e| format!("plugin '{display}' missing free: {e}"))?;
+        let close = *lib
+            .get::<CloseFn>(secret_symbol::CLOSE)
+            .map_err(|e| format!("plugin '{display}' missing close: {e}"))?;
+        (open, call, free, close)
+    };
+    let mut handle: *mut c_void = std::ptr::null_mut();
+    let mut err: *mut u8 = std::ptr::null_mut();
+    let mut err_len: usize = 0;
+    let status = unsafe {
+        open(
+            cfg_json.as_ptr(),
+            cfg_json.len(),
+            &mut handle,
+            &mut err,
+            &mut err_len,
+        )
+    };
+    if status != STATUS_OK || handle.is_null() {
+        let msg = if err.is_null() || err_len == 0 {
+            format!("status {status}")
+        } else {
+            let m = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(err, err_len) })
+                .into_owned();
+            unsafe { free(err, err_len) };
+            m
+        };
+        return Err(format!("plugin '{display}' open failed: {msg}"));
+    }
+    Ok(Box::new(DynSecret {
+        handle,
+        call,
+        free,
+        close,
+        path: display,
+        _lib: lib,
+        _backing: backing,
+    }))
+}
+
 /// Load a store backend from the dynamic library at `lib_path`, passing `cfg_json` to its `open`.
 ///
 /// Validates the ABI-version handshake before calling anything else (a library that isn't a busbar

@@ -140,6 +140,47 @@ pub enum StoreResponse {
     Audit(Vec<AuditRecord>),
 }
 
+// ── SECRET-plugin wire (`kind: secret`) ─────────────────────────────────────────────────────────
+// A secret plugin rides the SAME five-symbol C shape as a store plugin (version/open/call/free/
+// close; JSON payloads over ptr+len), under its own symbol names and its own tiny request enum. A
+// plugin is a plugin: the tarball/manifest/signature/trust pipeline is IDENTICAL - only the
+// manifest `kind` (and therefore which engine seam consumes it) differs.
+
+/// The secret-plugin ABI version. v1 (1.5.0): the initial `Resolve` wire.
+pub const SECRET_ABI_VERSION: u32 = 1;
+
+/// The exported-symbol names of a SECRET plugin (`kind: secret`). Same five-symbol shape as
+/// [`symbol`], distinct names so one dylib could even export both kinds without collision.
+pub mod secret_symbol {
+    /// `busbar_secret_abi_version() -> u32` - the ABI handshake.
+    pub const ABI_VERSION: &[u8] = b"busbar_secret_abi_version\0";
+    /// `busbar_secret_open(cfg, cfg_len, out_handle, out_err, out_err_len) -> i32`.
+    pub const OPEN: &[u8] = b"busbar_secret_open\0";
+    /// `busbar_secret_call(handle, req, req_len, out, out_len) -> i32`.
+    pub const CALL: &[u8] = b"busbar_secret_call\0";
+    /// `busbar_secret_free(ptr, len)` - free a buffer the plugin allocated for the engine.
+    pub const FREE: &[u8] = b"busbar_secret_free\0";
+    /// `busbar_secret_close(handle)` - drop the module instance.
+    pub const CLOSE: &[u8] = b"busbar_secret_close\0";
+}
+
+/// A [`busbar_api::SecretModule`] operation, serialized as the secret `call` request payload.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SecretRequest {
+    /// `resolve` - one secret reference's opaque settings map in, the secret bytes out.
+    Resolve {
+        settings: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+/// The success payload for a secret `call`. Module-level failures return `STATUS_ERR` with a UTF-8
+/// message in the out buffer (which must never carry secret material).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SecretResponse {
+    /// `resolve` - the secret bytes.
+    Bytes(Vec<u8>),
+}
+
 // ── C fn-pointer signatures the engine resolves ──────────────────────────────────────────────────
 // Provided as type aliases so the engine's loader and the plugin's SDK agree on the exact ABI. All
 // are `unsafe extern "C"`. Buffers the plugin allocates (the `out*` params) are owned by the engine

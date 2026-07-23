@@ -33,6 +33,9 @@ use std::path::{Path, PathBuf};
 pub fn supported_abi(kind: &str) -> &'static [u32] {
     match kind {
         "store" => &[busbar_plugin_abi::ABI_VERSION],
+        // A `kind: secret` plugin exports the secret C ABI (busbar_secret_* symbols) - the same
+        // five-symbol shape as a store plugin, resolving a secret reference's settings to bytes.
+        "secret" => &[busbar_plugin_abi::SECRET_ABI_VERSION],
         // auth/hook plugins share the manifest + trust + registry machinery today; their C ABI
         // contracts are v1 placeholders until the engine grows dynamic consumers for those kinds.
         "auth" | "hook" => &[1],
@@ -161,6 +164,42 @@ impl PluginRegistry {
             ));
         }
         crate::load_store_from_bytes(&p.lib_bytes, cfg_json, &p.manifest.name)
+    }
+
+    /// Open a SECRET plugin resolved by name or alias: verifies the resolved plugin's `kind` is
+    /// `secret`, then loads the VERIFIED bytes over the secret C ABI and `open`s it with
+    /// `cfg_json`. Same trust and load pipeline as a store plugin - only the kind (and the seam
+    /// consuming it) differs. FAIL-CLOSED: any resolution/kind/load failure is an error the caller
+    /// surfaces as an unresolvable secret.
+    pub fn open_secret(
+        &self,
+        name_or_alias: &str,
+        cfg_json: &str,
+    ) -> Result<Box<dyn busbar_api::SecretModule>, String> {
+        let Some(p) = self.resolve(name_or_alias) else {
+            return Err(match self.unresolved_reason(name_or_alias) {
+                Some(s) => format!(
+                    "plugin '{name_or_alias}' is present ({}) but was not loaded: {}",
+                    s.file, s.reason
+                ),
+                None => format!(
+                    "no plugin named or aliased '{name_or_alias}' is available (loadable plugins: \
+                     [{}])",
+                    self.loadable
+                        .iter()
+                        .map(|p| p.manifest.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        };
+        if p.manifest.kind != "secret" {
+            return Err(format!(
+                "plugin '{}' has kind '{}', not 'secret' - it cannot resolve config secrets",
+                p.manifest.name, p.manifest.kind
+            ));
+        }
+        crate::load_secret_from_bytes(&p.lib_bytes, cfg_json, &p.manifest.name)
     }
 }
 
@@ -672,6 +711,41 @@ mod tests {
         let reg = scan_and_validate(&dir, &policy(&release)).expect("scan");
         let err = reg.open_store("ranker", "{}").map(|_| ()).unwrap_err();
         assert!(err.contains("kind 'hook'"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kind gating for SECRETS (P2): a `kind: secret` plugin passes the SAME scan/trust pipeline
+    /// as a store plugin (a plugin is a plugin), and the kind gate is symmetric - a store plugin
+    /// cannot resolve config secrets, and a secret plugin cannot back the store. FAIL-CLOSED both
+    /// ways.
+    #[test]
+    fn open_secret_refuses_non_secret_kind_and_vice_versa() {
+        let release = key(1);
+        let dir = tmpdir("secretkind");
+        // A trusted secret plugin (abi_version stamped to the secret ABI so the scan admits it).
+        let mut m = manifest("busbar-secret-vault", "vault", "busbar");
+        m.kind = "secret".into();
+        m.abi_version = busbar_plugin_abi::SECRET_ABI_VERSION;
+        let m = sign(&release, m, b"secret lib");
+        write_tarball(&dir, "vault.tar.gz", &m, b"secret lib");
+        // And a trusted store plugin beside it.
+        let st = sign(
+            &release,
+            manifest("busbar-store-redis", "redis", "busbar"),
+            b"store lib",
+        );
+        write_tarball(&dir, "redis.tar.gz", &st, b"store lib");
+        let reg = scan_and_validate(&dir, &policy(&release)).expect("scan admits both kinds");
+        assert_eq!(reg.loadable().len(), 2, "one secret + one store validated");
+        // The kind gates: a store referenced as a secret module fails naming the kind...
+        let err = reg.open_secret("redis", "{}").map(|_| ()).unwrap_err();
+        assert!(err.contains("kind 'store'"), "got {err}");
+        // ...and a secret plugin cannot back the store.
+        let err = reg.open_store("vault", "{}").map(|_| ()).unwrap_err();
+        assert!(err.contains("kind 'secret'"), "got {err}");
+        // An unknown secret module name is fail-closed with the loadable set named.
+        let err = reg.open_secret("nope", "{}").map(|_| ()).unwrap_err();
+        assert!(err.contains("no plugin named or aliased"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

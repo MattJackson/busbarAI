@@ -11,7 +11,7 @@
 //! The manifest carries:
 //!
 //! - **identity**: `name` (canonical, e.g. `busbar-store-redis`), `alias` (the short config name,
-//!   e.g. `redis`), `kind` (`store` | `auth` | `hook`), `version` (semver);
+//!   e.g. `redis`), `kind` (`store` | `auth` | `hook` | `secret`), `version` (semver);
 //! - **binding + compat**: `sha256` (of the library bytes, pinning the manifest to that exact
 //!   binary) and `abi_version` (which busbar C ABI the cdylib exports for its `kind`);
 //! - **authenticity**: `publisher` + `signature` over the *canonical whole manifest*;
@@ -61,7 +61,7 @@ pub const FIRST_PARTY_PUBLISHER: &str = "busbar";
 
 /// The plugin kinds this binary understands. ONE plugin subsystem: `kind` only selects which C ABI
 /// the cdylib exports and which engine subsystem consumes it; discovery/trust/validation are shared.
-pub const KNOWN_KINDS: &[&str] = &["store", "auth", "hook"];
+pub const KNOWN_KINDS: &[&str] = &["store", "auth", "hook", "secret"];
 
 /// The busbar release ed25519 PUBLIC key embedded at BUILD time via the `BUSBAR_RELEASE_PUBKEY`
 /// environment variable (64 hex chars). `None` in a build where it was not provided (local dev
@@ -566,6 +566,34 @@ mod tests {
                 first_party: true
             }
         );
+    }
+
+    /// P2: `kind: secret` is a first-class plugin kind - a signed secret-module manifest passes
+    /// structural validation and the trust evaluation identically to a store plugin (a plugin is a
+    /// plugin), while an unknown kind still fails structure.
+    #[test]
+    fn secret_kind_is_known_and_signs_like_any_plugin() {
+        assert!(KNOWN_KINDS.contains(&"secret"));
+        let release = test_key(1);
+        let artifact = b"\x7fELF secret plugin";
+        let mut m0 = manifest("busbar-secret-vault", "vault", FIRST_PARTY_PUBLISHER);
+        m0.kind = "secret".to_string();
+        let m = sign(&release, m0, artifact);
+        validate_structure(&m, artifact, &abi).expect("kind secret is structurally valid");
+        let pol = policy(Some(&release), &[], false, false);
+        assert_eq!(
+            evaluate(artifact, &m, &pol).unwrap(),
+            Verdict::Trusted {
+                publisher: FIRST_PARTY_PUBLISHER.into(),
+                first_party: true
+            }
+        );
+        // A made-up kind still fails structure (the closed KNOWN_KINDS set).
+        let mut bad = manifest("busbar-x", "x", FIRST_PARTY_PUBLISHER);
+        bad.kind = "gizmo".to_string();
+        let bad = sign(&release, bad, artifact);
+        let err = validate_structure(&bad, artifact, &abi).unwrap_err();
+        assert!(err.contains("gizmo"), "got {err}");
     }
 
     #[test]
