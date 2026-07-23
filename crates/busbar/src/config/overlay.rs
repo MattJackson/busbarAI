@@ -12,12 +12,20 @@
 //! corrupt overlay yields `None` and boot proceeds on base config alone — a bad overlay never bricks
 //! startup).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{HookCfg, RootCfg};
+use super::{GroupCfg, HookCfg, RootCfg};
+
+/// Current overlay schema version. Stamped on every write; a missing field (a pre-versioning overlay)
+/// reads as `1`, the additive baseline (hooks + the newly-added groups section, both backward
+/// compatible). Bump only on a BREAKING overlay-format change, and add a migration at `read` time.
+pub(crate) const OVERLAY_VERSION: u32 = 1;
+fn default_overlay_version() -> u32 {
+    1
+}
 
 /// Persist the current hook state to the overlay at `path`, IF persistence is enabled (`Some`), and
 /// update the TOMBSTONE set for this change: `deleted_add` (a just-deleted hook) is tombstoned so the
@@ -35,45 +43,89 @@ pub(crate) fn persist(
     deleted_remove: Option<&str>,
 ) {
     if let Some(p) = path {
-        // Read-modify-WRITE, not the fail-soft boot read. `read()` collapses absent/unreadable/corrupt
-        // to None; starting empty then overwriting would PERMANENTLY drop accumulated deletions and
-        // silently resurrect an API-deleted hook on restart. Distinguish: absent -> start fresh;
-        // present-but-unreadable -> REFUSE to overwrite, preserving the existing overlay.
-        let mut deleted = match read_state(p) {
-            OverlayReadState::Absent => Vec::new(),
-            OverlayReadState::Loaded(d) => d.deleted,
-            OverlayReadState::Unreadable => {
-                tracing::error!(
-                    path = %p.display(),
-                    "config overlay exists but is unreadable/corrupt; REFUSING to overwrite it (would \
-                     drop hook-deletion tombstones and could resurrect a deleted hook). This apply is \
-                     NOT persisted — fix or remove the overlay file to restore durability."
-                );
-                return;
-            }
+        // Read-modify-WRITE the WHOLE overlay so a hook write preserves the groups section verbatim
+        // (and vice-versa in `persist_groups`). `load_for_rmw` refuses on an unreadable overlay —
+        // starting empty then overwriting would PERMANENTLY drop accumulated tombstones from BOTH
+        // sections and silently resurrect an API-deleted hook/group on restart.
+        let Some(mut doc) = load_for_rmw(p) else {
+            return;
         };
         if let Some(name) = deleted_add {
-            if !deleted.iter().any(|n| n == name) {
-                deleted.push(name.to_string());
+            if !doc.deleted.iter().any(|n| n == name) {
+                doc.deleted.push(name.to_string());
             }
         }
         if let Some(name) = deleted_remove {
-            deleted.retain(|n| n != name);
+            doc.deleted.retain(|n| n != name);
         }
+        doc.hooks = hooks.clone();
+        doc.global_hooks = global_hooks.to_vec();
         // INVARIANT: a hook present in the registry being persisted can never ALSO be tombstoned —
         // the boot-merge would insert it then subtract it, silently dropping a live hook. The
         // explicit `deleted_remove` above covers the register-a-name case; this reconciliation also
         // covers the WHOLESALE-registry writes (config ROLLBACK, which passes both args `None`):
         // rollback restores a registry that may contain a name still tombstoned from an earlier
         // API delete, and without this the rollback would not survive a restart (found: audit c1r5).
-        deleted.retain(|name| !hooks.contains_key(name));
-        let doc = OverlayDoc {
-            hooks: hooks.clone(),
-            global_hooks: global_hooks.to_vec(),
-            deleted,
-        };
+        doc.deleted.retain(|name| !hooks.contains_key(name));
+        doc.version = OVERLAY_VERSION;
         if let Err(e) = write(p, &doc) {
             tracing::warn!(error = %e, path = %p.display(), "failed to persist config overlay");
+        }
+    }
+}
+
+/// Load the existing overlay for a read-modify-WRITE, or `None` to signal REFUSE-to-overwrite.
+/// `Absent` -> a fresh default doc (safe to start clean); `Loaded` -> the existing doc (all sections
+/// carried forward so a write to one section never clobbers another); `Unreadable` -> `None`, and the
+/// caller aborts the write, because overwriting a corrupt overlay would drop the deletion tombstones
+/// of EVERY section. `version` is stamped by the caller just before `write`.
+fn load_for_rmw(p: &Path) -> Option<OverlayDoc> {
+    match read_state(p) {
+        OverlayReadState::Absent => Some(OverlayDoc::default()),
+        OverlayReadState::Loaded(doc) => Some(doc),
+        OverlayReadState::Unreadable => {
+            tracing::error!(
+                path = %p.display(),
+                "config overlay exists but is unreadable/corrupt; REFUSING to overwrite it (would \
+                 drop hook AND group deletion tombstones and could resurrect a deleted item). This \
+                 apply is NOT persisted — fix or remove the overlay file to restore durability."
+            );
+            None
+        }
+    }
+}
+
+/// Persist the current GROUPS state to the overlay, mirroring `persist` for the `groups:` section:
+/// the API-mutable group registry + its tombstones (`deleted_groups`), read-modify-written so the
+/// HOOKS section and its tombstones are preserved untouched. Same durability (not correctness)
+/// contract: the live config already swapped; a write failure is logged, never fatal. `None` path is a
+/// no-op. `deleted_add`/`deleted_remove` tombstone/untombstone a group name; a wholesale write (both
+/// `None`, e.g. rollback) reconciles away any tombstone for a name the restored registry contains.
+// Wired by the Phase 1 groups CRUD handler (task #100); staged here with the substrate it belongs to.
+#[allow(dead_code)]
+pub(crate) fn persist_groups(
+    path: Option<&Path>,
+    groups: &BTreeMap<String, GroupCfg>,
+    deleted_add: Option<&str>,
+    deleted_remove: Option<&str>,
+) {
+    if let Some(p) = path {
+        let Some(mut doc) = load_for_rmw(p) else {
+            return;
+        };
+        if let Some(name) = deleted_add {
+            if !doc.deleted_groups.iter().any(|n| n == name) {
+                doc.deleted_groups.push(name.to_string());
+            }
+        }
+        if let Some(name) = deleted_remove {
+            doc.deleted_groups.retain(|n| n != name);
+        }
+        doc.groups = groups.clone();
+        doc.deleted_groups.retain(|name| !groups.contains_key(name));
+        doc.version = OVERLAY_VERSION;
+        if let Err(e) = write(p, &doc) {
+            tracing::warn!(error = %e, path = %p.display(), "failed to persist config overlay (groups)");
         }
     }
 }
@@ -84,20 +136,43 @@ pub(crate) fn persist(
 /// remove a base-defined hook).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct OverlayDoc {
+    /// Overlay schema version (see `OVERLAY_VERSION`). Absent in a pre-versioning overlay -> `1`.
+    #[serde(default = "default_overlay_version")]
+    pub(crate) version: u32,
     #[serde(default)]
     pub(crate) hooks: HashMap<String, HookCfg>,
     #[serde(default)]
     pub(crate) global_hooks: Vec<String>,
     #[serde(default)]
     pub(crate) deleted: Vec<String>,
+    /// API-applied `groups:` entries (the second section on the spine). An overlay group with a base
+    /// group's name WINS at merge (last-applied definition), matching hook semantics.
+    #[serde(default)]
+    pub(crate) groups: BTreeMap<String, GroupCfg>,
+    /// Group tombstones — groups deleted via the API, subtracted from base config at boot.
+    #[serde(default)]
+    pub(crate) deleted_groups: Vec<String>,
 }
 
 /// Read the overlay at `path`, or `None` if it is absent, unreadable, or malformed. Fail-soft: a
 /// corrupt overlay must NEVER brick boot — busbar starts on base config alone and the operator can
-/// re-apply. (A future durable store surfaces a boot warning; the in-file MVP stays silent-soft.)
+/// re-apply. Unlike the old silent-soft read, a present-but-corrupt overlay is now logged LOUD at
+/// boot: silently starting on base config alone drops every API-applied hook AND group with no signal,
+/// which is exactly the failure that hides overlay corruption.
 pub(crate) fn read(path: &Path) -> Option<OverlayDoc> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    match read_state(path) {
+        OverlayReadState::Absent => None,
+        OverlayReadState::Loaded(doc) => Some(doc),
+        OverlayReadState::Unreadable => {
+            tracing::warn!(
+                path = %path.display(),
+                "config overlay is present but unreadable/corrupt; starting on base config.yaml ALONE \
+                 — API-applied hooks and groups are NOT restored. Fix or remove the overlay file to \
+                 restore durability."
+            );
+            None
+        }
+    }
 }
 
 /// Classified overlay read for the read-modify-WRITE path (`persist`), which — unlike the fail-soft
@@ -137,6 +212,7 @@ pub(crate) fn from_state(hooks: &HashMap<String, HookCfg>, global_hooks: &[Strin
         hooks: hooks.clone(),
         global_hooks: global_hooks.to_vec(),
         deleted: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -156,10 +232,21 @@ pub(crate) fn merge_into(cfg: &mut RootCfg, doc: OverlayDoc) {
             cfg.global_hooks.push(g);
         }
     }
-    // Tombstones LAST: an API deletion removes the hook from the effective config even if base defined it.
+    // Groups section: same semantics as hooks — an overlay group with a base group's name wins, then
+    // group tombstones are subtracted LAST so an API deletion survives a restart even if base defined
+    // the group. The parent-chain validity (parents exist, acyclic, depth) is re-checked by
+    // `validate_groups` after the merge, exactly as for a hand-written config.
+    for (name, group) in doc.groups {
+        cfg.groups.insert(name, group);
+    }
+    // Tombstones LAST: an API deletion removes the hook/group from the effective config even if base
+    // defined it.
     for name in &doc.deleted {
         cfg.hooks.remove(name);
         cfg.global_hooks.retain(|g| g != name);
+    }
+    for name in &doc.deleted_groups {
+        cfg.groups.remove(name);
     }
 }
 
@@ -254,6 +341,7 @@ mod tests {
             hooks: HashMap::new(),
             global_hooks: Vec::new(),
             deleted: vec!["base_hook".to_string()],
+            ..Default::default()
         };
         merge_into(&mut cfg, doc);
         assert!(
@@ -305,6 +393,7 @@ mod tests {
                 hooks: HashMap::new(),
                 global_hooks: Vec::new(),
                 deleted: vec!["x".to_string()],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -327,6 +416,109 @@ mod tests {
         assert!(
             cfg.hooks.contains_key("x"),
             "rollback is durable across restart"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn group_with_budget() -> GroupCfg {
+        serde_json::from_value(serde_json::json!({
+            "limits": [ { "budget": 1000, "per": "month" } ]
+        }))
+        .unwrap()
+    }
+
+    /// merge_into inserts overlay groups (an overlay group with a base group's name wins) and applies
+    /// group tombstones LAST — an API-deleted group stays gone even if base config.yaml defined it.
+    #[test]
+    fn merge_into_groups_and_group_tombstones() {
+        let mut cfg = minimal_cfg();
+        cfg.groups.insert("team".to_string(), group_with_budget());
+        cfg.groups.insert("doomed".to_string(), group_with_budget());
+        let doc = OverlayDoc {
+            groups: BTreeMap::from([("user:alice".to_string(), group_with_budget())]),
+            deleted_groups: vec!["doomed".to_string()],
+            ..Default::default()
+        };
+        merge_into(&mut cfg, doc);
+        assert!(cfg.groups.contains_key("user:alice"), "overlay group added");
+        assert!(cfg.groups.contains_key("team"), "base group untouched");
+        assert!(
+            !cfg.groups.contains_key("doomed"),
+            "tombstoned group removed even though base defined it"
+        );
+    }
+
+    /// REGRESSION: a HOOK write must PRESERVE the groups section + its tombstones — the read-modify-write
+    /// loads the whole doc and mutates only the hook section. Guards against "persist rebuilds the doc
+    /// inline and silently drops groups".
+    #[test]
+    fn persist_hook_preserves_groups_section() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busbar-ovl-preserve-{}.json", std::process::id()));
+        write(
+            &path,
+            &OverlayDoc {
+                groups: BTreeMap::from([("user:bob".to_string(), group_with_budget())]),
+                deleted_groups: vec!["oldteam".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        persist(
+            Some(&path),
+            &HashMap::from([("h".to_string(), gate())]),
+            &["h".to_string()],
+            None,
+            None,
+        );
+        let doc = read(&path).expect("read back");
+        assert!(doc.hooks.contains_key("h"), "hook written");
+        assert!(
+            doc.groups.contains_key("user:bob"),
+            "groups section preserved across a hook write"
+        );
+        assert!(
+            doc.deleted_groups.iter().any(|n| n == "oldteam"),
+            "group tombstones preserved across a hook write"
+        );
+        assert_eq!(
+            doc.version, OVERLAY_VERSION,
+            "schema version stamped on write"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Symmetric: a GROUP write preserves the hooks section, and reconciles away a group tombstone for a
+    /// name the written registry contains (wholesale-rollback safety, mirroring the hook path's c1r5 fix).
+    #[test]
+    fn persist_groups_preserves_hooks_and_reconciles_tombstone() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busbar-ovl-gpreserve-{}.json", std::process::id()));
+        write(
+            &path,
+            &OverlayDoc {
+                hooks: HashMap::from([("keepme".to_string(), gate())]),
+                deleted_groups: vec!["x".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Persist a group registry that CONTAINS "x" (a rollback), both tombstone args None.
+        persist_groups(
+            Some(&path),
+            &BTreeMap::from([("x".to_string(), group_with_budget())]),
+            None,
+            None,
+        );
+        let doc = read(&path).expect("read back");
+        assert!(
+            doc.hooks.contains_key("keepme"),
+            "hooks section preserved across a group write"
+        );
+        assert!(doc.groups.contains_key("x"), "group written");
+        assert!(
+            !doc.deleted_groups.iter().any(|n| n == "x"),
+            "tombstone reconciled away for a restored group, else it vanishes on restart"
         );
         let _ = std::fs::remove_file(&path);
     }
