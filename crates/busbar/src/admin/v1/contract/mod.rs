@@ -39,6 +39,7 @@ pub(crate) const ADMIN_PREFIX: &str = "/api/v1/admin";
 pub(crate) const PATH_ADMIN_AUTH: &str = "/admin-auth";
 pub(crate) const PATH_CONFIG_VALIDATE: &str = "/config/validate";
 pub(crate) const PATH_HOOKS: &str = "/hooks";
+pub(crate) const PATH_GROUPS: &str = "/groups";
 
 /// Shared pagination limit policy (§0.4, one cursor grammar → one limit policy) for the admin
 /// lists: `?limit=` hard cap and default page size, used by the keys list (admin.rs) and the
@@ -391,6 +392,72 @@ pub(crate) struct HookView {
     pub(crate) settings: serde_json::Map<String, serde_json::Value>,
     /// Whether this hook fires on every request (globally wired).
     pub(crate) global: bool,
+}
+
+/// A group definition in the registry read (`GET /api/v1/admin/groups`,
+/// `GET /api/v1/admin/groups/{name}`) — the limit-tree read surface. Projects the `groups:` config
+/// entry faithfully (parent chain, enabled freeze flag, the ordered limits, the `child_default`
+/// budget template for auto-provisioned children), never a secret. This is the READ shape; the
+/// WRITE verbs accept a `GroupCfg` verbatim (paste a config.yaml group block). Additive-only.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct GroupView {
+    pub(crate) name: String,
+    /// The parent group whose limits this one is ANDed under (the enforcement chain). `None` = a
+    /// root group. Skipped from the body when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) parent: Option<String>,
+    /// `false` FREEZES the group (every request charging through it is rejected; history kept).
+    pub(crate) enabled: bool,
+    /// The group's own limits, enforced together (AND). Order preserved from config.
+    pub(crate) limits: Vec<LimitView>,
+    /// The limit template stamped onto children auto-provisioned under this group (e.g. a
+    /// `user:<sub>` leaf on first self-mint). Skipped from the body when the group sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) child_default: Option<Vec<LimitView>>,
+}
+
+/// One limit inside a `GroupView`: an explicit `{ metric, amount, per }` projection of a config
+/// `LimitCfg`. The config file's compact `{ budget: 3000, per: month }` form is deserialize-only
+/// sugar; the read API projects it explicitly so a consumer never has to know the metric is the
+/// map key. `per` is `None` only for `concurrent` (an instantaneous gauge, no window).
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct LimitView {
+    /// One of `requests` | `tokens` | `budget` | `concurrent`.
+    pub(crate) metric: &'static str,
+    /// The cap amount (requests/tokens/cents, or the in-flight gauge for `concurrent`).
+    pub(crate) amount: u64,
+    /// The accounting window: `minute` | `hour` | `day` | `month` | `total`. Absent for `concurrent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) per: Option<&'static str>,
+}
+
+impl LimitView {
+    /// Project a config `LimitCfg` into its explicit read shape.
+    pub(crate) fn from_cfg(l: &crate::config::LimitCfg) -> Self {
+        LimitView {
+            metric: l.metric.as_str(),
+            amount: l.amount,
+            per: l.per.map(|w| w.as_str()),
+        }
+    }
+}
+
+impl GroupView {
+    /// Project a named `groups:` config entry into its read shape.
+    pub(crate) fn from_cfg(name: &str, cfg: &crate::config::GroupCfg) -> Self {
+        GroupView {
+            name: name.to_string(),
+            parent: cfg.parent.clone(),
+            enabled: cfg.enabled,
+            limits: cfg.limits.iter().map(LimitView::from_cfg).collect(),
+            child_default: cfg
+                .child_default
+                .as_ref()
+                .map(|cd| cd.limits.iter().map(LimitView::from_cfg).collect()),
+        }
+    }
 }
 
 /// The transport half of a `HookView`: which wire the hook speaks and its target (socket path or

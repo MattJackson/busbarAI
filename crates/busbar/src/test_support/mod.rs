@@ -719,6 +719,13 @@ impl TestApp {
         self.base_hook_names.insert(name.into());
         self
     }
+    /// Register a `groups:` entry into the App's group registry (the Admin-API groups read/mutation
+    /// surface). Marks it a BASE (config-file) group, so the base-shadow 409 guard sees it.
+    pub(crate) fn group(mut self, name: &str, cfg: crate::config::GroupCfg) -> Self {
+        self.groups_registry.insert(name.into(), cfg);
+        self.base_group_names.insert(name.into());
+        self
+    }
     /// Add a name to the `global_hooks:` list (globally-wired hooks).
     pub(crate) fn global_hook(mut self, name: &str) -> Self {
         self.global_hooks.push(name.into());

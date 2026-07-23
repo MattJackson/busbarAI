@@ -66,6 +66,28 @@ pub(crate) async fn get_hook(
     )
 }
 
+/// `GET /api/v1/admin/groups` — the `groups:` limit-tree read (+ config-plane `ETag` for `If-Match`
+/// chaining, so a client reads then mutates without a second round-trip).
+pub(crate) async fn list_groups(State(handle): State<Arc<AppHandle>>) -> Response {
+    let version = handle.load().config_version;
+    with_config_etag(
+        respond(StatusCode::OK, service(&handle).list_groups().await),
+        version,
+    )
+}
+
+/// `GET /api/v1/admin/groups/{name}` — one group definition (404 if unknown; + config-plane `ETag`).
+pub(crate) async fn get_group(
+    State(handle): State<Arc<AppHandle>>,
+    Path(name): Path<String>,
+) -> Response {
+    let version = handle.load().config_version;
+    with_config_etag(
+        respond(StatusCode::OK, service(&handle).get_group(&name).await),
+        version,
+    )
+}
+
 /// `GET /api/v1/admin/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
 pub(crate) async fn hook_health(
     State(handle): State<Arc<AppHandle>>,
@@ -1419,6 +1441,10 @@ pub(crate) const V1_GET_PATHS: &[(&str, &str)] = &[
     ("/providers", "Distinct providers + lane counts"),
     (PATH_HOOKS, "Hook registry (definitions)"),
     (
+        PATH_GROUPS,
+        "Group registry — the limit tree (parent chain, limits, child_default budget template)",
+    ),
+    (
         "/plugins",
         "Plugin catalog by type (compiled-in + external + dynamic-library)",
     ),
@@ -1592,6 +1618,23 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
                     "403": {"description": "A `hooks-register` principal may not delete a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)"},
                     "404": {"description": "Unknown hook (error code `not_found`)"},
                     "409": {"description": "Base-defined hook — read-only via the API; edit config.yaml (error code `conflict`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
+        ap("/groups/{name}"),
+        json!({
+            "get": {
+                "summary": "One group definition (parent, enabled, limits, child_default)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Unknown group (error code `not_found`)"}
                 }
             }
         }),
@@ -2131,9 +2174,9 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     }
 
     use crate::admin::v1::contract::{
-        AdminAuthView, AuthView, ConfigValidateView, EffectiveConfigView, HookHealthView, HookView,
-        InfoView, ModelView, Page, PluginInstallView, PluginReloadView, PluginView, PoolDetailView,
-        PoolView, ProviderView, UsageView,
+        AdminAuthView, AuthView, ConfigValidateView, EffectiveConfigView, GroupView,
+        HookHealthView, HookView, InfoView, ModelView, Page, PluginInstallView, PluginReloadView,
+        PluginView, PoolDetailView, PoolView, ProviderView, UsageView,
     };
 
     // Info & topology.
@@ -2152,6 +2195,9 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/hooks/{name}/health", "get", "200", HookHealthView);
     typed!("/hooks/{name}/schema", "get", "200", sview::HookSchemaView);
     typed!("/hooks/{name}/status", "get", "200", sview::HookStatusView);
+    // Groups (the limit tree).
+    typed!(PATH_GROUPS, "get", "200", Page<GroupView>);
+    typed!("/groups/{name}", "get", "200", GroupView);
     // Auth & credentials.
     typed!("/auth", "get", "200", AuthView);
     typed!(PATH_ADMIN_AUTH, "get", "200", AdminAuthView);

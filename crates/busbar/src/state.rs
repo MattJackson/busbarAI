@@ -212,8 +212,6 @@ pub(crate) struct App {
     /// projection in `cost.groups()` (which buckets limits per window and drops `child_default`).
     /// A group mutation swaps a new `App` snapshot (clone → mutate this map → re-validate → rebuild
     /// `cost` via `CostModel::with_groups`), never mutating in place. Empty when none configured.
-    // Read by the Phase 1 groups-CRUD read + mutation handlers (task #100); carried here first.
-    #[allow(dead_code)]
     pub(crate) groups_registry: std::collections::BTreeMap<String, crate::config::GroupCfg>,
     /// Group names defined in the BASE config file (pre-overlay). A `PUT`/`DELETE` on a base group is
     /// a 409 (edit config.yaml — the API cannot silently shadow or subtract operator file config, and

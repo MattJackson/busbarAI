@@ -15,9 +15,9 @@ use crate::state::App;
 
 use super::contract::{
     AdminAuthView, AdminError, AuthView, BuildInfo, ConfigValidateView, EffectiveConfigView,
-    HookHealthView, HookTransportView, HookView, InfoView, KeyUsageView, ModelUsageView, ModelView,
-    Page, PluginView, PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView, ProviderView,
-    TopologyInfo, UsageBreakdown, UsageView, UsageWindow,
+    GroupView, HookHealthView, HookTransportView, HookView, InfoView, KeyUsageView, ModelUsageView,
+    ModelView, Page, PluginView, PoolDetailView, PoolMemberStatusView, PoolMemberView, PoolView,
+    ProviderView, TopologyInfo, UsageBreakdown, UsageView, UsageWindow,
 };
 use crate::config::{
     DeployCfg, HookCfg, HookKind, HookStage, PromptAccess, ProviderDef, UserAccess,
@@ -638,6 +638,28 @@ impl AdminService {
             .get(name)
             .map(|cfg| self.hook_view(name, cfg))
             .ok_or_else(|| AdminError::NotFound(format!("hook `{name}`")))
+    }
+
+    /// `GET /api/v1/admin/groups` — the `groups:` limit tree read. Read scope. Each entry is the
+    /// DEFINITION (parent, enabled, limits, `child_default`), never a secret. Sorted by name (the
+    /// registry is already a BTreeMap, so iteration is name-ordered).
+    pub(crate) async fn list_groups(&self) -> Result<Page<GroupView>, AdminError> {
+        let groups: Vec<GroupView> = self
+            .app
+            .groups_registry
+            .iter()
+            .map(|(name, cfg)| GroupView::from_cfg(name, cfg))
+            .collect();
+        Ok(Page::single(groups))
+    }
+
+    /// `GET /api/v1/admin/groups/{name}` — one group definition, or `not_found` if the name is unknown.
+    pub(crate) async fn get_group(&self, name: &str) -> Result<GroupView, AdminError> {
+        self.app
+            .groups_registry
+            .get(name)
+            .map(|cfg| GroupView::from_cfg(name, cfg))
+            .ok_or_else(|| AdminError::NotFound(format!("group `{name}`")))
     }
 
     /// `GET /api/v1/admin/plugins?type=auth|hooks` — the plugin catalog for one TYPE. Read
@@ -1805,5 +1827,87 @@ mod tests {
         );
         svc.install_store_plugin("first.tar.gz", &upgrade)
             .expect("same-name overwrite is a legal upgrade");
+    }
+
+    // ---- groups read surface (Phase 1, task #100) ----
+
+    use crate::config::groups::{ChildDefault, LimitMetric, LimitWindow};
+    use crate::config::{GroupCfg, LimitCfg};
+
+    fn budget(cents: u64, per: LimitWindow) -> LimitCfg {
+        LimitCfg {
+            metric: LimitMetric::Budget,
+            amount: cents,
+            per: Some(per),
+        }
+    }
+
+    /// `list_groups` projects every `groups:` entry (name-sorted by the BTreeMap), faithfully
+    /// carrying parent, enabled, the ordered limits, and the `child_default` budget template.
+    #[tokio::test]
+    async fn list_groups_projects_the_limit_tree() {
+        let team = GroupCfg {
+            limits: vec![budget(20_000, LimitWindow::Month)],
+            child_default: Some(ChildDefault {
+                limits: vec![budget(2_000, LimitWindow::Month)],
+            }),
+            ..Default::default()
+        };
+        let bob = GroupCfg {
+            parent: Some("team".into()),
+            limits: vec![budget(3_000, LimitWindow::Month)],
+            ..Default::default()
+        };
+        let app = TestApp::new()
+            .group("team", team)
+            .group("user:bob", bob)
+            .build();
+        let svc = AdminService::new(app);
+
+        let page = svc.list_groups().await.expect("list ok");
+        // BTreeMap order: "team" < "user:bob".
+        assert_eq!(page.items.len(), 2);
+        let team = &page.items[0];
+        assert_eq!(team.name, "team");
+        assert_eq!(team.parent, None);
+        assert!(team.enabled);
+        assert_eq!(team.limits.len(), 1);
+        assert_eq!(team.limits[0].metric, "budget");
+        assert_eq!(team.limits[0].amount, 20_000);
+        assert_eq!(team.limits[0].per, Some("month"));
+        // The child_default template projects as an explicit limit list.
+        let cd = team.child_default.as_ref().expect("child_default present");
+        assert_eq!(cd.len(), 1);
+        assert_eq!(cd[0].amount, 2_000);
+
+        let bob = &page.items[1];
+        assert_eq!(bob.name, "user:bob");
+        assert_eq!(bob.parent.as_deref(), Some("team"));
+        assert!(bob.child_default.is_none());
+    }
+
+    /// `get_group` returns one entry by name; an unknown name is `not_found`.
+    #[tokio::test]
+    async fn get_group_by_name_and_not_found() {
+        let app = TestApp::new()
+            .group(
+                "acme",
+                GroupCfg {
+                    limits: vec![budget(5_000_000, LimitWindow::Month)],
+                    ..Default::default()
+                },
+            )
+            .build();
+        let svc = AdminService::new(app);
+
+        let g = svc.get_group("acme").await.expect("found");
+        assert_eq!(g.name, "acme");
+        assert_eq!(g.limits[0].amount, 5_000_000);
+
+        let err = svc.get_group("ghost").await.unwrap_err();
+        assert!(
+            matches!(&err, AdminError::NotFound(msg) if msg.contains("ghost")),
+            "unknown group is not_found: {err:?}"
+        );
     }
 }

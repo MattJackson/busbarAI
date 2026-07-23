@@ -465,7 +465,10 @@
             "items": {
               "type": "string"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "aws_access_key_id": {
             "description": "AWS AccessKeyId (present only when `issue_aws_credential` was set). Not secret.",
@@ -481,9 +484,6 @@
               "null"
             ]
           },
-          "budget_period": {
-            "type": "string"
-          },
           "created_at": {
             "format": "uint64",
             "minimum": 0,
@@ -492,50 +492,37 @@
           "enabled": {
             "type": "boolean"
           },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
-          "max_budget_cents": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "name": {
             "type": "string"
           },
-          "rpm_limit": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "secret": {
             "description": "The bearer secret — shown EXACTLY once, never returned by any read.",
             "type": "string"
-          },
-          "tpm_limit": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           }
         },
         "required": [
           "id",
           "name",
           "allowed_pools",
-          "max_budget_cents",
-          "budget_period",
-          "rpm_limit",
-          "tpm_limit",
+          "group",
           "enabled",
           "created_at",
+          "labels",
           "secret"
         ],
         "type": "object"
@@ -626,6 +613,48 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "GroupView": {
+        "description": "A group definition in the registry read (`GET /api/v1/admin/groups`,\n`GET /api/v1/admin/groups/{name}`) — the limit-tree read surface. Projects the `groups:` config\nentry faithfully (parent chain, enabled freeze flag, the ordered limits, the `child_default`\nbudget template for auto-provisioned children), never a secret. This is the READ shape; the\nWRITE verbs accept a `GroupCfg` verbatim (paste a config.yaml group block). Additive-only.",
+        "properties": {
+          "child_default": {
+            "description": "The limit template stamped onto children auto-provisioned under this group (e.g. a\n`user:<sub>` leaf on first self-mint). Skipped from the body when the group sets none.",
+            "items": {
+              "$ref": "#/components/schemas/LimitView"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "enabled": {
+            "description": "`false` FREEZES the group (every request charging through it is rejected; history kept).",
+            "type": "boolean"
+          },
+          "limits": {
+            "description": "The group's own limits, enforced together (AND). Order preserved from config.",
+            "items": {
+              "$ref": "#/components/schemas/LimitView"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parent": {
+            "description": "The parent group whose limits this one is ANDed under (the enforcement chain). `None` = a\nroot group. Skipped from the body when absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "enabled",
+          "limits"
         ],
         "type": "object"
       },
@@ -924,7 +953,7 @@
         "type": "object"
       },
       "KeyMeteringView": {
-        "description": "`GET /keys/{id}/usage` — the current budget-window counters for one key, plus the fraction of the\ntightest RPM/TPM cap remaining (`null` = uncapped). `budget_period`/`window_start` are `null`\nwhen the key record could not be read.",
+        "description": "`GET /keys/{id}/usage`: the key's all-time attribution counters (a 1.5.0 key bucket accrues in\nthe `total` window; limits live on the bound group's own windows) plus the fraction of the\ntightest `requests`/`tokens` limit across the group chain remaining (`null` = no such limit).",
         "properties": {
           "as_of": {
             "format": "uint64",
@@ -932,6 +961,11 @@
             "type": "integer"
           },
           "budget_period": {
+            "description": "Always `\"total\"` (the key attribution window).",
+            "type": "string"
+          },
+          "group": {
+            "description": "The bound `groups:` entry (`null` = unlimited key).",
             "type": [
               "string",
               "null"
@@ -962,12 +996,10 @@
             "type": "integer"
           },
           "window_start": {
+            "description": "Always `0` (the all-time window start).",
             "format": "uint64",
             "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           }
         },
         "required": [
@@ -975,6 +1007,7 @@
           "budget_period",
           "window_start",
           "as_of",
+          "group",
           "spend_cents",
           "tokens",
           "requests",
@@ -1062,16 +1095,16 @@
         "type": "object"
       },
       "KeyView": {
-        "description": "Virtual-key metadata — the `key_meta()` shape returned by `GET /keys/{id}`, `PATCH /keys/{id}`,\nand as each item of `GET /keys`. Never the secret or its hash.",
+        "description": "Virtual-key metadata — the `key_meta()` shape returned by `GET /keys/{id}`, `PATCH /keys/{id}`,\nand as each item of `GET /keys`. Never the secret or its hash. 1.5.0: keys are PURE AUTH, no\ninline limits; `allowed_pools` is `null` = all pools, `[]` = no pools (C6); `group` names the\nbound `groups:` entry (`null` = unlimited).",
         "properties": {
           "allowed_pools": {
             "items": {
               "type": "string"
             },
-            "type": "array"
-          },
-          "budget_period": {
-            "type": "string"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "created_at": {
             "format": "uint64",
@@ -1081,46 +1114,60 @@
           "enabled": {
             "type": "boolean"
           },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
-          "max_budget_cents": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "name": {
             "type": "string"
-          },
-          "rpm_limit": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "tpm_limit": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           }
         },
         "required": [
           "id",
           "name",
           "allowed_pools",
-          "max_budget_cents",
-          "budget_period",
-          "rpm_limit",
-          "tpm_limit",
+          "group",
           "enabled",
-          "created_at"
+          "created_at",
+          "labels"
+        ],
+        "type": "object"
+      },
+      "LimitView": {
+        "description": "One limit inside a `GroupView`: an explicit `{ metric, amount, per }` projection of a config\n`LimitCfg`. The config file's compact `{ budget: 3000, per: month }` form is deserialize-only\nsugar; the read API projects it explicitly so a consumer never has to know the metric is the\nmap key. `per` is `None` only for `concurrent` (an instantaneous gauge, no window).",
+        "properties": {
+          "amount": {
+            "description": "The cap amount (requests/tokens/cents, or the in-flight gauge for `concurrent`).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "metric": {
+            "description": "One of `requests` | `tokens` | `budget` | `concurrent`.",
+            "type": "string"
+          },
+          "per": {
+            "description": "The accounting window: `minute` | `hour` | `day` | `month` | `total`. Absent for `concurrent`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "metric",
+          "amount"
         ],
         "type": "object"
       },
@@ -1190,6 +1237,28 @@
         "required": [
           "model",
           "provider"
+        ],
+        "type": "object"
+      },
+      "Page_GroupView": {
+        "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/GroupView"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
         ],
         "type": "object"
       },
@@ -1304,7 +1373,7 @@
         "type": "object"
       },
       "PluginInstallView": {
-        "description": "The result of installing a dynamic-library store plugin (`POST /api/v1/admin/plugins`). The\nengine RE-VERIFIED the uploaded bytes against the running trust posture (the client is never\ntrusted), validated the ABI handshake, and atomically wrote the library (+ its manifest sidecar)\ninto the plugins directory. `active` takes effect on the next store (re)load — a store change\napplies on restart / `governance.store` apply, not as a hot swap (design: store install is\nboot-time/config-apply). Additive-only; never a secret.",
+        "description": "The result of installing a dynamic-library store plugin (`POST /api/v1/admin/plugins`). The\nengine RE-VERIFIED the uploaded bytes against the running trust posture (the client is never\ntrusted), validated the ABI handshake, and atomically wrote the library (+ its manifest sidecar)\ninto the plugins directory. `active` takes effect on the next store (re)load — a store change\napplies on restart / `store.module` apply, not as a hot swap (design: store install is\nboot-time/config-apply). Additive-only; never a secret.",
         "properties": {
           "file": {
             "description": "The library FILENAME written into the plugins directory (the handle `DELETE` takes).",
@@ -1374,7 +1443,7 @@
         "type": "object"
       },
       "PluginView": {
-        "description": "One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either\nCOMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`),\nEXTERNAL (registered at runtime over socket/webhook), or a DYNAMIC-LIBRARY plugin (a loadable\n`.so`/`.dll`/`.dylib` in the plugins directory, loaded over the store C ABI). `active` is\n`Some(true/false)` where activation is tracked (auth modules: in the chain?; external hooks:\nconfigured = true; dynamic store: the configured `governance.store`) and `None` where it is a\nper-pool concern not summarized here (compiled-in ranking policies). Additive-only.",
+        "description": "One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either\nCOMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`),\nEXTERNAL (registered at runtime over socket/webhook), or a DYNAMIC-LIBRARY plugin (a loadable\n`.so`/`.dll`/`.dylib` in the plugins directory, loaded over the store C ABI). `active` is\n`Some(true/false)` where activation is tracked (auth modules: in the chain?; external hooks:\nconfigured = true; dynamic store: the configured `store.module`) and `None` where it is a\nper-pool concern not summarized here (compiled-in ranking policies). Additive-only.",
         "properties": {
           "active": {
             "description": "Whether the plugin is currently active, where tracked; `None` when activation is not summarized\nat this level.",
@@ -1421,7 +1490,7 @@
             ]
           },
           "trust": {
-            "description": "The server-side trust verdict for a dynamic-library plugin, re-evaluated against the running\n`governance.trust` posture: `\"trusted\"` (signed by an allowlisted publisher), `\"unverified\"`\n(loaded but not verified — the posture permits it), or `\"rejected\"` (the `halt` posture would\nrefuse it). `None` for compiled-in/external.",
+            "description": "The server-side trust verdict for a dynamic-library plugin, re-evaluated against the running\n`plugins.trust` posture: `\"trusted\"` (signed by an allowlisted publisher), `\"unverified\"`\n(loaded but not verified — the posture permits it), or `\"rejected\"` (the `halt` posture would\nrefuse it). `None` for compiled-in/external.",
             "type": [
               "string",
               "null"
@@ -1623,10 +1692,10 @@
             "items": {
               "type": "string"
             },
-            "type": "array"
-          },
-          "budget_period": {
-            "type": "string"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "created_at": {
             "format": "uint64",
@@ -1636,50 +1705,37 @@
           "enabled": {
             "type": "boolean"
           },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
-          "max_budget_cents": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
           },
           "name": {
             "type": "string"
           },
-          "rpm_limit": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "secret": {
             "description": "The fresh bearer secret — shown EXACTLY once.",
             "type": "string"
-          },
-          "tpm_limit": {
-            "format": "uint32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
           }
         },
         "required": [
           "id",
           "name",
           "allowed_pools",
-          "max_budget_cents",
-          "budget_period",
-          "rpm_limit",
-          "tpm_limit",
+          "group",
           "enabled",
           "created_at",
+          "labels",
           "secret"
         ],
         "type": "object"
@@ -2758,6 +2814,118 @@
           }
         ],
         "summary": "One retained config version, with its hook-surface snapshot",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/groups": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_GroupView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Group registry — the limit tree (parent chain, limits, child_default budget template)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
+    "/api/v1/admin/groups/{name}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown group (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "One group definition (parent, enabled, limits, child_default)",
         "x-busbar-required-scope": "read-only"
       }
     },
@@ -4290,7 +4458,7 @@
                 }
               }
             },
-            "description": "The upload is untrusted and not opted-in (`conflict`) - sign it with an allowlisted publisher, add the publisher to governance.trust.publishers, or set governance.trust.allow_unsigned_plugins / allow_third_party"
+            "description": "The upload is untrusted and not opted-in (`conflict`) - sign it with an allowlisted publisher, add the publisher to plugins.trust.publishers, or set plugins.trust.allow_unsigned / allow_third_party"
           },
           "429": {
             "content": {

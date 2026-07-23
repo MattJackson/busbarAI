@@ -16,7 +16,7 @@ pub(crate) mod migrate;
 /// The secret-reference type (C2): `{ module, settings }` + the `{env}`/`{file}` sugar.
 pub(crate) mod secret;
 
-pub(crate) use groups::GroupCfg;
+pub(crate) use groups::{GroupCfg, LimitCfg};
 pub(crate) use secret::SecretRef;
 
 // Re-export status_class_from_str for config validation
