@@ -45,9 +45,9 @@ in a backend you run (a local SQLite file keeps state on the same host).
 A `base_url` / `path` / `path_base` / OAuth `token_url` / hook `webhook:` URL that resolves to a
 cloud-metadata endpoint would send credential-bearing traffic to IMDS. **Mitigation:** a load-time
 SSRF denylist (`config_validate::ssrf_blocked_host`) blocks cloud-metadata/IMDS hosts, and normalizes
-the authority the way the connecting stack does — backslash→slash, userinfo stripping,
-percent-decoding, trailing-dot, and alternate IPv4 encodings (decimal/hex/octal `inet_aton`,
-IPv4-mapped IPv6) — so an obfuscated host can't slip past. `path`/`path_base` must begin with `/` (an
+the authority the way the connecting stack does (backslash→slash, userinfo stripping,
+percent-decoding, trailing-dot, and alternate IPv4 encodings: decimal/hex/octal `inet_aton`,
+IPv4-mapped IPv6), so an obfuscated host can't slip past. `path`/`path_base` must begin with `/` (an
 override can only extend the path, never re-home the authority), the composed URL is re-checked, and
 `token_url` gets the same guard because it carries the client secret. A hook `webhook:` URL is
 validated the same way at load (`observability::validate_routing_webhook_url`) so a gate or tap
@@ -110,8 +110,8 @@ the binaries and both container images, plus a cosign-signed GHCR image. Release
 only from a signed version tag by a public workflow. See the
 [Security page](https://getbusbar.com/security/) for verification recipes.
 
-### T9 — Malicious dynamic plugin (boundary 4)
-A dynamic store/auth/hook plugin is native code loaded with `dlopen` — it runs in-process with full
+### T9 (Malicious dynamic plugin, boundary 4)
+A dynamic store/auth/hook plugin is native code loaded with `dlopen`; it runs in-process with full
 engine privileges, so a hostile or tampered plugin is a code-execution foothold. **Mitigation:** the
 whole subsystem is **off by default** (`plugins.enabled: false`; with it off, a tarball dropped in
 `plugins.dir` is inert). When enabled, every plugin's signed `manifest.json` is verified against the
