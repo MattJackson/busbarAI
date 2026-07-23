@@ -43,7 +43,20 @@ use std::os::raw::c_void;
 /// `key_id` to `bucket_id` (key buckets and budget-group buckets share the shape). A breaking wire
 /// change, so the version bumps: a v1 plugin is refused at load, never mis-called. 1.5.0 is
 /// unreleased, so no v1 plugin exists in the wild.
-pub const ABI_VERSION: u32 = 2;
+///
+/// v3 (1.5.0, pre-release): KEYS ARE PURE AUTH. `VirtualKey` (which crosses this ABI as JSON in
+/// the key CRUD messages) dropped its inline limits (`max_budget_cents` / `budget_period` /
+/// `rpm_limit` / `tpm_limit`), renamed `budget_group` to `group`, and re-encoded `allowed_pools`
+/// as an Option (`null` = all pools, `[]` = NO pools - C6). A breaking wire change to a message
+/// payload, so the version bumps; still no earlier plugin exists in the wild.
+///
+/// v4 (1.5.0, pre-release): the usage ledger SPLIT its request count. `UsageLedger`/`UsageDelta`
+/// (which cross this ABI as JSON in the `Get/Put/AddUsage` messages) gained `billable_requests`
+/// alongside `requests`: `requests` stays the admission count (never refunded, the requests-limit
+/// truth), `billable_requests` is admitted minus non-2xx refunds (the fee base for the 2xx-only
+/// charge). The field is serde-default, so an older plugin's payload still deserializes; still a
+/// wire-shape change to a message payload, so the version bumps in the same unreleased cycle.
+pub const ABI_VERSION: u32 = 4;
 
 /// The exported-symbol names the engine resolves after `dlopen`/`LoadLibrary`. A store plugin MUST
 /// export all five with these exact names and the signatures in the `*Fn` type aliases below. The
@@ -251,14 +264,10 @@ mod tests {
             id: "vk_1".into(),
             key_hash: "deadbeef".into(),
             name: "test".into(),
-            allowed_pools: vec!["p1".into()],
-            max_budget_cents: Some(1000),
-            budget_period: "total".into(),
-            rpm_limit: Some(60),
-            tpm_limit: None,
+            allowed_pools: Some(vec!["p1".into()]),
             enabled: true,
             created_at: 42,
-            budget_group: Some("growth".into()),
+            group: Some("growth".into()),
             labels: std::collections::BTreeMap::new(),
         }
     }
@@ -281,6 +290,7 @@ mod tests {
                 window_start: 100,
                 ledger: busbar_api::UsageLedger {
                     requests: 1,
+                    billable_requests: 1,
                     models: vec![busbar_api::ModelTokens {
                         model: "gpt-5".into(),
                         tokens: busbar_api::TierTokens {
@@ -297,6 +307,7 @@ mod tests {
                 window_start: 100,
                 delta: busbar_api::UsageDelta {
                     requests: 1,
+                    billable_requests: 1,
                     models: vec![busbar_api::ModelTokensDelta {
                         model: "gpt-5".into(),
                         tokens: busbar_api::TierTokensDelta {
@@ -341,7 +352,8 @@ mod tests {
 
     #[test]
     fn abi_version_is_two() {
-        // v2 = the token-ledger wire (1.5.0). A v1 plugin is refused at the handshake.
-        assert_eq!(ABI_VERSION, 2);
+        // v4 = the billable-requests ledger split (1.5.0). A mismatched plugin is refused at the
+        // handshake.
+        assert_eq!(ABI_VERSION, 4);
     }
 }

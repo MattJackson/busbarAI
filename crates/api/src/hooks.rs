@@ -144,8 +144,8 @@ pub struct Candidate<'a> {
 /// projection from the token ledger x the operator's current rate card (never stored, no currency).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BudgetBucketState {
-    /// The bucket id: the key's own id (innermost bucket) or `group:<name>` for an ancestor
-    /// budget group.
+    /// The bucket id: the key's own id (innermost bucket) or `group:<name>@<window>` for an
+    /// ancestor group's budget-window bucket.
     pub bucket_id: String,
     /// The budget-group name for a group bucket; `None` for the key's own bucket.
     pub budget_group: Option<String>,
@@ -155,7 +155,7 @@ pub struct BudgetBucketState {
     pub remaining_micros: Option<i64>,
     /// Epoch start of the bucket's current budget window.
     pub window_start: u64,
-    /// "total" | "daily" | "monthly" - this bucket's own window kind.
+    /// This bucket's own window kind: `minute` | `hour` | `day` | `month` | `total` (C8 nouns).
     pub budget_period: String,
 }
 

@@ -7,19 +7,20 @@ use sha2::{Digest, Sha256};
 
 /// The authenticated PRINCIPAL — who the caller IS, established at the auth stage and keyed to by
 /// everything downstream (governance, audit attribution, the hook `send_user` projection, admin
-/// scopes). IDENTITY ONLY: a module returns who; policy (allowed pools, budgets, admin scope) is
-/// resolved by busbar from config (`group_map:`), never asserted by the module (design-hooks-v2
-/// §2.3). NEVER carries the credential itself.
+/// scopes). IDENTITY ONLY: a module returns who; policy (allowed pools, group, admin scope) is
+/// resolved by busbar from config (`auth.role_bindings:`, nested by module), never asserted by the
+/// module (design-hooks-v2 §2.3). NEVER carries the credential itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     /// Stable identity handle (required): the virtual-key id for governance keys, a stable
-    /// module-scoped handle otherwise (e.g. `tokens:2`, an AD UPN).
+    /// module-scoped handle otherwise (e.g. an AD UPN).
     pub id: String,
     /// Display name, if the module knows one.
     pub name: Option<String>,
-    /// Group memberships (external modules). Mapped to governance via config `group_map:`;
-    /// intersected with the module's `allowed_groups:` cap before mapping. Empty = no groups.
-    pub groups: Vec<String>,
+    /// ROLES the identifying module asserts for this principal (1.5.0: `roles`, was `groups`).
+    /// Mapped to policy through `auth.role_bindings.<module>` (nested by module, so a role from
+    /// one module never rides another's binding). Empty = no roles (grants nothing).
+    pub roles: Vec<String>,
     /// Module-suggested cache TTL for this identification, seconds (clamped by the engine's hard
     /// cap when the credential cache lands). `None` = engine default.
     pub ttl_secs: Option<u64>,
@@ -31,7 +32,7 @@ impl Principal {
         Self {
             id: id.into(),
             name: None,
-            groups: Vec::new(),
+            roles: Vec::new(),
             ttl_secs: None,
         }
     }

@@ -8,38 +8,45 @@
 //! These are the same records the admin API and governance enforcement speak, moved here so the
 //! contract — not the engine — owns them. No I/O, no engine state: pure data.
 
-/// A virtual key issued by busbar (distinct from upstream provider keys). Maps a caller to the
-/// pools they may use plus their budget/rate-limit policy.
+/// A virtual key issued by busbar (distinct from upstream provider keys) - a PURE AUTH binding
+/// (1.5.0, S1): identity + pool grants + at most one `groups:` binding. Keys carry NO inline
+/// limits: every cap (requests / tokens / budget / concurrent) lives on the bound group's chain,
+/// so policy is mutable in config/store without re-issuing the credential.
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VirtualKey {
     pub id: String,
-    /// SHA-256 hex of the presented secret (the secret itself is never stored).
+    /// SHA-256 hex of the presented secret (the secret itself is never stored). For a 1.5.0
+    /// signed-token key this is a non-authenticating `binding:<id>` marker (the token is the
+    /// credential).
     pub key_hash: String,
     pub name: String,
-    /// Pools this key may target; empty = all pools allowed.
-    pub allowed_pools: Vec<String>,
-    /// Spend cap in cents (abstract minor units) for the budget period; None = unlimited.
-    pub max_budget_cents: Option<i64>,
-    /// "total" | "daily" | "monthly".
-    pub budget_period: String,
-    /// Requests-per-minute cap; None = unlimited.
-    pub rpm_limit: Option<u32>,
-    /// Tokens-per-minute cap; None = unlimited.
-    pub tpm_limit: Option<u32>,
+    /// Pools this key may target. `None` = ALL pools (the grant was omitted at mint);
+    /// `Some(list)` = exactly those pools; `Some([])` = NO pools (C6: an empty list is the empty
+    /// set, never "all").
+    #[serde(default)]
+    pub allowed_pools: Option<Vec<String>>,
     pub enabled: bool,
     pub created_at: u64,
-    /// The `governance.budget_groups` bucket this key charges INTO (in addition to its own inline
-    /// budget above, which stays the innermost bucket). `None` = the key participates in no group
-    /// chain. Named `budget_group` (never bare `group`) to avoid colliding with the auth
-    /// `group_map` concept, which has opposite (union / most-permissive) semantics.
-    /// `#[serde(default)]` keeps persisted pre-cost-model rows deserializable.
+    /// The `groups:` bucket this key charges through (at most one; the chain walks `parent` up
+    /// from here). `None` = no group: the key is authed + UNLIMITED (access only).
     #[serde(default)]
-    pub budget_group: Option<String>,
+    pub group: Option<String>,
     /// Optional operator-supplied labels attached at mint (e.g. `{"team": "growth"}`), echoed onto
     /// per-key metric series so external dashboards can `sum by (team)` WITHOUT busbar knowing what
     /// "team" means. Never interpreted by enforcement. BTreeMap for a deterministic label order.
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+}
+
+impl VirtualKey {
+    /// Whether this key may target `pool` (C6: `allowed_pools` omitted = all pools; an explicit
+    /// list is exhaustive; an explicit empty list is NO pools).
+    pub fn pool_allowed(&self, pool: &str) -> bool {
+        match &self.allowed_pools {
+            None => true,
+            Some(list) => list.iter().any(|p| p == pool),
+        }
+    }
 }
 
 // MANUAL Debug that REDACTS `key_hash`. A derived `Debug` would print the SHA-256 of the key's
@@ -63,13 +70,9 @@ impl std::fmt::Debug for VirtualKey {
             )
             .field("name", &self.name)
             .field("allowed_pools", &self.allowed_pools)
-            .field("max_budget_cents", &self.max_budget_cents)
-            .field("budget_period", &self.budget_period)
-            .field("rpm_limit", &self.rpm_limit)
-            .field("tpm_limit", &self.tpm_limit)
             .field("enabled", &self.enabled)
             .field("created_at", &self.created_at)
-            .field("budget_group", &self.budget_group)
+            .field("group", &self.group)
             .field("labels", &self.labels)
             .finish()
     }
@@ -187,7 +190,16 @@ pub struct ModelTokens {
 /// deterministic, and consumers do a few multiply-adds over it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageLedger {
+    /// ADMISSION count: every admitted request, NEVER refunded - the `requests`-limit truth. A
+    /// failed request still consumed a request slot, so a caller cannot escape the requests cap by
+    /// hammering failures.
     pub requests: u64,
+    /// BILLABLE request count: admitted requests MINUS the non-2xx refunds - the flat-fee base
+    /// (the fee bills 2xx only), so budget SPEND derives from this, not from `requests`.
+    /// `#[serde(default)]` so a pre-split persisted row deserializes with 0; the engine's
+    /// `hydrate_budgets` seeds it from `requests` for such a row.
+    #[serde(default)]
+    pub billable_requests: u64,
     pub models: Vec<ModelTokens>,
 }
 
@@ -229,9 +241,13 @@ impl UsageLedger {
             .saturating_add_signed(delta.tokens.cache_write);
     }
 
-    /// Apply a whole [`UsageDelta`] (requests + every model row), flooring at 0.
+    /// Apply a whole [`UsageDelta`] (admission requests + billable requests + every model row),
+    /// flooring at 0.
     pub fn apply_delta(&mut self, delta: &UsageDelta) {
         self.requests = self.requests.saturating_add_signed(delta.requests);
+        self.billable_requests = self
+            .billable_requests
+            .saturating_add_signed(delta.billable_requests);
         for m in &delta.models {
             self.apply_model_delta(m);
         }
@@ -266,14 +282,20 @@ pub struct ModelTokensDelta {
 /// derives spend locally from its own rate card.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageDelta {
+    /// Signed delta of the admission (never-refunded) request count.
     pub requests: i64,
+    /// Signed delta of the billable (fee-base, refundable) request count.
+    #[serde(default)]
+    pub billable_requests: i64,
     pub models: Vec<ModelTokensDelta>,
 }
 
 impl UsageDelta {
-    /// Nothing to flush (requests delta zero and every model delta zero).
+    /// Nothing to flush (both request deltas zero and every model delta zero).
     pub fn is_zero(&self) -> bool {
-        self.requests == 0 && self.models.iter().all(|m| m.tokens.is_zero())
+        self.requests == 0
+            && self.billable_requests == 0
+            && self.models.iter().all(|m| m.tokens.is_zero())
     }
 }
 
@@ -525,16 +547,29 @@ mod tests {
             id: "vk_1".to_string(),
             key_hash: "deadbeefdeadbeef".to_string(),
             name: "test".to_string(),
-            allowed_pools: vec!["p".to_string()],
-            max_budget_cents: Some(100),
-            budget_period: "total".to_string(),
-            rpm_limit: Some(60),
-            tpm_limit: None,
+            allowed_pools: Some(vec!["p".to_string()]),
             enabled: true,
             created_at: 42,
-            budget_group: Some("growth".to_string()),
+            group: Some("growth".to_string()),
             labels: std::collections::BTreeMap::from([("team".to_string(), "growth".to_string())]),
         }
+    }
+
+    /// C6 pool-grant semantics on the runtime encoding: omitted (`None`) = ALL pools; an explicit
+    /// list is exhaustive; an explicit EMPTY list is NO pools (never "all").
+    #[test]
+    fn pool_allowed_c6_semantics() {
+        let mut k = sample_key();
+        k.allowed_pools = None;
+        assert!(k.pool_allowed("anything"), "omitted = all pools");
+        k.allowed_pools = Some(vec!["fast".to_string()]);
+        assert!(k.pool_allowed("fast"));
+        assert!(!k.pool_allowed("cold"));
+        k.allowed_pools = Some(Vec::new());
+        assert!(
+            !k.pool_allowed("fast"),
+            "an explicit [] is the EMPTY set - no pools, never all"
+        );
     }
 
     /// REGRESSION (P2): the redacting `Debug` - the guard for the structured-logging surface, since
@@ -607,16 +642,15 @@ mod tests {
         assert_eq!(cred, back);
     }
 
-    /// A persisted `VirtualKey` row written BEFORE the cost model (no `budget_group` / `labels`
-    /// fields in its JSON) still deserializes - the new fields default. Guards the redis-style
-    /// JSON persistence across the 1.5.0 schema growth.
+    /// The minimal pure-auth JSON round-trips, and the optional fields default: a row with no
+    /// `allowed_pools` / `group` / `labels` deserializes to all-pools / no-group / no labels.
+    /// Guards the redis-style JSON persistence for the 1.5.0 pure-auth key shape.
     #[test]
-    fn virtual_key_pre_cost_model_json_still_deserializes() {
-        let old = r#"{"id":"vk_1","key_hash":"h","name":"n","allowed_pools":[],
-            "max_budget_cents":null,"budget_period":"total","rpm_limit":null,"tpm_limit":null,
-            "enabled":true,"created_at":1}"#;
-        let k: VirtualKey = serde_json::from_str(old).unwrap();
-        assert_eq!(k.budget_group, None);
+    fn virtual_key_minimal_json_defaults_optionals() {
+        let minimal = r#"{"id":"vk_1","key_hash":"h","name":"n","enabled":true,"created_at":1}"#;
+        let k: VirtualKey = serde_json::from_str(minimal).unwrap();
+        assert_eq!(k.allowed_pools, None, "absent grant = all pools");
+        assert_eq!(k.group, None);
         assert!(k.labels.is_empty());
     }
 
@@ -627,6 +661,7 @@ mod tests {
         let mut l = UsageLedger::default();
         l.apply_delta(&UsageDelta {
             requests: 2,
+            billable_requests: 2,
             models: vec![ModelTokensDelta {
                 model: "gpt-5".to_string(),
                 tokens: TierTokensDelta {
@@ -648,6 +683,7 @@ mod tests {
         // A second model materializes its own row; the first is untouched.
         l.apply_delta(&UsageDelta {
             requests: 1,
+            billable_requests: 1,
             models: vec![ModelTokensDelta {
                 model: "haiku".to_string(),
                 tokens: TierTokensDelta {
@@ -664,6 +700,7 @@ mod tests {
         // Over-refund floors at 0, never negative.
         l.apply_delta(&UsageDelta {
             requests: -10,
+            billable_requests: -10,
             models: vec![ModelTokensDelta {
                 model: "haiku".to_string(),
                 tokens: TierTokensDelta {
@@ -723,6 +760,7 @@ mod tests {
         let s = Double::default();
         let d = UsageDelta {
             requests: 1,
+            billable_requests: 1,
             models: vec![ModelTokensDelta {
                 model: "m".to_string(),
                 tokens: TierTokensDelta {
