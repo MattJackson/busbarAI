@@ -110,6 +110,36 @@ fn group_prefixed_principal_id_cannot_alias_a_budget_group_bucket() {
     bare.groups = vec!["eng".to_string()];
     assert!(synthesize_principal_key(&bare, &gm).is_none());
 }
+
+/// REGRESSION (vk_ alias hardening): a principal whose id starts with `vk_` must NEVER get a
+/// synthetic key. A real virtual key's id is `vk_<16 hex>` and IS its ledger/rate bucket id, so an
+/// IdP-supplied subject shaped `vk_<...>` would alias a real virtual key's ledger + rate bucket
+/// (charging/reading it, or riding its rate window). Fail closed like the `group:` guard.
+#[test]
+fn vk_prefixed_principal_id_cannot_alias_a_virtual_key_bucket() {
+    use crate::config::GroupMapEntry;
+    let mut gm = std::collections::HashMap::new();
+    gm.insert(
+        "eng".to_string(),
+        GroupMapEntry {
+            allowed_pools: Some(vec![]),
+            ..Default::default()
+        },
+    );
+
+    // A `vk_`-shaped id (the exact shape of a real minted virtual key) must produce NO key.
+    let mut evil = crate::auth::Principal::from_id("vk_deadbeefdeadbeef");
+    evil.groups = vec!["eng".to_string()];
+    assert!(
+        synthesize_principal_key(&evil, &gm).is_none(),
+        "a vk_-prefixed principal id must be refused, never keyed into a virtual key's bucket"
+    );
+
+    // The bare prefix is equally reserved.
+    let mut bare = crate::auth::Principal::from_id("vk_");
+    bare.groups = vec!["eng".to_string()];
+    assert!(synthesize_principal_key(&bare, &gm).is_none());
+}
 use super::*;
 
 fn sample_key(id: &str, hash: &str) -> VirtualKey {

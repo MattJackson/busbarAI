@@ -373,11 +373,17 @@ pub(crate) fn synthesize_principal_key(
     // principal id (attacker-influenced at the IdP) literally starting with `group:` would alias a
     // budget group's cell - charging it, reading it, and corrupting group enforcement. Fail closed:
     // such a principal gets NO synthetic key (no data-plane access), never a colliding bucket.
-    if principal.id.starts_with(crate::cost::GROUP_BUCKET_PREFIX) {
+    //
+    // The SAME hazard applies to the `vk_` prefix: a real virtual key's id is `vk_<16 hex>` and is
+    // its ledger/rate bucket id. An IdP subject shaped `vk_<...>` would alias a real virtual key's
+    // ledger + rate bucket (charging/reading it, or riding its rate window). Reserve `vk_` too.
+    if principal.id.starts_with(crate::cost::GROUP_BUCKET_PREFIX)
+        || principal.id.starts_with(VK_ID_PREFIX)
+    {
         tracing::warn!(
             principal = %principal.id,
-            "refusing to synthesize a governance key: principal id collides with the reserved \
-             budget-group bucket namespace (group:)"
+            "refusing to synthesize a governance key: principal id collides with a reserved bucket \
+             namespace (group: or vk_)"
         );
         return None;
     }
