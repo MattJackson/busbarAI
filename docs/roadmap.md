@@ -77,6 +77,26 @@ the next **auth adapters** on a seam that already exists.
   benches it for the others. Concurrency and `max_requests` budget stay shared
   (one upstream); a successful health probe recovers the lane in every pool.
 
+## Shipped in 1.5
+
+- **The cost model: tokens are the ledger, dollars are derived.** Governance accumulates a
+  per-(bucket, window, model, tier) token ledger; every spend figure is computed at read time from
+  that ledger and `governance.rate_card` (per-model, per-tier micro-unit rates in an abstract cost
+  unit). Nothing dollar-shaped is stored, so correcting a rate is a config edit and reload, not a
+  re-billing. The old flat `governance.price_per_1k_tokens_cents` is gone; `rate_card` is the only
+  token-pricing mechanism, with `price_per_request_cents` as a separate flat per-call fee.
+- **Budget groups (`governance.budget_groups`).** Nestable enforcement buckets above the per-key
+  budget. A key binds one with the mint field `budget_group`; admission walks the whole chain
+  most-restrictively and the 429 names the exhausted bucket. Mint-time key `labels` ride onto the
+  Prometheus series so external dashboards break spend down by any operator dimension.
+- **Governance is always on.** The `governance.enabled` switch is removed. Governance is always
+  present and simply inert until an admin token is set and keys are minted, so a default deploy
+  behaves as "off" did with the same RAM. The durable store is a choice via `governance.store`.
+- **Dynamic plugins.** Store, auth, and hook backends can load from a signed `.tar.gz` at boot over
+  a versioned C ABI, gated by the `plugins.*` block (off by default, ed25519 signature verification
+  against the embedded release key, explicit opt-ins for unsigned or third-party). The default
+  binary is leaner for it: the SQLite store now ships as a droppable plugin rather than compiled in.
+
 ## Post-1.0 roadmap
 
 ### Auth adapters for enterprise backends
