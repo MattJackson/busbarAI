@@ -206,6 +206,22 @@ pub(crate) struct App {
     /// base hook is a 409 (edit the file, don't shadow it); API-registered (overlay) hooks replace
     /// freely. Immutable after boot.
     pub(crate) base_hook_names: std::collections::HashSet<String>,
+    /// The raw `groups:` registry (name → definition) as the EFFECTIVE config resolves it (base +
+    /// overlay), for the Admin API v1 groups READ + MUTATION surface (`GET/POST/PUT/DELETE
+    /// /api/v1/admin/groups`). This is the source-of-truth `GroupCfg` map — distinct from the LOSSY
+    /// projection in `cost.groups()` (which buckets limits per window and drops `child_default`).
+    /// A group mutation swaps a new `App` snapshot (clone → mutate this map → re-validate → rebuild
+    /// `cost` via `CostModel::with_groups`), never mutating in place. Empty when none configured.
+    // Read by the Phase 1 groups-CRUD read + mutation handlers (task #100); carried here first.
+    #[allow(dead_code)]
+    pub(crate) groups_registry: std::collections::BTreeMap<String, crate::config::GroupCfg>,
+    /// Group names defined in the BASE config file (pre-overlay). A `PUT`/`DELETE` on a base group is
+    /// a 409 (edit config.yaml — the API cannot silently shadow or subtract operator file config, and
+    /// the additive overlay can't durably remove a base group); API-created (overlay) groups mutate
+    /// freely. Immutable after boot — mirrors `base_hook_names`.
+    // Read by the Phase 1 groups-CRUD PUT/DELETE base-shadow guard (task #100); carried here first.
+    #[allow(dead_code)]
+    pub(crate) base_group_names: std::collections::HashSet<String>,
     /// Per-principal ADMIN MUTATION rate limiter (§6.6). Arc-shared across apply snapshots so the
     /// windows survive every swap.
     pub(crate) mutation_limiter: Arc<crate::admin::rate::MutationLimiter>,

@@ -677,9 +677,11 @@ async fn run() {
     // build_app_from_config — the one construction path).
     let mut cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
-    // The BASE hook names (config-defined, pre-overlay): the admin API refuses to PUT-replace one.
+    // The BASE hook + group names (config-defined, pre-overlay): the admin API refuses to
+    // PUT-replace / DELETE one (edit config.yaml — the overlay can't durably shadow file config).
     let base_hook_names: std::collections::HashSet<String> = cfg.hooks.keys().cloned().collect();
-    // Merge the persisted overlay (API-registered hooks) onto the RESOLVED registry.
+    let base_group_names: std::collections::HashSet<String> = cfg.groups.keys().cloned().collect();
+    // Merge the persisted overlay (API-registered hooks + groups) onto the RESOLVED registry.
     if let Some(doc) = overlay_doc {
         config::overlay::merge_into(&mut cfg, doc);
     }
@@ -716,6 +718,7 @@ async fn run() {
             plugins_cfg,
             overlay_path,
             base_hook_names,
+            base_group_names,
             (Some(config_path.clone()), Some(providers_path.clone())),
             None,
         )
@@ -1704,6 +1707,7 @@ pub(crate) fn build_app_from_config(
     plugins_cfg: config::PluginsCfg,
     overlay_path: Option<std::path::PathBuf>,
     base_hook_names: std::collections::HashSet<String>,
+    base_group_names: std::collections::HashSet<String>,
     config_paths: (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
     prior: Option<&state::App>,
 ) -> Result<state::App, String> {
@@ -2383,6 +2387,8 @@ pub(crate) fn build_app_from_config(
         global_gates,
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
+        groups_registry: cfg.groups.clone(),
+        base_group_names,
         // History + rate windows are Arc-shared across applies (process-lifetime state).
         versions: prior.map_or_else(
             || Arc::new(admin::versions::VersionLog::new()),

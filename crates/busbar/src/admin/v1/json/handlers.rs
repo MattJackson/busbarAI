@@ -1004,10 +1004,12 @@ pub(crate) async fn reload_config(
     .and_then(|loaded| {
         let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
             .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
-        // Base hook names = the config-defined registry, pre-overlay (the admin API refuses to
-        // PUT-replace one); then merge the persisted overlay onto the resolved registry.
+        // Base hook + group names = the config-defined registry, pre-overlay (the admin API refuses
+        // to PUT-replace / DELETE one); then merge the persisted overlay onto the resolved registry.
         let base_hook_names: std::collections::HashSet<String> =
             cfg.hooks.keys().cloned().collect();
+        let base_group_names: std::collections::HashSet<String> =
+            cfg.groups.keys().cloned().collect();
         if let Some(doc) = loaded.overlay_doc {
             crate::config::overlay::merge_into(&mut cfg, doc);
         }
@@ -1016,6 +1018,7 @@ pub(crate) async fn reload_config(
             loaded.deploy.plugins.clone(),
             loaded.overlay_path,
             base_hook_names,
+            base_group_names,
             (Some(config_path), Some(providers_path)),
             Some(&current),
         )
@@ -1109,14 +1112,17 @@ pub(crate) async fn apply_config(
     let outcome = crate::config::resolve(&req.config, &req.providers)
         .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))
         .and_then(|cfg| {
-            // Base hook names = the applied config's own (synthesized) registry.
+            // Base hook + group names = the applied config's own (synthesized) registry.
             let base_hook_names: std::collections::HashSet<String> =
                 cfg.hooks.keys().cloned().collect();
+            let base_group_names: std::collections::HashSet<String> =
+                cfg.groups.keys().cloned().collect();
             crate::build_app_from_config(
                 cfg,
                 req.config.plugins.clone(),
                 current.overlay_path.clone(),
                 base_hook_names,
+                base_group_names,
                 (current.config_path.clone(), current.providers_path.clone()),
                 Some(&current),
             )

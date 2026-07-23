@@ -208,6 +208,40 @@ impl CostModel {
                 .map(|(model, r)| (model.clone(), RateNanos::from_cfg(r)))
                 .collect::<HashMap<String, RateNanos>>()
         });
+        let (groups, group_idx) = Self::project_groups(groups_cfg);
+        Self {
+            rates,
+            groups,
+            group_idx,
+            price_per_request_cents: per_request_fee.max(0),
+        }
+    }
+
+    /// Rebuild the model with a NEW groups map, reusing the resolved rate card + flat fee unchanged.
+    /// The Admin-API group-mutation seam (`build_with_group` / `build_without_group`): a runtime
+    /// group change must reproject enforcement buckets WITHOUT re-parsing the rate card (which the
+    /// mutation never touched). Pure — assumes the caller already re-ran `validate_groups`.
+    // Wired by the Phase 1 groups-CRUD handler (task #100); staged ahead of its caller.
+    #[allow(dead_code)]
+    pub(crate) fn with_groups(
+        &self,
+        groups_cfg: &std::collections::BTreeMap<String, crate::config::GroupCfg>,
+    ) -> Self {
+        let (groups, group_idx) = Self::project_groups(groups_cfg);
+        Self {
+            rates: self.rates.clone(),
+            groups,
+            group_idx,
+            price_per_request_cents: self.price_per_request_cents,
+        }
+    }
+
+    /// Project a `GroupCfg` map into the runtime enforcement form: sorted `GroupRuntime` vec + a
+    /// name→index map (parents resolved to indices). Shared verbatim by `resolve_parts` (boot/apply)
+    /// and `with_groups` (runtime group mutation) so the two paths can never drift.
+    fn project_groups(
+        groups_cfg: &std::collections::BTreeMap<String, crate::config::GroupCfg>,
+    ) -> (Vec<GroupRuntime>, HashMap<String, usize>) {
         let mut group_names: Vec<&String> = groups_cfg.keys().collect();
         group_names.sort();
         let group_idx: HashMap<String, usize> = group_names
@@ -279,12 +313,7 @@ impl CostModel {
                 }
             })
             .collect();
-        Self {
-            rates,
-            groups,
-            group_idx,
-            price_per_request_cents: per_request_fee.max(0),
-        }
+        (groups, group_idx)
     }
 
     /// A minimal model for tests / governance-off paths: no card, no groups, the given flat fee.
