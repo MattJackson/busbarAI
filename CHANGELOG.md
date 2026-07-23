@@ -11,6 +11,9 @@ item under **Changed**.
 
 ## [Unreleased]
 
+
+## [1.5.0], 2026-07-20
+
 ### Added
 
 - **The 1.5.0 cost model: tokens are the ledger, dollars are derived.** The governance store now
@@ -64,9 +67,9 @@ item under **Changed**.
   from `key_id` to `bucket_id` (key buckets and budget-group buckets share the machinery) and
   carry NO dollar field. `add_usage` ships per-(model, tier) signed token deltas (the
   fleet-additive cross-node flush; each node derives spend locally from its own rate card). The
-  store plugin ABI bumps to v2; sqlite (`PRAGMA user_version`), postgres (`busbar_schema`), and
-  redis (`busbar:schema`) stamp schema v2 and DROP a pre-v2 dev schema on open (1.5.0 is
-  unreleased: a bump, not a migration).
+  store plugin ABI is v2; sqlite (`PRAGMA user_version`), postgres (`busbar_schema`), and
+  redis (`busbar:schema`) stamp schema v2 and DROP a pre-v2 dev schema on open (there was no
+  earlier stable cost-model schema to migrate from).
 - **`VirtualKey` grows `budget_group` + `labels`** (serde-defaulted; pre-cost-model persisted rows
   keep deserializing).
 - **Admin usage reads derive per model.** `GET /usage` prices each metering row at the current
@@ -76,22 +79,6 @@ item under **Changed**.
   derived-from-the-rate-card (not "token-accurate" flat pricing); budget scoping is per-key /
   per-budget-group (not "per team"); the governance store default is documented as in-memory (not
   SQLite); the budget hard cap carries the per-node fleet caveat everywhere it is described.
-
-### Removed
-
-- **`governance.price_per_1k_tokens_cents`.** The flat blended token price is gone;
-  `governance.rate_card` is the ONLY token-pricing mechanism (`price_per_request_cents` stays -
-  the flat per-call surcharge, charged pre-forward at admission). **Migration:** delete the key
-  (a stale key is a loud unknown-field boot error) and, to keep pricing tokens, add a `rate_card`
-  entry per configured model; a former `price_per_1k_tokens_cents: N` is equivalent to
-  `input_utok/output_utok/cache_read_utok/cache_write_utok: N * 10` (N cents per 1k tokens =
-  10 N micro-units per token) on every tier.
-
-
-## [1.5.0], 2026-07-20
-
-### Changed
-
 - **Governance is now always available; `governance.enabled` is removed.** Governance no longer has an
   on/off switch. It is always present and simply INERT until an admin token is set and virtual keys are
   minted (a default deploy with no admin token behaves exactly as "off" did, with identical RAM). The
@@ -200,6 +187,13 @@ item under **Changed**.
 
 ### Removed
 
+- **`governance.price_per_1k_tokens_cents`.** The flat blended token price is gone;
+  `governance.rate_card` is the ONLY token-pricing mechanism (`price_per_request_cents` stays -
+  the flat per-call surcharge, charged pre-forward at admission). **Migration:** delete the key
+  (a stale key is a loud unknown-field boot error) and, to keep pricing tokens, add a `rate_card`
+  entry per configured model; a former `price_per_1k_tokens_cents: N` is equivalent to
+  `input_utok/output_utok/cache_read_utok/cache_write_utok: N * 10` (N cents per 1k tokens =
+  10 N micro-units per token) on every tier.
 - **`governance.budget_on_store_error`**: obsolete (see **Migration** under **Changed**): in-memory
   admission cannot incur a store error, so the fail-open/closed knob no longer has a failure to govern.
 
