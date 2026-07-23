@@ -62,7 +62,7 @@ Name a **selection strategy** in the pool's `hooks:` list and it decides the ord
 | `usage` | the most rate-limit headroom. |
 | an **ordering gate hook** | the order your own compiled socket hook or HTTPS webhook returns (a `kind: gate` replying with the `order` arm). |
 
-A pool names at most one strategy plus any number of gates in one `hooks: [...]` list, e.g. `hooks: [cheapest, pii-guard]`. External ordering logic is a hook, not a pool key: the pre-1.3 `route:` / `policy:` / `route: script` (embedded Rhai) keys were **removed** and are now hard startup errors (see [Migrating to 1.3](migration-1.3.md)). Every strategy and the ordering-hook contract live in the [Routing guide](routing.md) and the [Hooks guide](/docs/hooks/). The rest of this page is about pool *structure*: members, weights, failover, and affinity.
+A pool names at most one strategy plus any number of gates in one `hooks: [...]` list, e.g. `hooks: [cheapest, pii-guard]`. External ordering logic is a hook, not a pool key: the pre-1.3 `route:` / `policy:` / `route: script` (embedded Rhai) keys were **removed** and are now hard startup errors (see [Migrating to 1.3](migration-1.3.md)). Every strategy and the ordering-hook contract live in the [Hooks guide](hooks.md) and the pool-hooks reference in [Configuration](configuration.md#pool-hooks-ordering-and-gates). The rest of this page is about pool *structure*: members, weights, failover, and affinity.
 
 ## Config reference
 
@@ -74,7 +74,7 @@ A pool names at most one strategy plus any number of gates in one `hooks: [...]`
 | `hooks` | list | `[]` | This pool's ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`, at most one) plus any gates, referenced by name from the top-level `hooks:` registry. |
 | `affinity` | object | none | `mode: session` pins a session to a lane by `header_name` (default `x-session-id`). |
 
-See the [Routing guide](routing.md) for every selection strategy and the ordering-hook contract, the [Hooks guide](/docs/hooks/) for the full hook model, [Circuit breaker](/docs/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/docs/failover/) for `failover` and `on_exhausted`.
+See the [Hooks guide](/docs/hooks/) for every selection strategy, the ordering-hook contract, and the full hook model, [Circuit breaker](/docs/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/docs/failover/) for `failover` and `on_exhausted`.
 
 **Member fields**
 
@@ -87,7 +87,7 @@ See the [Routing guide](routing.md) for every selection strategy and the orderin
 | `cost_per_mtok` | float | none | Cost per million tokens; drives the `cheapest` policy. |
 | `tags` | list | `[]` | Free-form labels read by ordering/gate hooks. |
 
-`tier`, `cost_per_mtok`, and `tags` are consumed by the selection strategies and ordering hooks; see [Routing](routing.md#the-routing-signals) for the full signal set each receives.
+`tier`, `cost_per_mtok`, and `tags` are consumed by the selection strategies and ordering hooks; see [What a gate receives](hooks.md#what-a-gate-receives) for the full signal set each candidate carries.
 
 ## Multi-protocol pools
 
@@ -146,6 +146,6 @@ pools:
 
 ### Cost-, latency-, and custom-based routing
 
-Choosing *which* member serves a request (cheapest, fastest, least busy, or your own webhook/socket gate hook returning an `order`) is a routing concern, not a pool-shape one: a pool names its selection strategy plus any gates in one `hooks: [...]` list. Those recipes, with full worked examples, live in the [Routing guide](routing.md#full-examples).
+Choosing *which* member serves a request (cheapest, fastest, least busy, or your own webhook/socket gate hook returning an `order`) is a routing concern, not a pool-shape one: a pool names its selection strategy plus any gates in one `hooks: [...]` list. Those recipes, with a worked pool example, live in the [Hooks guide](hooks.md) and the [pool-hooks reference](configuration.md#pool-hooks-ordering-and-gates).
 
-See the [Routing guide](routing.md) for the full ordering-hook contract and the signals each strategy and gate hook receives, and [Circuit breaker](/docs/circuit-breaker/) / [In-flight failover](/docs/failover/) for how the breaker and failover behave once a strategy or gate hook has chosen an order.
+See the [Hooks guide](hooks.md) for the full ordering-hook contract and the signals each strategy and gate hook receives, and [Circuit breaker](/docs/circuit-breaker/) / [In-flight failover](/docs/failover/) for how the breaker and failover behave once a strategy or gate hook has chosen an order.

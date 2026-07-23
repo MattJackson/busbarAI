@@ -5,7 +5,7 @@ Busbar keeps serving through provider failures. That reliability is not one feat
 **Structure**: how you describe your backends ([Core concepts](/docs/pools/)):
 
 - **[Pools](/docs/pools/)** - group backends into one named target with weighting and automatic failover.
-- **[Routing policies](/docs/routing/)** - choose which member serves each request: cheapest, fastest, least busy, or your own logic.
+- **[Routing hooks](/docs/hooks/)** - choose which member serves each request: cheapest, fastest, least busy, or your own logic.
 
 **Resilience**: what happens when a backend misbehaves (the guides in this section):
 
@@ -130,7 +130,7 @@ governance:
 Then mint a key bound to it, with a label for external reporting:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/admin/keys \
+curl -s -X POST http://localhost:8081/api/v1/admin/keys \
   -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{

@@ -218,13 +218,13 @@ All hook mutations honor `If-Match` against the config-plane ETag, are audited (
 # Register a global compression gate — live immediately
 curl -s -X POST -H "x-admin-token: $TOK" -H 'content-type: application/json' \
   --data '{"name":"compress","config":{"kind":"gate","webhook":"http://127.0.0.1:8900/","prompt":"rw","global":true}}' \
-  http://localhost:8080/api/v1/admin/hooks
+  http://localhost:8081/api/v1/admin/hooks
 
 # Is it running what we pushed? (desired vs reported, with a drift verdict)
-curl -s -H "x-admin-token: $TOK" http://localhost:8080/api/v1/admin/hooks/compress/status
+curl -s -H "x-admin-token: $TOK" http://localhost:8081/api/v1/admin/hooks/compress/status
 
 # Remove it
-curl -s -X DELETE -H "x-admin-token: $TOK" http://localhost:8080/api/v1/admin/hooks/compress
+curl -s -X DELETE -H "x-admin-token: $TOK" http://localhost:8081/api/v1/admin/hooks/compress
 ```
 
 ## Dynamic plugins: install, list, remove, reload
@@ -279,19 +279,19 @@ curl -s -X DELETE -H "x-admin-token: $TOK" \
 
 ```bash
 # What am I running, and which plugins are compiled in?
-curl -s -H "x-admin-token: $TOK" http://localhost:8080/api/v1/admin/info
+curl -s -H "x-admin-token: $TOK" http://localhost:8081/api/v1/admin/info
 
 # The whole topology with live health, in one call
-curl -s -H "x-admin-token: $TOK" 'http://localhost:8080/api/v1/admin/pools?detail=true'
+curl -s -H "x-admin-token: $TOK" 'http://localhost:8081/api/v1/admin/pools?detail=true'
 
 # Preview a config change without applying it
 curl -s -X POST -H "x-admin-token: $TOK" -H 'content-type: application/json' \
-  --data @proposed.json http://localhost:8080/api/v1/admin/config/validate
+  --data @proposed.json http://localhost:8081/api/v1/admin/config/validate
 
 # Guarded apply: read the config ETag, then chain it
-ETAG=$(curl -sI -H "x-admin-token: $TOK" http://localhost:8080/api/v1/admin/config | grep -i ^etag | cut -d' ' -f2)
+ETAG=$(curl -sI -H "x-admin-token: $TOK" http://localhost:8081/api/v1/admin/config | grep -i ^etag | cut -d' ' -f2)
 curl -s -X POST -H "x-admin-token: $TOK" -H "If-Match: $ETAG" -H 'content-type: application/json' \
-  --data @proposed.json http://localhost:8080/api/v1/admin/config/apply
+  --data @proposed.json http://localhost:8081/api/v1/admin/config/apply
 ```
 
 ---
