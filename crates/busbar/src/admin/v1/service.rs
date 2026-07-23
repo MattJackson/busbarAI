@@ -1011,6 +1011,7 @@ impl AdminService {
         let empty = || UsageView {
             window,
             as_of: now,
+            currency: (),
             total: UsageBreakdown::default(),
             by_model: Vec::new(),
             by_key: Vec::new(),
@@ -1128,6 +1129,7 @@ impl AdminService {
         Ok(UsageView {
             window,
             as_of: now,
+            currency: (),
             total,
             by_model,
             by_key,

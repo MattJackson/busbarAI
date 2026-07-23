@@ -1023,7 +1023,7 @@
             "type": "integer"
           },
           "spend_micros": {
-            "description": "Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,\nsub-cent precise, no float drift), from the operator's configured global prices. A consumer\nwith its own per-model catalog recomputes from the raw token split instead.",
+            "description": "Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -\ninteger math, sub-cent precise, no float drift), recomputed at read time from the raw token\nsplit x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate\ncard's numbers are whatever unit the operator priced in; display/denomination is entirely\nthe consumer's concern. A consumer with its own per-model catalog recomputes from the raw\ntoken split instead.",
             "format": "int64",
             "type": "integer"
           },
@@ -1139,7 +1139,7 @@
             "type": "integer"
           },
           "spend_micros": {
-            "description": "Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,\nsub-cent precise, no float drift), from the operator's configured global prices. A consumer\nwith its own per-model catalog recomputes from the raw token split instead.",
+            "description": "Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -\ninteger math, sub-cent precise, no float drift), recomputed at read time from the raw token\nsplit x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate\ncard's numbers are whatever unit the operator priced in; display/denomination is entirely\nthe consumer's concern. A consumer with its own per-model catalog recomputes from the raw\ntoken split instead.",
             "format": "int64",
             "type": "integer"
           },
@@ -1719,7 +1719,7 @@
             "type": "integer"
           },
           "spend_micros": {
-            "description": "Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,\nsub-cent precise, no float drift), from the operator's configured global prices. A consumer\nwith its own per-model catalog recomputes from the raw token split instead.",
+            "description": "Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -\ninteger math, sub-cent precise, no float drift), recomputed at read time from the raw token\nsplit x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate\ncard's numbers are whatever unit the operator priced in; display/denomination is entirely\nthe consumer's concern. A consumer with its own per-model catalog recomputes from the raw\ntoken split instead.",
             "format": "int64",
             "type": "integer"
           },
@@ -1756,7 +1756,6 @@
         "type": "object"
       },
       "UsageView": {
-        "description": "Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle:\nbusbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token\nSPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer\nwith its own (special/negotiated) price catalog reconstructs cost independently; `spend_micros`\nis busbar's DERIVED estimate from the operator's configured global prices, computed at read time\n(raw counts are what's stored — a price change re-prices history consistently).\n\nTime base — THE PINNED SHAPE RULING (external review R3 #1): a usage response is ALWAYS exactly\nONE fixed UTC-day metering bucket (`window`). `?window=<bucket-start-epoch>` selects a PAST\nbucket (default: the current one); a multi-window series is the CLIENT fetching N buckets — or\na future additive `?from=&to=` returning an ARRAY OF THIS SAME PER-BUCKET SHAPE, never a\ndifferently-shaped merged view. Billing periods aggregate client-side from day buckets (raw\ncounts are stored, so the math is exact). Deliberately decoupled from per-key budget windows so\nper-model aggregation across keys is well-defined; budget ENFORCEMENT state lives on\n`GET /keys/{id}/usage`, not here. Empty aggregations when governance is disabled. No secrets —\nkey ids/names only, never a token.\n\nLEDGER RULE (one loud contract sentence): `spend_micros` is a MUTABLE ESTIMATE — derived at\nread time from the operator's CURRENT prices, so a price change re-prices history. Never store\nit as a ledger charge; bill from the raw token split.",
         "properties": {
           "as_of": {
             "description": "Freshness marker: the epoch this read was computed at (counters accumulate live).",
@@ -1783,7 +1782,7 @@
             "type": "array"
           },
           "currency": {
-            "description": "The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`).",
+            "description": "The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`, currently\n`\"USD\"`). A single-const source of truth so removal is one line. Emitted only here.",
             "type": "string"
           },
           "others": {

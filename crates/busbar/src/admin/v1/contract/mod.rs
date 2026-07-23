@@ -657,6 +657,17 @@ pub(crate) struct EffectiveConfigView {
 /// LEDGER RULE (one loud contract sentence): `spend_micros` is a MUTABLE ESTIMATE — derived at
 /// read time from the operator's CURRENT prices, so a price change re-prices history. Never store
 /// it as a ledger charge; bill from the raw token split.
+/// The denomination reported alongside every `spend_micros` in the admin usage response. A SINGLE
+/// source of truth so a future removal (returning to the currency-agnostic stance) is one line.
+/// Emitted ONLY on `GET /api/v1/admin/usage` (the `currency` field of `UsageView`), never on the
+/// per-key views — those stay currency-agnostic raw-split ledgers.
+pub(crate) const USAGE_CURRENCY: &str = "USD";
+
+/// Serialize helper: `UsageView::currency` is a fixed contract constant, not a stored field.
+fn serialize_usage_currency<S: serde::Serializer>(_: &(), s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(USAGE_CURRENCY)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct UsageView {
@@ -664,6 +675,11 @@ pub(crate) struct UsageView {
     pub(crate) window: UsageWindow,
     /// Freshness marker: the epoch this read was computed at (counters accumulate live).
     pub(crate) as_of: u64,
+    /// The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`, currently
+    /// `"USD"`). A single-const source of truth so removal is one line. Emitted only here.
+    #[serde(serialize_with = "serialize_usage_currency")]
+    #[cfg_attr(feature = "openapi-schema", schemars(with = "String"))]
+    pub(crate) currency: (),
     pub(crate) total: UsageBreakdown,
     /// Per-(model, provider) aggregation — cost attribution by model (the FinOps unit).
     pub(crate) by_model: Vec<ModelUsageView>,

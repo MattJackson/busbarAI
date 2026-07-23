@@ -107,3 +107,36 @@ fn admin_error_codes_and_statuses_are_frozen() {
         assert_eq!(e.http_status(), status, "frozen error status changed");
     }
 }
+
+/// F1 CONTRACT: the admin usage response ALWAYS serializes `currency: "USD"`, sourced from the
+/// single `USAGE_CURRENCY` const (so a future removal is one line). Emitted ONLY on `UsageView`
+/// (the `GET /api/v1/admin/usage` surface) — the per-key/per-model ledger views stay
+/// currency-agnostic. Regression: the audit/cost pass dropped this field, breaking the
+/// contract + the committed openapi.json.
+#[test]
+fn usage_view_serializes_currency_from_const() {
+    let view = UsageView {
+        window: UsageWindow { start: 0, end: 1 },
+        as_of: 0,
+        currency: (),
+        total: UsageBreakdown::default(),
+        by_model: Vec::new(),
+        by_key: Vec::new(),
+        by_key_truncated: false,
+        others: None,
+    };
+    let v: serde_json::Value = serde_json::to_value(&view).expect("serialize UsageView");
+    assert_eq!(
+        v.get("currency").and_then(|c| c.as_str()),
+        Some(USAGE_CURRENCY),
+        "usage response must carry the currency field from the USAGE_CURRENCY const"
+    );
+    assert_eq!(USAGE_CURRENCY, "USD");
+    // The per-model / per-key ledger rows stay currency-agnostic (no currency key).
+    let row = UsageBreakdown::default();
+    let rv: serde_json::Value = serde_json::to_value(row).expect("serialize breakdown");
+    assert!(
+        rv.get("currency").is_none(),
+        "the raw-split ledger breakdown must NOT carry a currency"
+    );
+}
