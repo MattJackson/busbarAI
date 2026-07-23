@@ -351,7 +351,7 @@ the admin API returns `401`.
 ### Creating a key
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/admin/keys \
+curl -s -X POST http://localhost:8081/api/v1/admin/keys \
   -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
   -H "content-type: application/json" \
   -d '{
