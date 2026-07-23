@@ -825,27 +825,46 @@ impl AdminService {
             }
         };
 
-        // ── 4. CONFLICT vs the already-installed loadable set (excluding a same-name overwrite) ──
-        if let Ok(reg) = busbar_plugin_loader::scan_and_validate(&self.app.plugins_dir, &policy) {
-            for existing in reg.loadable() {
-                if existing.file == file {
-                    continue; // overwriting the same tarball file is a legitimate upgrade
-                }
-                let clash = existing.manifest.name == manifest.name
-                    || existing.manifest.alias == manifest.alias
-                    || existing.manifest.name == manifest.alias
-                    || existing.manifest.alias == manifest.name;
-                if clash && existing.manifest.name != manifest.name {
-                    return Err(AdminError::Conflict(format!(
-                        "plugin name/alias conflict: uploaded '{}' (alias '{}') collides with \
-                         installed '{}' (alias '{}', file {})",
-                        manifest.name,
-                        manifest.alias,
-                        existing.manifest.name,
-                        existing.manifest.alias,
-                        existing.file
-                    )));
-                }
+        // ── 4. CONFLICT vs the already-installed loadable set ──
+        // M7 (fail-open): a corrupt tarball already in the plugins dir makes scan_and_validate Err.
+        // The old `if let Ok(reg)` SILENTLY SKIPPED the conflict check and published anyway. Propagate
+        // it as a Conflict so we never admit a plugin whose conflict status we could not determine.
+        let reg = busbar_plugin_loader::scan_and_validate(&self.app.plugins_dir, &policy).map_err(
+            |errors| {
+                AdminError::Conflict(format!(
+                    "cannot validate the installed plugin set before publishing (fix or remove the \
+                     offending tarball first): {}",
+                    errors.join("; ")
+                ))
+            },
+        )?;
+        for existing in reg.loadable() {
+            if existing.file == file {
+                continue; // overwriting the same tarball file is a legitimate upgrade
+            }
+            let clash = existing.manifest.name == manifest.name
+                || existing.manifest.alias == manifest.alias
+                || existing.manifest.name == manifest.alias
+                || existing.manifest.alias == manifest.name;
+            // H2 (bricks next boot): the old gate exempted a SAME-NAME upload under a DIFFERENT
+            // filename (`&& existing.manifest.name != manifest.name`). But boot's phase-3
+            // conflicts() hard-rejects two loadable plugins with the same name (different files) -
+            // admitting one BRICKS the next restart. Reject it here (409) so we never publish a
+            // state boot will refuse: a same-name upgrade must REUSE the existing filename (which
+            // hits the `existing.file == file` overwrite path above), not add a second file.
+            if clash {
+                return Err(AdminError::Conflict(format!(
+                    "plugin name/alias conflict: uploaded '{}' (alias '{}', file {}) collides with \
+                     installed '{}' (alias '{}', file {}); a same-name upgrade must reuse the \
+                     existing filename, not add a second file (boot would reject two files claiming \
+                     the same plugin name)",
+                    manifest.name,
+                    manifest.alias,
+                    file,
+                    existing.manifest.name,
+                    existing.manifest.alias,
+                    existing.file
+                )));
             }
         }
 

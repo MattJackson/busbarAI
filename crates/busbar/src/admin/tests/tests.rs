@@ -4945,12 +4945,19 @@ async fn serve_with_plugins_dir(
 
 /// Build an UNSIGNED (structurally valid) plugin tarball in memory for the HTTP lifecycle tests.
 fn admin_test_tarball(name: &str, alias: &str) -> Vec<u8> {
-    let lib = b"junk library bytes (never dlopened by the admin surface)";
+    admin_test_tarball_versioned(name, alias, "1.0.0")
+}
+
+/// As `admin_test_tarball`, with an explicit version so a test can build two SAME-NAME tarballs that
+/// differ only in version (and thus filename) - the H2 same-name-different-file case.
+fn admin_test_tarball_versioned(name: &str, alias: &str, version: &str) -> Vec<u8> {
+    let lib = format!("junk library bytes for {name} {version} (never dlopened)").into_bytes();
+    let lib = lib.as_slice();
     let m = busbar_plugin_sign::Manifest {
         name: name.into(),
         alias: alias.into(),
         kind: "store".into(),
-        version: "1.0.0".into(),
+        version: version.into(),
         publisher: "acme".into(),
         abi_version: *busbar_plugin_loader::supported_abi("store")
             .iter()
@@ -5088,6 +5095,115 @@ async fn test_admin_v1_plugin_install_list_reload_remove() {
     assert!(
         actions.contains(&"plugin.remove"),
         "remove audited: {actions:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    handle.abort();
+}
+
+/// H2 (bricks next boot): installing a SAME-NAME plugin under a DIFFERENT filename (e.g. a version
+/// bump `-1.1.0.tar.gz` over an installed `-1.0.0.tar.gz`) must be a 409, NOT admitted. Two files
+/// claiming the same plugin name are a hard conflict at boot (registry::conflicts()) - admitting the
+/// second bricks the next restart. A same-name upgrade must REUSE the existing filename. The old gate
+/// exempted this case (`&& existing.manifest.name != manifest.name`).
+#[tokio::test]
+async fn test_admin_v1_plugin_install_same_name_different_file_is_409() {
+    use base64::Engine as _;
+    crate::metrics::init();
+    let dir = std::env::temp_dir().join(format!("busbar-admin-plugins-h2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, handle) = serve_with_plugins_dir(dir.clone()).await;
+    let client = reqwest::Client::new();
+
+    let install = |file: &'static str, tarball: Vec<u8>| {
+        let client = client.clone();
+        let body = serde_json::json!({
+            "file": file,
+            "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball),
+        });
+        async move {
+            client
+                .post(format!("http://{addr}/api/v1/admin/plugins"))
+                .header("x-admin-token", "admintok")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // v1.0.0 installs cleanly.
+    let v1 = admin_test_tarball_versioned("busbar-store-x", "storex", "1.0.0");
+    let r1 = install("busbar-store-x-1.0.0.tar.gz", v1).await;
+    assert_eq!(r1.status().as_u16(), 201, "first install succeeds");
+
+    // v1.1.0 - SAME manifest name, DIFFERENT filename - must be a 409 (boot would reject two files
+    // claiming the same name), NOT a silent second publish.
+    let v2 = admin_test_tarball_versioned("busbar-store-x", "storex", "1.1.0");
+    let r2 = install("busbar-store-x-1.1.0.tar.gz", v2).await;
+    assert_eq!(
+        r2.status().as_u16(),
+        409,
+        "same-name under a different filename must conflict, not brick the next boot"
+    );
+    let b: serde_json::Value = r2.json().await.unwrap();
+    assert_eq!(b["error"]["code"], "conflict");
+    assert!(
+        !dir.join("busbar-store-x-1.1.0.tar.gz").exists(),
+        "the conflicting second file must NOT be published"
+    );
+    // The original is untouched (still exactly one plugin file on disk).
+    let tars: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".tar.gz"))
+        .collect();
+    assert_eq!(tars.len(), 1, "only the original v1.0.0 file remains");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    handle.abort();
+}
+
+/// M7 (fail-open): a CORRUPT tarball already sitting in the plugins dir makes scan_and_validate Err.
+/// The old `if let Ok(reg)` SILENTLY SKIPPED the conflict check and published anyway. Now a new
+/// install returns an error (never 201) until the offending tarball is fixed/removed.
+#[tokio::test]
+async fn test_admin_v1_plugin_install_corrupt_existing_tarball_blocks_publish() {
+    use base64::Engine as _;
+    crate::metrics::init();
+    let dir = std::env::temp_dir().join(format!("busbar-admin-plugins-m7-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Plant a corrupt (non-tarball) *.tar.gz that discover() picks up but examine() cannot parse.
+    std::fs::write(
+        dir.join("busbar-store-corrupt.tar.gz"),
+        b"not a real tarball",
+    )
+    .unwrap();
+    let (addr, handle) = serve_with_plugins_dir(dir.clone()).await;
+    let client = reqwest::Client::new();
+
+    let good = admin_test_tarball("busbar-store-good", "goodstore");
+    let resp = client
+        .post(format!("http://{addr}/api/v1/admin/plugins"))
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({
+            "file": "busbar-store-good.tar.gz",
+            "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&good),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        resp.status().as_u16(),
+        201,
+        "an unvalidatable installed set must NOT let a new install publish (fail-open closed)"
+    );
+    assert_eq!(resp.status().as_u16(), 409, "surfaced as a conflict");
+    assert!(
+        !dir.join("busbar-store-good.tar.gz").exists(),
+        "nothing published while the installed set is unvalidatable"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
