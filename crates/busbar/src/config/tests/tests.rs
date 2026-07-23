@@ -96,6 +96,27 @@ fn test_legacy_token_key_is_rejected_at_parse() {
     );
 }
 
+/// M8 (deny_unknown_fields gap): `TlsCfg` is now `#[serde(deny_unknown_fields)]`, so a TYPO under
+/// `tls:` (e.g. `client_ca_fil:` for `client_ca_file:`) is REJECTED AT PARSE rather than silently
+/// ignored (which would leave mTLS DISABLED while the operator believes it is on: a security
+/// downgrade with no diagnostic). A correctly-spelled config still parses.
+#[test]
+fn test_tls_typo_is_rejected_at_parse() {
+    // A typo'd mTLS key must fail, not be silently dropped.
+    let bad = "cert_file: /c.pem\nkey_file: /k.pem\nclient_ca_fil: /ca.pem";
+    let err = serde_yaml::from_str::<TlsCfg>(bad)
+        .expect_err("a typo under tls: must be rejected at parse (deny_unknown_fields)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown field") && msg.contains("client_ca_fil"),
+        "expected an unknown-field error naming the typo; got: {msg}"
+    );
+    // The correct spelling still parses and enables mTLS.
+    let good = "cert_file: /c.pem\nkey_file: /k.pem\nclient_ca_file: /ca.pem";
+    let cfg = serde_yaml::from_str::<TlsCfg>(good).expect("well-formed tls config parses");
+    assert_eq!(cfg.client_ca_file.as_deref(), Some("/ca.pem"));
+}
+
 /// 1.0.0 KEY RENAMES — back-compat: every renamed key still loads from its OLD spelling via a
 /// serde alias, and the new spelling loads too. Pins the alias surface so a future field rename
 /// can't silently drop the alias (which would break a deployed pre-1.0 config on upgrade).

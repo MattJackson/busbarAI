@@ -185,7 +185,11 @@ pub(crate) struct RootCfg {
 /// `client_ca_file` is also set, it additionally requires and verifies a client certificate (mTLS).
 /// All three paths are PEM files on the operator's host; they are loaded once at startup and any
 /// load/parse error is fatal (`die`). Key bytes are never logged.
+// deny_unknown_fields (M8): a typo under `tls:` - e.g. `client_ca_fil:` for `client_ca_file:` -
+// would otherwise be SILENTLY IGNORED, leaving mTLS DISABLED while the operator believes it is on
+// (a security downgrade with no diagnostic). Reject any unknown key here so the typo fails boot.
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TlsCfg {
     /// PEM certificate chain, leaf first (e.g. fullchain.pem).
     pub(crate) cert_file: String,
@@ -287,6 +291,7 @@ pub(crate) fn augment_config_error(err: impl std::fmt::Display) -> String {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // M8: a typo'd provider key must fail boot, not be silently ignored.
 pub(crate) struct ProviderCfg {
     #[serde(default = "default_protocol")]
     pub(crate) protocol: String,
@@ -520,7 +525,11 @@ impl<'de> Deserialize<'de> for PoolCfg {
     where
         D: serde::Deserializer<'de>,
     {
+        // M8: deny unknown keys so a typo'd pool key fails boot. The retired keys (policy/hook/route)
+        // are captured as explicit fields below (to emit precise migration errors), so they still
+        // parse here; only a genuinely-unknown key trips deny_unknown_fields.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawPoolCfg {
             #[serde(default)]
             members: Vec<PoolMember>,
@@ -969,6 +978,7 @@ fn default_policy_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M8: a typo'd pool-member key must fail boot, not be silently ignored.
 pub(crate) struct PoolMember {
     pub(crate) target: String,
     #[serde(default = "default_weight")]
@@ -1776,6 +1786,7 @@ pub(crate) struct BudgetGroupCfg {
 
 /// Observability sinks. All fields optional; absent = that sink is disabled.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M8: a typo'd observability key must fail boot, not be silently ignored.
 pub(crate) struct ObservabilityCfg {
     /// OTLP/HTTP traces endpoint (e.g. `http://localhost:4318/v1/traces`). When set, busbar
     /// installs an OpenTelemetry tracer + exports spans.
@@ -1976,6 +1987,7 @@ fn default_probe_timeout_secs() -> u64 {
 /// The `limits:` block — global operational caps. Each field defaults to its historical hardcoded
 /// value, so an absent field (or an absent block) is today's behavior.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M8: a typo'd limits key must fail boot, not be silently ignored.
 pub(crate) struct LimitsCfg {
     #[serde(default = "default_upstream_request_timeout_secs")]
     pub(crate) upstream_request_timeout_secs: u64,
@@ -2078,6 +2090,7 @@ impl Default for LimitsCfg {
 
 /// The `metrics:` block.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M8: a typo'd metrics key must fail boot, not be silently ignored.
 pub(crate) struct MetricsCfg {
     #[serde(default = "default_key_gauge_limit")]
     pub(crate) key_gauge_limit: usize,
@@ -2113,6 +2126,7 @@ impl Default for HealthDefaultsCfg {
 /// The `routing:` block — the global default policy timeout (per-policy `policy.timeout_ms` still
 /// overrides).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M8: a typo'd routing key must fail boot, not be silently ignored.
 pub(crate) struct RoutingCfg {
     #[serde(default = "default_policy_timeout_ms")]
     pub(crate) default_policy_timeout_ms: u64,

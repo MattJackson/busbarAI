@@ -592,9 +592,13 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
         .json()
         .await
         .unwrap();
-    // Window/freshness header (the audit's #2/#3 findings). No `currency` field anymore: spend
-    // is abstract cost units and currency is the consumer's display concern.
-    assert!(body.get("currency").is_none(), "currency field is gone");
+    // Window/freshness header (the audit's #2/#3 findings). F1: the usage response carries a
+    // `currency` field sourced from the single USAGE_CURRENCY const (emitted only on this endpoint).
+    assert_eq!(
+        body.get("currency").and_then(|c| c.as_str()),
+        Some("USD"),
+        "usage response carries currency:USD (F1)"
+    );
     assert!(body["as_of"].as_u64().unwrap() >= now);
     let (start, end) = (
         body["window"]["start"].as_u64().unwrap(),
