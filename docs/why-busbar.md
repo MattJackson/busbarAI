@@ -22,11 +22,13 @@ Busbar presents a single endpoint to your application. You configure which provi
 
 ### Cost control requires a control plane
 
-Direct API usage gives you a bill at the end of the month. It does not give you per-team or per-application budget caps, rate limits enforced in real time, or auditability of which workload consumed what. Without a control plane, cost control means trusting every developer and every deployment to self-police.
+Direct API usage gives you a bill at the end of the month. It does not give you enforced budget caps, rate limits applied in real time, or auditability of which workload consumed what. Without a control plane, cost control means trusting every developer and every deployment to self-police.
 
-Busbar's governance layer issues virtual keys, scoped bearer tokens with configurable per-request and per-1k-token pricing, daily/monthly/total budget caps, RPM and TPM limits, and pool-level access controls. A virtual key for a staging environment can be capped at a daily budget and restricted to a cheaper model pool. An internal tool can be rate-limited independently of the production path. Usage is tracked per key and queryable via the admin API.
+Busbar's governance layer issues virtual keys: scoped bearer tokens with a flat per-request fee, per-model token pricing from an operator-declared rate card, daily/monthly/total budget caps, RPM and TPM limits, and pool-level access controls. A virtual key for a staging environment can be capped at a daily budget and restricted to a cheaper model pool. An internal tool can be rate-limited independently of the production path. Budgets also nest above the key: a key binds to a named **budget group** (a person, team, org, or project bucket), groups nest under a parent, and admission walks the whole chain so a request passes only when the key and every ancestor group are under cap. That is how per-team or per-project budgets are enforced, not just observed. Usage is tracked per key and queryable via the admin API.
 
-One operational caveat worth stating plainly. RPM limits are enforced precisely (the counter is incremented synchronously on admission). Budget caps are too: the over-budget check and the flat per-request charge are a single atomic in-memory operation (`charge_within_budget`), so concurrent in-flight requests cannot overshoot the cap. Because admission is in-memory and never touches the durable store, the cap holds even when the store is unreachable; a durable store (`sqlite`, `postgres`, or `redis`) is a write-behind persistence layer, not an admission-path dependency. TPM limits remain best-effort under concurrency, since token usage is only known after the response.
+Costs are computed from tokens, not stored as dollars. The store accumulates immutable per-model token counts; every spend figure is derived at read time as `tokens x rate_card + requests x price_per_request_cents`. Correcting a mispriced model is a config edit and a reload, and every historical and current window re-prices on the next read, with no re-billing and no migration. The rate numbers are abstract cost units, so busbar attaches no currency and does pure integer math; symbols and FX are your dashboard's concern.
+
+One operational caveat worth stating plainly. RPM limits are enforced precisely (the counter is incremented synchronously on admission). Budget caps are hard and atomic: at admission busbar derives every bucket's spend fresh from its token ledger and admits only if the key and every ancestor budget group are under cap, charging the whole chain or nothing in one critical section. A 429 `insufficient_quota` names which bucket blocked. Because admission is in-memory and never touches the durable store, the cap holds even when the store is unreachable. That in-memory speed carries one honest limit: the hard cap is enforced **per node**. With N busbar nodes splitting traffic behind a shared store, each node enforces from its own counters and reconciles durably through additive flushes, so between flushes the fleet can admit up to roughly N times a configured cap. The cap is not a synchronous cluster-wide gate. TPM limits remain best-effort under concurrency, since token usage is only known after the response.
 
 ### Your data path is also your security perimeter
 
@@ -58,7 +60,7 @@ Busbar ships as a single static binary. Deployment is:
 2. Set the environment variables your config references (one per provider key).
 3. Run the binary.
 
-There is no Python environment to manage, no Node runtime, no database to provision (governance uses an embedded SQLite file if you enable it), and no sidecar required. Health, metrics, and management traffic all pass through the same process on the same port.
+There is no Python environment to manage, no Node runtime, and no database to provision: governance defaults to an in-memory store (ephemeral RAM, zero setup), and durability is an opt-in you point at a `sqlite`, `postgres`, or `redis` store plugin. No sidecar is required. Health, metrics, and management traffic all pass through the same process on the same port.
 
 **Observability is built in.** Prometheus metrics are exposed at `/metrics` with bounded cardinality: metric labels use configured pool names and fixed enumerations, never raw model strings from client requests. OTLP trace export and a request-log webhook are both optional and configurable. The `/healthz` endpoint is side-effect-free (it never steals a recovery probe) and safe for high-frequency load balancer probing. Note that `/metrics` and `/stats` are not auth-exempt, they go through the same auth check as request traffic, since telemetry is itself a fingerprinting surface.
 
@@ -76,7 +78,7 @@ One auth note for Bedrock: Busbar signs outbound Bedrock requests with AWS SigV4
 
 - You run your own infrastructure and want to own the full request path to AI providers.
 - You use more than one provider and want failover, load distribution, or the ability to swap providers without code changes.
-- You need per-team or per-application cost control enforced at the control plane, before the request runs.
+- You need per-key, per-team, or per-project cost control enforced at the control plane through nestable budget groups, before the request runs.
 - Your existing applications use different provider SDKs (OpenAI, Anthropic, Gemini, Bedrock, Cohere) and you want to standardize the routing layer without rewriting call sites.
 - You have data residency, compliance, or internal security requirements that exclude third-party traffic routing.
 

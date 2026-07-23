@@ -162,14 +162,19 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 
 When a virtual key is resolved, the route handler enforces, in order:
 allowed-pools (`403`), budget (`429`, or `400` for Bedrock ingress), and rate
-limits (`429` + `Retry-After`) *before* forwarding. Budget exhaustion does **not**
+limits (`429` + `Retry-After`) *before* forwarding. The budget check walks the
+key's whole chain (the key's own bucket, then its `budget_group`, then that
+group's parent, up to the root) and admits only if every bucket is under cap; the
+429 names which bucket blocked. Budget exhaustion does **not**
 emit `402`: no upstream vendor returns `402` for an over-quota condition, so a
 `402` would be a router-side tell. Instead each ingress writer maps to its native
 quota shape: `429` (`insufficient_quota`) for OpenAI / Responses / Anthropic /
 Gemini / Cohere, and `400` (`ServiceQuotaExceededException`) for Bedrock. The flat
-per-request fee is charged at request completion;
-token-based spend is charged when the response stream completes (token-accurate
-accounting). See [operations.md](operations.md).
+per-request fee is charged at admission; the token counts land on the ledger when
+the response stream completes. Spend itself is never stored: it is derived at read
+time from the accumulated per-model tokens times the current `governance.rate_card`,
+so a rate correction re-prices past and present windows on the next read. See
+[operations.md](operations.md).
 
 ### 4. Pool / lane selection
 
