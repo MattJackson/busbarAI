@@ -196,10 +196,11 @@ pub(crate) async fn operation_resolved(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let charged = match governance_guard(app, gov, proto, model, started, charged_at) {
+    let admit = match governance_guard(app, gov, proto, model, started, charged_at) {
         Err(resp) => return *resp,
-        Ok(charged) => charged,
+        Ok(admit) => admit,
     };
+    let charged = admit.is_some();
 
     let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(model) {
         (c.clone(), model)
@@ -265,7 +266,7 @@ pub(crate) async fn operation_resolved(
             operation,
             op_handler,
         },
-        usage_sink(app, gov, charged_at),
+        usage_sink(app, gov, charged_at, admit),
     )
     .await;
     finish_admitted(app, gov, proto, model, started, charged_at, resp, charged)

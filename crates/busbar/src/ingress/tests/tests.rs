@@ -163,12 +163,8 @@ fn governed_app_with_key() -> (Arc<App>, crate::governance::VirtualKey) {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(100_000),
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -213,8 +209,8 @@ fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
     // Seed the admission charge in memory (30c flat fee) via the real admission charge.
     let charge = || {
         govstate
-            .try_charge_request_within_budget(&app.cost, &key, at)
-            .expect("well under the cap");
+            .try_admit(&app.cost, &key, at)
+            .expect("an uncapped chain admits");
     };
     charge();
     assert_eq!(
@@ -285,8 +281,8 @@ fn test_pre_routing_failure_does_not_refund_prior_charge() {
     // authoritative) window via the real admission charge. `key_spend`/`usage_for` and any (buggy)
     // `refund_request` all target this same cell.
     govstate
-        .try_charge_request_within_budget(&app.cost, &key, 1_700_000_000)
-        .expect("well under the cap");
+        .try_admit(&app.cost, &key, 1_700_000_000)
+        .expect("an uncapped chain admits");
     assert_eq!(key_spend(&app, &key.id), 30, "prior charge seeded");
 
     // A malformed-JSON request on the SAME key fails pre-routing (model never resolved) → 400.
@@ -357,12 +353,8 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -388,8 +380,8 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
 
     // Admission charge into the charged_at day window via the real admission charge (it lands the
     // flat fee into `budget_window("daily", charged_at)` = day_window).
-    gov.try_charge_request_within_budget(&cost, &key, charged_at)
-        .expect("well under the cap");
+    gov.try_admit(&cost, &key, charged_at)
+        .expect("an uncapped chain admits");
     assert_eq!(
         gov.usage_for(&cost, &key.id, charged_at)
             .unwrap()
@@ -429,19 +421,20 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
     );
 }
 
-/// Regression for #29 (admission-gate side): `budget_check` must evaluate the over-budget
+/// Regression for #29 (admission-gate side): `admit_check` must evaluate the over-budget
 /// condition against the SAME window the request will be charged in — the pinned `charged_at`
 /// (header-arrival) epoch — NOT a fresh `store::now()`. Otherwise the admission gate and the
 /// charge can land in different windows when a request straddles a window boundary: the old
-/// code (`is_over_budget_async(key, store::now())`) admitted against an empty current-day
-/// window while the spend that exhausts the budget lives in the `charged_at` day.
+/// code admitted against an empty current-day window while the spend that exhausts the budget
+/// lives in the `charged_at` day.
 ///
-/// Setup: a `daily`-period key with a 30c cap whose spend (30c) was already charged into a PAST
-/// day window. Probing that past window (`charged_at` on that day) must reject (spend ≥ cap);
-/// probing today's empty window (`store::now()`) must admit. The pre-fix code used the latter
-/// unconditionally and so would have admitted a request that the charge then overshot the cap.
+/// Setup: a key bound to a GROUP with a 30c/day budget whose spend (30c) was already charged
+/// into a PAST day window. Probing that past window (`charged_at` on that day) must reject
+/// (spend ≥ cap); probing today's empty window (`store::now()`) must admit. The pre-fix code
+/// used the latter unconditionally and so would have admitted a request that the charge then
+/// overshot the cap.
 #[tokio::test]
-async fn test_budget_check_uses_charged_at_window_not_clock() {
+async fn test_admit_check_uses_charged_at_window_not_clock() {
     use crate::governance::{GovState, MemoryStore, NewKeySpec, SECS_PER_DAY};
     crate::metrics::init();
 
@@ -454,30 +447,38 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     );
 
     // Seed 30c of spend into the PAST day window through the AUTHORITATIVE in-memory path
-    // (the real admission charge lands the flat fee into `budget_window("daily", past_day)` =
-    // past_window), so the deterministic precondition matches what the in-memory admission gate
-    // reads. (Enforcement is in-memory: seeding via the store alone would be invisible to
-    // `budget_check`.)
+    // (the real admission charge lands the flat fee into the group's day bucket for
+    // `budget_window("day", past_day)` = past_window), so the deterministic precondition matches
+    // what the in-memory admission gate reads. (Enforcement is in-memory: seeding via the store
+    // alone would be invisible to `admit_check`.)
     let store = std::sync::Arc::new(MemoryStore::new());
     let gov =
         std::sync::Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
-    let cost = std::sync::Arc::new(crate::cost::CostModel::flat(30)); // 30c/req
+    let groups = std::collections::BTreeMap::from([(
+        "daycap".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 30,
+                per: Some(crate::config::groups::LimitWindow::Day),
+            }],
+        },
+    )]);
+    let cost = std::sync::Arc::new(crate::cost::CostModel::resolve_parts(None, 30, &groups));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(30), // exhausted by a single 30c request
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: Some("daycap".to_string()),
                 labels: Default::default(),
             },
             1_700_000_000,
         )
         .unwrap();
-    gov.try_charge_request_within_budget(&cost, &key, past_day)
+    gov.try_admit(&cost, &key, past_day)
         .expect("first request fits the cap exactly");
 
     let mut app = minimal_app();
@@ -491,19 +492,18 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
     };
 
     assert_eq!(
-        gov.usage_for(&cost, &key.id, past_day)
+        gov.derived_bucket_usage(&cost, "group:daycap@day", "day", true, past_day)
             .unwrap()
-            .map(|u| u.spend_cents)
-            .unwrap_or(0),
+            .spend_cents,
         30,
         "test precondition: the past day window is at the cap"
     );
 
     // Gate keyed off the (past) `charged_at` window sees spend ≥ cap → reject.
-    let rejected = budget_check(&app, &govctx, "openai", past_day);
+    let rejected = admit_check(&app, &govctx, "openai", past_day);
     assert!(
         rejected.is_err(),
-        "budget_check must reject against the charged_at window where the spend lives (#29)"
+        "admit_check must reject against the charged_at window where the spend lives (#29)"
     );
     assert_eq!(
         rejected.unwrap_err().status(),
@@ -513,7 +513,7 @@ async fn test_budget_check_uses_charged_at_window_not_clock() {
 
     // Sanity: today's window is empty, so a gate keyed off the wall clock (the OLD behaviour)
     // would have WRONGLY admitted. This proves the bug was real and the pin fixes it.
-    let admitted_today = budget_check(&app, &govctx, "openai", crate::store::now());
+    let admitted_today = admit_check(&app, &govctx, "openai", crate::store::now());
     assert!(
         admitted_today.is_ok(),
         "today's window is empty; the old clock-based gate would have admitted here"
@@ -3025,12 +3025,8 @@ fn governed_app_pool_restricted() -> (Arc<App>, crate::governance::VirtualKey) {
         .create_key(
             NewKeySpec {
                 name: "restricted".to_string(),
-                allowed_pools: vec!["allowed-only".to_string()],
-                max_budget_cents: Some(100_000),
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: Some(vec!["allowed-only".to_string()]),
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -3113,8 +3109,8 @@ async fn test_governance_guard_passes_when_allowed() {
         crate::store::now(),
     );
     assert!(
-        matches!(passed, Ok(true)),
-        "an allowed, in-budget, in-rate request is admitted AND charged (Ok(true))"
+        matches!(passed, Ok(Some(_))),
+        "an allowed, in-limits request is admitted AND charged (Ok(Some(grant)))"
     );
 }
 
@@ -3132,9 +3128,7 @@ async fn finish_admitted_does_not_refund_an_uncharged_admit() {
     let at = 1_700_000_000;
     // A PRIOR legitimate request charges the flat fee (price=30) into this window.
     let g = app.governance.as_ref().unwrap();
-    assert!(g
-        .try_charge_request_within_budget(&app.cost, &key, at)
-        .is_ok());
+    assert!(g.try_admit(&app.cost, &key, at).is_ok());
     let charged_spend = key_spend(&app, &key.id);
     assert_eq!(charged_spend, 30, "prior request charged the flat fee");
 
@@ -3195,8 +3189,8 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     let gov2 = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key2.clone())),
     };
-    let resp = budget_check(&app2, &gov2, "openai", crate::store::now())
-        .expect_err("zero-budget key ⇒ over-budget response");
+    let resp = admit_check(&app2, &gov2, "openai", crate::store::now())
+        .expect_err("a zero-budget group ⇒ over-budget response");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = body_string(*resp).await;
     assert_leak_free(&body, &key2.id, "any-pool");
@@ -3207,8 +3201,8 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     let gov2b = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key2b.clone())),
     };
-    let resp = budget_check(&app2b, &gov2b, "bedrock", crate::store::now())
-        .expect_err("zero-budget key ⇒ over-budget response (bedrock)");
+    let resp = admit_check(&app2b, &gov2b, "bedrock", crate::store::now())
+        .expect_err("a zero-budget group ⇒ over-budget response (bedrock)");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_string(*resp).await;
     assert!(
@@ -3218,13 +3212,14 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     assert_leak_free(&body, &key2b.id, "any-pool");
     let _ = &app2b;
 
-    // --- 429: rate limited. A key with rpm_limit=0 is rate-limited on the first request. ---
+    // --- 429: rate limited. A group with `requests: 0, per: minute` blocks the first request. ---
     let (app3, key3) = governed_app_rate_limited();
     let gov3 = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key3.clone())),
     };
-    let resp =
-        rate_check(&app3, &gov3, "openai", crate::store::now()).expect("rpm=0 key ⇒ 429 response");
+    let resp = admit_check(&app3, &gov3, "openai", crate::store::now())
+        .expect_err("requests=0 group ⇒ 429 response");
+    let resp = *resp;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     // The Retry-After header must still be present (regression: copy change must not drop it).
     assert!(
@@ -3270,12 +3265,8 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
         .create_key(
             NewKeySpec {
                 name: "broke".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(0),
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: Some("empty".to_string()),
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -3284,12 +3275,25 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
     let mut app = minimal_app();
     let inner = Arc::get_mut(&mut app).expect("sole owner");
     inner.governance = Some(gov);
-    // 30c flat fee against a 0c cap: the very first request is over budget.
-    inner.cost = std::sync::Arc::new(crate::cost::CostModel::flat(30));
+    // A ZERO-cap GROUP budget: the very first request is over budget (keys carry no caps).
+    let groups = std::collections::BTreeMap::from([(
+        "empty".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 0,
+                per: Some(crate::config::groups::LimitWindow::Total),
+            }],
+        },
+    )]);
+    inner.cost = std::sync::Arc::new(crate::cost::CostModel::resolve_parts(None, 30, &groups));
     (app, key)
 }
 
-/// Governance-enabled App whose only key has `rpm_limit = 0`, so the first request is rate-limited.
+/// Governance-enabled App whose key binds to a group with `{ requests: 0, per: minute }`, so the
+/// first request is rate-limited (keys carry no caps; the group is the limiter).
 fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
@@ -3298,12 +3302,8 @@ fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
         .create_key(
             NewKeySpec {
                 name: "throttled".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(100_000),
-                budget_period: "total".to_string(),
-                rpm_limit: Some(0),
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: Some("closed".to_string()),
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -3312,7 +3312,19 @@ fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
     let mut app = minimal_app();
     let inner = Arc::get_mut(&mut app).expect("sole owner");
     inner.governance = Some(gov);
-    inner.cost = std::sync::Arc::new(crate::cost::CostModel::flat(30));
+    let groups = std::collections::BTreeMap::from([(
+        "closed".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Requests,
+                amount: 0,
+                per: Some(crate::config::groups::LimitWindow::Minute),
+            }],
+        },
+    )]);
+    inner.cost = std::sync::Arc::new(crate::cost::CostModel::resolve_parts(None, 30, &groups));
     (app, key)
 }
 
@@ -4517,14 +4529,10 @@ async fn governed_pool_acl_router(
             key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
             name: "acl".to_string(),
             // Allowed ONLY on a pool the requests never use → every request is pool-rejected 403.
-            allowed_pools: vec!["other-pool".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["other-pool".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -4777,14 +4785,10 @@ async fn test_fallback_pool_acl_denies_key_not_allowed_on_fallback_target() {
             key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
             name: "fb".to_string(),
             // Allowed ONLY on pool A. Pool B (the fallback target) is NOT in the list.
-            allowed_pools: vec!["A".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["A".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -4865,14 +4869,10 @@ async fn test_fallback_pool_acl_allows_key_permitted_on_both_pools() {
             key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
             name: "fb2".to_string(),
             // Allowed on BOTH A and the fallback target B → no ACL rejection on either.
-            allowed_pools: vec!["A".to_string(), "B".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["A".to_string(), "B".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -5037,14 +5037,10 @@ async fn test_adhoc_governance_pool_acl_403_via_router() {
             id: "kadhoc".to_string(),
             key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
             name: "adhoc-acl".to_string(),
-            allowed_pools: vec!["other-pool".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["other-pool".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -5336,18 +5332,20 @@ async fn test_gemini_v1_stable_stream_generate_content_no_alt_sse() {
 // The rejection fires in `governance_guard` BEFORE model resolution, so no lane/pool/backend is
 // needed — only a parseable body carrying `model` where the body-model protocols expect it.
 
-/// Build a governance-enabled router whose single virtual key is over its limit, selected by
-/// `rpm` (`Some(0)` ⇒ rate-limited on the first request) and/or `max_budget_cents` (`Some(0)` ⇒
-/// over budget on the first request). `allowed_pools: vec![]` admits every pool so the ACL never
-/// short-circuits the gate under test. Returns `(addr, handle, secret)`.
+/// Build a governance-enabled router whose single virtual key binds to a GROUP that is over its
+/// limit from the first request, selected by `over`: `"requests"` (a `{ requests: 0, per: minute }`
+/// limit ⇒ rate-limited) or `"budget"` (a `{ budget: 0, per: total }` limit ⇒ over quota). Keys
+/// are pure auth, so the tripping limit lives on the bound group. An omitted `allowed_pools`
+/// admits every pool so the ACL never short-circuits the gate under test. Returns
+/// `(addr, handle, secret)`.
 async fn governed_limit_router(
-    rpm: Option<u32>,
-    max_budget_cents: Option<i64>,
+    over: &'static str,
 ) -> (
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
     &'static str,
 ) {
+    use crate::config::groups::{LimitCfg, LimitMetric, LimitWindow};
     use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
     const SECRET: &str = "sk-vk-limit-route";
     let store = StdArc::new(MemoryStore::new());
@@ -5356,19 +5354,39 @@ async fn governed_limit_router(
             id: "klimit".to_string(),
             key_hash: crate::sigv4::sha256_hex(SECRET.as_bytes()),
             name: "limit".to_string(),
-            allowed_pools: vec![], // all pools — ACL never short-circuits
-            max_budget_cents,
-            budget_period: "total".to_string(),
-            rpm_limit: rpm,
-            tpm_limit: None,
+            allowed_pools: None, // all pools; ACL never short-circuits
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: Some("tripped".to_string()),
             labels: Default::default(),
         })
         .unwrap();
     let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
-    let app = TestApp::new().governance(gov).build();
+    let tripping = if over == "requests" {
+        LimitCfg {
+            metric: LimitMetric::Requests,
+            amount: 0,
+            per: Some(LimitWindow::Minute),
+        }
+    } else {
+        LimitCfg {
+            metric: LimitMetric::Budget,
+            amount: 0,
+            per: Some(LimitWindow::Total),
+        }
+    };
+    let groups = std::collections::BTreeMap::from([(
+        "tripped".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![tripping],
+        },
+    )]);
+    let app = TestApp::new()
+        .governance(gov)
+        .cost(crate::cost::CostModel::resolve_parts(None, 0, &groups))
+        .build();
     let (addr, handle) = serve(app).await;
     (addr, handle, SECRET)
 }
@@ -5390,7 +5408,7 @@ async fn test_governance_rate_limit_429_native_envelope_all_ingress() {
         ("/v1/responses", json!({"model": "m", "input": "hi"})),
         ("/v2/chat", json!({"model": "m", "messages": []})),
     ] {
-        let (addr, handle, secret) = governed_limit_router(Some(0), None).await;
+        let (addr, handle, secret) = governed_limit_router("requests").await;
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}{path}"))
             .bearer_auth(secret)
@@ -5408,7 +5426,7 @@ async fn test_governance_rate_limit_429_native_envelope_all_ingress() {
 
     // gemini path-model route: native quota envelope is error.code 429 + RESOURCE_EXHAUSTED.
     {
-        let (addr, handle, secret) = governed_limit_router(Some(0), None).await;
+        let (addr, handle, secret) = governed_limit_router("requests").await;
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/v1beta/models/m:generateContent"))
             .bearer_auth(secret)
@@ -5430,7 +5448,7 @@ async fn test_governance_rate_limit_429_native_envelope_all_ingress() {
 
     // bedrock path-model route: native 429 carries the ThrottlingException envelope + headers.
     {
-        let (addr, handle, secret) = governed_limit_router(Some(0), None).await;
+        let (addr, handle, secret) = governed_limit_router("requests").await;
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/model/m/converse"))
             .bearer_auth(secret)
@@ -5470,7 +5488,7 @@ async fn test_governance_over_budget_native_envelope_all_ingress() {
         ("/v2/chat", json!({"model": "m", "messages": []})),
         ("/v1beta/models/m:generateContent", json!({"contents": []})),
     ] {
-        let (addr, handle, secret) = governed_limit_router(None, Some(0)).await;
+        let (addr, handle, secret) = governed_limit_router("budget").await;
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}{path}"))
             .bearer_auth(secret)
@@ -5484,7 +5502,7 @@ async fn test_governance_over_budget_native_envelope_all_ingress() {
 
     // bedrock: native ServiceQuotaExceededException is a 400-class error, not 429.
     {
-        let (addr, handle, secret) = governed_limit_router(None, Some(0)).await;
+        let (addr, handle, secret) = governed_limit_router("budget").await;
         let resp = reqwest::Client::new()
             .post(format!("http://{addr}/model/m/converse"))
             .bearer_auth(secret)
@@ -5686,12 +5704,8 @@ fn governed_app_group_blocked() -> (Arc<App>, crate::governance::VirtualKey) {
         .create_key(
             NewKeySpec {
                 name: "grouped".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: Some("finance".to_string()),
+                allowed_pools: None,
+                group: Some("finance".to_string()),
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -5715,8 +5729,8 @@ async fn test_group_blocked_429_names_the_budget_group() {
         key: Some(std::sync::Arc::new(key.clone())),
     };
     let at = crate::store::now();
-    let resp = budget_check(&app, &gov, "openai", at)
-        .expect_err("a zero-cap group blocks the whole chain");
+    let resp =
+        admit_check(&app, &gov, "openai", at).expect_err("a zero-cap group blocks the whole chain");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = body_string(*resp).await;
     assert!(
@@ -5724,8 +5738,8 @@ async fn test_group_blocked_429_names_the_budget_group() {
         "canonical quota error type: {body}"
     );
     assert!(
-        body.contains("budget group 'finance' exhausted"),
-        "the 429 must NAME the blocking bucket: {body}"
+        body.contains("group 'finance' budget per total exhausted"),
+        "the 429 must NAME the blocking bucket (group + metric + window): {body}"
     );
     assert!(!body.contains(&key.id), "never the key id: {body}");
     // All-or-nothing: the rejected attempt charged nothing anywhere in the chain.
@@ -5746,16 +5760,16 @@ async fn test_missing_group_fails_closed_at_ingress() {
     crate::metrics::init();
     let (app, key) = governed_app_group_blocked();
     let mut orphan = key.clone();
-    orphan.budget_group = Some("ghost".to_string());
+    orphan.group = Some("ghost".to_string());
     let gov = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(orphan)),
     };
-    let resp = budget_check(&app, &gov, "openai", crate::store::now())
+    let resp = admit_check(&app, &gov, "openai", crate::store::now())
         .expect_err("a missing group must fail closed");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = body_string(*resp).await;
     assert!(
-        body.contains("budget group 'ghost'"),
+        body.contains("group 'ghost' is not configured"),
         "the missing bucket is named for the operator-facing fix: {body}"
     );
 }
@@ -5774,12 +5788,8 @@ async fn test_unpriced_passthrough_model_rejected_when_rate_card_present() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,

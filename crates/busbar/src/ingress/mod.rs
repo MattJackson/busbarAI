@@ -57,10 +57,10 @@ fn fallback_pools_authorized(
     proto: &str,
 ) -> Option<Response> {
     let key = gov.key.as_ref()?;
-    // A key with no restriction (empty `allowed_pools`) admits every pool — nothing to walk.
-    if key.allowed_pools.is_empty() {
-        return None;
-    }
+    // A key with no restriction (`allowed_pools` omitted at mint = None) admits every pool,
+    // nothing to walk. (An explicit empty list is the EMPTY set and walks like any list: every
+    // pool denies.)
+    key.allowed_pools.as_ref()?;
     let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut current = pool;
     loop {
@@ -94,6 +94,7 @@ fn usage_sink(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     charged_at: u64,
+    admit: Option<crate::governance::AdmitGrant>,
 ) -> Option<crate::proxy::UsageSink> {
     match (&app.governance, &gov.key) {
         (Some(g), Some(key)) => Some(crate::proxy::UsageSink {
@@ -101,13 +102,19 @@ fn usage_sink(
             // The resolved cost model rides along (an Arc bump) so the stream-end accrual can walk
             // the key's budget-group chain without reaching back into the App snapshot.
             cost: app.cost.clone(),
-            // Share the resolved key by `Arc` — no per-request `id`/`budget_period` String clone;
-            // both are read through `sink.key` at charge time.
+            // Share the resolved key by `Arc`: no per-request `id` String clone; it is read
+            // through `sink.key` at charge time.
             key: key.clone(),
             // The header-arrival epoch this request was admitted at — reused for the token fee so it
             // shares the flat per-request fee's window (#29). See `UsageSink::charged_at`.
             charged_at,
+            // The admission's in-flight HOLDS (the `concurrent` limit gauges) ride the sink so
+            // they release when the response stream completes / the request context unwinds - the
+            // sink is the one per-request object that provably lives to stream end. Arc'd because
+            // the sink clones per failover attempt; the LAST clone dropping releases the gauges.
+            admit: admit.map(std::sync::Arc::new),
         }),
+        // No governance/key = nothing was admitted through the limit engine; a grant cannot exist.
         _ => None,
     }
 }
@@ -131,102 +138,140 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
     }
 }
 
-/// Reject before forwarding when the resolved virtual key is already over its budget for the
-/// window the request was admitted in. No-op when governance is off or the key has no budget cap.
-/// Async: the atomic budget check-and-charge is a (blocking) SQLite UPSERT offloaded to the blocking
-/// pool inside `charge_within_budget_async`, so the request path never stalls a Tokio worker thread.
+/// Run the atomic group-limit ADMISSION for a request that is about to be forwarded (the P4
+/// generic limit engine). `Ok(Some(grant))` = admitted AND charged (the flat per-request fee + one
+/// request landed on every chain bucket; a non-2xx must refund, and the grant holds the
+/// `concurrent` in-flight gauges until the response completes). `Ok(None)` = admitted WITHOUT a
+/// charge (governance off / no key) - a non-2xx must NOT refund, because `refund_request` is a
+/// blind decrement that would erode ANOTHER request's spend/count in the same window (see
+/// `finish_rejected`). `Err(resp)` = rejected with the protocol-native error NAMING the exact
+/// blocking bucket (group + metric + window).
 ///
 /// The admission window is keyed off `charged_at` (the pinned header-arrival epoch), NOT a fresh
-/// `store::now()`. The flat per-request fee is charged HERE, atomically, into the `charged_at`
-/// window, and the token-fee (`UsageSink::charged_at` → `record_tokens`) bills into the SAME window,
-/// so the charge-and-check and the later token charge must read the SAME window — else, when a
-/// request straddles a window boundary, a fresh clock here could admit/charge against an empty new
-/// window while the token fee falls into the old one, or vice-versa (#29 sibling of the token pin).
-/// `Ok(true)` = admitted AND the flat per-request fee was CHARGED (a non-2xx must refund it).
-/// `Ok(false)` = admitted WITHOUT a charge (governance off / no key / store-error fail-open) — a
-/// non-2xx must NOT refund, because `refund_request` is a blind decrement that would erode ANOTHER
-/// request's spend/count in the same window (see `finish_rejected`). `Err(resp)` = rejected.
-fn budget_check(
+/// `store::now()`: the token fee (`UsageSink::charged_at` -> `record_usage`) bills into the SAME
+/// window, so a request straddling a window boundary can never split its charges (#29).
+fn admit_check(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     proto: &str,
     charged_at: u64,
-) -> Result<bool, Box<Response>> {
-    if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-        // ATOMIC budget check-and-charge (fix 2a): one indivisible UPSERT charges the flat per-request
-        // fee + one request IFF it stays within the cap. This replaces the old non-atomic read
-        // (`is_over_budget_async`) + later write (`record_request` in `finish`) pair, which let N
-        // concurrent requests for one key all read "under budget" and all charge → overshoot. Now the
-        // flat fee is a HARD cap. The charge fires HERE (so `finish` must NOT re-charge it); a non-2xx
-        // outcome is REFUNDED in `finish` to preserve the "bill 2xx only" flat-fee policy. This guard
-        // runs LAST in `governance_guard` (after pool/rate), so no later guard can reject an
-        // already-charged request.
-        // In-memory hard cap over the whole BUDGET CHAIN: `try_charge_request_within_budget`
-        // derives every bucket's spend from its token ledger x the current rate card (pure
-        // recompute, no spend cache) and admits only if the key bucket AND every ancestor budget
-        // group are under their caps, charging all of them atomically. Infallible in-memory
-        // (write-behind store): admission never blocks on or fails from the durable store.
-        // `Ok(())` = charged + admitted (a non-2xx refunds); `Err` = a NAMED bucket blocked.
-        match g.try_charge_request_within_budget(&app.cost, key, charged_at) {
-            Ok(()) => Ok(true),
-            Err(blocked) => {
-                // `insufficient_quota` is the canonical OpenAI/Responses quota error type (the
-                // OpenAI writer passes it through verbatim as a real type; the Responses writer
-                // maps it explicitly).
-                //
-                // The 429 NAMES WHICH BUCKET blocked (cost-model spec §6): the key's own budget vs
-                // a named budget group. The key ID itself is still never echoed - the key bucket
-                // keeps the vendor-plausible copy verbatim; a GROUP rejection appends the group
-                // name (an operator-chosen, caller-meaningful bucket label, not an internal
-                // credential handle). Server-side tracing records the full detail either way.
-                tracing::info!(key_id = %key.id, blocked = ?blocked, "governance: budget bucket exhausted");
-                let message = match &blocked {
-                    crate::governance::BudgetBlocked::Key => {
-                        "You have exceeded your current quota. Please check your plan and billing details."
-                            .to_string()
-                    }
-                    crate::governance::BudgetBlocked::Group(name) => format!(
-                        "You have exceeded your current quota (budget group '{name}' exhausted). \
-                         Please check your plan and billing details."
+) -> Result<Option<crate::governance::AdmitGrant>, Box<Response>> {
+    let (Some(g), Some(key)) = (&app.governance, &gov.key) else {
+        // Governance off or no resolved key → no charge landed; nothing to refund on a non-2xx.
+        return Ok(None);
+    };
+    // ONE indivisible check-and-charge over the whole chain: every group's every limit must admit
+    // (AND / most-restrictive) and every bucket is charged in the same critical section - N
+    // concurrent requests can never each read "under the cap" and all charge. Infallible
+    // in-memory (write-behind store): admission never blocks on or fails from the durable store.
+    match g.try_admit(&app.cost, key, charged_at) {
+        Ok(grant) => Ok(Some(grant)),
+        Err(blocked) => {
+            // The rejection NAMES WHICH BUCKET blocked (group + metric + window). The key ID
+            // itself is never echoed; a group name is an operator-chosen, caller-meaningful
+            // bucket label, not an internal credential handle. Server-side tracing records the
+            // full detail either way.
+            tracing::info!(key_id = %key.id, blocked = ?blocked, "governance: limit bucket blocked admission");
+            use crate::governance::LimitBlocked;
+            let (status, kind, message, retry_after) = match &blocked {
+                LimitBlocked::Limit {
+                    group,
+                    metric: metric @ ("requests" | "tokens"),
+                    window,
+                    retry_after,
+                } => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    crate::proxy::KIND_RATE_LIMIT,
+                    format!(
+                        "Rate limit exceeded (group '{group}': {metric} per {}). Please retry \
+                         after the indicated time.",
+                        window.unwrap_or("total")
                     ),
-                    // FAIL-CLOSED: a key bound to a group this node's config does not know is not
-                    // admitted; the message names the missing bucket so the operator can fix it.
-                    crate::governance::BudgetBlocked::MissingGroup(name) => format!(
-                        "Your quota configuration is incomplete (budget group '{name}' is not \
+                    *retry_after,
+                ),
+                LimitBlocked::Limit {
+                    group,
+                    metric: "concurrent",
+                    ..
+                } => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    crate::proxy::KIND_RATE_LIMIT,
+                    format!(
+                        "Too many concurrent requests (group '{group}' is at its in-flight \
+                         limit). Please retry shortly."
+                    ),
+                    None,
+                ),
+                LimitBlocked::Limit {
+                    group,
+                    window,
+                    retry_after,
+                    ..
+                } => (
+                    // Native quota status differs by vendor (Bedrock's
+                    // ServiceQuotaExceededException is 400; every other vendor surfaces
+                    // over-quota as 429). The writer owns that mapping.
+                    crate::proto::protocol_for(proto)
+                        .map(|p| p.writer().quota_exceeded_status())
+                        .unwrap_or(StatusCode::TOO_MANY_REQUESTS),
+                    crate::proxy::KIND_INSUFFICIENT_QUOTA,
+                    format!(
+                        "You have exceeded your current quota (group '{group}' budget per {} \
+                         exhausted). Please check your plan and billing details.",
+                        window.unwrap_or("total")
+                    ),
+                    *retry_after,
+                ),
+                // A FROZEN group (`enabled: false`) is an administrative freeze, not a quota: the
+                // vendor-plausible shape is a permission denial.
+                LimitBlocked::Disabled(group) => (
+                    StatusCode::FORBIDDEN,
+                    crate::proxy::KIND_PERMISSION,
+                    format!(
+                        "Your API key does not currently have access to this resource (group \
+                         '{group}' is disabled)."
+                    ),
+                    None,
+                ),
+                // FAIL-CLOSED: a key bound to a group this node's config does not know is not
+                // admitted; the message names the missing bucket so the operator can fix it.
+                LimitBlocked::MissingGroup(group) => (
+                    crate::proto::protocol_for(proto)
+                        .map(|p| p.writer().quota_exceeded_status())
+                        .unwrap_or(StatusCode::TOO_MANY_REQUESTS),
+                    crate::proxy::KIND_INSUFFICIENT_QUOTA,
+                    format!(
+                        "Your quota configuration is incomplete (group '{group}' is not \
                          configured). Please contact your administrator."
                     ),
-                };
-                // Native quota status differs by vendor (Bedrock's ServiceQuotaExceededException
-                // is 400; every other vendor surfaces over-quota as 429). The writer owns that
-                // mapping via `quota_exceeded_status()`.
-                let status = crate::proto::protocol_for(proto)
-                    .map(|p| p.writer().quota_exceeded_status())
-                    .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
-                Err(Box::new(ingress_error(
-                    proto,
-                    status,
-                    crate::proxy::KIND_INSUFFICIENT_QUOTA,
-                    &message,
-                )))
+                    None,
+                ),
+            };
+            let mut resp = ingress_error(proto, status, kind, &message);
+            // Standard `Retry-After` for a rolling window so a well-behaved SDK backs off the
+            // right amount ('total' never rolls: no header).
+            if let Some(retry) = retry_after {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&retry.to_string()) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, hv);
+                }
             }
+            Err(Box::new(resp))
         }
-    } else {
-        // Governance off or no resolved key → no charge landed; nothing to refund on a non-2xx.
-        Ok(false)
     }
 }
 
-/// Run the three governance guards (pool-allowed / over-budget / rate-limited) for a request that
-/// is about to be forwarded. Returns the protocol-native rejection response already passed through
-/// `finish_rejected`. The statuses are deliberately vendor-faithful and never 402: pool-not-allowed maps to
-/// 403, over-budget maps to 429 (Bedrock's quota shape is a 400-class error — see `budget_check`),
-/// and rate-limited maps to 429 + `Retry-After`. busbar never emits 402 here — a blanket 402 was a
-/// vendor-agnostic tell, since no real provider returns 402 for these conditions. Routing through
-/// `finish_rejected` means a governance-rejected request still emits `REQUESTS_TOTAL`, the
-/// `REQUEST_DURATION_SECONDS` histogram, and the request-log webhook. Returns `None` when every
-/// guard passes and the caller should proceed to resolve+forward. Without this, the early returns
-/// from `forward_resolved`/`named`/`adhoc` made every governance-rejected request invisible to
-/// Prometheus and the webhook.
+/// Run the governance guards (pool ACL / unpriced-model / the atomic group-limit admission) for a
+/// request that is about to be forwarded. Returns the protocol-native rejection response already
+/// passed through `finish_rejected`. The statuses are deliberately vendor-faithful and never 402:
+/// pool-not-allowed and a frozen group map to 403, an exhausted budget maps to the vendor's quota
+/// status (Bedrock's quota shape is a 400-class error, see `admit_check`), and requests / tokens /
+/// concurrent limits map to 429 (+ `Retry-After` for rolling windows). busbar never emits 402 here
+/// a blanket 402 was a vendor-agnostic tell, since no real provider returns 402 for these
+/// conditions. Routing through `finish_rejected` means a governance-rejected request still emits
+/// `REQUESTS_TOTAL`, the `REQUEST_DURATION_SECONDS` histogram, and the request-log webhook.
+/// `Ok(Some(grant))` = admitted + charged (see `admit_check`); the caller threads the grant into
+/// the request's `UsageSink` so the in-flight holds release at stream end.
 fn governance_guard(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
@@ -234,7 +279,7 @@ fn governance_guard(
     pool: &str,
     started: Instant,
     charged_at: u64,
-) -> Result<bool, Box<Response>> {
+) -> Result<Option<crate::governance::AdmitGrant>, Box<Response>> {
     // A governance rejection fires BEFORE the model is resolved to a configured pool, so the raw
     // client-supplied `pool` string must be mapped to the bounded metric label (metrics.rs)
     // before it reaches `finish` (which stamps it onto REQUESTS_TOTAL / the duration histogram /
@@ -279,60 +324,16 @@ fn governance_guard(
             app, gov, proto, label, started, charged_at, resp,
         )));
     }
-    // RATE check BEFORE the budget charge: `budget_check` now atomically CHARGES the flat fee at
-    // admission (fix 2a), so it must be the LAST guard — nothing may reject an already-charged
-    // request. A rate-limited request is rejected here without ever being charged.
-    if let Some(resp) = rate_check(app, gov, proto, charged_at) {
-        return Err(Box::new(finish_rejected(
-            app, gov, proto, label, started, charged_at, resp,
-        )));
-    }
-    // Budget charge LAST. On rejection nothing was charged → `finish_rejected` (no refund). On
-    // admission, `budget_check` reports whether the flat fee actually LANDED: `Ok(true)` means the
-    // post-admission `finish` must refund it on a non-2xx; `Ok(false)` (governance off / no key /
-    // store-error fail-open) means NO charge landed, so the caller must NOT refund — a blind refund
-    // there erodes another request's spend (found: audit c2r1). That flag is the guard's return.
-    match budget_check(app, gov, proto, charged_at) {
+    // The atomic group-limit ADMISSION runs LAST: it CHARGES every chain bucket on admit, so
+    // nothing may reject an already-charged request after it. On rejection nothing was charged →
+    // `finish_rejected` (no refund). On admission the returned grant reports whether the charge
+    // LANDED (`Some` = refund on non-2xx) and holds the `concurrent` in-flight gauges.
+    match admit_check(app, gov, proto, charged_at) {
         Err(resp) => Err(Box::new(finish_rejected(
             app, gov, proto, label, started, charged_at, *resp,
         ))),
-        Ok(charged) => Ok(charged),
+        Ok(grant) => Ok(grant),
     }
-}
-
-/// reject (429 + Retry-After) before forwarding when the resolved virtual key is over
-/// its RPM/TPM for the current window. No-op when governance is off or the key has no rate cap.
-fn rate_check(
-    app: &Arc<App>,
-    gov: &crate::governance::GovCtx,
-    proto: &str,
-    charged_at: u64,
-) -> Option<Response> {
-    if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-        // Pin the rate window to the SAME `charged_at` epoch the budget charge uses (the once-captured
-        // header-arrival time), NOT a fresh `store::now()`. `budget_check` evaluates against
-        // `charged_at`; reading a fresh clock here could attribute the rate check and the budget charge
-        // to different sub-second windows on a 60s boundary. Both governance guards now read one epoch.
-        if let Err(retry) = g.check_rate(key, charged_at) {
-            // Native error envelope for the body, plus the standard `Retry-After` header so a
-            // well-behaved SDK backs off the right amount. The client-facing message carries only
-            // vendor-plausible rate-limit copy — never the internal key id or governance
-            // vocabulary. The key id + retry window are recorded server-side via tracing.
-            tracing::info!(key_id = %key.id, retry_after_secs = retry, "governance: key rate limited");
-            let mut resp = ingress_error(
-                proto,
-                StatusCode::TOO_MANY_REQUESTS,
-                crate::proxy::KIND_RATE_LIMIT,
-                "Rate limit exceeded. Please retry after the indicated time.",
-            );
-            if let Ok(hv) = axum::http::HeaderValue::from_str(&retry.to_string()) {
-                resp.headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, hv);
-            }
-            return Some(resp);
-        }
-    }
-    None
 }
 
 /// Map a client-supplied model/name string to a BOUNDED `pool` metric label (metrics.rs).
@@ -1114,13 +1115,14 @@ pub(crate) async fn named(
     // Header-arrival epoch pinned once; reused for both the per-request and token fees (#29).
     let charged_at = crate::store::now();
 
-    // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
-    // inside `governance_guard` (this handler just returns that response). On admission it reports
-    // whether the flat fee was CHARGED, so the post-admission finish only refunds when it landed.
-    let charged = match governance_guard(&app, &gov, PROTO_ANTHROPIC, &name, started, charged_at) {
+    // Governance guards (pool ACL / group limits); a rejection is wrapped in `finish_rejected`
+    // inside `governance_guard` (this handler just returns that response). On admission the grant
+    // reports whether the fee was CHARGED (refund gate) and holds the in-flight gauges.
+    let admit = match governance_guard(&app, &gov, PROTO_ANTHROPIC, &name, started, charged_at) {
         Err(resp) => return *resp,
-        Ok(charged) => charged,
+        Ok(admit) => admit,
     };
+    let charged = admit.is_some();
 
     if let Some(cands) = app.pools.get(&name) {
         let affinity_key = headers
@@ -1138,7 +1140,7 @@ pub(crate) async fn named(
             affinity_key,
             PROTO_ANTHROPIC,
             crate::handlers::chat(PROTO_ANTHROPIC),
-            usage_sink(&app, &gov, charged_at),
+            usage_sink(&app, &gov, charged_at, admit),
         )
         .await;
         return finish_admitted(
@@ -1170,7 +1172,7 @@ pub(crate) async fn named(
             None,
             PROTO_ANTHROPIC,
             crate::handlers::chat(PROTO_ANTHROPIC),
-            usage_sink(&app, &gov, charged_at),
+            usage_sink(&app, &gov, charged_at, admit),
         )
         .await;
         return finish_admitted(
@@ -1235,13 +1237,14 @@ pub(crate) async fn adhoc(
     // Header-arrival epoch pinned once; reused for both the per-request and token fees (#29).
     let charged_at = crate::store::now();
 
-    // Governance guards (pool-allowed / budget / rate); a rejection is wrapped in `finish_rejected`
+    // Governance guards (pool ACL / group limits); a rejection is wrapped in `finish_rejected`
     // inside `governance_guard` (this handler just returns that response). `charged` gates the
-    // post-admission refund so an un-charged (store-error-Allow) admit never blind-refunds.
-    let charged = match governance_guard(&app, &gov, PROTO_ANTHROPIC, &model, started, charged_at) {
+    // post-admission refund so an un-charged (governance-off) admit never blind-refunds.
+    let admit = match governance_guard(&app, &gov, PROTO_ANTHROPIC, &model, started, charged_at) {
         Err(resp) => return *resp,
-        Ok(charged) => charged,
+        Ok(admit) => admit,
     };
+    let charged = admit.is_some();
 
     match app.by_model.get(&model) {
         Some(&i) if app.lanes[i].provider == provider => {
@@ -1262,7 +1265,7 @@ pub(crate) async fn adhoc(
                 None,
                 PROTO_ANTHROPIC,
                 crate::handlers::chat(PROTO_ANTHROPIC),
-                usage_sink(&app, &gov, charged_at),
+                usage_sink(&app, &gov, charged_at, admit),
             )
             .await;
             finish_admitted(

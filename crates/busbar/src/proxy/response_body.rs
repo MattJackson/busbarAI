@@ -8,9 +8,9 @@ pub(crate) struct UsageSink {
     /// The resolved cost model (chain topology; rates are NOT used at accrual - tokens are the
     /// ledger, spend derives at read time). Arc bump per request, rebuilt on config apply.
     pub(crate) cost: Arc<crate::cost::CostModel>,
-    /// The resolved virtual key, shared via `Arc` — `key_id` and `budget_period` are read THROUGH it
-    /// (`key.id` / `key.budget_period`) at charge time, so building the sink (once per request) and
-    /// cloning it (once per failover attempt) is a refcount bump, not two per-request `String` clones.
+    /// The resolved virtual key, shared via `Arc`: `key_id` is read THROUGH it (`key.id`) at
+    /// charge time, so building the sink (once per request) and cloning it (once per failover
+    /// attempt) is a refcount bump, not a per-request `String` clone.
     pub(crate) key: Arc<crate::governance::VirtualKey>,
     /// Wall-clock epoch (seconds) captured ONCE at header-arrival time for this request. Both the
     /// flat per-request fee (`ingress::budget_check` → `try_charge_request_within_budget`) and the token fee (`record_tokens`,
@@ -20,6 +20,13 @@ pub(crate) struct UsageSink {
     /// calls read the clock independently and could land in different 60s rate windows / budget
     /// periods, mis-attributing spend and TPM.
     pub(crate) charged_at: u64,
+    /// The admission's in-flight HOLDS (the `concurrent` limit gauges), released when the LAST
+    /// clone of this sink drops - i.e. when the response stream completes or the request context
+    /// unwinds on any error path. `Arc` because the sink clones per failover attempt; `None` for
+    /// a chain with no concurrent caps or a test sink built off the admission path. Never read:
+    /// the field exists purely so its Drop (on the last clone) releases the gauges.
+    #[allow(dead_code)]
+    pub(crate) admit: Option<Arc<crate::governance::AdmitGrant>>,
 }
 
 /// Body wrapper that drives IR-based usage extraction, billing, and mid-stream error handling for

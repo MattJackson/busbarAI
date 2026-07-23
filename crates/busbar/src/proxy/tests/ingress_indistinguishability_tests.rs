@@ -437,12 +437,8 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -454,6 +450,7 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     // Lane speaks OpenAI; ingress is Anthropic → cross-protocol translation hop.
@@ -538,12 +535,8 @@ async fn test_same_protocol_nonstream_multichunk_counts_usage() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -555,6 +548,7 @@ async fn test_same_protocol_nonstream_multichunk_counts_usage() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     // An OpenAI chat.completion 2xx with 600 input + 400 output = 1000 tokens, with `usage` at the
@@ -805,12 +799,8 @@ async fn test_mid_stream_transport_error_does_not_bill_partial_usage() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -822,6 +812,7 @@ async fn test_mid_stream_transport_error_does_not_bill_partial_usage() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     let app = TestApp::new()
@@ -2719,12 +2710,8 @@ async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             charged_at,
@@ -2735,6 +2722,7 @@ async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     // Cross-protocol translator: openai EGRESS SSE → anthropic INGRESS SSE. The tap scans the
@@ -2844,12 +2832,8 @@ async fn test_cancel_drop_bills_partial_tokens() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             charged_at,
@@ -2860,6 +2844,7 @@ async fn test_cancel_drop_bills_partial_tokens() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     let translate = crate::proto::StreamTranslate::new("anthropic", "openai")
@@ -2949,12 +2934,8 @@ async fn test_cancel_drop_skips_billing_on_aborted_translate() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             charged_at,
@@ -2965,6 +2946,7 @@ async fn test_cancel_drop_skips_billing_on_aborted_translate() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     let translate = crate::proto::StreamTranslate::new("anthropic", "openai")

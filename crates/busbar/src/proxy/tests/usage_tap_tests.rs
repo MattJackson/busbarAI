@@ -215,17 +215,27 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
     let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, None).expect("gov"));
     // No per-request fee, no rate card: token accrual changes `tokens`, never `spend_cents`.
-    let cost = Arc::new(crate::cost::CostModel::flat(0));
+    // Keys attribute all-time now, so the per-DAY window under test lives on the bound GROUP's
+    // day bucket (a loose day budget materialises it without ever blocking).
+    let groups = std::collections::BTreeMap::from([(
+        "daygrp".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 1_000_000,
+                per: Some(crate::config::groups::LimitWindow::Day),
+            }],
+        },
+    )]);
+    let cost = Arc::new(crate::cost::CostModel::resolve_parts(None, 0, &groups));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: Some("daygrp".to_string()),
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -247,6 +257,7 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at,
+        admit: None,
     });
 
     // `record_ir_usage` ledgers per-model tokens keyed by the lane's wire model, so it needs a
@@ -273,25 +284,31 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
     };
     record_ir_usage(&usage, &sink, Some(&lane));
 
-    // The 1000 tokens must be ledgered in the charged_at day's window...
+    // The 1000 tokens must be ledgered in the charged_at day's window of the GROUP day bucket...
     let in_window = gov
-        .usage_for(&cost, &key.id, charged_at)
+        .derived_bucket_usage(&cost, "group:daygrp@day", "day", true, charged_at)
         .expect("usage read")
-        .map(|u| u.tokens)
-        .unwrap_or(0);
+        .tokens;
     assert_eq!(
         in_window, 1000,
         "token accrual must be attributed to the charged_at (header-arrival) day window"
     );
     // ...and NOT in today's window (which the old `now()`-based code would have used).
     let in_today = gov
-        .usage_for(&cost, &key.id, crate::store::now())
+        .derived_bucket_usage(&cost, "group:daygrp@day", "day", true, crate::store::now())
         .expect("usage read")
-        .map(|u| u.tokens)
-        .unwrap_or(0);
+        .tokens;
     assert_eq!(
         in_today, 0,
         "token accrual must NOT leak into the wall-clock 'now' window (the #29 split bug)"
+    );
+    // The key's all-time attribution bucket sees the tokens regardless of the day (sanity).
+    assert_eq!(
+        gov.usage_for(&cost, &key.id, crate::store::now())
+            .expect("usage read")
+            .map(|u| u.tokens)
+            .unwrap_or(0),
+        1000
     );
 }
 
@@ -312,12 +329,8 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: Some(1_000_000),
-                budget_period: "daily".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1_700_000_000,
@@ -328,6 +341,7 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
         charged_at: 1_700_000_000,
+        admit: None,
     });
 
     // The accrual path only runs with a serving lane (no lane = nothing to attribute), so build

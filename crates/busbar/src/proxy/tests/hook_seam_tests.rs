@@ -1330,12 +1330,8 @@ async fn send_user_projects_governance_key_identity() {
         .create_key(
             NewKeySpec {
                 name: "sales-team".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "monthly".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             1,
@@ -1434,14 +1430,10 @@ async fn send_user_falls_back_to_synthesized_group_key_identity() {
         id: "eng-oncall".to_string(),
         key_hash: "principal:eng-oncall".to_string(),
         name: "eng-oncall".to_string(),
-        allowed_pools: vec![],
-        max_budget_cents: None,
-        budget_period: "total".to_string(),
-        rpm_limit: None,
-        tpm_limit: None,
+        allowed_pools: None,
         enabled: true,
         created_at: 0,
-        budget_group: None,
+        group: None,
         labels: Default::default(),
     });
     let rc = RequestCtx::new(60);
@@ -1504,14 +1496,10 @@ async fn forward_with_pool_keyed_threads_group_key_to_pool_policy() {
         id: "eng-oncall".to_string(),
         key_hash: "principal:eng-oncall".to_string(),
         name: "eng-oncall".to_string(),
-        allowed_pools: vec![],
-        max_budget_cents: None,
-        budget_period: "total".to_string(),
-        rpm_limit: None,
-        tpm_limit: None,
+        allowed_pools: None,
         enabled: true,
         created_at: 0,
-        budget_group: None,
+        group: None,
         labels: Default::default(),
     });
     let body = Bytes::from(serde_json::to_vec(&body()).unwrap());
