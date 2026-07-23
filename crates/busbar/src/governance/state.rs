@@ -30,7 +30,7 @@ impl GovState {
                 by_hash,
                 by_access_key_id,
             }),
-            rate: Sharded::new(),
+            concurrent: RwLock::new(HashMap::new()),
             admin_token_hash: admin_token
                 .as_ref()
                 .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
@@ -141,15 +141,11 @@ impl GovState {
             // durable store's UNIQUE(key_hash) constraint is satisfied; never used to authenticate.
             key_hash: format!("binding:{id}"),
             name: spec.name,
+            // C6 intent carried intact from the mint body: None = all pools; Some([]) = none.
             allowed_pools: spec.allowed_pools,
-            // Keys carry NO inline limits (S1): all enforcement flows through the bound group.
-            max_budget_cents: None,
-            budget_period: BUDGET_PERIOD_TOTAL.to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
             enabled: true,
             created_at: now,
-            budget_group: spec.budget_group,
+            group: spec.group,
             labels: spec.labels,
         };
         self.store.put_key(&binding)?;
@@ -183,13 +179,9 @@ impl GovState {
             key_hash: format!("binding:{id}"),
             name: spec.name,
             allowed_pools: spec.allowed_pools,
-            max_budget_cents: None,
-            budget_period: BUDGET_PERIOD_TOTAL.to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
             enabled: true,
             created_at: now,
-            budget_group: spec.budget_group,
+            group: spec.group,
             labels: spec.labels,
         };
         self.store.put_key_with_aws_credential(
@@ -269,29 +261,20 @@ impl GovState {
         if tokens.is_zero() {
             return; // nothing to ledger
         }
-        // A missing budget group cannot block ACCRUAL (the request was already admitted/served);
-        // degrade to the key-only chain so the tokens are never lost.
+        // A missing group cannot block ACCRUAL (the request was already admitted/served);
+        // degrade to the key-only bucket so the tokens are never lost.
         let chain = match cost.chain_for(key) {
             Ok(c) => c,
             Err(missing) => {
-                tracing::warn!(key = %key.id, budget_group = missing,
-                    "budget_group missing at accrual; tokens ledgered to the key bucket only");
-                let solo = VirtualKey {
-                    budget_group: None,
-                    ..key.clone()
-                };
-                self.accrue_bucket(&solo.id, &solo.budget_period, model, tokens, now);
-                self.add_rate_tokens(&key.id, now, tokens.total());
+                tracing::warn!(key = %key.id, group = missing,
+                    "group missing at accrual; tokens ledgered to the key bucket only");
+                self.accrue_bucket(&key.id, super::WINDOW_TOTAL, model, tokens, now);
                 return;
             }
         };
         for bucket in chain.iter() {
-            self.accrue_bucket(bucket.bucket_id, bucket.budget_period, model, tokens, now);
+            self.accrue_bucket(bucket.bucket_id, bucket.window, model, tokens, now);
         }
-        // Feed the TPM counter (raw total across tiers). `add_rate_tokens` is UPDATE-only: it
-        // credits an existing entry (created by `check_rate` for a capped key) but never
-        // materialises one, so the rate map stays bounded for caps-free deployments.
-        self.add_rate_tokens(&key.id, now, tokens.total());
     }
 
     /// Accrue `tokens` under `model` to ONE bucket's current-window ledger cell (straddle-safe;
@@ -359,50 +342,58 @@ impl GovState {
         self.store.list_metering(bucket)
     }
 
-    /// READ-ONLY rate-limit headroom for a key: the fraction `[0.0, 1.0]` of the most-constrained
-    /// configured rate limit (RPM and/or TPM) still available in the current 60s window, where `1.0`
-    /// is "fully unused" and `0.0` is "at the cap". `None` when the key has neither an RPM nor a TPM
-    /// limit (nothing to be near). The routing `usage` policy ranks by this (more headroom = preferred).
+    /// READ-ONLY limit headroom for a key: the fraction `[0.0, 1.0]` of the most-constrained
+    /// `requests`/`tokens` limit across the key's GROUP CHAIN still available in each limit's own
+    /// current window, where `1.0` is "fully unused" and `0.0` is "at the cap". `None` when the
+    /// chain carries no requests/tokens limit (nothing to be near). The routing `usage` policy
+    /// ranks by this (more headroom = preferred).
     ///
-    /// This is a pure observation: it NEVER mutates the window (no increment, no stale-reset, no
-    /// sweep) — `check_rate` owns all of that on the admission path. A stale entry (from an older
-    /// window) reads as fully-available for the current window, which is correct: its counters do not
-    /// carry forward. When both RPM and TPM are set, the headroom is the MINIMUM of the two (the
-    /// tighter constraint governs how close the key is to a 429).
+    /// This is a pure observation: it NEVER mutates a cell (no charge, no stale-reset, no sweep):
+    /// `try_admit` owns all of that on the admission path. A stale (older-window) cell reads as
+    /// fully-available for the current window, which is correct: its counters do not carry
+    /// forward. The headroom is the MINIMUM across every windowed requests/tokens cap in the chain
+    /// (the tightest constraint governs how close the key is to a 429).
     // Wired into production routing: `proxy engine::decide_policy_order` calls this on the key it
     // looked up (one lookup shared with the `send_user` identity projection) to produce the
     // per-lane `usage` signal; the in-crate tests also exercise it directly.
-    pub(crate) fn rate_headroom(&self, key: &VirtualKey, now: u64) -> Option<f64> {
-        if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
-            return None;
-        }
-        let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
-        // Counters for THIS window only; a stale (older-window) entry contributes zero usage.
-        let (requests, tokens) = match self.rate.read(&key.id).get(&key.id) {
-            Some(st) if st.window_start == window => (st.requests, st.tokens),
-            _ => (0, 0),
-        };
-        let mut headroom = 1.0_f64;
-        if let Some(rpm) = key.rpm_limit {
-            // `rpm == 0` is a fully-closed limit: no headroom. Avoid a divide-by-zero.
-            let frac = if rpm == 0 {
-                0.0
-            } else {
-                1.0 - (requests as f64 / rpm as f64)
+    pub(crate) fn rate_headroom(
+        &self,
+        cost: &crate::cost::CostModel,
+        key: &VirtualKey,
+        now: u64,
+    ) -> Option<f64> {
+        let chain = cost.chain_for(key).ok()?;
+        let mut headroom: Option<f64> = None;
+        for bucket in chain.iter() {
+            if bucket.requests_cap.is_none() && bucket.tokens_cap.is_none() {
+                continue;
+            }
+            let window = budget_window(bucket.window, now);
+            // Counters for THIS window only; a stale (older-window) cell contributes zero usage.
+            let (requests, tokens) = match self.budget.read(bucket.bucket_id).get(bucket.bucket_id)
+            {
+                Some(cell) if cell.window_start == window => (cell.requests, cell.total_tokens()),
+                _ => (0, 0),
             };
-            headroom = headroom.min(frac);
-        }
-        if let Some(tpm) = key.tpm_limit {
-            let frac = if tpm == 0 {
-                0.0
-            } else {
-                1.0 - (tokens as f64 / tpm as f64)
+            let frac = |used: u64, cap: u64| -> f64 {
+                // `cap == 0` is a fully-closed limit: no headroom. Avoid a divide-by-zero.
+                if cap == 0 {
+                    0.0
+                } else {
+                    1.0 - (used as f64 / cap as f64)
+                }
             };
-            headroom = headroom.min(frac);
+            let mut h = f64::INFINITY;
+            if let Some(cap) = bucket.requests_cap {
+                h = h.min(frac(requests, cap));
+            }
+            if let Some(cap) = bucket.tokens_cap {
+                h = h.min(frac(tokens, cap));
+            }
+            let h = h.clamp(0.0, 1.0);
+            headroom = Some(headroom.map_or(h, |cur: f64| cur.min(h)));
         }
-        // Clamp to [0,1]: a window that already exceeded its cap (in-flight concurrency can push usage
-        // past the limit, per `check_rate`'s best-effort note) would otherwise yield a negative value.
-        Some(headroom.clamp(0.0, 1.0))
+        headroom
     }
 
     /// Acquire the combined key caches (`by_hash` + `by_access_key_id`) for reading, recovering from a
@@ -458,13 +449,9 @@ impl GovState {
             key_hash: hash,
             name: spec.name,
             allowed_pools: spec.allowed_pools,
-            max_budget_cents: spec.max_budget_cents,
-            budget_period: spec.budget_period,
-            rpm_limit: spec.rpm_limit,
-            tpm_limit: spec.tpm_limit,
             enabled: true,
             created_at: now,
-            budget_group: spec.budget_group,
+            group: spec.group,
             labels: spec.labels,
         };
         self.store.put_key(&key)?;
@@ -507,13 +494,9 @@ impl GovState {
             key_hash: hash,
             name: spec.name,
             allowed_pools: spec.allowed_pools,
-            max_budget_cents: spec.max_budget_cents,
-            budget_period: spec.budget_period,
-            rpm_limit: spec.rpm_limit,
-            tpm_limit: spec.tpm_limit,
             enabled: true,
             created_at: now,
-            budget_group: spec.budget_group,
+            group: spec.group,
             labels: spec.labels,
         };
         // ATOMIC: persist the bearer key row and its paired AWS credential in ONE transaction (see
@@ -579,28 +562,17 @@ impl GovState {
         Ok(Some((key, secret)))
     }
 
-    /// Apply a partial update to an existing key: enable/disable it, or adjust its rate/budget caps.
-    /// `key_hash`/`name`/`allowed_pools`/`budget_period`/`created_at` are preserved (the secret is
-    /// never re-minted). Returns `Ok(None)` when the key does not exist (so the caller can 404),
-    /// `Ok(Some(updated_metadata))` otherwise. Validation (non-negative budget, non-zero rate caps on
-    /// a *present* value) is the caller's responsibility, mirroring `create_key`'s ingress.
-    ///
-    /// THREE-STATE caps. The three cap fields (`rpm_limit`/`tpm_limit`/`max_budget_cents`) are
-    /// `Option<Option<T>>` so the API can distinguish all three intents the JSON allows:
-    ///   - `None`: field absent from the request body -> leave the stored value unchanged.
-    ///   - `Some(None)`: field present as JSON `null` -> CLEAR the cap to unlimited (None).
-    ///   - `Some(Some)`: field present with a value -> SET the cap to that value.
-    ///
-    /// The old single-`Option` shape conflated absent and present-null, so a cap could never be
-    /// cleared back to unlimited once set — only widened/narrowed. `enabled` stays a plain `Option`
-    /// (a bool has no "unlimited"/clear state; absent vs present is its only distinction).
+    /// Apply a partial update to an existing key. Keys are PURE AUTH (S1), so the mutable surface
+    /// is auth-shaped only: `enabled` (freeze/unfreeze the binding) and `group` (rebind the limit
+    /// chain; three-state: absent = unchanged, `null` = unbind to unlimited, a value = rebind -
+    /// the caller validates the named group exists). `key_hash`/`name`/`allowed_pools`/
+    /// `created_at` are preserved (the credential is never re-minted). Returns `Ok(None)` when the
+    /// key does not exist (so the caller can 404), `Ok(Some(updated_metadata))` otherwise.
     pub(crate) fn update_key(
         &self,
         id: &str,
         enabled: Option<bool>,
-        rpm_limit: Option<Option<u32>>,
-        tpm_limit: Option<Option<u32>>,
-        max_budget_cents: Option<Option<i64>>,
+        group: Option<Option<String>>,
     ) -> StoreResult<Option<VirtualKey>> {
         let Some(mut key) = self.store.get_key(id)? else {
             return Ok(None);
@@ -608,17 +580,9 @@ impl GovState {
         if let Some(e) = enabled {
             key.enabled = e;
         }
-        // Outer `Some` = the field was present in the request. The inner option is then assigned
-        // verbatim: inner `Some(v)` sets the cap, inner `None` (JSON null) clears it to unlimited.
-        // Outer `None` (field absent) falls through and leaves the stored value untouched.
-        if let Some(r) = rpm_limit {
-            key.rpm_limit = r;
-        }
-        if let Some(t) = tpm_limit {
-            key.tpm_limit = t;
-        }
-        if let Some(b) = max_budget_cents {
-            key.max_budget_cents = b;
+        // Outer `Some` = the field was present in the request; inner `None` (JSON null) unbinds.
+        if let Some(g) = group {
+            key.group = g;
         }
         // `put_key` UPSERTs on the PRIMARY KEY `id` with identical `key_hash`, so this is an in-place
         // update of the existing row (no secret rotation). Refresh the in-memory cache so the change
@@ -647,22 +611,31 @@ impl GovState {
         now: u64,
     ) -> StoreResult<()> {
         let keys = self.store.list_keys()?;
-        let key_buckets = keys
-            .iter()
-            .map(|k| (k.id.as_str(), k.budget_period.as_str()));
+        let key_buckets = keys.iter().map(|k| (k.id.as_str(), super::WINDOW_TOTAL));
         let group_buckets = cost
             .groups()
             .iter()
-            .map(|g| (g.bucket_id.as_str(), g.budget_period.as_str()));
+            .flat_map(|g| g.buckets.iter())
+            .map(|b| (b.bucket_id.as_str(), b.window));
         for (bucket_id, period) in key_buckets.chain(group_buckets) {
             let window = budget_window(period, now);
             let ledger = self.store.get_usage(bucket_id, window)?;
             if ledger.requests == 0 && ledger.models.is_empty() {
                 continue;
             }
+            // A pre-split persisted row has `billable_requests == 0` but a nonzero `requests`
+            // (the two counters were one field); seed billable from `requests` so its fee base is
+            // not silently zeroed on the first post-upgrade boot.
+            let billable = if ledger.billable_requests == 0 && ledger.requests > 0 {
+                ledger.requests
+            } else {
+                ledger.billable_requests
+            };
             let mut cell = BudgetCell::fresh(window);
             cell.requests = ledger.requests;
             cell.flushed_requests = ledger.requests;
+            cell.billable_requests = billable;
+            cell.flushed_billable_requests = billable;
             cell.models = ledger
                 .models
                 .iter()
@@ -691,10 +664,10 @@ impl GovState {
         now: u64,
     ) -> StoreResult<Option<DerivedUsage>> {
         match self.store.get_key(id)? {
-            Some(key) => Ok(Some(self.derived_bucket_usage(
+            Some(_) => Ok(Some(self.derived_bucket_usage(
                 cost,
                 id,
-                &key.budget_period,
+                super::WINDOW_TOTAL,
                 true,
                 now,
             )?)),
@@ -717,9 +690,11 @@ impl GovState {
         if let Some(cell) = self.budget.read(bucket_id).get(bucket_id) {
             if cell.window_start == window {
                 return Ok(DerivedUsage {
+                    // Fee derives from the BILLABLE (2xx-only) count; `requests` reports the
+                    // admission count (the requests-limit truth).
                     spend_cents: cost.derive_spend_cents(
                         cell.model_views(),
-                        cell.requests,
+                        cell.billable_requests,
                         include_request_fee,
                     ),
                     tokens: cell.total_tokens(),
@@ -731,7 +706,7 @@ impl GovState {
         Ok(DerivedUsage {
             spend_cents: cost.derive_spend_cents(
                 ledger.models.iter().map(|m| (m.model.as_str(), &m.tokens)),
-                ledger.requests,
+                ledger.billable_requests,
                 include_request_fee,
             ),
             tokens: ledger.total_tokens(),
@@ -787,19 +762,17 @@ impl GovState {
         };
         let mut out = Vec::with_capacity(chain.len());
         for bucket in chain.iter() {
-            let window = budget_window(bucket.budget_period, now);
-            let (spend_micros, requests) = {
+            let window = budget_window(bucket.window, now);
+            let spend_micros = {
                 let map = self.budget.read(bucket.bucket_id);
                 match map.get(bucket.bucket_id) {
-                    Some(cell) if cell.window_start == window => (
-                        cost.derive_spend_micros(cell.model_views(), cell.requests, bucket.is_key),
-                        cell.requests,
-                    ),
-                    _ => (0, 0),
+                    Some(cell) if cell.window_start == window => {
+                        cost.derive_spend_micros(cell.model_views(), cell.billable_requests, true)
+                    }
+                    _ => 0,
                 }
             };
-            let _ = requests;
-            let remaining_micros = bucket.max_budget_cents.map(|cap| {
+            let remaining_micros = bucket.budget_cap.map(|cap| {
                 cap.saturating_mul(10_000)
                     .saturating_sub(spend_micros)
                     .max(0)
@@ -810,228 +783,132 @@ impl GovState {
                 spend_micros_at_current_rate: spend_micros,
                 remaining_micros,
                 window_start: window,
-                budget_period: bucket.budget_period.to_string(),
+                budget_period: bucket.window.to_string(),
             });
         }
         out
     }
 
-    /// check + consume one request slot against the key's RPM/TPM for the current 60s window.
-    /// `Ok(())` admits the request (and counts it); `Err(retry_after_secs)` rejects it (429).
-    ///
-    /// RPM is enforced precisely: the request counter is incremented synchronously on admission.
-    ///
-    /// TPM is BEST-EFFORT, not a hard cap. Token counts are fed in post-response (from the usage
-    /// tap, via `record_tokens`), so this check only sees tokens from requests
-    /// that have ALREADY COMPLETED in the current 60s window. Consequences operators must know:
-    /// - In-flight concurrent requests are not counted, so N requests can pass the check
-    ///   simultaneously while each is under the limit and collectively exceed the configured TPM.
-    /// - The first request of each window is admitted regardless of TPM, because the window's token
-    ///   counter starts at zero (it is intentionally not carried across the 60s boundary).
-    ///
-    /// A hard TPM cap would require reserving estimated tokens at admit time; that is out of scope
-    /// for the single-node best-effort limiter. Use the budget cap (cents) for a real spend ceiling.
-    pub(crate) fn check_rate(&self, key: &VirtualKey, now: u64) -> Result<(), u64> {
-        if key.rpm_limit.is_none() && key.tpm_limit.is_none() {
-            return Ok(());
+    /// The in-flight gauge for `group`, materialised on first sight. Read-locked resolve on the
+    /// hot path (an existing gauge mutates through the shared atomic); the write lock is taken
+    /// only to insert a missing gauge (once per group per process lifetime).
+    fn concurrent_gauge(&self, group: &str) -> Arc<std::sync::atomic::AtomicI64> {
+        if let Some(g) = self
+            .concurrent
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group)
+        {
+            return g.clone();
         }
-        let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
-        let retry = (window + RATE_WINDOW_SECS).saturating_sub(now).max(1);
-        // Bounded eviction of stale entries (keys that have gone silent in older windows) keeps the
-        // map from leaking entries forever. This is an O(active-key-count) scan, so we DO NOT run it
-        // on every admission — it is purely a memory bound and is not required for correctness (the
-        // per-key staleness reset below already resets the looked-up key's own entry). Instead we
-        // amortize it: only every `RATE_SWEEP_INTERVAL`th call pays the sweep.
-        //
-        // SINGLE write-lock: the amortized sweep and the per-key check/increment share ONE
-        // `rate_write()` guard. The sweep-needed flag is the cheap lock-free ticker below (an atomic
-        // `fetch_add` + `is_multiple_of`), computed BEFORE the guard; then under one guard we do the
-        // conditional sweep first and the per-key resolution second. Acquiring the write lock twice
-        // (sweep, then a fresh guard for the per-key work) cost a second lock round-trip on every
-        // admission for no benefit: the per-key critical section is O(1) and the sweep, when it fires,
-        // is O(active-key-count) but rare (every `RATE_SWEEP_INTERVAL`th call) — coalescing them under
-        // one guard cannot lengthen the common-case hold (no sweep runs) and saves an acquire/release.
-        // Correctness is unchanged: the sweep only evicts entries whose `window_start != window`, and
-        // the per-key resolution below re-checks/refreshes this key's own entry for `window` regardless
-        // of whether the sweep ran, so nothing the sweep does (or skips) can admit a request that
-        // should be rejected or vice versa.
-        // MSRV NOTE: `u32::is_multiple_of` was stabilized in Rust 1.87. It is used here (and clippy's
-        // `manual_is_multiple_of` actively REWRITES the equivalent `% N == 0` form back to it, so the
-        // two cannot both be satisfied without a declared MSRV), which makes 1.87 the effective
-        // minimum supported toolchain. Cargo.toml declares `rust-version = "1.87"` so the constraint
-        // is visible to toolchain installers, CI matrices, and clippy's `incompatible_msrv` lint,
-        // rather than surfacing as a silent compile failure on an older pinned stable.
-        // POST-increment semantics: test the value AFTER this call's increment, not the
-        // pre-increment value `fetch_add` returns. This fixes two off-by-one defects of the naive
-        // `fetch_add(..).is_multiple_of(N)`:
-        //  1. The ticker starts at 0, so the pre-increment value on the very first call is 0, which
-        //     IS a multiple of N — the sweep would fire immediately on startup against an empty map.
-        //  2. When the u32 wraps, the pre-increment value 0xFFFFFFFF is NOT a multiple of N, so one
-        //     sweep cycle would be silently skipped every ~4B calls.
-        // Using `wrapping_add(1)` on the returned pre-increment value reproduces the value now stored
-        // in the atomic: the sweep fires on calls N, 2N, 3N, ... and the wrap boundary (pre = 0xFFFF…F
-        // -> post = 0, a multiple of N) is handled correctly with no skipped cycle.
-        // Per-shard amortized sweep + per-key check/increment under THIS key's shard lock. The ticker
-        // is the shard's own, so each shard sweeps only its own (~1/GOV_SHARDS) entries — the memory
-        // bound holds per shard, and cross-key contention is confined to a single shard.
-        let shard = self.rate.shard_for(&key.id);
-        let sweep_needed = shard
-            .sweep_ticker
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1)
-            .is_multiple_of(crate::limits::rate_sweep_interval());
-        let mut map = shard.map.write().unwrap_or_else(|p| p.into_inner());
-        if sweep_needed {
-            map.retain(|_, st| st.window_start == window);
-        }
-        // Resolve this key's entry for the CURRENT window. Three cases:
-        //  - present & current-window  -> mutate in place (fast path; no key clone).
-        //  - present but STALE         -> reset it in place to the current window (counters back to
-        //                                 zero). This per-key reset is what makes correctness
-        //                                 independent of the global sweep above: even if the stale
-        //                                 entry was not evicted, we never carry an old window's
-        //                                 counts forward. (The previous code relied on the eager
-        //                                 retain having already removed it, so `or_insert_with`
-        //                                 minted a fresh one; with the sweep amortized we must reset
-        //                                 explicitly here.)
-        //  - absent                    -> insert a fresh entry (cold path; pays the key clone).
-        let st = match map.get_mut(&key.id) {
-            Some(st) if st.window_start == window => st,
-            Some(st) => {
-                *st = RateState {
-                    window_start: window,
-                    requests: 0,
-                    tokens: 0,
-                };
-                st
-            }
-            None => map.entry(key.id.clone()).or_insert_with(|| RateState {
-                window_start: window,
-                requests: 0,
-                tokens: 0,
-            }),
-        };
-        if let Some(tpm) = key.tpm_limit {
-            if st.tokens >= tpm as u64 {
-                return Err(retry);
-            }
-        }
-        if let Some(rpm) = key.rpm_limit {
-            if st.requests >= rpm {
-                return Err(retry);
-            }
-        }
-        st.requests += 1;
-        Ok(())
+        self.concurrent
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(group.to_string())
+            .or_default()
+            .clone()
     }
 
-    /// Add tokens to the key's rate window for TPM accounting. Called post-response from
-    /// `record_tokens` (the production token-fee path; `record_request` is test-only). `now` is the
-    /// request's pinned `charged_at` (the header-arrival epoch), i.e. the window the request STARTED
-    /// in — NOT a fresh completion clock. This matters for a request that straddles a 60s boundary: it is admitted by
-    /// `check_rate` in its start window W0, but by the time its (streamed) response completes, a LATER
-    /// admission for the same key may have rolled the live entry forward to W1. The credit then
-    /// arrives carrying `charged_at` in W0 while the entry lives in W1.
-    ///
-    /// CREDIT THE ENTRY'S LIVE WINDOW. A start-window OLDER-or-equal to the
-    /// entry's window is the straddle case above: the request's tokens belong to the same TPM budget
-    /// the key is currently spending, so we credit the entry's existing (live) window IN PLACE rather
-    /// than dropping the credit or rewinding the entry to the older start window. Previously a `<`
-    /// (older start window than entry) was either dropped or — worse — used to REINITIALISE the entry
-    /// back to W0, destroying the live W1 counter; either way a boundary-straddling request never
-    /// counted against TPM, letting a key sustain above its configured limit. Only a start-window
-    /// strictly NEWER than the entry (the entry is genuinely stale — an old window the sweep has not
-    /// yet evicted) reinitialises the entry to the new window before crediting.
-    ///
-    /// UPDATE-ONLY (the rate map must not grow for uncapped keys). This method credits an entry that
-    /// ALREADY EXISTS but never materialises a missing one. `check_rate` only ever creates entries for
-    /// keys that carry an RPM/TPM cap (it early-returns for uncapped keys before touching the map), so
-    /// the only entries that exist belong to capped keys — and crediting one is always safe. An
-    /// uncapped key has no entry, and because we do not create one here, it cannot grow the map
-    /// through this path. (Materialising unconditionally — as very old code did on EVERY response, for
-    /// EVERY key — leaked one entry per uncapped key forever, since the sweep only evicts entries
-    /// whose window is stale and a busy uncapped key keeps refreshing its own.)
-    pub(crate) fn add_rate_tokens(&self, key_id: &str, now: u64, tokens: u64) {
-        if tokens == 0 {
-            return;
-        }
-        let window = now / RATE_WINDOW_SECS * RATE_WINDOW_SECS;
-        let mut map = self.rate.write(key_id);
-        let Some(st) = map.get_mut(key_id) else {
-            // No entry -> do NOT materialise one. An uncapped key has no entry (check_rate never made
-            // one), so skipping creation here bounds the rate map for caps-free deployments. A capped
-            // key's entry is created by `check_rate` on admission, so the credit lands there.
-            return;
-        };
-        if window <= st.window_start {
-            // Start-window older-or-equal to the entry's window. Either the same window (the normal
-            // case) or a boundary-straddling request whose live entry has rolled forward since
-            // admission. The tokens belong to the key's currently-live TPM budget, so credit the
-            // entry's existing window IN PLACE — do not rewind it to the older start window (which
-            // would wipe the live counter) and do not drop the credit (which would let a straddling
-            // request escape TPM accounting).
-            st.tokens = st.tokens.saturating_add(tokens);
-        } else {
-            // Start-window strictly NEWER than the entry -> the entry is genuinely stale (an old
-            // window the amortized sweep has not yet evicted). Reinitialise it for this window and
-            // credit there, so a stale entry never carries old counts forward.
-            *st = RateState {
-                window_start: window,
-                requests: 0,
-                tokens,
-            };
-        }
+    /// TEST-ONLY: the current in-flight count for a group's `concurrent` gauge.
+    #[cfg(test)]
+    pub(crate) fn concurrent_in_flight(&self, group: &str) -> i64 {
+        self.concurrent
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(group)
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
-    /// ATOMIC budget CHAIN check-and-charge for the admission path - the HARD-cap primitive.
+    /// ATOMIC chain ADMISSION for the request path - the generic limit engine's hard-cap
+    /// primitive (P4). Resolves the key's enforcement chain ([key attribution bucket] -> the bound
+    /// group's window buckets -> parent's -> ... root) and admits ONLY if EVERY limit of EVERY
+    /// group in the chain admits (AND / most-restrictive). Keys carry NO limits of their own; a
+    /// key with no group is authed + unlimited (its 1-bucket chain has no caps).
     ///
-    /// Resolves the key's enforcement chain ([key bucket] -> budget_group -> parent -> ... root),
-    /// derives every bucket's CURRENT spend from its token ledger x the rate card (plus the flat
-    /// per-request fee x requests on the key bucket only - pure recompute, no spend cache), and
-    /// admits ONLY if EVERY bucket is under its own cap (AND / most-restrictive). On admit, every
-    /// bucket in the chain is charged one request in the SAME critical section - all-or-nothing;
-    /// on any bucket over cap, NOTHING is charged and the blocking bucket is NAMED in the error.
+    /// Order of enforcement:
+    /// 1. `enabled: false` anywhere in the chain FREEZES it - rejected before anything is charged.
+    /// 2. `concurrent` gauges (instantaneous): each capped group's gauge is compare-and-incremented
+    ///    innermost-first; on any full gauge the already-taken holds are released and the request
+    ///    is rejected naming that group. The holds ride the returned [`AdmitGrant`] (RAII release).
+    /// 3. Windowed limits (`requests` / `tokens` / `budget`): every involved shard lock is
+    ///    acquired in ASCENDING shard-index order (canonical = deadlock-free), every bucket is
+    ///    CHECKED against each of its caps for its OWN current window, and only if all pass is
+    ///    every bucket CHARGED one request in the SAME critical section - all-or-nothing. On any
+    ///    blocked bucket NOTHING is charged, the concurrent holds are released, and the exact
+    ///    blocking (group, metric, window) is named with a `Retry-After` for rolling windows.
     ///
-    /// ATOMICITY: every involved shard lock is acquired in ASCENDING shard-index order before any
-    /// check runs (a canonical order = deadlock-free), so N concurrent requests can never each read
-    /// "under budget" and all charge. The single-bucket case (no budget group - the common fleet)
-    /// degenerates to exactly the old one-shard critical section. Zero heap allocation on the
-    /// admit path: the chain and the guard set live in fixed arrays; the rejection variant (cold)
-    /// may allocate its group-name String.
+    /// Metric semantics per bucket:
+    /// - `requests`: precise - the +1 charge is synchronous with the check.
+    /// - `tokens`: BEST-EFFORT (the old TPM posture) - tokens land post-response, so the cap
+    ///   blocks the NEXT request once the ledgered total has crossed it; in-flight requests'
+    ///   tokens are invisible to admissions racing them.
+    /// - `budget`: derived at check time from the cell's token ledger x the current rate card,
+    ///   PLUS the flat per-request fee x its request count; the prospective post-charge spend
+    ///   (one more fee) must stay within the cap, and a bucket already at/over cap blocks. The
+    ///   fee component is hard; token overshoot past a cap is bounded by the tokens of every
+    ///   in-flight admitted request (as with TPM, a hard token cap would need admit-time
+    ///   reservation - out of scope).
     ///
-    /// Residual (documented honestly): token cost is reconciled post-response (`record_usage`), so
-    /// an admitted request's tokens are invisible to admissions that race it. The FEE component is
-    /// hard (charged atomically at admission), but the token overshoot past a cap is bounded by
-    /// the token cost of EVERY in-flight admitted request for the bucket (i.e. by the concurrency
-    /// in flight when the cap is reached), not by a single request. A hard token cap would require
-    /// reserving estimated tokens at admit time - out of scope, as with TPM.
-    ///
-    /// SYNCHRONOUS and INFALLIBLE (in-memory cells; no store round-trip, no await). The flat fee is
-    /// charged HERE (as +1 request; spend derives), so the caller must NOT re-charge in `finish`;
-    /// a non-2xx outcome refunds via [`GovState::refund_request`].
-    pub(crate) fn try_charge_request_within_budget(
+    /// SYNCHRONOUS and INFALLIBLE (in-memory cells; no store round-trip, no await). The flat fee
+    /// is charged HERE (as +1 request per bucket; spend derives), so the caller must NOT re-charge
+    /// in `finish`; a non-2xx outcome refunds via [`GovState::refund_request`]. Zero heap
+    /// allocation on the admit path (fixed scratch arrays; the grant's gauge Vec is empty for the
+    /// common no-concurrent-cap chain; the rejection variant (cold) allocates its group-name
+    /// String).
+    pub(crate) fn try_admit(
         &self,
         cost: &crate::cost::CostModel,
         key: &VirtualKey,
         now: u64,
-    ) -> Result<(), BudgetBlocked> {
+    ) -> Result<AdmitGrant, LimitBlocked> {
         let chain = match cost.chain_for(key) {
             Ok(c) => c,
             // FAIL-CLOSED: a key bound to a group this node's config does not know cannot be
             // admitted under the chain's caps, so it is not admitted at all.
-            Err(missing) => return Err(BudgetBlocked::MissingGroup(missing.to_string())),
+            Err(missing) => return Err(LimitBlocked::MissingGroup(missing.to_string())),
         };
-        let fee = cost.price_per_request_cents();
-        // FIRST-REQUEST GUARD: a flat fee that ALONE exceeds the key's whole cap can never be
-        // admitted, even into a fresh window. (Group caps have no fee component.)
-        if let Some(m) = key.max_budget_cents {
-            if fee > m {
-                return Err(BudgetBlocked::Key);
+        let groups = cost.groups();
+
+        // 1. FREEZE check: any `enabled: false` group in the chain rejects (C10) - checked before
+        // any gauge or charge so a frozen chain mutates nothing.
+        for &gi in chain.group_indices() {
+            if !groups[gi].enabled {
+                return Err(LimitBlocked::Disabled(groups[gi].name.clone()));
             }
         }
 
-        // Acquire every involved shard's write lock in ASCENDING shard order (dedup) - fixed-size
-        // scratch, no heap. `guard_slot[i]` = the position in `guards` holding bucket i's shard.
+        // 2. CONCURRENT holds, innermost-first. `fetch_update` is a CAS loop: the increment lands
+        // only while strictly under the cap, so N racing admissions can never jointly overshoot.
+        // On a full gauge, roll back the holds already taken (the grant drop) and name the group.
+        let mut grant = AdmitGrant::default();
+        for &gi in chain.group_indices() {
+            let Some(cap) = groups[gi].concurrent_cap else {
+                continue;
+            };
+            let gauge = self.concurrent_gauge(&groups[gi].name);
+            let cap = i64::try_from(cap).unwrap_or(i64::MAX);
+            let admitted = gauge
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    (v < cap).then_some(v + 1)
+                })
+                .is_ok();
+            if !admitted {
+                drop(grant); // release the holds taken so far
+                return Err(LimitBlocked::Limit {
+                    group: groups[gi].name.clone(),
+                    metric: "concurrent",
+                    window: None,
+                    retry_after: None,
+                });
+            }
+            grant.gauges.push(gauge);
+        }
+
+        // 3. WINDOWED limits: acquire every involved shard's write lock in ASCENDING shard order
+        // (dedup) - fixed-size scratch, no heap. `guard_slot[i]` = the position in `guards`
+        // holding bucket i's shard.
+        let fee = cost.price_per_request_cents();
         let mut shard_idx = [0usize; crate::cost::MAX_CHAIN];
         let mut n = 0usize;
         for bucket in chain.iter() {
@@ -1041,18 +918,18 @@ impl GovState {
         let mut order: [usize; crate::cost::MAX_CHAIN] = shard_idx;
         order[..n].sort_unstable();
         let mut guards: [Option<std::sync::RwLockWriteGuard<'_, HashMap<String, BudgetCell>>>;
-            crate::cost::MAX_CHAIN] = Default::default();
+            crate::cost::MAX_CHAIN] = [const { None }; crate::cost::MAX_CHAIN];
         let mut guard_shards = [usize::MAX; crate::cost::MAX_CHAIN];
         let mut g = 0usize;
-        for &s in order[..n].iter() {
-            if g > 0 && guard_shards[g - 1] == s {
+        for &sh in order[..n].iter() {
+            if g > 0 && guard_shards[g - 1] == sh {
                 continue; // dedup: two buckets sharing a shard use one guard
             }
-            let shard = self.budget.shard_at(s);
+            let shard = self.budget.shard_at(sh);
             // Amortized bounded eviction of stale cells, per acquired shard - identical rationale
-            // to `check_rate` (POST-increment ticker; age-based, period-agnostic retain so no
-            // still-current cell of ANY period is evicted; `window_start == 0` = the all-time
-            // window, never aged out).
+            // to the old rate-map sweep (POST-increment ticker; age-based, window-agnostic retain
+            // so no still-current cell of ANY window is evicted; `window_start == 0` = the
+            // all-time window, never aged out).
             let sweep_needed = shard
                 .sweep_ticker
                 .fetch_add(1, Ordering::Relaxed)
@@ -1066,67 +943,89 @@ impl GovState {
                 });
             }
             guards[g] = Some(map);
-            guard_shards[g] = s;
+            guard_shards[g] = sh;
             g += 1;
         }
         let guard_for = |shards: &[usize], target: usize| -> usize {
             shards[..g]
                 .iter()
-                .position(|&s| s == target)
+                .position(|&sh| sh == target)
                 .expect("every bucket's shard was acquired")
         };
 
         // PASS 1 - CHECK every bucket under the held guards: resolve its cell for ITS OWN current
-        // window (stale cells reset in place; missing cells read as empty) and derive spend. The
-        // key bucket includes the flat fee (its prospective post-charge spend adds one more fee);
-        // group buckets derive tokens-only and block when already at/over cap.
+        // window (missing/stale cells read as empty) and test each configured cap. The blocking
+        // bucket is named exactly: (group, metric, window) + retry-after for a rolling window.
         for (bi, bucket) in chain.iter().enumerate() {
+            if bucket.requests_cap.is_none()
+                && bucket.tokens_cap.is_none()
+                && bucket.budget_cap.is_none()
+            {
+                continue; // uncapped bucket (e.g. the key's attribution bucket) never blocks
+            }
             let gi = guard_for(&guard_shards, shard_idx[bi]);
-            let Some(cap) = bucket.max_budget_cents else {
-                continue; // uncapped bucket never blocks
-            };
-            let window = budget_window(bucket.budget_period, now);
+            let window = budget_window(bucket.window, now);
             let map = guards[gi].as_deref().expect("guard held");
-            // Derive from the LIVE cell when it holds this window OR a NEWER one (the straddle:
-            // `now` is the pinned `charged_at`, so a request admitted just before a boundary can
-            // arrive after a concurrent admission already rolled the cell forward - its charge
-            // lands on the live cell in PASS 2, so the check must read that same cell's spend,
-            // never treat it as a fresh window). Only a genuinely STALE (older-window) or absent
-            // cell reads as zero spend.
-            let derived = match map.get(bucket.bucket_id) {
-                Some(cell) if cell.window_start >= window => {
-                    cost.derive_spend_cents(cell.model_views(), cell.requests, bucket.is_key)
-                }
-                _ => 0, // stale or absent cell = fresh window = zero spend
+            // Read the LIVE cell when it holds this window OR a NEWER one (the straddle: `now` is
+            // the pinned `charged_at`, so a request admitted just before a boundary can arrive
+            // after a concurrent admission already rolled the cell forward - its charge lands on
+            // the live cell in PASS 2, so the check must read that same cell, never treat it as a
+            // fresh window). Only a genuinely STALE (older-window) or absent cell reads as empty.
+            let (requests, tokens, derived) = match map.get(bucket.bucket_id) {
+                Some(cell) if cell.window_start >= window => (
+                    cell.requests,
+                    if bucket.tokens_cap.is_some() {
+                        cell.total_tokens()
+                    } else {
+                        0
+                    },
+                    if bucket.budget_cap.is_some() {
+                        cost.derive_spend_cents(cell.model_views(), cell.billable_requests, true)
+                    } else {
+                        0
+                    },
+                ),
+                _ => (0, 0, 0), // stale or absent cell = fresh window = nothing used
             };
-            let blocked = if bucket.is_key {
-                derived.saturating_add(fee) > cap
+            let blocked_metric = if bucket
+                .requests_cap
+                .is_some_and(|cap| requests.saturating_add(1) > cap)
+            {
+                Some("requests")
+            } else if bucket.tokens_cap.is_some_and(|cap| tokens >= cap) {
+                Some("tokens")
+            } else if bucket
+                .budget_cap
+                .is_some_and(|cap| derived >= cap || derived.saturating_add(fee) > cap)
+            {
+                Some("budget")
             } else {
-                derived >= cap
+                None
             };
-            if blocked {
-                return Err(match bucket.group_name {
-                    None => BudgetBlocked::Key,
-                    Some(name) => BudgetBlocked::Group(name.to_string()),
+            if let Some(metric) = blocked_metric {
+                drop(guards); // release the shard locks before the (cold) rejection build
+                drop(grant); // release the concurrent holds - nothing was admitted
+                return Err(LimitBlocked::Limit {
+                    group: bucket
+                        .group_name
+                        .expect("only group buckets carry caps")
+                        .to_string(),
+                    metric,
+                    window: Some(bucket.window),
+                    retry_after: super::window_end(bucket.window, now)
+                        .map(|end| end.saturating_sub(now).max(1)),
                 });
             }
         }
 
         // PASS 2 - CHARGE every bucket (+1 request, dirty) under the SAME held guards: atomic
-        // all-or-nothing with the checks above.
+        // all-or-nothing with the checks above. STRADDLE-SAFE cell resolution (mirrors
+        // `accrue_bucket`): reset ONLY a genuinely stale cell (this window strictly newer); a cell
+        // holding the SAME or a NEWER window is charged IN PLACE.
         for (bi, bucket) in chain.iter().enumerate() {
             let gi = guard_for(&guard_shards, shard_idx[bi]);
-            let window = budget_window(bucket.budget_period, now);
+            let window = budget_window(bucket.window, now);
             let map = guards[gi].as_deref_mut().expect("guard held");
-            // STRADDLE-SAFE cell resolution (mirrors `accrue_bucket` / `add_rate_tokens`): reset
-            // ONLY a genuinely stale cell (this window strictly newer). A cell holding the SAME or
-            // a NEWER window is charged IN PLACE - rewinding a newer live cell to this request's
-            // older `charged_at` window (the pre-fix `!=` arm) zeroed the live window's accrued
-            // tokens/requests AND its flush baselines, wiping real spend at every window boundary
-            // with a straddling admission. The µs-race residual: a straddle-charged fee whose
-            // refund later arrives carrying the older window is dropped by `refund_bucket`
-            // (bounded to one boundary-racing request; the safe direction - never a blind
-            // decrement of another window's charge).
             let cell = match map.get_mut(bucket.bucket_id) {
                 Some(c) if window > c.window_start => {
                     *c = BudgetCell::fresh(window);
@@ -1138,9 +1037,10 @@ impl GovState {
                     .or_insert_with(|| BudgetCell::fresh(window)),
             };
             cell.requests = cell.requests.saturating_add(1);
+            cell.billable_requests = cell.billable_requests.saturating_add(1);
             cell.dirty = true;
         }
-        Ok(())
+        Ok(grant)
     }
 
     /// Refund the request charged at admission across EVERY bucket of the key's chain, for a
@@ -1153,11 +1053,11 @@ impl GovState {
         let Ok(chain) = cost.chain_for(key) else {
             // The charge failed closed on a missing group, so nothing was charged; refund only the
             // key bucket defensively (it floors at 0 on a no-op).
-            self.refund_bucket(&key.id, &key.budget_period, now);
+            self.refund_bucket(&key.id, super::WINDOW_TOTAL, now);
             return;
         };
         for bucket in chain.iter() {
-            self.refund_bucket(bucket.bucket_id, bucket.budget_period, now);
+            self.refund_bucket(bucket.bucket_id, bucket.window, now);
         }
     }
 
@@ -1166,7 +1066,11 @@ impl GovState {
         let mut map = self.budget.write(bucket_id);
         if let Some(cell) = map.get_mut(bucket_id) {
             if cell.window_start == window {
-                cell.requests = cell.requests.saturating_sub(1);
+                // Refund ONLY the billable (fee-base) counter - the flat fee bills 2xx only. The
+                // admission `requests` counter is NEVER refunded, so a failed request still
+                // consumed its requests-limit slot (a caller cannot escape the requests cap by
+                // hammering failures).
+                cell.billable_requests = cell.billable_requests.saturating_sub(1);
                 cell.dirty = true;
             }
         }
@@ -1200,6 +1104,7 @@ impl GovState {
             window: u64,
             delta: UsageDelta,
             cur_requests: u64,
+            cur_billable_requests: u64,
             cur_models: Vec<(std::sync::Arc<str>, TierTokens)>,
         }
         // Snapshot dirty cells across ALL shards and clear their flags. One shard is locked at a
@@ -1232,9 +1137,12 @@ impl GovState {
                     window: cell.window_start,
                     delta: UsageDelta {
                         requests: signed(cell.requests) - signed(cell.flushed_requests),
+                        billable_requests: signed(cell.billable_requests)
+                            - signed(cell.flushed_billable_requests),
                         models,
                     },
                     cur_requests: cell.requests,
+                    cur_billable_requests: cell.billable_requests,
                     cur_models: cell
                         .models
                         .iter()
@@ -1264,6 +1172,7 @@ impl GovState {
                     if let Some(cell) = map.get_mut(&snap.bucket_id) {
                         if cell.window_start == snap.window {
                             cell.flushed_requests = snap.cur_requests;
+                            cell.flushed_billable_requests = snap.cur_billable_requests;
                             for (model, cur) in &snap.cur_models {
                                 if let Some(mc) = cell.models.iter_mut().find(|m| m.model == *model)
                                 {

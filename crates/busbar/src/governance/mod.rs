@@ -6,43 +6,31 @@
 //! per-key usage counters (spend/tokens/requests) per budget window. Historical request logs are
 //! NOT stored here (they go to the observability pipeline). The `Store` CONTRACT lives in
 //! `busbar-api`; the DEFAULT backend is the in-memory `MemoryStore` (ephemeral, zero-setup), with
-//! `SqliteStore` (durable) and future backends as swappable plugin crates chosen by `governance.store`.
+//! `SqliteStore` (durable) and future backends as swappable plugin crates chosen by `store.module`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Length of the fixed rate-limit window (RPM/TPM are evaluated per this many seconds).
-const RATE_WINDOW_SECS: u64 = 60;
-
-/// Amortize the bounded eviction sweep of the rate map: a full `retain` (O(active keys)) runs at
-/// most once per this many `check_rate` admissions, instead of on every single admission. Per-key
-/// correctness does not depend on the sweep — `check_rate` already resets a looked-up key's entry
-/// when its `window_start` is stale — so the sweep is purely to bound the map's memory by evicting
-/// keys that have gone silent. Running it occasionally keeps the per-request cost off the hot path
-/// while still guaranteeing the map cannot grow unboundedly across windows.
-/// Operator-tunable via `governance.rate_sweep_interval` (default 256). Read in production through
-/// `crate::limits::rate_sweep_interval()`; this const is retained (as the config DEFAULT) only for
-/// the tests that exercise the default-configured sweep cadence.
-#[cfg(test)]
-const RATE_SWEEP_INTERVAL: u32 = crate::config::DEFAULT_RATE_SWEEP_INTERVAL;
 /// Seconds in a UTC day, for `budget_window`'s day/month arithmetic. `pub(crate)` so cross-module
 /// TEST code can reference it as `crate::governance::SECS_PER_DAY`; production modules that need the
 /// same value independently (e.g. `sigv4.rs`) keep a private copy where layering prohibits importing
 /// it for a one-line constant.
 pub(crate) const SECS_PER_DAY: u64 = 86_400;
 
-// ── Budget-period sentinel tokens (matched in `budget_window`) ───────────────────────────────────
-/// The "all-time" budget window sentinel: a single window from epoch 0.
-pub(crate) const BUDGET_PERIOD_TOTAL: &str = "total";
-/// The "daily" budget window sentinel: resets at UTC midnight.
-pub(crate) const BUDGET_PERIOD_DAILY: &str = "daily";
-/// The "monthly" budget window sentinel: resets at UTC first-of-month.
-pub(crate) const BUDGET_PERIOD_MONTHLY: &str = "monthly";
-/// The "minute" budget window sentinel (1.5.0 groups: `per: minute`): resets each UTC minute.
-pub(crate) const BUDGET_PERIOD_MINUTE: &str = "minute";
-/// The "hour" budget window sentinel (1.5.0 groups: `per: hour`): resets each UTC hour.
-pub(crate) const BUDGET_PERIOD_HOUR: &str = "hour";
+// ── Window sentinel tokens (C8 nouns; matched in `budget_window`). The SAME strings are the
+// `groups:` config vocabulary (`per: minute|hour|day|month|total`), the ledger-bucket window
+// suffix, and the metrics/error dimension - one vocabulary everywhere. ─────────────────────────────
+/// The "all-time" window sentinel: a single window from epoch 0.
+pub(crate) const WINDOW_TOTAL: &str = "total";
+/// The "day" window sentinel: resets at UTC midnight.
+pub(crate) const WINDOW_DAY: &str = "day";
+/// The "month" window sentinel: resets at UTC first-of-month.
+pub(crate) const WINDOW_MONTH: &str = "month";
+/// The "minute" window sentinel: resets each UTC minute.
+pub(crate) const WINDOW_MINUTE: &str = "minute";
+/// The "hour" window sentinel: resets each UTC hour.
+pub(crate) const WINDOW_HOUR: &str = "hour";
 
 // ── Virtual-key / bearer-secret formats ──────────────────────────────────────────────────────────
 /// The `"vk_"` prefix prepended to the 16-hex-char hash prefix to form a virtual-key id.
@@ -63,16 +51,7 @@ const AWS_SECRET_ACCESS_KEY_LEN: usize = 40;
 
 // SQLite `busy_timeout` for the on-disk DB: a transient lock contention retries for this many
 // milliseconds before failing, rather than erroring instantly with `SQLITE_BUSY`. Operator-tunable
-// via `governance.sqlite_busy_timeout_ms` (default 5000); read through `crate::limits`.
-
-/// Per-key rate-limit state for the current 60s window. Ephemeral (in-memory, not persisted):
-/// rate windows are single-node; cross-node distributed limits would be a future concern.
-#[derive(Default)]
-struct RateState {
-    window_start: u64,
-    requests: u32,
-    tokens: u64,
-}
+// via the store module's own `settings.busy_timeout_ms` (default 5000).
 
 /// One model's in-cell token counters: the CURRENT tier tokens plus the last durably-ACKNOWLEDGED
 /// (flushed) tier tokens - the additive-flush baseline, per model. The model name is an
@@ -92,18 +71,28 @@ struct ModelCell {
 /// x requests on the key bucket) - tokens are the only stored truth, so a rate-card correction
 /// reprices everything on the next read with no data fix. The durable store is a write-behind
 /// layer flushed off the request path. One cell per bucket (current window only; reset on
-/// rollover), so growth is bucket-count-bounded like the rate map.
+/// rollover), so growth is bucket-count-bounded (keys + group-window buckets).
 #[derive(Clone, Default)]
 struct BudgetCell {
     window_start: u64,
+    /// ADMISSION count: incremented once per admitted request, NEVER refunded. This backs the
+    /// `requests`-LIMIT metric, so a caller cannot escape the requests cap by hammering failing
+    /// requests (each still consumed a request slot at admission).
     requests: u64,
-    /// The last durably-acknowledged request count - the additive-flush baseline. Each flush
-    /// writes only the DELTA (current - flushed) via `Store::add_usage`, then advances the
+    /// BILLABLE request count: admitted requests MINUS non-2xx refunds. This backs the flat
+    /// per-request-FEE component of the `budget` metric (the fee bills 2xx only), so budget spend
+    /// derives from this, never from `requests`. Charged with `requests` at admission; a non-2xx
+    /// outcome decrements ONLY this via `refund_bucket`.
+    billable_requests: u64,
+    /// The last durably-acknowledged admission-request count - the additive-flush baseline. Each
+    /// flush writes only the DELTA (current - flushed) via `Store::add_usage`, then advances the
     /// baselines on success, so a shared store accumulates the TRUE fleet total across nodes. On
     /// a failed flush the baseline does not advance and the cell is re-marked dirty, so the
     /// unacked delta is retried (at-least-once: an ack lost after the write landed can
     /// double-count at most one flush interval - documented).
     flushed_requests: u64,
+    /// The billable-request flush baseline (twin of `flushed_requests` for the fee-base counter).
+    flushed_billable_requests: u64,
     /// Per-(model, tier) token counters + flush baselines. Small Vec (the models this bucket
     /// actually used), scanned linearly.
     models: Vec<ModelCell>,
@@ -152,19 +141,62 @@ impl BudgetCell {
     }
 }
 
-/// Why an admission was refused by the budget chain - carried to ingress so the 429 NAMES the
-/// blocking bucket. Built only on the rejection path (cold), so the owned String is off the admit
-/// hot path.
+/// Why an admission was refused by the group limit chain - carried to ingress so the rejection
+/// NAMES the exact blocking bucket (group + metric + window). Built only on the rejection path
+/// (cold), so the owned Strings are off the admit hot path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum BudgetBlocked {
-    /// The key's own (innermost) budget bucket is exhausted.
-    Key,
-    /// The named budget group (the key's group or an ancestor) is exhausted.
-    Group(String),
-    /// The key names a `budget_group` that does not exist in this node's config - FAIL-CLOSED
+pub(crate) enum LimitBlocked {
+    /// A specific limit bucket blocked: the owning group, the metric (`requests` | `tokens` |
+    /// `budget` | `concurrent`), the window word (`None` for the instantaneous `concurrent`
+    /// gauge), and - for a windowed limit - the seconds until its window rolls (`None` for
+    /// `total`, which never rolls).
+    Limit {
+        group: String,
+        metric: &'static str,
+        window: Option<&'static str>,
+        retry_after: Option<u64>,
+    },
+    /// A group in the chain is FROZEN (`enabled: false`): every request charging through it is
+    /// rejected while its history is kept (C10).
+    Disabled(String),
+    /// The key names a `group` that does not exist in this node's config - FAIL-CLOSED
     /// (mint and boot validate this; it can only arise from a shared durable store whose keys
     /// reference a group another node's config no longer has).
     MissingGroup(String),
+}
+
+/// The in-flight HOLD an admission acquires on every `concurrent`-capped group in the key's chain.
+/// RAII: dropping the grant releases the gauges, so the in-flight count can never leak - the grant
+/// rides inside the request's `UsageSink` (dropped when the response stream completes / the request
+/// context unwinds on any error path). The Vec is EMPTY (no allocation) for the common chain with
+/// no concurrent caps.
+#[derive(Default)]
+pub(crate) struct AdmitGrant {
+    gauges: Vec<Arc<std::sync::atomic::AtomicI64>>,
+}
+
+impl AdmitGrant {
+    /// TEST-ONLY: how many gauges this grant holds.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.gauges.len()
+    }
+}
+
+impl Drop for AdmitGrant {
+    fn drop(&mut self) {
+        for g in &self.gauges {
+            g.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl std::fmt::Debug for AdmitGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmitGrant")
+            .field("gauges", &self.gauges.len())
+            .finish()
+    }
 }
 
 /// A derived (read-time) usage view for admin/metrics consumers: `spend_cents` is COMPUTED from
@@ -319,10 +351,12 @@ pub(crate) struct GovState {
     /// Both auth-path caches under ONE lock so `refresh` swaps them atomically — a reader can never
     /// observe a new `by_hash` against a stale `by_access_key_id`. See `GovCaches`.
     caches: RwLock<GovCaches>,
-    /// per-key RPM/TPM windows (ephemeral). SHARDED by key id so concurrent admissions for different
-    /// keys don't serialize on one lock (each key deterministically owns one shard; per-key window
-    /// semantics are unchanged — see [`Sharded`]).
-    rate: Sharded<RateState>,
+    /// Per-GROUP in-flight gauges for the `concurrent` limit metric (instantaneous - no window).
+    /// Keyed by group NAME (stable across config applies, while `CostModel` group indices are
+    /// not); values are `Arc`ed atomics so an [`AdmitGrant`] holds its release handles without
+    /// touching the map again. Read-locked on the hot path (atomics mutate through a shared ref);
+    /// write-locked only to materialise a gauge on first sight.
+    concurrent: RwLock<HashMap<String, Arc<std::sync::atomic::AtomicI64>>>,
     /// SHA-256 hex digest of the configured /admin bearer token, computed once at construction. The
     /// plaintext token is NOT retained — only its digest, which is all the constant-time compare on
     /// the /admin path needs (less plaintext secret held in memory). `None` = admin API disabled.
@@ -331,7 +365,7 @@ pub(crate) struct GovState {
     /// charged) on the request hot path with NO await and NO store round-trip. Keyed by BUCKET id:
     /// a virtual key's id, or `group:<name>` for a budget-group bucket - key buckets and group
     /// buckets are the same machinery. One `BudgetCell` per bucket for its CURRENT window (reset on
-    /// rollover), so the map is bucket-count-bounded exactly like `rate`. The durable store is a
+    /// rollover), so the map is bucket-count-bounded (keys + group-window buckets). The durable store is a
     /// WRITE-BEHIND layer: `flush_budgets` pushes each dirty cell's per-model TOKEN deltas
     /// additively off the request path, and boot `hydrate_budgets` re-loads accrued ledgers so a
     /// restart forgets nothing. The atomic chain check-and-charge acquires every involved shard
@@ -355,16 +389,15 @@ pub(crate) struct GovState {
     denylist: RwLock<std::collections::HashSet<String>>,
 }
 
-/// Parameters for minting a new virtual key (from the management API).
+/// Parameters for minting a new virtual key (from the management API) - PURE AUTH (S1): identity,
+/// pool grants, at most one group binding, labels. No limits: they live on the bound group.
 pub(crate) struct NewKeySpec {
     pub(crate) name: String,
-    pub(crate) allowed_pools: Vec<String>,
-    pub(crate) max_budget_cents: Option<i64>,
-    pub(crate) budget_period: String,
-    pub(crate) rpm_limit: Option<u32>,
-    pub(crate) tpm_limit: Option<u32>,
-    /// Optional `governance.budget_groups` binding (validated to exist at mint).
-    pub(crate) budget_group: Option<String>,
+    /// Pool grants with the C6 intent carried intact: `None` = the mint body OMITTED
+    /// `allowed_pools` = ALL pools; `Some(list)` = exactly those; `Some([])` = NO pools.
+    pub(crate) allowed_pools: Option<Vec<String>>,
+    /// Optional `groups:` binding (validated to exist at mint).
+    pub(crate) group: Option<String>,
     /// Optional mint-time labels echoed onto metrics (never interpreted by enforcement).
     pub(crate) labels: std::collections::BTreeMap<String, String>,
 }
@@ -409,18 +442,17 @@ pub(crate) fn synthesize_principal_key(
     }
     let table = bindings?;
     let granting: Vec<&crate::config::RoleBindingCfg> = principal
-        .groups
+        .roles
         .iter()
         .filter_map(|role| table.get(role))
         .collect();
     if granting.is_empty() {
         return None;
     }
-    // Pool union under C6 semantics: OMITTED `allowed_pools` on any granting binding = ALL pools;
-    // an explicit list contributes its entries; an explicit `[]` contributes nothing. An
-    // all-bindings-empty union = the EMPTY SET = no data-plane access (fail closed). The
-    // `VirtualKey` runtime encoding keeps `[]` = all pools, so "all" maps to an empty Vec and an
-    // empty union maps to `None` here (no key at all - nothing to admit).
+    // Pool union under C6 semantics: OMITTED `allowed_pools` on any granting binding = ALL pools
+    // (`None` in the runtime encoding too); an explicit list contributes its entries; an explicit
+    // `[]` contributes nothing. An all-bindings-empty union = the EMPTY SET = no data-plane access
+    // (fail closed: no key at all - nothing to admit).
     let mut pools: Vec<String> = Vec::new();
     let mut all_pools = false;
     for b in &granting {
@@ -435,12 +467,14 @@ pub(crate) fn synthesize_principal_key(
             }
         }
     }
-    if all_pools {
-        pools.clear();
+    let allowed_pools = if all_pools {
+        None // any omitted grant widens the union to ALL pools
     } else if pools.is_empty() {
         // Every granting binding said `allowed_pools: []` - the empty set. No access (C6).
         return None;
-    }
+    } else {
+        Some(pools)
+    };
     // The bound group (first in role order). Group limits are enforced through the group chain;
     // the key itself carries NO inline caps (keys are pure auth).
     let group = granting.iter().find_map(|b| b.group.clone());
@@ -453,14 +487,10 @@ pub(crate) fn synthesize_principal_key(
             .name
             .clone()
             .unwrap_or_else(|| principal.id.clone()),
-        allowed_pools: pools,
-        max_budget_cents: None,
-        budget_period: BUDGET_PERIOD_TOTAL.to_string(),
-        rpm_limit: None,
-        tpm_limit: None,
+        allowed_pools,
         enabled: true,
         created_at: 0,
-        budget_group: group,
+        group,
         labels: std::collections::BTreeMap::new(),
     }))
 }
@@ -546,37 +576,53 @@ fn generate_aws_secret_access_key() -> Result<String, getrandom::Error> {
     Ok(out)
 }
 
-/// Whether `key` may target `pool` (empty allowed_pools = all pools).
+/// Whether `key` may target `pool` (C6: an OMITTED grant = all pools; an explicit list is
+/// exhaustive; an explicit `[]` = NO pools). Delegates to the contract crate's encoding.
 pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
-    key.allowed_pools.is_empty() || key.allowed_pools.iter().any(|p| p == pool)
+    key.pool_allowed(pool)
 }
 
-/// The epoch start of the budget window containing `now` for a given period. "total" = a
-/// single all-time window (0); "daily" = UTC midnight; "monthly" = UTC first-of-month.
+/// The epoch start of the window containing `now` for a given window word (C8 nouns): `total` = a
+/// single all-time window (0); `day` = UTC midnight; `month` = UTC first-of-month.
 pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
     match period {
-        BUDGET_PERIOD_MINUTE => now / 60 * 60,
-        BUDGET_PERIOD_HOUR => now / 3600 * 3600,
-        BUDGET_PERIOD_DAILY => now / SECS_PER_DAY * SECS_PER_DAY,
-        BUDGET_PERIOD_MONTHLY => {
+        WINDOW_MINUTE => now / 60 * 60,
+        WINDOW_HOUR => now / 3600 * 3600,
+        WINDOW_DAY => now / SECS_PER_DAY * SECS_PER_DAY,
+        WINDOW_MONTH => {
             let days = (now / SECS_PER_DAY) as i64;
             let (y, m, _) = civil_from_days(days);
             (days_from_civil(y, m, 1) as u64) * SECS_PER_DAY
         }
-        BUDGET_PERIOD_TOTAL => 0, // explicit all-time window (the documented sentinel)
-        // An unrecognized period (typo such as `monthlly`, or an unsupported value such as
-        // `weekly`) is NOT silently accepted as `total`: it almost always means a misconfigured
-        // key. We fail safe to the all-time window (0) — the tightest enforcement, never wider —
-        // but emit a diagnostic so the misconfiguration is visible instead of silent. (Rejecting
-        // the value at key-creation time is the admin handler's job; this is the evaluation-path
-        // backstop.) Misconfiguration is rare, so the per-evaluation warn is acceptable.
+        WINDOW_TOTAL => 0, // explicit all-time window (the documented sentinel)
+        // An unrecognized window word can only arise from a corrupt/foreign store row (config
+        // parse rejects it). Fail SAFE to the all-time window (0), the tightest enforcement,
+        // never wider, with a diagnostic so the corruption is visible instead of silent.
         other => {
             tracing::warn!(
-                budget_period = other,
-                "unrecognized budget_period; enforcing as all-time ('total') window"
+                window = other,
+                "unrecognized limit window; enforcing as all-time ('total') window"
             );
             0
         }
+    }
+}
+
+/// The epoch at which `period`'s window containing `now` ROLLS to the next window - the
+/// `Retry-After` source for a windowed-limit rejection. `None` for `total` (never rolls) and for
+/// an unrecognized word (backstopped to `total` above).
+pub(crate) fn window_end(period: &str, now: u64) -> Option<u64> {
+    match period {
+        WINDOW_MINUTE => Some(now / 60 * 60 + 60),
+        WINDOW_HOUR => Some(now / 3600 * 3600 + 3600),
+        WINDOW_DAY => Some(now / SECS_PER_DAY * SECS_PER_DAY + SECS_PER_DAY),
+        WINDOW_MONTH => {
+            let days = (now / SECS_PER_DAY) as i64;
+            let (y, m, _) = civil_from_days(days);
+            let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+            Some((days_from_civil(ny, nm, 1) as u64) * SECS_PER_DAY)
+        }
+        _ => None,
     }
 }
 
@@ -714,3 +760,7 @@ pub(crate) fn spawn_budget_flusher(
 #[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/limits_tests.rs"]
+mod limits_tests;

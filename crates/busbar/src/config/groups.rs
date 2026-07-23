@@ -72,7 +72,7 @@ impl LimitMetric {
 }
 
 /// A limit's accounting window (C8: nouns only).
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LimitWindow {
     Minute,
@@ -80,6 +80,20 @@ pub(crate) enum LimitWindow {
     Day,
     Month,
     Total,
+}
+
+impl LimitWindow {
+    /// The config spelling - ALSO the runtime window-period sentinel (`governance::budget_window`
+    /// matches these exact strings) and the metrics/error vocabulary. One vocabulary everywhere.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            LimitWindow::Minute => "minute",
+            LimitWindow::Hour => "hour",
+            LimitWindow::Day => "day",
+            LimitWindow::Month => "month",
+            LimitWindow::Total => "total",
+        }
+    }
 }
 
 /// One parsed limit: exactly one metric key + its amount, plus the window for windowed metrics.

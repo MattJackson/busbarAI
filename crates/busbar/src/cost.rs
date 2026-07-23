@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The COST MODEL: rate-card resolution + ledger-to-spend derivation + budget-group chain
-//! resolution. This is the ONE module the engine calls for anything cost-shaped; the `Store` trait
-//! (in `busbar-api`) stays the persistence seam and carries ONLY tokens.
+//! The COST + LIMIT MODEL: rate-card resolution, ledger-to-spend derivation, and the resolved
+//! `groups:` limit topology the generic limit engine (governance) enforces. This is the ONE module
+//! the engine calls for anything cost- or limit-shaped; the `Store` trait (in `busbar-api`) stays
+//! the persistence seam and carries ONLY tokens.
 //!
-//! Principles (the 1.5.0 cost-model spec):
+//! Principles (the 1.5.0 redesign):
 //! - TOKENS ARE THE LEDGER; dollars are ALWAYS derived, never stored as truth. Every spend figure
 //!   is computed here at read time as `ledger x current rate card`, so correcting a rate is a
 //!   config edit + reload - past and future derived figures instantly become right. (Honest limit:
@@ -17,6 +18,9 @@
 //!   per-request fee counts); present => authoritative + complete (validated at boot).
 //! - INTEGER MATH ONLY on the hot path: config floats convert ONCE here to nano-units per token;
 //!   derivation is a few u128 multiply-adds over the models a bucket actually used.
+//! - GROUPS are the ONE limit tree (S3): a group's generic limits (requests / tokens / budget per
+//!   window, plus the instantaneous `concurrent` gauge) resolve here into per-(group, window)
+//!   ENFORCEMENT BUCKETS; keys are pure auth and contribute no caps of their own.
 //!
 //! A `CostModel` is resolved from config at boot / config-apply and lives on `App` (rebuilt on
 //! apply), while the `GovState` token ledger survives the apply - which is exactly what makes
@@ -26,12 +30,20 @@ use std::collections::HashMap;
 
 use busbar_api::TierTokens;
 
-/// Maximum budget-group chain depth (a key's own bucket not counted). Validated at boot; the
-/// runtime walk also clamps here so a corrupt store/config can never loop.
+use crate::config::groups::LimitMetric;
+
+/// Maximum group chain depth (a key's own bucket not counted). Validated at boot; the runtime walk
+/// also clamps here so a corrupt store/config can never loop.
 pub(crate) const MAX_GROUP_DEPTH: usize = 8;
 
-/// Maximum enforcement-chain length: the key's own bucket + `MAX_GROUP_DEPTH` group buckets.
-pub(crate) const MAX_CHAIN: usize = 1 + MAX_GROUP_DEPTH;
+/// Distinct accounting windows a group's windowed limits can use (minute|hour|day|month|total) -
+/// the per-group ceiling on enforcement buckets.
+pub(crate) const MAX_WINDOWS: usize = 5;
+
+/// Maximum enforcement-chain length in BUCKETS: the key's own attribution bucket + every ancestor
+/// group's per-window buckets. Sizes the fixed (no-heap) scratch arrays of the atomic admission
+/// check.
+pub(crate) const MAX_CHAIN: usize = 1 + MAX_GROUP_DEPTH * MAX_WINDOWS;
 
 /// Nano-units (1e-9 abstract cost unit) per cent (1e-2 unit): the divisor that lands a derived
 /// nano-unit total in whole cents.
@@ -40,8 +52,10 @@ const NANOS_PER_CENT: u128 = 10_000_000;
 /// Nano-units per micro-unit, for the hook seam's `spend_micros` projection.
 const NANOS_PER_MICRO: u128 = 1_000;
 
-/// The prefix namespacing budget-GROUP bucket ids in the store, so a group named like a key id can
-/// never collide with a real key's bucket. Key buckets use the bare key id.
+/// The prefix namespacing GROUP bucket ids in the store, so a group named like a key id can never
+/// collide with a real key's bucket. Key buckets use the bare key id. A group's per-window buckets
+/// are `group:<name>@<window>` - one ledger row per (group, window granularity), so a group with
+/// limits in several windows never double-counts a flush into one row.
 pub(crate) const GROUP_BUCKET_PREFIX: &str = "group:";
 
 /// One model's per-token rates in integer NANO-units per token (config micro-units x 1000, rounded
@@ -85,15 +99,41 @@ impl RateNanos {
     }
 }
 
-/// One resolved budget group: its bucket identity, cap, window, and parent (by index, so the chain
-/// walk is index-chasing with zero hashing).
+/// One (group, window) ENFORCEMENT BUCKET, resolved from the group's windowed limits: every limit
+/// of the group that shares this window enforces against this one ledger cell. The three windowed
+/// metrics are independent caps on the same cell's counters (requests / total tokens / derived
+/// spend).
+#[derive(Debug, Clone)]
+pub(crate) struct GroupBucket {
+    /// The store/ledger bucket id: `group:<name>@<window>`.
+    pub(crate) bucket_id: String,
+    /// The window word (`minute` | `hour` | `day` | `month` | `total`) - the `budget_window`
+    /// period sentinel AND the metrics/error vocabulary.
+    pub(crate) window: &'static str,
+    /// Request-count cap per window (`{ requests: N, per: <window> }`), if any.
+    pub(crate) requests_cap: Option<u64>,
+    /// Total-token cap per window (`{ tokens: N, per: <window> }`), if any. Best-effort like the
+    /// old TPM: tokens land post-response, so the cap blocks the NEXT request once crossed.
+    pub(crate) tokens_cap: Option<u64>,
+    /// Spend cap per window (`{ budget: N, per: <window> }`) in abstract cents, if any. Derived at
+    /// check time from the cell's token ledger x the current rate card (+ the flat per-request
+    /// fee x requests).
+    pub(crate) budget_cap: Option<i64>,
+}
+
+/// One resolved group: its enabled flag, in-flight cap, per-window enforcement buckets, and parent
+/// (by index, so the chain walk is index-chasing with zero hashing).
 #[derive(Debug, Clone)]
 pub(crate) struct GroupRuntime {
     pub(crate) name: String,
-    /// The store bucket id (`group:<name>`).
-    pub(crate) bucket_id: String,
-    pub(crate) max_budget_cents: i64,
-    pub(crate) budget_period: String,
+    /// `false` FREEZES the group: every request charging through it (its own keys AND every
+    /// descendant's) is rejected while history is kept (C10).
+    pub(crate) enabled: bool,
+    /// The instantaneous in-flight cap (`{ concurrent: N }` - no window), if any.
+    pub(crate) concurrent_cap: Option<u64>,
+    /// The group's windowed enforcement buckets, one per distinct window its limits use (config
+    /// order of first use). Empty for a group with only a `concurrent` limit (or none).
+    pub(crate) buckets: Vec<GroupBucket>,
     pub(crate) parent: Option<usize>,
 }
 
@@ -101,23 +141,29 @@ pub(crate) struct GroupRuntime {
 /// chain walk allocates nothing).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChainBucket<'a> {
-    /// The store/ledger bucket id (key id, or `group:<name>`).
+    /// The store/ledger bucket id (the key id, or `group:<name>@<window>`).
     pub(crate) bucket_id: &'a str,
-    /// The operator-facing name for diagnostics: the group name, or `None` for the key's own
-    /// bucket.
+    /// The operator-facing group name for diagnostics; `None` for the key's own bucket.
     pub(crate) group_name: Option<&'a str>,
-    pub(crate) max_budget_cents: Option<i64>,
-    pub(crate) budget_period: &'a str,
-    /// True for the key's own (innermost) bucket - the only bucket the flat per-request fee
-    /// counts against.
-    pub(crate) is_key: bool,
+    /// The bucket's window word - the `budget_window` period sentinel (`total` for the key's own
+    /// attribution bucket). `'static`: both sources (the group buckets and the key's `total`) are
+    /// compile-time sentinels.
+    pub(crate) window: &'static str,
+    pub(crate) requests_cap: Option<u64>,
+    pub(crate) tokens_cap: Option<u64>,
+    pub(crate) budget_cap: Option<i64>,
 }
 
-/// A resolved enforcement chain: the key bucket plus every ancestor group, innermost first.
-/// Fixed-capacity (no heap) - depth is validated <= [`MAX_GROUP_DEPTH`].
+/// A resolved enforcement chain: the key's attribution bucket plus every ancestor group's
+/// per-window buckets, innermost group first. Fixed-capacity (no heap) - depth is validated
+/// <= [`MAX_GROUP_DEPTH`] and windows <= [`MAX_WINDOWS`]. Also carries the GROUP INDICES walked
+/// (for the `enabled` freeze check and the `concurrent` gauges, which are per group, not per
+/// window bucket).
 pub(crate) struct Chain<'a> {
     buckets: [Option<ChainBucket<'a>>; MAX_CHAIN],
     len: usize,
+    groups: [usize; MAX_GROUP_DEPTH],
+    groups_len: usize,
 }
 
 impl<'a> Chain<'a> {
@@ -128,9 +174,14 @@ impl<'a> Chain<'a> {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
+
+    /// The `CostModel::groups()` indices of the chain's groups, innermost first.
+    pub(crate) fn group_indices(&self) -> &[usize] {
+        &self.groups[..self.groups_len]
+    }
 }
 
-/// The resolved cost model: the effective integer rate table + the budget-group topology + the
+/// The resolved cost model: the effective integer rate table + the group limit topology + the
 /// flat per-request fee. Immutable once resolved; rebuilt with the config on apply/reload.
 pub(crate) struct CostModel {
     /// `None` = `rate_card` absent = token pricing 0 for every model. `Some` = the AUTHORITATIVE
@@ -143,8 +194,8 @@ pub(crate) struct CostModel {
 
 impl CostModel {
     /// Resolve from config. Assumes `config_validate` has already passed (completeness, acyclic
-    /// groups, valid periods); this is a pure projection and is defensive, never panicking, on
-    /// anything validation should have caught.
+    /// groups, valid limit shapes); this is a pure projection and is defensive, never panicking,
+    /// on anything validation should have caught.
     pub(crate) fn resolve_parts(
         rate_card: Option<&std::collections::BTreeMap<String, crate::config::RateEntryCfg>>,
         per_request_fee: i64,
@@ -168,33 +219,60 @@ impl CostModel {
             .iter()
             .map(|name| {
                 let g = &groups_cfg[name.as_str()];
-                // P1 projection: the group's BUDGET limit (the first, when present) drives the
-                // existing budget-chain machinery; a group with no budget limit is uncapped on
-                // the spend axis (i64::MAX, "total"). The generic limit engine (requests /
-                // tokens / concurrent + per-window budget stacking) lands in P4 on this same
-                // topology.
-                let budget = g.limits.iter().find_map(|l| {
-                    (l.metric == crate::config::groups::LimitMetric::Budget)
-                        .then_some((l.amount, l.per))
-                });
-                let (max_budget_cents, budget_period) = match budget {
-                    Some((amount, per)) => {
-                        let period = match per {
-                            Some(crate::config::groups::LimitWindow::Day) => "daily",
-                            Some(crate::config::groups::LimitWindow::Month) => "monthly",
-                            Some(crate::config::groups::LimitWindow::Minute) => "minute",
-                            Some(crate::config::groups::LimitWindow::Hour) => "hour",
-                            Some(crate::config::groups::LimitWindow::Total) | None => "total",
-                        };
-                        (i64::try_from(amount).unwrap_or(i64::MAX), period)
+                // Project the group's generic limits into per-window enforcement buckets. A window
+                // bucket materialises on first use (config order); a metric repeated for the same
+                // window keeps the MOST RESTRICTIVE (minimum) amount - AND semantics inside one
+                // group, same as across the chain.
+                let mut buckets: Vec<GroupBucket> = Vec::new();
+                let mut concurrent_cap: Option<u64> = None;
+                for l in &g.limits {
+                    match (l.metric, l.per) {
+                        (LimitMetric::Concurrent, _) => {
+                            concurrent_cap =
+                                Some(concurrent_cap.map_or(l.amount, |c: u64| c.min(l.amount)));
+                        }
+                        (metric, Some(window)) => {
+                            let w = window.as_str();
+                            let bucket = match buckets.iter_mut().find(|b| b.window == w) {
+                                Some(b) => b,
+                                None => {
+                                    buckets.push(GroupBucket {
+                                        bucket_id: format!("{GROUP_BUCKET_PREFIX}{name}@{w}"),
+                                        window: w,
+                                        requests_cap: None,
+                                        tokens_cap: None,
+                                        budget_cap: None,
+                                    });
+                                    buckets.last_mut().expect("just pushed")
+                                }
+                            };
+                            let min_u = |cur: Option<u64>| {
+                                Some(cur.map_or(l.amount, |c: u64| c.min(l.amount)))
+                            };
+                            match metric {
+                                LimitMetric::Requests => {
+                                    bucket.requests_cap = min_u(bucket.requests_cap)
+                                }
+                                LimitMetric::Tokens => bucket.tokens_cap = min_u(bucket.tokens_cap),
+                                LimitMetric::Budget => {
+                                    let amount = i64::try_from(l.amount).unwrap_or(i64::MAX);
+                                    bucket.budget_cap = Some(
+                                        bucket.budget_cap.map_or(amount, |c: i64| c.min(amount)),
+                                    );
+                                }
+                                LimitMetric::Concurrent => unreachable!("matched above"),
+                            }
+                        }
+                        // A windowed metric with no `per` cannot deserialize (LimitCfg enforces the
+                        // shape at parse); defensively skip rather than panic.
+                        (_, None) => {}
                     }
-                    None => (i64::MAX, "total"),
-                };
+                }
                 GroupRuntime {
                     name: (*name).clone(),
-                    bucket_id: format!("{GROUP_BUCKET_PREFIX}{name}"),
-                    max_budget_cents,
-                    budget_period: budget_period.to_string(),
+                    enabled: g.enabled,
+                    concurrent_cap,
+                    buckets,
                     // A missing parent is a validate error; defensively resolve to None here so a
                     // bad config that somehow booted degrades to a shorter chain, never a panic.
                     parent: g.parent.as_deref().and_then(|p| group_idx.get(p).copied()),
@@ -245,8 +323,8 @@ impl CostModel {
         self.group_idx.get(name).map(|&i| &self.groups[i])
     }
 
-    /// The effective rate for `model` (post-`upstream_model` resolution, pool-member override
-    /// already merged). Semantics of the three outcomes:
+    /// The effective rate for `model` (post-`upstream_model` resolution). Semantics of the three
+    /// outcomes:
     /// - card absent: `Some(zero)` - every model prices at 0.
     /// - card present, model priced: `Some(rate)`.
     /// - card present, model UNKNOWN: `None` - fail-closed; the admission path rejects an
@@ -272,9 +350,12 @@ impl CostModel {
     }
 
     /// DERIVE the spend (in cents, abstract minor units) of a ledger view: a few multiply-adds
-    /// over the models the bucket actually used, plus - for the key's own bucket - the flat
-    /// per-request fee times the request count. Pure recompute from tokens x current rates: no
-    /// spend is ever cached or stored.
+    /// over the models the bucket actually used, plus - when `include_request_fee` - the flat
+    /// per-request fee times the BILLABLE request count (`fee_requests`: admitted minus refunded,
+    /// so the fee bills 2xx only). Every enforcement/read path passes `true` (each bucket counts
+    /// its own billable requests, so its fee component is its own); the flag exists for callers
+    /// that want a tokens-only projection. Pure recompute from tokens x current rates: no spend is
+    /// ever cached or stored.
     ///
     /// A model with no rate (card present, entry missing - only possible for ledger rows written
     /// under a previous config) derives at 0; the mismatch is the operator's rate-card edit
@@ -282,7 +363,7 @@ impl CostModel {
     pub(crate) fn derive_spend_cents<'m>(
         &self,
         models: impl Iterator<Item = (&'m str, &'m TierTokens)>,
-        requests: u64,
+        fee_requests: u64,
         include_request_fee: bool,
     ) -> i64 {
         let mut nanos: u128 = 0;
@@ -300,7 +381,7 @@ impl CostModel {
         if include_request_fee {
             let fee = self
                 .price_per_request_cents
-                .saturating_mul(i64::try_from(requests).unwrap_or(i64::MAX));
+                .saturating_mul(i64::try_from(fee_requests).unwrap_or(i64::MAX));
             cents = cents.saturating_add(fee);
         }
         cents.max(0)
@@ -310,7 +391,7 @@ impl CostModel {
     pub(crate) fn derive_spend_micros<'m>(
         &self,
         models: impl Iterator<Item = (&'m str, &'m TierTokens)>,
-        requests: u64,
+        fee_requests: u64,
         include_request_fee: bool,
     ) -> i64 {
         let mut nanos: u128 = 0;
@@ -325,33 +406,37 @@ impl CostModel {
             let fee_micros = self
                 .price_per_request_cents
                 .saturating_mul(10_000)
-                .saturating_mul(i64::try_from(requests).unwrap_or(i64::MAX));
+                .saturating_mul(i64::try_from(fee_requests).unwrap_or(i64::MAX));
             micros.saturating_add(fee_micros)
         } else {
             micros
         }
     }
 
-    /// Resolve the ENFORCEMENT CHAIN for a key: [key's own bucket] -> key.budget_group -> parent
-    /// -> ... root, innermost first. Zero-allocation (borrows the key + this model's group table).
+    /// Resolve the ENFORCEMENT CHAIN for a key: [key's attribution bucket] -> key.group's window
+    /// buckets -> parent's -> ... root, innermost first. Zero-allocation (borrows the key + this
+    /// model's group table).
     ///
-    /// `Err(missing)` when the key names a `budget_group` that does not exist in config - the
+    /// `Err(missing)` when the key names a `group` that does not exist in config - the
     /// FAIL-CLOSED outcome (mint validates the group; boot re-checks; this arm covers a shared
     /// durable store whose keys reference a group another node's config no longer has).
     pub(crate) fn chain_for<'a>(
         &'a self,
         key: &'a busbar_api::VirtualKey,
     ) -> Result<Chain<'a>, &'a str> {
-        let mut buckets: [Option<ChainBucket<'a>>; MAX_CHAIN] = Default::default();
+        let mut buckets: [Option<ChainBucket<'a>>; MAX_CHAIN] = [const { None }; MAX_CHAIN];
         buckets[0] = Some(ChainBucket {
             bucket_id: &key.id,
             group_name: None,
-            max_budget_cents: key.max_budget_cents,
-            budget_period: &key.budget_period,
-            is_key: true,
+            window: crate::governance::WINDOW_TOTAL,
+            requests_cap: None,
+            tokens_cap: None,
+            budget_cap: None,
         });
         let mut len = 1;
-        let mut next = match key.budget_group.as_deref() {
+        let mut groups = [0usize; MAX_GROUP_DEPTH];
+        let mut groups_len = 0usize;
+        let mut next = match key.group.as_deref() {
             None => None,
             Some(name) => match self.group_idx.get(name) {
                 Some(&i) => Some(i),
@@ -359,299 +444,38 @@ impl CostModel {
             },
         };
         while let Some(i) = next {
-            if len >= MAX_CHAIN {
+            if groups_len >= MAX_GROUP_DEPTH {
                 // Validation caps depth at MAX_GROUP_DEPTH; clamp defensively (never loop).
                 break;
             }
             let g = &self.groups[i];
-            buckets[len] = Some(ChainBucket {
-                bucket_id: &g.bucket_id,
-                group_name: Some(&g.name),
-                max_budget_cents: Some(g.max_budget_cents),
-                budget_period: &g.budget_period,
-                is_key: false,
-            });
-            len += 1;
+            groups[groups_len] = i;
+            groups_len += 1;
+            for b in &g.buckets {
+                if len >= MAX_CHAIN {
+                    break; // unreachable by construction (depth x windows bounds); defensive
+                }
+                buckets[len] = Some(ChainBucket {
+                    bucket_id: &b.bucket_id,
+                    group_name: Some(&g.name),
+                    window: b.window,
+                    requests_cap: b.requests_cap,
+                    tokens_cap: b.tokens_cap,
+                    budget_cap: b.budget_cap,
+                });
+                len += 1;
+            }
             next = g.parent;
         }
-        Ok(Chain { buckets, len })
+        Ok(Chain {
+            buckets,
+            len,
+            groups,
+            groups_len,
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::groups::{GroupCfg, LimitCfg, LimitMetric, LimitWindow};
-    use crate::config::RateEntryCfg;
-    use busbar_api::VirtualKey;
-    use std::collections::BTreeMap;
-
-    fn card(entries: &[(&str, f64, f64)]) -> BTreeMap<String, RateEntryCfg> {
-        entries
-            .iter()
-            .map(|(m, i, o)| {
-                (
-                    m.to_string(),
-                    RateEntryCfg {
-                        input_utok: *i,
-                        output_utok: *o,
-                        cache_read_utok: 0.0,
-                        cache_write_utok: 0.0,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn resolve_card_fee(
-        rate_card: Option<&BTreeMap<String, RateEntryCfg>>,
-        per_request_fee: i64,
-    ) -> CostModel {
-        CostModel::resolve_parts(rate_card, per_request_fee, &BTreeMap::new())
-    }
-
-    /// A group whose only limit is a budget cap (the P1 projection the chain machinery enforces).
-    fn budget_group(budget: u64, per: LimitWindow, parent: Option<&str>) -> GroupCfg {
-        GroupCfg {
-            parent: parent.map(str::to_string),
-            enabled: true,
-            limits: vec![LimitCfg {
-                metric: LimitMetric::Budget,
-                amount: budget,
-                per: Some(per),
-            }],
-        }
-    }
-
-    fn key(budget: Option<i64>, group: Option<&str>) -> VirtualKey {
-        VirtualKey {
-            id: "vk_1".into(),
-            key_hash: "h".into(),
-            name: "k".into(),
-            allowed_pools: vec![],
-            max_budget_cents: budget,
-            budget_period: "total".into(),
-            rpm_limit: None,
-            tpm_limit: None,
-            enabled: true,
-            created_at: 0,
-            budget_group: group.map(String::from),
-            labels: BTreeMap::new(),
-        }
-    }
-
-    fn toks(input: u64, output: u64) -> TierTokens {
-        TierTokens {
-            input,
-            output,
-            cache_read: 0,
-            cache_write: 0,
-        }
-    }
-
-    /// ABSENT rate card => token pricing is 0 for every model; only the flat per-request fee
-    /// counts. This is the all-or-nothing OFF arm.
-    #[test]
-    fn absent_rate_card_prices_tokens_at_zero() {
-        let cm = resolve_card_fee(None, 3);
-        assert!(!cm.pricing_enabled());
-        assert!(!cm.model_unpriced("anything"), "no card = nothing to miss");
-        let t = toks(1_000_000, 1_000_000);
-        let spend = cm.derive_spend_cents([("anything", &t)].into_iter(), 5, true);
-        assert_eq!(spend, 15, "tokens derive to 0; 5 requests x 3c fee remain");
-    }
-
-    /// PRESENT rate card: derivation is integer nano-unit math over the tier split. gpt-5 at
-    /// 2.5 utok input / 10 utok output: 1M input + 1M output tokens = 2.5 + 10 units = 1250 cents.
-    #[test]
-    fn present_rate_card_derives_integer_spend() {
-        let c = card(&[("gpt-5", 2.5, 10.0)]);
-        let cm = resolve_card_fee(Some(&c), 0);
-        assert!(cm.pricing_enabled());
-        let t = toks(1_000_000, 1_000_000);
-        let spend = cm.derive_spend_cents([("gpt-5", &t)].into_iter(), 0, false);
-        assert_eq!(spend, 1250);
-        // Micro projection: 12.5 units = 12_500_000 micro-units.
-        let micros = cm.derive_spend_micros([("gpt-5", &t)].into_iter(), 0, false);
-        assert_eq!(micros, 12_500_000);
-    }
-
-    /// Sub-micro precision survives the nano scale: 3.125 utok/token x 8 tokens = 25 micro-units
-    /// exactly (no truncation at the micro boundary).
-    #[test]
-    fn nano_scale_keeps_sub_micro_precision() {
-        let c = BTreeMap::from([(
-            "m".to_string(),
-            RateEntryCfg {
-                input_utok: 3.125,
-                output_utok: 0.0,
-                cache_read_utok: 0.0,
-                cache_write_utok: 0.0,
-            },
-        )]);
-        let cm = resolve_card_fee(Some(&c), 0);
-        let t = toks(8, 0);
-        assert_eq!(
-            cm.derive_spend_micros([("m", &t)].into_iter(), 0, false),
-            25
-        );
-    }
-
-    /// Runtime model NOT in a present card => `model_unpriced` (the admission path rejects); the
-    /// derive paths price it at 0 (ledger rows from a previous config).
-    #[test]
-    fn unknown_model_with_card_is_unpriced_and_derives_zero() {
-        let c = card(&[("gpt-5", 1.0, 1.0)]);
-        let cm = resolve_card_fee(Some(&c), 0);
-        assert!(cm.model_unpriced("mystery-model"));
-        assert!(!cm.model_unpriced("gpt-5"));
-        let t = toks(1_000_000, 0);
-        assert_eq!(
-            cm.derive_spend_cents([("mystery-model", &t)].into_iter(), 0, false),
-            0
-        );
-    }
-
-    /// REPRICE-ON-READ: the ledger (tokens) is fixed; deriving under a corrected rate card yields
-    /// the corrected spend - no stored dollar to migrate.
-    #[test]
-    fn reprice_on_read_recomputes_derived_spend() {
-        let t = toks(1_000_000, 0);
-        let wrong = resolve_card_fee(Some(&card(&[("m", 10.0, 0.0)])), 0);
-        let fixed = resolve_card_fee(Some(&card(&[("m", 5.0, 0.0)])), 0);
-        assert_eq!(
-            wrong.derive_spend_cents([("m", &t)].into_iter(), 0, false),
-            1000
-        );
-        assert_eq!(
-            fixed.derive_spend_cents([("m", &t)].into_iter(), 0, false),
-            500,
-            "same tokens, corrected rate: derived spend halves on next read"
-        );
-    }
-
-    /// REGRESSION (audit cost-1.5.0 #2): a cent total past i64::MAX SATURATES at i64::MAX
-    /// (fail-closed: an astronomical ledger blocks). The pre-fix `as i64` cast wrapped - a large
-    /// (u64-scale tokens x large configured rate) ledger could land NEGATIVE, be floored to 0 by
-    /// `.max(0)`, and derive as FREE, bypassing every budget cap.
-    #[test]
-    fn derive_spend_cents_saturates_never_wraps_free() {
-        // 1e15 micro-units/token -> 1e18 nano-units/token; x u64::MAX tokens ~= 1.8e37 nanos
-        // -> ~1.8e30 cents, far past i64::MAX.
-        let cm = resolve_card_fee(Some(&card(&[("m", 1e15, 0.0)])), 0);
-        let t = toks(u64::MAX, 0);
-        assert_eq!(
-            cm.derive_spend_cents([("m", &t)].into_iter(), 0, false),
-            i64::MAX,
-            "an over-i64 cent total must pin at i64::MAX (blocks), never wrap toward 0 (free)"
-        );
-        // The micro projection already saturated correctly; pin it too.
-        assert_eq!(
-            cm.derive_spend_micros([("m", &t)].into_iter(), 0, false),
-            i64::MAX
-        );
-    }
-
-    /// S5: rate_card is the ONLY cost source - pool members carry no cost, and the routing
-    /// scalar (`cheapest` / hook Candidate.cost_per_mtok) derives from a model's card entry as
-    /// the blended (input + output) / 2 in units/mtok.
-    #[test]
-    fn rate_card_is_sole_cost_source_and_drives_routing_scalar() {
-        let c = card(&[("gpt-5", 2.5, 10.0)]);
-        let cm = resolve_card_fee(Some(&c), 0);
-        let r = cm.rate_for("gpt-5").unwrap();
-        assert_eq!(
-            (r.input, r.output),
-            (2_500, 10_000),
-            "nano-unit rates come straight from the card"
-        );
-        // The routing scalar projection: (2.5 + 10.0) / 2 = 6.25 units/mtok.
-        let scalar = crate::config::rate_entry_per_mtok(&c["gpt-5"]);
-        assert!((scalar - 6.25).abs() < f64::EPSILON);
-        // A pool member no longer parses a cost field at all (fail-closed on the removed key).
-        let err = serde_yaml::from_str::<crate::config::PoolCfg>(
-            "members:\n  - model: gpt-5\n    cost_per_mtok: 4\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("cost_per_mtok"),
-            "the removed member cost key must fail loudly: {err}"
-        );
-    }
-
-    /// Chain resolution: key bucket first (fee applies there only), then the group chain to the
-    /// root; each bucket carries its OWN period. A key with no group is a 1-bucket chain.
-    #[test]
-    fn chain_resolves_key_then_group_ancestry() {
-        let groups = BTreeMap::from([
-            (
-                "acme".to_string(),
-                budget_group(10_000_000, LimitWindow::Month, None),
-            ),
-            (
-                "growth".to_string(),
-                budget_group(2_000_000, LimitWindow::Month, Some("acme")),
-            ),
-            (
-                "bob".to_string(),
-                budget_group(500_000, LimitWindow::Day, Some("growth")),
-            ),
-        ]);
-        let cm = CostModel::resolve_parts(None, 0, &groups);
-        let k = key(Some(100_000), Some("bob"));
-        let chain = cm.chain_for(&k).expect("resolves");
-        let got: Vec<(String, Option<i64>, String, bool)> = chain
-            .iter()
-            .map(|b| {
-                (
-                    b.bucket_id.to_string(),
-                    b.max_budget_cents,
-                    b.budget_period.to_string(),
-                    b.is_key,
-                )
-            })
-            .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("vk_1".to_string(), Some(100_000), "total".to_string(), true),
-                (
-                    "group:bob".to_string(),
-                    Some(500_000),
-                    "daily".to_string(),
-                    false
-                ),
-                (
-                    "group:growth".to_string(),
-                    Some(2_000_000),
-                    "monthly".to_string(),
-                    false
-                ),
-                (
-                    "group:acme".to_string(),
-                    Some(10_000_000),
-                    "monthly".to_string(),
-                    false
-                ),
-            ]
-        );
-
-        // No group: exactly the key bucket.
-        let solo = key(None, None);
-        let chain = cm.chain_for(&solo).expect("resolves");
-        assert_eq!(chain.len(), 1);
-        assert!(chain.iter().next().unwrap().is_key);
-    }
-
-    /// A key naming a MISSING group fails closed: chain resolution surfaces the offender.
-    #[test]
-    fn chain_with_missing_group_fails_closed_naming_it() {
-        let cm = CostModel::resolve_parts(None, 0, &BTreeMap::new());
-        let k = key(None, Some("ghost"));
-        match cm.chain_for(&k) {
-            Err(missing) => assert_eq!(missing, "ghost"),
-            Ok(_) => panic!("a missing group must fail chain resolution"),
-        }
-    }
-}
+#[path = "tests/cost_tests.rs"]
+mod tests;
