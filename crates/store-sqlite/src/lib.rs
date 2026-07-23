@@ -23,27 +23,34 @@ impl<T> IntoStoreResult<T> for Result<T, rusqlite::Error> {
     }
 }
 
-/// Store schema version, kept in SQLite's `PRAGMA user_version`. v2 = the 1.5.0 cost-model schema:
-/// the scalar `usage_counters` table (stored `spend_cents` - a derived dollar persisted as truth)
-/// is REPLACED by the per-(bucket, window[, model]) token-ledger pair `usage_windows` +
-/// `usage_ledger`, and `virtual_keys` grows `budget_group` + `labels`. 1.5.0 is UNRELEASED, so the
-/// bump is destructive (drop + recreate), never a migration: a pre-v2 dev database is recreated
+/// Store schema version, kept in SQLite's `PRAGMA user_version`. v2 (1.5.0 dev) replaced the
+/// scalar `usage_counters` table with the per-(bucket, window[, model]) token-ledger pair
+/// `usage_windows` + `usage_ledger`. v3 = the 1.5.0 PURE-AUTH key shape: `virtual_keys` drops the
+/// inline limit columns (`max_budget_cents` / `budget_period` / `rpm_limit` / `tpm_limit` - every
+/// cap now lives on the config `groups:` chain), renames `budget_group` to `key_group` (the
+/// `VirtualKey.group` binding; `key_group` because bare GROUP is an SQL keyword), and makes
+/// `allowed_pools` NULLABLE so the C6 grant intent round-trips faithfully: NULL = the grant was
+/// omitted (ALL pools), `'[]'` = an explicit empty grant (NO pools). v4 = the usage ledger's
+/// REQUEST-COUNT SPLIT: `usage_windows` gains a `billable_requests` column alongside `requests`.
+/// `requests` stays the admission count (never refunded, the requests-limit truth);
+/// `billable_requests` is admitted minus non-2xx refunds (the fee base for the 2xx-only charge).
+/// 1.5.0 is UNRELEASED, so each
+/// bump is destructive (drop + recreate), never a migration: a pre-v4 dev database is recreated
 /// empty on open.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS virtual_keys (
     id               TEXT PRIMARY KEY,
     key_hash         TEXT NOT NULL UNIQUE,
     name             TEXT NOT NULL,
-    allowed_pools    TEXT NOT NULL DEFAULT '',
-    max_budget_cents INTEGER,
-    budget_period    TEXT NOT NULL DEFAULT 'total',
-    rpm_limit        INTEGER,
-    tpm_limit        INTEGER,
+    -- NULLABLE JSON array (v3): NULL = the pool grant was OMITTED at mint = ALL pools; '[]' = an
+    -- explicit empty grant = NO pools (C6: the two must never collapse into each other).
+    allowed_pools    TEXT,
     enabled          INTEGER NOT NULL DEFAULT 1,
     created_at       INTEGER NOT NULL,
-    budget_group     TEXT,
+    -- The key's `groups:` binding (`VirtualKey.group`); `key_group` because GROUP is an SQL keyword.
+    key_group        TEXT,
     labels           TEXT NOT NULL DEFAULT '{}'
 );
 -- AWS-style credentials for inbound SigV4 verification (the MinIO/S3-compatible model), kept in a
@@ -68,7 +75,11 @@ CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id
 CREATE TABLE IF NOT EXISTS usage_windows (
     bucket_id    TEXT NOT NULL,
     window_start INTEGER NOT NULL,
+    -- ADMISSION count (never refunded): the requests-LIMIT truth.
     requests     INTEGER NOT NULL DEFAULT 0,
+    -- v4: admitted MINUS non-2xx refunds - the FEE BASE for the 2xx-only charge. Persisted and
+    -- accumulated exactly like `requests`, just with its own signed delta.
+    billable_requests INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_id, window_start)
 );
 CREATE TABLE IF NOT EXISTS usage_ledger (
@@ -119,7 +130,7 @@ CREATE TABLE IF NOT EXISTS denylist (
 );
 ";
 
-/// Embedded SQLite `Store` backend (durable; opt-in via `governance.store: sqlite`). The single
+/// Embedded SQLite `Store` backend (durable; opt-in via `store.module: sqlite`). The single
 /// `Connection` is mutex-guarded; the governance surface is low-frequency (key CRUD) or batched
 /// (usage), so it is never on the request hot path.
 pub struct SqliteStore {
@@ -180,10 +191,11 @@ impl SqliteStore {
 
     fn migrate(&self) -> StoreResult<()> {
         let conn = self.lock_conn();
-        // SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model). 1.5.0 is unreleased, so a
-        // pre-v2 database (user_version < 2 with any governance table already present) is DROPPED
-        // and recreated - a bump, not a migration. A fresh database (no tables) simply creates the
-        // v2 schema; a v2 database is untouched (idempotent CREATE IF NOT EXISTS).
+        // SCHEMA-VERSION BUMP (v4, the 1.5.0 billable-requests ledger split; see SCHEMA_VERSION).
+        // 1.5.0 is unreleased, so a pre-v4 database (user_version < 4 with any governance table
+        // already present) is DROPPED and recreated - a bump, not a migration. A fresh database (no
+        // tables) simply creates the v4 schema; a v4 database is untouched (idempotent CREATE IF
+        // NOT EXISTS).
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .store()?;
@@ -238,13 +250,16 @@ impl SqliteStore {
         )
         .store()?;
         tx.execute(
-            "INSERT INTO usage_windows (bucket_id, window_start, requests)
-             VALUES (?1,?2,?3)
-             ON CONFLICT(bucket_id, window_start) DO UPDATE SET requests = excluded.requests",
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+             VALUES (?1,?2,?3,?4)
+             ON CONFLICT(bucket_id, window_start) DO UPDATE SET
+                requests = excluded.requests,
+                billable_requests = excluded.billable_requests",
             params![
                 bucket_id,
                 window_start as i64,
-                i64::try_from(ledger.requests).unwrap_or(i64::MAX)
+                i64::try_from(ledger.requests).unwrap_or(i64::MAX),
+                i64::try_from(ledger.billable_requests).unwrap_or(i64::MAX)
             ],
         )
         .store()?;
@@ -282,11 +297,17 @@ impl SqliteStore {
         let mut conn = Self::lock_conn_raw(conn);
         let tx = conn.transaction().store()?;
         tx.execute(
-            "INSERT INTO usage_windows (bucket_id, window_start, requests)
-             VALUES (?1,?2,MAX(0,?3))
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+             VALUES (?1,?2,MAX(0,?3),MAX(0,?4))
              ON CONFLICT(bucket_id, window_start) DO UPDATE SET
-                requests = MAX(0, requests + ?3)",
-            params![bucket_id, window_start as i64, delta.requests],
+                requests = MAX(0, requests + ?3),
+                billable_requests = MAX(0, billable_requests + ?4)",
+            params![
+                bucket_id,
+                window_start as i64,
+                delta.requests,
+                delta.billable_requests
+            ],
         )
         .store()?;
         for m in &delta.models {
@@ -383,18 +404,21 @@ impl SqliteStore {
         // `put_usage`/`add_usage` (another process on the same file) can never yield a torn ledger.
         let mut conn = Self::lock_conn_raw(conn);
         let tx = conn.transaction().store()?;
-        let requests: Option<i64> = tx
+        let row: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT requests FROM usage_windows WHERE bucket_id=?1 AND window_start=?2",
+                "SELECT requests, billable_requests
+                 FROM usage_windows WHERE bucket_id=?1 AND window_start=?2",
                 params![bucket_id, window_start as i64],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .store()?;
+        let (requests, billable_requests) = row.unwrap_or((0, 0));
         let mut ledger = UsageLedger {
             // DI-3: clamp a (corrupt / direct-DB) negative stored counter to 0 instead of wrapping
             // a negative i64 to a huge u64 via `as`.
-            requests: requests.unwrap_or(0).max(0) as u64,
+            requests: requests.max(0) as u64,
+            billable_requests: billable_requests.max(0) as u64,
             models: Vec::new(),
         };
         {
@@ -436,26 +460,22 @@ impl SqliteStore {
 // every row written before this change — falls back to the comma split), so an existing on-disk DB
 // keeps working without a migration. New writes are always JSON, so a comma-bearing name survives a
 // write/read round-trip exactly.
-fn pools_to_storage(pools: &[String]) -> String {
-    // serde_json::to_string over a `&[String]` is infallible (no map keys, no non-finite floats),
-    // but we must not panic on the admin write path: on the unreachable error fall back to the empty
-    // JSON array, which `pools_from_storage` reads back as "no restriction" — fail-safe, and far
-    // better than aborting the request task.
-    serde_json::to_string(pools).unwrap_or_else(|_| "[]".to_string())
+fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
+    // C6 intent preserved through storage: `None` (grant omitted = ALL pools) persists as SQL
+    // NULL; `Some(list)` - INCLUDING the explicit empty grant `Some([])` = NO pools - persists as
+    // a JSON array. serde_json::to_string over a `&[String]` is infallible (no map keys, no
+    // non-finite floats), but we must not panic on the admin write path: on the unreachable error
+    // fall back to the empty JSON array (the most restrictive spelling - fail-safe).
+    pools
+        .as_ref()
+        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".to_string()))
 }
-fn pools_from_storage(stored: &str) -> Vec<String> {
-    let trimmed = stored.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    // New format: a JSON array of strings. Parse it as the source of truth.
-    if let Ok(pools) = serde_json::from_str::<Vec<String>>(trimmed) {
-        return pools;
-    }
-    // Legacy format (written before the JSON migration): bare comma-delimited string. A comma-free
-    // legacy value round-trips identically; a comma-bearing one is preserved as-is by future JSON
-    // writes once the key is next persisted.
-    trimmed.split(',').map(String::from).collect()
+fn pools_from_storage(stored: Option<String>) -> Option<Vec<String>> {
+    let stored = stored?;
+    // A stored value is always a JSON array of strings (the v3 writer). A malformed value (only
+    // possible from a direct-DB edit) reads as the EMPTY grant - the most restrictive reading,
+    // never a silent widen to "all pools".
+    Some(serde_json::from_str::<Vec<String>>(stored.trim()).unwrap_or_default())
 }
 
 // Shared SQL bodies for the key/credential UPSERTs, so the autocommit single-statement methods
@@ -467,28 +487,23 @@ fn pools_from_storage(stored: &str) -> Vec<String> {
 fn put_key_inner(conn: &rusqlite::Connection, key: &VirtualKey) -> StoreResult<()> {
     conn.execute(
         "INSERT INTO virtual_keys
-                (id, key_hash, name, allowed_pools, max_budget_cents, budget_period, rpm_limit, tpm_limit, enabled, created_at, budget_group, labels)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                (id, key_hash, name, allowed_pools, enabled, created_at, key_group, labels)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET
                 key_hash=excluded.key_hash, name=excluded.name, allowed_pools=excluded.allowed_pools,
-                max_budget_cents=excluded.max_budget_cents, budget_period=excluded.budget_period,
-                rpm_limit=excluded.rpm_limit, tpm_limit=excluded.tpm_limit, enabled=excluded.enabled,
-                budget_group=excluded.budget_group, labels=excluded.labels",
+                enabled=excluded.enabled, key_group=excluded.key_group, labels=excluded.labels",
         params![
             key.id,
             key.key_hash,
             key.name,
             pools_to_storage(&key.allowed_pools),
-            key.max_budget_cents,
-            key.budget_period,
-            key.rpm_limit,
-            key.tpm_limit,
             key.enabled as i64,
             key.created_at as i64,
-            key.budget_group,
+            key.group,
             labels_to_storage(&key.labels),
         ],
-    ).store()?;
+    )
+    .store()?;
     Ok(())
 }
 
@@ -524,21 +539,24 @@ impl Store for SqliteStore {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels
+                "SELECT id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels
                  FROM virtual_keys WHERE id=?1",
                 params![id],
                 row_to_key,
             )
-            .optional().store()?;
+            .optional()
+            .store()?;
         Ok(row)
     }
 
     fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
         let conn = self.lock_conn();
-        let mut stmt = conn.prepare(
-            "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels
              FROM virtual_keys ORDER BY created_at",
-        ).store()?;
+            )
+            .store()?;
         let rows = stmt.query_map([], row_to_key).store()?;
         let mut out = Vec::new();
         for r in rows {
@@ -760,12 +778,13 @@ impl SqliteStore {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels
+                "SELECT id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels
                  FROM virtual_keys WHERE key_hash=?1",
                 params![key_hash],
                 row_to_key,
             )
-            .optional().store()?;
+            .optional()
+            .store()?;
         Ok(row)
     }
 }
@@ -775,22 +794,13 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
         id: r.get(0)?,
         key_hash: r.get(1)?,
         name: r.get(2)?,
-        allowed_pools: pools_from_storage(&r.get::<_, String>(3)?),
-        max_budget_cents: r.get(4)?,
-        budget_period: r.get(5)?,
-        // DI-2: a direct-DB value above u32::MAX would silently wrap to a WRONG (lower) cap with
-        // `as u32`. Saturate instead — the admin API already bounds these on the write path; this
-        // closes the direct-DB hole.
-        rpm_limit: r
-            .get::<_, Option<i64>>(6)?
-            .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
-        tpm_limit: r
-            .get::<_, Option<i64>>(7)?
-            .map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
-        enabled: r.get::<_, i64>(8)? != 0,
-        created_at: r.get::<_, i64>(9)? as u64,
-        budget_group: r.get(10)?,
-        labels: labels_from_storage(&r.get::<_, String>(11)?),
+        // NULL column = the grant was omitted (ALL pools); a JSON array = the exhaustive grant,
+        // including the explicit empty grant (NO pools). See `pools_from_storage`.
+        allowed_pools: pools_from_storage(r.get::<_, Option<String>>(3)?),
+        enabled: r.get::<_, i64>(4)? != 0,
+        created_at: r.get::<_, i64>(5)? as u64,
+        group: r.get(6)?,
+        labels: labels_from_storage(&r.get::<_, String>(7)?),
     })
 }
 
@@ -798,21 +808,16 @@ fn row_to_key(r: &rusqlite::Row) -> rusqlite::Result<VirtualKey> {
 mod tests {
     use super::*;
     use busbar_api::{ModelTokensDelta, Store, TierTokensDelta, VirtualKey};
-    use rusqlite::params;
 
     fn sample_key(id: &str, hash: &str) -> VirtualKey {
         VirtualKey {
             id: id.to_string(),
             key_hash: hash.to_string(),
             name: "test".to_string(),
-            allowed_pools: vec![],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: None,
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: std::collections::BTreeMap::new(),
         }
     }
@@ -820,6 +825,9 @@ mod tests {
     fn delta(requests: i64, model: &str, input: i64, output: i64) -> UsageDelta {
         UsageDelta {
             requests,
+            // Default the billable delta to mirror `requests` for the token-focused helpers; the
+            // dedicated split test drives `billable_requests` independently.
+            billable_requests: requests,
             models: vec![ModelTokensDelta {
                 model: model.to_string(),
                 tokens: TierTokensDelta {
@@ -839,6 +847,7 @@ mod tests {
         let s = SqliteStore::open(":memory:", 5000).unwrap();
         let base = UsageLedger {
             requests: 3,
+            billable_requests: 3,
             models: vec![ModelTokens {
                 model: "gpt-5".into(),
                 tokens: TierTokens {
@@ -881,6 +890,7 @@ mod tests {
             0,
             &UsageLedger {
                 requests: 2,
+                billable_requests: 2,
                 models: vec![
                     ModelTokens {
                         model: "a".into(),
@@ -909,6 +919,7 @@ mod tests {
             0,
             &UsageLedger {
                 requests: 1,
+                billable_requests: 1,
                 models: vec![ModelTokens {
                     model: "a".into(),
                     tokens: TierTokens {
@@ -931,11 +942,65 @@ mod tests {
         assert_eq!(u.tokens_for("a").unwrap().input, 9);
     }
 
-    /// SCHEMA BUMP (v2): opening a database that still carries the pre-cost-model `usage_counters`
-    /// schema DROPS and recreates the governance tables (1.5.0 unreleased: bump, not migrate) and
-    /// stamps `user_version = 2`. A v2 database re-opens untouched.
+    /// v4: `billable_requests` persists and accumulates INDEPENDENTLY of `requests` (admission
+    /// count vs the 2xx-only fee base). An absolute put with requests != billable_requests survives
+    /// a get; an additive delta touches each counter on its own axis and floors each at 0.
     #[test]
-    fn legacy_schema_is_bumped_to_v2_on_open() {
+    fn billable_requests_roundtrips_independently_of_requests() {
+        let s = SqliteStore::open_in_memory().unwrap();
+        // Admission 5, but only 3 billable (2 non-2xx refunded off the fee base).
+        s.put_usage(
+            "k_bill",
+            7,
+            &UsageLedger {
+                requests: 5,
+                billable_requests: 3,
+                models: vec![],
+            },
+        )
+        .unwrap();
+        let u = s.get_usage("k_bill", 7).unwrap();
+        assert_eq!((u.requests, u.billable_requests), (5, 3));
+        // A delta that refunds one non-2xx: -2 off both axes lands independently and floors at 0.
+        Store::add_usage(
+            &s,
+            "k_bill",
+            7,
+            &UsageDelta {
+                requests: -2,
+                billable_requests: -2,
+                models: vec![],
+            },
+        )
+        .unwrap();
+        let u = s.get_usage("k_bill", 7).unwrap();
+        assert_eq!((u.requests, u.billable_requests), (3, 1));
+        // An over-refund of the fee base alone floors billable_requests at 0 while requests holds.
+        Store::add_usage(
+            &s,
+            "k_bill",
+            7,
+            &UsageDelta {
+                requests: 0,
+                billable_requests: -100,
+                models: vec![],
+            },
+        )
+        .unwrap();
+        let u = s.get_usage("k_bill", 7).unwrap();
+        assert_eq!(
+            (u.requests, u.billable_requests),
+            (3, 0),
+            "the fee base floors at 0 without disturbing the admission count"
+        );
+    }
+
+    /// SCHEMA BUMP (v4): opening a database that still carries a pre-v4 schema (here: a v1-shaped
+    /// `usage_counters` + inline-limit `virtual_keys`) DROPS and recreates the governance tables
+    /// (1.5.0 unreleased: bump, not migrate) and stamps `user_version = 4`. A v4 database re-opens
+    /// untouched.
+    #[test]
+    fn legacy_schema_is_bumped_to_v4_on_open() {
         let dir = std::env::temp_dir().join(format!("busbar-sqlite-bump-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("legacy.db");
@@ -959,7 +1024,7 @@ mod tests {
             .unwrap();
         }
         let s = SqliteStore::open(&path_str, 5000).unwrap();
-        // The legacy table is gone; the v2 ledger is empty and functional.
+        // The legacy table is gone; the v4 ledger is empty and functional.
         assert_eq!(s.get_usage("vk_old", 0).unwrap(), UsageLedger::default());
         Store::add_usage(&s, "vk_old", 0, &delta(1, "m", 1, 1)).unwrap();
         assert_eq!(s.get_usage("vk_old", 0).unwrap().requests, 1);
@@ -968,53 +1033,57 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        // Re-open: v2 data survives (no re-drop).
+        // Re-open: v4 data survives (no re-drop).
         drop(s);
         let s2 = SqliteStore::open(&path_str, 5000).unwrap();
         assert_eq!(
             s2.get_usage("vk_old", 0).unwrap().requests,
             1,
-            "a v2 database must re-open without being dropped"
+            "a v4 database must re-open without being dropped"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `budget_group` + `labels` persist through the sqlite row round-trip.
+    /// `group` + `labels` persist through the sqlite row round-trip (the `key_group` column).
     #[test]
-    fn budget_group_and_labels_roundtrip() {
+    fn group_and_labels_roundtrip() {
         let s = SqliteStore::open_in_memory().unwrap();
         let mut k = sample_key("kg", "hashG");
-        k.budget_group = Some("growth".to_string());
+        k.group = Some("growth".to_string());
         k.labels = std::collections::BTreeMap::from([
             ("team".to_string(), "growth".to_string()),
             ("env".to_string(), "prod".to_string()),
         ]);
         s.put_key(&k).unwrap();
         let got = s.get_key("kg").unwrap().unwrap();
-        assert_eq!(got.budget_group.as_deref(), Some("growth"));
+        assert_eq!(got.group.as_deref(), Some("growth"));
         assert_eq!(got.labels.get("env").map(String::as_str), Some("prod"));
         assert_eq!(got, k);
     }
 
-    /// DI-2: a direct-DB `rpm_limit`/`tpm_limit` above `u32::MAX` must SATURATE to `u32::MAX` on read,
-    /// not wrap to a wrong (lower) cap via `as u32`.
+    /// C6 grant round-trip (v3): NULL (grant omitted = ALL pools) vs '[]' (explicit empty grant =
+    /// NO pools) must survive the SQL column faithfully and never collapse into each other.
     #[test]
-    fn test_rpm_tpm_above_u32max_saturate_on_read() {
+    fn allowed_pools_none_vs_empty_roundtrip() {
         let s = SqliteStore::open_in_memory().unwrap();
-        let k = sample_key("kbig", "hashBIG");
-        s.put_key(&k).unwrap();
-        let huge: i64 = i64::from(u32::MAX) + 1_000;
-        {
-            let conn = s.lock_conn();
-            conn.execute(
-                "UPDATE virtual_keys SET rpm_limit=?1, tpm_limit=?2 WHERE id='kbig'",
-                params![huge, huge],
-            )
-            .unwrap();
-        }
-        let got = s.get_key("kbig").unwrap().unwrap();
-        assert_eq!(got.rpm_limit, Some(u32::MAX));
-        assert_eq!(got.tpm_limit, Some(u32::MAX));
+        let mut all = sample_key("k_all", "hash_all");
+        all.allowed_pools = None;
+        let mut none = sample_key("k_none", "hash_none");
+        none.allowed_pools = Some(vec![]);
+        let mut some = sample_key("k_some", "hash_some");
+        some.allowed_pools = Some(vec!["fast".to_string()]);
+        s.put_key(&all).unwrap();
+        s.put_key(&none).unwrap();
+        s.put_key(&some).unwrap();
+        assert_eq!(s.get_key("k_all").unwrap().unwrap().allowed_pools, None);
+        assert_eq!(
+            s.get_key("k_none").unwrap().unwrap().allowed_pools,
+            Some(vec![])
+        );
+        assert_eq!(
+            s.get_key("k_some").unwrap().unwrap().allowed_pools,
+            Some(vec!["fast".to_string()])
+        );
     }
 
     /// DI-3: direct-DB NEGATIVE stored ledger counters clamp to 0 on read, never wrap to a huge u64.
@@ -1083,29 +1152,30 @@ mod tests {
     fn test_comma_bearing_pool_name_roundtrips_as_single_pool() {
         let s = SqliteStore::open_in_memory().unwrap();
         let mut k = sample_key("kc", "hashCOMMA");
-        k.allowed_pools = vec!["prod,special".to_string(), "plain".to_string()];
+        k.allowed_pools = Some(vec!["prod,special".to_string(), "plain".to_string()]);
         s.put_key(&k).unwrap();
         let got = s.get_key("kc").unwrap().unwrap();
         assert_eq!(
             got.allowed_pools,
-            vec!["prod,special".to_string(), "plain".to_string()]
+            Some(vec!["prod,special".to_string(), "plain".to_string()])
         );
     }
 
-    /// `pools_from_storage` must still read a LEGACY bare comma-delimited row.
+    /// `pools_from_storage` (v3): NULL reads as None (all pools); a JSON array reads exactly; a
+    /// malformed direct-DB value reads as the EMPTY grant (fail-restrictive, never "all").
     #[test]
-    fn test_pools_from_storage_reads_legacy_csv() {
+    fn test_pools_from_storage_v3_semantics() {
+        assert_eq!(pools_from_storage(None), None);
         assert_eq!(
-            pools_from_storage("[\"a\",\"b\"]"),
-            vec!["a".to_string(), "b".to_string()]
+            pools_from_storage(Some("[\"a\",\"b\"]".to_string())),
+            Some(vec!["a".to_string(), "b".to_string()])
         );
+        assert_eq!(pools_from_storage(Some("[]".to_string())), Some(vec![]));
         assert_eq!(
-            pools_from_storage("a,b"),
-            vec!["a".to_string(), "b".to_string()]
+            pools_from_storage(Some("not-json".to_string())),
+            Some(vec![]),
+            "a malformed stored grant must read restrictive (no pools), never as all pools"
         );
-        assert_eq!(pools_from_storage("solo"), vec!["solo".to_string()]);
-        assert!(pools_from_storage("").is_empty());
-        assert!(pools_from_storage("[]").is_empty());
     }
 
     #[test]
@@ -1201,11 +1271,11 @@ mod tests {
 
         let mut k2 = k.clone();
         k2.enabled = false;
-        k2.allowed_pools = vec![];
+        k2.allowed_pools = Some(vec![]);
         s.put_key(&k2).unwrap();
         let got = s.get_key("k1").unwrap().unwrap();
         assert!(!got.enabled);
-        assert!(got.allowed_pools.is_empty());
+        assert_eq!(got.allowed_pools, Some(vec![]));
 
         s.delete_key("k1").unwrap();
         assert_eq!(s.get_key("k1").unwrap(), None);

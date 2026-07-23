@@ -177,14 +177,10 @@ mod tests {
             id: id.to_string(),
             key_hash: format!("h_{id}"),
             name: "t".to_string(),
-            allowed_pools: vec![],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: None,
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: std::collections::BTreeMap::new(),
         }
     }
@@ -192,6 +188,7 @@ mod tests {
     fn ledger(requests: u64, model: &str, input: u64, output: u64) -> UsageLedger {
         UsageLedger {
             requests,
+            billable_requests: requests,
             models: vec![busbar_api::ModelTokens {
                 model: model.to_string(),
                 tokens: busbar_api::TierTokens {
@@ -232,6 +229,7 @@ mod tests {
         let s = MemoryStore::new();
         let d = UsageDelta {
             requests: 1,
+            billable_requests: 1,
             models: vec![busbar_api::ModelTokensDelta {
                 model: "gpt-5".to_string(),
                 tokens: busbar_api::TierTokensDelta {
@@ -254,6 +252,7 @@ mod tests {
             100,
             &UsageDelta {
                 requests: -5,
+                billable_requests: -5,
                 models: vec![],
             },
         )

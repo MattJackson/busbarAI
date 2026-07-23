@@ -14,8 +14,9 @@
 //!   indexes them; `busbar:awscred_ids:<key_id>` maps a virtual key to its AccessKeyIds so a key delete
 //!   removes them (a revoked key's SigV4 credential must never outlive it - the same guarantee the SQL
 //!   backends enforce with a `DELETE … WHERE key_id`).
-//! - **token ledger** - `busbar:usage:<bucket_id>:<window_start>` is a HASH holding `requests` plus
-//!   per-(model, tier) token fields `m:<model>:input|output|cache_read|cache_write`. `put_usage`
+//! - **token ledger** - `busbar:usage:<bucket_id>:<window_start>` is a HASH holding `requests`
+//!   (admission count) + `billable_requests` (v4: admitted minus non-2xx refunds, the fee base)
+//!   plus per-(model, tier) token fields `m:<model>:input|output|cache_read|cache_write`. `put_usage`
 //!   replaces the hash with absolute values; `add_usage` HINCRBYs the signed deltas (the
 //!   fleet-additive flush, so concurrent nodes accumulate instead of overwriting each other);
 //!   `get_usage` HGETALLs and parses the model fields. NO spend field: dollars are derived at read
@@ -76,11 +77,15 @@ const AUDIT_ZSET: &str = "busbar:audit";
 /// accounts for them.
 const DENYLIST_PREFIX: &str = "busbar:denylist:";
 const DENYLIST_INDEX: &str = "busbar:denylist";
-/// The schema-version marker key (mirrors the SQLite `PRAGMA user_version`). v2 = the 1.5.0
-/// token-ledger cost model. A pre-v2 namespace is WIPED on connect (1.5.0 unreleased: bump, not
-/// migrate).
+/// The schema-version marker key (mirrors the SQLite `PRAGMA user_version`). v2 (1.5.0 dev) = the
+/// token-ledger cost model; v3 = the 1.5.0 PURE-AUTH key shape (the key JSON dropped its inline
+/// limit fields, renamed `budget_group` to `group`, and re-encoded `allowed_pools` as an Option:
+/// `null` = all pools, `[]` = no pools - C6). v4 = the usage ledger's REQUEST-COUNT SPLIT: the
+/// `busbar:usage:*` HASH gains a `billable_requests` field (admitted minus non-2xx refunds - the
+/// fee base) alongside `requests` (the admission count), HINCRBY-accumulated on its own axis. A
+/// pre-v4 namespace is WIPED on connect (1.5.0 unreleased: bump, not migrate).
 const SCHEMA_KEY: &str = "busbar:schema";
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 fn usage_key(bucket_id: &str, window_start: u64) -> String {
     format!("busbar:usage:{bucket_id}:{window_start}")
@@ -213,14 +218,14 @@ impl RedisStore {
         Ok(store)
     }
 
-    /// SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model): a `busbar:*` namespace written
-    /// by a pre-v2 build (no/older `busbar:schema` marker but governance keys present) is WIPED and
-    /// re-marked - 1.5.0 is unreleased, so this is a bump, never a migration. A fresh namespace is
-    /// simply marked; a v2 namespace passes through untouched.
+    /// SCHEMA-VERSION BUMP (v4, the 1.5.0 billable-requests ledger split; see SCHEMA_VERSION): a
+    /// `busbar:*` namespace written by a pre-v4 build (no/older `busbar:schema` marker but
+    /// governance keys present) is WIPED and re-marked - 1.5.0 is unreleased, so this is a bump,
+    /// never a migration. A fresh namespace is simply marked; a v4 namespace passes through
+    /// untouched.
     fn migrate(&self) -> StoreResult<()> {
-        let version: i64 = self
-            .with_conn(|c| c.get::<_, Option<i64>>(SCHEMA_KEY))?
-            .unwrap_or(0);
+        let marker: Option<i64> = self.with_conn(|c| c.get::<_, Option<i64>>(SCHEMA_KEY))?;
+        let version = marker.unwrap_or(0);
         if version >= SCHEMA_VERSION {
             return Ok(());
         }
@@ -229,23 +234,38 @@ impl RedisStore {
                 .collect::<Result<Vec<String>, _>>()
         })?;
         if existing.is_empty() {
-            // A fresh namespace: just mark it v2.
+            // A fresh namespace: just mark it v4.
             return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
         }
-        // M2 (data-loss): the marker is absent (or pre-v2) but `busbar:*` DATA exists. The old code
+        // A PRESENT-but-older marker PROVES this is a busbar namespace of an earlier dev schema:
+        // wipe it (1.5.0 unreleased: bump, not migrate) without the legacy-shape heuristic, which
+        // only exists for the marker-ABSENT ambiguity below.
+        if marker.is_some() {
+            self.with_conn(|c| {
+                let mut pipe = redis::pipe();
+                pipe.atomic();
+                for k in &existing {
+                    pipe.del(k).ignore();
+                }
+                pipe.query::<()>(c)
+            })?;
+            return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
+        }
+        // M2 (data-loss): the marker is absent (or pre-v3) but `busbar:*` DATA exists. The old code
         // WIPED the whole namespace unconditionally - so a marker EVICTED under `maxmemory
-        // allkeys-*` (while the v2 data survived) destroyed a healthy database on the next boot.
-        // Only wipe when LEGACY-SHAPED keys are actually present (a pre-v2 build's `busbar:usage:*`
-        // HASH carried a `spend_cents` field that the v2 token-ledger shape never has). If data
-        // exists but is NOT legacy-shaped and the marker is absent, we CANNOT prove it is safe to
-        // wipe - REFUSE to boot loudly rather than silently destroy it.
+        // allkeys-*` (while the current-version data survived) destroyed a healthy database on the
+        // next boot. Only wipe when LEGACY-SHAPED keys are actually present (a pre-v2 build's
+        // `busbar:usage:*` HASH carried a `spend_cents` field that the token-ledger shape never
+        // has). If data exists but is NOT legacy-shaped and the marker is absent, we CANNOT prove
+        // it is safe to wipe - REFUSE to boot loudly rather than silently destroy it.
         if !self.namespace_is_legacy_shaped(&existing)? {
             return Err(StoreError(format!(
                 "redis: found {} busbar:* keys but no '{SCHEMA_KEY}' marker, and the data is NOT \
-                 legacy (pre-1.5.0) shaped. Refusing to wipe a namespace that may be a healthy v2 \
-                 database whose schema marker was evicted (e.g. under `maxmemory allkeys-*`). \
-                 Restore the marker with `SET {SCHEMA_KEY} {SCHEMA_VERSION}` if this IS a v2 \
-                 database, or clear the busbar:* namespace deliberately if it is not.",
+                 legacy (pre-1.5.0) shaped. Refusing to wipe a namespace that may be a healthy \
+                 current-version database whose schema marker was evicted (e.g. under `maxmemory \
+                 allkeys-*`). Restore the marker with `SET {SCHEMA_KEY} {SCHEMA_VERSION}` if this \
+                 IS a current-version database, or clear the busbar:* namespace deliberately if \
+                 it is not.",
                 existing.len()
             )));
         }
@@ -457,6 +477,12 @@ impl Store for RedisStore {
                 ledger.requests = read_u64(v);
                 continue;
             }
+            if name == "billable_requests" {
+                // v4: the 2xx-only fee base, on its own hash field (a transient negative from an
+                // over-refunding HINCRBY clamps to 0 on read, same posture as `requests`).
+                ledger.billable_requests = read_u64(v);
+                continue;
+            }
             let Some((model, tier)) = parse_model_field(&name) else {
                 continue;
             };
@@ -498,6 +524,8 @@ impl Store for RedisStore {
             pipe.atomic();
             pipe.del(&k).ignore();
             pipe.hset(&k, "requests", clamp(ledger.requests)).ignore();
+            pipe.hset(&k, "billable_requests", clamp(ledger.billable_requests))
+                .ignore();
             for m in &ledger.models {
                 pipe.hset(&k, model_field(&m.model, "input"), clamp(m.tokens.input))
                     .ignore();
@@ -535,6 +563,14 @@ impl Store for RedisStore {
                 .arg(&k)
                 .arg("requests")
                 .arg(delta.requests)
+                .ignore();
+            // v4: accumulate the fee base on its own hash field, exactly like `requests`. Kept
+            // unconditional (matching the `requests` HINCRBY) so the field materializes even on a
+            // zero delta, and a transient negative from an over-refund clamps to 0 on read.
+            pipe.cmd("HINCRBY")
+                .arg(&k)
+                .arg("billable_requests")
+                .arg(delta.billable_requests)
                 .ignore();
             for m in &delta.models {
                 for (tier, v) in [
@@ -866,14 +902,10 @@ mod tests {
             id: id.into(),
             key_hash: "h".into(),
             name: id.into(),
-            allowed_pools: vec!["prod,special".into()],
-            max_budget_cents: Some(1234),
-            budget_period: "total".into(),
-            rpm_limit: Some(60),
-            tpm_limit: None,
+            allowed_pools: Some(vec!["prod,special".into()]),
             enabled: true,
             created_at: 99,
-            budget_group: Some("growth".into()),
+            group: Some("growth".into()),
             labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
         }
     }
@@ -887,16 +919,39 @@ mod tests {
         let key = vk("vk_redis");
         store.put_key(&key).unwrap();
         let got = store.get_key("vk_redis").unwrap().unwrap();
-        assert_eq!(got.max_budget_cents, Some(1234));
         // The comma-bearing pool name survives (whole-key JSON, not a bare comma split).
-        assert_eq!(got.allowed_pools, vec!["prod,special".to_string()]);
-        assert_eq!(got.rpm_limit, Some(60));
+        assert_eq!(got.allowed_pools, Some(vec!["prod,special".to_string()]));
         assert_eq!(
-            got.budget_group.as_deref(),
+            got.group.as_deref(),
             Some("growth"),
-            "budget_group survives the redis JSON round-trip"
+            "the group binding survives the redis JSON round-trip"
         );
         assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
+        // C6 grant intent round-trips through the whole-key JSON: null (all) vs [] (none).
+        let mut all = vk("vk_redis_all");
+        all.allowed_pools = None;
+        let mut none = vk("vk_redis_none");
+        none.allowed_pools = Some(vec![]);
+        store.put_key(&all).unwrap();
+        store.put_key(&none).unwrap();
+        assert_eq!(
+            store
+                .get_key("vk_redis_all")
+                .unwrap()
+                .unwrap()
+                .allowed_pools,
+            None
+        );
+        assert_eq!(
+            store
+                .get_key("vk_redis_none")
+                .unwrap()
+                .unwrap()
+                .allowed_pools,
+            Some(vec![])
+        );
+        store.delete_key("vk_redis_all").unwrap();
+        store.delete_key("vk_redis_none").unwrap();
         assert!(store
             .list_keys()
             .unwrap()
@@ -906,6 +961,9 @@ mod tests {
         // Token ledger: absolute put (DEL + HSET) round-trips; additive HINCRBY accumulates on top.
         let base = UsageLedger {
             requests: 3,
+            // v4: 2 of the 3 admitted requests are billable (one non-2xx refunded off the fee
+            // base); the two axes must round-trip INDEPENDENTLY through the hash.
+            billable_requests: 2,
             models: vec![ModelTokens {
                 model: "gpt-5".into(),
                 tokens: TierTokens {
@@ -919,6 +977,10 @@ mod tests {
         store.put_usage("vk_redis", 100, &base).unwrap();
         let u = store.get_usage("vk_redis", 100).unwrap();
         assert_eq!(u.requests, 3);
+        assert_eq!(
+            u.billable_requests, 2,
+            "billable_requests round-trips independently of requests"
+        );
         let t = u.tokens_for("gpt-5").unwrap();
         assert_eq!(
             (t.input, t.output, t.cache_read, t.cache_write),
@@ -930,6 +992,7 @@ mod tests {
                 100,
                 &busbar_api::UsageDelta {
                     requests: 2,
+                    billable_requests: 2,
                     models: vec![busbar_api::ModelTokensDelta {
                         model: "gpt-5".into(),
                         tokens: busbar_api::TierTokensDelta {
@@ -944,6 +1007,10 @@ mod tests {
             .unwrap();
         let u = store.get_usage("vk_redis", 100).unwrap();
         assert_eq!(u.requests, 5, "add_usage accumulates the requests delta");
+        assert_eq!(
+            u.billable_requests, 4,
+            "add_usage accumulates the billable_requests delta on its own axis (2 + 2)"
+        );
         let t = u.tokens_for("gpt-5").unwrap();
         assert_eq!(
             (t.input, t.output),
@@ -957,6 +1024,7 @@ mod tests {
                 100,
                 &busbar_api::UsageDelta {
                     requests: 0,
+                    billable_requests: 0,
                     models: vec![busbar_api::ModelTokensDelta {
                         model: "org:custom:model".into(),
                         tokens: busbar_api::TierTokensDelta {
@@ -1106,6 +1174,68 @@ mod tests {
         );
     }
 
+    /// v4: `billable_requests` persists and HINCRBY-accumulates INDEPENDENTLY of `requests` on its
+    /// own hash field (admission count vs the 2xx-only fee base). Gated on a live Redis, same as the
+    /// other round-trip tests.
+    #[test]
+    fn billable_requests_roundtrips_independently_against_live_redis() {
+        let Some(store) = live_store() else { return };
+        let bucket_id = "vk_redis_billable";
+        let window = 1_700_000_200_u64;
+        let _ = store.with_conn(|c| c.del::<_, ()>(usage_key(bucket_id, window)));
+
+        // Admission 5, only 3 billable (2 non-2xx refunded off the fee base).
+        store
+            .put_usage(
+                bucket_id,
+                window,
+                &UsageLedger {
+                    requests: 5,
+                    billable_requests: 3,
+                    models: vec![],
+                },
+            )
+            .unwrap();
+        let u = store.get_usage(bucket_id, window).unwrap();
+        assert_eq!((u.requests, u.billable_requests), (5, 3));
+
+        // A delta refunding one non-2xx: -2 off both axes, accumulated independently.
+        store
+            .add_usage(
+                bucket_id,
+                window,
+                &busbar_api::UsageDelta {
+                    requests: -2,
+                    billable_requests: -2,
+                    models: vec![],
+                },
+            )
+            .unwrap();
+        let u = store.get_usage(bucket_id, window).unwrap();
+        assert_eq!((u.requests, u.billable_requests), (3, 1));
+
+        // An over-refund of the fee base alone clamps billable_requests to 0 on read (a transient
+        // negative HINCRBY floors on read - see the crate doc) while requests holds.
+        store
+            .add_usage(
+                bucket_id,
+                window,
+                &busbar_api::UsageDelta {
+                    requests: 0,
+                    billable_requests: -100,
+                    models: vec![],
+                },
+            )
+            .unwrap();
+        let u = store.get_usage(bucket_id, window).unwrap();
+        assert_eq!(
+            (u.requests, u.billable_requests),
+            (3, 0),
+            "the fee base clamps to 0 on read without disturbing the admission count"
+        );
+        let _ = store.with_conn(|c| c.del::<_, ()>(usage_key(bucket_id, window)));
+    }
+
     /// ATOMIC key+credential publish: `put_key_with_aws_credential` writes both (and all three
     /// indexes) in ONE MULTI/EXEC, and the delete cascade removes every trace in ONE MULTI/EXEC -
     /// no orphaned SigV4 credential, no dangling index member.
@@ -1184,6 +1314,7 @@ mod tests {
 
         let delta = || busbar_api::UsageDelta {
             requests: 1,
+            billable_requests: 1,
             models: vec![busbar_api::ModelTokensDelta {
                 model: "gpt-x".into(),
                 tokens: busbar_api::TierTokensDelta {

@@ -596,14 +596,10 @@ mod tests {
             id: id.into(),
             key_hash: "hash".into(),
             name: "n".into(),
-            allowed_pools: vec![],
-            max_budget_cents: None,
-            budget_period: "total".into(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: None,
             enabled: true,
             created_at: 1,
-            budget_group: None,
+            group: None,
             labels: std::collections::BTreeMap::new(),
         }
     }

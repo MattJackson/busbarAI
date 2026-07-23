@@ -116,10 +116,14 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 }
 
 /// Store schema version, mirrored from the SQLite backend's `PRAGMA user_version` in a tiny
-/// `busbar_schema` table. v2 = the 1.5.0 token-ledger cost model (see the SQLite backend's
-/// `SCHEMA_VERSION` doc). 1.5.0 is unreleased, so a pre-v2 database is dropped and recreated - a
-/// bump, never a migration.
-const SCHEMA_VERSION: i64 = 2;
+/// `busbar_schema` table. v2 (1.5.0 dev) = the token-ledger cost model; v3 = the 1.5.0 PURE-AUTH
+/// key shape (inline limit columns dropped, `budget_group` renamed `key_group`, `allowed_pools`
+/// nullable for the C6 NULL-vs-`'[]'` grant intent - see the SQLite backend's `SCHEMA_VERSION`
+/// doc). v4 = the usage ledger's REQUEST-COUNT SPLIT: `usage_windows` gains a `billable_requests`
+/// column (admitted minus non-2xx refunds - the fee base) alongside `requests` (the admission
+/// count). 1.5.0 is unreleased, so a pre-v4 database is dropped and recreated - a bump, never a
+/// migration.
+const SCHEMA_VERSION: i64 = 4;
 
 // Same tables/columns as the SQLite backend, in Postgres types: INTEGER -> BIGINT, the enabled flag
 // as BOOLEAN. `CREATE TABLE IF NOT EXISTS` is idempotent, so migrate() is safe to run every open.
@@ -131,14 +135,13 @@ CREATE TABLE IF NOT EXISTS virtual_keys (
     id               TEXT PRIMARY KEY,
     key_hash         TEXT NOT NULL UNIQUE,
     name             TEXT NOT NULL,
-    allowed_pools    TEXT NOT NULL DEFAULT '',
-    max_budget_cents BIGINT,
-    budget_period    TEXT NOT NULL DEFAULT 'total',
-    rpm_limit        BIGINT,
-    tpm_limit        BIGINT,
+    -- NULLABLE JSON array (v3): NULL = the pool grant was OMITTED at mint = ALL pools; '[]' = an
+    -- explicit empty grant = NO pools (C6: the two must never collapse into each other).
+    allowed_pools    TEXT,
     enabled          BOOLEAN NOT NULL DEFAULT TRUE,
     created_at       BIGINT NOT NULL,
-    budget_group     TEXT,
+    -- The key's groups: binding (VirtualKey.group); key_group because GROUP is an SQL keyword.
+    key_group        TEXT,
     labels           TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS aws_credentials (
@@ -153,7 +156,11 @@ CREATE INDEX IF NOT EXISTS idx_aws_credentials_key_id ON aws_credentials (key_id
 CREATE TABLE IF NOT EXISTS usage_windows (
     bucket_id    TEXT NOT NULL,
     window_start BIGINT NOT NULL,
+    -- ADMISSION count (never refunded): the requests-LIMIT truth.
     requests     BIGINT NOT NULL DEFAULT 0,
+    -- v4: admitted MINUS non-2xx refunds - the FEE BASE for the 2xx-only charge. Persisted and
+    -- accumulated exactly like `requests`, just with its own signed delta.
+    billable_requests BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_id, window_start)
 );
 CREATE TABLE IF NOT EXISTS usage_ledger (
@@ -218,13 +225,6 @@ fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
 }
 
-/// Read a signed BIGINT rate-limit column back as a `u32`, SATURATING an out-of-range value to
-/// `u32::MAX` (and clamping a negative to 0) instead of wrapping via `as u32` - mirrors the SQLite
-/// backend's DI-2 posture so a direct-DB write can never silently narrow to a WRONG cap.
-fn read_u32_cap(v: i64) -> u32 {
-    u32::try_from(v).unwrap_or(u32::MAX)
-}
-
 impl PostgresStore {
     /// Connect to Postgres with the given libpq connection string / URL (e.g.
     /// `postgres://user:pass@host:5432/dbname`) and ensure the schema. TLS is not wired in this
@@ -253,10 +253,11 @@ impl PostgresStore {
 
     fn migrate(&self) -> StoreResult<()> {
         let mut client = self.lock();
-        // SCHEMA-VERSION BUMP (v2, the 1.5.0 token-ledger cost model). A pre-v2 database - one that
-        // still carries the legacy `usage_counters` table, or a `virtual_keys` without the v2
-        // columns - is DROPPED and recreated (1.5.0 is unreleased: bump, not migrate). A fresh or
-        // already-v2 database passes straight through the idempotent CREATEs.
+        // SCHEMA-VERSION BUMP (v4, the 1.5.0 billable-requests ledger split; see SCHEMA_VERSION). A
+        // pre-v4 database - one that still carries the legacy `usage_counters` table, or a
+        // `virtual_keys` with the old inline-limit columns, or a `usage_windows` without
+        // `billable_requests` - is DROPPED and recreated (1.5.0 is unreleased: bump, not migrate). A
+        // fresh or already-v4 database passes straight through the idempotent CREATEs.
         //
         // H1 (data-loss): the version read must never CONFLATE a transient read error with a fresh
         // DB. We ensure the version table exists FIRST, then read; a *transient* read failure
@@ -317,20 +318,18 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
     serde_json::from_str(stored).unwrap_or_default()
 }
 
-// `allowed_pools` encoding — identical to the SQLite backend: JSON array of strings (delimiter-safe),
-// reading legacy bare comma-delimited values transparently.
-fn pools_to_storage(pools: &[String]) -> String {
-    serde_json::to_string(pools).unwrap_or_else(|_| "[]".to_string())
+// `allowed_pools` encoding - identical to the SQLite backend (v3): SQL NULL = the grant was
+// OMITTED (ALL pools); a JSON array = the exhaustive grant, including the explicit empty grant
+// (NO pools). A malformed direct-DB value reads as the EMPTY grant (fail-restrictive, never a
+// silent widen to "all pools").
+fn pools_to_storage(pools: &Option<Vec<String>>) -> Option<String> {
+    pools
+        .as_ref()
+        .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "[]".to_string()))
 }
-fn pools_from_storage(stored: &str) -> Vec<String> {
-    let trimmed = stored.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    if let Ok(pools) = serde_json::from_str::<Vec<String>>(trimmed) {
-        return pools;
-    }
-    trimmed.split(',').map(String::from).collect()
+fn pools_from_storage(stored: Option<String>) -> Option<Vec<String>> {
+    let stored = stored?;
+    Some(serde_json::from_str::<Vec<String>>(stored.trim()).unwrap_or_default())
 }
 
 /// Map a `virtual_keys` row (in the fixed SELECT column order) to a `VirtualKey`.
@@ -339,45 +338,32 @@ fn row_to_key(r: &Row) -> VirtualKey {
         id: r.get(0),
         key_hash: r.get(1),
         name: r.get(2),
-        allowed_pools: pools_from_storage(&r.get::<_, String>(3)),
-        max_budget_cents: r.get(4),
-        budget_period: r.get(5),
-        // DI-2 (mirrors the SQLite backend): a direct-DB BIGINT above u32::MAX (or a negative)
-        // would silently wrap to a WRONG rate-limit cap with `as u32`. Saturate instead - the admin
-        // API bounds these on the write path; this closes the direct-DB hole.
-        rpm_limit: r.get::<_, Option<i64>>(6).map(read_u32_cap),
-        tpm_limit: r.get::<_, Option<i64>>(7).map(read_u32_cap),
-        enabled: r.get(8),
-        created_at: read_u64(r.get::<_, i64>(9)),
-        budget_group: r.get(10),
-        labels: labels_from_storage(&r.get::<_, String>(11)),
+        allowed_pools: pools_from_storage(r.get::<_, Option<String>>(3)),
+        enabled: r.get(4),
+        created_at: read_u64(r.get::<_, i64>(5)),
+        group: r.get(6),
+        labels: labels_from_storage(&r.get::<_, String>(7)),
     }
 }
 
-const KEY_COLUMNS: &str =
-    "id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels";
+const KEY_COLUMNS: &str = "id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels";
 
 impl Store for PostgresStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
         let pools = pools_to_storage(&key.allowed_pools);
         let labels = labels_to_storage(&key.labels);
-        let rpm = key.rpm_limit.map(|v| v as i64);
-        let tpm = key.tpm_limit.map(|v| v as i64);
         let created = clamp(key.created_at);
         self.lock()
             .execute(
                 "INSERT INTO virtual_keys
-                    (id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                    (id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                  ON CONFLICT (id) DO UPDATE SET
                     key_hash=EXCLUDED.key_hash, name=EXCLUDED.name, allowed_pools=EXCLUDED.allowed_pools,
-                    max_budget_cents=EXCLUDED.max_budget_cents, budget_period=EXCLUDED.budget_period,
-                    rpm_limit=EXCLUDED.rpm_limit, tpm_limit=EXCLUDED.tpm_limit, enabled=EXCLUDED.enabled,
-                    budget_group=EXCLUDED.budget_group, labels=EXCLUDED.labels",
+                    enabled=EXCLUDED.enabled, key_group=EXCLUDED.key_group, labels=EXCLUDED.labels",
                 &[
-                    &key.id, &key.key_hash, &key.name, &pools, &key.max_budget_cents,
-                    &key.budget_period, &rpm, &tpm, &key.enabled, &created,
-                    &key.budget_group, &labels,
+                    &key.id, &key.key_hash, &key.name, &pools, &key.enabled, &created, &key.group,
+                    &labels,
                 ],
             )
             .store()?;
@@ -419,14 +405,15 @@ impl Store for PostgresStore {
         let ws = clamp(window_start);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
-        let requests: u64 = tx
+        let (requests, billable_requests): (u64, u64) = tx
             .query_opt(
-                "SELECT requests FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
+                "SELECT requests, billable_requests
+                 FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
                 &[&bucket_id, &ws],
             )
             .store()?
-            .map(|r| read_u64(r.get::<_, i64>(0)))
-            .unwrap_or(0);
+            .map(|r| (read_u64(r.get::<_, i64>(0)), read_u64(r.get::<_, i64>(1))))
+            .unwrap_or((0, 0));
         let rows = tx
             .query(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
@@ -437,6 +424,7 @@ impl Store for PostgresStore {
         tx.commit().store()?;
         Ok(UsageLedger {
             requests,
+            billable_requests,
             models: rows
                 .iter()
                 .map(|r| ModelTokens {
@@ -463,6 +451,7 @@ impl Store for PostgresStore {
         // and a reader never sees half a ledger.
         let ws = clamp(window_start);
         let rq = clamp(ledger.requests);
+        let brq = clamp(ledger.billable_requests);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         tx.execute(
@@ -471,10 +460,12 @@ impl Store for PostgresStore {
         )
         .store()?;
         tx.execute(
-            "INSERT INTO usage_windows (bucket_id, window_start, requests)
-             VALUES ($1,$2,$3)
-             ON CONFLICT (bucket_id, window_start) DO UPDATE SET requests = EXCLUDED.requests",
-            &[&bucket_id, &ws, &rq],
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (bucket_id, window_start) DO UPDATE SET
+                requests = EXCLUDED.requests,
+                billable_requests = EXCLUDED.billable_requests",
+            &[&bucket_id, &ws, &rq, &brq],
         )
         .store()?;
         for m in &ledger.models {
@@ -506,13 +497,15 @@ impl Store for PostgresStore {
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         tx.execute(
-            // `$3::bigint` casts anchor the parameter type inside GREATEST (whose bare `0` would
-            // otherwise make Postgres infer int4 and fail to serialize the i64 binding).
-            "INSERT INTO usage_windows (bucket_id, window_start, requests)
-             VALUES ($1,$2,GREATEST(0,$3::bigint))
+            // `$N::bigint` casts anchor the parameter type inside GREATEST (whose bare `0` would
+            // otherwise make Postgres infer int4 and fail to serialize the i64 binding). The
+            // `billable_requests` axis accumulates exactly like `requests`, floored at 0.
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+             VALUES ($1,$2,GREATEST(0,$3::bigint),GREATEST(0,$4::bigint))
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
-                requests = GREATEST(0, usage_windows.requests + $3::bigint)",
-            &[&bucket_id, &ws, &delta.requests],
+                requests = GREATEST(0, usage_windows.requests + $3::bigint),
+                billable_requests = GREATEST(0, usage_windows.billable_requests + $4::bigint)",
+            &[&bucket_id, &ws, &delta.requests, &delta.billable_requests],
         )
         .store()?;
         for m in &delta.models {
@@ -616,24 +609,19 @@ impl Store for PostgresStore {
         // ATOMIC mint: the bearer key and its AWS credential commit together or not at all.
         let pools = pools_to_storage(&key.allowed_pools);
         let labels = labels_to_storage(&key.labels);
-        let rpm = key.rpm_limit.map(|v| v as i64);
-        let tpm = key.tpm_limit.map(|v| v as i64);
         let created = clamp(key.created_at);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         tx.execute(
             "INSERT INTO virtual_keys
-                (id,key_hash,name,allowed_pools,max_budget_cents,budget_period,rpm_limit,tpm_limit,enabled,created_at,budget_group,labels)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                (id,key_hash,name,allowed_pools,enabled,created_at,key_group,labels)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
              ON CONFLICT (id) DO UPDATE SET
                 key_hash=EXCLUDED.key_hash, name=EXCLUDED.name, allowed_pools=EXCLUDED.allowed_pools,
-                max_budget_cents=EXCLUDED.max_budget_cents, budget_period=EXCLUDED.budget_period,
-                rpm_limit=EXCLUDED.rpm_limit, tpm_limit=EXCLUDED.tpm_limit, enabled=EXCLUDED.enabled,
-                budget_group=EXCLUDED.budget_group, labels=EXCLUDED.labels",
+                enabled=EXCLUDED.enabled, key_group=EXCLUDED.key_group, labels=EXCLUDED.labels",
             &[
-                &key.id, &key.key_hash, &key.name, &pools, &key.max_budget_cents,
-                &key.budget_period, &rpm, &tpm, &key.enabled, &created,
-                &key.budget_group, &labels,
+                &key.id, &key.key_hash, &key.name, &pools, &key.enabled, &created, &key.group,
+                &labels,
             ],
         )
         .store()?;
@@ -787,20 +775,6 @@ mod tests {
         assert_eq!(percent_decode("bad%zz"), "bad%zz");
     }
 
-    /// DI-2: a BIGINT rate-limit column above `u32::MAX` (or negative) must SATURATE to `u32::MAX`,
-    /// not wrap to a wrong (lower) cap via `as u32`. Matches the SQLite backend's semantics exactly.
-    #[test]
-    fn read_u32_cap_saturates_out_of_range_bigint() {
-        assert_eq!(read_u32_cap(60), 60, "in-range value passes through");
-        assert_eq!(read_u32_cap(0), 0);
-        assert_eq!(read_u32_cap(i64::from(u32::MAX)), u32::MAX, "the boundary");
-        // Above u32::MAX would wrap to a WRONG lower cap with `as u32` (e.g. 0); saturate instead.
-        assert_eq!(read_u32_cap(i64::from(u32::MAX) + 1), u32::MAX);
-        assert_eq!(read_u32_cap(i64::MAX), u32::MAX);
-        // A corrupt/direct-DB negative clamps to u32::MAX too (matches SQLite's unwrap_or(MAX)).
-        assert_eq!(read_u32_cap(-1), u32::MAX);
-    }
-
     /// End-to-end against a REAL Postgres, gated on `BUSBAR_TEST_POSTGRES_URL` (a docker
     /// `postgres:16` service in CI). Skips cleanly when unset LOCALLY so the default `cargo test`
     /// needs no database - but MUST NOT silently skip in CI: CI provisions the service and sets the
@@ -831,32 +805,50 @@ mod tests {
             id: "vk_pg".into(),
             key_hash: "h".into(),
             name: "pg".into(),
-            allowed_pools: vec!["prod,special".into()],
-            max_budget_cents: Some(1234),
-            budget_period: "total".into(),
-            rpm_limit: Some(60),
-            tpm_limit: None,
+            allowed_pools: Some(vec!["prod,special".into()]),
             enabled: true,
             created_at: 99,
-            budget_group: Some("growth".into()),
+            group: Some("growth".into()),
             labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
         };
         store.put_key(&key).unwrap();
         let got = store.get_key("vk_pg").unwrap().unwrap();
-        assert_eq!(got.max_budget_cents, Some(1234));
         // The comma-bearing pool name survives (JSON encoding, not a bare comma split).
-        assert_eq!(got.allowed_pools, vec!["prod,special".to_string()]);
-        assert_eq!(got.rpm_limit, Some(60));
+        assert_eq!(got.allowed_pools, Some(vec!["prod,special".to_string()]));
         assert_eq!(
-            got.budget_group.as_deref(),
+            got.group.as_deref(),
             Some("growth"),
-            "budget_group survives the Postgres round-trip"
+            "the group binding survives the Postgres round-trip"
         );
         assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
+        // C6 grant intent round-trips: NULL (all pools) vs '[]' (no pools) never collapse.
+        let mut all = key.clone();
+        all.id = "vk_pg_all".into();
+        all.key_hash = "h_all".into();
+        all.allowed_pools = None;
+        let mut none = key.clone();
+        none.id = "vk_pg_none".into();
+        none.key_hash = "h_none".into();
+        none.allowed_pools = Some(vec![]);
+        store.put_key(&all).unwrap();
+        store.put_key(&none).unwrap();
+        assert_eq!(
+            store.get_key("vk_pg_all").unwrap().unwrap().allowed_pools,
+            None
+        );
+        assert_eq!(
+            store.get_key("vk_pg_none").unwrap().unwrap().allowed_pools,
+            Some(vec![])
+        );
+        store.delete_key("vk_pg_all").unwrap();
+        store.delete_key("vk_pg_none").unwrap();
 
         // Absolute put_usage of a per-model token ledger, then read back.
         let base = UsageLedger {
             requests: 3,
+            // v4: only 2 of the 3 admitted requests are billable (one non-2xx refunded off the fee
+            // base); the two axes must persist and read back INDEPENDENTLY.
+            billable_requests: 2,
             models: vec![ModelTokens {
                 model: "gpt-5".into(),
                 tokens: TierTokens {
@@ -870,12 +862,19 @@ mod tests {
         store.put_usage("vk_pg", 100, &base).unwrap();
         let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!(u.requests, 3);
+        assert_eq!(
+            u.billable_requests, 2,
+            "billable_requests persists independently of requests"
+        );
         assert_eq!(u.tokens_for("gpt-5").unwrap().input, 9);
 
         // ADDITIVE fleet flush primitive: add_usage accumulates per-model signed deltas on top
         // (and a negative delta refunds, floored at 0). A second model materializes its own row.
         let mk_delta = |requests: i64, model: &str, input: i64| busbar_api::UsageDelta {
             requests,
+            // Mirror the billable axis onto the request delta for this token-focused block; the
+            // billable-specific flooring is asserted below.
+            billable_requests: requests,
             models: vec![busbar_api::ModelTokensDelta {
                 model: model.into(),
                 tokens: busbar_api::TierTokensDelta {
@@ -891,6 +890,10 @@ mod tests {
             .unwrap();
         let u = store.get_usage("vk_pg", 100).unwrap();
         assert_eq!(u.requests, 5, "add_usage accumulates the requests delta");
+        assert_eq!(
+            u.billable_requests, 4,
+            "add_usage accumulates the billable_requests delta on its own axis (2 + 2)"
+        );
         let t = u.tokens_for("gpt-5").unwrap();
         assert_eq!(
             (t.input, t.output),
@@ -913,6 +916,10 @@ mod tests {
             (u.requests, u.tokens_for("gpt-5").unwrap().input),
             (0, 0),
             "an over-refund floors at 0, never negative"
+        );
+        assert_eq!(
+            u.billable_requests, 0,
+            "the billable fee base floors at 0 under an over-refund too"
         );
 
         // METERING: the billing-critical raw-consumption UPSERT. Two deltas for the SAME
@@ -1129,21 +1136,17 @@ mod tests {
             other.code()
         );
 
-        // End to end: a healthy v2 DB carrying data survives a re-run of migrate() (connect() runs
-        // it). Seed a key, reconnect (re-migrate), and assert the key is STILL there - the legacy
-        // DROP path never fires on a correctly-read v2 version.
+        // End to end: a healthy current-version DB carrying data survives a re-run of migrate()
+        // (connect() runs it). Seed a key, reconnect (re-migrate), and assert the key is STILL
+        // there - the legacy DROP path never fires on a correctly-read current version.
         let key = VirtualKey {
             id: "vk_h1".into(),
             key_hash: "h1_hash".into(),
             name: "h1".into(),
-            allowed_pools: vec![],
-            max_budget_cents: None,
-            budget_period: "total".into(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: None,
             enabled: true,
             created_at: 1,
-            budget_group: None,
+            group: None,
             labels: std::collections::BTreeMap::new(),
         };
         let _ = store.delete_key("vk_h1");
@@ -1152,7 +1155,7 @@ mod tests {
         let store2 = PostgresStore::connect(&url).expect("re-connect+re-migrate");
         assert!(
             store2.get_key("vk_h1").unwrap().is_some(),
-            "a healthy v2 DB must NOT be dropped by a migrate() re-run"
+            "a healthy current-version DB must NOT be dropped by a migrate() re-run"
         );
         store2.delete_key("vk_h1").unwrap();
     }

@@ -826,25 +826,16 @@ mod tests {
             id: "vk_pipeline".into(),
             key_hash: "h".into(),
             name: "pipeline".into(),
-            allowed_pools: vec!["p".into()],
-            max_budget_cents: Some(9),
-            budget_period: "total".into(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["p".into()]),
             enabled: true,
             created_at: 1,
-            budget_group: None,
+            group: Some("growth".into()),
             labels: std::collections::BTreeMap::new(),
         };
         store.put_key(&key).expect("put over the ABI");
-        assert_eq!(
-            store
-                .get_key("vk_pipeline")
-                .unwrap()
-                .unwrap()
-                .max_budget_cents,
-            Some(9)
-        );
+        let got = store.get_key("vk_pipeline").unwrap().unwrap();
+        assert_eq!(got.group.as_deref(), Some("growth"));
+        assert_eq!(got.allowed_pools, Some(vec!["p".to_string()]));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

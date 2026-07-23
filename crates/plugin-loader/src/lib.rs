@@ -822,25 +822,25 @@ mod tests {
             id: "vk_dyn".into(),
             key_hash: "abc".into(),
             name: "dynamic".into(),
-            allowed_pools: vec!["p".into()],
-            max_budget_cents: Some(500),
-            budget_period: "total".into(),
-            rpm_limit: Some(10),
-            tpm_limit: None,
+            allowed_pools: Some(vec!["p".into()]),
             enabled: true,
             created_at: 7,
-            budget_group: Some("growth".into()),
+            group: Some("growth".into()),
             labels: std::collections::BTreeMap::from([("team".into(), "growth".into())]),
         };
         store.put_key(&key).expect("put_key");
 
         let got = store.get_key("vk_dyn").expect("get_key").expect("present");
         assert_eq!(got.id, "vk_dyn");
-        assert_eq!(got.max_budget_cents, Some(500));
         assert_eq!(
-            got.budget_group.as_deref(),
+            got.group.as_deref(),
             Some("growth"),
-            "budget_group survives the ABI round-trip"
+            "the group binding survives the ABI round-trip"
+        );
+        assert_eq!(
+            got.allowed_pools,
+            Some(vec!["p".to_string()]),
+            "the pool grant survives the ABI round-trip"
         );
         assert_eq!(got.labels.get("team").map(String::as_str), Some("growth"));
 
@@ -849,6 +849,7 @@ mod tests {
         // The token LEDGER round-trips over the ABI: absolute put, additive add, then read back.
         let ledger = busbar_api::UsageLedger {
             requests: 3,
+            billable_requests: 3,
             models: vec![busbar_api::ModelTokens {
                 model: "gpt-5".into(),
                 tokens: busbar_api::TierTokens {
@@ -866,6 +867,7 @@ mod tests {
                 100,
                 &busbar_api::UsageDelta {
                     requests: 1,
+                    billable_requests: 1,
                     models: vec![busbar_api::ModelTokensDelta {
                         model: "gpt-5".into(),
                         tokens: busbar_api::TierTokensDelta {
@@ -998,14 +1000,10 @@ mod tests {
             id: "vk_b".into(),
             key_hash: "h".into(),
             name: "b".into(),
-            allowed_pools: vec!["p".into()],
-            max_budget_cents: Some(1),
-            budget_period: "total".into(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["p".into()]),
             enabled: true,
             created_at: 1,
-            budget_group: None,
+            group: None,
             labels: std::collections::BTreeMap::new(),
         };
         store.put_key(&key).expect("put_key over from-bytes load");
