@@ -101,8 +101,6 @@ fn load_for_rmw(p: &Path) -> Option<OverlayDoc> {
 /// contract: the live config already swapped; a write failure is logged, never fatal. `None` path is a
 /// no-op. `deleted_add`/`deleted_remove` tombstone/untombstone a group name; a wholesale write (both
 /// `None`, e.g. rollback) reconciles away any tombstone for a name the restored registry contains.
-// Wired by the Phase 1 groups CRUD handler (task #100); staged here with the substrate it belongs to.
-#[allow(dead_code)]
 pub(crate) fn persist_groups(
     path: Option<&Path>,
     groups: &BTreeMap<String, GroupCfg>,

@@ -292,6 +292,22 @@ pub(crate) struct PutHookReq {
     config: crate::config::HookCfg,
 }
 
+/// The `POST /api/v1/admin/groups` request body: the group name + its definition (a `GroupCfg`
+/// accepted VERBATIM — paste a `groups:` block from config.yaml). Optimistic concurrency rides the
+/// `If-Match` header, never a body field.
+#[derive(serde::Deserialize)]
+pub(crate) struct RegisterGroupReq {
+    name: String,
+    config: crate::config::GroupCfg,
+}
+
+/// The `PUT /api/v1/admin/groups/{name}` body: the replacement definition (name rides the path;
+/// optimistic concurrency rides `If-Match`).
+#[derive(serde::Deserialize)]
+pub(crate) struct PutGroupReq {
+    config: crate::config::GroupCfg,
+}
+
 /// `POST /api/v1/admin/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
 /// the next `App` snapshot with the hook wired + transports re-resolved, atomically `swap`s it in, and
 /// returns `201` with the registered hook. A `global` hook is LIVE immediately (new requests see it);
@@ -561,6 +577,222 @@ pub(crate) async fn delete_hook(
             err_json(&e)
         }
     }
+}
+
+/// `POST /api/v1/admin/groups` — create (or replace) a group at RUNTIME. Validate-at-the-door: the
+/// mutated tree is re-validated (parent exists, acyclic, depth) — an invalid tree is a `400` that
+/// changes nothing. `201` when the name is NEW, `200` on replace (upsert). `409` for a base-config
+/// group (edit config.yaml; the API cannot silently shadow file config) or a stale `If-Match`.
+/// Live immediately (limits rebuilt into the cost model, swapped in); persisted to the overlay so it
+/// survives restart. Full scope (the `/groups` mutation fallthrough); the narrow delegated
+/// `group-admin` scope for the self-service tool lands in Phase 2.
+pub(crate) async fn register_group(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let req: RegisterGroupReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed group body: {e}"
+            )))
+        }
+    };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    let resource = format!("group:{}", req.name);
+    // A base-config group is file-owned: the additive overlay cannot durably shadow it, and a narrow
+    // token must not silently redirect a base group's limits. Edit config.yaml. (Mirrors hooks.)
+    if current.base_group_names.contains(&req.name) {
+        audit::AUDIT.record_by("group.create", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "group `{}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)",
+            req.name
+        )));
+    }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("group.create", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
+    let existed = current.groups_registry.contains_key(&req.name);
+    match build_with_group(&current, &req.name, req.config) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("group.create", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            record_group_version(&installed, &actor, &format!("group.create {resource}"));
+            // Persist the whole groups section; clear any tombstone for this name (re-create un-deletes).
+            crate::config::overlay::persist_groups(
+                cur.overlay_path.as_deref(),
+                &cur.groups_registry,
+                None,
+                Some(&req.name),
+            );
+            with_config_etag(
+                respond(
+                    if existed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::CREATED
+                    },
+                    service(&handle).get_group(&req.name).await,
+                ),
+                installed.config_version,
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("group.create", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
+/// `PUT /api/v1/admin/groups/{name}` — REPLACE an existing group at runtime (live, atomic swap).
+/// `404` for an unknown name (PUT replaces; POST creates). `409` for a base-config group or a stale
+/// `If-Match`, `400` if the replacement breaks the tree. Audited + versioned + overlay-persisted.
+pub(crate) async fn put_group(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let req: PutGroupReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed group body: {e}"
+            )))
+        }
+    };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    let resource = format!("group:{name}");
+    if !current.groups_registry.contains_key(&name) {
+        audit::AUDIT.record_by("group.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::NotFound(format!("group `{name}`")));
+    }
+    if current.base_group_names.contains(&name) {
+        audit::AUDIT.record_by("group.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "group `{name}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)"
+        )));
+    }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("group.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
+    match build_with_group(&current, &name, req.config) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("group.replace", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            record_group_version(&installed, &actor, &format!("group.replace {resource}"));
+            crate::config::overlay::persist_groups(
+                cur.overlay_path.as_deref(),
+                &cur.groups_registry,
+                None,
+                Some(&name),
+            );
+            with_config_etag(
+                respond(StatusCode::OK, service(&handle).get_group(&name).await),
+                installed.config_version,
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("group.replace", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
+/// `DELETE /api/v1/admin/groups/{name}` — remove an API-created group at runtime (live). `404` if
+/// unknown; `409` if base-config-defined (edit config.yaml) or if another group still names it as
+/// `parent` (re-parent/remove the children first — never silently orphan them). `204` on success;
+/// the name is tombstoned so the deletion survives a restart.
+pub(crate) async fn delete_group(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    let resource = format!("group:{name}");
+    if !current.groups_registry.contains_key(&name) {
+        audit::AUDIT.record_by("group.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::NotFound(format!("group `{name}`")));
+    }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("group.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
+    if current.base_group_names.contains(&name) {
+        audit::AUDIT.record_by("group.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "group `{name}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)"
+        )));
+    }
+    match build_without_group(&current, &name) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("group.delete", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            record_group_version(&installed, &actor, &format!("group.delete {resource}"));
+            // Tombstone this name so the deletion survives a restart (overlay is additive otherwise).
+            crate::config::overlay::persist_groups(
+                cur.overlay_path.as_deref(),
+                &cur.groups_registry,
+                Some(&name),
+                None,
+            );
+            with_config_etag(
+                StatusCode::NO_CONTENT.into_response(),
+                installed.config_version,
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("group.delete", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
+/// Record a config-version entry for a GROUP mutation. The `VersionLog` snapshot payload is the
+/// hook surface (its rollback scope today); a group change still bumps `config_version` and lands an
+/// audited, timestamped version row (so `GET /config/versions` shows the event honestly). Extending
+/// the snapshot + `config/rollback` to restore groups is a tracked follow-up (task #100).
+fn record_group_version(installed: &Arc<crate::state::App>, actor: &str, summary: &str) {
+    installed.versions.record(
+        installed.config_version,
+        actor,
+        summary,
+        &installed.hook_registry,
+        &installed.global_hooks,
+    );
 }
 
 /// `GET /api/v1/admin/audit` — the admin audit log (most-recent-first), every mutation with its outcome.
@@ -1526,6 +1758,25 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
             }),
         );
     }
+    // Runtime group creation: POST on the /groups collection (merged onto its GET entry above).
+    if let Some(obj) = paths
+        .get_mut(&ap(PATH_GROUPS))
+        .and_then(|p| p.as_object_mut())
+    {
+        obj.insert(
+            "post".to_string(),
+            json!({
+                "summary": "Create (or replace) a group at runtime — live immediately (upsert)",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "201": {"description": "Created — the name is NEW (body is the group definition)"},
+                    "200": {"description": "Replaced — the name existed (body is the group definition)"},
+                    "400": {"description": "Invalid tree — dangling/cyclic parent or depth (`invalid_request`)"},
+                    "409": {"description": "Base-defined group (edit config.yaml) or stale `If-Match` (`version_conflict`)"}
+                }
+            }),
+        );
+    }
     // Plugin INSTALL: POST on the /plugins collection (merged onto its GET entry above).
     if let Some(obj) = paths
         .get_mut(&ap("/plugins"))
@@ -1635,6 +1886,33 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "200": {"description": "OK"},
                     "404": {"description": "Unknown group (error code `not_found`)"}
+                }
+            },
+            "put": {
+                "summary": "Replace an overlay group definition — live immediately (limits rebuilt)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "The replaced group"},
+                    "400": {"description": "Invalid tree — dangling/cyclic parent or depth (error code `invalid_request`)"},
+                    "404": {"description": "Unknown group (error code `not_found`)"},
+                    "409": {"description": "Base-defined group (edit config.yaml), or stale `If-Match` (`version_conflict`)"}
+                }
+            },
+            "delete": {
+                "summary": "Remove an overlay group at runtime — live immediately",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "204": {"description": "Removed"},
+                    "404": {"description": "Unknown group (error code `not_found`)"},
+                    "409": {"description": "Base-defined group, or another group still names it as parent (error code `conflict`)"}
                 }
             }
         }),
@@ -2197,7 +2475,10 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/hooks/{name}/status", "get", "200", sview::HookStatusView);
     // Groups (the limit tree).
     typed!(PATH_GROUPS, "get", "200", Page<GroupView>);
+    typed!(PATH_GROUPS, "post", "201", GroupView);
+    typed!(PATH_GROUPS, "post", "200", GroupView);
     typed!("/groups/{name}", "get", "200", GroupView);
+    typed!("/groups/{name}", "put", "200", GroupView);
     // Auth & credentials.
     typed!("/auth", "get", "200", AuthView);
     typed!(PATH_ADMIN_AUTH, "get", "200", AdminAuthView);

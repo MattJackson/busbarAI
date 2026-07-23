@@ -221,8 +221,6 @@ impl CostModel {
     /// The Admin-API group-mutation seam (`build_with_group` / `build_without_group`): a runtime
     /// group change must reproject enforcement buckets WITHOUT re-parsing the rate card (which the
     /// mutation never touched). Pure — assumes the caller already re-ran `validate_groups`.
-    // Wired by the Phase 1 groups-CRUD handler (task #100); staged ahead of its caller.
-    #[allow(dead_code)]
     pub(crate) fn with_groups(
         &self,
         groups_cfg: &std::collections::BTreeMap<String, crate::config::GroupCfg>,

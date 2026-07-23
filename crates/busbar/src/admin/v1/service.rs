@@ -178,6 +178,9 @@ pub(crate) const MAX_SETTINGS_KEYS: usize = 256;
 /// Upper bound on a hook name (a registry key persisted to the state file + every audit row).
 /// Generous headroom over any real hook name; guards the durable-state/audit/reconnect path.
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 256;
+/// Upper bound on a group name — same rationale as the hook cap (a registry key persisted to the
+/// overlay + every audit row). Generous over any real `org/dept/team/user:<sub>` name.
+pub(crate) const MAX_GROUP_NAME_LEN: usize = 256;
 
 /// Fail-closed size check for a hook's `settings` map — see the cap rationale above.
 pub(crate) fn validate_hook_settings_size(
@@ -368,6 +371,77 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
         &next.client,
         next.config_version,
     );
+    Ok(next)
+}
+
+/// Build the next `App` snapshot with `name` created-or-replaced in the group registry — the pure
+/// core of `POST`/`PUT /api/v1/admin/groups`. VALIDATE-AT-THE-DOOR: the mutated registry is run
+/// through the SAME `validate_groups` boot uses (parent references exist, the parent chain is
+/// acyclic and within the depth cap), so a bad group (dangling/cyclic parent) is a `400` that
+/// changes nothing. On success the enforcement projection is rebuilt via `CostModel::with_groups`
+/// (reusing the rate card + fee unchanged) so the new limits are live after the swap; the governance
+/// LEDGER survives (it is Arc-shared, not rebuilt), so past accrual is preserved across the change.
+pub(crate) fn build_with_group(
+    current: &App,
+    name: &str,
+    cfg: crate::config::GroupCfg,
+) -> Result<App, AdminError> {
+    if name.trim().is_empty() {
+        return Err(AdminError::Validation(
+            "group name must not be empty".into(),
+        ));
+    }
+    if name.len() > MAX_GROUP_NAME_LEN {
+        return Err(AdminError::Validation(format!(
+            "group name is {} chars; must be <= {MAX_GROUP_NAME_LEN}",
+            name.len()
+        )));
+    }
+    // Build the candidate registry and validate it WHOLE before mutating the snapshot — a group's
+    // legality (parent exists, acyclic, depth) is a property of the tree, not the single entry.
+    let mut groups = current.groups_registry.clone();
+    groups.insert(name.to_string(), cfg);
+    let mut errors = Vec::new();
+    crate::config::groups::validate_groups(&groups, &mut errors);
+    if !errors.is_empty() {
+        return Err(AdminError::Validation(format!(
+            "invalid group `{name}`: {}",
+            errors.join("; ")
+        )));
+    }
+    let mut next = current.clone();
+    next.config_version = current.config_version.wrapping_add(1);
+    next.cost = std::sync::Arc::new(next.cost.with_groups(&groups));
+    next.groups_registry = groups;
+    Ok(next)
+}
+
+/// Build the next `App` snapshot with `name` REMOVED from the group registry — the pure core of
+/// `DELETE /api/v1/admin/groups/{name}`. `not_found` if unknown. RE-VALIDATES the reduced tree: if
+/// another group still names the removed one as its `parent`, the delete is a `409 conflict` (remove
+/// or re-parent the children first) rather than silently orphaning them. On success the enforcement
+/// projection is rebuilt (the removed group's buckets disappear); the ledger survives the swap.
+pub(crate) fn build_without_group(current: &App, name: &str) -> Result<App, AdminError> {
+    if !current.groups_registry.contains_key(name) {
+        return Err(AdminError::NotFound(format!("group `{name}`")));
+    }
+    let mut groups = current.groups_registry.clone();
+    groups.remove(name);
+    // A dangling `parent` after the removal is the only new error a delete can introduce; surface it
+    // as a state CONFLICT (something still references this group) so the caller distinguishes it from
+    // a malformed request.
+    let mut errors = Vec::new();
+    crate::config::groups::validate_groups(&groups, &mut errors);
+    if !errors.is_empty() {
+        return Err(AdminError::Conflict(format!(
+            "cannot delete group `{name}`: {} (re-parent or remove the referencing group first)",
+            errors.join("; ")
+        )));
+    }
+    let mut next = current.clone();
+    next.config_version = current.config_version.wrapping_add(1);
+    next.cost = std::sync::Arc::new(next.cost.with_groups(&groups));
+    next.groups_registry = groups;
     Ok(next)
 }
 

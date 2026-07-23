@@ -20,7 +20,10 @@ use serde::Serialize;
 use serde_json::json;
 
 use super::contract::{AdminError, PATH_ADMIN_AUTH, PATH_CONFIG_VALIDATE, PATH_GROUPS, PATH_HOOKS};
-use super::service::{build_with_hook, build_with_registry, build_without_hook, AdminService};
+use super::service::{
+    build_with_group, build_with_hook, build_with_registry, build_without_group,
+    build_without_hook, AdminService,
+};
 use crate::admin::audit;
 use crate::admin::transport::AdminTransport;
 use crate::state::AppHandle;
@@ -65,10 +68,13 @@ impl AdminTransport for JsonV1 {
             .route("/hooks/{name}/settings", patch(patch_hook_settings))
             .route("/hooks/{name}/schema", get(hook_schema))
             .route("/hooks/{name}/status", get(hook_status))
-            // Groups — the `groups:` limit-tree read surface (Phase 1, task #100). Mutations
-            // (POST/PUT/PATCH/DELETE) land with the write increment; reads ship first.
-            .route(PATH_GROUPS, get(list_groups))
-            .route("/groups/{name}", get(get_group))
+            // Groups — the `groups:` limit-tree CRUD (Phase 1, task #100): runtime-mutable groups
+            // → per-user budgets. Reads are read-only scope; mutations are full scope.
+            .route(PATH_GROUPS, get(list_groups).post(register_group))
+            .route(
+                "/groups/{name}",
+                get(get_group).put(put_group).delete(delete_group),
+            )
             .route("/plugins", get(list_plugins).post(install_plugin))
             .route("/plugins/reload", post(reload_plugins))
             .route("/plugins/{file}", axum::routing::delete(remove_plugin))
