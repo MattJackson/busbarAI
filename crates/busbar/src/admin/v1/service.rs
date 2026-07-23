@@ -1984,4 +1984,131 @@ mod tests {
             "unknown group is not_found: {err:?}"
         );
     }
+
+    /// A team ceiling with a per-user leaf beneath it — the base tree the mutation tests build on.
+    fn team_app() -> Arc<App> {
+        TestApp::new()
+            .group(
+                "team",
+                GroupCfg {
+                    limits: vec![budget(20_000, LimitWindow::Month)],
+                    ..Default::default()
+                },
+            )
+            .build()
+    }
+
+    /// `build_with_group` creates a valid leaf, bumps the version, and rebuilds the cost model so the
+    /// new group's limits are live in the enforcement projection (the "raise a user's budget" path).
+    #[test]
+    fn build_with_group_creates_leaf_and_rebuilds_cost() {
+        let app = team_app();
+        let bob = GroupCfg {
+            parent: Some("team".into()),
+            limits: vec![budget(3_000, LimitWindow::Month)],
+            ..Default::default()
+        };
+        let next = build_with_group(&app, "user:bob", bob).expect("valid leaf");
+        assert_eq!(next.config_version, app.config_version.wrapping_add(1));
+        assert!(next.groups_registry.contains_key("user:bob"));
+        // The rebuilt cost model sees the new leaf AND its parent chain (parent index resolved).
+        let leaf = next
+            .cost
+            .group_named("user:bob")
+            .expect("leaf in cost model");
+        assert!(leaf.parent.is_some(), "leaf's parent chain resolved");
+        // The parent's own ceiling is still present (cost rebuilt the WHOLE tree, not just the leaf).
+        assert!(next.cost.group_named("team").is_some());
+    }
+
+    /// A group whose `parent` names a nonexistent group is rejected at the door (validate_groups),
+    /// changing nothing — a 400 `invalid_request`.
+    #[test]
+    fn build_with_group_rejects_dangling_parent() {
+        let app = team_app();
+        let orphan = GroupCfg {
+            parent: Some("nonexistent".into()),
+            ..Default::default()
+        };
+        let Err(err) = build_with_group(&app, "orphan", orphan) else {
+            panic!("dangling parent must be rejected");
+        };
+        assert!(
+            matches!(&err, AdminError::Validation(m) if m.contains("orphan")),
+            "dangling parent is a validation error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_with_group_rejects_empty_name() {
+        let app = team_app();
+        let Err(err) = build_with_group(&app, "   ", GroupCfg::default()) else {
+            panic!("empty name must be rejected");
+        };
+        assert!(matches!(err, AdminError::Validation(_)));
+    }
+
+    /// Deleting a leaf removes it from the registry and the rebuilt cost model.
+    #[test]
+    fn build_without_group_removes_leaf() {
+        // Build a tree that already contains the leaf.
+        let app = TestApp::new()
+            .group(
+                "team",
+                GroupCfg {
+                    limits: vec![budget(20_000, LimitWindow::Month)],
+                    ..Default::default()
+                },
+            )
+            .group(
+                "user:bob",
+                GroupCfg {
+                    parent: Some("team".into()),
+                    limits: vec![budget(3_000, LimitWindow::Month)],
+                    ..Default::default()
+                },
+            )
+            .build();
+        let next = build_without_group(&app, "user:bob").expect("leaf removable");
+        assert!(!next.groups_registry.contains_key("user:bob"));
+        assert!(next.cost.group_named("user:bob").is_none());
+        assert!(next.cost.group_named("team").is_some());
+    }
+
+    /// Deleting a group that still PARENTS another is a 409 conflict — never silently orphan the child.
+    #[test]
+    fn build_without_group_conflict_when_still_a_parent() {
+        let app = TestApp::new()
+            .group(
+                "team",
+                GroupCfg {
+                    limits: vec![budget(20_000, LimitWindow::Month)],
+                    ..Default::default()
+                },
+            )
+            .group(
+                "user:bob",
+                GroupCfg {
+                    parent: Some("team".into()),
+                    ..Default::default()
+                },
+            )
+            .build();
+        let Err(err) = build_without_group(&app, "team") else {
+            panic!("deleting a still-referenced parent must conflict");
+        };
+        assert!(
+            matches!(&err, AdminError::Conflict(m) if m.contains("team")),
+            "deleting a still-referenced parent is a conflict: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_without_group_not_found() {
+        let app = team_app();
+        let Err(err) = build_without_group(&app, "ghost") else {
+            panic!("unknown group must be not_found");
+        };
+        assert!(matches!(&err, AdminError::NotFound(m) if m.contains("ghost")));
+    }
 }
