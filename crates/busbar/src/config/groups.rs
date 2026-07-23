@@ -23,10 +23,11 @@
 use std::fmt;
 
 use serde::de::{self, Deserializer, MapAccess, Visitor};
-use serde::Deserialize;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 
 /// One `groups:` entry.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupCfg {
     /// Optional parent group, forming the enforcement chain (acyclic, depth <= 8; validated at
@@ -72,7 +73,7 @@ impl LimitMetric {
 }
 
 /// A limit's accounting window (C8: nouns only).
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LimitWindow {
     Minute,
@@ -199,6 +200,27 @@ impl<'de> Deserialize<'de> for LimitCfg {
     }
 }
 
+/// Serialize mirrors the custom deserializer: a limit is a map with its ONE metric key + amount, plus
+/// `per: <window>` for the windowed metrics (never for `concurrent`). This is what lets a group survive
+/// in the config OVERLAY (the Admin-API-mutable persistence layer): the round-trip `{ budget: 1000,
+/// per: month }` -> LimitCfg -> `{ budget: 1000, per: month }` is exact, so an API-applied group budget
+/// re-parses identically at boot. Deliberately hand-written (not derived) so it can never drift from the
+/// `{ <metric>: <amount>, per: <window> }` shape the deserializer enforces.
+impl Serialize for LimitCfg {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let len = if self.per.is_some() { 2 } else { 1 };
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry(self.metric.as_str(), &self.amount)?;
+        if let Some(window) = self.per {
+            map.serialize_entry("per", window.as_str())?;
+        }
+        map.end()
+    }
+}
+
 /// Validate the whole `groups:` tree: parents exist, acyclic, depth <= 8. Returns paste-ready
 /// errors in the config_validate style. Pure - shared verbatim by boot and `--validate` so the two
 /// cannot drift.
@@ -246,5 +268,53 @@ pub(crate) fn validate_groups(
             }
             cursor = groups.get(cur).and_then(|g| g.parent.as_deref());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A group round-trips through YAML (deserialize -> serialize -> deserialize) unchanged. This is
+    /// the property the config OVERLAY relies on: an Admin-API-applied group budget must re-parse
+    /// identically at boot. Exercises every limit shape: windowed metrics, the windowless `concurrent`,
+    /// a per-pool budget (future `pool:` qualifier is additive; this covers today's shape), and the
+    /// parent chain.
+    #[test]
+    fn group_yaml_round_trips_exactly() {
+        let src = "\
+parent: team-payments
+enabled: true
+limits:
+  - { budget: 1000, per: month }
+  - { requests: 500, per: minute }
+  - { tokens: 20000000, per: day }
+  - { concurrent: 5 }
+";
+        let g1: GroupCfg = serde_yaml::from_str(src).expect("parse group");
+        // Serialize back out, then parse again — the two parsed values must be identical.
+        let out = serde_yaml::to_string(&g1).expect("serialize group");
+        let g2: GroupCfg = serde_yaml::from_str(&out).expect("re-parse serialized group");
+        assert_eq!(g1, g2, "group must survive a serialize/deserialize round-trip");
+
+        // Spot-check the serialized shape is the canonical `{ <metric>: <amount>, per: <window> }`,
+        // not some derived tagged form — a drift here would silently corrupt the overlay format.
+        assert!(out.contains("budget: 1000"), "budget metric key preserved: {out}");
+        assert!(out.contains("per: month"), "window preserved: {out}");
+        assert!(out.contains("concurrent: 5"), "windowless concurrent preserved: {out}");
+        assert!(!out.contains("per: null"), "concurrent must not emit a null `per`: {out}");
+    }
+
+    /// The windowless `concurrent` limit serializes WITHOUT a `per` key (len 1 map), and windowed
+    /// limits serialize WITH it (len 2) — the custom Serialize mirrors the custom Deserialize.
+    #[test]
+    fn limit_serialize_shape_matches_deserialize() {
+        let concurrent: LimitCfg = serde_yaml::from_str("{ concurrent: 3 }").unwrap();
+        assert_eq!(serde_yaml::to_string(&concurrent).unwrap().trim(), "concurrent: 3");
+
+        let budget: LimitCfg = serde_yaml::from_str("{ budget: 5000, per: month }").unwrap();
+        let out = serde_yaml::to_string(&budget).unwrap();
+        let back: LimitCfg = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(budget, back);
     }
 }
