@@ -1507,7 +1507,7 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
                 "responses": {
                     "201": {"description": "Installed — `{file, name, interface_version, trust, version?, publisher?, note}`"},
                     "400": {"description": "Malformed body, bad base64, or the library is not a loadable busbar store plugin (`invalid_request`)"},
-                    "409": {"description": "The upload is untrusted and not opted-in (`conflict`) - sign it with an allowlisted publisher, add the publisher to governance.trust.publishers, or set governance.trust.allow_unsigned_plugins / allow_third_party"}
+                    "409": {"description": "The upload is untrusted and not opted-in (`conflict`) - sign it with an allowlisted publisher, add the publisher to plugins.trust.publishers, or set plugins.trust.allow_unsigned / allow_third_party"}
                 }
             }),
         );

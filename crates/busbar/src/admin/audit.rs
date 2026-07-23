@@ -96,7 +96,7 @@ fn from_record(r: busbar_api::AuditRecord) -> AuditEntry {
 
 /// The in-memory audit ring. `record` is append-only + bounded (FIFO prune of the oldest — a hot
 /// cache of the recent tail); `list` returns most-recent-first. When a DURABLE store sink is attached
-/// (governance.store: sqlite/postgres/redis), each appended entry is ALSO write-through-persisted to
+/// (store.module: sqlite/postgres/redis), each appended entry is ALSO write-through-persisted to
 /// the store, which keeps the FULL history (never pruned) — so the ring's size bound bounds RAM, not
 /// history, and a hard crash loses ~0 entries instead of up to a snapshot interval. With the RAM
 /// default (`store: memory`) no sink is attached and the log stays ephemeral, exactly as before.

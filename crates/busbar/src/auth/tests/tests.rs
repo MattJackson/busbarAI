@@ -41,7 +41,7 @@ fn chain_cfg(modules: &[&str]) -> crate::config::AuthCfg {
 /// Helper: a role-carrying principal (the shape the test-groups-module mints).
 fn grp_principal(id: &str, roles: &[&str]) -> Principal {
     let mut p = Principal::from_id(id);
-    p.groups = roles.iter().map(|r| r.to_string()).collect();
+    p.roles = roles.iter().map(|r| r.to_string()).collect();
     p
 }
 
@@ -217,7 +217,7 @@ fn test_chain_identifies_with_module_and_principal() {
         ChainVerdict::Identified { module, principal } => {
             assert_eq!(module, "test-groups-module");
             assert_eq!(principal.id, "test:dev");
-            assert_eq!(principal.groups, vec!["dev".to_string()]);
+            assert_eq!(principal.roles, vec!["dev".to_string()]);
         }
         other => panic!("expected Identified, got {other:?}"),
     }
@@ -327,8 +327,8 @@ fn role_table(
 }
 
 /// OMITTED `allowed_pools` on a granting binding = ALL pools. The `VirtualKey` runtime encoding
-/// keeps "empty vec = all pools", so the synthesized key carries an EMPTY `allowed_pools`. The key
-/// is pure auth: no inline rpm/tpm/budget caps (limits live on groups only).
+/// carries the intent intact (`None` = all pools). The key is pure auth: no inline caps of any
+/// kind exist on the struct (limits live on groups only), so the only policy handle is `group`.
 #[test]
 fn test_synth_key_omitted_pools_grants_all_pools() {
     let table = role_table(&[("dev", binding(None, None, None))]);
@@ -336,15 +336,12 @@ fn test_synth_key_omitted_pools_grants_all_pools() {
     let key = crate::governance::synthesize_principal_key(&p, Some(&table))
         .expect("a bound role must synthesize a key");
     assert_eq!(
-        key.allowed_pools,
-        Vec::<String>::new(),
-        "omitted allowed_pools = ALL pools = empty vec on the key"
+        key.allowed_pools, None,
+        "omitted allowed_pools = ALL pools = None on the key"
     );
     assert!(key.enabled);
     assert_eq!(key.id, "test:dev");
-    assert!(key.rpm_limit.is_none() && key.tpm_limit.is_none());
-    assert!(key.max_budget_cents.is_none());
-    assert!(key.budget_group.is_none());
+    assert!(key.group.is_none());
 }
 
 /// REGRESSION for the C6 flip: an explicit `allowed_pools: []` is the EMPTY SET (no pools), no
@@ -379,7 +376,7 @@ fn test_synth_key_explicit_empty_pools_fails_closed_c6_flip() {
     let p = grp_principal("test:dev", &["dev", "ops"]);
     let key = crate::governance::synthesize_principal_key(&p, Some(&table))
         .expect("an omitted-pools binding grants all pools");
-    assert_eq!(key.allowed_pools, Vec::<String>::new());
+    assert_eq!(key.allowed_pools, None);
 }
 
 /// Explicit pool lists union across granting bindings (deduplicated); an omitted-pools binding
@@ -393,7 +390,10 @@ fn test_synth_key_pool_union_and_all_pools_dominates() {
     let p = grp_principal("test:u", &["a", "b"]);
     let key = crate::governance::synthesize_principal_key(&p, Some(&table))
         .expect("bound roles must synthesize a key");
-    assert_eq!(key.allowed_pools, vec!["p1".to_string(), "p2".to_string()]);
+    assert_eq!(
+        key.allowed_pools,
+        Some(vec!["p1".to_string(), "p2".to_string()])
+    );
 
     let table = role_table(&[
         ("a", binding(Some(&["p1"]), None, None)),
@@ -403,8 +403,7 @@ fn test_synth_key_pool_union_and_all_pools_dominates() {
     let key = crate::governance::synthesize_principal_key(&p, Some(&table))
         .expect("bound roles must synthesize a key");
     assert_eq!(
-        key.allowed_pools,
-        Vec::<String>::new(),
+        key.allowed_pools, None,
         "one omitted-pools binding widens the union to ALL pools"
     );
 }
@@ -421,15 +420,15 @@ fn test_synth_key_unbound_roles_grant_nothing() {
     assert!(crate::governance::synthesize_principal_key(&p, None).is_none());
 }
 
-/// A bound `group:` lands in the synthesized key's `budget_group` (the group chain is where
+/// A bound `group:` lands in the synthesized key's `group` binding (the group chain is where
 /// limits are enforced). The first granting role in the principal's role order wins.
 #[test]
-fn test_synth_key_bound_group_lands_in_budget_group() {
+fn test_synth_key_bound_group_lands_in_group_binding() {
     let table = role_table(&[("dev", binding(None, Some("eng"), None))]);
     let p = grp_principal("test:dev", &["dev"]);
     let key = crate::governance::synthesize_principal_key(&p, Some(&table))
         .expect("a bound role must synthesize a key");
-    assert_eq!(key.budget_group.as_deref(), Some("eng"));
+    assert_eq!(key.group.as_deref(), Some("eng"));
 
     // Two granting roles with groups: the first in role order carries.
     let table = role_table(&[
@@ -439,7 +438,7 @@ fn test_synth_key_bound_group_lands_in_budget_group() {
     let p = grp_principal("test:dev", &["dev", "ops"]);
     let key = crate::governance::synthesize_principal_key(&p, Some(&table))
         .expect("bound roles must synthesize a key");
-    assert_eq!(key.budget_group.as_deref(), Some("eng"));
+    assert_eq!(key.group.as_deref(), Some("eng"));
 }
 
 /// Reserved bucket namespaces: a principal id shaped like a group bucket (`group:...`) or a real
@@ -1429,14 +1428,10 @@ async fn test_disabled_virtual_key_is_rejected_401() {
         id: id.to_string(),
         key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
         name: id.to_string(),
-        allowed_pools: vec!["pa".to_string()],
-        max_budget_cents: None,
-        budget_period: "total".to_string(),
-        rpm_limit: None,
-        tpm_limit: None,
+        allowed_pools: Some(vec!["pa".to_string()]),
         enabled,
         created_at: 0,
-        budget_group: None,
+        group: None,
         labels: Default::default(),
     };
     store.put_key(&mk("kdis", disabled_secret, false)).unwrap();
@@ -1550,14 +1545,10 @@ async fn test_none_mode_with_governance_still_requires_virtual_key() {
             id: "k".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "k".to_string(),
-            allowed_pools: vec!["pa".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["pa".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -1659,14 +1650,10 @@ async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
             id: "k".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "k".to_string(),
-            allowed_pools: vec!["pa".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["pa".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -2038,14 +2025,10 @@ async fn test_governance_accepts_vendor_carriers_and_native_401() {
             id: "kc".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "kc".to_string(),
-            allowed_pools: vec!["pa".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["pa".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -2161,14 +2144,10 @@ async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
             id: "empty".to_string(),
             key_hash: crate::sigv4::sha256_hex(b""),
             name: "empty".to_string(),
-            allowed_pools: vec!["pa".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["pa".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -2348,12 +2327,8 @@ fn gov_with_aws_key() -> (std::sync::Arc<crate::governance::GovState>, String, S
         .create_key_with_aws(
             NewKeySpec {
                 name: "bedrock".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             crate::store::now(),
@@ -2482,20 +2457,15 @@ fn test_verify_bedrock_sigv4_disabled_key_rejected() {
         .create_key_with_aws(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             crate::store::now(),
         )
         .unwrap();
     // Disable the key.
-    gov.update_key(&key.id, Some(false), None, None, None)
-        .unwrap();
+    gov.update_key(&key.id, Some(false), None).unwrap();
     let (a, _d) = crate::sigv4::format_amz_time(crate::store::now());
     let path = "/model/anthropic.claude/converse";
     let (auth, headers) =
@@ -2821,14 +2791,10 @@ async fn test_governance_active_with_admin_token_enforces_minted_key() {
             id: "k".to_string(),
             key_hash: crate::sigv4::sha256_hex(secret.as_bytes()),
             name: "k".to_string(),
-            allowed_pools: vec!["pa".to_string()],
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["pa".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -3000,14 +2966,10 @@ async fn test_inert_governance_persisted_key_is_not_enforced_static_chain_wins()
             id: "kold".to_string(),
             key_hash: crate::sigv4::sha256_hex(persisted_secret.as_bytes()),
             name: "kold".to_string(),
-            allowed_pools: vec!["restricted".to_string()],
-            max_budget_cents: Some(0), // a budget that, if enforced, would block every request
-            budget_period: "total".to_string(),
-            rpm_limit: Some(0), // an RPM of 0 that, if enforced, would reject every request
-            tpm_limit: None,
+            allowed_pools: Some(vec!["restricted".to_string()]),
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();
@@ -3113,14 +3075,10 @@ async fn test_active_governance_persisted_key_is_enforced() {
             id: "kold".to_string(),
             key_hash: crate::sigv4::sha256_hex(persisted_secret.as_bytes()),
             name: "kold".to_string(),
-            allowed_pools: vec!["restricted".to_string()], // NOT "pa"
-            max_budget_cents: None,
-            budget_period: "total".to_string(),
-            rpm_limit: None,
-            tpm_limit: None,
+            allowed_pools: Some(vec!["restricted".to_string()]), // NOT "pa"
             enabled: true,
             created_at: 0,
-            budget_group: None,
+            group: None,
             labels: Default::default(),
         })
         .unwrap();

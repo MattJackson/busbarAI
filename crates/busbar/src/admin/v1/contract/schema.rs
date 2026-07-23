@@ -21,18 +21,18 @@ use serde::Serialize;
 use super::{AdminError, HookView};
 
 /// Virtual-key metadata — the `key_meta()` shape returned by `GET /keys/{id}`, `PATCH /keys/{id}`,
-/// and as each item of `GET /keys`. Never the secret or its hash.
+/// and as each item of `GET /keys`. Never the secret or its hash. 1.5.0: keys are PURE AUTH, no
+/// inline limits; `allowed_pools` is `null` = all pools, `[]` = no pools (C6); `group` names the
+/// bound `groups:` entry (`null` = unlimited).
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct KeyView {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) allowed_pools: Vec<String>,
-    pub(crate) max_budget_cents: Option<i64>,
-    pub(crate) budget_period: String,
-    pub(crate) rpm_limit: Option<u32>,
-    pub(crate) tpm_limit: Option<u32>,
+    pub(crate) allowed_pools: Option<Vec<String>>,
+    pub(crate) group: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) created_at: u64,
+    pub(crate) labels: std::collections::BTreeMap<String, String>,
 }
 
 /// `POST /keys` (mint) — the key metadata plus the ONCE-shown secret, and (when an AWS SigV4
@@ -42,13 +42,11 @@ pub(crate) struct KeyView {
 pub(crate) struct CreatedKeyView {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) allowed_pools: Vec<String>,
-    pub(crate) max_budget_cents: Option<i64>,
-    pub(crate) budget_period: String,
-    pub(crate) rpm_limit: Option<u32>,
-    pub(crate) tpm_limit: Option<u32>,
+    pub(crate) allowed_pools: Option<Vec<String>>,
+    pub(crate) group: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) created_at: u64,
+    pub(crate) labels: std::collections::BTreeMap<String, String>,
     /// The bearer secret — shown EXACTLY once, never returned by any read.
     pub(crate) secret: String,
     /// AWS AccessKeyId (present only when `issue_aws_credential` was set). Not secret.
@@ -64,26 +62,28 @@ pub(crate) struct CreatedKeyView {
 pub(crate) struct RotatedKeyView {
     pub(crate) id: String,
     pub(crate) name: String,
-    pub(crate) allowed_pools: Vec<String>,
-    pub(crate) max_budget_cents: Option<i64>,
-    pub(crate) budget_period: String,
-    pub(crate) rpm_limit: Option<u32>,
-    pub(crate) tpm_limit: Option<u32>,
+    pub(crate) allowed_pools: Option<Vec<String>>,
+    pub(crate) group: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) created_at: u64,
+    pub(crate) labels: std::collections::BTreeMap<String, String>,
     /// The fresh bearer secret — shown EXACTLY once.
     pub(crate) secret: String,
 }
 
-/// `GET /keys/{id}/usage` — the current budget-window counters for one key, plus the fraction of the
-/// tightest RPM/TPM cap remaining (`null` = uncapped). `budget_period`/`window_start` are `null`
-/// when the key record could not be read.
+/// `GET /keys/{id}/usage`: the key's all-time attribution counters (a 1.5.0 key bucket accrues in
+/// the `total` window; limits live on the bound group's own windows) plus the fraction of the
+/// tightest `requests`/`tokens` limit across the group chain remaining (`null` = no such limit).
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct KeyMeteringView {
     pub(crate) id: String,
-    pub(crate) budget_period: Option<String>,
-    pub(crate) window_start: Option<u64>,
+    /// Always `"total"` (the key attribution window).
+    pub(crate) budget_period: String,
+    /// Always `0` (the all-time window start).
+    pub(crate) window_start: u64,
     pub(crate) as_of: u64,
+    /// The bound `groups:` entry (`null` = unlimited key).
+    pub(crate) group: Option<String>,
     pub(crate) spend_cents: i64,
     pub(crate) tokens: u64,
     pub(crate) requests: u64,

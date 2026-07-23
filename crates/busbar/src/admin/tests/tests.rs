@@ -481,12 +481,8 @@ async fn test_admin_v1_get_single_key() {
         .create_key(
             NewKeySpec {
                 name: "svc".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             crate::store::now(),
@@ -562,12 +558,8 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
         .create_key(
             NewKeySpec {
                 name: "team-a".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             now,
@@ -1841,14 +1833,14 @@ async fn test_admin_v1_key_idempotent_mint_and_if_match() {
         .to_string();
     let stale = admin(client.patch(format!("http://{addr}/api/v1/admin/keys/{id}")))
         .header("if-match", "\"deadbeefdeadbeef\"")
-        .body(serde_json::json!({"rpm_limit": 5}).to_string())
+        .body(serde_json::json!({"enabled": false}).to_string())
         .send()
         .await
         .unwrap();
     assert_eq!(stale.status().as_u16(), 409, "stale If-Match conflicts");
     let fresh = admin(client.patch(format!("http://{addr}/api/v1/admin/keys/{id}")))
         .header("if-match", format!("\"{etag}\""))
-        .body(serde_json::json!({"rpm_limit": 5}).to_string())
+        .body(serde_json::json!({"enabled": false}).to_string())
         .send()
         .await
         .unwrap();
@@ -2585,12 +2577,8 @@ async fn test_admin_v1_list_keys_filters() {
         .create_key(
             NewKeySpec {
                 name: "filter-probe".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: "total".to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             crate::store::now(),
@@ -4095,22 +4083,40 @@ async fn test_create_key_rejects_removed_rate_limit_fields() {
 }
 
 #[tokio::test]
-async fn test_patch_key_three_state_caps_and_enabled() {
-    // PATCH /keys/{id} still carries the three-state cap fields (rpm_limit/tpm_limit/
-    // max_budget_cents) in its OWN `UpdateKeyReq` (unchanged in 1.5.0) - a SET value, a `null`
-    // clear, or absent (leave). What changed is the RESPONSE: `key_meta` no longer surfaces those
-    // caps (keys are pure auth now), so we assert on the WIRE CONTRACT the handler still owns - the
-    // 200/400 acceptance of each three-state form - and observe the one cap-independent field that
-    // IS still on key_meta: `enabled`. (The stored-cap mutation itself is covered by the
-    // governance `update_key` unit tests.)
+async fn test_patch_key_three_state_group_and_enabled() {
+    // PATCH /keys/{id} is AUTH-SHAPED in 1.5.0: `{enabled?, group??}`. `group` is three-state
+    // (absent = unchanged, `null` = unbind to unlimited, a value = rebind with mint-parity
+    // existence validation). The removed 1.4.x cap fields (rpm_limit/tpm_limit/max_budget_cents)
+    // are UNKNOWN fields now and must 400 - PATCH cannot be a back door to a limit surface that
+    // no longer exists (limits live on groups).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
     let gov = gov_with_signer(store, Some("admintok".to_string()));
-    let (addr, handle) = serve_with_gov(gov).await;
+    // The rebind target must EXIST: give the App a cost model carrying group "eng".
+    let groups = std::collections::BTreeMap::from([(
+        "eng".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Requests,
+                amount: 100,
+                per: Some(crate::config::groups::LimitWindow::Minute),
+            }],
+        },
+    )]);
+    let app = crate::test_support::TestApp::new()
+        .governance(gov)
+        .cost(crate::cost::CostModel::resolve_parts(None, 0, &groups))
+        .build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1/admin/keys");
 
-    // Mint a pure-auth key (no inline caps in the body - that is now the ONLY shape mint accepts).
+    // Mint a pure-auth key (no group).
     let created: serde_json::Value = client
         .post(&base)
         .header("x-admin-token", "admintok")
@@ -4123,59 +4129,51 @@ async fn test_patch_key_three_state_caps_and_enabled() {
         .unwrap();
     let id = created["id"].as_str().unwrap().to_string();
     assert_eq!(created["enabled"], true, "a fresh key is enabled");
+    assert!(created["group"].is_null(), "minted without a group");
     let key_url = format!("{base}/{id}");
 
-    // SET (a present value): PATCH accepts the caps and returns 200; key_meta no longer echoes them.
+    // SET (a present value): rebind to an existing group; the response surfaces the binding.
     let set: serde_json::Value = client
         .patch(&key_url)
         .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({"rpm_limit": 7, "tpm_limit": 99, "max_budget_cents": 123}))
+        .json(&serde_json::json!({"group": "eng"}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert!(
-        set.get("rpm_limit").is_none() || set["rpm_limit"].is_null(),
-        "key_meta no longer surfaces the caps: {set}"
+    assert_eq!(
+        set["group"], "eng",
+        "rebind surfaces the new binding: {set}"
     );
 
-    // CLEAR (present null): the three-state `null` clears to unlimited - must NOT trip the
-    // create-parity guards (which reject a present 0/negative VALUE, not a clear). 200.
-    let cleared = client
+    // A rebind to a MISSING group is a 400 (mint parity: no dangling binding via PATCH).
+    let dangling = client
         .patch(&key_url)
         .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({
-            "rpm_limit": null, "tpm_limit": null, "max_budget_cents": null
-        }))
+        .json(&serde_json::json!({"group": "ghost"}))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        cleared.status().as_u16(),
-        200,
-        "null (clear) is accepted by the create-parity guards"
+        dangling.status().as_u16(),
+        400,
+        "a rebind target must exist (mint parity)"
     );
 
-    // A present INVALID value (0 rate / negative budget) is still a 400 at create-parity.
-    for bad in [
-        serde_json::json!({"rpm_limit": 0}),
-        serde_json::json!({"tpm_limit": 0}),
-        serde_json::json!({"max_budget_cents": -1}),
-    ] {
-        let r = client
-            .patch(&key_url)
-            .header("x-admin-token", "admintok")
-            .json(&bad)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status().as_u16(), 400, "PATCH must reject {bad} with 400");
-    }
-
-    // ABSENT caps + a present `enabled`: the caps are left untouched and `enabled` toggles - the one
-    // key_meta field the caller can still observe.
+    // CLEAR (present null): unbind back to authed + unlimited. Absent leaves it unchanged.
+    let cleared: serde_json::Value = client
+        .patch(&key_url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"group": null}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cleared["group"].is_null(), "null unbinds: {cleared}");
     let toggled: serde_json::Value = client
         .patch(&key_url)
         .header("x-admin-token", "admintok")
@@ -4186,11 +4184,34 @@ async fn test_patch_key_three_state_caps_and_enabled() {
         .json()
         .await
         .unwrap();
-    assert_eq!(toggled["enabled"], false, "enabled toggled off: {toggled}");
+    assert_eq!(toggled["enabled"], false, "enabled toggles");
+    assert!(
+        toggled["group"].is_null(),
+        "an absent group field leaves the (unbound) binding unchanged"
+    );
+
+    // The removed 1.4.x cap fields are UNKNOWN and 400 loudly (no silent no-op back door).
+    for gone in [
+        serde_json::json!({"rpm_limit": 5}),
+        serde_json::json!({"tpm_limit": 99}),
+        serde_json::json!({"max_budget_cents": 123}),
+    ] {
+        let r = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&gone)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            400,
+            "a removed cap field must fail loudly: {gone}"
+        );
+    }
 
     handle.abort();
 }
-
 #[test]
 fn test_create_key_warns_on_unconfigured_allowed_pool() {
     // Regression (LOW #13, completeness): create_key accepted `allowed_pools` with NO ingress
@@ -4309,12 +4330,8 @@ async fn test_delete_existing_key_returns_200() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -4373,12 +4390,8 @@ async fn test_delete_key_is_not_idempotent_204() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -4417,12 +4430,8 @@ async fn test_concurrent_delete_returns_exactly_one_204() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -4481,12 +4490,8 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -4654,12 +4659,8 @@ async fn test_patch_interleaved_with_delete_never_resurrects_key() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -4751,12 +4752,8 @@ async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -4871,12 +4868,8 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
         .create_key(
             NewKeySpec {
                 name: "k".to_string(),
-                allowed_pools: vec![],
-                max_budget_cents: None,
-                budget_period: super::VALID_BUDGET_PERIODS[0].to_string(),
-                rpm_limit: None,
-                tpm_limit: None,
-                budget_group: None,
+                allowed_pools: None,
+                group: None,
                 labels: Default::default(),
             },
             0,
@@ -5728,10 +5721,10 @@ async fn test_signed_mint_group_none_and_pool_acl_matrix() {
     let all_pools_id = no_group["id"].as_str().unwrap().to_string();
     let binding = gov.lookup_by_sub(&all_pools_id).expect("binding present");
     assert!(
-        binding.allowed_pools.is_empty(),
+        binding.allowed_pools.is_none(),
         "omitted allowed_pools = the empty-vec ALL encoding"
     );
-    assert!(binding.budget_group.is_none(), "no group bound");
+    assert!(binding.group.is_none(), "no group bound");
 
     // allowed_pools = explicit [] -> the binding stores an explicit empty list too. On the wire the
     // two are the same empty array; the distinction (all vs none) is a runtime interpretation of the

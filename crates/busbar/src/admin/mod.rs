@@ -127,20 +127,6 @@ fn parse_duration_secs(s: &str) -> Result<u64, String> {
         .ok_or_else(|| "duration is too large (max 10 years)".to_string())
 }
 
-/// The budget periods `governance::budget_window` actually enforces. An unrecognized value (a typo
-/// like `"weekly"` / `"monthlly"`) is NOT a window `budget_window` knows: it silently degrades to the
-/// all-time `"total"` window with a `tracing::warn!`, so a key created with a typo'd period returns
-/// 201 yet enforces an all-time cap — its stored metadata says one thing while governance does
-/// another. Validate at the ingress (key creation) so an operator gets a 400 with the allowed set
-/// instead of a silently-misenforcing key. Kept in lock-step with the arms of
-/// `governance::budget_window`.
-#[cfg_attr(not(test), allow(dead_code))]
-const VALID_BUDGET_PERIODS: &[&str] = &[
-    crate::governance::BUDGET_PERIOD_TOTAL,
-    crate::governance::BUDGET_PERIOD_DAILY,
-    crate::governance::BUDGET_PERIOD_MONTHLY,
-];
-
 /// Error-type taxonomy strings used by the admin API and by `main.rs` (which references them via
 /// `crate::admin::ERR_TYPE_*`). The two values shared with the forward/OpenAI-family vocabulary
 /// alias their canonical home in `proto::openai_family` so the banks cannot drift.
@@ -331,14 +317,14 @@ fn parse_key_if_match(headers: &axum::http::HeaderMap) -> Result<Option<String>,
 }
 
 fn key_meta(k: &VirtualKey) -> Value {
-    // 1.5.0 keys are PURE AUTH bindings: id / name / allowed_pools / group / labels. The inline
-    // budget/rate fields are gone from the surface (all enforcement flows through the bound group);
-    // the `group` field surfaces the binding's `budget_group` under its 1.5.0 name.
+    // 1.5.0 keys are PURE AUTH bindings: id / name / allowed_pools / group / labels. Keys carry no
+    // limits (all enforcement flows through the bound group). `allowed_pools` keeps the C6 intent:
+    // JSON `null` = all pools; `[]` = no pools.
     json!({
         "id": k.id,
         "name": k.name,
         "allowed_pools": k.allowed_pools,
-        "group": k.budget_group,
+        "group": k.group,
         "enabled": k.enabled,
         "created_at": k.created_at,
         "labels": k.labels,
@@ -573,10 +559,10 @@ pub(crate) async fn create_key(
         }
         (None, None) => now.saturating_add(DEFAULT_KEY_TTL_SECS),
     };
-    // `allowed_pools`: OMITTED = all pools (empty vec = the runtime "all" encoding); an explicit
-    // `[]` = NO pools; a list scopes it. NON-FATAL typo diagnostic on each named pool.
-    let allowed_pools = req.allowed_pools.unwrap_or_default();
-    for pool in &allowed_pools {
+    // `allowed_pools` (C6, intent carried INTACT into the binding): OMITTED = all pools (`None`);
+    // an explicit `[]` = NO pools; a list scopes it. NON-FATAL typo diagnostic on each named pool.
+    let allowed_pools = req.allowed_pools;
+    for pool in allowed_pools.iter().flatten() {
         if !app.pools.contains_key(pool) {
             tracing::warn!(
                 pool = %pool,
@@ -602,15 +588,11 @@ pub(crate) async fn create_key(
             );
         }
     }
+    // Keys carry NO inline limits (S1); enforcement flows through the bound group.
     let spec = NewKeySpec {
         name: req.name,
         allowed_pools,
-        // Keys carry NO inline limits (S1); enforcement flows through the bound group.
-        max_budget_cents: None,
-        budget_period: crate::governance::BUDGET_PERIOD_TOTAL.to_string(),
-        rpm_limit: None,
-        tpm_limit: None,
-        budget_group: req.group,
+        group: req.group,
         labels: req.labels,
     };
     // Offload the blocking store write off the Tokio worker thread (matches the request-path
@@ -682,33 +664,32 @@ pub(crate) async fn create_key(
     }
 }
 
-/// Partial update to an existing key. Every field is optional; only the present ones change. The
-/// secret, name, allowed-pools, and budget period are immutable here (rotate/recreate for those).
+/// Partial update to an existing key. Keys are PURE AUTH (1.5.0, S1), so the mutable surface is
+/// auth-shaped only. Every field is optional; only the present ones change. The credential, name,
+/// allowed-pools, and labels are immutable here (rotate/recreate for those).
 ///
-/// The three cap fields are THREE-STATE via serde double-option (`Option<Option<T>>`):
-///   - absent (`#[serde(default)]` -> outer `None`): leave the stored cap unchanged.
-///   - JSON `null` (`Some(None)`): CLEAR the cap back to unlimited.
-///   - a value (`Some(Some(v))`): SET the cap to that value.
+/// `group` is THREE-STATE via serde double-option (`Option<Option<String>>`):
+///   - absent (`#[serde(default)]` -> outer `None`): leave the binding unchanged.
+///   - JSON `null` (`Some(None)`): UNBIND to no group (authed + unlimited).
+///   - a value (`Some(Some(name))`): REBIND to that group (must exist; mint-parity check).
 ///
-/// A single `Option<T>` could not tell absent from present-null, so a cap could never be cleared
-/// once set. `enabled` is a plain `Option<bool>` (a bool has no "unlimited"/clear state).
+/// A single `Option<T>` could not tell absent from present-null, so a binding could never be
+/// cleared once set. `enabled` is a plain `Option<bool>` (a bool has no clear state). The 1.4.x
+/// cap fields (`rpm_limit`/`tpm_limit`/`max_budget_cents`) are GONE: limits live on the group.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateKeyReq {
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default, deserialize_with = "double_option")]
-    rpm_limit: Option<Option<u32>>,
-    #[serde(default, deserialize_with = "double_option")]
-    tpm_limit: Option<Option<u32>>,
-    #[serde(default, deserialize_with = "double_option")]
-    max_budget_cents: Option<Option<i64>>,
+    group: Option<Option<String>>,
 }
 
-/// PATCH /api/v1/admin/keys/{id} — enable/disable a key or adjust its rate/budget caps. The `enabled` field
-/// is the primary use (disabling a key WITHOUT destroying its usage history, which `DELETE` would).
-/// Admin-gated by the auth middleware (every `/admin/*` path requires the admin token). Validation
-/// is kept at create-parity: a negative budget or a zero rate cap is a 400, exactly as `create_key`
-/// rejects them — otherwise PATCH would be a back door around those guards. 404 if the key is absent.
+/// PATCH /api/v1/admin/keys/{id}: enable/disable a key or rebind/unbind its group. `enabled` is
+/// the primary use (disabling a key WITHOUT destroying its usage history, which `DELETE` would).
+/// Admin-gated by the auth middleware (every `/admin/*` path requires the admin token). A rebind
+/// target is validated to EXIST (mint parity): otherwise PATCH would be a back door minting a
+/// dangling binding that fails every request closed. 404 if the key is absent.
 pub(crate) async fn update_key(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
@@ -746,44 +727,24 @@ pub(crate) async fn update_key(
             );
         }
     };
-    // Create-parity validation (see create_key for the rationale on each): a negative budget is a
-    // silent over-budget DoS; a zero rate cap is a permanently-unusable key. Reject both here so PATCH
-    // cannot install a value create() forbids.
-    //
-    // THREE-STATE: validation applies ONLY to a present *value* (`Some(Some(v))` = set). A present
-    // `null` (`Some(Some(_))` vs `Some(None)`) means "clear to unlimited" and is always allowed — it
-    // can never produce a dead/over-budget key, so it must NOT be rejected by the create-parity
-    // guards. Absent (`None`) leaves the field unchanged and likewise needs no check.
-    if let Some(Some(budget)) = req.max_budget_cents {
-        if budget < 0 {
+    // MINT-PARITY validation: a rebind target must exist in the top-level groups block NOW - a
+    // dangling binding would fail every request on this key closed at admission. Only a present
+    // VALUE is checked (`Some(Some(name))`); a present `null` (unbind) and an absent field need no
+    // check.
+    if let Some(Some(group)) = req.group.as_ref() {
+        if app.cost.group_named(group).is_none() {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 ERR_TYPE_INVALID_REQUEST,
-                "max_budget_cents must be >= 0 (use null to clear to unlimited)",
+                format!(
+                    "group '{group}' does not exist in the top-level groups block; configure it \
+                     first (e.g. {group}: {{ limits: [ {{ budget: 0, per: month }} ] }})"
+                ),
             );
         }
     }
-    if req.rpm_limit == Some(Some(0)) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            ERR_TYPE_INVALID_REQUEST,
-            "rpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)",
-        );
-    }
-    if req.tpm_limit == Some(Some(0)) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            ERR_TYPE_INVALID_REQUEST,
-            "tpm_limit must be >= 1 (omit to leave unchanged, null to clear to unlimited)",
-        );
-    }
     let gov = gov.clone();
-    let (enabled, rpm, tpm, budget) = (
-        req.enabled,
-        req.rpm_limit,
-        req.tpm_limit,
-        req.max_budget_cents,
-    );
+    let (enabled, group) = (req.enabled, req.group);
     // RESURRECTION RACE: `update_key` is a check-then-act (`get_key` → `put_key`, and `put_key`
     // UPSERTs on the PRIMARY KEY, so it INSERTs a missing row rather than no-opping). A PATCH that
     // reads an extant key, then has a concurrent DELETE remove the row before its `put_key` runs,
@@ -816,7 +777,7 @@ pub(crate) async fn update_key(
                     Some(_) => {}
                 }
             }
-            Ok(match gov.update_key(&id, enabled, rpm, tpm, budget)? {
+            Ok(match gov.update_key(&id, enabled, group)? {
                 Some(key) => UpdateOutcome::Updated(Box::new(key)),
                 None => UpdateOutcome::NotFound,
             })
@@ -1166,9 +1127,10 @@ pub(crate) async fn get_key(
 
 /// GET /api/v1/admin/keys/{id}/usage — the key's BUDGET-window counters (the enforcement view:
 /// spend/tokens/requests against its own budget window; the fleet FinOps series lives on `/usage`)
-/// plus `rate_headroom`: the fraction `[0,1]` of the tightest configured RPM/TPM limit still
-/// available in the current 60s window (`null` when the key has no rate caps) — a client can back
-/// off BEFORE hitting a 429 instead of discovering the cap by tripping it (key-06).
+/// plus `rate_headroom`: the fraction `[0,1]` of the tightest `requests`/`tokens` limit across
+/// the key's group chain still available in each limit's own window (`null` when the chain has no
+/// such limit): a client can back off BEFORE hitting a 429 instead of discovering the cap by
+/// tripping it (key-06).
 pub(crate) async fn key_usage(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     Path(id): Path<String>,
@@ -1195,29 +1157,22 @@ pub(crate) async fn key_usage(
     .await;
     match res {
         Ok(Ok(Some((u, key)))) => {
-            let headroom = key.as_ref().and_then(|k| gov.rate_headroom(k, now));
-            // Label the numbers (re-audit L): WHICH budget window these counters cover
-            // (`budget_period` + its start epoch) and when the read was taken — a consumer can
-            // cache, align, and reset-detect without guessing.
-            let (period, window_start) = key
+            // Headroom derives from the key's GROUP CHAIN (keys carry no caps of their own):
+            // the tightest requests/tokens limit across the chain, `null` when unlimited.
+            let headroom = key
                 .as_ref()
-                .map(|k| {
-                    (
-                        k.budget_period.clone(),
-                        crate::governance::budget_window(&k.budget_period, now),
-                    )
-                })
-                .map_or(
-                    (serde_json::Value::Null, serde_json::Value::Null),
-                    |(p, w)| (json!(p), json!(w)),
-                );
+                .and_then(|k| gov.rate_headroom(&app.cost, k, now));
+            // Label the numbers (re-audit L): a key's attribution bucket accrues in the ALL-TIME
+            // window (its limits, if any, live on the bound group's own windows), plus when the
+            // read was taken, so a consumer can cache, align, and reset-detect without guessing.
             json_response(
                 StatusCode::OK,
                 json!({
                     "id": id,
-                    "budget_period": period,
-                    "window_start": window_start,
+                    "budget_period": crate::governance::WINDOW_TOTAL,
+                    "window_start": 0,
                     "as_of": now,
+                    "group": key.as_ref().and_then(|k| k.group.clone()),
                     "spend_cents": u.spend_cents,
                     "tokens": u.tokens,
                     "requests": u.requests,

@@ -425,7 +425,7 @@ pub(crate) struct HookHealthView {
 /// EXTERNAL (registered at runtime over socket/webhook), or a DYNAMIC-LIBRARY plugin (a loadable
 /// `.so`/`.dll`/`.dylib` in the plugins directory, loaded over the store C ABI). `active` is
 /// `Some(true/false)` where activation is tracked (auth modules: in the chain?; external hooks:
-/// configured = true; dynamic store: the configured `governance.store`) and `None` where it is a
+/// configured = true; dynamic store: the configured `store.module`) and `None` where it is a
 /// per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
@@ -454,7 +454,7 @@ pub(crate) struct PluginView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) interface_version: Option<u32>,
     /// The server-side trust verdict for a dynamic-library plugin, re-evaluated against the running
-    /// `governance.trust` posture: `"trusted"` (signed by an allowlisted publisher), `"unverified"`
+    /// `plugins.trust` posture: `"trusted"` (signed by an allowlisted publisher), `"unverified"`
     /// (loaded but not verified — the posture permits it), or `"rejected"` (the `halt` posture would
     /// refuse it). `None` for compiled-in/external.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,7 +499,7 @@ impl PluginView {
 /// engine RE-VERIFIED the uploaded bytes against the running trust posture (the client is never
 /// trusted), validated the ABI handshake, and atomically wrote the library (+ its manifest sidecar)
 /// into the plugins directory. `active` takes effect on the next store (re)load — a store change
-/// applies on restart / `governance.store` apply, not as a hot swap (design: store install is
+/// applies on restart / `store.module` apply, not as a hot swap (design: store install is
 /// boot-time/config-apply). Additive-only; never a secret.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]

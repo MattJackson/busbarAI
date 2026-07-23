@@ -707,7 +707,7 @@ impl AdminService {
             // `store` (alias `db`) — DYNAMIC-LIBRARY plugins in the plugins directory. Always includes
             // the compiled-in `memory` default; then every loadable library present, each vetted (ABI
             // handshake) and its signed sidecar manifest read + re-evaluated against the running trust
-            // posture. The store the operator configured (`governance.store`) is `active`.
+            // posture. The store the operator configured (`store.module`) is `active`.
             "store" | "db" => {
                 plugins.append(&mut self.store_plugin_catalog());
             }
@@ -731,7 +731,7 @@ impl AdminService {
     /// happens through the boot pipeline, which re-runs the same three-phase validation.
     fn store_plugin_catalog(&self) -> Vec<PluginView> {
         // The compiled-in RAM default is always present. Which store backend is ACTIVE is a
-        // `governance.store` config concern (read via `GET /config`), not summarized per-row here —
+        // `store.module` config concern (read via `GET /config`), not summarized per-row here,
         // the same posture the compiled-in hook rows take (`active: None`).
         let mut out = vec![PluginView::basic(
             "memory".to_string(),
@@ -950,7 +950,7 @@ impl AdminService {
             plugins,
             note:
                 "re-scanned the plugins directory; a store change takes effect on the next store \
-                   (re)load (restart or governance.store apply), not as a hot swap",
+                   (re)load (restart or store.module apply), not as a hot swap",
         })
     }
 
