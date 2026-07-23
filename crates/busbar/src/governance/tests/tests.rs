@@ -273,7 +273,7 @@ async fn test_concurrent_govstate_admission_respects_cap() {
         let cost = cost.clone();
         let key = key.clone();
         handles.push(tokio::spawn(async move {
-            gov.try_admit(&cost, &key, at).is_ok()
+            gov.try_admit(&cost, &key, "", at).is_ok()
         }));
     }
     let mut admitted = 0u32;
@@ -332,11 +332,11 @@ async fn test_charge_refund_readmit_cycle() {
     let at = 1_700_000_000u64;
     // Charge to the cap.
     assert!(
-        gov.try_admit(&cost, &key, at).is_ok(),
+        gov.try_admit(&cost, &key, "", at).is_ok(),
         "1st (1c) admitted, spends the whole 1c group cap"
     );
     // At cap - next request rejected, NAMING the group's budget bucket.
-    match gov.try_admit(&cost, &key, at).unwrap_err() {
+    match gov.try_admit(&cost, &key, "", at).unwrap_err() {
         LimitBlocked::Limit {
             group,
             metric: "budget",
@@ -345,7 +345,7 @@ async fn test_charge_refund_readmit_cycle() {
         other => panic!("expected the group budget to block, got {other:?}"),
     }
     // Refund reverses the in-memory charge synchronously (the fee derives from the request count).
-    gov.refund_request(&cost, &key, at);
+    gov.refund_request(&cost, &key, "", at);
     assert_eq!(
         gov.usage_for(&cost, &key.id, at)
             .unwrap()
@@ -356,7 +356,7 @@ async fn test_charge_refund_readmit_cycle() {
     );
     // Budget is free again - a new request is re-admitted.
     assert!(
-        gov.try_admit(&cost, &key, at).is_ok(),
+        gov.try_admit(&cost, &key, "", at).is_ok(),
         "post-refund request re-admitted: the refunded fee freed the budget"
     );
 }
@@ -380,14 +380,21 @@ async fn test_try_admit_rejects_at_group_cap() {
         )
         .unwrap();
     let at = 1_700_000_000u64;
-    assert!(gov.try_admit(&cost, &key, at).is_ok(), "1st (1c) admitted");
-    assert!(gov.try_admit(&cost, &key, at).is_ok(), "2nd (2c) admitted");
+    assert!(
+        gov.try_admit(&cost, &key, "", at).is_ok(),
+        "1st (1c) admitted"
+    );
+    assert!(
+        gov.try_admit(&cost, &key, "", at).is_ok(),
+        "2nd (2c) admitted"
+    );
     assert_eq!(
-        gov.try_admit(&cost, &key, at).unwrap_err(),
+        gov.try_admit(&cost, &key, "", at).unwrap_err(),
         LimitBlocked::Limit {
             group: "g".to_string(),
             metric: "budget",
             window: Some("total"),
+            pool: None,
             retry_after: None,
         },
         "3rd (would be 3c > 2c cap) rejected atomically, naming the exact bucket"
@@ -812,7 +819,7 @@ fn test_derived_spend_enforces_cap_from_request_ledger() {
 
     for i in 0..3 {
         assert!(
-            gov.try_admit(&cost, &k, 1_700_000_000).is_ok(),
+            gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok(),
             "admission {i} fits (derived spend stays under 100c)"
         );
     }
@@ -824,7 +831,7 @@ fn test_derived_spend_enforces_cap_from_request_ledger() {
         90,
         "derived spend = 3 requests x 30c"
     );
-    match gov.try_admit(&cost, &k, 1_700_000_000).unwrap_err() {
+    match gov.try_admit(&cost, &k, "", 1_700_000_000).unwrap_err() {
         LimitBlocked::Limit {
             group,
             metric: "budget",
@@ -837,7 +844,7 @@ fn test_derived_spend_enforces_cap_from_request_ledger() {
     unlimited.id = "k_free".to_string();
     unlimited.group = None;
     assert!(
-        gov.try_admit(&cost, &unlimited, 1_700_000_000).is_ok(),
+        gov.try_admit(&cost, &unlimited, "", 1_700_000_000).is_ok(),
         "a key with no group is authed + unlimited"
     );
 }
@@ -859,14 +866,14 @@ fn test_two_node_flush_is_additive_no_lost_update() {
 
     // Node A charges 3 requests + per-model tokens; node B charges 2 + tokens on TWO models.
     for _ in 0..3 {
-        assert!(node_a.try_admit(&cost, &k, 1_700_000_000).is_ok());
+        assert!(node_a.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     }
-    node_a.record_usage(&cost, &k, "gpt-5", &tt(100), 1_700_000_000);
+    node_a.record_usage(&cost, &k, "", "gpt-5", &tt(100), 1_700_000_000);
     for _ in 0..2 {
-        assert!(node_b.try_admit(&cost, &k, 1_700_000_000).is_ok());
+        assert!(node_b.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     }
-    node_b.record_usage(&cost, &k, "gpt-5", &tt(40), 1_700_000_000);
-    node_b.record_usage(&cost, &k, "haiku", &tt(7), 1_700_000_000);
+    node_b.record_usage(&cost, &k, "", "gpt-5", &tt(40), 1_700_000_000);
+    node_b.record_usage(&cost, &k, "", "haiku", &tt(7), 1_700_000_000);
     node_a.flush_budgets();
     node_b.flush_budgets();
 
@@ -894,7 +901,7 @@ fn test_two_node_flush_is_additive_no_lost_update() {
     assert_eq!(u.tokens_for("gpt-5").unwrap().input, 140);
 
     // More accrual on one node keeps accumulating correctly.
-    assert!(node_a.try_admit(&cost, &k, 1_700_000_000).is_ok());
+    assert!(node_a.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     node_a.flush_budgets();
     assert_eq!(store.get_usage("k_fleet", 0).unwrap().requests, 6);
 }
@@ -911,14 +918,14 @@ fn test_additive_flush_carries_refund_deltas() {
     let cost = flat_cost(10);
 
     // Charge 2 requests, flush (durable requests=2, billable=2), then refund one and flush again.
-    assert!(gov.try_admit(&cost, &k, 1_700_000_000).is_ok());
-    assert!(gov.try_admit(&cost, &k, 1_700_000_000).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     gov.flush_budgets();
     let u = store.get_usage("k_refund", 0).unwrap();
     assert_eq!(u.requests, 2);
     assert_eq!(u.billable_requests, 2);
 
-    gov.refund_request(&cost, &k, 1_700_000_000);
+    gov.refund_request(&cost, &k, "", 1_700_000_000);
     gov.flush_budgets();
     let u = store.get_usage("k_refund", 0).unwrap();
     assert_eq!(
@@ -1005,7 +1012,7 @@ fn test_failed_flush_retries_the_unacked_delta() {
     let gov = GovState::new(store.clone(), None).unwrap();
     let cost = flat_cost(10);
 
-    assert!(gov.try_admit(&cost, &k, 1_700_000_000).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     gov.flush_budgets(); // store down: delta stays unacked, cell re-marked dirty
     assert_eq!(store.inner.get_usage("k_flaky", 0).unwrap().requests, 0);
 
@@ -1032,7 +1039,7 @@ fn test_record_usage_derives_spend_and_reprices_on_read() {
         k
     };
     let cost = card_cost("gpt-5", 500.0); // 500 micro-units/token
-    gov.record_usage(&cost, &k, "gpt-5", &tt(2000), 1_700_000_000);
+    gov.record_usage(&cost, &k, "", "gpt-5", &tt(2000), 1_700_000_000);
     gov.flush_budgets();
     let ledger = store.get_usage("k1", 0).unwrap();
     assert_eq!(ledger.tokens_for("gpt-5").unwrap().input, 2000);
@@ -1069,7 +1076,7 @@ fn test_sub_cent_precision_via_ledger_no_carry() {
     };
     let cost = card_cost("m", 10.0); // 10 micro-units/token = the old 1 cent per 1k tokens
 
-    gov.record_usage(&cost, &k, "m", &tt(500), 1_700_000_000);
+    gov.record_usage(&cost, &k, "", "m", &tt(500), 1_700_000_000);
     let u1 = gov.usage_for(&cost, "k1", 1_700_000_000).unwrap().unwrap();
     assert_eq!(u1.spend_cents, 0, "0.5 cents derives to 0 whole cents");
     assert_eq!(
@@ -1077,7 +1084,7 @@ fn test_sub_cent_precision_via_ledger_no_carry() {
         "but every token is recorded - nothing truncated"
     );
 
-    gov.record_usage(&cost, &k, "m", &tt(500), 1_700_000_000);
+    gov.record_usage(&cost, &k, "", "m", &tt(500), 1_700_000_000);
     let u2 = gov.usage_for(&cost, "k1", 1_700_000_000).unwrap().unwrap();
     assert_eq!(
         u2.spend_cents, 1,
@@ -1107,9 +1114,9 @@ fn test_ledger_windows_are_isolated_across_days() {
     let w2 = budget_window(WINDOW_DAY, day2);
     assert_ne!(w1, w2);
 
-    gov.record_usage(&cost, &k, "m", &tt(500), day1);
+    gov.record_usage(&cost, &k, "", "m", &tt(500), day1);
     gov.flush_budgets(); // persist the day-1 cell before it rolls over
-    gov.record_usage(&cost, &k, "m", &tt(500), day2);
+    gov.record_usage(&cost, &k, "", "m", &tt(500), day2);
     gov.flush_budgets();
     assert_eq!(
         ledger_tokens(&store, "group:g@day", w1),
@@ -1139,7 +1146,7 @@ async fn test_record_usage_write_behind_under_runtime() {
         k
     };
     let cost = card_cost("gpt-5", 500.0);
-    gov.record_usage(&cost, &k, "gpt-5", &tt(2000), 1_700_000_000);
+    gov.record_usage(&cost, &k, "", "gpt-5", &tt(2000), 1_700_000_000);
     assert_eq!(
         store.get_usage("k1", 0).unwrap(),
         UsageLedger::default(),
@@ -1175,7 +1182,7 @@ fn test_rate_headroom_reports_fraction_remaining() {
     // No group -> no limits -> no headroom signal.
     let unl = sample_key("ku", "hu");
     let no_groups = crate::cost::CostModel::flat(0);
-    assert_eq!(gov.rate_headroom(&no_groups, &unl, now), None);
+    assert_eq!(gov.rate_headroom(&no_groups, &unl, None, now), None);
 
     // requests=0: a fully-closed limit. The code guards the divide-by-zero (cap==0 -> no
     // headroom); assert 0.0 rather than a panic, so a future removal of that guard is caught.
@@ -1198,7 +1205,7 @@ fn test_rate_headroom_reports_fraction_remaining() {
     let mut kz = sample_key("kz", "hz");
     kz.group = Some("z".to_string());
     assert_eq!(
-        gov.rate_headroom(&zero, &kz, now),
+        gov.rate_headroom(&zero, &kz, None, now),
         Some(0.0),
         "requests=0 is fully closed -> 0.0 headroom, not a divide-by-zero panic"
     );
@@ -1231,24 +1238,24 @@ fn test_rate_headroom_reports_fraction_remaining() {
     let cost = crate::cost::CostModel::resolve_parts(None, 0, &cfg);
     let mut k = sample_key("k1", "h1");
     k.group = Some("g".to_string());
-    assert_eq!(gov.rate_headroom(&cost, &k, now), Some(1.0));
+    assert_eq!(gov.rate_headroom(&cost, &k, None, now), Some(1.0));
     assert_eq!(
-        gov.rate_headroom(&cost, &k, now),
+        gov.rate_headroom(&cost, &k, None, now),
         Some(1.0),
         "rate_headroom is read-only; repeated reads must not drain the window"
     );
 
     // Consume 1 of 4 via the admission path -> 3/4 headroom = 0.75 (the loose tokens cap does
     // not tighten the min).
-    assert!(gov.try_admit(&cost, &k, now).is_ok());
-    let h = gov.rate_headroom(&cost, &k, now).unwrap();
+    assert!(gov.try_admit(&cost, &k, "", now).is_ok());
+    let h = gov.rate_headroom(&cost, &k, None, now).unwrap();
     assert!((h - 0.75).abs() < 1e-9, "expected 0.75 headroom, got {h}");
 
     // Drive requests to the cap -> 0.0, clamped.
     for _ in 0..3 {
-        assert!(gov.try_admit(&cost, &k, now).is_ok());
+        assert!(gov.try_admit(&cost, &k, "", now).is_ok());
     }
-    let hb = gov.rate_headroom(&cost, &k, now).unwrap();
+    let hb = gov.rate_headroom(&cost, &k, None, now).unwrap();
     assert!(
         hb.abs() < 1e-9,
         "requests at cap must yield 0.0 headroom, got {hb}"
@@ -1309,7 +1316,7 @@ fn test_budget_sweep_is_window_agnostic_across_cotenants() {
         Ordering::Relaxed,
     );
     assert!(
-        gov.try_admit(&flat_cost(1), &survivor, now).is_ok(),
+        gov.try_admit(&flat_cost(1), &survivor, "", now).is_ok(),
         "key admits"
     );
 
@@ -1370,7 +1377,7 @@ fn test_budget_sweep_cadence_post_increment_no_off_by_one() {
     // FIRST admission: k1's shard ticker is 0, post-increment value is 1 (not a multiple of N) ->
     // NO sweep. The stale co-tenant must survive.
     assert_eq!(gov.budget.sweep_ticker_for("k1").load(Ordering::Relaxed), 0);
-    assert!(gov.try_admit(&flat_cost(0), &k, now).is_ok());
+    assert!(gov.try_admit(&flat_cost(0), &k, "", now).is_ok());
     assert!(
         gov.budget.read("k1").contains_key("stale"),
         "first admission must NOT sweep (post-increment value 1 is not a multiple of N)"
@@ -1381,7 +1388,7 @@ fn test_budget_sweep_cadence_post_increment_no_off_by_one() {
     gov.budget
         .sweep_ticker_for("k1")
         .store(N - 1, Ordering::Relaxed);
-    assert!(gov.try_admit(&flat_cost(0), &k, now).is_ok());
+    assert!(gov.try_admit(&flat_cost(0), &k, "", now).is_ok());
     assert!(
         !gov.budget.read("k1").contains_key("stale"),
         "admission N must run the sweep and evict the stale entry"
@@ -1396,7 +1403,7 @@ fn test_budget_sweep_cadence_post_increment_no_off_by_one() {
     gov.budget
         .sweep_ticker_for("k1")
         .store(u32::MAX, Ordering::Relaxed);
-    assert!(gov.try_admit(&flat_cost(0), &k, now).is_ok());
+    assert!(gov.try_admit(&flat_cost(0), &k, "", now).is_ok());
     assert_eq!(
         gov.budget.sweep_ticker_for("k1").load(Ordering::Relaxed),
         0,
@@ -1418,7 +1425,7 @@ async fn test_admission_charge_write_behind_under_runtime() {
     let gov = GovState::new(store.clone(), None).unwrap();
     let cost = group_cost(30, &[("team", 1000, "total", None)]);
 
-    assert!(gov.try_admit(&cost, &k, 1_700_000_000).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     assert_eq!(
         store.get_usage("k1", 0).unwrap().requests,
         0,
@@ -1436,7 +1443,7 @@ async fn test_admission_charge_write_behind_under_runtime() {
         "the group's window bucket flushed too"
     );
     // Derived spend follows: 1 request x 30c fee, still under the 1000c group cap.
-    assert!(gov.try_admit(&cost, &k, 1_700_000_000).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
 }
 
 #[test]
@@ -1461,7 +1468,7 @@ fn test_negative_fee_and_rate_clamp_to_zero() {
     };
 
     for _ in 0..5 {
-        assert!(gov.try_admit(&cost, &k, 1_700_000_000).is_ok());
+        assert!(gov.try_admit(&cost, &k, "", 1_700_000_000).is_ok());
     }
     let u = gov.usage_for(&cost, "k1", 1_700_000_000).unwrap().unwrap();
     assert_eq!(u.spend_cents, 0, "negative fee clamps to 0 derived spend");
@@ -1469,7 +1476,7 @@ fn test_negative_fee_and_rate_clamp_to_zero() {
 
     // A negative per-token rate likewise derives 0 (never subtracts).
     let neg_rate = card_cost("m", -100.0);
-    gov.record_usage(&neg_rate, &k, "m", &tt(5000), 1_700_000_000);
+    gov.record_usage(&neg_rate, &k, "", "m", &tt(5000), 1_700_000_000);
     let u = gov
         .usage_for(&neg_rate, "k1", 1_700_000_000)
         .unwrap()
@@ -1620,15 +1627,15 @@ fn test_poisoned_budget_lock_recovers_not_panics() {
 
     // Despite the poison, the hot path keeps working (no panic, the cap still enforced).
     assert!(
-        gov.try_admit(&cost, &k, now).is_ok(),
+        gov.try_admit(&cost, &k, "", now).is_ok(),
         "1st admits after poison"
     );
     assert!(
-        gov.try_admit(&cost, &k, now).is_ok(),
+        gov.try_admit(&cost, &k, "", now).is_ok(),
         "2nd admits after poison"
     );
     assert!(
-        gov.try_admit(&cost, &k, now).is_err(),
+        gov.try_admit(&cost, &k, "", now).is_err(),
         "2c cap still enforced on a recovered (poisoned) lock"
     );
 }
@@ -1742,7 +1749,7 @@ async fn test_write_behind_flush_serializes_and_counts_exactly_once() {
     // Accrue an OLDER 3 requests, then start the flusher: its first tick snapshots that cell and
     // its `add_usage` BLOCKS mid-write (holding the flush in flight).
     for _ in 0..3 {
-        assert!(gov.try_admit(&cost, &key, at).is_ok());
+        assert!(gov.try_admit(&cost, &key, "", at).is_ok());
     }
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
     crate::governance::spawn_budget_flusher(gov.clone(), shutdown_rx);
@@ -1753,8 +1760,8 @@ async fn test_write_behind_flush_serializes_and_counts_exactly_once() {
         .unwrap();
 
     // While that older flush is pinned, accrue 2 NEWER requests and re-mark the cell dirty.
-    assert!(gov.try_admit(&cost, &key, at).is_ok());
-    assert!(gov.try_admit(&cost, &key, at).is_ok());
+    assert!(gov.try_admit(&cost, &key, "", at).is_ok());
+    assert!(gov.try_admit(&cost, &key, "", at).is_ok());
 
     // Give the flusher time to fire (and SKIP) several overlapping ticks while the first blocks.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -1810,11 +1817,12 @@ fn test_chain_enforcement_rejects_naming_the_blocking_group() {
     kb.group = Some("broke".to_string());
     store.put_key(&kb).unwrap();
     assert_eq!(
-        gov.try_admit(&zero, &kb, at).unwrap_err(),
+        gov.try_admit(&zero, &kb, "", at).unwrap_err(),
         LimitBlocked::Limit {
             group: "broke".to_string(),
             metric: "budget",
             window: Some("month"),
+            pool: None,
             retry_after: crate::governance::window_end("month", at)
                 .map(|end| end.saturating_sub(at).max(1)),
         },
@@ -1830,10 +1838,10 @@ fn test_chain_enforcement_rejects_naming_the_blocking_group() {
     );
 
     // The bob chain admits twice under every cap and charges EVERY bucket in the chain.
-    assert!(gov.try_admit(&cost, &k, at).is_ok());
-    assert!(gov.try_admit(&cost, &k, at).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", at).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", at).is_ok());
     // The 3rd would derive 30c > bob's 25c cap: rejected naming bob.
-    match gov.try_admit(&cost, &k, at).unwrap_err() {
+    match gov.try_admit(&cost, &k, "", at).unwrap_err() {
         LimitBlocked::Limit {
             group,
             metric: "budget",
@@ -1883,14 +1891,15 @@ fn test_group_token_spend_blocks_chain_admission() {
     store.put_key(&k).unwrap();
     let at = 1_700_000_000u64;
 
-    assert!(gov.try_admit(&cost, &k, at).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", at).is_ok());
     // Accrue exactly the cap's worth of tokens: 10_000 x 100 micro = 100 cents.
-    gov.record_usage(&cost, &k, "gpt-5", &tt(10_000), at);
-    match gov.try_admit(&cost, &k, at).unwrap_err() {
+    gov.record_usage(&cost, &k, "", "gpt-5", &tt(10_000), at);
+    match gov.try_admit(&cost, &k, "", at).unwrap_err() {
         LimitBlocked::Limit {
             group,
             metric: "budget",
             window: Some("total"),
+            pool: None,
             retry_after: None,
         } => assert_eq!(group, "team"),
         other => panic!("expected team's budget to block, got {other:?}"),
@@ -1917,9 +1926,9 @@ fn test_boundary_straddle_charge_never_rewinds_the_live_cell() {
     let bucket = "group:g@day";
 
     // A W1 admission rolls the group cell to the new day and accrues real spend there.
-    gov.try_admit(&cost, &k, w1_early)
+    gov.try_admit(&cost, &k, "", w1_early)
         .expect("fresh window admits");
-    gov.record_usage(&cost, &k, "m", &tt(10_000), w1_early);
+    gov.record_usage(&cost, &k, "", "m", &tt(10_000), w1_early);
     let before = gov
         .derived_bucket_usage(&cost, bucket, WINDOW_DAY, true, w1_early)
         .unwrap();
@@ -1927,7 +1936,7 @@ fn test_boundary_straddle_charge_never_rewinds_the_live_cell() {
 
     // The straddler (charged_at still in W0) is admitted - 100c < 150c cap - and must charge the
     // LIVE cell without rewinding it.
-    gov.try_admit(&cost, &k, w0_late)
+    gov.try_admit(&cost, &k, "", w0_late)
         .expect("under-cap straddler admits");
     let after = gov
         .derived_bucket_usage(&cost, bucket, WINDOW_DAY, true, w1_early)
@@ -1941,8 +1950,8 @@ fn test_boundary_straddle_charge_never_rewinds_the_live_cell() {
 
     // Exhaust the live window's cap; a further STRADDLING admission must SEE that spend and
     // reject (pre-fix it derived 0 for the 'stale' window and admitted).
-    gov.record_usage(&cost, &k, "m", &tt(10_000), w1_early); // now 200c > 150c cap
-    match gov.try_admit(&cost, &k, w0_late).unwrap_err() {
+    gov.record_usage(&cost, &k, "", "m", &tt(10_000), w1_early); // now 200c > 150c cap
+    match gov.try_admit(&cost, &k, "", w0_late).unwrap_err() {
         LimitBlocked::Limit {
             group,
             metric: "budget",
@@ -1968,12 +1977,12 @@ fn test_missing_group_fails_closed() {
     let at = 1_700_000_000u64;
 
     assert_eq!(
-        gov.try_admit(&cost, &k, at).unwrap_err(),
+        gov.try_admit(&cost, &k, "", at).unwrap_err(),
         LimitBlocked::MissingGroup("ghost".to_string()),
         "an unresolvable chain is never admitted (fail closed), naming the missing group"
     );
     // Accrual (post-admission on another node, or a race) still ledgers to the key bucket.
-    gov.record_usage(&cost, &k, "m", &tt(7), at);
+    gov.record_usage(&cost, &k, "", "m", &tt(7), at);
     gov.flush_budgets();
     assert_eq!(ledger_tokens(&store, "vk_g", 0), 7, "tokens are never lost");
 }
@@ -1992,14 +2001,14 @@ fn test_hydrate_budgets_restores_group_buckets() {
     {
         let gov = GovState::new(store.clone(), None).unwrap();
         // Seed the group's ledger with the cap's worth of tokens: 2500 x 100 micro = 25 cents.
-        gov.record_usage(&card(), &k, "m", &tt(2_500), at);
+        gov.record_usage(&card(), &k, "", "m", &tt(2_500), at);
         gov.flush_budgets();
     }
 
     // Restart: a fresh GovState hydrates key AND group cells from the durable ledger.
     let gov2 = GovState::new(store.clone(), None).unwrap();
     gov2.hydrate_budgets(&card(), at).expect("hydrate");
-    match gov2.try_admit(&card(), &k, at).unwrap_err() {
+    match gov2.try_admit(&card(), &k, "", at).unwrap_err() {
         LimitBlocked::Limit {
             group,
             metric: "budget",
@@ -2099,7 +2108,7 @@ fn test_budget_state_projects_the_whole_chain() {
     store.put_key(&k).unwrap();
     let at = 1_700_000_000u64;
 
-    assert!(gov.try_admit(&cost, &k, at).is_ok());
+    assert!(gov.try_admit(&cost, &k, "", at).is_ok());
     let state = gov.budget_state(&cost, &k, at);
     assert_eq!(state.len(), 3, "key + growth@month + acme@month");
     assert_eq!(state[0].bucket_id, "vk_s");

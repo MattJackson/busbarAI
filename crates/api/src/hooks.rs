@@ -144,11 +144,16 @@ pub struct Candidate<'a> {
 /// projection from the token ledger x the operator's current rate card (never stored, no currency).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BudgetBucketState {
-    /// The bucket id: the key's own id (innermost bucket) or `group:<name>@<window>` for an
-    /// ancestor group's budget-window bucket.
+    /// The bucket id: the key's own id (innermost bucket) or `group:<name>@<window>[#<pool>]`
+    /// for an ancestor group's budget-window bucket.
     pub bucket_id: String,
     /// The budget-group name for a group bucket; `None` for the key's own bucket.
     pub budget_group: Option<String>,
+    /// The bucket's pool scope: `Some(pool)` for a pool-qualified limit's bucket (it accounts
+    /// only that pool's traffic); `None` for a group-wide bucket. Additive - absent on the wire
+    /// from older busbars reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     /// The bucket's spend so far this window, derived at the CURRENT rate card.
     pub spend_micros_at_current_rate: i64,
     /// Micro-units remaining under the bucket's cap (`None` = uncapped bucket).

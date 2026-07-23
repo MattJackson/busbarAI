@@ -862,6 +862,7 @@ mod tests {
         gov.record_usage(
             &cost,
             &key,
+            "",
             "gpt-5",
             &busbar_api::TierTokens {
                 input: 100,

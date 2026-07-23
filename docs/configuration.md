@@ -315,9 +315,9 @@ groups:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `parent` | string | none | The parent group; must exist; the chain must be acyclic and at most 8 deep (validated with paste-ready fixes). |
+| `parent` | string | none | The parent group; must exist; the chain must be acyclic (validated with paste-ready fixes). Any depth. |
 | `enabled` | bool | `true` | `false` FREEZES the group: every request charging through it (its own keys and every descendant's) is rejected with a 403 naming the group, while its usage history is kept. |
-| `limits` | list | `[]` | Each entry has exactly ONE metric key: `requests`, `tokens`, or `budget` with a required `per:` window (`minute` \| `hour` \| `day` \| `month` \| `total`), or `concurrent` with NO `per:` (instantaneous). A metric repeated for the same window keeps the most restrictive amount. |
+| `limits` | list | `[]` | Each entry has exactly ONE metric key: `requests`, `tokens`, or `budget` with a required `per:` window (`minute` \| `hour` \| `day` \| `month` \| `total`), or `concurrent` with NO `per:` (instantaneous). An optional `pool: <name>` on a windowed metric scopes the limit to that pool's traffic (see below); the pool must exist. A metric repeated for the same window + pool scope keeps the most restrictive amount. |
 
 **Metric semantics:**
 
@@ -330,7 +330,26 @@ groups:
   plus `per_request_fee` x its request count, in abstract cents. Rejection: the vendor's native
   quota status (429 for most protocols; Bedrock's quota shape is 400-class), naming the bucket.
 - **`concurrent`** is an in-flight gauge: incremented at admission, released when the response
-  stream completes. Rejection: 429, no `Retry-After`.
+  stream completes. Rejection: 429, no `Retry-After`. Takes no `pool:` (the gauge is per group).
+
+**Pool-scoped limits (`pool:`).** A windowed limit may carry `pool: <name>`, making it account and
+enforce per `(group, pool)` instead of group-wide — the per-tier budget split:
+
+```yaml
+groups:
+  dev-team:
+    limits:
+      - { budget: 5000, per: month, pool: frontier }   # expensive tier: its own bucket
+      - { budget: 5000, per: month, pool: value }      # cheap tier: its own bucket
+```
+
+Each pool-qualified limit gets its own ledger bucket (`group:<name>@<window>#<pool>`): exhausting
+the `frontier` budget blocks only requests dispatched through `frontier` (the rejection names the
+pool), while `value` traffic still admits against its untouched bucket. Group-wide limits (no
+`pool:`) still count ALL traffic, and everything ANDs across the chain as usual. Token accrual and
+non-2xx refunds mirror the admission exactly: they touch only the buckets the request's pool
+charged. The named pool must exist in `pools:` — a dangling qualifier fails validation (it would
+be an unenforced budget).
 
 ---
 

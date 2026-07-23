@@ -1159,9 +1159,11 @@ pub(crate) async fn key_usage(
         Ok(Ok(Some((u, key)))) => {
             // Headroom derives from the key's GROUP CHAIN (keys carry no caps of their own):
             // the tightest requests/tokens limit across the chain, `null` when unlimited.
+            // Pool-less read: a per-pool cap is not a property of the key as a whole, so
+            // pool-scoped buckets are excluded from this overview figure.
             let headroom = key
                 .as_ref()
-                .and_then(|k| gov.rate_headroom(&app.cost, k, now));
+                .and_then(|k| gov.rate_headroom(&app.cost, k, None, now));
             // Label the numbers (re-audit L): a key's attribution bucket accrues in the ALL-TIME
             // window (its limits, if any, live on the bound group's own windows), plus when the
             // read was taken, so a consumer can cache, align, and reset-detect without guessing.

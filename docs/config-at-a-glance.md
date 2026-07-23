@@ -47,7 +47,8 @@ groups:
     limits:                  # default: [] (an inherit-only group, capped by its parent chain)
       - { requests: 500, per: minute }   # requests|tokens|budget need a per: window
       - { budget: 1000000, per: month }
-      - { concurrent: 5 }                # instantaneous in-flight cap: NO per:
+      - { budget: 5000, per: month, pool: frontier }   # optional pool: = per-(group, pool) accounting
+      - { concurrent: 5 }                # instantaneous in-flight cap: NO per:, NO pool:
 ```
 
 Chain-AND enforced at admission (atomic, all-or-nothing); rejections name the exact blocking

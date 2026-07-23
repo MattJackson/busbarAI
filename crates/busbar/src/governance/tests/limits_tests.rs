@@ -99,6 +99,7 @@ fn assert_blocked(
             group: g,
             metric: m,
             window: w,
+            pool: _,
             retry_after,
         } => {
             assert_eq!(g, group, "blocking group");
@@ -126,12 +127,13 @@ fn requests_per_minute_enforced_and_window_rolls() {
     let k = key("vk_r", Some("bob"));
     let now = 1_700_000_000; // mid-minute
     for _ in 0..3 {
-        g.try_admit(&cm, &k, now).expect("under the cap");
+        g.try_admit(&cm, &k, "", now).expect("under the cap");
     }
-    let err = g.try_admit(&cm, &k, now).unwrap_err();
+    let err = g.try_admit(&cm, &k, "", now).unwrap_err();
     assert_blocked(err, "bob", "requests", Some("minute"), true);
     // The next minute window is fresh.
-    g.try_admit(&cm, &k, now + 60).expect("new window admits");
+    g.try_admit(&cm, &k, "", now + 60)
+        .expect("new window admits");
 }
 
 /// Every windowed granularity resolves and enforces independently: an HOUR cap and a DAY cap on
@@ -152,11 +154,11 @@ fn hour_and_day_windows_enforce_independently() {
     )]);
     let k = key("vk_hd", Some("g"));
     let day0 = 1_700_006_400 / super::SECS_PER_DAY * super::SECS_PER_DAY; // a UTC midnight
-    g.try_admit(&cm, &k, day0).expect("1st");
-    g.try_admit(&cm, &k, day0).expect("2nd");
+    g.try_admit(&cm, &k, "", day0).expect("1st");
+    g.try_admit(&cm, &k, "", day0).expect("2nd");
     // Hour cap (2) trips first.
     assert_blocked(
-        g.try_admit(&cm, &k, day0).unwrap_err(),
+        g.try_admit(&cm, &k, "", day0).unwrap_err(),
         "g",
         "requests",
         Some("hour"),
@@ -165,9 +167,9 @@ fn hour_and_day_windows_enforce_independently() {
     // Next hour: the hour bucket is fresh but the DAY bucket already holds 2; one more is the
     // day's 3rd and passes, the next blocks on the day cap.
     let next_hour = day0 + 3600;
-    g.try_admit(&cm, &k, next_hour).expect("day's 3rd");
+    g.try_admit(&cm, &k, "", next_hour).expect("day's 3rd");
     assert_blocked(
-        g.try_admit(&cm, &k, next_hour).unwrap_err(),
+        g.try_admit(&cm, &k, "", next_hour).unwrap_err(),
         "g",
         "requests",
         Some("day"),
@@ -188,9 +190,9 @@ fn total_window_blocks_without_retry_after() {
         ),
     )]);
     let k = key("vk_t", Some("g"));
-    g.try_admit(&cm, &k, 100).expect("first");
+    g.try_admit(&cm, &k, "", 100).expect("first");
     assert_blocked(
-        g.try_admit(&cm, &k, 100_000_000).unwrap_err(),
+        g.try_admit(&cm, &k, "", 100_000_000).unwrap_err(),
         "g",
         "requests",
         Some("total"),
@@ -213,19 +215,20 @@ fn tokens_cap_blocks_after_ledger_crosses() {
     )]);
     let k = key("vk_tok", Some("g"));
     let now = 1_700_000_000;
-    g.try_admit(&cm, &k, now).expect("no tokens ledgered yet");
-    g.record_usage(&cm, &k, "m", &toks(60, 39), now); // 99 < 100
-    g.try_admit(&cm, &k, now).expect("still under");
-    g.record_usage(&cm, &k, "m", &toks(1, 0), now); // exactly 100 = at the cap
+    g.try_admit(&cm, &k, "", now)
+        .expect("no tokens ledgered yet");
+    g.record_usage(&cm, &k, "", "m", &toks(60, 39), now); // 99 < 100
+    g.try_admit(&cm, &k, "", now).expect("still under");
+    g.record_usage(&cm, &k, "", "m", &toks(1, 0), now); // exactly 100 = at the cap
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "g",
         "tokens",
         Some("minute"),
         true,
     );
     // A fresh window forgets the tokens.
-    g.try_admit(&cm, &k, now + 60).expect("fresh window");
+    g.try_admit(&cm, &k, "", now + 60).expect("fresh window");
 }
 
 /// `budget` per window derives spend from the token ledger x the rate card PLUS the flat fee x
@@ -249,12 +252,12 @@ fn budget_cap_derives_from_ledger_and_rate_card() {
     );
     let k = key("vk_b", Some("g"));
     let now = 1_700_000_000;
-    g.try_admit(&cm, &k, now).expect("nothing spent");
-    g.record_usage(&cm, &k, "m", &toks(99_000, 0), now); // 99 cents
-    g.try_admit(&cm, &k, now).expect("under the cap");
-    g.record_usage(&cm, &k, "m", &toks(1_000, 0), now); // 100 cents = at the cap
+    g.try_admit(&cm, &k, "", now).expect("nothing spent");
+    g.record_usage(&cm, &k, "", "m", &toks(99_000, 0), now); // 99 cents
+    g.try_admit(&cm, &k, "", now).expect("under the cap");
+    g.record_usage(&cm, &k, "", "m", &toks(1_000, 0), now); // 100 cents = at the cap
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "g",
         "budget",
         Some("month"),
@@ -281,18 +284,19 @@ fn per_request_fee_counts_into_group_budget() {
     );
     let k = key("vk_fee", Some("g"));
     let now = 1_700_000_000;
-    g.try_admit(&cm, &k, now).expect("fee 10 <= 25");
-    g.try_admit(&cm, &k, now).expect("fee 20 <= 25");
+    g.try_admit(&cm, &k, "", now).expect("fee 10 <= 25");
+    g.try_admit(&cm, &k, "", now).expect("fee 20 <= 25");
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "g",
         "budget",
         Some("day"),
         true,
     );
     // A refund (non-2xx) returns the fee, re-opening the cap (the fee bills 2xx only).
-    g.refund_request(&cm, &k, now);
-    g.try_admit(&cm, &k, now).expect("refund re-opened the cap");
+    g.refund_request(&cm, &k, "", now);
+    g.try_admit(&cm, &k, "", now)
+        .expect("refund re-opened the cap");
 }
 
 /// REGRESSION (found by the test agent): a REFUND must return the fee (2xx-only billing) WITHOUT
@@ -320,14 +324,14 @@ fn refund_returns_the_fee_but_never_the_requests_limit_slot() {
     let k = key("vk_split", Some("g"));
     let now = 1_700_000_000;
     // Two admissions, both REFUNDED (simulating two non-2xx outcomes).
-    g.try_admit(&cm, &k, now).expect("1st admits");
-    g.refund_request(&cm, &k, now);
-    g.try_admit(&cm, &k, now).expect("2nd admits");
-    g.refund_request(&cm, &k, now);
+    g.try_admit(&cm, &k, "", now).expect("1st admits");
+    g.refund_request(&cm, &k, "", now);
+    g.try_admit(&cm, &k, "", now).expect("2nd admits");
+    g.refund_request(&cm, &k, "", now);
     // The requests LIMIT saw 2 admissions and was NOT refunded: the 3rd is rejected on the
     // requests cap even though both prior requests "failed".
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "g",
         "requests",
         Some("day"),
@@ -356,12 +360,12 @@ fn concurrent_gauge_holds_and_releases() {
     )]);
     let k = key("vk_c", Some("g"));
     let now = 1_700_000_000;
-    let g1 = g.try_admit(&cm, &k, now).expect("1st in flight");
-    let g2 = g.try_admit(&cm, &k, now).expect("2nd in flight");
+    let g1 = g.try_admit(&cm, &k, "", now).expect("1st in flight");
+    let g2 = g.try_admit(&cm, &k, "", now).expect("2nd in flight");
     assert_eq!(g1.held(), 1);
     assert_eq!(g.concurrent_in_flight("g"), 2);
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "g",
         "concurrent",
         None,
@@ -369,7 +373,7 @@ fn concurrent_gauge_holds_and_releases() {
     );
     drop(g1);
     assert_eq!(g.concurrent_in_flight("g"), 1);
-    let _g3 = g.try_admit(&cm, &k, now).expect("slot freed");
+    let _g3 = g.try_admit(&cm, &k, "", now).expect("slot freed");
     drop(g2);
     drop(_g3);
     assert_eq!(g.concurrent_in_flight("g"), 0, "all holds released");
@@ -400,11 +404,11 @@ fn rejected_admission_releases_concurrent_holds() {
     ]);
     let k = key("vk_leak", Some("child"));
     let now = 1_700_000_000;
-    let held = g.try_admit(&cm, &k, now).expect("first admits");
+    let held = g.try_admit(&cm, &k, "", now).expect("first admits");
     // Second: the child's gauge increments, then the parent's requests cap blocks - the gauge
     // must be released with the rejection.
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "parent",
         "requests",
         Some("minute"),
@@ -443,11 +447,11 @@ fn chain_and_parent_blocks_child_and_charges_nothing() {
     ]);
     let k = key("vk_child", Some("growth"));
     let now = 1_700_000_000;
-    g.try_admit(&cm, &k, now).expect("1st");
-    g.try_admit(&cm, &k, now).expect("2nd");
+    g.try_admit(&cm, &k, "", now).expect("1st");
+    g.try_admit(&cm, &k, "", now).expect("2nd");
     // Parent cap (2) blocks despite the child's 100-cap headroom.
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "acme",
         "requests",
         Some("minute"),
@@ -503,10 +507,10 @@ fn runtime_added_user_leaf_is_capped_by_the_team_ceiling() {
     let now = 1_700_000_000;
     // Two admissions fit under the team ceiling; the third is blocked by TEAM, not bob's 5-cap —
     // the personal budget cannot exceed the shared team pool no matter how generously it's set.
-    g.try_admit(&cm, &k, now).expect("1st");
-    g.try_admit(&cm, &k, now).expect("2nd");
+    g.try_admit(&cm, &k, "", now).expect("1st");
+    g.try_admit(&cm, &k, "", now).expect("2nd");
     assert_blocked(
-        g.try_admit(&cm, &k, now).unwrap_err(),
+        g.try_admit(&cm, &k, "", now).unwrap_err(),
         "team",
         "requests",
         Some("minute"),
@@ -536,10 +540,10 @@ fn disabled_group_freezes_the_chain() {
     let now = 1_700_000_000;
     // Accrue history under the enabled config first.
     let cm = build(true);
-    g.try_admit(&cm, &k, now).expect("enabled admits");
+    g.try_admit(&cm, &k, "", now).expect("enabled admits");
     // Freeze the ANCESTOR: the child's keys are rejected too (freeze walks the chain).
     let frozen = build(false);
-    match g.try_admit(&frozen, &k, now).unwrap_err() {
+    match g.try_admit(&frozen, &k, "", now).unwrap_err() {
         LimitBlocked::Disabled(name) => assert_eq!(name, "parent"),
         other => panic!("expected Disabled, got {other:?}"),
     }
@@ -549,7 +553,8 @@ fn disabled_group_freezes_the_chain() {
         .unwrap();
     assert_eq!(hist.requests, 1, "freezing keeps history");
     // Unfreeze: admission resumes.
-    g.try_admit(&build(true), &k, now).expect("unfrozen admits");
+    g.try_admit(&build(true), &k, "", now)
+        .expect("unfrozen admits");
 }
 
 /// A key with NO group is authed + UNLIMITED: every admission passes and only its own attribution
@@ -568,7 +573,7 @@ fn key_with_no_group_is_unlimited() {
     let k = key("vk_free", None);
     let now = 1_700_000_000;
     for _ in 0..100 {
-        g.try_admit(&cm, &k, now).expect("no group = no caps");
+        g.try_admit(&cm, &k, "", now).expect("no group = no caps");
     }
     let usage = g.usage_for(&cm, "vk_free", now).unwrap();
     // usage_for reads the store; the key was never persisted, so read the bucket directly.
@@ -590,7 +595,7 @@ fn missing_group_fails_closed() {
     let g = gov();
     let cm = model(&[]);
     let k = key("vk_ghost", Some("ghost"));
-    match g.try_admit(&cm, &k, 1_700_000_000).unwrap_err() {
+    match g.try_admit(&cm, &k, "", 1_700_000_000).unwrap_err() {
         LimitBlocked::MissingGroup(name) => assert_eq!(name, "ghost"),
         other => panic!("expected MissingGroup, got {other:?}"),
     }
@@ -619,8 +624,8 @@ fn accrual_and_hydrate_cover_every_chain_bucket() {
     );
     let k = key("vk_acc", Some("g"));
     let now = 1_700_000_000;
-    g.try_admit(&cm, &k, now).expect("admits");
-    g.record_usage(&cm, &k, "m", &toks(500, 0), now);
+    g.try_admit(&cm, &k, "", now).expect("admits");
+    g.record_usage(&cm, &k, "", "m", &toks(500, 0), now);
     for bucket in ["vk_acc", "group:g@day", "group:g@month"] {
         let window = if bucket == "vk_acc" {
             super::WINDOW_TOTAL
@@ -663,11 +668,177 @@ fn rate_headroom_reads_the_chain() {
     )]);
     let k = key("vk_head", Some("g"));
     let now = 1_700_000_000;
-    assert_eq!(g.rate_headroom(&cm, &k, now), Some(1.0), "untouched = full");
-    g.try_admit(&cm, &k, now).unwrap();
-    g.try_admit(&cm, &k, now).unwrap();
-    let h = g.rate_headroom(&cm, &k, now).unwrap();
+    assert_eq!(
+        g.rate_headroom(&cm, &k, None, now),
+        Some(1.0),
+        "untouched = full"
+    );
+    g.try_admit(&cm, &k, "", now).unwrap();
+    g.try_admit(&cm, &k, "", now).unwrap();
+    let h = g.rate_headroom(&cm, &k, None, now).unwrap();
     assert!((h - 0.5).abs() < 1e-9, "2 of 4 used = 0.5, got {h}");
     // No group = no limits = nothing to be near.
-    assert_eq!(g.rate_headroom(&cm, &key("vk_none", None), now), None);
+    assert_eq!(g.rate_headroom(&cm, &key("vk_none", None), None, now), None);
+}
+
+// ── pool-scoped limits (§6b: per-(group, pool) accounting) ───────────────────────────────────────
+
+fn pooled(metric: LimitMetric, amount: u64, per: LimitWindow, pool: &str) -> LimitCfg {
+    LimitCfg {
+        metric,
+        amount,
+        per: Some(per),
+        pool: Some(pool.to_string()),
+    }
+}
+
+/// The pool-split budget: `{ budget: 25, per: day, pool: frontier }` + the same for `value` on ONE
+/// group account INDEPENDENTLY - exhausting the frontier budget blocks only frontier traffic (the
+/// rejection names the pool), value traffic still admits against its own untouched bucket, and a
+/// pool with no qualified limit is capped by neither.
+#[test]
+fn pool_scoped_budgets_account_independently() {
+    let g = gov();
+    let cm = model_with_card(
+        &[(
+            "team",
+            group_cfg(
+                None,
+                true,
+                vec![
+                    pooled(LimitMetric::Budget, 25, LimitWindow::Day, "frontier"),
+                    pooled(LimitMetric::Budget, 25, LimitWindow::Day, "value"),
+                ],
+            ),
+        )],
+        10,
+        &[],
+    );
+    let k = key("vk_ps", Some("team"));
+    let now = 1_700_000_000;
+    // fee=10: two frontier admissions spend 20; the 3rd would reach 30 > 25.
+    g.try_admit(&cm, &k, "frontier", now).expect("frontier 1st");
+    g.try_admit(&cm, &k, "frontier", now).expect("frontier 2nd");
+    match g.try_admit(&cm, &k, "frontier", now).unwrap_err() {
+        LimitBlocked::Limit {
+            group,
+            metric: "budget",
+            window: Some("day"),
+            pool: Some(pool),
+            retry_after: Some(_),
+        } => {
+            assert_eq!(group, "team");
+            assert_eq!(pool, "frontier", "the rejection names the exhausted pool");
+        }
+        other => panic!("expected the frontier budget to block, got {other:?}"),
+    }
+    // The value pool's own bucket is untouched: the dev's traffic downgrades, it is not locked out.
+    g.try_admit(&cm, &k, "value", now).expect("value 1st");
+    g.try_admit(&cm, &k, "value", now).expect("value 2nd");
+    assert_blocked(
+        g.try_admit(&cm, &k, "value", now).unwrap_err(),
+        "team",
+        "budget",
+        Some("day"),
+        true,
+    );
+    // A pool neither limit names is capped by neither bucket.
+    g.try_admit(&cm, &k, "other", now)
+        .expect("unqualified pool is not pool-capped");
+}
+
+/// A group-wide limit still ANDs across every pool: pool-scoped budgets carve the spend, the
+/// group-wide `requests` ceiling counts ALL traffic regardless of pool.
+#[test]
+fn group_wide_limit_ands_with_pool_scoped() {
+    let g = gov();
+    let cm = model_with_card(
+        &[(
+            "team",
+            group_cfg(
+                None,
+                true,
+                vec![
+                    limit(LimitMetric::Requests, 3, Some(LimitWindow::Day)),
+                    pooled(LimitMetric::Budget, 100, LimitWindow::Day, "frontier"),
+                ],
+            ),
+        )],
+        1,
+        &[],
+    );
+    let k = key("vk_gw", Some("team"));
+    let now = 1_700_000_000;
+    g.try_admit(&cm, &k, "frontier", now).expect("1st");
+    g.try_admit(&cm, &k, "value", now)
+        .expect("2nd (different pool, same requests ceiling)");
+    g.try_admit(&cm, &k, "frontier", now).expect("3rd");
+    assert_blocked(
+        g.try_admit(&cm, &k, "value", now).unwrap_err(),
+        "team",
+        "requests",
+        Some("day"),
+        true,
+    );
+}
+
+/// Accrual mirrors admission: tokens ledgered under pool A land ONLY in A's pool bucket, so they
+/// exhaust A's budget without touching B's; and the REFUND of a pool-A admission erodes only the
+/// buckets that admission charged.
+#[test]
+fn pool_scoped_accrual_and_refund_mirror_the_charge() {
+    let g = gov();
+    // 10 utok/token: 100_000 input tokens = 100 cents = AT a 100-cent cap. No flat fee.
+    let cm = model_with_card(
+        &[(
+            "team",
+            group_cfg(
+                None,
+                true,
+                vec![
+                    pooled(LimitMetric::Budget, 100, LimitWindow::Month, "frontier"),
+                    pooled(LimitMetric::Budget, 100, LimitWindow::Month, "value"),
+                ],
+            ),
+        )],
+        0,
+        &[("m", 10.0, 0.0)],
+    );
+    let k = key("vk_pa", Some("team"));
+    let now = 1_700_000_000;
+    // Tokens served through the value pool fill ONLY value's bucket.
+    g.record_usage(&cm, &k, "value", "m", &toks(100_000, 0), now);
+    g.try_admit(&cm, &k, "frontier", now)
+        .expect("frontier bucket is untouched by value-pool tokens");
+    match g.try_admit(&cm, &k, "value", now).unwrap_err() {
+        LimitBlocked::Limit {
+            pool: Some(pool), ..
+        } => assert_eq!(pool, "value"),
+        other => panic!("expected value's budget to block, got {other:?}"),
+    }
+    // Refund mirror: a frontier admission's refund re-opens frontier, never value.
+    let g2 = gov();
+    let cm2 = model_with_card(
+        &[(
+            "team",
+            group_cfg(
+                None,
+                true,
+                vec![pooled(
+                    LimitMetric::Budget,
+                    25,
+                    LimitWindow::Day,
+                    "frontier",
+                )],
+            ),
+        )],
+        10,
+        &[],
+    );
+    g2.try_admit(&cm2, &k, "frontier", now).expect("1st");
+    g2.try_admit(&cm2, &k, "frontier", now).expect("2nd");
+    assert!(g2.try_admit(&cm2, &k, "frontier", now).is_err(), "at cap");
+    g2.refund_request(&cm2, &k, "frontier", now);
+    g2.try_admit(&cm2, &k, "frontier", now)
+        .expect("the refunded fee re-opened frontier's bucket");
 }

@@ -45,6 +45,18 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   precisely; tokens are best-effort post-paid (the old TPM posture); budget derives at check time
   from the token ledger x the current rate card + the flat fee; `concurrent` holds release
   automatically when the response stream completes.
+- **Pool-scoped limits (`pool:` qualifier) - the per-tier budget split.** A windowed limit may
+  carry `pool: <name>`, so it accounts and enforces per `(group, pool)` instead of group-wide:
+  `{ budget: 5000, per: month, pool: frontier }` + `{ budget: 5000, per: month, pool: value }`
+  carve one team's spend across model tiers, each in its own ledger bucket
+  (`group:<name>@<window>#<pool>`). Exhausting the frontier budget blocks ONLY frontier traffic
+  (the rejection names the pool - the caller's expensive calls stop while cheap ones continue);
+  group-wide limits still AND over all traffic. Admission charge, token accrual, and non-2xx
+  refunds share one participation predicate, so what was charged is exactly what refunds. The
+  named pool must exist (validated at boot / `--validate` / Admin API); the hook seam's
+  `BudgetBucketState` and the Admin groups read (`LimitView`) carry the pool scope. Also gone:
+  the arbitrary 8-level group-depth ceiling (the cycle check is what bounds the walk; hierarchy
+  depth is the operator's call).
 - **KEYS ARE PURE AUTH + THEY EXPIRE.** A minted key is a busbar-SIGNED token `{sub, exp, kid}`
   (ed25519). Verify = signature + expiry (stateless) + a small revocation denylist; policy (the
   bound `group`, `allowed_pools`) is resolved from the store by `sub`, so policy is mutable

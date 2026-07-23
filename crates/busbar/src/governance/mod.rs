@@ -148,12 +148,14 @@ impl BudgetCell {
 pub(crate) enum LimitBlocked {
     /// A specific limit bucket blocked: the owning group, the metric (`requests` | `tokens` |
     /// `budget` | `concurrent`), the window word (`None` for the instantaneous `concurrent`
-    /// gauge), and - for a windowed limit - the seconds until its window rolls (`None` for
-    /// `total`, which never rolls).
+    /// gauge), the pool scope (`Some` when a pool-qualified limit blocked - only that pool's
+    /// traffic is capped), and - for a windowed limit - the seconds until its window rolls
+    /// (`None` for `total`, which never rolls).
     Limit {
         group: String,
         metric: &'static str,
         window: Option<&'static str>,
+        pool: Option<String>,
         retry_after: Option<u64>,
     },
     /// A group in the chain is FROZEN (`enabled: false`): every request charging through it is

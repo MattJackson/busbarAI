@@ -254,6 +254,7 @@ impl GovState {
         &self,
         cost: &crate::cost::CostModel,
         key: &VirtualKey,
+        pool: &str,
         model: &str,
         tokens: &TierTokens,
         now: u64,
@@ -272,7 +273,9 @@ impl GovState {
                 return;
             }
         };
-        for bucket in chain.iter() {
+        // Tokens land only on the buckets this request's pool participates in - the same
+        // predicate the admission charge used, so accrual mirrors the charge exactly.
+        for bucket in chain.iter().filter(|b| b.applies_to_pool(pool)) {
             self.accrue_bucket(bucket.bucket_id, bucket.window, model, tokens, now);
         }
     }
@@ -360,12 +363,24 @@ impl GovState {
         &self,
         cost: &crate::cost::CostModel,
         key: &VirtualKey,
+        pool: Option<&str>,
         now: u64,
     ) -> Option<f64> {
         let chain = cost.chain_for(key).ok()?;
         let mut headroom: Option<f64> = None;
         for bucket in chain.iter() {
             if bucket.requests_cap.is_none() && bucket.tokens_cap.is_none() {
+                continue;
+            }
+            // A pool-scoped bucket constrains only its own pool's traffic: with a pool in hand
+            // (the routing `usage` signal) skip other pools' buckets; with none (an admin-plane
+            // key overview) skip ALL pool-scoped buckets - a per-pool cap is not a property of
+            // the key as a whole.
+            let applies = match pool {
+                Some(p) => bucket.applies_to_pool(p),
+                None => bucket.pool.is_none(),
+            };
+            if !applies {
                 continue;
             }
             let window = budget_window(bucket.window, now);
@@ -780,6 +795,7 @@ impl GovState {
             out.push(busbar_api::BudgetBucketState {
                 bucket_id: bucket.bucket_id.to_string(),
                 budget_group: bucket.group_name.map(String::from),
+                pool: bucket.pool.map(String::from),
                 spend_micros_at_current_rate: spend_micros,
                 remaining_micros,
                 window_start: window,
@@ -860,6 +876,7 @@ impl GovState {
         &self,
         cost: &crate::cost::CostModel,
         key: &VirtualKey,
+        pool: &str,
         now: u64,
     ) -> Result<AdmitGrant, LimitBlocked> {
         let chain = match cost.chain_for(key) {
@@ -868,6 +885,10 @@ impl GovState {
             // admitted under the chain's caps, so it is not admitted at all.
             Err(missing) => return Err(LimitBlocked::MissingGroup(missing.to_string())),
         };
+        // Pool-scoped buckets participate only when THIS request's pool matches; filtered ONCE
+        // here so the check pass, the charge pass, and the shard-lock set can never disagree.
+        let buckets: Vec<&crate::cost::ChainBucket<'_>> =
+            chain.iter().filter(|b| b.applies_to_pool(pool)).collect();
         let groups = cost.groups();
 
         // 1. FREEZE check: any `enabled: false` group in the chain rejects (C10) - checked before
@@ -899,6 +920,7 @@ impl GovState {
                     group: groups[gi].name.clone(),
                     metric: "concurrent",
                     window: None,
+                    pool: None,
                     retry_after: None,
                 });
             }
@@ -909,9 +931,9 @@ impl GovState {
         // (dedup) - scratch sized by the chain actually resolved. `guard_shards[j]` = the shard
         // whose guard sits at position j in `guards`.
         let fee = cost.price_per_request_cents();
-        let n = chain.len();
+        let n = buckets.len();
         let mut shard_idx: Vec<usize> = Vec::with_capacity(n);
-        for bucket in chain.iter() {
+        for bucket in &buckets {
             shard_idx.push(self.budget.shard_index(bucket.bucket_id));
         }
         let mut order = shard_idx.clone();
@@ -956,7 +978,7 @@ impl GovState {
         // PASS 1 - CHECK every bucket under the held guards: resolve its cell for ITS OWN current
         // window (missing/stale cells read as empty) and test each configured cap. The blocking
         // bucket is named exactly: (group, metric, window) + retry-after for a rolling window.
-        for (bi, bucket) in chain.iter().enumerate() {
+        for (bi, bucket) in buckets.iter().enumerate() {
             if bucket.requests_cap.is_none()
                 && bucket.tokens_cap.is_none()
                 && bucket.budget_cap.is_none()
@@ -1012,6 +1034,7 @@ impl GovState {
                         .to_string(),
                     metric,
                     window: Some(bucket.window),
+                    pool: bucket.pool.map(String::from),
                     retry_after: super::window_end(bucket.window, now)
                         .map(|end| end.saturating_sub(now).max(1)),
                 });
@@ -1022,7 +1045,7 @@ impl GovState {
         // all-or-nothing with the checks above. STRADDLE-SAFE cell resolution (mirrors
         // `accrue_bucket`): reset ONLY a genuinely stale cell (this window strictly newer); a cell
         // holding the SAME or a NEWER window is charged IN PLACE.
-        for (bi, bucket) in chain.iter().enumerate() {
+        for (bi, bucket) in buckets.iter().enumerate() {
             let gi = guard_for(&guard_shards, shard_idx[bi]);
             let window = budget_window(bucket.window, now);
             let map = guards[gi].as_deref_mut().expect("guard held");
@@ -1049,14 +1072,22 @@ impl GovState {
     /// bucket). `now` MUST be the same `charged_at` epoch the admission charge used so the refund
     /// lands in the SAME window per bucket; a bucket whose window has rolled past is a no-op.
     /// Floored at 0 - a refund can never drive a counter negative.
-    pub(crate) fn refund_request(&self, cost: &crate::cost::CostModel, key: &VirtualKey, now: u64) {
+    pub(crate) fn refund_request(
+        &self,
+        cost: &crate::cost::CostModel,
+        key: &VirtualKey,
+        pool: &str,
+        now: u64,
+    ) {
         let Ok(chain) = cost.chain_for(key) else {
             // The charge failed closed on a missing group, so nothing was charged; refund only the
             // key bucket defensively (it floors at 0 on a no-op).
             self.refund_bucket(&key.id, super::WINDOW_TOTAL, now);
             return;
         };
-        for bucket in chain.iter() {
+        // Refund EXACTLY the buckets the admission charged: the same pool predicate, so a
+        // pool-scoped bucket another pool's request never charged is never eroded by its refund.
+        for bucket in chain.iter().filter(|b| b.applies_to_pool(pool)) {
             self.refund_bucket(bucket.bucket_id, bucket.window, now);
         }
     }

@@ -73,6 +73,7 @@ pub(crate) fn record_ir_usage(
             sink.gov.record_usage(
                 &sink.cost,
                 &sink.key,
+                &sink.pool,
                 lane.wire_model(),
                 &tier,
                 sink.charged_at,

@@ -12,6 +12,11 @@ pub(crate) struct UsageSink {
     /// charge time, so building the sink (once per request) and cloning it (once per failover
     /// attempt) is a refcount bump, not a per-request `String` clone.
     pub(crate) key: Arc<crate::governance::VirtualKey>,
+    /// The pool this request was ADMITTED through (the ingress-requested pool) - the accounting
+    /// scope for pool-qualified limits. Stream-end token accrual charges exactly the buckets the
+    /// admission charged, so the two can never disagree on a pool-scoped budget. `Arc<str>`: the
+    /// sink clones per failover attempt.
+    pub(crate) pool: std::sync::Arc<str>,
     /// Wall-clock epoch (seconds) captured ONCE at header-arrival time for this request. Both the
     /// flat per-request fee (`ingress::budget_check` → `try_charge_request_within_budget`) and the token fee (`record_tokens`,
     /// fired at stream end / on the buffered path) are attributed to the window this epoch implies,
@@ -581,6 +586,7 @@ where
                                 sink.gov.record_usage(
                                     &sink.cost,
                                     &sink.key,
+                                    &sink.pool,
                                     lane.wire_model(),
                                     &tier,
                                     sink.charged_at,
@@ -651,6 +657,7 @@ impl<S, P> Drop for FirstByteBody<S, P> {
                 sink.gov.record_usage(
                     &sink.cost,
                     &sink.key,
+                    &sink.pool,
                     lane.wire_model(),
                     &tier,
                     sink.charged_at,

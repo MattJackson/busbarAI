@@ -93,6 +93,7 @@ fn fallback_pools_authorized(
 fn usage_sink(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
+    pool: &str,
     charged_at: u64,
     admit: Option<crate::governance::AdmitGrant>,
 ) -> Option<crate::proxy::UsageSink> {
@@ -105,6 +106,9 @@ fn usage_sink(
             // Share the resolved key by `Arc`: no per-request `id` String clone; it is read
             // through `sink.key` at charge time.
             key: key.clone(),
+            // The admitted pool: the accounting scope for pool-qualified limits (accrual mirrors
+            // the admission charge).
+            pool: std::sync::Arc::from(pool),
             // The header-arrival epoch this request was admitted at — reused for the token fee so it
             // shares the flat per-request fee's window (#29). See `UsageSink::charged_at`.
             charged_at,
@@ -138,6 +142,16 @@ fn affinity_header_for<'a>(app: &'a Arc<App>, pool: &str) -> &'a str {
     }
 }
 
+/// Render the pool scope of a blocking limit for the client-facing rejection: a pool-qualified
+/// limit caps only that pool's traffic, and saying so tells the caller the actionable part -
+/// other pools may still serve them.
+fn pool_scope_suffix(pool: &Option<String>) -> String {
+    match pool {
+        Some(p) => format!(", pool '{p}'"),
+        None => String::new(),
+    }
+}
+
 /// Run the atomic group-limit ADMISSION for a request that is about to be forwarded (the P4
 /// generic limit engine). `Ok(Some(grant))` = admitted AND charged (the flat per-request fee + one
 /// request landed on every chain bucket; a non-2xx must refund, and the grant holds the
@@ -154,6 +168,7 @@ fn admit_check(
     app: &Arc<App>,
     gov: &crate::governance::GovCtx,
     proto: &str,
+    pool: &str,
     charged_at: u64,
 ) -> Result<Option<crate::governance::AdmitGrant>, Box<Response>> {
     let (Some(g), Some(key)) = (&app.governance, &gov.key) else {
@@ -164,7 +179,7 @@ fn admit_check(
     // (AND / most-restrictive) and every bucket is charged in the same critical section - N
     // concurrent requests can never each read "under the cap" and all charge. Infallible
     // in-memory (write-behind store): admission never blocks on or fails from the durable store.
-    match g.try_admit(&app.cost, key, charged_at) {
+    match g.try_admit(&app.cost, key, pool, charged_at) {
         Ok(grant) => Ok(Some(grant)),
         Err(blocked) => {
             // The rejection NAMES WHICH BUCKET blocked (group + metric + window). The key ID
@@ -178,14 +193,16 @@ fn admit_check(
                     group,
                     metric: metric @ ("requests" | "tokens"),
                     window,
+                    pool: limit_pool,
                     retry_after,
                 } => (
                     StatusCode::TOO_MANY_REQUESTS,
                     crate::proxy::KIND_RATE_LIMIT,
                     format!(
-                        "Rate limit exceeded (group '{group}': {metric} per {}). Please retry \
+                        "Rate limit exceeded (group '{group}': {metric} per {}{}). Please retry \
                          after the indicated time.",
-                        window.unwrap_or("total")
+                        window.unwrap_or("total"),
+                        pool_scope_suffix(limit_pool),
                     ),
                     *retry_after,
                 ),
@@ -205,6 +222,7 @@ fn admit_check(
                 LimitBlocked::Limit {
                     group,
                     window,
+                    pool: limit_pool,
                     retry_after,
                     ..
                 } => (
@@ -216,9 +234,10 @@ fn admit_check(
                         .unwrap_or(StatusCode::TOO_MANY_REQUESTS),
                     crate::proxy::KIND_INSUFFICIENT_QUOTA,
                     format!(
-                        "You have exceeded your current quota (group '{group}' budget per {} \
+                        "You have exceeded your current quota (group '{group}' budget per {}{} \
                          exhausted). Please check your plan and billing details.",
-                        window.unwrap_or("total")
+                        window.unwrap_or("total"),
+                        pool_scope_suffix(limit_pool),
                     ),
                     *retry_after,
                 ),
@@ -328,7 +347,7 @@ fn governance_guard(
     // nothing may reject an already-charged request after it. On rejection nothing was charged →
     // `finish_rejected` (no refund). On admission the returned grant reports whether the charge
     // LANDED (`Some` = refund on non-2xx) and holds the `concurrent` in-flight gauges.
-    match admit_check(app, gov, proto, charged_at) {
+    match admit_check(app, gov, proto, pool, charged_at) {
         Err(resp) => Err(Box::new(finish_rejected(
             app, gov, proto, label, started, charged_at, *resp,
         ))),
@@ -500,7 +519,7 @@ fn finish_inner(
     let is_success = matches!(resp.status().as_u16(), 200..=299);
     if refund_on_non_2xx && !is_success {
         if let (Some(g), Some(key)) = (&app.governance, &gov.key) {
-            g.refund_request(&app.cost, key, charged_at);
+            g.refund_request(&app.cost, key, pool, charged_at);
         }
     }
     resp
@@ -1140,7 +1159,7 @@ pub(crate) async fn named(
             affinity_key,
             PROTO_ANTHROPIC,
             crate::handlers::chat(PROTO_ANTHROPIC),
-            usage_sink(&app, &gov, charged_at, admit),
+            usage_sink(&app, &gov, &name, charged_at, admit),
         )
         .await;
         return finish_admitted(
@@ -1172,7 +1191,7 @@ pub(crate) async fn named(
             None,
             PROTO_ANTHROPIC,
             crate::handlers::chat(PROTO_ANTHROPIC),
-            usage_sink(&app, &gov, charged_at, admit),
+            usage_sink(&app, &gov, "", charged_at, admit),
         )
         .await;
         return finish_admitted(
@@ -1265,7 +1284,7 @@ pub(crate) async fn adhoc(
                 None,
                 PROTO_ANTHROPIC,
                 crate::handlers::chat(PROTO_ANTHROPIC),
-                usage_sink(&app, &gov, charged_at, admit),
+                usage_sink(&app, &gov, "", charged_at, admit),
             )
             .await;
             finish_admitted(

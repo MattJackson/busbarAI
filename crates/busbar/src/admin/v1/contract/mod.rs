@@ -417,10 +417,11 @@ pub(crate) struct GroupView {
     pub(crate) child_default: Option<Vec<LimitView>>,
 }
 
-/// One limit inside a `GroupView`: an explicit `{ metric, amount, per }` projection of a config
-/// `LimitCfg`. The config file's compact `{ budget: 3000, per: month }` form is deserialize-only
-/// sugar; the read API projects it explicitly so a consumer never has to know the metric is the
-/// map key. `per` is `None` only for `concurrent` (an instantaneous gauge, no window).
+/// One limit inside a `GroupView`: an explicit `{ metric, amount, per, pool }` projection of a
+/// config `LimitCfg`. The config file's compact `{ budget: 3000, per: month }` form is
+/// deserialize-only sugar; the read API projects it explicitly so a consumer never has to know
+/// the metric is the map key. `per` is `None` only for `concurrent` (an instantaneous gauge, no
+/// window); `pool` is present only on a pool-scoped limit.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
 pub(crate) struct LimitView {
@@ -431,6 +432,10 @@ pub(crate) struct LimitView {
     /// The accounting window: `minute` | `hour` | `day` | `month` | `total`. Absent for `concurrent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) per: Option<&'static str>,
+    /// The pool scope: present when the limit carries `pool: <name>` (it accounts and enforces
+    /// only that pool's traffic, per `(group, pool)`); absent for a group-wide limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pool: Option<String>,
 }
 
 impl LimitView {
@@ -440,6 +445,7 @@ impl LimitView {
             metric: l.metric.as_str(),
             amount: l.amount,
             per: l.per.map(|w| w.as_str()),
+            pool: l.pool.clone(),
         }
     }
 }

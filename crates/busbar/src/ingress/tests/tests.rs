@@ -211,7 +211,7 @@ fn test_finish_refunds_flat_fee_on_non_2xx_keeps_on_2xx() {
     // Seed the admission charge in memory (30c flat fee) via the real admission charge.
     let charge = || {
         govstate
-            .try_admit(&app.cost, &key, at)
+            .try_admit(&app.cost, &key, "", at)
             .expect("an uncapped chain admits");
     };
     charge();
@@ -283,7 +283,7 @@ fn test_pre_routing_failure_does_not_refund_prior_charge() {
     // authoritative) window via the real admission charge. `key_spend`/`usage_for` and any (buggy)
     // `refund_request` all target this same cell.
     govstate
-        .try_admit(&app.cost, &key, 1_700_000_000)
+        .try_admit(&app.cost, &key, "", 1_700_000_000)
         .expect("an uncapped chain admits");
     assert_eq!(key_spend(&app, &key.id), 30, "prior charge seeded");
 
@@ -382,7 +382,7 @@ fn test_flat_fee_charge_and_refund_use_charged_at_window() {
 
     // Admission charge into the charged_at day window via the real admission charge (it lands the
     // flat fee into `budget_window("daily", charged_at)` = day_window).
-    gov.try_admit(&cost, &key, charged_at)
+    gov.try_admit(&cost, &key, "", charged_at)
         .expect("an uncapped chain admits");
     assert_eq!(
         gov.usage_for(&cost, &key.id, charged_at)
@@ -482,7 +482,7 @@ async fn test_admit_check_uses_charged_at_window_not_clock() {
             1_700_000_000,
         )
         .unwrap();
-    gov.try_admit(&cost, &key, past_day)
+    gov.try_admit(&cost, &key, "", past_day)
         .expect("first request fits the cap exactly");
 
     let mut app = minimal_app();
@@ -504,7 +504,7 @@ async fn test_admit_check_uses_charged_at_window_not_clock() {
     );
 
     // Gate keyed off the (past) `charged_at` window sees spend ≥ cap → reject.
-    let rejected = admit_check(&app, &govctx, "openai", past_day);
+    let rejected = admit_check(&app, &govctx, "openai", "", past_day);
     assert!(
         rejected.is_err(),
         "admit_check must reject against the charged_at window where the spend lives (#29)"
@@ -517,7 +517,7 @@ async fn test_admit_check_uses_charged_at_window_not_clock() {
 
     // Sanity: today's window is empty, so a gate keyed off the wall clock (the OLD behaviour)
     // would have WRONGLY admitted. This proves the bug was real and the pin fixes it.
-    let admitted_today = admit_check(&app, &govctx, "openai", crate::store::now());
+    let admitted_today = admit_check(&app, &govctx, "openai", "", crate::store::now());
     assert!(
         admitted_today.is_ok(),
         "today's window is empty; the old clock-based gate would have admitted here"
@@ -3132,7 +3132,7 @@ async fn finish_admitted_does_not_refund_an_uncharged_admit() {
     let at = 1_700_000_000;
     // A PRIOR legitimate request charges the flat fee (price=30) into this window.
     let g = app.governance.as_ref().unwrap();
-    assert!(g.try_admit(&app.cost, &key, at).is_ok());
+    assert!(g.try_admit(&app.cost, &key, "", at).is_ok());
     let charged_spend = key_spend(&app, &key.id);
     assert_eq!(charged_spend, 30, "prior request charged the flat fee");
 
@@ -3193,7 +3193,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     let gov2 = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key2.clone())),
     };
-    let resp = admit_check(&app2, &gov2, "openai", crate::store::now())
+    let resp = admit_check(&app2, &gov2, "openai", "", crate::store::now())
         .expect_err("a zero-budget group ⇒ over-budget response");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = body_string(*resp).await;
@@ -3205,7 +3205,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     let gov2b = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key2b.clone())),
     };
-    let resp = admit_check(&app2b, &gov2b, "bedrock", crate::store::now())
+    let resp = admit_check(&app2b, &gov2b, "bedrock", "", crate::store::now())
         .expect_err("a zero-budget group ⇒ over-budget response (bedrock)");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_string(*resp).await;
@@ -3221,7 +3221,7 @@ async fn test_governance_rejection_bodies_leak_no_internal_vocab() {
     let gov3 = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(key3.clone())),
     };
-    let resp = admit_check(&app3, &gov3, "openai", crate::store::now())
+    let resp = admit_check(&app3, &gov3, "openai", "", crate::store::now())
         .expect_err("requests=0 group ⇒ 429 response");
     let resp = *resp;
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -5742,8 +5742,8 @@ async fn test_group_blocked_429_names_the_budget_group() {
         key: Some(std::sync::Arc::new(key.clone())),
     };
     let at = crate::store::now();
-    let resp =
-        admit_check(&app, &gov, "openai", at).expect_err("a zero-cap group blocks the whole chain");
+    let resp = admit_check(&app, &gov, "openai", "", at)
+        .expect_err("a zero-cap group blocks the whole chain");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = body_string(*resp).await;
     assert!(
@@ -5777,7 +5777,7 @@ async fn test_missing_group_fails_closed_at_ingress() {
     let gov = crate::governance::GovCtx {
         key: Some(std::sync::Arc::new(orphan)),
     };
-    let resp = admit_check(&app, &gov, "openai", crate::store::now())
+    let resp = admit_check(&app, &gov, "openai", "", crate::store::now())
         .expect_err("a missing group must fail closed");
     assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     let body = body_string(*resp).await;

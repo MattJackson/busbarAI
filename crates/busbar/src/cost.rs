@@ -42,7 +42,9 @@ const NANOS_PER_MICRO: u128 = 1_000;
 /// The prefix namespacing GROUP bucket ids in the store, so a group named like a key id can never
 /// collide with a real key's bucket. Key buckets use the bare key id. A group's per-window buckets
 /// are `group:<name>@<window>` - one ledger row per (group, window granularity), so a group with
-/// limits in several windows never double-counts a flush into one row.
+/// limits in several windows never double-counts a flush into one row. A POOL-SCOPED bucket
+/// (limits carrying `pool: <name>`) appends `#<pool>`: `group:<name>@<window>#<pool>` - its own
+/// ledger row, accounting only the traffic dispatched through that pool.
 pub(crate) const GROUP_BUCKET_PREFIX: &str = "group:";
 
 /// One model's per-token rates in integer NANO-units per token (config micro-units x 1000, rounded
@@ -86,13 +88,14 @@ impl RateNanos {
     }
 }
 
-/// One (group, window) ENFORCEMENT BUCKET, resolved from the group's windowed limits: every limit
-/// of the group that shares this window enforces against this one ledger cell. The three windowed
-/// metrics are independent caps on the same cell's counters (requests / total tokens / derived
-/// spend).
+/// One (group, window, pool?) ENFORCEMENT BUCKET, resolved from the group's windowed limits:
+/// every limit of the group that shares this window AND pool scope enforces against this one
+/// ledger cell. The three windowed metrics are independent caps on the same cell's counters
+/// (requests / total tokens / derived spend).
 #[derive(Debug, Clone)]
 pub(crate) struct GroupBucket {
-    /// The store/ledger bucket id: `group:<name>@<window>`.
+    /// The store/ledger bucket id: `group:<name>@<window>`, or `group:<name>@<window>#<pool>`
+    /// for a pool-scoped bucket.
     pub(crate) bucket_id: String,
     /// The window word (`minute` | `hour` | `day` | `month` | `total`) - the `budget_window`
     /// period sentinel AND the metrics/error vocabulary.
@@ -106,6 +109,9 @@ pub(crate) struct GroupBucket {
     /// check time from the cell's token ledger x the current rate card (+ the flat per-request
     /// fee x requests).
     pub(crate) budget_cap: Option<i64>,
+    /// `Some(pool)` = this bucket accounts ONLY traffic dispatched through that pool (limits
+    /// carrying `pool: <name>`); `None` = group-wide (every request through the group).
+    pub(crate) pool: Option<String>,
 }
 
 /// One resolved group: its enabled flag, in-flight cap, per-window enforcement buckets, and parent
@@ -127,7 +133,7 @@ pub(crate) struct GroupRuntime {
 /// One bucket of a resolved enforcement chain (borrowed views into the key / the `CostModel`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChainBucket<'a> {
-    /// The store/ledger bucket id (the key id, or `group:<name>@<window>`).
+    /// The store/ledger bucket id (the key id, or `group:<name>@<window>[#<pool>]`).
     pub(crate) bucket_id: &'a str,
     /// The operator-facing group name for diagnostics; `None` for the key's own bucket.
     pub(crate) group_name: Option<&'a str>,
@@ -138,6 +144,19 @@ pub(crate) struct ChainBucket<'a> {
     pub(crate) requests_cap: Option<u64>,
     pub(crate) tokens_cap: Option<u64>,
     pub(crate) budget_cap: Option<i64>,
+    /// `Some(pool)` = the bucket is pool-scoped: it checks/charges/accrues ONLY when the request
+    /// was dispatched through that pool. `None` = applies to every request through the group.
+    pub(crate) pool: Option<&'a str>,
+}
+
+impl ChainBucket<'_> {
+    /// Whether this bucket participates in a request dispatched through `pool` - group-wide
+    /// buckets always do; a pool-scoped bucket only for its own pool. Every enforcement walk
+    /// (admit / charge / refund / accrue / headroom) keys off this ONE predicate so the paths
+    /// can never disagree on what was charged vs what is refunded.
+    pub(crate) fn applies_to_pool(&self, pool: &str) -> bool {
+        self.pool.is_none_or(|p| p == pool)
+    }
 }
 
 /// A resolved enforcement chain: the key's attribution bucket plus every ancestor group's
@@ -236,10 +255,12 @@ impl CostModel {
             .iter()
             .map(|name| {
                 let g = &groups_cfg[name.as_str()];
-                // Project the group's generic limits into per-window enforcement buckets. A window
-                // bucket materialises on first use (config order); a metric repeated for the same
-                // window keeps the MOST RESTRICTIVE (minimum) amount - AND semantics inside one
-                // group, same as across the chain.
+                // Project the group's generic limits into per-(window, pool) enforcement buckets.
+                // A bucket materialises on first use (config order); a metric repeated for the
+                // same window + pool scope keeps the MOST RESTRICTIVE (minimum) amount - AND
+                // semantics inside one group, same as across the chain. A pool-qualified limit
+                // gets its OWN bucket (its own ledger row), so `budget: 5000 pool: frontier` and
+                // `budget: 5000 pool: value` account independently.
                 let mut buckets: Vec<GroupBucket> = Vec::new();
                 let mut concurrent_cap: Option<u64> = None;
                 for l in &g.limits {
@@ -250,15 +271,25 @@ impl CostModel {
                         }
                         (metric, Some(window)) => {
                             let w = window.as_str();
-                            let bucket = match buckets.iter_mut().find(|b| b.window == w) {
+                            let bucket = match buckets
+                                .iter_mut()
+                                .find(|b| b.window == w && b.pool.as_deref() == l.pool.as_deref())
+                            {
                                 Some(b) => b,
                                 None => {
+                                    let bucket_id = match &l.pool {
+                                        Some(p) => {
+                                            format!("{GROUP_BUCKET_PREFIX}{name}@{w}#{p}")
+                                        }
+                                        None => format!("{GROUP_BUCKET_PREFIX}{name}@{w}"),
+                                    };
                                     buckets.push(GroupBucket {
-                                        bucket_id: format!("{GROUP_BUCKET_PREFIX}{name}@{w}"),
+                                        bucket_id,
                                         window: w,
                                         requests_cap: None,
                                         tokens_cap: None,
                                         budget_cap: None,
+                                        pool: l.pool.clone(),
                                     });
                                     buckets.last_mut().expect("just pushed")
                                 }
@@ -444,6 +475,7 @@ impl CostModel {
             requests_cap: None,
             tokens_cap: None,
             budget_cap: None,
+            pool: None,
         });
         let mut groups: Vec<usize> = Vec::new();
         let mut next = match key.group.as_deref() {
@@ -469,6 +501,7 @@ impl CostModel {
                     requests_cap: b.requests_cap,
                     tokens_cap: b.tokens_cap,
                     budget_cap: b.budget_cap,
+                    pool: b.pool.as_deref(),
                 });
             }
             next = g.parent;

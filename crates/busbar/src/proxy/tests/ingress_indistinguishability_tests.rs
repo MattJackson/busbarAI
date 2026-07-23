@@ -449,6 +449,7 @@ async fn test_untranslatable_2xx_does_not_charge_tokens() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });
@@ -547,6 +548,7 @@ async fn test_same_protocol_nonstream_multichunk_counts_usage() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });
@@ -811,6 +813,7 @@ async fn test_mid_stream_transport_error_does_not_bill_partial_usage() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });
@@ -2721,6 +2724,7 @@ async fn test_streaming_translate_abort_trips_breaker_and_skips_billing() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });
@@ -2843,6 +2847,7 @@ async fn test_cancel_drop_bills_partial_tokens() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });
@@ -2945,6 +2950,7 @@ async fn test_cancel_drop_skips_billing_on_aborted_translate() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });

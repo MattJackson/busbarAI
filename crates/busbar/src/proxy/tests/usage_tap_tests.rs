@@ -258,6 +258,7 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at,
         admit: None,
     });
@@ -342,6 +343,7 @@ fn test_nonstream_token_sum_saturates_no_panic_on_overflow() {
         gov: gov.clone(),
         cost: cost.clone(),
         key: std::sync::Arc::new(key.clone()),
+        pool: std::sync::Arc::from(""),
         charged_at: 1_700_000_000,
         admit: None,
     });

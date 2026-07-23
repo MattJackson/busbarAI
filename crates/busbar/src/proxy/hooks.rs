@@ -595,7 +595,7 @@ pub(crate) async fn decide_policy_order(
     }
     .or_else(|| resolved_gov_key.cloned());
     let rate_headroom: Option<f64> = match (gov, gov_key.as_ref()) {
-        (Some(g), Some(key)) => g.rate_headroom(&app.cost, key, now()),
+        (Some(g), Some(key)) => g.rate_headroom(&app.cost, key, Some(pool_name), now()),
         _ => None,
     };
 

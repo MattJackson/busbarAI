@@ -266,7 +266,7 @@ pub(crate) async fn operation_resolved(
             operation,
             op_handler,
         },
-        usage_sink(app, gov, charged_at, admit),
+        usage_sink(app, gov, pool_name, charged_at, admit),
     )
     .await;
     finish_admitted(app, gov, proto, model, started, charged_at, resp, charged)
