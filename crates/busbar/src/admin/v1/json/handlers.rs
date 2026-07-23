@@ -308,6 +308,25 @@ pub(crate) struct PutGroupReq {
     config: crate::config::GroupCfg,
 }
 
+/// The `PATCH /api/v1/admin/groups/{name}` body: a PARTIAL update — only the fields present are
+/// changed, the rest preserved from the current definition. The ergonomic "raise Alice's budget"
+/// (send just `limits`) and "freeze a group" (send `enabled: false`) verb. `limits`/`child_default`
+/// REPLACE their whole list when present (a list can't be field-merged). To CLEAR `parent` or
+/// `child_default` (make a group a root / drop its template), use `PUT` with the full definition.
+/// `deny_unknown_fields` so a typo'd field is a 400, never a silent no-op.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupPatchReq {
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    limits: Option<Vec<crate::config::LimitCfg>>,
+    #[serde(default)]
+    child_default: Option<crate::config::groups::ChildDefault>,
+}
+
 /// `POST /api/v1/admin/hooks` — register (or replace) a hook at RUNTIME. Validates the definition, builds
 /// the next `App` snapshot with the hook wired + transports re-resolved, atomically `swap`s it in, and
 /// returns `201` with the registered hook. A `global` hook is LIVE immediately (new requests see it);
@@ -722,6 +741,82 @@ pub(crate) async fn put_group(
     }
 }
 
+/// `PATCH /api/v1/admin/groups/{name}` — PARTIAL update: change only the fields present, preserve
+/// the rest (the "raise Alice's budget" / "freeze this team" verb). Merges onto the current
+/// definition then routes through the SAME `build_with_group` validation + cost rebuild as PUT, so
+/// a partial edit that breaks the tree is a `400` that changes nothing. `404`/`409` semantics match
+/// PUT (unknown name / base group / stale `If-Match`). Audited + versioned + overlay-persisted.
+pub(crate) async fn patch_group(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let req: GroupPatchReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed group patch: {e}"
+            )))
+        }
+    };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    let resource = format!("group:{name}");
+    let Some(existing) = current.groups_registry.get(&name) else {
+        audit::AUDIT.record_by("group.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::NotFound(format!("group `{name}`")));
+    };
+    if current.base_group_names.contains(&name) {
+        audit::AUDIT.record_by("group.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Conflict(format!(
+            "group `{name}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)"
+        )));
+    }
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("group.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
+    // Merge the provided fields onto the current definition; absent fields are preserved.
+    let merged = merge_group_patch(
+        existing.clone(),
+        req.parent,
+        req.enabled,
+        req.limits,
+        req.child_default,
+    );
+    match build_with_group(&current, &name, merged) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("group.patch", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            record_group_version(&installed, &actor, &format!("group.patch {resource}"));
+            crate::config::overlay::persist_groups(
+                cur.overlay_path.as_deref(),
+                &cur.groups_registry,
+                None,
+                Some(&name),
+            );
+            with_config_etag(
+                respond(StatusCode::OK, service(&handle).get_group(&name).await),
+                installed.config_version,
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("group.patch", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&e)
+        }
+    }
+}
+
 /// `DELETE /api/v1/admin/groups/{name}` — remove an API-created group at runtime (live). `404` if
 /// unknown; `409` if base-config-defined (edit config.yaml) or if another group still names it as
 /// `parent` (re-parent/remove the children first — never silently orphan them). `204` on success;
@@ -779,6 +874,31 @@ pub(crate) async fn delete_group(
             err_json(&e)
         }
     }
+}
+
+/// Apply a partial group PATCH onto a base definition: a field that is `Some` REPLACES, `None`
+/// PRESERVES. `limits`/`child_default` replace their whole list (a list can't be field-merged). The
+/// pure, testable core of `patch_group`.
+fn merge_group_patch(
+    mut base: crate::config::GroupCfg,
+    parent: Option<String>,
+    enabled: Option<bool>,
+    limits: Option<Vec<crate::config::LimitCfg>>,
+    child_default: Option<crate::config::groups::ChildDefault>,
+) -> crate::config::GroupCfg {
+    if let Some(p) = parent {
+        base.parent = Some(p);
+    }
+    if let Some(en) = enabled {
+        base.enabled = en;
+    }
+    if let Some(l) = limits {
+        base.limits = l;
+    }
+    if let Some(cd) = child_default {
+        base.child_default = Some(cd);
+    }
+    base
 }
 
 /// Record a config-version entry for a GROUP mutation. The `VersionLog` snapshot payload is the
@@ -1902,6 +2022,20 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
                     "409": {"description": "Base-defined group (edit config.yaml), or stale `If-Match` (`version_conflict`)"}
                 }
             },
+            "patch": {
+                "summary": "Partial update — change only the fields present (e.g. raise a budget, freeze a group)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "The updated group"},
+                    "400": {"description": "Invalid tree after the merge, or unknown patch field (error code `invalid_request`)"},
+                    "404": {"description": "Unknown group (error code `not_found`)"},
+                    "409": {"description": "Base-defined group, or stale `If-Match` (`version_conflict`)"}
+                }
+            },
             "delete": {
                 "summary": "Remove an overlay group at runtime — live immediately",
                 "security": [{"adminToken": []}],
@@ -2479,6 +2613,7 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!(PATH_GROUPS, "post", "200", GroupView);
     typed!("/groups/{name}", "get", "200", GroupView);
     typed!("/groups/{name}", "put", "200", GroupView);
+    typed!("/groups/{name}", "patch", "200", GroupView);
     // Auth & credentials.
     typed!("/auth", "get", "200", AuthView);
     typed!(PATH_ADMIN_AUTH, "get", "200", AdminAuthView);
@@ -2657,4 +2792,68 @@ pub(crate) async fn validate_config(
             .validate_config(req.config, req.providers)
             .await,
     )
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::merge_group_patch;
+    use crate::config::groups::{ChildDefault, LimitMetric, LimitWindow};
+    use crate::config::{GroupCfg, LimitCfg};
+
+    fn budget(cents: u64) -> LimitCfg {
+        LimitCfg {
+            metric: LimitMetric::Budget,
+            amount: cents,
+            per: Some(LimitWindow::Month),
+        }
+    }
+
+    /// The raise-a-budget path: patching only `limits` replaces them and PRESERVES parent + enabled.
+    #[test]
+    fn patch_limits_preserves_other_fields() {
+        let base = GroupCfg {
+            parent: Some("team".into()),
+            enabled: true,
+            limits: vec![budget(3_000)],
+            child_default: None,
+        };
+        let out = merge_group_patch(base, None, None, Some(vec![budget(5_000)]), None);
+        assert_eq!(out.parent.as_deref(), Some("team"));
+        assert!(out.enabled);
+        assert_eq!(out.limits.len(), 1);
+        assert_eq!(out.limits[0].amount, 5_000);
+        assert!(out.child_default.is_none());
+    }
+
+    /// Freezing a group: patching only `enabled` flips it, leaving limits + parent intact.
+    #[test]
+    fn patch_enabled_only_freezes_without_touching_limits() {
+        let base = GroupCfg {
+            parent: Some("team".into()),
+            enabled: true,
+            limits: vec![budget(3_000)],
+            child_default: Some(ChildDefault {
+                limits: vec![budget(500)],
+            }),
+        };
+        let out = merge_group_patch(base, None, Some(false), None, None);
+        assert!(!out.enabled);
+        assert_eq!(out.limits[0].amount, 3_000);
+        assert_eq!(out.parent.as_deref(), Some("team"));
+        let cd = out.child_default.expect("child_default preserved");
+        assert_eq!(cd.limits[0].amount, 500);
+    }
+
+    /// An empty patch (all None) is an identity: nothing changes.
+    #[test]
+    fn empty_patch_is_identity() {
+        let base = GroupCfg {
+            parent: Some("p".into()),
+            enabled: false,
+            limits: vec![budget(1)],
+            child_default: None,
+        };
+        let out = merge_group_patch(base.clone(), None, None, None, None);
+        assert_eq!(out, base);
+    }
 }

@@ -73,7 +73,10 @@ impl AdminTransport for JsonV1 {
             .route(PATH_GROUPS, get(list_groups).post(register_group))
             .route(
                 "/groups/{name}",
-                get(get_group).put(put_group).delete(delete_group),
+                get(get_group)
+                    .put(put_group)
+                    .patch(patch_group)
+                    .delete(delete_group),
             )
             .route("/plugins", get(list_plugins).post(install_plugin))
             .route("/plugins/reload", post(reload_plugins))
