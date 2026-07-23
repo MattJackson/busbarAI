@@ -40,24 +40,31 @@ auth:
   #     growth-eng: { allowed_pools: [fast], group: growth }
   #     platform:   { group: acme, admin_scope: full }       # allowed_pools omitted = ALL pools
 
-# ── GROUPS: the ONE limit tree ──
+# ── GROUPS: the ONE limit tree (also runtime-mutable over the Admin API: GET/POST/PUT/PATCH/
+#    DELETE /api/v1/admin/groups — "raise Alice's budget" = PATCH her leaf's limits) ──
 groups:
-  acme:
+  acme:                                                     # org ceiling
     limits:
       - { requests: 500, per: minute }
       - { budget: 1000000, per: month }
-  growth:
+  growth:                                                   # a team under the org
     parent: acme
     limits:
       - { requests: 50, per: minute }
       - { budget: 200000, per: month }
-  bob:
+    child_default:                                          # per-HEAD budget stamped onto each
+      limits:                                               # user leaf auto-provisioned under this
+        - { budget: 2000, per: month }                      # team (nearest-ancestor wins)
+  # A USER is just a LEAF GROUP parented to their team: the personal budget is the leaf's own
+  # limits, always sub-capped by the team ceiling (the chain ANDs, so per-user budgets can never
+  # sum past the team pool). Enforcement walks user -> team -> org and ANDs every limit.
+  user:bob:
     parent: growth
-    enabled: true                                            # false = freeze this group
+    enabled: true                                           # false = freeze this group
     limits:
       - { requests: 10,   per: minute }
       - { requests: 1000, per: day }
-      - { concurrent: 5 }                                    # no `per` = in-flight cap
+      - { concurrent: 5 }                                   # no `per` = in-flight cap
 
 # ── PRICING: the ONE cost source ──
 rate_card:
