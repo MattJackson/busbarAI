@@ -15,7 +15,9 @@ else
   export AWS_BEDROCK_CREDS="${AKID}:${SKEY}"
 fi
 
-export BUSBAR_CLIENT_TOKEN="${BUSBAR_CLIENT_TOKEN:-vk_demo_local}"
+# The admin token guards the admin API; mint the agent's signed key with:
+#   curl -s -X POST http://127.0.0.1:8081/api/v1/admin/keys -H "authorization: Bearer $BUSBAR_ADMIN_TOKEN" -d '{"name":"claude-code"}'
+export BUSBAR_ADMIN_TOKEN="${BUSBAR_ADMIN_TOKEN:-demo-admin-token}"
 export BUSBAR_CONFIG="$HERE/config.yaml"
 export BUSBAR_PROVIDERS="$ROOT/providers.yaml"
 export BUSBAR_STATE_FILE=""

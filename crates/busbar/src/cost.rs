@@ -134,13 +134,8 @@ impl<'a> Chain<'a> {
 /// flat per-request fee. Immutable once resolved; rebuilt with the config on apply/reload.
 pub(crate) struct CostModel {
     /// `None` = `rate_card` absent = token pricing 0 for every model. `Some` = the AUTHORITATIVE
-    /// effective table: `governance.rate_card` merged with pool-member tiered overrides (member
-    /// override wins for its member's resolved upstream model).
+    /// effective table, straight from the top-level `rate_card:` (S5: the ONLY cost source).
     rates: Option<HashMap<String, RateNanos>>,
-    /// Config model name -> resolved upstream model name, for the FEW models whose
-    /// `upstream_model` differs from their config key. Metering rows (and any other consumer
-    /// keyed by the configured name) resolve through this before the rate lookup.
-    alias: HashMap<String, String>,
     groups: Vec<GroupRuntime>,
     group_idx: HashMap<String, usize>,
     price_per_request_cents: i64,
@@ -151,35 +146,18 @@ impl CostModel {
     /// groups, valid periods); this is a pure projection and is defensive, never panicking, on
     /// anything validation should have caught.
     pub(crate) fn resolve_parts(
-        gov: &crate::config::GovernanceCfg,
-        models: &HashMap<String, crate::config::ModelCfg>,
-        pools: &HashMap<String, crate::config::PoolCfg>,
+        rate_card: Option<&std::collections::BTreeMap<String, crate::config::RateEntryCfg>>,
+        per_request_fee: i64,
+        groups_cfg: &std::collections::BTreeMap<String, crate::config::GroupCfg>,
     ) -> Self {
-        let rates = gov.rate_card.as_ref().map(|card| {
-            let mut table: HashMap<String, RateNanos> = card
-                .iter()
+        // S5: rate_card is the ONLY cost source - the 1.4.x pool-member tiered-override loop is
+        // GONE (cost lives on no pool member; routing derives its scalar from the card).
+        let rates = rate_card.map(|card| {
+            card.iter()
                 .map(|(model, r)| (model.clone(), RateNanos::from_cfg(r)))
-                .collect();
-            // Pool-member tiered overrides: a member carrying the 4-tier `cost_per_mtok` shape
-            // overrides the card entry for ITS resolved upstream model. Deterministic order
-            // (BTree-sorted pool names at validate; here: sort for stable last-wins) - a
-            // conflicting pair of overrides for one model is rejected by `--validate`.
-            let mut pool_names: Vec<&String> = pools.keys().collect();
-            pool_names.sort();
-            for pool in pool_names {
-                for member in &pools[pool].members {
-                    if let Some(tiered) = member.cost_per_mtok.as_ref().and_then(|c| c.tiered()) {
-                        let upstream = models
-                            .get(&member.target)
-                            .and_then(|m| m.upstream_model.as_deref())
-                            .unwrap_or(&member.target);
-                        table.insert(upstream.to_string(), RateNanos::from_cfg(tiered));
-                    }
-                }
-            }
-            table
+                .collect::<HashMap<String, RateNanos>>()
         });
-        let mut group_names: Vec<&String> = gov.budget_groups.keys().collect();
+        let mut group_names: Vec<&String> = groups_cfg.keys().collect();
         group_names.sort();
         let group_idx: HashMap<String, usize> = group_names
             .iter()
@@ -189,33 +167,45 @@ impl CostModel {
         let groups: Vec<GroupRuntime> = group_names
             .iter()
             .map(|name| {
-                let g = &gov.budget_groups[name.as_str()];
+                let g = &groups_cfg[name.as_str()];
+                // P1 projection: the group's BUDGET limit (the first, when present) drives the
+                // existing budget-chain machinery; a group with no budget limit is uncapped on
+                // the spend axis (i64::MAX, "total"). The generic limit engine (requests /
+                // tokens / concurrent + per-window budget stacking) lands in P4 on this same
+                // topology.
+                let budget = g.limits.iter().find_map(|l| {
+                    (l.metric == crate::config::groups::LimitMetric::Budget)
+                        .then_some((l.amount, l.per))
+                });
+                let (max_budget_cents, budget_period) = match budget {
+                    Some((amount, per)) => {
+                        let period = match per {
+                            Some(crate::config::groups::LimitWindow::Day) => "daily",
+                            Some(crate::config::groups::LimitWindow::Month) => "monthly",
+                            Some(crate::config::groups::LimitWindow::Minute) => "minute",
+                            Some(crate::config::groups::LimitWindow::Hour) => "hour",
+                            Some(crate::config::groups::LimitWindow::Total) | None => "total",
+                        };
+                        (i64::try_from(amount).unwrap_or(i64::MAX), period)
+                    }
+                    None => (i64::MAX, "total"),
+                };
                 GroupRuntime {
                     name: (*name).clone(),
                     bucket_id: format!("{GROUP_BUCKET_PREFIX}{name}"),
-                    max_budget_cents: g.max_budget_cents,
-                    budget_period: g.budget_period.clone(),
+                    max_budget_cents,
+                    budget_period: budget_period.to_string(),
                     // A missing parent is a validate error; defensively resolve to None here so a
                     // bad config that somehow booted degrades to a shorter chain, never a panic.
                     parent: g.parent.as_deref().and_then(|p| group_idx.get(p).copied()),
                 }
             })
             .collect();
-        let alias: HashMap<String, String> = models
-            .iter()
-            .filter_map(|(name, m)| {
-                m.upstream_model
-                    .as_ref()
-                    .filter(|u| *u != name)
-                    .map(|u| (name.clone(), u.clone()))
-            })
-            .collect();
         Self {
             rates,
-            alias,
             groups,
             group_idx,
-            price_per_request_cents: gov.price_per_request_cents.max(0),
+            price_per_request_cents: per_request_fee.max(0),
         }
     }
 
@@ -224,17 +214,18 @@ impl CostModel {
     pub(crate) fn flat(price_per_request_cents: i64) -> Self {
         Self {
             rates: None,
-            alias: HashMap::new(),
             groups: Vec::new(),
             group_idx: HashMap::new(),
             price_per_request_cents: price_per_request_cents.max(0),
         }
     }
 
-    /// Resolve a CONFIGURED model name to its rate-card key (the `upstream_model` override when one
-    /// is set, else the name itself). Borrowed in/out - no allocation.
+    /// Resolve a CONFIGURED model name to its rate-card key. 1.5.0: the rate card is keyed by the
+    /// CONFIG model name itself (two providers serving one upstream model are two `models:`
+    /// entries with two card entries), so this is the identity - kept as the one seam every
+    /// consumer resolves through, so a future re-aliasing lands in one place.
     pub(crate) fn resolve_model_alias<'a>(&'a self, model: &'a str) -> &'a str {
-        self.alias.get(model).map(String::as_str).unwrap_or(model)
+        model
     }
 
     /// Whether a rate card is configured (token pricing active).
@@ -390,33 +381,46 @@ impl CostModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BudgetGroupCfg, GovernanceCfg, RateEntryCfg};
+    use crate::config::groups::{GroupCfg, LimitCfg, LimitMetric, LimitWindow};
+    use crate::config::RateEntryCfg;
     use busbar_api::VirtualKey;
     use std::collections::BTreeMap;
 
-    #[allow(clippy::field_reassign_with_default)]
-    fn gov_with_card(card: &[(&str, f64, f64)]) -> GovernanceCfg {
-        let mut g = GovernanceCfg::default();
-        g.rate_card = Some(
-            card.iter()
-                .map(|(m, i, o)| {
-                    (
-                        m.to_string(),
-                        RateEntryCfg {
-                            input_utok: *i,
-                            output_utok: *o,
-                            cache_read_utok: 0.0,
-                            cache_write_utok: 0.0,
-                        },
-                    )
-                })
-                .collect(),
-        );
-        g
+    fn card(entries: &[(&str, f64, f64)]) -> BTreeMap<String, RateEntryCfg> {
+        entries
+            .iter()
+            .map(|(m, i, o)| {
+                (
+                    m.to_string(),
+                    RateEntryCfg {
+                        input_utok: *i,
+                        output_utok: *o,
+                        cache_read_utok: 0.0,
+                        cache_write_utok: 0.0,
+                    },
+                )
+            })
+            .collect()
     }
 
-    fn resolve(gov: &GovernanceCfg) -> CostModel {
-        CostModel::resolve_parts(gov, &Default::default(), &Default::default())
+    fn resolve_card_fee(
+        rate_card: Option<&BTreeMap<String, RateEntryCfg>>,
+        per_request_fee: i64,
+    ) -> CostModel {
+        CostModel::resolve_parts(rate_card, per_request_fee, &BTreeMap::new())
+    }
+
+    /// A group whose only limit is a budget cap (the P1 projection the chain machinery enforces).
+    fn budget_group(budget: u64, per: LimitWindow, parent: Option<&str>) -> GroupCfg {
+        GroupCfg {
+            parent: parent.map(str::to_string),
+            enabled: true,
+            limits: vec![LimitCfg {
+                metric: LimitMetric::Budget,
+                amount: budget,
+                per: Some(per),
+            }],
+        }
     }
 
     fn key(budget: Option<i64>, group: Option<&str>) -> VirtualKey {
@@ -448,11 +452,8 @@ mod tests {
     /// ABSENT rate card => token pricing is 0 for every model; only the flat per-request fee
     /// counts. This is the all-or-nothing OFF arm.
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
     fn absent_rate_card_prices_tokens_at_zero() {
-        let mut gov = GovernanceCfg::default();
-        gov.price_per_request_cents = 3;
-        let cm = resolve(&gov);
+        let cm = resolve_card_fee(None, 3);
         assert!(!cm.pricing_enabled());
         assert!(!cm.model_unpriced("anything"), "no card = nothing to miss");
         let t = toks(1_000_000, 1_000_000);
@@ -464,8 +465,8 @@ mod tests {
     /// 2.5 utok input / 10 utok output: 1M input + 1M output tokens = 2.5 + 10 units = 1250 cents.
     #[test]
     fn present_rate_card_derives_integer_spend() {
-        let gov = gov_with_card(&[("gpt-5", 2.5, 10.0)]);
-        let cm = resolve(&gov);
+        let c = card(&[("gpt-5", 2.5, 10.0)]);
+        let cm = resolve_card_fee(Some(&c), 0);
         assert!(cm.pricing_enabled());
         let t = toks(1_000_000, 1_000_000);
         let spend = cm.derive_spend_cents([("gpt-5", &t)].into_iter(), 0, false);
@@ -478,10 +479,8 @@ mod tests {
     /// Sub-micro precision survives the nano scale: 3.125 utok/token x 8 tokens = 25 micro-units
     /// exactly (no truncation at the micro boundary).
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
     fn nano_scale_keeps_sub_micro_precision() {
-        let mut gov = GovernanceCfg::default();
-        gov.rate_card = Some(BTreeMap::from([(
+        let c = BTreeMap::from([(
             "m".to_string(),
             RateEntryCfg {
                 input_utok: 3.125,
@@ -489,8 +488,8 @@ mod tests {
                 cache_read_utok: 0.0,
                 cache_write_utok: 0.0,
             },
-        )]));
-        let cm = resolve(&gov);
+        )]);
+        let cm = resolve_card_fee(Some(&c), 0);
         let t = toks(8, 0);
         assert_eq!(
             cm.derive_spend_micros([("m", &t)].into_iter(), 0, false),
@@ -502,8 +501,8 @@ mod tests {
     /// derive paths price it at 0 (ledger rows from a previous config).
     #[test]
     fn unknown_model_with_card_is_unpriced_and_derives_zero() {
-        let gov = gov_with_card(&[("gpt-5", 1.0, 1.0)]);
-        let cm = resolve(&gov);
+        let c = card(&[("gpt-5", 1.0, 1.0)]);
+        let cm = resolve_card_fee(Some(&c), 0);
         assert!(cm.model_unpriced("mystery-model"));
         assert!(!cm.model_unpriced("gpt-5"));
         let t = toks(1_000_000, 0);
@@ -518,8 +517,8 @@ mod tests {
     #[test]
     fn reprice_on_read_recomputes_derived_spend() {
         let t = toks(1_000_000, 0);
-        let wrong = resolve(&gov_with_card(&[("m", 10.0, 0.0)]));
-        let fixed = resolve(&gov_with_card(&[("m", 5.0, 0.0)]));
+        let wrong = resolve_card_fee(Some(&card(&[("m", 10.0, 0.0)])), 0);
+        let fixed = resolve_card_fee(Some(&card(&[("m", 5.0, 0.0)])), 0);
         assert_eq!(
             wrong.derive_spend_cents([("m", &t)].into_iter(), 0, false),
             1000
@@ -539,7 +538,7 @@ mod tests {
     fn derive_spend_cents_saturates_never_wraps_free() {
         // 1e15 micro-units/token -> 1e18 nano-units/token; x u64::MAX tokens ~= 1.8e37 nanos
         // -> ~1.8e30 cents, far past i64::MAX.
-        let cm = resolve(&gov_with_card(&[("m", 1e15, 0.0)]));
+        let cm = resolve_card_fee(Some(&card(&[("m", 1e15, 0.0)])), 0);
         let t = toks(u64::MAX, 0);
         assert_eq!(
             cm.derive_spend_cents([("m", &t)].into_iter(), 0, false),
@@ -553,73 +552,53 @@ mod tests {
         );
     }
 
-    /// Pool-member 4-tier override wins over the card entry for its resolved upstream model, and
-    /// the member's routing scalar derives from the tiered shape.
+    /// S5: rate_card is the ONLY cost source - pool members carry no cost, and the routing
+    /// scalar (`cheapest` / hook Candidate.cost_per_mtok) derives from a model's card entry as
+    /// the blended (input + output) / 2 in units/mtok.
     #[test]
-    fn member_tiered_override_wins_over_card() {
-        use crate::config::MemberCost;
-        let gov = gov_with_card(&[("gpt-5", 2.5, 10.0)]);
-        let mut models: HashMap<String, crate::config::ModelCfg> = HashMap::new();
-        models.insert(
-            "gpt-5".into(),
-            serde_yaml::from_str("provider: p").expect("model cfg"),
-        );
-        let pool: crate::config::PoolCfg = serde_yaml::from_str(
-            "members:\n  - target: gpt-5\n    cost_per_mtok: { input_utok: 1.0, output_utok: 2.0 }\n",
-        )
-        .expect("pool cfg");
-        let mut pools = HashMap::new();
-        pools.insert("main".to_string(), pool);
-        let cm = CostModel::resolve_parts(&gov, &models, &pools);
+    fn rate_card_is_sole_cost_source_and_drives_routing_scalar() {
+        let c = card(&[("gpt-5", 2.5, 10.0)]);
+        let cm = resolve_card_fee(Some(&c), 0);
         let r = cm.rate_for("gpt-5").unwrap();
         assert_eq!(
             (r.input, r.output),
-            (1_000, 2_000),
-            "the member override (in nano-units) replaced the card entry"
+            (2_500, 10_000),
+            "nano-unit rates come straight from the card"
         );
-        // Routing scalar from the tiered shape: (1.0 + 2.0) / 2 = 1.5 units/mtok.
-        let mc = MemberCost::Tiered(RateEntryCfg {
-            input_utok: 1.0,
-            output_utok: 2.0,
-            cache_read_utok: 0.0,
-            cache_write_utok: 0.0,
-        });
-        assert!((mc.per_mtok() - 1.5).abs() < f64::EPSILON);
+        // The routing scalar projection: (2.5 + 10.0) / 2 = 6.25 units/mtok.
+        let scalar = crate::config::rate_entry_per_mtok(&c["gpt-5"]);
+        assert!((scalar - 6.25).abs() < f64::EPSILON);
+        // A pool member no longer parses a cost field at all (fail-closed on the removed key).
+        let err = serde_yaml::from_str::<crate::config::PoolCfg>(
+            "members:\n  - model: gpt-5\n    cost_per_mtok: 4\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cost_per_mtok"),
+            "the removed member cost key must fail loudly: {err}"
+        );
     }
 
     /// Chain resolution: key bucket first (fee applies there only), then the group chain to the
     /// root; each bucket carries its OWN period. A key with no group is a 1-bucket chain.
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
     fn chain_resolves_key_then_group_ancestry() {
-        let mut gov = GovernanceCfg::default();
-        gov.budget_groups = BTreeMap::from([
+        let groups = BTreeMap::from([
             (
                 "acme".to_string(),
-                BudgetGroupCfg {
-                    max_budget_cents: 10_000_000,
-                    budget_period: "monthly".into(),
-                    parent: None,
-                },
+                budget_group(10_000_000, LimitWindow::Month, None),
             ),
             (
                 "growth".to_string(),
-                BudgetGroupCfg {
-                    max_budget_cents: 2_000_000,
-                    budget_period: "monthly".into(),
-                    parent: Some("acme".into()),
-                },
+                budget_group(2_000_000, LimitWindow::Month, Some("acme")),
             ),
             (
                 "bob".to_string(),
-                BudgetGroupCfg {
-                    max_budget_cents: 500_000,
-                    budget_period: "daily".into(),
-                    parent: Some("growth".into()),
-                },
+                budget_group(500_000, LimitWindow::Day, Some("growth")),
             ),
         ]);
-        let cm = resolve(&gov);
+        let cm = CostModel::resolve_parts(None, 0, &groups);
         let k = key(Some(100_000), Some("bob"));
         let chain = cm.chain_for(&k).expect("resolves");
         let got: Vec<(String, Option<i64>, String, bool)> = chain
@@ -668,7 +647,7 @@ mod tests {
     /// A key naming a MISSING group fails closed: chain resolution surfaces the offender.
     #[test]
     fn chain_with_missing_group_fails_closed_naming_it() {
-        let cm = resolve(&GovernanceCfg::default());
+        let cm = CostModel::resolve_parts(None, 0, &BTreeMap::new());
         let k = key(None, Some("ghost"));
         match cm.chain_for(&k) {
             Err(missing) => assert_eq!(missing, "ghost"),

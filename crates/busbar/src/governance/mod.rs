@@ -39,6 +39,10 @@ pub(crate) const BUDGET_PERIOD_TOTAL: &str = "total";
 pub(crate) const BUDGET_PERIOD_DAILY: &str = "daily";
 /// The "monthly" budget window sentinel: resets at UTC first-of-month.
 pub(crate) const BUDGET_PERIOD_MONTHLY: &str = "monthly";
+/// The "minute" budget window sentinel (1.5.0 groups: `per: minute`): resets each UTC minute.
+pub(crate) const BUDGET_PERIOD_MINUTE: &str = "minute";
+/// The "hour" budget window sentinel (1.5.0 groups: `per: hour`): resets each UTC hour.
+pub(crate) const BUDGET_PERIOD_HOUR: &str = "hour";
 
 // ── Virtual-key / bearer-secret formats ──────────────────────────────────────────────────────────
 /// The `"vk_"` prefix prepended to the 16-hex-char hash prefix to form a virtual-key id.
@@ -354,24 +358,26 @@ pub(crate) struct NewKeySpec {
 
 mod state;
 
-/// THE GOVERNANCE RE-KEY (design-hooks-v2 §2.3): synthesize the governance grants for a
-/// GROUP-CARRYING principal from the UNION of its `group_map:` entries — the same `VirtualKey`
-/// shape every enforcement site already speaks, keyed by the PRINCIPAL id, so an SSO user and a
-/// virtual key get identical enforcement (pool ACL, RPM/TPM windows, budget, usage attribution,
-/// the hook `send_user` projection) through identical code.
+/// THE GOVERNANCE RE-KEY for a ROLE-CARRYING principal (an external auth module's verdict): a
+/// synthesized `VirtualKey` built from the principal's roles under the identifying MODULE's
+/// `role_bindings` table (S4: bindings are nested by module - `bindings` here is
+/// `role_bindings.<identifying module>`; a role asserted by another module never rides it).
+/// An SSO user and a virtual key then get identical enforcement (pool ACL, group limits, usage
+/// attribution, the hook `send_user` projection) through identical code.
 ///
-/// Fail-closed: `None` unless at least one mapped group SETS `allowed_pools` (the data-plane
-/// grant; an admin-only group confers no inference access). Union is most-permissive: pool lists
-/// union (an explicit `[]` = every pool); a granting group without an rpm/tpm/budget cap makes the
-/// principal uncapped on that axis, otherwise the max wins.
+/// Fail-closed: `None` when no role of the principal is bound (an unbound role grants nothing),
+/// or when the bound pool grants union to the EMPTY SET (C6: `allowed_pools: []` = NO pools).
+/// Pool semantics per C6: a binding that OMITS `allowed_pools` grants ALL pools; lists union.
+/// Limits come ONLY from the bound `group:` (keys/principals carry no inline caps); with several
+/// bound groups the first in role order wins (one group per principal - the chain is a tree).
 pub(crate) fn synthesize_principal_key(
     principal: &crate::auth::Principal,
-    group_map: &std::collections::HashMap<String, crate::config::GroupMapEntry>,
+    bindings: Option<&std::collections::BTreeMap<String, crate::config::RoleBindingCfg>>,
 ) -> Option<Arc<VirtualKey>> {
     // BUCKET-NAMESPACE GUARD (audit cost-1.5.0): the synthesized key's `id` becomes its LEDGER
-    // BUCKET id, and budget-group buckets live in the same store namespace as `group:<name>`. A
+    // BUCKET id, and group buckets live in the same store namespace as `group:<name>`. A
     // principal id (attacker-influenced at the IdP) literally starting with `group:` would alias a
-    // budget group's cell - charging it, reading it, and corrupting group enforcement. Fail closed:
+    // group's cell - charging it, reading it, and corrupting group enforcement. Fail closed:
     // such a principal gets NO synthetic key (no data-plane access), never a colliding bucket.
     //
     // The SAME hazard applies to the `vk_` prefix: a real virtual key's id is `vk_<16 hex>` and is
@@ -387,22 +393,25 @@ pub(crate) fn synthesize_principal_key(
         );
         return None;
     }
-    let granting: Vec<&crate::config::GroupMapEntry> = principal
+    let table = bindings?;
+    let granting: Vec<&crate::config::RoleBindingCfg> = principal
         .groups
         .iter()
-        .filter_map(|g| group_map.get(g))
-        .filter(|e| e.allowed_pools.is_some())
+        .filter_map(|role| table.get(role))
         .collect();
     if granting.is_empty() {
         return None;
     }
-    // Pool union. An explicit `[]` on any granting group = unrestricted (empty Vec is the
-    // VirtualKey encoding for "all pools").
+    // Pool union under C6 semantics: OMITTED `allowed_pools` on any granting binding = ALL pools;
+    // an explicit list contributes its entries; an explicit `[]` contributes nothing. An
+    // all-bindings-empty union = the EMPTY SET = no data-plane access (fail closed). The
+    // `VirtualKey` runtime encoding keeps `[]` = all pools, so "all" maps to an empty Vec and an
+    // empty union maps to `None` here (no key at all - nothing to admit).
     let mut pools: Vec<String> = Vec::new();
     let mut all_pools = false;
-    for e in &granting {
-        match e.allowed_pools.as_deref() {
-            Some([]) => all_pools = true,
+    for b in &granting {
+        match b.allowed_pools.as_deref() {
+            None => all_pools = true,
             Some(list) => {
                 for p in list {
                     if !pools.contains(p) {
@@ -410,24 +419,17 @@ pub(crate) fn synthesize_principal_key(
                     }
                 }
             }
-            None => unreachable!("filtered on is_some"),
         }
     }
     if all_pools {
         pools.clear();
+    } else if pools.is_empty() {
+        // Every granting binding said `allowed_pools: []` - the empty set. No access (C6).
+        return None;
     }
-    // Most-permissive cap union: any granting group WITHOUT the cap lifts it entirely.
-    let cap_union = |get: fn(&crate::config::GroupMapEntry) -> Option<i64>| -> Option<i64> {
-        let mut max: Option<i64> = None;
-        for e in &granting {
-            let v = get(e)?; // a capless granting group lifts the cap entirely
-            max = Some(max.map_or(v, |m: i64| m.max(v)));
-        }
-        max
-    };
-    let rpm = cap_union(|e| e.rpm_limit.map(i64::from)).map(|v| v as u32);
-    let tpm = cap_union(|e| e.tpm_limit.map(i64::from)).map(|v| v as u32);
-    let budget = cap_union(|e| e.max_budget_cents);
+    // The bound group (first in role order). Group limits are enforced through the group chain;
+    // the key itself carries NO inline caps (keys are pure auth).
+    let group = granting.iter().find_map(|b| b.group.clone());
     Some(Arc::new(VirtualKey {
         id: principal.id.clone(),
         // NOT a credential hash — a marker. The synthetic key never authenticates anything (the
@@ -438,15 +440,13 @@ pub(crate) fn synthesize_principal_key(
             .clone()
             .unwrap_or_else(|| principal.id.clone()),
         allowed_pools: pools,
-        max_budget_cents: budget,
+        max_budget_cents: None,
         budget_period: BUDGET_PERIOD_TOTAL.to_string(),
-        rpm_limit: rpm,
-        tpm_limit: tpm,
+        rpm_limit: None,
+        tpm_limit: None,
         enabled: true,
         created_at: 0,
-        // Auth `group_map` groups and `budget_groups` are deliberately INDEPENDENT concepts
-        // (union-grant vs intersection-cap); a synthesized principal key binds to no budget group.
-        budget_group: None,
+        budget_group: group,
         labels: std::collections::BTreeMap::new(),
     }))
 }
@@ -541,6 +541,8 @@ pub(crate) fn pool_allowed(key: &VirtualKey, pool: &str) -> bool {
 /// single all-time window (0); "daily" = UTC midnight; "monthly" = UTC first-of-month.
 pub(crate) fn budget_window(period: &str, now: u64) -> u64 {
     match period {
+        BUDGET_PERIOD_MINUTE => now / 60 * 60,
+        BUDGET_PERIOD_HOUR => now / 3600 * 3600,
         BUDGET_PERIOD_DAILY => now / SECS_PER_DAY * SECS_PER_DAY,
         BUDGET_PERIOD_MONTHLY => {
             let days = (now / SECS_PER_DAY) as i64;

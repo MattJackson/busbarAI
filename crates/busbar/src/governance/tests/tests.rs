@@ -1,48 +1,42 @@
-/// The re-key union semantics: pools union (`[]` = every pool), caps are most-permissive
-/// (a granting group without a cap lifts it; otherwise max wins), and a principal whose
-/// groups never set `allowed_pools` gets NO synthetic key (admin-only groups confer no
-/// data-plane access).
+/// The re-key union semantics under role_bindings (C6): pools union (OMITTED `allowed_pools` on
+/// any granting binding = every pool; explicit `[]` contributes nothing), the synthesized key
+/// carries NO inline caps (keys are pure auth; limits live on `groups:`), the first bound
+/// `group` becomes the key's budget_group, and a principal whose roles all bind `[]` (or bind
+/// nothing) gets NO synthetic key (fail closed).
 #[test]
 fn synthesize_principal_key_union_semantics() {
-    use crate::config::GroupMapEntry;
-    let mut gm = std::collections::HashMap::new();
-    gm.insert(
+    use crate::config::RoleBindingCfg;
+    let mut table = std::collections::BTreeMap::new();
+    table.insert(
         "a".to_string(),
-        GroupMapEntry {
+        RoleBindingCfg {
             allowed_pools: Some(vec!["p1".to_string()]),
-            rpm_limit: Some(10),
-            tpm_limit: Some(1000),
-            max_budget_cents: Some(500),
+            group: Some("finance".to_string()),
             ..Default::default()
         },
     );
-    gm.insert(
+    table.insert(
         "b".to_string(),
-        GroupMapEntry {
+        RoleBindingCfg {
             allowed_pools: Some(vec!["p2".to_string()]),
-            rpm_limit: Some(60),
-            // no tpm cap: lifts the axis entirely (most permissive)
             ..Default::default()
         },
     );
-    gm.insert(
+    // An ADMIN-ONLY role: admin scope, but an explicit [] pool grant = NO data-plane access.
+    table.insert(
         "admin-only".to_string(),
-        GroupMapEntry {
+        RoleBindingCfg {
+            allowed_pools: Some(vec![]),
             admin_scope: Some("full".to_string()),
             ..Default::default()
         },
     );
-    gm.insert(
-        "all-pools".to_string(),
-        GroupMapEntry {
-            allowed_pools: Some(vec![]),
-            ..Default::default()
-        },
-    );
+    // OMITTED allowed_pools = ALL pools (C6).
+    table.insert("all-pools".to_string(), RoleBindingCfg::default());
 
     let mut p = crate::auth::Principal::from_id("test:u");
     p.groups = vec!["a".to_string(), "b".to_string()];
-    let k = synthesize_principal_key(&p, &gm).expect("granting groups synthesize");
+    let k = synthesize_principal_key(&p, Some(&table)).expect("bound roles synthesize");
     assert_eq!(k.id, "test:u", "keyed by the principal id");
     let mut pools = k.allowed_pools.clone();
     pools.sort();
@@ -51,24 +45,36 @@ fn synthesize_principal_key_union_semantics() {
         vec!["p1".to_string(), "p2".to_string()],
         "pools union"
     );
-    assert_eq!(k.rpm_limit, Some(60), "max rpm wins");
-    assert_eq!(k.tpm_limit, None, "a capless granting group lifts the cap");
-    assert_eq!(k.max_budget_cents, None, "same for budget");
+    // Keys are PURE AUTH: no rate/budget caps ride the synthesized key (limits live on groups).
+    assert_eq!(k.rpm_limit, None, "no per-key rpm cap");
+    assert_eq!(k.tpm_limit, None, "no per-key tpm cap");
+    assert_eq!(k.max_budget_cents, None, "no per-key budget cap");
+    assert_eq!(
+        k.budget_group.as_deref(),
+        Some("finance"),
+        "the bound group becomes the key's budget_group"
+    );
     assert!(k.enabled);
 
-    // An explicit [] on any granting group = every pool.
+    // An OMITTED allowed_pools on any granting binding = every pool (empty Vec encoding).
     p.groups = vec!["a".to_string(), "all-pools".to_string()];
-    let k = synthesize_principal_key(&p, &gm).expect("granting");
-    assert!(k.allowed_pools.is_empty(), "explicit [] grants every pool");
-
-    // Admin-only groups (and unmapped ones) confer no data-plane key.
-    p.groups = vec!["admin-only".to_string(), "unmapped".to_string()];
+    let k = synthesize_principal_key(&p, Some(&table)).expect("granting");
     assert!(
-        synthesize_principal_key(&p, &gm).is_none(),
-        "no allowed_pools grant = no synthetic key (fail closed)"
+        k.allowed_pools.is_empty(),
+        "omitted allowed_pools grants every pool"
+    );
+
+    // All granting bindings say []: the EMPTY SET - no synthetic key (fail closed).
+    p.groups = vec!["admin-only".to_string(), "unbound".to_string()];
+    assert!(
+        synthesize_principal_key(&p, Some(&table)).is_none(),
+        "an all-[] pool grant = no synthetic key (fail closed)"
     );
     p.groups = vec![];
-    assert!(synthesize_principal_key(&p, &gm).is_none());
+    assert!(synthesize_principal_key(&p, Some(&table)).is_none());
+    // No bindings table for the identifying module at all: nothing to grant.
+    p.groups = vec!["a".to_string()];
+    assert!(synthesize_principal_key(&p, None).is_none());
 }
 
 /// REGRESSION (audit cost-1.5.0, bucket-namespace hardening): a principal whose id literally
@@ -78,21 +84,16 @@ fn synthesize_principal_key_union_semantics() {
 /// Fail closed: no key, no data-plane access, no collision.
 #[test]
 fn group_prefixed_principal_id_cannot_alias_a_budget_group_bucket() {
-    use crate::config::GroupMapEntry;
-    let mut gm = std::collections::HashMap::new();
-    gm.insert(
-        "eng".to_string(),
-        GroupMapEntry {
-            allowed_pools: Some(vec![]),
-            ..Default::default()
-        },
-    );
+    use crate::config::RoleBindingCfg;
+    let mut table = std::collections::BTreeMap::new();
+    // OMITTED allowed_pools = ALL pools: the broadest possible grant.
+    table.insert("eng".to_string(), RoleBindingCfg::default());
 
     // Control: the same grants under a benign id DO synthesize, and the bucket id is the
     // principal id - which is exactly why the reserved prefix must be rejected.
     let mut ok = crate::auth::Principal::from_id("sso:alice");
     ok.groups = vec!["eng".to_string()];
-    let k = synthesize_principal_key(&ok, &gm).expect("benign id synthesizes");
+    let k = synthesize_principal_key(&ok, Some(&table)).expect("benign id synthesizes");
     assert_eq!(k.id, "sso:alice", "the key id IS the ledger bucket id");
 
     // The attack shape: identical grants, but the id sits in the budget-group bucket namespace.
@@ -101,14 +102,14 @@ fn group_prefixed_principal_id_cannot_alias_a_budget_group_bucket() {
     let mut evil = crate::auth::Principal::from_id("group:acme");
     evil.groups = vec!["eng".to_string()];
     assert!(
-        synthesize_principal_key(&evil, &gm).is_none(),
+        synthesize_principal_key(&evil, Some(&table)).is_none(),
         "a group:-prefixed principal id must be refused, never keyed into the ledger"
     );
 
     // The bare prefix is equally reserved.
     let mut bare = crate::auth::Principal::from_id("group:");
     bare.groups = vec!["eng".to_string()];
-    assert!(synthesize_principal_key(&bare, &gm).is_none());
+    assert!(synthesize_principal_key(&bare, Some(&table)).is_none());
 }
 
 /// REGRESSION (vk_ alias hardening): a principal whose id starts with `vk_` must NEVER get a
@@ -117,28 +118,22 @@ fn group_prefixed_principal_id_cannot_alias_a_budget_group_bucket() {
 /// (charging/reading it, or riding its rate window). Fail closed like the `group:` guard.
 #[test]
 fn vk_prefixed_principal_id_cannot_alias_a_virtual_key_bucket() {
-    use crate::config::GroupMapEntry;
-    let mut gm = std::collections::HashMap::new();
-    gm.insert(
-        "eng".to_string(),
-        GroupMapEntry {
-            allowed_pools: Some(vec![]),
-            ..Default::default()
-        },
-    );
+    use crate::config::RoleBindingCfg;
+    let mut table = std::collections::BTreeMap::new();
+    table.insert("eng".to_string(), RoleBindingCfg::default());
 
     // A `vk_`-shaped id (the exact shape of a real minted virtual key) must produce NO key.
     let mut evil = crate::auth::Principal::from_id("vk_deadbeefdeadbeef");
     evil.groups = vec!["eng".to_string()];
     assert!(
-        synthesize_principal_key(&evil, &gm).is_none(),
+        synthesize_principal_key(&evil, Some(&table)).is_none(),
         "a vk_-prefixed principal id must be refused, never keyed into a virtual key's bucket"
     );
 
     // The bare prefix is equally reserved.
     let mut bare = crate::auth::Principal::from_id("vk_");
     bare.groups = vec!["eng".to_string()];
-    assert!(synthesize_principal_key(&bare, &gm).is_none());
+    assert!(synthesize_principal_key(&bare, Some(&table)).is_none());
 }
 use super::*;
 
@@ -164,13 +159,12 @@ fn flat_cost(fee: i64) -> crate::cost::CostModel {
     crate::cost::CostModel::flat(fee)
 }
 
-/// A cost model with ONE rate-card entry (input tier only, `input_utok` micro-units/token) and no
-/// flat fee - the minimal token-priced model.
-#[allow(clippy::field_reassign_with_default)]
-fn card_cost(model: &str, input_utok: f64) -> crate::cost::CostModel {
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.price_per_request_cents = 0;
-    gov.rate_card = Some(std::collections::BTreeMap::from([(
+/// A one-entry rate card (input tier only, `input_utok` micro-units/token).
+fn one_entry_card(
+    model: &str,
+    input_utok: f64,
+) -> std::collections::BTreeMap<String, crate::config::RateEntryCfg> {
+    std::collections::BTreeMap::from([(
         model.to_string(),
         crate::config::RateEntryCfg {
             input_utok,
@@ -178,29 +172,65 @@ fn card_cost(model: &str, input_utok: f64) -> crate::cost::CostModel {
             cache_read_utok: 0.0,
             cache_write_utok: 0.0,
         },
-    )]));
-    crate::cost::CostModel::resolve_parts(&gov, &Default::default(), &Default::default())
+    )])
+}
+
+/// A `groups:` entry carrying one BUDGET limit (cap in cents on the given runtime period noun:
+/// total | daily | monthly | minute | hour) and an optional parent.
+fn budget_group_cfg(cap: i64, period: &str, parent: Option<&str>) -> crate::config::GroupCfg {
+    use crate::config::groups::{LimitCfg, LimitMetric, LimitWindow};
+    let per = match period {
+        "daily" => LimitWindow::Day,
+        "monthly" => LimitWindow::Month,
+        "minute" => LimitWindow::Minute,
+        "hour" => LimitWindow::Hour,
+        _ => LimitWindow::Total,
+    };
+    crate::config::GroupCfg {
+        parent: parent.map(String::from),
+        enabled: true,
+        limits: vec![LimitCfg {
+            metric: LimitMetric::Budget,
+            amount: u64::try_from(cap).unwrap_or(0),
+            per: Some(per),
+        }],
+    }
+}
+
+/// A cost model with ONE rate-card entry (input tier only, `input_utok` micro-units/token) and no
+/// flat fee - the minimal token-priced model.
+fn card_cost(model: &str, input_utok: f64) -> crate::cost::CostModel {
+    crate::cost::CostModel::resolve_parts(
+        Some(&one_entry_card(model, input_utok)),
+        0,
+        &std::collections::BTreeMap::new(),
+    )
 }
 
 /// A cost model with budget GROUPS (name, cap, period, parent) and a flat fee, no rate card.
-#[allow(clippy::field_reassign_with_default)]
 fn group_cost(fee: i64, groups: &[(&str, i64, &str, Option<&str>)]) -> crate::cost::CostModel {
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.price_per_request_cents = fee;
-    gov.budget_groups = groups
+    let groups_cfg: std::collections::BTreeMap<String, crate::config::GroupCfg> = groups
         .iter()
         .map(|(name, cap, period, parent)| {
-            (
-                name.to_string(),
-                crate::config::BudgetGroupCfg {
-                    max_budget_cents: *cap,
-                    budget_period: period.to_string(),
-                    parent: parent.map(String::from),
-                },
-            )
+            (name.to_string(), budget_group_cfg(*cap, period, *parent))
         })
         .collect();
-    crate::cost::CostModel::resolve_parts(&gov, &Default::default(), &Default::default())
+    crate::cost::CostModel::resolve_parts(None, fee, &groups_cfg)
+}
+
+/// A cost model with BOTH a one-entry rate card and budget groups, no flat fee.
+fn card_and_group_cost(
+    model: &str,
+    input_utok: f64,
+    groups: &[(&str, i64, &str, Option<&str>)],
+) -> crate::cost::CostModel {
+    let groups_cfg: std::collections::BTreeMap<String, crate::config::GroupCfg> = groups
+        .iter()
+        .map(|(name, cap, period, parent)| {
+            (name.to_string(), budget_group_cfg(*cap, period, *parent))
+        })
+        .collect();
+    crate::cost::CostModel::resolve_parts(Some(&one_entry_card(model, input_utok)), 0, &groups_cfg)
 }
 
 /// An input-only tier split of `n` tokens (the scalar-total shorthand old tests used).
@@ -2203,27 +2233,7 @@ fn test_group_token_spend_blocks_chain_admission() {
     let store = Arc::new(MemoryStore::new());
     let gov = GovState::new(store.clone(), None).unwrap();
     // 100 micro-units/token; group cap = 100 cents = 10_000 tokens' worth. No flat fee.
-    let mut gcfg = crate::config::GovernanceCfg::default();
-    gcfg.price_per_request_cents = 0;
-    gcfg.rate_card = Some(std::collections::BTreeMap::from([(
-        "gpt-5".to_string(),
-        crate::config::RateEntryCfg {
-            input_utok: 100.0,
-            output_utok: 0.0,
-            cache_read_utok: 0.0,
-            cache_write_utok: 0.0,
-        },
-    )]));
-    gcfg.budget_groups = std::collections::BTreeMap::from([(
-        "team".to_string(),
-        crate::config::BudgetGroupCfg {
-            max_budget_cents: 100,
-            budget_period: "total".to_string(),
-            parent: None,
-        },
-    )]);
-    let cost =
-        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+    let cost = card_and_group_cost("gpt-5", 100.0, &[("team", 100, "total", None)]);
 
     let mut k = sample_key("vk_t", "h_t");
     k.max_budget_cents = None;
@@ -2335,28 +2345,7 @@ fn test_hydrate_budgets_restores_group_buckets() {
         let gov = GovState::new(store.clone(), None).unwrap();
         // The team cap is on derived TOKEN spend (fee counts on the key bucket only) - seed the
         // group's ledger with tokens via a card so the persisted spend is meaningful.
-        let card = {
-            let mut g = crate::config::GovernanceCfg::default();
-            g.price_per_request_cents = 0;
-            g.rate_card = Some(std::collections::BTreeMap::from([(
-                "m".to_string(),
-                crate::config::RateEntryCfg {
-                    input_utok: 100.0,
-                    output_utok: 0.0,
-                    cache_read_utok: 0.0,
-                    cache_write_utok: 0.0,
-                },
-            )]));
-            g.budget_groups = std::collections::BTreeMap::from([(
-                "team".to_string(),
-                crate::config::BudgetGroupCfg {
-                    max_budget_cents: 25,
-                    budget_period: "total".to_string(),
-                    parent: None,
-                },
-            )]);
-            crate::cost::CostModel::resolve_parts(&g, &Default::default(), &Default::default())
-        };
+        let card = card_and_group_cost("m", 100.0, &[("team", 25, "total", None)]);
         gov.record_usage(&card, &k, "m", &tt(2_500), at); // 2500 x 100 micro = 25 cents = the cap
         gov.flush_budgets();
         drop(card);
@@ -2364,28 +2353,7 @@ fn test_hydrate_budgets_restores_group_buckets() {
 
     // Restart: a fresh GovState hydrates key AND group cells from the durable ledger.
     let gov2 = GovState::new(store.clone(), None).unwrap();
-    let card = {
-        let mut g = crate::config::GovernanceCfg::default();
-        g.price_per_request_cents = 0;
-        g.rate_card = Some(std::collections::BTreeMap::from([(
-            "m".to_string(),
-            crate::config::RateEntryCfg {
-                input_utok: 100.0,
-                output_utok: 0.0,
-                cache_read_utok: 0.0,
-                cache_write_utok: 0.0,
-            },
-        )]));
-        g.budget_groups = std::collections::BTreeMap::from([(
-            "team".to_string(),
-            crate::config::BudgetGroupCfg {
-                max_budget_cents: 25,
-                budget_period: "total".to_string(),
-                parent: None,
-            },
-        )]);
-        crate::cost::CostModel::resolve_parts(&g, &Default::default(), &Default::default())
-    };
+    let card = card_and_group_cost("m", 100.0, &[("team", 25, "total", None)]);
     gov2.hydrate_budgets(&card, at).expect("hydrate");
     assert_eq!(
         gov2.try_charge_request_within_budget(&card, &k, at),

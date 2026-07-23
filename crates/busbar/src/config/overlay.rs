@@ -17,7 +17,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DeployCfg, HookCfg};
+use super::{HookCfg, RootCfg};
 
 /// Persist the current hook state to the overlay at `path`, IF persistence is enabled (`Some`), and
 /// update the TOMBSTONE set for this change: `deleted_add` (a just-deleted hook) is tombstoned so the
@@ -140,25 +140,26 @@ pub(crate) fn from_state(hooks: &HashMap<String, HookCfg>, global_hooks: &[Strin
     }
 }
 
-/// Merge an overlay into a deploy config BEFORE resolve (the boot-merge). Overlay hooks are inserted
-/// into the registry (an overlay hook with a base hook's name WINS — the last-applied definition, which
-/// matches the live-apply semantics), overlay global names are unioned into `global_hooks`, and finally
-/// TOMBSTONES (`deleted`) are subtracted — so a hook the API deleted stays gone across a restart even if
-/// it was defined in base `config.yaml`. Tombstones are applied LAST so a delete always wins over a
-/// stale add.
-pub(crate) fn merge_into(deploy: &mut DeployCfg, doc: OverlayDoc) {
-    for (name, cfg) in doc.hooks {
-        deploy.hooks.insert(name, cfg);
+/// Merge an overlay into the RESOLVED config (the boot-merge, run AFTER `config::resolve` - the
+/// runtime hook registry is synthesized there from the inline refs, so the overlay layers on top
+/// of it). Overlay hooks are inserted into the registry (an overlay hook with a base hook's name
+/// WINS - the last-applied definition, which matches the live-apply semantics), overlay global
+/// names are unioned into `global_hooks`, and finally TOMBSTONES (`deleted`) are subtracted - so a
+/// hook the API deleted stays gone across a restart even if it was defined in base `config.yaml`.
+/// Tombstones are applied LAST so a delete always wins over a stale add.
+pub(crate) fn merge_into(cfg: &mut RootCfg, doc: OverlayDoc) {
+    for (name, hook) in doc.hooks {
+        cfg.hooks.insert(name, hook);
     }
     for g in doc.global_hooks {
-        if !deploy.global_hooks.contains(&g) {
-            deploy.global_hooks.push(g);
+        if !cfg.global_hooks.contains(&g) {
+            cfg.global_hooks.push(g);
         }
     }
     // Tombstones LAST: an API deletion removes the hook from the effective config even if base defined it.
     for name in &doc.deleted {
-        deploy.hooks.remove(name);
-        deploy.global_hooks.retain(|g| g != name);
+        cfg.hooks.remove(name);
+        cfg.global_hooks.retain(|g| g != name);
     }
 }
 
@@ -206,14 +207,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// merge_into adds overlay hooks to the deploy registry + unions global names; an overlay hook with
-    /// a base hook's name wins.
+    /// A minimal RESOLVED config to merge overlays into (providers/models empty; registry empty).
+    fn minimal_cfg() -> RootCfg {
+        let deploy: super::super::DeployCfg =
+            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
+        super::super::resolve(&deploy, &HashMap::new()).expect("minimal config resolves")
+    }
+
+    /// merge_into adds overlay hooks to the resolved registry + unions global names; an overlay
+    /// hook with a base hook's name wins.
     #[test]
     fn merge_into_deploy() {
-        // A minimal deploy config (providers/models required; the rest default).
-        let mut deploy: DeployCfg =
-            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
-        deploy.hooks.insert("base_hook".to_string(), gate());
+        let mut cfg = minimal_cfg();
+        cfg.hooks.insert("base_hook".to_string(), gate());
         let doc = from_state(
             &HashMap::from([
                 ("base_hook".to_string(), gate()), // same name as a base hook → overlay wins
@@ -221,42 +227,40 @@ mod tests {
             ]),
             &["api_hook".to_string(), "base_hook".to_string()],
         );
-        deploy.global_hooks.push("base_hook".to_string());
-        merge_into(&mut deploy, doc);
-        assert!(deploy.hooks.contains_key("api_hook"));
-        assert!(deploy.hooks.contains_key("base_hook"));
+        cfg.global_hooks.push("base_hook".to_string());
+        merge_into(&mut cfg, doc);
+        assert!(cfg.hooks.contains_key("api_hook"));
+        assert!(cfg.hooks.contains_key("base_hook"));
         // global_hooks unioned, no duplicate of base_hook.
         assert_eq!(
-            deploy
-                .global_hooks
+            cfg.global_hooks
                 .iter()
                 .filter(|g| *g == "base_hook")
                 .count(),
             1,
             "global union does not duplicate"
         );
-        assert!(deploy.global_hooks.iter().any(|g| g == "api_hook"));
+        assert!(cfg.global_hooks.iter().any(|g| g == "api_hook"));
     }
 
     /// TOMBSTONE: a hook the API deleted (recorded in `deleted`) is removed from the effective config at
     /// boot even if it was defined in base config.yaml — so an API deletion survives a restart.
     #[test]
     fn merge_into_applies_tombstones() {
-        let mut deploy: DeployCfg =
-            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
-        deploy.hooks.insert("base_hook".to_string(), gate());
-        deploy.global_hooks.push("base_hook".to_string());
+        let mut cfg = minimal_cfg();
+        cfg.hooks.insert("base_hook".to_string(), gate());
+        cfg.global_hooks.push("base_hook".to_string());
         let doc = OverlayDoc {
             hooks: HashMap::new(),
             global_hooks: Vec::new(),
             deleted: vec!["base_hook".to_string()],
         };
-        merge_into(&mut deploy, doc);
+        merge_into(&mut cfg, doc);
         assert!(
-            !deploy.hooks.contains_key("base_hook"),
+            !cfg.hooks.contains_key("base_hook"),
             "a tombstoned base hook is removed from the effective config"
         );
-        assert!(!deploy.global_hooks.iter().any(|g| g == "base_hook"));
+        assert!(!cfg.global_hooks.iter().any(|g| g == "base_hook"));
     }
 
     /// REGRESSION: `persist` must NOT overwrite a present-but-unreadable/corrupt overlay — that would
@@ -318,11 +322,10 @@ mod tests {
             "a restored hook must not remain tombstoned, or it vanishes on restart"
         );
         // And it survives the boot merge (inserted, not subtracted).
-        let mut deploy: DeployCfg =
-            serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
-        merge_into(&mut deploy, doc);
+        let mut cfg = minimal_cfg();
+        merge_into(&mut cfg, doc);
         assert!(
-            deploy.hooks.contains_key("x"),
+            cfg.hooks.contains_key("x"),
             "rollback is durable across restart"
         );
         let _ = std::fs::remove_file(&path);

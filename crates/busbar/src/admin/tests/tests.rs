@@ -103,16 +103,20 @@ async fn test_admin_v1_info_reports_version_features_and_topology() {
         Some(env!("CARGO_PKG_VERSION")),
         "info must report the build version"
     );
-    // The `weighted_floor` is ALWAYS true (non-removable). `tokens`/`ranking` are present iff their
-    // feature is compiled in — so the compliance-by-compilation proof holds under
-    // `--no-default-features` too (the lists are empty there).
+    // The `weighted_floor` is ALWAYS true (non-removable). `keys` is engine-handled and always
+    // present; `admin-tokens`/`ranking` are present iff their feature is compiled in - so the
+    // compliance-by-compilation proof holds under `--no-default-features` too.
     assert_eq!(body["build"]["weighted_floor"], serde_json::json!(true));
     let auth_modules = body["build"]["auth_modules"].as_array().unwrap();
+    assert!(
+        auth_modules.iter().any(|m| m == "keys"),
+        "auth_modules must contain the built-in `keys` verifier: {auth_modules:?}"
+    );
     assert_eq!(
-            auth_modules.iter().any(|m| m == "tokens"),
-            cfg!(feature = "auth-tokens"),
-            "auth_modules must contain `tokens` iff the auth-tokens feature is compiled in: {auth_modules:?}"
-        );
+        auth_modules.iter().any(|m| m == "admin-tokens"),
+        cfg!(feature = "auth-admin-tokens"),
+        "auth_modules must contain `admin-tokens` iff its feature is compiled in: {auth_modules:?}"
+    );
     let hook_plugins = body["build"]["hook_plugins"].as_array().unwrap();
     assert_eq!(
             hook_plugins.iter().any(|m| m == "ranking"),
@@ -522,23 +526,15 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
         cache_read_utok: 500.0,
         cache_write_utok: 500.0,
     };
-    let gov_cfg = crate::config::GovernanceCfg {
-        store: "memory".to_string(),
-        db_path: "busbar-governance.db".to_string(),
-        price_per_request_cents: 1,
-        rate_card: Some(
-            [("gpt-x".to_string(), rate), ("claude-z".to_string(), rate)]
-                .into_iter()
-                .collect(),
-        ),
-        budget_groups: Default::default(),
-        admin_token: Some("admintok".to_string()),
-        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-    };
-    let cost =
-        crate::cost::CostModel::resolve_parts(&gov_cfg, &Default::default(), &Default::default());
+    let rate_card: std::collections::BTreeMap<String, crate::config::RateEntryCfg> =
+        [("gpt-x".to_string(), rate), ("claude-z".to_string(), rate)]
+            .into_iter()
+            .collect();
+    let cost = crate::cost::CostModel::resolve_parts(
+        Some(&rate_card),
+        1,
+        &std::collections::BTreeMap::new(),
+    );
     let now = crate::store::now();
     let (minted, minted_secret) = gov
         .create_key(
@@ -829,12 +825,12 @@ async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
         },
         "config": {
             "listen": "127.0.0.1:0",
-            "providers": {"test-provider": {"api_key_env": "BUSBAR_TEST_APPLY_NO_KEY"}},
+            "providers": {"test-provider": {"api_key": {"env": "BUSBAR_TEST_APPLY_NO_KEY"}}},
             "models": {
                 "m0": {"provider": "test-provider", "max_concurrent": 4},
                 "m-applied": {"provider": "test-provider", "max_concurrent": 4}
             },
-            "pools": {"apply-pool": {"members": [{"target": "m0"}, {"target": "m-applied"}]}}
+            "pools": {"apply-pool": {"members": [{"model": "m0"}, {"model": "m-applied"}]}}
         }
     });
     let resp = admin(client.post(format!("http://{addr}/api/v1/admin/config/apply")))
@@ -914,7 +910,7 @@ async fn test_admin_v1_config_reload_swaps_disk_truth_and_carries_health() {
         "listen: 127.0.0.1:0
 providers:
   test-provider:
-    api_key_env: BUSBAR_TEST_RELOAD_NO_SUCH_KEY
+    api_key: { env: BUSBAR_TEST_RELOAD_NO_SUCH_KEY }
 models:
   m0:
     provider: test-provider
@@ -925,8 +921,8 @@ models:
 pools:
   reload-pool:
     members:
-      - target: m0
-      - target: m-new
+      - model: m0
+      - model: m-new
 ",
     )
     .unwrap();
@@ -1108,50 +1104,50 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
         inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
-        inner.group_map.insert(
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
             "viewers".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("read-only".to_string()),
                 ..Default::default()
             },
         );
-        inner.group_map.insert(
+        table.insert(
             "registrars".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("hooks-register".to_string()),
                 ..Default::default()
             },
         );
-        // For the CAP proofs below: a group MAPPED full — the module ceiling must cut it
-        // down — and a group mapped full that the allowlist doesn't authorize at all.
-        inner.group_map.insert(
+        // For the CAP proofs below: a role BOUND full - the module ceiling must cut it down.
+        table.insert(
             "admins-capped".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("full".to_string()),
                 ..Default::default()
             },
         );
-        inner.group_map.insert(
+        inner
+            .role_bindings
+            .insert("test-scope-module".to_string(), table);
+        // S4 trust boundary: `sneaky` is bound full ONLY under a DIFFERENT module - a role
+        // asserted by test-scope-module never rides another module's binding table.
+        let mut other = std::collections::BTreeMap::new();
+        other.insert(
             "sneaky".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("full".to_string()),
                 ..Default::default()
             },
         );
-        // §2.4 trust-boundary caps on the external module: it may only assert these groups
-        // (`sneaky` is deliberately NOT pre-authorized), and nothing through it can exceed
-        // hooks-register regardless of group_map.
-        inner.auth_modules.insert(
+        inner
+            .role_bindings
+            .insert("other-module".to_string(), other);
+        // §2.4 trust-boundary CEILING on the external module: nothing through it can exceed
+        // hooks-register regardless of what role_bindings grant.
+        inner.auth_scope_caps.insert(
             "test-scope-module".to_string(),
-            crate::config::AuthModuleCfg {
-                allowed_groups: Some(vec![
-                    "viewers".to_string(),
-                    "registrars".to_string(),
-                    "admins-capped".to_string(),
-                    "strangers".to_string(),
-                ]),
-                max_admin_scope: Some("hooks-register".to_string()),
-            },
+            "hooks-register".to_string(),
         );
     }
     let router = crate::build_router(app);
@@ -1264,8 +1260,8 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
         "group_map said full, the module ceiling says hooks-register — the ceiling wins"
     );
 
-    // allowed_groups INTERSECTION: `sneaky` is mapped full in group_map but the module is not
-    // authorized to assert it — the group is dropped BEFORE mapping, leaving zero grants.
+    // S4 NESTED-BY-MODULE: `sneaky` is bound full under `other-module` only - asserted through
+    // test-scope-module it earns nothing (a role never rides another module's binding table).
     let r = with(
         "grp:sneaky",
         client.get(format!("http://{addr}/api/v1/admin/info")),
@@ -1276,7 +1272,7 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     assert_eq!(
         r.status().as_u16(),
         403,
-        "a group outside allowed_groups never reaches group_map"
+        "a role bound under another module grants nothing through this one"
     );
 
     // The operator token is still full (admin-tokens is exempt from module ceilings).
@@ -1306,22 +1302,22 @@ async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
         inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
-        inner.group_map.insert(
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
             "registrars".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("hooks-register".to_string()),
                 ..Default::default()
             },
         );
+        inner
+            .role_bindings
+            .insert("test-scope-module".to_string(), table);
         // The module ceiling defaults to read-only; lift it so registrars actually resolves to
         // hooks-register (admin-tokens stays full — it is ceiling-exempt).
-        inner.auth_modules.insert(
-            "test-scope-module".to_string(),
-            crate::config::AuthModuleCfg {
-                allowed_groups: None,
-                max_admin_scope: Some("full".to_string()),
-            },
-        );
+        inner
+            .auth_scope_caps
+            .insert("test-scope-module".to_string(), "full".to_string());
     }
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1455,21 +1451,21 @@ async fn test_admin_v1_idempotency_key_is_principal_scoped() {
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
         inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
-        // A group mapped FULL so the second principal can also mint keys.
-        inner.group_map.insert(
+        // A role bound FULL so the second principal can also mint keys.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
             "admins".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("full".to_string()),
                 ..Default::default()
             },
         );
-        inner.auth_modules.insert(
-            "test-scope-module".to_string(),
-            crate::config::AuthModuleCfg {
-                allowed_groups: None,
-                max_admin_scope: Some("full".to_string()),
-            },
-        );
+        inner
+            .role_bindings
+            .insert("test-scope-module".to_string(), table);
+        inner
+            .auth_scope_caps
+            .insert("test-scope-module".to_string(), "full".to_string());
     }
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1520,13 +1516,17 @@ async fn test_admin_v1_credential_cache_and_flush_endpoint() {
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
         inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
-        inner.group_map.insert(
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
             "viewers".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("read-only".to_string()),
                 ..Default::default()
             },
         );
+        inner
+            .role_bindings
+            .insert("test-scope-module".to_string(), table);
     }
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1616,23 +1616,23 @@ async fn test_admin_v1_put_auth_dry_run_guard() {
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
-        // Chain starts as BOTH modules (so both credentials work); group_map + an explicit
+        // Chain starts as BOTH modules (so both credentials work); a role binding + an explicit
         // full ceiling make `grp:admins` a full principal through the external stand-in.
         inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
-        inner.group_map.insert(
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
             "admins".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 admin_scope: Some("full".to_string()),
                 ..Default::default()
             },
         );
-        inner.auth_modules.insert(
-            "test-scope-module".to_string(),
-            crate::config::AuthModuleCfg {
-                allowed_groups: None,
-                max_admin_scope: Some("full".to_string()),
-            },
-        );
+        inner
+            .role_bindings
+            .insert("test-scope-module".to_string(), table);
+        inner
+            .auth_scope_caps
+            .insert("test-scope-module".to_string(), "full".to_string());
     }
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2775,9 +2775,11 @@ async fn test_admin_v1_hook_register_persists_to_overlay() {
     assert!(doc.hooks.contains_key("persisted_gate"));
     assert!(doc.global_hooks.iter().any(|g| g == "persisted_gate"));
 
-    // "Restart": merge the overlay onto a fresh base config → the hook is restored.
-    let mut fresh: crate::config::DeployCfg =
+    // "Restart": merge the overlay onto a fresh RESOLVED base config → the hook is restored.
+    let fresh_deploy: crate::config::DeployCfg =
         serde_json::from_value(serde_json::json!({"providers": {}, "models": {}})).unwrap();
+    let mut fresh = crate::config::resolve(&fresh_deploy, &std::collections::HashMap::new())
+        .expect("minimal config resolves");
     crate::config::overlay::merge_into(&mut fresh, doc);
     assert!(
         fresh.hooks.contains_key("persisted_gate"),
@@ -3175,18 +3177,24 @@ async fn test_admin_v1_plugins_catalog_by_type() {
         }
     };
 
-    // auth: the compiled-in tokens module — present iff the auth-tokens feature is compiled in.
+    // auth: `keys` (engine-handled) is always listed; `admin-tokens` iff its feature is on.
     let auth: serde_json::Value = get("auth").await.json().await.unwrap();
     let a_items = auth["items"].as_array().unwrap();
-    let tokens = a_items.iter().find(|p| p["name"] == "tokens");
+    let keys = a_items
+        .iter()
+        .find(|p| p["name"] == "keys")
+        .expect("the built-in keys verifier is always listed");
+    assert_eq!(keys["loader"], "compiled-in");
+    assert_eq!(keys["type"], "auth");
+    let admin_tokens = a_items.iter().find(|p| p["name"] == "admin-tokens");
     assert_eq!(
-        tokens.is_some(),
-        cfg!(feature = "auth-tokens"),
-        "tokens listed iff compiled in"
+        admin_tokens.is_some(),
+        cfg!(feature = "auth-admin-tokens"),
+        "admin-tokens listed iff compiled in"
     );
-    if let Some(tokens) = tokens {
-        assert_eq!(tokens["loader"], "compiled-in");
-        assert_eq!(tokens["type"], "auth");
+    if let Some(admin_tokens) = admin_tokens {
+        assert_eq!(admin_tokens["loader"], "compiled-in");
+        assert_eq!(admin_tokens["type"], "auth");
     }
 
     // hooks: the weighted floor is ALWAYS compiled-in; ranking iff the feature is on; plus the
@@ -3283,7 +3291,7 @@ async fn test_admin_v1_config_validate_dry_run() {
     // → resolve fails with a dangling-provider error → 200 ok:false.
     let proposed = serde_json::json!({
         "config": {
-            "providers": { "openai": { "api_key_env": "OPENAI_KEY" } },
+            "providers": { "openai": { "api_key": { "env": "OPENAI_KEY" } } },
             "models": {}
         },
         "providers": {}
@@ -5426,17 +5434,19 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // An App whose cost model KNOWS the "growth" group; "ghost" stays unconfigured.
     let cost = {
-        #[allow(clippy::field_reassign_with_default)]
-        let mut gcfg = crate::config::GovernanceCfg::default();
-        gcfg.budget_groups = std::collections::BTreeMap::from([(
+        let groups = std::collections::BTreeMap::from([(
             "growth".to_string(),
-            crate::config::BudgetGroupCfg {
-                max_budget_cents: 1_000_000,
-                budget_period: "monthly".to_string(),
+            crate::config::GroupCfg {
                 parent: None,
+                enabled: true,
+                limits: vec![crate::config::groups::LimitCfg {
+                    metric: crate::config::groups::LimitMetric::Budget,
+                    amount: 1_000_000,
+                    per: Some(crate::config::groups::LimitWindow::Month),
+                }],
             },
         )]);
-        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default())
+        crate::cost::CostModel::resolve_parts(None, 0, &groups)
     };
     let app = TestApp::new().governance(gov).cost(cost).build();
     let router = crate::build_router(app);

@@ -153,14 +153,14 @@ listen: "127.0.0.1:$PORT"
 admin_listen: "127.0.0.1:$((PORT + 1))"
 observability:
   emit_server_timing: true
+# Training runs against a local mock with the open front door (empty chain): the static-token
+# module was removed in 1.5.0 and signed-key minting is pointless for a throwaway trainer.
 auth:
-  chain: [tokens]
+  chain: []
   upstream_credentials: own
-  client_tokens:
-    - "pgo-token"
 providers:
   mock:
-    api_key_env: PGO_MOCK_KEY
+    api_key: { env: PGO_MOCK_KEY }
 models:
   gpt-4o-mini:
     provider: mock
@@ -169,7 +169,7 @@ models:
 pools:
   bench-pool:
     members:
-      - target: gpt-4o-mini
+      - model: gpt-4o-mini
 YAML
 cat > "$WORK/providers.yaml" <<YAML
 mock:

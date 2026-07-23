@@ -1,59 +1,125 @@
-/// `admin_scope_for`: the operator principal is full; group-carrying principals resolve
-/// through group_map (most permissive wins, unmapped grants nothing); a groupless non-operator
-/// principal gets nothing; the open posture (no principal) is full.
+use super::*;
+use axum::http::header::CONTENT_TYPE;
+
+/// Helper: a `RoleBindingCfg` from optional pool list / group / admin scope.
+fn binding(
+    allowed_pools: Option<&[&str]>,
+    group: Option<&str>,
+    admin_scope: Option<&str>,
+) -> crate::config::RoleBindingCfg {
+    crate::config::RoleBindingCfg {
+        allowed_pools: allowed_pools.map(|ps| ps.iter().map(|p| p.to_string()).collect()),
+        group: group.map(str::to_string),
+        admin_scope: admin_scope.map(str::to_string),
+    }
+}
+
+/// Helper: a `RoleBindings` table with one module's role->binding entries.
+fn bindings_for(
+    module: &str,
+    roles: &[(&str, crate::config::RoleBindingCfg)],
+) -> crate::config::RoleBindings {
+    let mut table = std::collections::BTreeMap::new();
+    for (role, b) in roles {
+        table.insert(role.to_string(), b.clone());
+    }
+    let mut rb = crate::config::RoleBindings::new();
+    rb.insert(module.to_string(), table);
+    rb
+}
+
+/// Helper: an `AuthCfg` whose data-plane chain names the given modules (bare entries).
+fn chain_cfg(modules: &[&str]) -> crate::config::AuthCfg {
+    let mut cfg = crate::config::AuthCfg::default_none();
+    cfg.chain = modules
+        .iter()
+        .map(|m| crate::config::AuthChainEntry::bare(*m))
+        .collect();
+    cfg
+}
+
+/// Helper: a role-carrying principal (the shape the test-groups-module mints).
+fn grp_principal(id: &str, roles: &[&str]) -> Principal {
+    let mut p = Principal::from_id(id);
+    p.groups = roles.iter().map(|r| r.to_string()).collect();
+    p
+}
+
+/// `admin_scope_for`: the operator principal is full; role-carrying principals resolve
+/// through `role_bindings.<identifying module>` (most permissive bound scope wins, unbound
+/// roles grant nothing); a roleless non-operator principal gets nothing; the open posture
+/// (no principal) is full.
 #[test]
 fn admin_scope_resolution() {
     use crate::admin::v1::contract::Scope;
-    let mut gm = std::collections::HashMap::new();
-    gm.insert(
-        "viewers".to_string(),
-        crate::config::GroupMapEntry {
-            admin_scope: Some("read-only".to_string()),
-            ..Default::default()
-        },
+    let rb = bindings_for(
+        "test-groups-module",
+        &[
+            ("viewers", binding(None, None, Some("read-only"))),
+            ("admins", binding(None, None, Some("full"))),
+            ("no-admin", binding(None, None, None)),
+        ],
     );
-    gm.insert(
-        "admins".to_string(),
-        crate::config::GroupMapEntry {
-            admin_scope: Some("full".to_string()),
-            ..Default::default()
-        },
-    );
-    gm.insert(
-        "no-admin".to_string(),
-        crate::config::GroupMapEntry {
-            admin_scope: None,
-            ..Default::default()
-        },
-    );
+    let module = Some("test-groups-module");
 
-    // Open posture: full.
-    assert_eq!(admin_scope_for(None, &gm), Some(Scope::Full));
-    // The operator principal (admin-tokens): full.
+    // Open posture (no principal): full.
+    assert_eq!(admin_scope_for(None, None, &rb), Some(Scope::Full));
+    // The operator principal (admin-tokens): full by definition, no binding required.
     #[cfg(feature = "auth-admin-tokens")]
     assert_eq!(
-        admin_scope_for(Some(&Principal::from_id("admin")), &gm),
+        admin_scope_for(
+            Some(crate::config::ADMIN_TOKENS_MODULE),
+            Some(&Principal::from_id(
+                busbar_auth_admin_tokens::ADMIN_TOKENS_PRINCIPAL_ID
+            )),
+            &rb
+        ),
         Some(Scope::Full)
     );
-    // Group-mapped: most permissive of the mapped groups wins.
-    let mut p = Principal::from_id("ad:alice");
-    p.groups = vec!["viewers".to_string(), "admins".to_string()];
-    assert_eq!(admin_scope_for(Some(&p), &gm), Some(Scope::Full));
-    p.groups = vec!["viewers".to_string()];
-    assert_eq!(admin_scope_for(Some(&p), &gm), Some(Scope::ReadOnly));
-    // Unmapped groups grant nothing (fail closed).
-    p.groups = vec!["strangers".to_string()];
-    assert_eq!(admin_scope_for(Some(&p), &gm), None);
-    // A group mapped WITHOUT admin_scope grants nothing.
-    p.groups = vec!["no-admin".to_string()];
-    assert_eq!(admin_scope_for(Some(&p), &gm), None);
-    // A groupless NON-operator principal gets nothing (an external module cannot mint the
+    // Role-bound: the most permissive of the principal's bound roles wins.
+    let p = grp_principal("test:alice", &["viewers", "admins"]);
+    assert_eq!(admin_scope_for(module, Some(&p), &rb), Some(Scope::Full));
+    let p = grp_principal("test:alice", &["viewers"]);
+    assert_eq!(
+        admin_scope_for(module, Some(&p), &rb),
+        Some(Scope::ReadOnly)
+    );
+    // Unbound roles grant nothing (fail closed).
+    let p = grp_principal("test:alice", &["strangers"]);
+    assert_eq!(admin_scope_for(module, Some(&p), &rb), None);
+    // A role bound WITHOUT an admin_scope grants nothing.
+    let p = grp_principal("test:alice", &["no-admin"]);
+    assert_eq!(admin_scope_for(module, Some(&p), &rb), None);
+    // A roleless NON-operator principal gets nothing (an external module cannot mint the
     // operator identity by returning a bare id).
-    let stranger = Principal::from_id("ad:bob");
-    assert_eq!(admin_scope_for(Some(&stranger), &gm), None);
+    let stranger = Principal::from_id("test:bob");
+    assert_eq!(admin_scope_for(module, Some(&stranger), &rb), None);
 }
-use super::*;
-use axum::http::header::CONTENT_TYPE;
+
+/// S4 module scoping: bindings are NESTED BY MODULE, so a role asserted by module A must NOT
+/// ride module B's binding. A binding that lives only under "other-module" grants nothing to a
+/// principal identified by the test-groups-module.
+#[test]
+fn admin_scope_bindings_are_module_scoped() {
+    use crate::admin::v1::contract::Scope;
+    let rb = bindings_for(
+        "other-module",
+        &[("admins", binding(None, None, Some("full")))],
+    );
+    let p = grp_principal("test:alice", &["admins"]);
+    assert_eq!(
+        admin_scope_for(Some("test-groups-module"), Some(&p), &rb),
+        None,
+        "a role asserted by module A must not ride module B's binding"
+    );
+    // Control: the SAME principal identified by the binding's own module resolves.
+    assert_eq!(
+        admin_scope_for(Some("other-module"), Some(&p), &rb),
+        Some(Scope::Full)
+    );
+    // A module with no binding table at all grants nothing.
+    assert_eq!(admin_scope_for(Some("unbound-module"), Some(&p), &rb), None);
+}
 
 /// Assert a string is canonical UUID-v4 shaped: five dash-separated lowercase-hex groups of
 /// lengths 8-4-4-4-12, with the version nibble == '4' and the variant nibble in {8,9,a,b}.
@@ -141,142 +207,93 @@ fn test_extract_bearer_token_malformed_no_panic() {
     assert_eq!(AuthMiddleware::extract_bearer_token("Basic abc"), None);
 }
 
-#[cfg(feature = "auth-tokens")]
+/// A configured chain module that recognizes the credential IDENTIFIES: the verdict carries BOTH
+/// the identifying module name and the principal (the struct variant), because role_bindings are
+/// nested by module and policy resolution needs both halves.
 #[test]
-fn test_auth_mode_token_valid() {
-    let cfg = AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["tok1".to_string(), "tok2".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
-    let mw = AuthMiddleware::new(&cfg);
+fn test_chain_identifies_with_module_and_principal() {
+    let mw = AuthMiddleware::new(&chain_cfg(&["test-groups-module"]));
+    match mw.run_chain(Some("grp:dev")) {
+        ChainVerdict::Identified { module, principal } => {
+            assert_eq!(module, "test-groups-module");
+            assert_eq!(principal.id, "test:dev");
+            assert_eq!(principal.groups, vec!["dev".to_string()]);
+        }
+        other => panic!("expected Identified, got {other:?}"),
+    }
+    assert!(mw.validate_token(Some("grp:dev")));
+    assert!(!mw.is_open());
+}
 
-    assert!(mw.validate_token(Some("tok1")));
-    assert!(mw.validate_token(Some("tok2")));
+/// FAIL CLOSED: a NON-EMPTY chain where every module passes (no module recognized the presented
+/// credential, or none was presented) DENIES. This is the successor of the old static-allowlist
+/// "wrong token rejected" coverage.
+#[test]
+fn test_nonempty_chain_fails_closed_on_all_pass() {
+    let mw = AuthMiddleware::new(&chain_cfg(&["test-groups-module"]));
+    assert_eq!(
+        mw.run_chain(Some("not-a-recognized-credential")),
+        ChainVerdict::Denied,
+        "an unrecognized credential must be denied by a configured chain"
+    );
+    assert_eq!(
+        mw.run_chain(None),
+        ChainVerdict::Denied,
+        "no credential at all must be denied by a configured chain"
+    );
     assert!(!mw.validate_token(Some("tok3")));
     assert!(!mw.validate_token(None));
     assert!(!mw.validate_token(Some(""))); // empty token never matches
 }
 
-#[cfg(feature = "auth-tokens")]
+/// The EMPTY chain is the open front door (the old `none`/`passthrough` modes): every request is
+/// admitted anonymously (`ChainVerdict::Open`), with or without a credential.
 #[test]
-fn test_validate_token_matches_any_allowlist_position() {
-    // Regression for the list-level timing oracle: validation must compare against EVERY
-    // configured token (bitwise-OR fold, no `.any()` short-circuit). Behaviorally this means a
-    // match is found regardless of the token's ordinal position — first, middle, or last.
-    let cfg = AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![
-            "first-token".to_string(),
-            "middle-token".to_string(),
-            "last-token".to_string(),
-        ],
-        modules: std::collections::HashMap::new(),
-    };
-    let mw = AuthMiddleware::new(&cfg);
-    assert!(mw.validate_token(Some("first-token")), "match at index 0");
-    assert!(mw.validate_token(Some("middle-token")), "match at index 1");
-    assert!(mw.validate_token(Some("last-token")), "match at last index");
-    assert!(!mw.validate_token(Some("absent-token")), "no match");
-}
-
-#[cfg(feature = "auth-tokens")]
-#[test]
-fn test_validate_token_length_independent_compare() {
-    // Regression for the client-token timing-LENGTH leak: the configured token's length must not
-    // be observable via `constant_time_eq`'s early length-mismatch return. Both sides are now
-    // SHA-256-hashed to a fixed 64-hex-char digest before the constant-time compare, so a
-    // wrong-length candidate runs the same work as a right-length one AND still fails.
-    let cfg = AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["the-real-token".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
-    let mw = AuthMiddleware::new(&cfg);
-
-    // Correctness preserved: the valid token still authenticates.
-    assert!(
-        mw.validate_token(Some("the-real-token")),
-        "valid token must authenticate"
-    );
-
-    // Wrong tokens are rejected regardless of length — shorter, longer, and equal-length.
-    assert!(
-        !mw.validate_token(Some("x")),
-        "much shorter wrong token rejected"
-    );
-    assert!(
-        !mw.validate_token(Some("a-very-much-longer-wrong-token-value")),
-        "much longer wrong token rejected"
-    );
-    assert!(
-        !mw.validate_token(Some("the-real-tokeX")),
-        "equal-length wrong token rejected"
-    );
-
-    // Structural guarantee: both the candidate and the stored token are hashed to equal length
-    // (32 bytes / 64 hex chars) before the compare, so the compare's runtime no longer depends
-    // on the relationship between the candidate length and the stored-token length.
-    let stored_hash = crate::sigv4::sha256_hex(mw.client_tokens[0].as_bytes());
-    let cand_short = crate::sigv4::sha256_hex(b"x");
-    let cand_long = crate::sigv4::sha256_hex(b"a-very-much-longer-wrong-token-value");
-    assert_eq!(stored_hash.len(), 64);
-    assert_eq!(cand_short.len(), 64);
-    assert_eq!(cand_long.len(), 64);
-}
-
-#[test]
-fn test_auth_mode_passthrough() {
-    let cfg = AuthCfg {
-        chain: vec![],
-        upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
-        client_tokens: vec![],
-        modules: std::collections::HashMap::new(),
-    };
-    let mw = AuthMiddleware::new(&cfg);
-
-    // Passthrough allows all (auth is upstream's responsibility)
+fn test_empty_chain_is_open_front_door() {
+    let mw = AuthMiddleware::new(&crate::config::AuthCfg::default_none());
+    assert!(mw.is_open());
+    assert_eq!(mw.run_chain(None), ChainVerdict::Open);
+    assert_eq!(mw.run_chain(Some("anything")), ChainVerdict::Open);
     assert!(mw.validate_token(None));
     assert!(mw.validate_token(Some("anything")));
 }
 
+/// `upstream_credentials` selects WHOSE credential goes upstream; it does not gate the front
+/// door. With an empty chain both modes admit everything (the old none/passthrough split is now
+/// chain-shape for the front door + this knob for egress).
 #[test]
-fn test_auth_mode_none() {
-    let cfg = AuthCfg {
-        chain: vec![],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![],
-        modules: std::collections::HashMap::new(),
-    };
-    let mw = AuthMiddleware::new(&cfg);
-
-    // None allows all (open relay)
-    assert!(mw.validate_token(None));
-    assert!(mw.validate_token(Some("anything")));
+fn test_open_door_regardless_of_upstream_creds() {
+    for uc in [UpstreamCreds::Own, UpstreamCreds::Passthrough] {
+        let mut cfg = crate::config::AuthCfg::default_none();
+        cfg.upstream_credentials = uc;
+        let mw = AuthMiddleware::new(&cfg);
+        assert_eq!(mw.upstream_creds, uc);
+        assert!(mw.validate_token(None));
+        assert!(mw.validate_token(Some("anything")));
+    }
 }
 
+/// `chain: [keys]` sets the `keys_in_chain` flag rather than installing a boxed module: virtual
+/// keys authenticate on the governance path (P1), so the entry records operator intent for
+/// validation/reporting and the boxed chain stays empty.
 #[test]
-fn test_auth_mode_none_with_client_tokens_is_inert_open_relay() {
-    // Regression (MEDIUM/correctness): `mode: none` together with a non-empty client_tokens list
-    // is an open relay — the listed tokens have ZERO enforcement effect. The constructor must not
-    // panic, must preserve the configured tokens, and `validate_token` must still admit EVERY
-    // request (including a token NOT in the list, and no token at all), proving the allowlist is
-    // inert. (A startup warning is emitted but is not asserted here — behaviour is the contract.)
-    let cfg = AuthCfg {
-        chain: vec![],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["listed-but-ignored".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
-    let mw = AuthMiddleware::new(&cfg);
-    assert_eq!(mw.client_tokens, vec!["listed-but-ignored".to_string()]);
-    // Open relay: a token NOT on the list is admitted (the list does not constrain access).
-    assert!(mw.validate_token(Some("some-other-token")));
-    // And so is no token at all.
-    assert!(mw.validate_token(None));
+fn test_keys_in_chain_sets_flag_not_module() {
+    let mw = AuthMiddleware::new(&chain_cfg(&["keys"]));
+    assert!(mw.keys_in_chain, "chain: [keys] must set keys_in_chain");
+    assert!(
+        mw.chain_names().is_empty(),
+        "keys is engine-handled, never a boxed module"
+    );
+
+    let mw = AuthMiddleware::new(&crate::config::AuthCfg::default_none());
+    assert!(!mw.keys_in_chain, "an empty chain must not claim keys");
+
+    // keys + an external module: the flag is set AND the boxed module still identifies.
+    let mw = AuthMiddleware::new(&chain_cfg(&["keys", "test-groups-module"]));
+    assert!(mw.keys_in_chain);
+    assert_eq!(mw.chain_names(), vec!["test-groups-module"]);
+    assert!(mw.validate_token(Some("grp:dev")));
+    assert!(!mw.validate_token(Some("wrong")), "still fail-closed");
 }
 
 #[test]
@@ -296,24 +313,148 @@ fn test_upstream_credentials_deserialize() {
     );
 }
 
+// ===================== SYNTHESIZED PRINCIPAL KEY (governance re-key) =====================
+
+/// Helper: the granting table for one module, handed to `synthesize_principal_key` the way the
+/// middleware does (`app.role_bindings.get(identifying_module)`).
+fn role_table(
+    roles: &[(&str, crate::config::RoleBindingCfg)],
+) -> std::collections::BTreeMap<String, crate::config::RoleBindingCfg> {
+    roles
+        .iter()
+        .map(|(r, b)| (r.to_string(), b.clone()))
+        .collect()
+}
+
+/// OMITTED `allowed_pools` on a granting binding = ALL pools. The `VirtualKey` runtime encoding
+/// keeps "empty vec = all pools", so the synthesized key carries an EMPTY `allowed_pools`. The key
+/// is pure auth: no inline rpm/tpm/budget caps (limits live on groups only).
 #[test]
-fn test_client_tokens_not_double_interpolated() {
-    // A client token that legitimately contains the literal `${...}` (legal in opaque API keys)
-    // must be passed through verbatim — the whole config file is already env-interpolated once
-    // at load, so AuthMiddleware::new must NOT interpolate again (which would re-expand or panic
-    // on an unset var). Regression for the dropped second interpolation pass.
-    let raw = "sk-${NOT_A_REAL_ENV_VAR}-suffix";
-    let cfg = AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![raw.to_string()],
-        modules: std::collections::HashMap::new(),
-    };
-    // Must not panic even though NOT_A_REAL_ENV_VAR is unset.
-    let mw = AuthMiddleware::new(&cfg);
-    assert_eq!(mw.client_tokens, vec![raw.to_string()]);
-    // And the verbatim token authenticates (it was not mangled by a second expansion pass).
-    assert!(mw.validate_token(Some(raw)));
+fn test_synth_key_omitted_pools_grants_all_pools() {
+    let table = role_table(&[("dev", binding(None, None, None))]);
+    let p = grp_principal("test:dev", &["dev"]);
+    let key = crate::governance::synthesize_principal_key(&p, Some(&table))
+        .expect("a bound role must synthesize a key");
+    assert_eq!(
+        key.allowed_pools,
+        Vec::<String>::new(),
+        "omitted allowed_pools = ALL pools = empty vec on the key"
+    );
+    assert!(key.enabled);
+    assert_eq!(key.id, "test:dev");
+    assert!(key.rpm_limit.is_none() && key.tpm_limit.is_none());
+    assert!(key.max_budget_cents.is_none());
+    assert!(key.budget_group.is_none());
+}
+
+/// REGRESSION for the C6 flip: an explicit `allowed_pools: []` is the EMPTY SET (no pools), no
+/// longer an "all pools" alias. When EVERY granting binding says `[]`, the union is empty and NO
+/// key is synthesized at all (fail closed - no data-plane access).
+#[test]
+fn test_synth_key_explicit_empty_pools_fails_closed_c6_flip() {
+    let table = role_table(&[("dev", binding(Some(&[]), None, None))]);
+    let p = grp_principal("test:dev", &["dev"]);
+    assert!(
+        crate::governance::synthesize_principal_key(&p, Some(&table)).is_none(),
+        "allowed_pools: [] must be the empty set (no access), not all pools"
+    );
+
+    // Two granting bindings, both explicit []: still the empty union, still no key.
+    let table = role_table(&[
+        ("dev", binding(Some(&[]), None, None)),
+        ("ops", binding(Some(&[]), None, None)),
+    ]);
+    let p = grp_principal("test:dev", &["dev", "ops"]);
+    assert!(
+        crate::governance::synthesize_principal_key(&p, Some(&table)).is_none(),
+        "an all-bindings-[] union must fail closed"
+    );
+
+    // But an explicit [] beside an omitted-pools binding does NOT poison the grant: omitted
+    // means ALL pools, which dominates the union.
+    let table = role_table(&[
+        ("dev", binding(Some(&[]), None, None)),
+        ("ops", binding(None, None, None)),
+    ]);
+    let p = grp_principal("test:dev", &["dev", "ops"]);
+    let key = crate::governance::synthesize_principal_key(&p, Some(&table))
+        .expect("an omitted-pools binding grants all pools");
+    assert_eq!(key.allowed_pools, Vec::<String>::new());
+}
+
+/// Explicit pool lists union across granting bindings (deduplicated); an omitted-pools binding
+/// anywhere in the grant set widens the union to ALL pools.
+#[test]
+fn test_synth_key_pool_union_and_all_pools_dominates() {
+    let table = role_table(&[
+        ("a", binding(Some(&["p1"]), None, None)),
+        ("b", binding(Some(&["p2", "p1"]), None, None)),
+    ]);
+    let p = grp_principal("test:u", &["a", "b"]);
+    let key = crate::governance::synthesize_principal_key(&p, Some(&table))
+        .expect("bound roles must synthesize a key");
+    assert_eq!(key.allowed_pools, vec!["p1".to_string(), "p2".to_string()]);
+
+    let table = role_table(&[
+        ("a", binding(Some(&["p1"]), None, None)),
+        ("c", binding(None, None, None)),
+    ]);
+    let p = grp_principal("test:u", &["a", "c"]);
+    let key = crate::governance::synthesize_principal_key(&p, Some(&table))
+        .expect("bound roles must synthesize a key");
+    assert_eq!(
+        key.allowed_pools,
+        Vec::<String>::new(),
+        "one omitted-pools binding widens the union to ALL pools"
+    );
+}
+
+/// Unbound roles grant nothing, and no binding table at all grants nothing (fail closed).
+#[test]
+fn test_synth_key_unbound_roles_grant_nothing() {
+    let p = grp_principal("test:u", &["strangers"]);
+    // The identifying module has a table, but none of the principal's roles are bound in it.
+    let table = role_table(&[("dev", binding(None, None, None))]);
+    assert!(crate::governance::synthesize_principal_key(&p, Some(&table)).is_none());
+    // The identifying module has NO binding table (module-scoped fail-closed: bindings that live
+    // under another module's table are simply not passed in for this module).
+    assert!(crate::governance::synthesize_principal_key(&p, None).is_none());
+}
+
+/// A bound `group:` lands in the synthesized key's `budget_group` (the group chain is where
+/// limits are enforced). The first granting role in the principal's role order wins.
+#[test]
+fn test_synth_key_bound_group_lands_in_budget_group() {
+    let table = role_table(&[("dev", binding(None, Some("eng"), None))]);
+    let p = grp_principal("test:dev", &["dev"]);
+    let key = crate::governance::synthesize_principal_key(&p, Some(&table))
+        .expect("a bound role must synthesize a key");
+    assert_eq!(key.budget_group.as_deref(), Some("eng"));
+
+    // Two granting roles with groups: the first in role order carries.
+    let table = role_table(&[
+        ("dev", binding(None, Some("eng"), None)),
+        ("ops", binding(None, Some("platform"), None)),
+    ]);
+    let p = grp_principal("test:dev", &["dev", "ops"]);
+    let key = crate::governance::synthesize_principal_key(&p, Some(&table))
+        .expect("bound roles must synthesize a key");
+    assert_eq!(key.budget_group.as_deref(), Some("eng"));
+}
+
+/// Reserved bucket namespaces: a principal id shaped like a group bucket (`group:...`) or a real
+/// virtual key id (`vk_...`) would alias another ledger cell, so no key is synthesized (fail
+/// closed) even when a binding grants.
+#[test]
+fn test_synth_key_reserved_id_prefixes_refused() {
+    let table = role_table(&[("dev", binding(None, None, None))]);
+    for id in ["group:evil", "vk_0123456789abcdef"] {
+        let p = grp_principal(id, &["dev"]);
+        assert!(
+            crate::governance::synthesize_principal_key(&p, Some(&table)).is_none(),
+            "reserved principal id '{id}' must not synthesize a key"
+        );
+    }
 }
 
 /// Helper: build a request with a single header set, for `extract_client_token` unit tests.
@@ -775,20 +916,20 @@ fn test_every_router_ingress_path_maps_to_non_fallback_proto() {
     }
 }
 
-/// End-to-end through the real router + `auth_middleware` in TOKEN mode: the busbar client
-/// token authenticates via `x-goog-api-key` (Gemini SDK), via `x-api-key` (Anthropic SDK), and
-/// via `Authorization: Bearer`. A missing/wrong token is rejected 401 with the native error
-/// envelope shaped for the inferred ingress protocol (`application/json`, not `text/plain`).
-#[cfg(feature = "auth-tokens")]
+/// End-to-end through the real router + `auth_middleware` with a CONFIGURED chain: the busbar
+/// client credential authenticates via `x-goog-api-key` (Gemini SDK), via `x-api-key` (Anthropic
+/// SDK), and via `Authorization: Bearer`. A missing/wrong credential is rejected 401 with the
+/// native error envelope shaped for the inferred ingress protocol (`application/json`, not
+/// `text/plain`). The chain is the test-groups-module (`grp:<role>` identifies).
 #[tokio::test]
-async fn test_token_mode_accepts_all_carriers_and_native_401() {
+async fn test_chain_accepts_all_carriers_and_native_401() {
     use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
     use serde_json::json;
     use std::sync::Arc;
 
     crate::metrics::init();
 
-    let token = "busbar-client-token";
+    let token = "grp:carrier";
 
     let state = Arc::new(MockServerState::new());
     // Three admitted requests reach the upstream; queue three OK bodies.
@@ -808,12 +949,7 @@ async fn test_token_mode_accepts_all_carriers_and_native_401() {
     }
     let server = MockServer::new(state).await;
 
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![token.to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
     let app = TestApp::new()
         .lane(
             LaneSpec::new(
@@ -930,7 +1066,6 @@ async fn test_token_mode_accepts_all_carriers_and_native_401() {
 /// RESPECTIVE protocol's native error envelope — not an Anthropic/OpenAI-shaped body. The
 /// existing multi-carrier test only covers the Anthropic path, leaving these two protocol
 /// envelopes untested on the auth boundary (an indistinguishability failure if regressed).
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn test_cohere_and_responses_ingress_token_mode_native_401() {
     use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -943,12 +1078,7 @@ async fn test_cohere_and_responses_ingress_token_mode_native_401() {
     let state = Arc::new(MockServerState::new());
     let server = MockServer::new(state).await;
 
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["the-real-token".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
     let app = TestApp::new()
         .lane(
             LaneSpec::new(
@@ -1035,7 +1165,6 @@ async fn test_cohere_and_responses_ingress_token_mode_native_401() {
 /// status + typing headers were exercised only by a direct `unauthorized_response` call that
 /// bypasses the middleware → router stack, so a regression dropping the 403/headers in the full
 /// pipeline would be uncaught.
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn test_bedrock_ingress_wrong_token_is_403_native_envelope() {
     use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -1048,12 +1177,7 @@ async fn test_bedrock_ingress_wrong_token_is_403_native_envelope() {
     let state = Arc::new(MockServerState::new());
     let server = MockServer::new(state).await;
 
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["the-real-token".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
     let app = TestApp::new()
         .lane(
             LaneSpec::new(
@@ -1125,7 +1249,6 @@ async fn test_bedrock_ingress_wrong_token_is_403_native_envelope() {
 /// "INVALID_ARGUMENT"` (a real Generative Language API bad key is 400 INVALID_ARGUMENT, NOT
 /// 401/UNAUTHENTICATED). The stable-v1 path was previously mis-shaped as an OpenAI 401 because
 /// `proto_for_path` had no `/v1/models/` arm — this exercises both prefixes through the full stack.
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn test_gemini_ingress_wrong_token_is_native_bad_key_envelope() {
     use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -1137,12 +1260,7 @@ async fn test_gemini_ingress_wrong_token_is_native_bad_key_envelope() {
     let state = Arc::new(MockServerState::new());
     let server = MockServer::new(state).await;
 
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["the-real-token".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
     let app = TestApp::new()
         .lane(
             LaneSpec::new(
@@ -1209,7 +1327,6 @@ async fn test_gemini_ingress_wrong_token_is_native_bad_key_envelope() {
 /// auth branch with the inferred-protocol native 401 envelope — never routed down the admin
 /// branch (which would early-return without the `CallerToken` extension and 500 in a non-admin
 /// handler). `/apix/v1/messages` infers the anthropic protocol via the `/v1/messages` suffix.
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn test_admin_prefix_is_boundary_safe() {
     use crate::test_support::{LaneSpec, MockServer, MockServerState, TestApp};
@@ -1221,12 +1338,7 @@ async fn test_admin_prefix_is_boundary_safe() {
     let state = Arc::new(MockServerState::new());
     let server = MockServer::new(state).await;
 
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["the-real-token".to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
     let app = TestApp::new()
         .lane(
             LaneSpec::new(
@@ -1506,13 +1618,12 @@ async fn test_none_mode_with_governance_still_requires_virtual_key() {
     server.shutdown().await;
 }
 
-/// Regression (LOW/test-coverage): `auth.mode=passthrough` + governance enabled is a documented
-/// UNSUPPORTED deployment. Passthrough's contract is "accept any caller credential and forward it
-/// upstream", but governance supersedes it: every request must resolve to a valid ENABLED virtual
-/// key. The middleware emits a one-shot operator warning (`WARN_ONCE` at the top of the governance
-/// branch) and then enforces the governance lookup. Following the project precedent
-/// (`test_auth_mode_none_with_client_tokens_is_inert_open_relay` and
-/// `test_none_mode_with_governance_still_requires_virtual_key`), the warn line itself is NOT
+/// Regression (LOW/test-coverage): `upstream_credentials: passthrough` + governance enabled is a
+/// documented UNSUPPORTED deployment. Passthrough's contract is "accept any caller credential and
+/// forward it upstream", but governance supersedes it: every request must resolve to a valid
+/// ENABLED virtual key. The middleware emits a one-shot operator warning (`WARN_ONCE` at the top
+/// of the governance branch) and then enforces the governance lookup. Following the project
+/// precedent (`test_none_mode_with_governance_still_requires_virtual_key`), the warn line itself is NOT
 /// asserted — it is a one-shot, process-global side effect emitted on a worker thread, so its
 /// documented BEHAVIOURAL consequence is the contract: passthrough's accept-and-forward semantics
 /// are NOT honoured. This pins it end-to-end through the real router so a future refactor can't
@@ -1629,180 +1740,6 @@ async fn test_passthrough_mode_with_governance_still_requires_virtual_key() {
 
     handle.abort();
     server.shutdown().await;
-}
-
-/// A `tracing::Layer` that records the messages of WARN-level events it sees, so a test can
-/// assert a particular `tracing::warn!` fired. Mirrors the helper used in eventstream/config
-/// tests; kept local to the auth test module. Only the `auth-tokens`-gated test below uses it.
-#[cfg(feature = "auth-tokens")]
-#[derive(Clone, Default)]
-struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-#[cfg(feature = "auth-tokens")]
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        if *event.metadata().level() != tracing::Level::WARN {
-            return;
-        }
-        struct Vis(String);
-        impl tracing::field::Visit for Vis {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-        }
-        let mut vis = Vis(String::new());
-        event.record(&mut vis);
-        if let Ok(mut msgs) = self.0.lock() {
-            msgs.push(vis.0);
-        }
-    }
-}
-
-/// Regression (LOW #13, completeness): `auth.mode=token` WITH a non-empty static `client_tokens`
-/// allowlist AND governance enabled is a silently inert configuration — governance supersedes the
-/// static allowlist, so the configured tokens have ZERO enforcement effect. The OLD code emitted
-/// NO diagnostic for this pairing (only the passthrough/none overrides warned), so an operator who
-/// believed the static list still gated access had no signal that it was dead. The fix adds a
-/// parallel one-shot `WARN_ONCE` inside the governance branch, gated on
-/// `auth_mode()==Token && !client_tokens.is_empty()`.
-///
-/// This pins the WARNING itself (not just behaviour): the inert-allowlist behaviour is unchanged
-/// by the fix, so a behaviour-only assertion would pass against the old code too. We drive the
-/// real router + `auth_middleware` on a CURRENT-THREAD runtime so the synchronous `tracing::warn!`
-/// fires on the same thread as the thread-local subscriber (`with_default`) and is captured — the
-/// multi-thread end-to-end siblings (none/passthrough) deliberately could NOT assert their warn
-/// line for exactly this thread-affinity reason. Against the old code the message assertion FAILS
-/// (no such warning); it passes once the diagnostic is emitted. The static `WARN_ONCE` is
-/// process-global, but this is the ONLY test that exercises the token+governance+non-empty pairing,
-/// so it observes the first (and only) firing.
-#[cfg(feature = "auth-tokens")]
-#[test]
-fn test_token_mode_with_governance_and_client_tokens_warns_inert_allowlist() {
-    use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
-    use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
-    use serde_json::json;
-    use std::sync::Arc;
-    use tracing_subscriber::layer::SubscriberExt as _;
-
-    crate::metrics::init();
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime must build");
-
-    let cap = WarnCapture::default();
-    let subscriber = tracing_subscriber::registry().with(cap.clone());
-
-    let admitted = tracing::subscriber::with_default(subscriber, || {
-        rt.block_on(async {
-                let state = Arc::new(MockServerState::new());
-                state.push(MockResponse::Ok {
-                    status: axum::http::StatusCode::OK,
-                    body: json!({
-                        "id": "msg_1",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "test-model",
-                        "content": [{"type": "text", "text": "hi"}],
-                        "stop_reason": "end_turn",
-                        "usage": {"input_tokens": 1, "output_tokens": 1}
-                    }),
-                });
-                let server = MockServer::new(state).await;
-
-                // The virtual key the request actually authenticates with under governance.
-                let vk_secret = "sk-vk-token-gov";
-                let store = Arc::new(MemoryStore::new());
-                store
-                    .put_key(&VirtualKey {
-                        id: "k".to_string(),
-                        key_hash: crate::sigv4::sha256_hex(vk_secret.as_bytes()),
-                        name: "k".to_string(),
-                        allowed_pools: vec!["pa".to_string()],
-                        max_budget_cents: None,
-                        budget_period: "total".to_string(),
-                        rpm_limit: None,
-                        tpm_limit: None,
-                        enabled: true,
-                        created_at: 0,
-                        budget_group: None,
-                        labels: Default::default(),
-                    })
-                    .unwrap();
-                // Admin token → governance is ACTIVE, so the inert-allowlist branch (and its
-                // one-shot warning) is reached. An inert engine (no admin token) would fall through
-                // to the static chain and never emit the warning.
-                let gov =
-                    Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
-
-                // auth.mode=token WITH a non-empty static allowlist — the inert combination. The
-                // listed static token is NOT the governance virtual key.
-                let auth_cfg = crate::config::AuthCfg {
-                    chain: vec!["tokens".to_string()], upstream_credentials: crate::auth::UpstreamCreds::Own,
-                    client_tokens: vec!["static-allowlisted-but-inert".to_string()],
-                    modules: std::collections::HashMap::new(),
-                };
-
-                let app = TestApp::new()
-                    .lane(
-                        LaneSpec::new(
-                            "test-model",
-                            crate::proto::Protocol::anthropic(),
-                            &server.base_url(),
-                        )
-                        .api_key("busbar-upstream-key"),
-                    )
-                    .pool("pa", &[(0, 1)])
-                    .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
-                    .governance(gov)
-                    .build();
-
-                let router = crate::build_router(app);
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let addr = listener.local_addr().unwrap();
-                // Spawn on the SAME current-thread runtime so the server-side middleware (and its
-                // synchronous warn!) runs on this thread, under the installed subscriber.
-                tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-
-                let client = reqwest::Client::new();
-                let url = format!("http://{addr}/pa/v1/messages");
-                let body = json!({"model": "pa", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 16})
-                    .to_string();
-
-                // Authenticate with the VIRTUAL KEY (governance is what is honoured), exercising the
-                // governance branch where the new warning lives.
-                let resp = client
-                    .post(&url)
-                    .bearer_auth(vk_secret)
-                    .body(body)
-                    .send()
-                    .await
-                    .unwrap();
-                resp.status().as_u16()
-            })
-    });
-
-    assert_eq!(
-        admitted, 200,
-        "the valid enabled virtual key must pass governance auth (got {admitted})"
-    );
-
-    let msgs = cap.0.lock().expect("warn capture mutex");
-    assert!(
-        msgs.iter().any(|m| {
-            let lc = m.to_ascii_lowercase();
-            lc.contains("auth.chain") && lc.contains("governance") && lc.contains("client_tokens")
-        }),
-        "token+governance with a non-empty client_tokens allowlist must WARN that governance \
-             supersedes the static allowlist; captured warnings: {msgs:?}"
-    );
 }
 
 #[test]
@@ -2295,37 +2232,31 @@ async fn test_governance_rejects_empty_token_even_if_empty_secret_key_exists() {
 
 #[test]
 fn test_auth_middleware_debug_redacts_tokens() {
-    // Regression (SECURITY LOW #22): `AuthMiddleware` previously DERIVED `Debug`, which prints
-    // every `client_tokens` entry in PLAINTEXT — a latent credential leak if it (or `App`) is
-    // ever debug-logged. The manual `Debug` must redact the values, exposing only the count.
-    let secret_a = "sk-super-secret-token-AAAA";
-    let secret_b = "sk-super-secret-token-BBBB";
-    let cfg = AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![secret_a.to_string(), secret_b.to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    // Regression (SECURITY LOW #22): `AuthMiddleware`'s manual `Debug` must expose only shape
+    // (chain length, keys flag, upstream mode), never any credential material. There are no
+    // static client tokens anymore; the invariant is that ONLY the whitelisted shape fields
+    // appear, so a future field holding a secret cannot leak through a derived Debug.
+    let cfg = chain_cfg(&["keys", "test-groups-module"]);
     let mw = AuthMiddleware::new(&cfg);
     let dbg = format!("{mw:?}");
-    // No token value (nor any non-trivial prefix of one) may appear in the Debug output.
-    assert!(
-        !dbg.contains(secret_a) && !dbg.contains(secret_b),
-        "AuthMiddleware Debug leaked a token value: {dbg}"
-    );
-    assert!(
-        !dbg.contains("sk-super-secret"),
-        "AuthMiddleware Debug leaked a token prefix: {dbg}"
-    );
-    // The count (and the chain length / upstream mode) are non-secret and SHOULD be reported.
-    assert!(
-        dbg.contains('2'),
-        "AuthMiddleware Debug should report the token count: {dbg}"
-    );
     assert!(
         dbg.contains("chain_len") && dbg.contains("Own"),
         "AuthMiddleware Debug should report the chain length + upstream mode: {dbg}"
     );
+    assert!(
+        dbg.contains("keys_in_chain"),
+        "AuthMiddleware Debug should report the keys flag: {dbg}"
+    );
+    // Nothing beyond the three shape fields is printed (the struct formatter would name any
+    // additional field before its value).
+    for forbidden in ["token", "secret", "credential"] {
+        assert!(
+            !dbg.to_ascii_lowercase()
+                .replace("keys_in_chain", "")
+                .contains(forbidden),
+            "AuthMiddleware Debug printed an unexpected field '{forbidden}': {dbg}"
+        );
+    }
 }
 
 #[test]
@@ -2693,11 +2624,10 @@ fn test_canonical_query_string_sorts_and_encodes() {
 // See `auth/mod.rs`: the vkey-resolution branch is gated on `admin_token_hash().is_some()`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// (a) DEFAULT DEPLOY, NO admin token, `auth.chain:[tokens]` + a static client_tokens entry: a
-/// request bearing that static token MUST be admitted by the static chain (governance is inert and
+/// (a) DEFAULT DEPLOY, NO admin token, a configured static auth chain: a request bearing a
+/// credential that chain recognizes MUST be admitted by the static chain (governance is inert and
 /// does NOT require a virtual key). Before the fix this 401'd because the always-present engine
 /// forced a vkey lookup that no minted key could satisfy.
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn test_governance_inert_without_admin_token_static_token_admitted() {
     use crate::governance::{GovState, MemoryStore};
@@ -2722,13 +2652,8 @@ async fn test_governance_inert_without_admin_token_static_token_admitted() {
     });
     let server = MockServer::new(state).await;
 
-    let token = "busbar-static-token";
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![token.to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    let token = "grp:static";
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
     // The default-deploy governance engine: RAM store, NO admin token, NO minted keys → INERT.
     let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, None).unwrap());
@@ -3039,7 +2964,6 @@ async fn test_governance_active_with_admin_token_rejects_missing_vkey() {
 /// so a seeded `MemoryStore` + `None` admin token faithfully reproduces the durable-store edge for
 /// the middleware's purposes (the store's DURABILITY only matters for the boot-time banner, covered
 /// by the main-crate tests).
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn test_inert_governance_persisted_key_is_not_enforced_static_chain_wins() {
     use crate::governance::{GovState, MemoryStore, Store, VirtualKey};
@@ -3094,15 +3018,10 @@ async fn test_inert_governance_persisted_key_is_not_enforced_static_chain_wins()
         "precondition: engine must be inert (no admin token)"
     );
 
-    // The STATIC chain is what actually gates now — a token allowlist that lists a DIFFERENT token,
-    // NOT the persisted key secret.
-    let static_token = "static-chain-token";
-    let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![static_token.to_string()],
-        modules: std::collections::HashMap::new(),
-    };
+    // The STATIC chain is what actually gates now - a chain that recognizes a DIFFERENT
+    // credential shape (`grp:<role>`), NOT the persisted key secret.
+    let static_token = "grp:static-chain";
+    let auth_cfg = chain_cfg(&["test-groups-module"]);
 
     let app = TestApp::new()
         .lane(
@@ -3253,4 +3172,59 @@ async fn test_active_governance_persisted_key_is_enforced() {
 
     handle.abort();
     server.shutdown().await;
+}
+
+/// The module `max_admin_scope` ceiling (App.auth_scope_caps) still caps what role_bindings
+/// grant, exercised through `dry_run_admin_scope` (the same chain -> bindings -> cap pipeline
+/// the admin middleware runs):
+///   - an external module DEFAULTS to a read-only ceiling, so a full binding is capped;
+///   - an explicit `max_admin_scope: full` cap lifts the ceiling;
+///   - module scoping holds through the full stack: a binding under another module's table
+///     earns the identified principal nothing;
+///   - a credential no module identifies is denied outright.
+#[test]
+fn test_admin_scope_cap_ceilings_external_module() {
+    use crate::admin::v1::contract::Scope;
+    crate::metrics::init();
+
+    let mk_app = |cap: Option<&str>, bind_module: &str| {
+        let mut app = crate::test_support::TestApp::new().build();
+        let a = std::sync::Arc::get_mut(&mut app).expect("freshly built App Arc is unshared");
+        a.admin_chain = vec!["test-scope-module".to_string()];
+        a.role_bindings = bindings_for(bind_module, &[("ops", binding(None, None, Some("full")))]);
+        if let Some(c) = cap {
+            a.auth_scope_caps
+                .insert("test-scope-module".to_string(), c.to_string());
+        }
+        app
+    };
+
+    // Default ceiling for an external module is read-only: the full binding is capped.
+    let app = mk_app(None, "test-scope-module");
+    assert_eq!(
+        dry_run_admin_scope(&app, Some("grp:ops"), None),
+        Some(Scope::ReadOnly),
+        "an external module without an explicit cap must be ceilinged to read-only"
+    );
+
+    // Explicit max_admin_scope: full lifts the ceiling; the full binding now lands.
+    let app = mk_app(Some("full"), "test-scope-module");
+    assert_eq!(
+        dry_run_admin_scope(&app, Some("grp:ops"), None),
+        Some(Scope::Full),
+        "an explicit full cap must let the full binding through"
+    );
+
+    // Module scoping through the full stack: the binding lives under ANOTHER module's table, so
+    // the principal (identified by test-scope-module) earns no scope at all.
+    let app = mk_app(Some("full"), "other-module");
+    assert_eq!(
+        dry_run_admin_scope(&app, Some("grp:ops"), None),
+        None,
+        "a binding under another module's table must grant nothing"
+    );
+
+    // A credential no chain module identifies: denied (fail closed).
+    let app = mk_app(Some("full"), "test-scope-module");
+    assert_eq!(dry_run_admin_scope(&app, Some("not-a-grp"), None), None);
 }

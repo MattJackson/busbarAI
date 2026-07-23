@@ -1002,14 +1002,20 @@ pub(crate) async fn reload_config(
         crate::config::EnvSubst::Strict,
     )
     .and_then(|loaded| {
-        let cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
+        let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
             .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
+        // Base hook names = the config-defined registry, pre-overlay (the admin API refuses to
+        // PUT-replace one); then merge the persisted overlay onto the resolved registry.
+        let base_hook_names: std::collections::HashSet<String> =
+            cfg.hooks.keys().cloned().collect();
+        if let Some(doc) = loaded.overlay_doc {
+            crate::config::overlay::merge_into(&mut cfg, doc);
+        }
         crate::build_app_from_config(
             cfg,
-            loaded.deploy.governance.clone(),
             loaded.deploy.plugins.clone(),
             loaded.overlay_path,
-            loaded.base_hook_names,
+            base_hook_names,
             (Some(config_path), Some(providers_path)),
             Some(&current),
         )
@@ -1100,14 +1106,14 @@ pub(crate) async fn apply_config(
         );
         return err_json(&e);
     }
-    let base_hook_names: std::collections::HashSet<String> =
-        req.config.hooks.keys().cloned().collect();
     let outcome = crate::config::resolve(&req.config, &req.providers)
         .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))
         .and_then(|cfg| {
+            // Base hook names = the applied config's own (synthesized) registry.
+            let base_hook_names: std::collections::HashSet<String> =
+                cfg.hooks.keys().cloned().collect();
             crate::build_app_from_config(
                 cfg,
-                req.config.governance.clone(),
                 req.config.plugins.clone(),
                 current.overlay_path.clone(),
                 base_hook_names,

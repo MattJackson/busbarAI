@@ -6,13 +6,13 @@
 # Two-file model:
 #   • providers.yaml  — the vetted provider catalog (protocol, base_url, error_map). Shipped.
 #   • config.yaml     — THIS file: your deployment. References providers by NAME and supplies their
-#                       keys via environment-variable names (never the keys themselves).
+#                       keys as SECRET REFERENCES (never the keys themselves).
 #
 # Flow: clients call busbar; busbar routes each request to a `model` or a `pool` of models, tracks
 # per-member health with a circuit breaker, and translates between protocols when a client speaks a
-# different wire format than the chosen backend. Secrets are never written here — configure the
-# environment-variable NAME that holds each key; dollar-brace placeholders are expanded at load time
-# (see `client_tokens` below). Every such placeholder's variable must be set in the environment.
+# different wire format than the chosen backend. Secrets are never written here - every secret value
+# is a SECRET REFERENCE resolved through a secret module: `{ env: VAR }` (environment variable),
+# `{ file: /path }` (file contents), or `{ module: <secret-plugin>, settings: {…} }`.
 #
 # This example builds up from the simplest case to progressively richer pools — read top to bottom.
 
@@ -26,35 +26,45 @@ listen: "0.0.0.0:8080"
 # (127.0.0.1:8081), so a zero-config deployment boots with admin reachable only on-host.
 #
 # SECURITY: a network-exposed admin_listen (any non-loopback bind) REFUSES TO BOOT unless it requires
-# client-certificate mTLS via admin_tls.client_ca_file. A loopback bind (127.0.0.1 / ::1 / localhost)
+# client-certificate mTLS via admin_tls.client_ca. A loopback bind (127.0.0.1 / ::1 / localhost)
 # is exempt. To run a token-only admin plane on an exposed address on purpose — e.g. behind a mesh
 # that terminates mTLS — set `admin_insecure: true` to waive the guard deliberately.
 #
 # admin_listen: "127.0.0.1:8081"    # default; set an exposed address (+ admin_tls) to manage off-host
 # admin_tls:
-#   cert_file: "/etc/busbar/admin-cert.pem"
-#   key_file:  "/etc/busbar/admin-key.pem"
-#   client_ca_file: "/etc/busbar/admin-client-ca.pem"   # present ⇒ mTLS required on the admin plane
+#   cert:      { file: /etc/busbar/admin-cert.pem }
+#   key:       { file: /etc/busbar/admin-key.pem }
+#   client_ca: { file: /etc/busbar/admin-client-ca.pem }   # present ⇒ mTLS required on the admin plane
 # admin_insecure: false                                  # true ⇒ waive the exposed-admin mTLS guard
 
 # ── Client authentication ────────────────────────────────────────────────────────────────────────
-# auth.chain — an ordered list of auth modules that identify the caller. `tokens` is the built-in:
-#   clients must send `Authorization: Bearer <token>` matching the allowlist below. An EMPTY chain is
-#   an open relay (no client auth; dev only). upstream_credentials controls whose key hits the
-#   provider: `own` (default — busbar's configured key) or `passthrough` (forward the caller's key).
-# When governance is active (admin_token set, bottom of file), virtual keys supersede this for proxied requests.
+# auth.chain - an ORDERED list of auth module entries identifying the caller. `keys` is the
+# built-in signed-key verifier: clients present busbar-minted keys (POST /api/v1/admin/keys).
+# An IdP module (a `kind: auth` plugin) is a map entry carrying its typed fields + settings, e.g.
+#   - ad: { max_admin_scope: full, settings: { server: "ldaps://corp" } }
+# An EMPTY chain is an open relay (no client auth; dev only). upstream_credentials controls whose
+# key hits the provider: `own` (default - busbar's configured key) or `passthrough` (forward the
+# caller's key). admin_auth gates /api/v1/admin/* (default [admin-tokens]); role_bindings map an
+# IdP module's asserted ROLES to policy (allowed_pools / group / admin_scope), NESTED BY MODULE.
 auth:
-  chain: [tokens]
+  chain:
+    - keys
   upstream_credentials: own
-  client_tokens:
-    - "${BUSBAR_CLIENT_TOKEN}"        # one or more allowed client tokens (env-expanded)
+  admin_auth:
+    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }   # guards the admin API (mint keys etc.)
+  # role_bindings:
+  #   ad:
+  #     growth-eng: { allowed_pools: [fast], group: growth }
+  #     platform:   { group: acme, admin_scope: full }       # allowed_pools omitted = ALL pools
+  # signing_key: { file: /var/lib/busbar/signing.key }       # fleet-shared key-signing key; absent
+  #                                                          # = generated on first boot (0600)
 
 # ── Providers ────────────────────────────────────────────────────────────────────────────────────
-# Reference a provider NAME from providers.yaml and give the env var holding its key. protocol /
+# Reference a provider NAME from providers.yaml and give a secret reference for its key. protocol /
 # base_url / error_map are inherited from providers.yaml; override here only in unusual cases.
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
     # Optional active health probing for this provider's lanes (default: no probing — health is
     # inferred from real traffic via the breaker + half-open probe).
     #   mode: none   — passive only (default).
@@ -65,14 +75,14 @@ providers:
     #   interval_secs: 30   # default 30
     #   timeout_secs: 5     # default 5
   openai:
-    api_key_env: OPENAI_KEY
+    api_key: { env: OPENAI_KEY }
   gemini:
-    api_key_env: GEMINI_KEY
+    api_key: { env: GEMINI_KEY }
   z.ai:
-    api_key_env: ZAI_KEY
+    api_key: { env: ZAI_KEY }
   bedrock:
-    # Bedrock auth is AWS SigV4: the key env holds `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`.
-    api_key_env: AWS_BEDROCK_CREDS
+    # Bedrock auth is AWS SigV4: the secret holds `ACCESS_KEY_ID:SECRET_ACCESS_KEY[:SESSION_TOKEN]`.
+    api_key: { env: AWS_BEDROCK_CREDS }
 
 # ── Models ───────────────────────────────────────────────────────────────────────────────────────
 # Each model names its provider, a per-model concurrency cap (max_concurrent), and an optional
@@ -129,21 +139,21 @@ pools:
   # 1) Simplest pool: a single model. Useful to give a model a stable public name / alias.
   haiku:
     members:
-      - target: claude-haiku
+      - model: claude-haiku
 
   # 2) Basic round-robin: equal-weight members. Smooth weighted round-robin spreads load evenly;
   #    if one member trips, traffic shifts to the others automatically.
   fast:
     members:
-      - target: claude-haiku
-      - target: gpt-4o-mini
+      - model: claude-haiku
+      - model: gpt-4o-mini
 
   # 3) Weighted split: send ~80% to the first member, ~20% to the second (e.g. canarying a model).
   balanced:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 8
-      - target: gpt-4o
+      - model: gpt-4o
         weight: 2
 
   # 4) Context-length aware: declare each member's max context window. A request that is too large
@@ -151,22 +161,21 @@ pools:
   #    the smaller lane (it was healthy; the request simply didn't fit).
   long-context:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         context_max: 200000
-      - target: gemini-1.5-pro
+      - model: gemini-1.5-pro
         context_max: 2000000
 
   # 5) Failover tuning: bound how long/often busbar retries across members for one request.
   #    timeout_secs — give up after this wall-clock budget. max_hops — at most this many failover hops.
-  #    (the old keys `deadline_secs` / `cap` still load via aliases.)
   #    exclusions — member models to never fail a request over TO (e.g. an expensive last resort).
   resilient:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 3
-      - target: gpt-4o
+      - model: gpt-4o
         weight: 2
-      - target: glm-4.6
+      - model: glm-4.6
         weight: 1
     failover:
       timeout_secs: 30
@@ -184,29 +193,27 @@ pools:
   #     a batch pool and 50ms in a latency-critical one. 0 is a startup error; omit to disable.
   realtime:
     members:
-      - target: gemini-1.5-pro
+      - model: gemini-1.5-pro
         attempt_timeout_ms: 250   # this pool is time-critical: hop if no headers in 250ms
-      - target: claude-haiku      # fallback lane picks the request up in-flight
+      - model: claude-haiku      # fallback lane picks the request up in-flight
 
   # 6) Exhaustion policy + fallback pool: when every member is tripped/at-capacity, choose what to do.
-  #    action: reject | status_503 | least_bad | fallback_pool:<name>
+  #    on_exhausted: reject | least_bad | { fallback_pool: <name> }
   #      least_bad      — serve the member whose cooldown expires soonest rather than 503.
-  #      fallback_pool  — route to another pool entirely (loop-guarded).
+  #      fallback_pool  - route to another pool entirely (loop-guarded; a structured reference).
   primary:
     members:
-      - target: claude-sonnet
-      - target: gpt-4o
-    on_exhausted:
-      action: fallback_pool:overflow      # when primary is fully exhausted, spill to `overflow`
+      - model: claude-sonnet
+      - model: gpt-4o
+    on_exhausted: { fallback_pool: overflow }   # when primary is fully exhausted, spill to `overflow`
 
-  # The fallback target referenced above. Its own exhaustion policy serves the soonest-healthy member.
+  # The fallback pool referenced above. Its own exhaustion policy serves the soonest-healthy member.
   overflow:
     members:
-      - target: claude-haiku
-      - target: gpt-4o-mini
-      - target: glm-4.6
-    on_exhausted:
-      action: least_bad
+      - model: claude-haiku
+      - model: gpt-4o-mini
+      - model: glm-4.6
+    on_exhausted: least_bad
 
   # 7) Session affinity + cross-protocol: pin a conversation to one member while it's healthy (so
   #    cache/state stays warm), keyed by a request header. Members here span THREE protocols
@@ -214,11 +221,11 @@ pools:
   #    busbar translates losslessly through its superset IR.
   smart:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 2
-      - target: gpt-4o
+      - model: gpt-4o
         weight: 2
-      - target: gemini-1.5-pro
+      - model: gemini-1.5-pro
         weight: 1
     affinity:
       mode: session              # stick to one member per session while it stays healthy
@@ -227,16 +234,16 @@ pools:
   # 8) Per-pool circuit breaker: tune when a member trips out and how long it cools down. Omit the
   #    block entirely for the ADR-0002 defaults (error_rate, 0.5 over a 30s/5-request floor).
   #      trip.mode        — error_rate (fraction of failures in a window) | consecutive (a streak).
-  #      trip.window_secs — sliding window for error_rate (old key `window_s` still loads via alias).
+  #      trip.window_secs - sliding window for error_rate.
   #      trip.threshold   — error fraction that trips (error_rate mode).
   #      trip.min_requests— floor: never trip on error_rate below this many outcomes in-window.
-  #      trip.consecutive_n — consecutive failures that trip (consecutive mode; old key `n` aliased).
+  #      trip.consecutive_n - consecutive failures that trip (consecutive mode).
   #      base/max_cooldown_secs — first cooldown after a trip, and the exponential-backoff ceiling.
   #    (A server Retry-After header is always honored as a cooldown floor, on top of these.)
   sensitive:
     members:
-      - target: claude-sonnet
-      - target: gpt-4o
+      - model: claude-sonnet
+      - model: gpt-4o
     breaker:
       trip:
         mode: consecutive        # trip fast on a short streak rather than a windowed rate
@@ -246,43 +253,61 @@ pools:
 
 # ── Observability (optional) ─────────────────────────────────────────────────────────────────────
 # Prometheus `/metrics` is always on and needs no config. These sinks/toggles are opt-in:
-#   otlp_endpoint            — export OpenTelemetry traces (OTLP/HTTP) to a collector.
+#   otlp_url                 - export OpenTelemetry traces (OTLP/HTTP) to a collector.
 #   request_log_webhook_url  — fire-and-forget a JSON request-log POST per request.
 #   emit_server_timing       — emit the `Server-Timing: busbar;dur=<ms>` response header (default
 #                              true). Set false to suppress it entirely (it is an in-band busbar
 #                              fingerprint you may want to hide for backend indistinguishability).
 # observability:
-#   otlp_endpoint: "http://localhost:4318/v1/traces"
+#   otlp_url: "http://localhost:4318/v1/traces"
 #   request_log_webhook_url: "https://logs.example.com/busbar"
 #   emit_server_timing: true
 
-# ── Governance (optional) ────────────────────────────────────────────────────────────────────────
-# Governance is ALWAYS available but INERT until you set an admin_token (and mint keys via the admin
-# API). Once active, clients authenticate with busbar-issued VIRTUAL KEYS (managed via the admin API)
-# instead of the static `auth` tokens above. Each key carries allowed-pools (403), a spend budget
-# (429 when exceeded, or 400 for Bedrock ingress), and RPM/TPM rate limits (429). There is no `enabled`
-# switch. The store defaults to ephemeral RAM (keys/budgets reset on restart); choose a durable `store`
-# for persistence; each durable backend is a signed plugin tarball (see the `plugins:` block below).
-# governance:
-#   admin_token: "$BUSBAR_ADMIN_TOKEN"        # ACTIVATES enforcement; guards /api/v1/admin/keys; wrap the name in braces, "$" + "{NAME}", when uncommented to env-expand
-#   price_per_request_cents: 1                # flat per-request budget charge (abstract minor units)
-#   rate_card:                                # per-model token pricing, MICRO-units per token (abstract
-#     gpt-5-mini:    { input_utok: 0.15, output_utok: 0.6 }        # cost units - busbar attaches no
-#     claude-sonnet: { input_utok: 3.0, output_utok: 15.0 }        # currency). ALL-OR-NOTHING: absent =
-#                                             # tokens price 0; present = EVERY configured model needs an
-#                                             # entry (--validate prints a paste-ready stub otherwise).
-#   budget_groups:                            # nestable enforced caps ABOVE the per-key budget; keys bind
-#     acme:   { max_budget_cents: 10000000, budget_period: monthly }         # via the mint field
-#     growth: { max_budget_cents: 2000000,  budget_period: monthly, parent: acme }  # `budget_group`
-#   # store: memory                          # default (ephemeral RAM); omit for the default
-#   # For persistence, pick a durable store PLUGIN (requires plugins.enabled below) by ALIAS or
-#   # CANONICAL NAME, plus its db_path target:
-#   # store: sqlite                          # single-node durable (busbar-store-sqlite)
-#   # db_path: /var/lib/busbar/governance.db
-#   # store: postgres                        # cluster-shared keys/usage/audit; db_path is a postgres:// URL
-#   # store: redis                           # cluster-shared keys/usage/audit; db_path is a redis:// (or rediss://) URL
-#   # store: acme-store-dynamo               # or any third-party store plugin by manifest name
-#   # usage_flush_interval_ms: 100           # write-behind flush cadence (ms) for durable stores
+# ── Groups: the ONE limit tree (optional) ────────────────────────────────────────────────────────
+# Named enforcement buckets forming an acyclic tree (parent chains AND together; depth <= 8). A
+# minted key binds to at most one group; a key with no group is authed + unlimited. Generic limits:
+# each is `{ <metric>: <amount>, per: <window> }` with metric one of requests|tokens|budget|
+# concurrent and window one of minute|hour|day|month|total (`concurrent` is instantaneous: no per).
+# `enabled: false` freezes a group (history kept).
+# groups:
+#   acme:
+#     limits:
+#       - { requests: 500, per: minute }
+#       - { budget: 10000000, per: month }
+#   growth:
+#     parent: acme
+#     limits:
+#       - { budget: 2000000, per: month }
+#       - { concurrent: 50 }
+
+# ── Pricing: the ONE cost source (optional) ──────────────────────────────────────────────────────
+# Per-model token pricing in MICRO-units per token (abstract cost units - busbar attaches no
+# currency). ALL-OR-NOTHING: absent = tokens price 0; present = EVERY configured model needs an
+# entry (--validate prints a paste-ready stub otherwise). Keys are the CONFIG model names above.
+# rate_card:
+#   claude-sonnet: { input_utok: 3.0, output_utok: 15.0, cache_read_utok: 0.3, cache_write_utok: 3.75 }
+#   gpt-4o:        { input_utok: 2.5, output_utok: 10.0 }
+# per_request_fee: 0                       # flat per-request budget charge (default 0)
+
+# ── Store (optional) ─────────────────────────────────────────────────────────────────────────────
+# The durable store as a plugin: `{ module, settings }`. Absent = ephemeral RAM (keys/usage reset
+# on restart). A non-memory module requires plugins.enabled below; settings are the module's own
+# config, passed through verbatim.
+# store:
+#   module: sqlite                          # busbar-store-sqlite (single-node durable)
+#   settings: { db_path: /var/lib/busbar/governance.db }
+# store:
+#   module: postgres                        # cluster-shared keys/usage/audit
+#   settings: { url: "postgres://user:pass@host/db" }
+# store:
+#   module: redis
+#   settings: { url: "redis://host:6379/0" }
+
+# ── Advanced (optional) ──────────────────────────────────────────────────────────────────────────
+# Internal tuning; the defaults are right for almost everyone.
+# advanced:
+#   rate_sweep_interval: 256                # rate-map idle-entry sweep amortization
+#   usage_flush_interval_ms: 100            # write-behind flush cadence for usage counters
 
 # ── Plugins (optional; OFF by default) ───────────────────────────────────────────────────────────
 # The dynamic plugin subsystem: signed plugin tarballs ({cdylib + manifest.json} as one .tar.gz)

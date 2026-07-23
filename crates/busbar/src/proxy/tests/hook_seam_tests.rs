@@ -596,9 +596,8 @@ async fn wait_for_tap_body(state: &crate::test_support::MockServerState) -> serd
 }
 
 /// STAGE TAPS: an UNAUTHENTICATED request fires the synthetic `rejected_by_auth` completion
-/// (through the real auth middleware) — audit taps see auth denials too. Requires the tokens
-/// module (featureless builds have no data-plane auth to reject with).
-#[cfg(feature = "auth-tokens")]
+/// (through the real auth middleware) - audit taps see auth denials too. Uses the test-only
+/// data-plane module (a non-empty chain with no matching credential denies fail-closed).
 #[tokio::test]
 async fn completion_tap_fires_synthetic_rejected_by_auth() {
     crate::metrics::init();
@@ -611,10 +610,8 @@ async fn completion_tap_fires_synthetic_rejected_by_auth() {
         ))
         .pool("p", &[(0, 1)])
         .auth(Arc::new(crate::auth::AuthMiddleware::new(
-            &serde_yaml::from_str::<crate::config::AuthCfg>(
-                "chain: [tokens]\nclient_tokens: [good-token]\n",
-            )
-            .unwrap(),
+            &serde_yaml::from_str::<crate::config::AuthCfg>("chain: [test-groups-module]\n")
+                .unwrap(),
         )))
         .build();
     Arc::get_mut(&mut app)
@@ -644,18 +641,14 @@ async fn completion_tap_fires_synthetic_rejected_by_auth() {
 /// REGRESSION (audit c1r6): the completion-tap `status` must be the PROTOCOL-NATIVE auth-failure
 /// status the client actually receives — not a hardcoded 401. A Gemini ingress bad-key denial is
 /// HTTP 400 (INVALID_ARGUMENT), so a tap watching it must see 400, matching the served response.
-/// Gated on the tokens module (featureless builds have no data-plane auth to reject with).
-#[cfg(feature = "auth-tokens")]
 #[tokio::test]
 async fn completion_tap_status_is_protocol_native_gemini_400() {
     crate::metrics::init();
     let (server, state, tap) = webhook_tap().await;
     let mut app = TestApp::new()
         .auth(Arc::new(crate::auth::AuthMiddleware::new(
-            &serde_yaml::from_str::<crate::config::AuthCfg>(
-                "chain: [tokens]\nclient_tokens: [good-token]\n",
-            )
-            .unwrap(),
+            &serde_yaml::from_str::<crate::config::AuthCfg>("chain: [test-groups-module]\n")
+                .unwrap(),
         )))
         .build();
     Arc::get_mut(&mut app)

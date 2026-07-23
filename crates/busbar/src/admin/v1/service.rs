@@ -56,12 +56,15 @@ pub(crate) fn mark_start() {
 }
 
 /// The auth modules COMPILED INTO this binary (feature-gated at compile time — real `#[cfg]` on each
-/// array element, so this reflects the ACTUAL binary and empties under `--no-default-features`). The
-/// single source for both `info`'s build proof and the `plugins?type=auth` catalog.
+/// array element, so this reflects the ACTUAL binary). The single source for both `info`'s build
+/// proof and the `plugins?type=auth` catalog. `keys` (the built-in signed-key verifier) is
+/// engine-handled and always present; `admin-tokens` (the operator admin credential) is the
+/// removable default-on feature.
 fn auth_modules_compiled_in() -> Vec<&'static str> {
     [
-        #[cfg(feature = "auth-tokens")]
-        "tokens",
+        crate::config::KEYS_MODULE,
+        #[cfg(feature = "auth-admin-tokens")]
+        crate::config::ADMIN_TOKENS_MODULE,
     ]
     .to_vec()
 }
@@ -472,9 +475,9 @@ impl AdminService {
     /// uptime, and pool/model/provider topology. Read scope. Infallible today, but returns `Result`
     /// for a uniform transport contract (every op is `Result<View, AdminError>`).
     pub(crate) async fn info(&self) -> Result<InfoView, AdminError> {
-        // The compiled-in plugin sets reflect the ACTUAL binary (feature-gated). `default auth =
-        // tokens` + `default hook = weighted` are the two OEM-default plugins; weighted is the one
-        // baked in (non-removable), so it appears as `weighted_floor` below, not in `hook_plugins`.
+        // The compiled-in plugin sets reflect the ACTUAL binary (feature-gated): the `keys` /
+        // `admin-tokens` auth builtins plus the ranking hooks. `weighted` is the one baked in
+        // (non-removable), so it appears as `weighted_floor` below, not in `hook_plugins`.
         let auth_modules = auth_modules_compiled_in();
         let hook_plugins = hook_plugins_compiled_in();
 
@@ -645,14 +648,23 @@ impl AdminService {
         let mut plugins: Vec<PluginView> = Vec::new();
         match ptype {
             "auth" => {
-                // Compiled-in auth modules (feature-gated). Active = present in the auth chain.
+                // Compiled-in auth modules (feature-gated). Active = wired into its chain: `keys`
+                // is engine-handled (a flag, not a boxed module), `admin-tokens` lives on the
+                // ADMIN chain, and anything else is a boxed data-plane chain module.
                 let chain = self.app.auth.chain_names();
                 for name in auth_modules_compiled_in() {
+                    let active = if name == crate::config::KEYS_MODULE {
+                        self.app.auth.keys_in_chain
+                    } else if name == crate::config::ADMIN_TOKENS_MODULE {
+                        self.app.admin_chain.iter().any(|m| m == name)
+                    } else {
+                        chain.contains(&name)
+                    };
                     plugins.push(PluginView::basic(
                         name.to_string(),
                         "auth",
                         "compiled-in",
-                        Some(chain.contains(&name)),
+                        Some(active),
                         None,
                     ));
                 }

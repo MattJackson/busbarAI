@@ -817,17 +817,19 @@ mod tests {
         let gov = gov_with_key(key.clone());
 
         // A cost model with the growth group; flat fee 1 (TestApp default shape).
-        let mut gcfg = crate::config::GovernanceCfg::default();
-        gcfg.budget_groups = std::collections::BTreeMap::from([(
+        let groups = std::collections::BTreeMap::from([(
             "growth".to_string(),
-            crate::config::BudgetGroupCfg {
-                max_budget_cents: 1_000,
-                budget_period: "total".to_string(),
+            crate::config::GroupCfg {
                 parent: None,
+                enabled: true,
+                limits: vec![crate::config::groups::LimitCfg {
+                    metric: crate::config::groups::LimitMetric::Budget,
+                    amount: 1_000,
+                    per: Some(crate::config::groups::LimitWindow::Total),
+                }],
             },
         )]);
-        let cost =
-            crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+        let cost = crate::cost::CostModel::resolve_parts(None, 1, &groups);
 
         // Accrue per-model tier tokens through the REAL accrual path (fans out to key + group).
         gov.record_usage(
@@ -851,11 +853,7 @@ mod tests {
             ))
             .pool("pool-b", &[(0, 1)])
             .governance(gov)
-            .cost(crate::cost::CostModel::resolve_parts(
-                &gcfg,
-                &Default::default(),
-                &Default::default(),
-            ))
+            .cost(crate::cost::CostModel::resolve_parts(None, 1, &groups))
             .build();
         refresh_scrape_gauges(&app);
         let out = render();

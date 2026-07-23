@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2026 Busbar Inc and contributors
+#
+# The 1.5.0 CLEAN CONFIG example: the full redesigned surface in one file, adapted from the
+# design contract (scratch/CLEAN-CONFIG-1.5.0.md) so that `busbar --validate` passes against the
+# shipped providers.yaml with no plugins installed and no secrets present:
+#   - the store uses the compiled-in `memory` module (a durable store is a plugin tarball),
+#   - the auth chain is the built-in `keys` verifier (an IdP module is a `kind: auth` plugin),
+#   - hook instances are the bare built-ins (an out-of-process hook is an inline module ref),
+#   - numeric literals carry no underscore separators (YAML ints are plain digits).
+#
+# Validate with:
+#   BUSBAR_CONFIG=examples/clean-config-1.5.0.yaml busbar --validate
+
+# ── transport ──
+listen: "0.0.0.0:8080"
+admin_listen: "127.0.0.1:8081"
+admin_insecure: false                         # waive exposed-admin mTLS guard (scary on purpose)
+# tls:
+#   cert: { file: /run/secrets/tls-cert.pem }
+#   key:  { file: /run/secrets/tls-key.pem }
+# admin_tls:
+#   cert:      { file: /run/secrets/admin-cert.pem }
+#   key:       { file: /run/secrets/admin-key.pem }
+#   client_ca: { file: /run/secrets/admin-ca.pem }
+
+# ── AUTH: identity (roles) + signed keys ──
+auth:
+  # signing_key: { file: /run/secrets/busbar-signing.key }   # rotate = revoke-all; fleet-shared;
+  #                                                          # absent = generated 0600 on first boot
+  upstream_credentials: own
+  chain:
+    - keys                                                   # built-in signed-key verifier (no config)
+    # - ad: { max_admin_scope: full, settings: { server: "ldaps://corp", base_dn: "dc=corp" } }
+  admin_auth:
+    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }
+  role_bindings: {}                                          # NESTED BY MODULE; pure auth, e.g.:
+  # role_bindings:
+  #   ad:
+  #     growth-eng: { allowed_pools: [fast], group: growth }
+  #     platform:   { group: acme, admin_scope: full }       # allowed_pools omitted = ALL pools
+
+# ── GROUPS: the ONE limit tree ──
+groups:
+  acme:
+    limits:
+      - { requests: 500, per: minute }
+      - { budget: 1000000, per: month }
+  growth:
+    parent: acme
+    limits:
+      - { requests: 50, per: minute }
+      - { budget: 200000, per: month }
+  bob:
+    parent: growth
+    enabled: true                                            # false = freeze this group
+    limits:
+      - { requests: 10,   per: minute }
+      - { requests: 1000, per: day }
+      - { concurrent: 5 }                                    # no `per` = in-flight cap
+
+# ── PRICING: the ONE cost source ──
+rate_card:
+  sonnet-anthropic: { input_utok: 3.0, output_utok: 15.0, cache_read_utok: 0.3, cache_write_utok: 3.75 }
+  sonnet-bedrock:   { input_utok: 2.8, output_utok: 14.0 }
+per_request_fee: 0
+
+# ── STORE: plugin + opaque settings ──
+store:
+  module: memory                              # a durable store is a plugin, e.g.:
+  # module: postgres
+  # settings: { url: "postgres://host/db" }
+
+# ── PROVIDERS / MODELS (two entries = same model, two providers) ──
+providers:
+  anthropic: { api_key: { env: ANTHROPIC_API_KEY } }
+  bedrock:   { api_key: { env: AWS_BEDROCK_CREDS } }
+models:
+  sonnet-anthropic: { provider: anthropic, upstream_model: claude-3-5-sonnet }
+  sonnet-bedrock:   { provider: bedrock,   upstream_model: anthropic.claude-3-5-sonnet-v1 }
+
+# ── POOLS: pure routing/topology ──
+pools:
+  fast:
+    members:
+      - { model: sonnet-anthropic, weight: 1, tier: null, tags: [] }   # `target` -> `model`
+      - { model: sonnet-bedrock,   weight: 1 }
+    hooks: [cheapest]                                        # derives cost from rate_card
+    breaker:  { base_cooldown_secs: 15, max_cooldown_secs: 120,
+                trip: { mode: error_rate, window_secs: 30, threshold: 0.5, min_requests: 5, consecutive_n: 3 } }
+    failover: { timeout_secs: 120, max_hops: 3, exclusions: [] }       # no deadline_secs/cap aliases
+    on_exhausted: reject                                     # | { fallback_pool: cold } | least_bad
+    affinity: { mode: session }
+
+# ── HOOKS: inline refs, no registry block ──
+# global_hooks:
+#   - { module: webhook, settings: { url: "https://sidecar.internal/pii" },
+#       kind: gate, timeout_ms: 5, on_error: reject, prompt: no, user: no }
+
+# ── PLUGINS (loader) ──
+plugins:
+  enabled: false
+  dir: plugins
+  trust: { publishers: [], allow_unsigned: false, allow_third_party: false }
+  min_versions: {}
+
+# ── SECURITY / OBSERVABILITY / LIMITS ──
+security:      { blocked_metadata_hosts: [], allow_metadata_hosts: [], allow_all_metadata: false }
+observability: { otlp_url: null, request_log_webhook_url: null, emit_server_timing: false }
+limits:        { upstream_request_timeout_secs: 300, request_body_max_bytes: 33554432,
+                 max_inbound_concurrent: 8192, hard_down_cooldown_secs: 1800,
+                 reasoning_effort_budgets: { minimal: 1024, low: 4096, medium: 8192, high: 16384 } }
+
+# ── ADVANCED: internal tuning ──
+advanced:
+  rate_sweep_interval: 256
+  usage_flush_interval_ms: 100

@@ -812,8 +812,8 @@ impl TestApp {
             base_hook_names: self.base_hook_names,
             admin_chain: vec!["admin-tokens".to_string()],
             credential_cache: std::sync::Arc::new(crate::auth_cache::CredentialCache::new()),
-            auth_modules: std::collections::HashMap::new(),
-            group_map: std::collections::HashMap::new(),
+            auth_scope_caps: std::collections::HashMap::new(),
+            role_bindings: crate::config::RoleBindings::new(),
             config_path: None,
             providers_path: None,
             overlay_path: self.overlay_path,
@@ -823,6 +823,9 @@ impl TestApp {
             fallback_pools: self.fallback_pools,
             on_exhausted_cfgs: self.on_exhausted_cfgs,
             governance: self.governance,
+            secret_resolver: std::sync::Arc::new(
+                crate::config::secret::SecretResolver::builtins_only(),
+            ),
             cost: self
                 .cost
                 .unwrap_or_else(|| std::sync::Arc::new(crate::cost::CostModel::flat(1))),

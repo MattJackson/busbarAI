@@ -229,12 +229,13 @@ pub(crate) struct App {
     /// The credential cache (design-hooks-v2 §2.5) — Arc-shared ACROSS config swaps (like the
     /// mutation limiter): an apply/reload must not silently re-open every cached-allow window.
     pub(crate) credential_cache: Arc<crate::auth_cache::CredentialCache>,
-    /// Per-module trust-boundary caps (`auth.modules:`) — consulted by BOTH chains at Identify
-    /// time (allowed_groups intersection) and at admin scope resolution (max_admin_scope ceiling).
-    pub(crate) auth_modules: std::collections::HashMap<String, crate::config::AuthModuleCfg>,
-    /// `group_map:` — principal groups → operator policy (admin scope today). Read by the admin
-    /// authorization resolution; unmapped groups grant nothing (fail closed).
-    pub(crate) group_map: HashMap<String, crate::config::GroupMapEntry>,
+    /// Per-module `max_admin_scope:` ceilings (from the auth chain entries) - consulted at admin
+    /// scope resolution.
+    pub(crate) auth_scope_caps: std::collections::HashMap<String, String>,
+    /// `auth.role_bindings:` - module -> role -> operator policy (S4: nested by module). Read by
+    /// the admin authorization resolution and the governance re-key; an unbound role grants
+    /// nothing (fail closed).
+    pub(crate) role_bindings: crate::config::RoleBindings,
     /// The config.yaml path busbar booted from — `POST /api/v1/admin/config/reload` re-runs the boot
     /// disk-load pipeline against it. `None` (tests / ephemeral) ⇒ reload is `invalid_request`.
     pub(crate) config_path: Option<std::path::PathBuf>,
@@ -260,6 +261,11 @@ pub(crate) struct App {
     pub(crate) on_exhausted_cfgs: std::collections::HashMap<String, crate::config::OnExhausted>,
     /// governance runtime (virtual keys + budgets/limits store). `None` = disabled.
     pub(crate) governance: Option<std::sync::Arc<crate::governance::GovState>>,
+    /// The SECRET RESOLVER seam (P2): resolves a config [`crate::config::SecretRef`] to bytes via
+    /// the built-in `env`/`file` modules or a loaded `kind: secret` plugin. Held so the TLS listener
+    /// (built after `build_app` returns) resolves cert/key/CA references through the same seam that
+    /// resolved provider keys and the admin token at build time.
+    pub(crate) secret_resolver: std::sync::Arc<crate::config::secret::SecretResolver>,
     /// The resolved COST MODEL (rate card + budget groups + flat fee), rebuilt with the config on
     /// every apply/reload while `governance` (the token ledger) survives the swap - which is what
     /// makes a rate-card correction reprice every past and future derived figure on the next read.

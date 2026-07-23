@@ -241,7 +241,7 @@ fn validate_config_command() -> i32 {
     );
     let safe_mode = std::env::args().any(|a| a == "--safe-mode");
 
-    let loaded = match load_config_from_disk(
+    let mut loaded = match load_config_from_disk(
         &config_path,
         &providers_path,
         safe_mode,
@@ -254,13 +254,18 @@ fn validate_config_command() -> i32 {
         }
     };
     let unset_env_vars = loaded.unset_env_vars.clone();
-    let cfg = match config::resolve(&loaded.deploy, &loaded.defs) {
+    let mut cfg = match config::resolve(&loaded.deploy, &loaded.defs) {
         Ok(c) => c,
         Err(errs) => {
             eprintln!("[error] config errors:\n  - {}", errs.join("\n  - "));
             return 1;
         }
     };
+    // Merge the persisted overlay exactly as boot does, so --validate validates the EFFECTIVE
+    // config (base + API-applied hooks), not just the base file.
+    if let Some(doc) = loaded.overlay_doc.take() {
+        config::overlay::merge_into(&mut cfg, doc);
+    }
     if let Err(errs) = config_validate::validate_with_unset(&cfg, &unset_env_vars) {
         eprintln!(
             "[error] config validation failed:\n  - {}",
@@ -273,14 +278,13 @@ fn validate_config_command() -> i32 {
     // consistency (plugins.enabled vs governance.store), trust-policy resolution, the three-phase
     // scan of every tarball (structural -> trust -> conflict), and store resolution. Manifest-only:
     // nothing is `dlopen`ed, no store is opened — zero side effects.
-    let registry =
-        match plugins_preflight(loaded.deploy.governance.as_ref(), &loaded.deploy.plugins) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[error] {e}");
-                return 1;
-            }
-        };
+    let registry = match plugins_preflight(loaded.deploy.store.as_ref(), &loaded.deploy.plugins) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[error] {e}");
+            return 1;
+        }
+    };
     println!(
         "ok: config valid — {} provider(s), {} model(s), {} pool(s)\n  config:    {}\n  providers: {}",
         cfg.providers.len(),
@@ -337,9 +341,9 @@ fn list_plugins_command() -> i32 {
         Ok(l) => {
             let store = l
                 .deploy
-                .governance
+                .store
                 .as_ref()
-                .map(|g| g.store.clone())
+                .map(|g| g.module.clone())
                 .unwrap_or_else(|| config::GOVERNANCE_STORE_MEMORY.to_string());
             (l.deploy.plugins, store)
         }
@@ -391,7 +395,7 @@ fn list_plugins_command() -> i32 {
             && row.status == "ready"
             && (name == store_ref || alias == store_ref);
         let status = if selected {
-            format!("LOADS (governance.store: {store_ref})")
+            format!("LOADS (store.module: {store_ref})")
         } else if !plugins_cfg.enabled && row.status == "ready" {
             "ready (inert: plugins.enabled is false)".to_string()
         } else {
@@ -466,15 +470,15 @@ fn resolve_model_context_max(
     let mut resolved: HashMap<String, Option<usize>> = HashMap::new();
     for pool in pools.values() {
         for m in &pool.members {
-            match resolved.get(&m.target) {
+            match resolved.get(&m.model) {
                 // First sighting of this model, or this member adds no opinion (None) — keep what
                 // we have / record what we got.
                 None => {
-                    resolved.insert(m.target.clone(), m.context_max);
+                    resolved.insert(m.model.clone(), m.context_max);
                 }
                 Some(None) => {
                     // Previously unspecified; let any value (including another None) refine it.
-                    resolved.insert(m.target.clone(), m.context_max);
+                    resolved.insert(m.model.clone(), m.context_max);
                 }
                 Some(Some(existing)) => match m.context_max {
                     // No opinion here, or an identical opinion — both fine, keep the explicit value.
@@ -483,7 +487,7 @@ fn resolve_model_context_max(
                     Some(c) => {
                         return Err(format!(
                             "model '{}' has conflicting context_max across pools ({} vs {}); a model maps to one lane and must declare a single context_max",
-                            m.target, existing, c
+                            m.model, existing, c
                         ));
                     }
                 },
@@ -635,14 +639,12 @@ async fn run() {
         deploy,
         defs,
         overlay_path,
-        base_hook_names,
+        overlay_doc,
         unset_env_vars: _,
     } = loaded;
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();
-    // Governance config; grab before `deploy` is borrowed by resolve.
-    let governance_cfg = deploy.governance.clone();
     // The top-level `plugins:` block (master switch + dir + trust). Absent = disabled defaults.
     let plugins_cfg = deploy.plugins.clone();
 
@@ -658,7 +660,7 @@ async fn run() {
 
     // Install the tracing subscriber now (stderr fmt always; OTLP export if configured) so all
     // subsequent startup and request-path logging is captured.
-    observability::init_logging(observability_cfg.otlp_endpoint.as_deref());
+    observability::init_logging(observability_cfg.otlp_url.as_deref());
 
     // First line in the logs: which build is running. Operators need this to confirm a deploy /
     // correlate logs to a release without shelling in to run `--version`.
@@ -668,8 +670,14 @@ async fn run() {
 
     // Resolve deployment + definitions into resolved RootCfg (semantic validation runs inside
     // build_app_from_config — the one construction path).
-    let cfg = config::resolve(&deploy, &defs)
+    let mut cfg = config::resolve(&deploy, &defs)
         .unwrap_or_else(|errs| die(format!("config errors:\n  - {}", errs.join("\n  - "))));
+    // The BASE hook names (config-defined, pre-overlay): the admin API refuses to PUT-replace one.
+    let base_hook_names: std::collections::HashSet<String> = cfg.hooks.keys().cloned().collect();
+    // Merge the persisted overlay (API-registered hooks) onto the RESOLVED registry.
+    if let Some(doc) = overlay_doc {
+        config::overlay::merge_into(&mut cfg, doc);
+    }
 
     // Metadata-SSRF protection status (discoverability). When the nuclear `allow_all_metadata` is set
     // the guard is OFF — that is a security-relevant degradation, so WARN. Otherwise report the count
@@ -695,10 +703,11 @@ async fn run() {
     let admin_tls_cfg = cfg.admin_tls.clone();
     let req_body_max = cfg.limits.request_body_max_bytes;
     let max_inbound = cfg.limits.max_inbound_concurrent;
+    // The secret resolver the listeners resolve TLS cert/key/CA references through - the SAME seam
+    // (built-in env/file + kind:secret plugins) that resolved provider keys at build time.
     let app = Arc::new(
         build_app_from_config(
             cfg,
-            governance_cfg,
             plugins_cfg,
             overlay_path,
             base_hook_names,
@@ -790,6 +799,9 @@ async fn run() {
     // concurrency layer (0 = unlimited / no layer, the default). The admin surface is built onto its
     // OWN router (ABSENT from the data router) and served on `admin_listen` below; the data router
     // serves the protocols. Both share one `app_handle`, so config-apply hot-swaps reach both planes.
+    // Grab the secret resolver before `app` is moved into the router builder - the TLS listeners
+    // resolve cert/key/CA references through it below.
+    let tls_secret_resolver = app.secret_resolver.clone();
     let (data_router, admin_router, app_handle) = build_split_routers_with_limits(
         app,
         req_body_max,
@@ -837,6 +849,7 @@ async fn run() {
             data_listener,
             data_router,
             tls_cfg,
+            tls_secret_resolver.clone(),
             &listen,
             recv_shutdown(shutdown_tx.subscribe()),
         ),
@@ -844,6 +857,7 @@ async fn run() {
             admin_listener,
             admin_router,
             admin_tls_cfg,
+            tls_secret_resolver.clone(),
             &admin_listen,
             recv_shutdown(shutdown_tx.subscribe()),
         ),
@@ -893,6 +907,7 @@ async fn serve_listener(
     listener: tokio::net::TcpListener,
     router: Router,
     tls_cfg: Option<crate::config::TlsCfg>,
+    secret_resolver: Arc<crate::config::secret::SecretResolver>,
     label: &str,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
@@ -905,9 +920,9 @@ async fn serve_listener(
         }
         Some(tls) => {
             tls::install_crypto_provider();
-            let server_config = tls::build_server_config(&tls)
+            let server_config = tls::build_server_config(&tls, &secret_resolver)
                 .unwrap_or_else(|e| die(format!("TLS configuration error for '{label}': {e}")));
-            let mtls = tls.client_ca_file.is_some();
+            let mtls = tls.client_ca.is_some();
             tracing::info!(listen = %label, mtls, "busbar listening (TLS)");
             if let Err(e) = tls::serve(listener, router, server_config, shutdown).await {
                 die(format!("server error on '{label}': {e}"));
@@ -1243,7 +1258,10 @@ pub(crate) struct LoadedConfig {
     pub(crate) deploy: config::DeployCfg,
     pub(crate) defs: HashMap<String, config::ProviderDef>,
     pub(crate) overlay_path: Option<std::path::PathBuf>,
-    pub(crate) base_hook_names: std::collections::HashSet<String>,
+    /// The persisted overlay document (API-registered hooks), applied onto the RESOLVED config
+    /// (`overlay::merge_into(&mut RootCfg, …)`) after `config::resolve` - the runtime registry is
+    /// synthesized there, so the overlay merges post-resolve. `None` = absent / safe mode.
+    pub(crate) overlay_doc: Option<config::overlay::OverlayDoc>,
     /// `${VAR}` refs that were UNSET during interpolation. Empty under Strict (boot/reload); populated
     /// under Lenient (--validate), where it becomes the "set these at runtime" note.
     pub(crate) unset_env_vars: Vec<String>,
@@ -1281,13 +1299,12 @@ pub(crate) fn load_config_from_disk(
     let interpolated_config =
         config::interpolate_env_with(&raw_config, env_mode, &mut unset_env_vars)
             .map_err(|e| format!("config.yaml: {e}"))?;
-    let mut deploy: config::DeployCfg =
-        serde_yaml::from_str(&interpolated_config).map_err(|e| {
-            format!(
-                "config.yaml: invalid YAML: {}",
-                config::augment_config_error(e)
-            )
-        })?;
+    let deploy: config::DeployCfg = serde_yaml::from_str(&interpolated_config).map_err(|e| {
+        format!(
+            "config.yaml: invalid YAML: {}",
+            config::augment_config_error(e)
+        )
+    })?;
 
     // Config-overlay persistence (opt-in via `BUSBAR_CONFIG_OVERLAY`): capture the BASE hook names
     // BEFORE the overlay merges in API-registered hooks (the admin API refuses to PUT-replace a
@@ -1296,7 +1313,6 @@ pub(crate) fn load_config_from_disk(
         .ok()
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
-    let base_hook_names: std::collections::HashSet<String> = deploy.hooks.keys().cloned().collect();
     if safe_mode {
         // `--safe-mode` (D3): boot on the operator-owned base config ALONE — the persisted overlay
         // (API-registered hooks) is quarantined, not deleted. The escape hatch for "an applied
@@ -1309,25 +1325,26 @@ pub(crate) fn load_config_from_disk(
             deploy,
             defs,
             overlay_path,
-            base_hook_names,
+            overlay_doc: None,
             unset_env_vars,
         });
     }
-    if let Some(ref p) = overlay_path {
-        if let Some(doc) = config::overlay::read(p) {
+    let overlay_doc = overlay_path.as_ref().and_then(|p| {
+        let doc = config::overlay::read(p);
+        if let Some(ref d) = doc {
             tracing::info!(
                 path = %p.display(),
-                hooks = doc.hooks.len(),
-                "merging persisted config overlay onto base config"
+                hooks = d.hooks.len(),
+                "config overlay loaded (merged onto the resolved config after resolve)"
             );
-            config::overlay::merge_into(&mut deploy, doc);
         }
-    }
+        doc
+    });
     Ok(LoadedConfig {
         deploy,
         defs,
         overlay_path,
-        base_hook_names,
+        overlay_doc,
         unset_env_vars,
     })
 }
@@ -1359,21 +1376,21 @@ pub(crate) fn load_config_from_disk(
 /// Returns the validated registry (empty when plugins are disabled and no plugin is referenced).
 /// NO plugin code runs in this function (manifest-only; `dlopen` happens later, at store open).
 pub(crate) fn plugins_preflight(
-    governance_cfg: Option<&config::GovernanceCfg>,
+    store_cfg: Option<&config::StoreCfg>,
     plugins_cfg: &config::PluginsCfg,
 ) -> Result<busbar_plugin_loader::PluginRegistry, String> {
-    let store_ref = governance_cfg
-        .map(|g| g.store.as_str())
+    let store_ref = store_cfg
+        .map(|g| g.module.as_str())
         .unwrap_or(config::GOVERNANCE_STORE_MEMORY);
     let store_is_plugin = store_ref != config::GOVERNANCE_STORE_MEMORY;
 
     // 1. Consistency: referencing a plugin store while the master switch is off is a NAMED error.
     if store_is_plugin && !plugins_cfg.enabled {
         return Err(format!(
-            "governance.store: '{store_ref}' requires the plugin subsystem, but plugins.enabled is \
+            "store.module: '{store_ref}' requires the plugin subsystem, but plugins.enabled is \
              false (the default). Set plugins.enabled: true and place the signed \
              '{store_ref}' store plugin tarball in the plugins directory ('{}'), or set \
-             governance.store: memory.",
+             store.module: memory.",
             plugins_cfg.dir
         ));
     }
@@ -1431,7 +1448,7 @@ pub(crate) fn plugins_preflight(
             Some(p) if p.manifest.kind == "store" => {}
             Some(p) => {
                 return Err(format!(
-                    "governance.store: '{store_ref}' resolves to plugin '{}' of kind '{}', not a \
+                    "store.module: '{store_ref}' resolves to plugin '{}' of kind '{}', not a \
                      store plugin",
                     p.manifest.name, p.manifest.kind
                 ));
@@ -1439,14 +1456,14 @@ pub(crate) fn plugins_preflight(
             None => {
                 return Err(match registry.unresolved_reason(store_ref) {
                     Some(s) => format!(
-                        "governance.store: '{store_ref}' matches plugin '{}' ({}) but it was not \
+                        "store.module: '{store_ref}' matches plugin '{}' ({}) but it was not \
                          loaded: {}",
                         s.manifest.name, s.file, s.reason
                     ),
                     None => format!(
-                        "governance.store: '{store_ref}' does not match any plugin in '{}' (by \
+                        "store.module: '{store_ref}' does not match any plugin in '{}' (by \
                          alias or canonical name; loadable: [{}]). Install the store plugin \
-                         tarball, or set governance.store: memory.",
+                         tarball, or set store.module: memory.",
                         plugins_cfg.dir,
                         registry
                             .loadable()
@@ -1462,22 +1479,37 @@ pub(crate) fn plugins_preflight(
     Ok(registry)
 }
 
-/// The JSON config blob handed to a store plugin's `open`. A SUPERSET across the shipped stores
-/// (each plugin reads the keys it needs and ignores the rest): `db_path` (sqlite file path),
-/// `url` (postgres/redis connection URL — carried in `governance.db_path`), `busy_timeout_ms`
-/// (sqlite).
-fn store_plugin_cfg_json(g: &config::GovernanceCfg) -> String {
-    serde_json::json!({
-        "db_path": g.db_path,
-        "url": g.db_path,
-        "busy_timeout_ms": g.sqlite_busy_timeout_ms,
-    })
-    .to_string()
+/// The JSON config blob handed to a store plugin's `open`: the operator's `store.settings` map,
+/// VERBATIM (S6/C2c: `settings` is the module's own opaque config - the sqlite plugin reads
+/// `db_path`/`busy_timeout_ms`, postgres/redis read `url`; a third-party store reads whatever it
+/// documents). busbar never interprets it.
+fn store_plugin_cfg_json(g: &config::StoreCfg) -> String {
+    serde_json::Value::Object(g.settings.clone()).to_string()
+}
+
+/// Build the [`config::secret::SecretResolver`] the engine resolves every secret reference through:
+/// the built-in `env`/`file` modules inline, and any OTHER module name via a loaded `kind: secret`
+/// plugin from `registry` (opened per resolution; a secret module is off every hot path so the
+/// per-call open + resolve is fine). FAIL-CLOSED: `open_secret` errors surface as an unresolvable
+/// secret. When the plugin subsystem is off the registry is empty and every non-built-in reference
+/// is a fail-closed error at resolve time.
+fn build_secret_resolver(
+    registry: Arc<busbar_plugin_loader::PluginRegistry>,
+) -> config::secret::SecretResolver {
+    config::secret::SecretResolver::with_plugin(Box::new(
+        move |module: &str, settings: &str| -> Result<Vec<u8>, String> {
+            let m = registry.open_secret(module, "{}")?;
+            m.resolve(
+                &serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(settings)
+                    .map_err(|e| format!("secret settings are not a JSON object: {e}"))?,
+            )
+            .map_err(|e| e.to_string())
+        },
+    ))
 }
 
 pub(crate) fn build_app_from_config(
     cfg: config::RootCfg,
-    governance_cfg: Option<config::GovernanceCfg>,
     plugins_cfg: config::PluginsCfg,
     overlay_path: Option<std::path::PathBuf>,
     base_hook_names: std::collections::HashSet<String>,
@@ -1506,6 +1538,17 @@ pub(crate) fn build_app_from_config(
         .auth
         .clone()
         .unwrap_or_else(config::AuthCfg::default_none);
+
+    // PLUGIN PRE-FLIGHT (the ONE shared pipeline; see the fn doc). Run UP FRONT so the secret
+    // resolver - and the store open below - both draw on the same validated registry. A non-memory
+    // store, an unresolvable secret plugin, or any invalid tarball fails boot here.
+    let plugin_registry = Arc::new(plugins_preflight(cfg.store.as_ref(), &plugins_cfg)?);
+
+    // The SECRET RESOLVER (P2): built-in env/file resolve inline; any other module delegates to a
+    // loaded `kind: secret` plugin via the registry (fail-closed if the plugin subsystem is off or
+    // the module is unknown). Shared by provider keys, the admin token, and the TLS listener.
+    let secret_resolver = Arc::new(build_secret_resolver(plugin_registry.clone()));
+
     let mut lanes_data = Vec::new();
     // Validated provider handle for each lane, captured in lockstep with `lanes_data` below. The
     // first loop already resolves `cfg.providers.get(&mc.provider)` (failing loud via `die` on a
@@ -1534,9 +1577,9 @@ pub(crate) fn build_app_from_config(
     // which survives the swap - so a rate-card correction reprices every derived figure on the
     // next read (tokens are the truth).
     let cost = Arc::new(crate::cost::CostModel::resolve_parts(
-        &governance_cfg.clone().unwrap_or_default(),
-        &cfg.models,
-        &cfg.pools,
+        cfg.rate_card.as_ref(),
+        cfg.per_request_fee,
+        &cfg.groups,
     ));
 
     let mut sorted_models: Vec<_> = cfg.models.into_iter().collect();
@@ -1549,13 +1592,23 @@ pub(crate) fn build_app_from_config(
                 mc.provider
             ));
         };
-        let key = provider_api_keys
-            .entry(mc.provider.clone())
-            .or_insert_with(|| std::env::var(&provider_cfg.api_key_env).unwrap_or_default());
+        let key = provider_api_keys.entry(mc.provider.clone()).or_insert_with(|| {
+            // Resolve the provider credential through its SECRET REFERENCE. An unresolvable
+            // secret degrades to the empty key with a loud warning (parity with the old empty
+            // env-var posture: keyless local upstreams - ollama/vLLM - are legitimate).
+            match secret_resolver.resolve_string(&provider_cfg.api_key) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!(provider = %mc.provider, "provider api_key did not resolve: {e}");
+                    String::new()
+                }
+            }
+        });
         if key.is_empty() {
             eprintln!(
-                "[warn] provider {} key env {} empty",
-                mc.provider, provider_cfg.api_key_env
+                "[warn] provider {} api_key ({}) empty",
+                mc.provider,
+                provider_cfg.api_key.describe()
             );
         }
         let limited = mc.max_requests >= 0;
@@ -1724,10 +1777,10 @@ pub(crate) fn build_app_from_config(
         let mut weighted_members: Vec<WeightedLane> = Vec::with_capacity(pool.members.len());
         for m in pool.members.iter() {
             {
-                let Some(&lane_idx) = by_model.get(&m.target) else {
+                let Some(&lane_idx) = by_model.get(&m.model) else {
                     return Err(format!(
                         "pool '{name}' references unknown model '{}'",
-                        m.target
+                        m.model
                     ));
                 };
                 weighted_members.push(WeightedLane {
@@ -1910,14 +1963,18 @@ pub(crate) fn build_app_from_config(
                     .members
                     .iter()
                     .filter_map(|m| {
-                        by_model.get(&m.target).map(|&idx| {
+                        by_model.get(&m.model).map(|&idx| {
                             (
                                 idx,
                                 state::MemberMeta {
                                     tier: m.tier.clone(),
-                                    // The ROUTING scalar projection of either cost shape (a bare
-                                    // per-mtok number, or the blended 4-tier rate override).
-                                    cost_per_mtok: m.cost_per_mtok.as_ref().map(|c| c.per_mtok()),
+                                    // S5: the routing cost scalar derives from the member's
+                                    // MODEL's rate_card entry - cost lives on no pool member.
+                                    cost_per_mtok: cfg
+                                        .rate_card
+                                        .as_ref()
+                                        .and_then(|card| card.get(&m.model))
+                                        .map(crate::config::rate_entry_per_mtok),
                                     tags: m.tags.clone(),
                                 },
                             )
@@ -1956,18 +2013,10 @@ pub(crate) fn build_app_from_config(
     let mut on_exhausted_cfgs = std::collections::HashMap::new();
     for (pool_name, pool_cfg) in &cfg.pools {
         if let Some(ref on_exc) = pool_cfg.on_exhausted {
-            match crate::config::OnExhausted::parse(&on_exc.action) {
-                Ok(mode) => {
-                    tracing::info!(pool = %pool_name, on_exhausted = ?mode, "pool exhaustion policy");
-                    on_exhausted_cfgs.insert(pool_name.clone(), mode);
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "pool '{pool_name}' has invalid on_exhausted action '{}': {e}",
-                        on_exc.action
-                    ))
-                }
-            }
+            // The structured config value maps directly (unknown spellings already failed parse).
+            let mode = on_exc.to_runtime();
+            tracing::info!(pool = %pool_name, on_exhausted = ?mode, "pool exhaustion policy");
+            on_exhausted_cfgs.insert(pool_name.clone(), mode);
         } else {
             // Default to Status503 if not specified
             on_exhausted_cfgs.insert(pool_name.clone(), crate::config::OnExhausted::Status503);
@@ -1978,8 +2027,6 @@ pub(crate) fn build_app_from_config(
     // three-phase scan -> store resolution). Runs on EVERY construction path (boot, apply, reload),
     // so a bad plugin state can never produce a partial App. When plugins are disabled and nothing
     // references one, this is a no-op empty registry.
-    let plugin_registry = plugins_preflight(governance_cfg.as_ref(), &plugins_cfg)?;
-
     // open the governance store + load the virtual-key cache when enabled.
     let governance = if let Some(p) = prior {
         // REUSED across applies: the keys + spend/rate state must survive config changes.
@@ -1989,27 +2036,32 @@ pub(crate) fn build_app_from_config(
         // minted). Only the STORE backend is a choice: ephemeral RAM by default, or a store PLUGIN
         // (resolved by alias or canonical name from the validated registry — the engine sees only the
         // returned `dyn Store`, exactly like a compiled-in backend).
-        let g = governance_cfg.unwrap_or_default();
-        let store: Arc<dyn governance::Store> = if g.store == crate::config::GOVERNANCE_STORE_MEMORY
-        {
-            tracing::warn!(
-                "governance store: in-memory (ephemeral) — keys, budgets, and usage reset on \
+        let g = cfg.store.clone().unwrap_or_default();
+        let store: Arc<dyn governance::Store> =
+            if g.module == crate::config::GOVERNANCE_STORE_MEMORY {
+                tracing::warn!(
+                    "store: in-memory (ephemeral) - keys, groups' usage, and ledgers reset on \
                      restart; configure a durable store plugin for persistence"
-            );
-            Arc::new(governance::MemoryStore::new())
-        } else {
-            let cfg_json = store_plugin_cfg_json(&g);
-            match plugin_registry.open_store(&g.store, &cfg_json) {
-                Ok(s) => Arc::from(s),
-                Err(e) => {
-                    return Err(format!(
-                        "governance store '{}' plugin load failed: {e}",
-                        g.store
-                    ))
+                );
+                Arc::new(governance::MemoryStore::new())
+            } else {
+                let cfg_json = store_plugin_cfg_json(&g);
+                match plugin_registry.open_store(&g.module, &cfg_json) {
+                    Ok(s) => Arc::from(s),
+                    Err(e) => return Err(format!("store '{}' plugin load failed: {e}", g.module)),
                 }
-            }
-        };
-        match governance::GovState::new(store, g.admin_token.clone()) {
+            };
+        // The operator ADMIN credential: the `admin-tokens` chain entry's `token:` secret ref.
+        // FAIL-CLOSED: a configured-but-unresolvable admin token refuses boot (a silently-absent
+        // token would lock the admin API while the operator believes it is guarded).
+        let admin_token: Option<String> =
+            match cfg.auth.as_ref().and_then(|a| a.admin_token_ref()) {
+                Some(r) => Some(secret_resolver.resolve_string(r).map_err(|e| {
+                    format!("auth.admin_auth admin-tokens token did not resolve: {e}")
+                })?),
+                None => None,
+            };
+        match governance::GovState::new(store, admin_token.clone()) {
             Ok(gs) => {
                 let gs = Arc::new(gs);
                 // BOOT-ONLY crash-recovery: hydrate the in-memory token-ledger cells (key buckets +
@@ -2041,8 +2093,8 @@ pub(crate) fn build_app_from_config(
                     if let Some(group) = k.budget_group.as_deref() {
                         if cost.group_named(group).is_none() {
                             return Err(format!(
-                                "virtual key '{}' names budget_group '{group}', which does not exist in governance.budget_groups.\n\
-                                 Paste this under governance.budget_groups and set a real cap:\n\n    {group}: {{ max_budget_cents: 0, budget_period: monthly }}\n",
+                                "virtual key '{}' names group '{group}', which does not exist in the top-level groups block.\n\
+                                 Paste this under groups and set real limits:\n\n    {group}:\n      limits:\n        - {{ budget: 0, per: month }}\n",
                                 k.id
                             ));
                         }
@@ -2056,12 +2108,9 @@ pub(crate) fn build_app_from_config(
                 // it. RAM stores can't reach this state, so `key_count` there is 0 (or the store is
                 // non-durable) and the banner is None. `all_keys()` failure is non-fatal — treat as 0
                 // keys (the enforcement gate is unaffected; we only lose the advisory).
-                let store_is_durable = g.store != crate::config::GOVERNANCE_STORE_MEMORY;
+                let store_is_durable = g.module != crate::config::GOVERNANCE_STORE_MEMORY;
                 let key_count = gs.all_keys().map(|k| k.len()).unwrap_or(0);
-                let admin_token_set = g
-                    .admin_token
-                    .as_deref()
-                    .is_some_and(|t| !t.trim().is_empty());
+                let admin_token_set = admin_token.as_deref().is_some_and(|t| !t.trim().is_empty());
                 if let Some(banner) =
                     inert_durable_keys_banner(store_is_durable, key_count, admin_token_set)
                 {
@@ -2154,12 +2203,26 @@ pub(crate) fn build_app_from_config(
             || Arc::new(auth_cache::CredentialCache::new()),
             |p| p.credential_cache.clone(),
         ),
-        auth_modules: cfg
+        auth_scope_caps: cfg
             .auth
             .as_ref()
-            .map(|a| a.modules.clone())
+            .map(|a| {
+                a.chain
+                    .iter()
+                    .chain(a.admin_auth.iter())
+                    .filter_map(|e| {
+                        e.max_admin_scope
+                            .as_ref()
+                            .map(|sc| (e.module.clone(), sc.clone()))
+                    })
+                    .collect()
+            })
             .unwrap_or_default(),
-        group_map: cfg.group_map.clone(),
+        role_bindings: cfg
+            .auth
+            .as_ref()
+            .map(|a| a.role_bindings.clone())
+            .unwrap_or_default(),
         config_path: config_paths.0,
         providers_path: config_paths.1,
         overlay_path,
@@ -2169,6 +2232,7 @@ pub(crate) fn build_app_from_config(
         fallback_pools,
         on_exhausted_cfgs,
         governance,
+        secret_resolver,
         cost,
         plugins_dir: std::path::PathBuf::from(&plugins_cfg.dir),
         plugins_cfg,

@@ -39,7 +39,6 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,83 +96,106 @@ pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Read a file, mapping any I/O error into a clear, file-named message. Never logs contents.
-fn read_pem(path: &str, what: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(Path::new(path)).map_err(|e| format!("cannot read TLS {what} '{path}': {e}"))
+/// Resolve a TLS secret reference to its PEM bytes, mapping any resolve error into a clear,
+/// source-named message. Never logs contents.
+fn read_pem(
+    resolver: &crate::config::secret::SecretResolver,
+    secret: &crate::config::SecretRef,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    resolver
+        .resolve(secret)
+        .map_err(|e| format!("cannot resolve TLS {what} ({}): {e}", secret.describe()))
 }
 
-/// Parse the PEM certificate chain (leaf first). Errors name the file; cert bytes are public, but we
-/// still avoid echoing them.
-fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
-    let bytes = read_pem(path, "cert_file")?;
+/// Parse the PEM certificate chain (leaf first). Errors name the secret source; cert bytes are
+/// public, but we still avoid echoing them.
+fn load_cert_chain(
+    resolver: &crate::config::secret::SecretResolver,
+    secret: &crate::config::SecretRef,
+) -> Result<Vec<CertificateDer<'static>>, String> {
+    let src = secret.describe();
+    let bytes = read_pem(resolver, secret, "cert")?;
     let certs = CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("cannot parse TLS cert_file '{path}': {e}"))?;
+        .map_err(|e| format!("cannot parse TLS cert ({src}): {e}"))?;
     if certs.is_empty() {
         return Err(format!(
-            "TLS cert_file '{path}' contains no certificates (expected a PEM chain, leaf first)"
+            "TLS cert ({src}) contains no certificates (expected a PEM chain, leaf first)"
         ));
     }
     Ok(certs)
 }
 
 /// Parse the PEM private key, accepting PKCS#8, PKCS#1 (RSA), or SEC1 (EC) encodings. NEVER logs key
-/// material — error messages name only the file path.
-fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
-    let bytes = read_pem(path, "key_file")?;
+/// material - error messages name only the secret source.
+fn load_private_key(
+    resolver: &crate::config::secret::SecretResolver,
+    secret: &crate::config::SecretRef,
+) -> Result<PrivateKeyDer<'static>, String> {
+    let src = secret.describe();
+    let bytes = read_pem(resolver, secret, "key")?;
     // `PrivateKeyDer::from_pem_slice` accepts PKCS#8, PKCS#1 (RSA), and SEC1 (EC) sections, picking the
     // first private-key section it finds. `NoItemsFound` means none was present; any other variant is a
-    // genuine parse error. Neither path echoes key material — error messages name only the file.
+    // genuine parse error. Neither path echoes key material - error messages name only the source.
     use rustls::pki_types::pem::Error as PemError;
     PrivateKeyDer::from_pem_slice(&bytes).map_err(|e| match e {
         PemError::NoItemsFound => {
-            format!("TLS key_file '{path}' contains no private key (expected PKCS#8 / PKCS#1 / SEC1 PEM)")
+            format!("TLS key ({src}) contains no private key (expected PKCS#8 / PKCS#1 / SEC1 PEM)")
         }
-        other => format!("cannot parse TLS key_file '{path}': {other}"),
+        other => format!("cannot parse TLS key ({src}): {other}"),
     })
 }
 
 /// Build the client-cert verifier root store from the operator's CA bundle (mTLS).
-fn load_client_roots(path: &str) -> Result<RootCertStore, String> {
-    let bytes = read_pem(path, "client_ca_file")?;
+fn load_client_roots(
+    resolver: &crate::config::secret::SecretResolver,
+    secret: &crate::config::SecretRef,
+) -> Result<RootCertStore, String> {
+    let src = secret.describe();
+    let bytes = read_pem(resolver, secret, "client_ca")?;
     let cas = CertificateDer::pem_slice_iter(&bytes)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("cannot parse TLS client_ca_file '{path}': {e}"))?;
+        .map_err(|e| format!("cannot parse TLS client_ca ({src}): {e}"))?;
     if cas.is_empty() {
-        return Err(format!(
-            "TLS client_ca_file '{path}' contains no CA certificates"
-        ));
+        return Err(format!("TLS client_ca ({src}) contains no CA certificates"));
     }
     let mut roots = RootCertStore::empty();
     for ca in cas {
         roots
             .add(ca)
-            .map_err(|e| format!("invalid CA certificate in TLS client_ca_file '{path}': {e}"))?;
+            .map_err(|e| format!("invalid CA certificate in TLS client_ca ({src}): {e}"))?;
     }
     Ok(roots)
 }
 
 /// Construct the rustls [`ServerConfig`] from the operator's [`TlsCfg`].
 ///
-/// * `client_ca_file` present ⇒ a [`WebPkiClientVerifier`] is installed: the client MUST present a
+/// * `client_ca` present ⇒ a [`WebPkiClientVerifier`] is installed: the client MUST present a
 ///   certificate chaining to that CA or the handshake fails (mTLS required).
-/// * `client_ca_file` absent ⇒ `with_no_client_auth()` (server-only TLS).
+/// * `client_ca` absent ⇒ `with_no_client_auth()` (server-only TLS).
 ///
 /// ALPN advertises only `http/1.1` — busbar's axum server speaks http/1.1, so we must not advertise
-/// h2. Returns a clear, file-named error on any load/parse problem (the caller turns it into `die`).
-pub(crate) fn build_server_config(tls: &TlsCfg) -> Result<ServerConfig, String> {
-    let certs = load_cert_chain(&tls.cert_file)?;
-    let key = load_private_key(&tls.key_file)?;
+/// h2. Returns a clear, source-named error on any load/parse problem (the caller turns it into `die`).
+pub(crate) fn build_server_config(
+    tls: &TlsCfg,
+    resolver: &crate::config::secret::SecretResolver,
+) -> Result<ServerConfig, String> {
+    let certs = load_cert_chain(resolver, &tls.cert)?;
+    let key = load_private_key(resolver, &tls.key)?;
 
     let builder = ServerConfig::builder();
 
-    let builder = match &tls.client_ca_file {
-        Some(ca_path) => {
-            let roots = load_client_roots(ca_path)?;
+    let builder = match &tls.client_ca {
+        Some(ca) => {
+            let roots = load_client_roots(resolver, ca)?;
             let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
                 .build()
                 .map_err(|e| {
-                    format!("cannot build client-cert verifier from TLS client_ca_file '{ca_path}': {e}")
+                    format!(
+                        "cannot build client-cert verifier from TLS client_ca ({}): {e}",
+                        ca.describe()
+                    )
                 })?;
             builder.with_client_cert_verifier(verifier)
         }
@@ -182,8 +204,9 @@ pub(crate) fn build_server_config(tls: &TlsCfg) -> Result<ServerConfig, String> 
 
     let mut config = builder.with_single_cert(certs, key).map_err(|e| {
         format!(
-            "TLS cert/key are not a valid pair (cert_file '{}', key_file '{}'): {e}",
-            tls.cert_file, tls.key_file
+            "TLS cert/key are not a valid pair (cert {}, key {}): {e}",
+            tls.cert.describe(),
+            tls.key.describe()
         )
     })?;
 
@@ -561,7 +584,11 @@ mod tests {
     /// install provider → build ServerConfig → `tls::serve`.
     async fn spawn_tls_server(tls: &TlsCfg) -> (SocketAddr, oneshot::Sender<()>) {
         super::install_crypto_provider();
-        let server_config = super::build_server_config(tls).expect("valid test TLS config");
+        let server_config = super::build_server_config(
+            tls,
+            &crate::config::secret::SecretResolver::builtins_only(),
+        )
+        .expect("valid test TLS config");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel::<()>();
@@ -586,9 +613,9 @@ mod tests {
         let cert_file = temp_pem("srv-cert", &cert_pem);
         let key_file = temp_pem("srv-key", &key_pem);
         let tls = TlsCfg {
-            cert_file: cert_file.to_string_lossy().into_owned(),
-            key_file: key_file.to_string_lossy().into_owned(),
-            client_ca_file: None,
+            cert: crate::config::SecretRef::file(cert_file.to_string_lossy().into_owned()),
+            key: crate::config::SecretRef::file(key_file.to_string_lossy().into_owned()),
+            client_ca: None,
         };
         let (addr, _stop) = spawn_tls_server(&tls).await;
 
@@ -616,9 +643,11 @@ mod tests {
         let key_file = temp_pem("m2-srv-key", &srv_key_pem);
         let ca_file = temp_pem("m2-ca", &ca_pem);
         let tls = TlsCfg {
-            cert_file: cert_file.to_string_lossy().into_owned(),
-            key_file: key_file.to_string_lossy().into_owned(),
-            client_ca_file: Some(ca_file.to_string_lossy().into_owned()),
+            cert: crate::config::SecretRef::file(cert_file.to_string_lossy().into_owned()),
+            key: crate::config::SecretRef::file(key_file.to_string_lossy().into_owned()),
+            client_ca: Some(crate::config::SecretRef::file(
+                ca_file.to_string_lossy().into_owned(),
+            )),
         };
         let (addr, _stop) = spawn_tls_server(&tls).await;
 
@@ -649,9 +678,11 @@ mod tests {
         let key_file = temp_pem("m3-srv-key", &srv_key_pem);
         let ca_file = temp_pem("m3-ca", &ca_pem);
         let tls = TlsCfg {
-            cert_file: cert_file.to_string_lossy().into_owned(),
-            key_file: key_file.to_string_lossy().into_owned(),
-            client_ca_file: Some(ca_file.to_string_lossy().into_owned()),
+            cert: crate::config::SecretRef::file(cert_file.to_string_lossy().into_owned()),
+            key: crate::config::SecretRef::file(key_file.to_string_lossy().into_owned()),
+            client_ca: Some(crate::config::SecretRef::file(
+                ca_file.to_string_lossy().into_owned(),
+            )),
         };
         let (addr, _stop) = spawn_tls_server(&tls).await;
         let url = format!("https://localhost:{}/healthz", addr.port());
@@ -731,13 +762,17 @@ mod tests {
     #[test]
     fn bad_cert_path_errors_clearly() {
         let tls = TlsCfg {
-            cert_file: "/nonexistent/busbar/does-not-exist-cert.pem".into(),
-            key_file: "/nonexistent/busbar/does-not-exist-key.pem".into(),
-            client_ca_file: None,
+            cert: crate::config::SecretRef::file("/nonexistent/busbar/does-not-exist-cert.pem"),
+            key: crate::config::SecretRef::file("/nonexistent/busbar/does-not-exist-key.pem"),
+            client_ca: None,
         };
-        let err = super::build_server_config(&tls).expect_err("missing cert file must error");
+        let err = super::build_server_config(
+            &tls,
+            &crate::config::secret::SecretResolver::builtins_only(),
+        )
+        .expect_err("missing cert file must error");
         assert!(
-            err.contains("cert_file") && err.contains("does-not-exist-cert.pem"),
+            err.contains("cert") && err.contains("does-not-exist-cert.pem"),
             "error must name the offending file: {err}"
         );
     }
@@ -749,15 +784,16 @@ mod tests {
         let (_c, key_pem) = gen_self_signed();
         let key_file = temp_pem("ok-key", &key_pem);
         let tls = TlsCfg {
-            cert_file: cert_file.to_string_lossy().into_owned(),
-            key_file: key_file.to_string_lossy().into_owned(),
-            client_ca_file: None,
+            cert: crate::config::SecretRef::file(cert_file.to_string_lossy().into_owned()),
+            key: crate::config::SecretRef::file(key_file.to_string_lossy().into_owned()),
+            client_ca: None,
         };
-        let err = super::build_server_config(&tls).expect_err("malformed cert must error");
-        assert!(
-            err.contains("cert_file"),
-            "error must reference cert_file: {err}"
-        );
+        let err = super::build_server_config(
+            &tls,
+            &crate::config::secret::SecretResolver::builtins_only(),
+        )
+        .expect_err("malformed cert must error");
+        assert!(err.contains("cert"), "error must reference the cert: {err}");
     }
 
     /// TEST 5 - REGRESSION (P1 slow-loris BODY): the inbound body-read timeout trips on a stalled

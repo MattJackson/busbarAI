@@ -43,8 +43,8 @@ fn minimal_app() -> Arc<App> {
         base_hook_names: std::collections::HashSet::new(),
         admin_chain: vec!["admin-tokens".to_string()],
         credential_cache: StdArc::new(crate::auth_cache::CredentialCache::new()),
-        auth_modules: std::collections::HashMap::new(),
-        group_map: std::collections::HashMap::new(),
+        auth_scope_caps: std::collections::HashMap::new(),
+        role_bindings: crate::config::RoleBindings::new(),
         config_path: None,
         providers_path: None,
         overlay_path: None,
@@ -54,6 +54,7 @@ fn minimal_app() -> Arc<App> {
         fallback_pools: std::collections::HashMap::new(),
         on_exhausted_cfgs: std::collections::HashMap::new(),
         governance: None,
+        secret_resolver: std::sync::Arc::new(crate::config::secret::SecretResolver::builtins_only()),
         cost: std::sync::Arc::new(crate::cost::CostModel::flat(1)),
         plugins_dir: std::path::PathBuf::from("plugins"),
         plugins_cfg: crate::config::PluginsCfg::default(),
@@ -1966,12 +1967,13 @@ async fn test_served_request_increments_hot_path_metrics() {
 }
 
 /// THE GOVERNANCE RE-KEY end-to-end (§2.3): with governance ON and an external data-plane
-/// module in the chain, a group-mapped principal gets a SYNTHESIZED key — its group's pool ACL
-/// admits/denies (403), its rpm cap 429s with Retry-After, and an unmapped group is rejected
-/// outright (fail closed) — all keyed by the principal id through the same machinery a virtual
-/// key uses.
+/// module in the chain, a role-bound principal gets a SYNTHESIZED key - its binding's pool ACL
+/// admits/denies (403), an omitted `allowed_pools` grants ALL pools (C6), an explicit `[]`
+/// grants nothing, and an unbound role is rejected outright (fail closed) - all keyed by the
+/// principal id through the same machinery a virtual key uses. (Rate/budget caps no longer ride
+/// the synthesized key: limits live on `groups:`, keys are pure auth.)
 #[tokio::test]
-async fn test_group_mapped_principal_governed_like_a_virtual_key() {
+async fn test_role_bound_principal_governed_like_a_virtual_key() {
     use crate::governance::{GovState, MemoryStore};
     crate::metrics::init();
     let state = StdArc::new(MockServerState::new());
@@ -1985,10 +1987,8 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
     let store = StdArc::new(MemoryStore::new());
     let gov = StdArc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["test-groups-module".to_string()],
-        upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![],
-        modules: std::collections::HashMap::new(),
+        chain: vec![crate::config::AuthChainEntry::bare("test-groups-module")],
+        ..crate::config::AuthCfg::default_none()
     };
     let mut app = TestApp::new()
         .lane(
@@ -2008,21 +2008,30 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
         .build();
     {
         let inner = StdArc::get_mut(&mut app).expect("sole owner");
-        inner.group_map.insert(
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
             "llm-users".to_string(),
-            crate::config::GroupMapEntry {
+            crate::config::RoleBindingCfg {
                 allowed_pools: Some(vec!["gpool-a".to_string()]),
                 ..Default::default()
             },
         );
-        inner.group_map.insert(
+        // OMITTED allowed_pools = ALL pools (C6).
+        table.insert(
             "batch".to_string(),
-            crate::config::GroupMapEntry {
-                allowed_pools: Some(vec!["gpool-a".to_string()]),
-                rpm_limit: Some(1),
+            crate::config::RoleBindingCfg::default(),
+        );
+        // Explicit [] = NO pools (the empty set, fail closed).
+        table.insert(
+            "locked".to_string(),
+            crate::config::RoleBindingCfg {
+                allowed_pools: Some(vec![]),
                 ..Default::default()
             },
         );
+        inner
+            .role_bindings
+            .insert("test-groups-module".to_string(), table);
     }
     let (addr, handle) = serve(app).await;
     let client = reqwest::Client::new();
@@ -2038,26 +2047,25 @@ async fn test_group_mapped_principal_governed_like_a_virtual_key() {
             .send()
     };
 
-    // Pool ACL from the group grant: gpool-a serves, gpool-b is denied.
+    // Pool ACL from the role binding: gpool-a serves, gpool-b is denied.
     let r = send("grp:llm-users", "gpool-a").await.unwrap();
     assert_eq!(r.status().as_u16(), 200, "granted pool serves");
     let r = send("grp:llm-users", "gpool-b").await.unwrap();
     assert_eq!(r.status().as_u16(), 403, "ungranted pool is denied");
 
-    // The rpm cap rides the synthesized key: second request in the window is a 429 with
-    // Retry-After, exactly like a capped virtual key.
+    // OMITTED allowed_pools grants every pool (C6).
     let r = send("grp:batch", "gpool-a").await.unwrap();
-    assert_eq!(r.status().as_u16(), 200);
-    let r = send("grp:batch", "gpool-a").await.unwrap();
-    assert_eq!(r.status().as_u16(), 429, "the group rpm cap enforces");
-    assert!(
-        r.headers().get("retry-after").is_some(),
-        "429 carries Retry-After"
-    );
+    assert_eq!(r.status().as_u16(), 200, "omitted allowed_pools grants all");
+    let r = send("grp:batch", "gpool-b").await.unwrap();
+    assert_eq!(r.status().as_u16(), 200, "omitted allowed_pools grants all");
 
-    // Fail closed: an identified principal whose groups earn no grant is rejected.
+    // Explicit [] grants the EMPTY SET: no data-plane access at all.
+    let r = send("grp:locked", "gpool-a").await.unwrap();
+    assert_eq!(r.status().as_u16(), 401, "allowed_pools [] grants nothing");
+
+    // Fail closed: an identified principal whose roles earn no binding is rejected.
     let r = send("grp:strangers", "gpool-a").await.unwrap();
-    assert_eq!(r.status().as_u16(), 401, "unmapped groups grant nothing");
+    assert_eq!(r.status().as_u16(), 401, "unbound roles grant nothing");
 
     handle.abort();
     server.shutdown().await;
@@ -5661,18 +5669,19 @@ fn governed_app_group_blocked() -> (Arc<App>, crate::governance::VirtualKey) {
     use crate::governance::{GovState, MemoryStore, NewKeySpec};
     let store = Arc::new(MemoryStore::new());
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
-    let mut gcfg = crate::config::GovernanceCfg::default();
-    gcfg.price_per_request_cents = 30;
-    gcfg.budget_groups = std::collections::BTreeMap::from([(
+    let groups = std::collections::BTreeMap::from([(
         "finance".to_string(),
-        crate::config::BudgetGroupCfg {
-            max_budget_cents: 0,
-            budget_period: "total".to_string(),
+        crate::config::GroupCfg {
             parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 0,
+                per: Some(crate::config::groups::LimitWindow::Total),
+            }],
         },
     )]);
-    let cost =
-        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+    let cost = crate::cost::CostModel::resolve_parts(None, 30, &groups);
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -5776,13 +5785,15 @@ async fn test_unpriced_passthrough_model_rejected_when_rate_card_present() {
             1_700_000_000,
         )
         .unwrap();
-    let mut gcfg = crate::config::GovernanceCfg::default();
-    gcfg.rate_card = Some(std::collections::BTreeMap::from([(
+    let rate_card = std::collections::BTreeMap::from([(
         "m".to_string(),
         crate::config::RateEntryCfg::default(),
-    )]));
-    let cost =
-        crate::cost::CostModel::resolve_parts(&gcfg, &Default::default(), &Default::default());
+    )]);
+    let cost = crate::cost::CostModel::resolve_parts(
+        Some(&rate_card),
+        0,
+        &std::collections::BTreeMap::new(),
+    );
     let mut app = minimal_app();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");

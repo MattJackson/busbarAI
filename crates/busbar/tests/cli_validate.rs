@@ -51,7 +51,7 @@ fn write_configs(dir: &Path, extra: &str) {
             r#"listen: "127.0.0.1:0"
 providers:
   mock:
-    api_key_env: MOCK_KEY
+    api_key: {{ env: MOCK_KEY }}
 models:
   test-model:
     provider: mock
@@ -133,12 +133,12 @@ fn validate_fails_on_unknown_config_key() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// FAIL-CLOSED (hard requirement 1+2): `governance.store: redis` with plugins disabled exits 1
+/// FAIL-CLOSED (hard requirement 1+2): `store.module: redis` with plugins disabled exits 1
 /// naming `plugins.enabled` — the exact same refusal boot performs.
 #[test]
 fn validate_fails_when_store_plugin_referenced_but_plugins_disabled() {
     let dir = fixture_dir("disabled");
-    write_configs(&dir, "governance:\n  store: redis\n");
+    write_configs(&dir, "store:\n  module: redis\n");
     let (code, _stdout, stderr) = run_busbar(&dir, &["--validate"]);
     assert_eq!(code, 1);
     assert!(
@@ -211,7 +211,7 @@ fn validate_trust_gate_matches_boot() {
     write_configs(
         &dir,
         &format!(
-            "{}governance:\n  store: sqlite\n",
+            "{}store:\n  module: sqlite\n",
             plugins_block(&dir, true, false)
         ),
     );
@@ -226,7 +226,7 @@ fn validate_trust_gate_matches_boot() {
     write_configs(
         &dir,
         &format!(
-            "{}governance:\n  store: sqlite\n",
+            "{}store:\n  module: sqlite\n",
             plugins_block(&dir, true, true)
         ),
     );
@@ -264,14 +264,14 @@ fn list_plugins_reports_statuses_without_loading() {
     write_configs(
         &dir,
         &format!(
-            "{}governance:\n  store: sqlite\n",
+            "{}store:\n  module: sqlite\n",
             plugins_block(&dir, true, true)
         ),
     );
     let (code, stdout, _stderr) = run_busbar(&dir, &["--list-plugins"]);
     assert_eq!(code, 0, "list-plugins is informational: {stdout}");
     assert!(
-        stdout.contains("LOADS (governance.store: sqlite)"),
+        stdout.contains("LOADS (store.module: sqlite)"),
         "the selected store row: {stdout}"
     );
     assert!(stdout.contains("busbar-store-sqlite"), "{stdout}");

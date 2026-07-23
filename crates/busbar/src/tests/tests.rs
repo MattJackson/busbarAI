@@ -85,21 +85,21 @@ fn pool(members: Vec<PoolMember>) -> PoolCfg {
         failover: None,
         on_exhausted: None,
         affinity: None,
+        module_hooks: Vec::new(),
         policy: crate::config::PoolPolicy::default(),
         gates: Vec::new(),
         base_named: false,
     }
 }
 
-fn member(target: &str, context_max: Option<usize>) -> PoolMember {
+fn member(model: &str, context_max: Option<usize>) -> PoolMember {
     PoolMember {
         reasoning: None,
-        target: target.to_string(),
+        model: model.to_string(),
         weight: 1,
         attempt_timeout_ms: None,
         context_max,
         tier: None,
-        cost_per_mtok: None,
         tags: Vec::new(),
     }
 }
@@ -709,9 +709,9 @@ fn plugins_cfg(dir: &std::path::Path, enabled: bool) -> crate::config::PluginsCf
     }
 }
 
-fn gov_with_store(store: &str) -> crate::config::GovernanceCfg {
-    crate::config::GovernanceCfg {
-        store: store.to_string(),
+fn gov_with_store(store: &str) -> crate::config::StoreCfg {
+    crate::config::StoreCfg {
+        module: store.to_string(),
         ..Default::default()
     }
 }

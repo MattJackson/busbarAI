@@ -820,25 +820,25 @@ async fn test_metrics_admitted_in_open_relay_mode() {
     handle.abort();
 }
 
-/// Companion to `test_metrics_admitted_in_open_relay_mode`: in `auth.mode=token`, a GET
-/// /metrics with NO bearer token is rejected with 401 — `/metrics` is auth-gated, NOT exempt
-/// like `/healthz`. This guards the [Unreleased] security fix that made `/metrics` auth-gated
-/// (superseding the 0.16.2 review note that described it as intentionally open): a regression
-/// that re-added `/metrics` to the always-open allowlist alongside `/healthz` (auth.rs)
-/// would let this unauthenticated scrape through and fail here. The same request WITH the
-/// configured token is admitted (200), proving the gate is token-based, not a blanket block.
-#[cfg(feature = "auth-tokens")]
+/// Companion to `test_metrics_admitted_in_open_relay_mode`: with a data-plane auth CHAIN
+/// configured, a GET /metrics with NO credential is rejected with 401 - `/metrics` is
+/// auth-gated, NOT exempt like `/healthz`. This guards the [Unreleased] security fix that made
+/// `/metrics` auth-gated (superseding the 0.16.2 review note that described it as intentionally
+/// open): a regression that re-added `/metrics` to the always-open allowlist alongside
+/// `/healthz` (auth.rs) would let this unauthenticated scrape through and fail here. The same
+/// request WITH a chain-admitted credential is admitted (200), proving the gate is
+/// credential-based, not a blanket block. (The static `tokens` allowlist is REMOVED in 1.5.0;
+/// the test-only groups module stands in for a real chain module.)
 #[tokio::test]
-async fn test_metrics_requires_auth_in_token_mode() {
+async fn test_metrics_requires_auth_in_chain_mode() {
     crate::metrics::init();
     metrics::counter!(crate::metrics::REQUESTS_TOTAL, "outcome" => "ok").increment(1);
 
-    let token = "sk-metrics-scrape";
+    let token = "grp:metrics-scrapers";
     let auth_cfg = crate::config::AuthCfg {
-        chain: vec!["tokens".to_string()],
+        chain: vec![crate::config::AuthChainEntry::bare("test-groups-module")],
         upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec![token.to_string()],
-        modules: std::collections::HashMap::new(),
+        ..crate::config::AuthCfg::default_none()
     };
     let app = TestApp::new()
         .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
@@ -2094,8 +2094,7 @@ async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
     let auth_cfg_passthrough = AuthCfg {
         chain: vec![],
         upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
-        client_tokens: vec![],
-        modules: std::collections::HashMap::new(),
+        ..crate::config::AuthCfg::default_none()
     };
     let app_passthrough = TestApp::new()
         .lane(
@@ -2155,10 +2154,9 @@ async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
     });
 
     let auth_cfg_token = AuthCfg {
-        chain: vec!["tokens".to_string()],
+        chain: vec![crate::config::AuthChainEntry::bare("keys")],
         upstream_credentials: crate::auth::UpstreamCreds::Own,
-        client_tokens: vec!["caller-token-123".to_string()],
-        modules: std::collections::HashMap::new(),
+        ..crate::config::AuthCfg::default_none()
     };
     let app_token = TestApp::new()
         .lane(
@@ -2269,8 +2267,7 @@ async fn test_passthrough_forwards_caller_token() {
     let auth_cfg_passthrough = AuthCfg {
         chain: vec![],
         upstream_credentials: crate::auth::UpstreamCreds::Passthrough,
-        client_tokens: vec![],
-        modules: std::collections::HashMap::new(),
+        ..crate::config::AuthCfg::default_none()
     };
     let app = TestApp::new()
         .lane(
@@ -3295,18 +3292,18 @@ mod disposition_matrix_tests {
         let pool = crate::config::PoolCfg {
             members: vec![crate::config::PoolMember {
                 reasoning: None,
-                target: "m".into(),
+                model: "m".into(),
                 weight: 1,
                 attempt_timeout_ms: None,
                 context_max: None,
                 tier: None,
-                cost_per_mtok: None,
                 tags: Vec::new(),
             }],
             breaker: None,
             failover: None,
             on_exhausted: None,
             affinity: None,
+            module_hooks: Vec::new(),
             policy: crate::config::PoolPolicy::default(),
             gates: Vec::new(),
             base_named: false,
@@ -3318,7 +3315,7 @@ mod disposition_matrix_tests {
                 crate::config::ProviderCfg {
                     protocol: "anthropic".into(),
                     base_url: "https://api.example.com".into(),
-                    api_key_env: "API_KEY".into(),
+                    api_key: crate::config::SecretRef::env("API_KEY"),
                     health: None,
                     error_map,
                     path: None,
@@ -3326,7 +3323,6 @@ mod disposition_matrix_tests {
                     token_url: None,
                     scope: None,
                     auth: None,
-                    _legacy_api_key: None,
                     allow_metadata_hosts: Vec::new(),
                 },
             );
@@ -3341,7 +3337,10 @@ mod disposition_matrix_tests {
                 admin_tls: None,
                 auth: None,
                 admin_auth: vec!["admin-tokens".to_string()],
-                group_map: std::collections::HashMap::new(),
+                groups: std::collections::BTreeMap::new(),
+                rate_card: None,
+                per_request_fee: 0,
+                store: None,
                 providers,
                 models,
                 pools,

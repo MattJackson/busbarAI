@@ -18,7 +18,10 @@ fn make_root_cfg(
         pools,
         hooks: HashMap::new(),
         admin_auth: vec!["admin-tokens".to_string()],
-        group_map: HashMap::new(),
+        groups: std::collections::BTreeMap::new(),
+        rate_card: None,
+        per_request_fee: 0,
+        store: None,
         global_hooks: Vec::new(),
         blocked_metadata_hosts: Vec::new(),
         allow_metadata_hosts: Vec::new(),
@@ -45,7 +48,9 @@ fn make_provider(protocol: &str, base_url: &str, api_key_env: &str) -> config::P
     config::ProviderCfg {
         protocol: protocol.into(),
         base_url: base_url.into(),
-        api_key_env: api_key_env.into(),
+        // C2: the credential is a SECRET REFERENCE now; the env-var sugar keeps the old
+        // helper signature usable across every existing test.
+        api_key: config::SecretRef::env(api_key_env),
         health: None,
         error_map,
         path: None,
@@ -53,7 +58,6 @@ fn make_provider(protocol: &str, base_url: &str, api_key_env: &str) -> config::P
         token_url: None,
         scope: None,
         auth: None,
-        _legacy_api_key: None,
         allow_metadata_hosts: Vec::new(),
     }
 }
@@ -88,21 +92,21 @@ fn make_pool(members: Vec<config::PoolMember>) -> config::PoolCfg {
         failover: None,
         on_exhausted: None,
         affinity: None,
+        module_hooks: Vec::new(),
         policy: config::PoolPolicy::default(),
         gates: Vec::new(),
         base_named: false,
     }
 }
 
-fn make_member(target: &str) -> config::PoolMember {
+fn make_member(model: &str) -> config::PoolMember {
     config::PoolMember {
         reasoning: None,
-        target: target.into(),
+        model: model.into(),
         weight: 1,
         attempt_timeout_ms: None,
         context_max: None,
         tier: None,
-        cost_per_mtok: None,
         tags: Vec::new(),
     }
 }
@@ -333,26 +337,9 @@ fn test_validate_rejects_empty_upstream_model() {
 #[test]
 fn test_validate_rejects_pool_name_equals_provider_name() {
     let mut providers = HashMap::new();
-    // Add minimal error_map to avoid extra validation error
-    let mut pm_error_map = std::collections::HashMap::new();
-    pm_error_map.insert("400".to_string(), "client_error".to_string());
-
     providers.insert(
         "myprovider".to_string(),
-        config::ProviderCfg {
-            protocol: "anthropic".into(),
-            base_url: "https://api.example.com".into(),
-            api_key_env: "API_KEY".into(),
-            health: None,
-            error_map: pm_error_map,
-            path: None,
-            path_base: None,
-            token_url: None,
-            scope: None,
-            auth: None,
-            _legacy_api_key: None,
-            allow_metadata_hosts: Vec::new(),
-        },
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
     );
 
     let mut models = HashMap::new();
@@ -377,26 +364,9 @@ fn test_validate_rejects_pool_name_equals_provider_name() {
 #[test]
 fn test_validate_rejects_unknown_member_ref() {
     let mut providers = HashMap::new();
-    // Add minimal error_map to avoid extra validation error
-    let mut mp_error_map = std::collections::HashMap::new();
-    mp_error_map.insert("400".to_string(), "client_error".to_string());
-
     providers.insert(
         "myprovider".to_string(),
-        config::ProviderCfg {
-            protocol: "anthropic".into(),
-            base_url: "https://api.example.com".into(),
-            api_key_env: "API_KEY".into(),
-            health: None,
-            error_map: mp_error_map,
-            path: None,
-            path_base: None,
-            token_url: None,
-            scope: None,
-            auth: None,
-            _legacy_api_key: None,
-            allow_metadata_hosts: Vec::new(),
-        },
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
     );
 
     let models = HashMap::new();
@@ -422,26 +392,12 @@ fn test_validate_token_url_ssrf_and_scheme() {
     // token_url carries the client secret in the POST body, so it must clear BOTH the https
     // requirement (case-INSENSITIVELY) and the SSRF/metadata denylist — same as base_url. (audit H1.)
     let build = |token_url: &str| -> Vec<String> {
-        let mut error_map = std::collections::HashMap::new();
-        error_map.insert("400".to_string(), "client_error".to_string());
         let mut providers = HashMap::new();
-        providers.insert(
-            "entra".to_string(),
-            config::ProviderCfg {
-                protocol: "openai".into(),
-                base_url: "https://myres.openai.azure.com".into(),
-                api_key_env: "API_KEY".into(),
-                health: None,
-                error_map,
-                path: None,
-                path_base: None,
-                token_url: Some(token_url.to_string()),
-                scope: Some("api://x/.default".into()),
-                auth: Some(config::ProviderAuth::OAuthClientCredentials),
-                _legacy_api_key: None,
-                allow_metadata_hosts: Vec::new(),
-            },
-        );
+        let mut entra = make_provider("openai", "https://myres.openai.azure.com", "API_KEY");
+        entra.token_url = Some(token_url.to_string());
+        entra.scope = Some("api://x/.default".into());
+        entra.auth = Some(config::ProviderAuth::OAuthClientCredentials);
+        providers.insert("entra".to_string(), entra);
         let mut models = HashMap::new();
         models.insert("m".to_string(), make_model("entra", 10));
         let mut pools = HashMap::new();
@@ -493,25 +449,10 @@ fn test_validate_conflicting_context_max_across_pools() {
     // A model maps to one lane, so a DIFFERING context_max across pools must be a validate() error —
     // not only a boot-time `die`. Else a clean --validate would still crash at real boot. (audit M7.)
     let build = |ca: Option<usize>, cb: Option<usize>| -> Vec<String> {
-        let mut error_map = std::collections::HashMap::new();
-        error_map.insert("400".to_string(), "client_error".to_string());
         let mut providers = HashMap::new();
         providers.insert(
             "p".to_string(),
-            config::ProviderCfg {
-                protocol: "openai".into(),
-                base_url: "https://api.example.com".into(),
-                api_key_env: "API_KEY".into(),
-                health: None,
-                error_map,
-                path: None,
-                path_base: None,
-                token_url: None,
-                scope: None,
-                auth: None,
-                _legacy_api_key: None,
-                allow_metadata_hosts: Vec::new(),
-            },
+            make_provider("openai", "https://api.example.com", "API_KEY"),
         );
         let mut models = HashMap::new();
         models.insert("m".to_string(), make_model("p", 10));
@@ -549,26 +490,9 @@ fn test_validate_conflicting_context_max_across_pools() {
 #[test]
 fn test_validate_collects_all_errors() {
     let mut providers = HashMap::new();
-    // Add minimal error_map to avoid extra validation error
-    let mut cm_error_map = std::collections::HashMap::new();
-    cm_error_map.insert("400".to_string(), "client_error".to_string());
-
     providers.insert(
         "conflict_provider".to_string(),
-        config::ProviderCfg {
-            protocol: "anthropic".into(),
-            base_url: "https://api.example.com".into(),
-            api_key_env: "API_KEY".into(),
-            health: None,
-            error_map: cm_error_map,
-            path: None,
-            path_base: None,
-            token_url: None,
-            scope: None,
-            auth: None,
-            _legacy_api_key: None,
-            allow_metadata_hosts: Vec::new(),
-        },
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
     );
 
     let mut models = HashMap::new();
@@ -603,46 +527,14 @@ fn test_validate_collects_all_errors() {
 #[test]
 fn test_validate_heterogeneous_pool_is_ok() {
     let mut providers = HashMap::new();
-    // Two different protocols with minimal error_maps
-    let mut anthropic_error_map = std::collections::HashMap::new();
-    anthropic_error_map.insert("400".to_string(), "client_error".to_string());
-
-    let mut openai_error_map = std::collections::HashMap::new();
-    openai_error_map.insert("400".to_string(), "client_error".to_string());
-
+    // Two different protocols.
     providers.insert(
         "anthropic_provider".to_string(),
-        config::ProviderCfg {
-            protocol: "anthropic".into(),
-            base_url: "https://api.anthropic.com".into(),
-            api_key_env: "ANTHROPIC_KEY".into(),
-            health: None,
-            error_map: anthropic_error_map,
-            path: None,
-            path_base: None,
-            token_url: None,
-            scope: None,
-            auth: None,
-            _legacy_api_key: None,
-            allow_metadata_hosts: Vec::new(),
-        },
+        make_provider("anthropic", "https://api.anthropic.com", "ANTHROPIC_KEY"),
     );
     providers.insert(
         "openai_provider".to_string(),
-        config::ProviderCfg {
-            protocol: "openai".into(),
-            base_url: "https://api.openai.com".into(),
-            api_key_env: "OPENAI_KEY".into(),
-            health: None,
-            error_map: openai_error_map,
-            path: None,
-            path_base: None,
-            token_url: None,
-            scope: None,
-            auth: None,
-            _legacy_api_key: None,
-            allow_metadata_hosts: Vec::new(),
-        },
+        make_provider("openai", "https://api.openai.com", "OPENAI_KEY"),
     );
 
     let mut models = HashMap::new();
@@ -675,26 +567,9 @@ fn test_validate_heterogeneous_pool_is_ok() {
 #[test]
 fn test_validate_valid_config_succeeds() {
     let mut providers = HashMap::new();
-    // Add minimal error_map to avoid validation errors
-    let mut pm_error_map = std::collections::HashMap::new();
-    pm_error_map.insert("400".to_string(), "client_error".to_string());
-
     providers.insert(
         "myprovider".to_string(),
-        config::ProviderCfg {
-            protocol: "anthropic".into(),
-            base_url: "https://api.example.com".into(),
-            api_key_env: "API_KEY".into(),
-            health: None,
-            error_map: pm_error_map,
-            path: None,
-            path_base: None,
-            token_url: None,
-            scope: None,
-            auth: None,
-            _legacy_api_key: None,
-            allow_metadata_hosts: Vec::new(),
-        },
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
     );
 
     let mut models = HashMap::new();
@@ -736,21 +611,17 @@ fn test_validate_model_without_provider_error() {
     assert!(errs[0].contains("references unknown provider"));
 }
 
-fn make_auth(mode: &str, client_tokens: Vec<&str>) -> config::AuthCfg {
-    // Map the legacy mode string onto the 1.3 chain/upstream shape: token -> chain [tokens];
-    // none -> empty chain; passthrough -> empty chain + upstream passthrough.
-    let (chain, upstream): (Vec<String>, crate::auth::UpstreamCreds) = match mode {
-        "token" => (vec!["tokens".to_string()], crate::auth::UpstreamCreds::Own),
-        "none" => (vec![], crate::auth::UpstreamCreds::Own),
-        "passthrough" => (vec![], crate::auth::UpstreamCreds::Passthrough),
-        other => panic!("invalid auth mode in test: {other}"),
-    };
-    config::AuthCfg {
-        chain,
-        upstream_credentials: upstream,
-        client_tokens: client_tokens.into_iter().map(|s| s.to_string()).collect(),
-        modules: std::collections::HashMap::new(),
-    }
+/// An `AuthCfg` with the given DATA-PLANE chain module names (bare entries) and upstream mode.
+/// The 1.4.x `make_auth(mode, client_tokens)` helper is gone with `client_tokens`/`modules`;
+/// chain semantics replace the mode string: `[keys]` = signed-key auth, `[]` = open front door.
+fn make_auth_chain(modules: &[&str], upstream: crate::auth::UpstreamCreds) -> config::AuthCfg {
+    let mut auth = config::AuthCfg::default_none();
+    auth.chain = modules
+        .iter()
+        .map(|m| config::AuthChainEntry::bare(*m))
+        .collect();
+    auth.upstream_credentials = upstream;
+    auth
 }
 
 fn make_breaker(
@@ -1421,37 +1292,46 @@ fn test_validate_rejects_unknown_failover_exclusion() {
 }
 
 #[test]
-fn test_validate_rejects_bad_module_scope_and_group_map_scope() {
-    // Both scope-token rules: a typo'd `auth.modules.<m>.max_admin_scope` and a typo'd
-    // `group_map.<g>.admin_scope` each fail loud at boot, naming the offender.
+fn test_validate_rejects_bad_chain_and_role_binding_scopes() {
+    // Both scope-token rules, on the 1.5.0 surface: a typo'd chain-entry `max_admin_scope` and a
+    // typo'd `role_bindings.<module>.<role>.admin_scope` each fail loud at boot, naming the
+    // offender. (The 1.4.x `auth.modules` caps map and `group_map.<g>.admin_scope` are GONE;
+    // these are their direct replacements.)
     let (providers, models, pools) = valid_maps();
     let mut cfg = make_root_cfg(providers, models, pools);
     let mut auth = config::AuthCfg::default_none();
-    auth.modules.insert(
-        "corp-ad".to_string(),
-        config::AuthModuleCfg {
-            allowed_groups: Some(vec!["llm-users".to_string()]),
-            max_admin_scope: Some("superuser".to_string()), // typo
-        },
+    let mut entry = config::AuthChainEntry::bare("keys");
+    entry.max_admin_scope = Some("superuser".to_string()); // typo
+    auth.chain = vec![entry];
+    auth.role_bindings.insert(
+        "keys".to_string(),
+        std::collections::BTreeMap::from([(
+            "viewers".to_string(),
+            config::RoleBindingCfg {
+                allowed_pools: None,
+                group: None,
+                admin_scope: Some("readonly".to_string()), // typo (it's read-only)
+            },
+        )]),
     );
     cfg.auth = Some(auth);
-    cfg.group_map.insert(
-        "viewers".to_string(),
-        config::GroupMapEntry {
-            admin_scope: Some("readonly".to_string()), // typo (it's read-only)
-            ..Default::default()
-        },
-    );
     let errs = validate(&cfg).expect_err("typo'd scope tokens must fail validation");
     assert!(
-        errs.iter()
-            .any(|e| e.contains("auth.modules 'corp-ad'") && e.contains("superuser")),
-        "expected the max_admin_scope error; got: {errs:?}"
+        errs.iter().any(|e| e.contains("auth chain entry 'keys'")
+            && e.contains("unknown max_admin_scope 'superuser'")),
+        "expected the chain-entry max_admin_scope error; got: {errs:?}"
     );
     assert!(
+        errs.iter().any(|e| e.contains("role_bindings.keys.viewers")
+            && e.contains("unknown admin_scope 'readonly'")),
+        "expected the role_bindings admin_scope error; got: {errs:?}"
+    );
+    // Both messages must teach the valid set so the operator can self-correct.
+    assert!(
         errs.iter()
-            .any(|e| e.contains("group_map 'viewers'") && e.contains("readonly")),
-        "expected the group_map scope error; got: {errs:?}"
+            .filter(|e| e.contains("superuser") || e.contains("readonly"))
+            .all(|e| e.contains("read-only") && e.contains("hooks-register") && e.contains("full")),
+        "scope errors must enumerate the valid scope tokens; got: {errs:?}"
     );
 }
 
@@ -1480,55 +1360,58 @@ fn test_validate_accepts_known_failover_exclusion() {
     );
 }
 
-// Admin-token behavior — requires the compile-removable `admin-tokens` module.
-#[cfg(feature = "auth-admin-tokens")]
-#[test]
-fn test_validate_governance_rejects_whitespace_only_admin_token() {
-    // Regression (LOW #21): a WHITESPACE-ONLY admin_token (" ", "\t", "\n") passes a bare
-    // is_empty() guard but is a degenerate, functionally-unusable secret — `${BUSBAR_ADMIN_TOKEN}`
-    // expanding to all blanks silently locks the /admin API exactly as an unset token does. The
-    // boot diagnostic must fire for the whitespace case too, not just truly-empty. Against the
-    // old `t.is_empty()` guard these would PASS validation (bug); the `t.trim().is_empty()` fix
-    // rejects them.
-    for blank in [" ", "   ", "\t", "\n", " \t\n "] {
-        let gov = config::GovernanceCfg {
-            store: "memory".to_string(),
-            db_path: "busbar-governance.db".to_string(),
-            price_per_request_cents: 1,
-            rate_card: None,
-            budget_groups: Default::default(),
-            admin_token: Some(blank.to_string()),
-            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-        };
-        let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
-            .unwrap_err_or_default(format!(
-                "a whitespace-only admin_token {blank:?} must fail validation"
-            ));
-        assert!(
-            errs.iter().any(|e| e.contains("governance.admin_token")
-                && e.contains("/admin management API is unreachable")),
-            "expected an admin-token lockout error for blank token {blank:?}; got: {errs:?}"
-        );
-    }
+// ── admin-tokens token placement + secret-module resolvability (the 1.5.0 heirs of the
+// governance.admin_token validation family) ──────────────────────────────────────────────────────
 
-    // A token with surrounding whitespace but a real non-blank core is usable and must NOT error
-    // (we only reject ALL-blank, not trim the stored secret).
-    let gov = config::GovernanceCfg {
-        store: "memory".to_string(),
-        db_path: "busbar-governance.db".to_string(),
-        price_per_request_cents: 1,
-        rate_card: None,
-        budget_groups: Default::default(),
-        admin_token: Some("  real-secret  ".to_string()),
-        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
+/// The `admin-tokens` operator credential is a SECRET REFERENCE now; `validate()` checks the
+/// MODULE resolves (env | file) without resolving the value, and a malformed built-in ref
+/// (env without settings.key) fails loud, replacing the 1.4.x blank-admin_token lockout guard.
+#[test]
+fn test_validate_admin_tokens_secret_module_checked() {
+    let build = |token: config::SecretRef| -> Result<(), Vec<String>> {
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        let mut auth = config::AuthCfg::default_none();
+        let mut entry = config::AuthChainEntry::bare(config::ADMIN_TOKENS_MODULE);
+        entry.token = Some(token);
+        auth.admin_auth = vec![entry];
+        cfg.auth = Some(auth);
+        validate(&cfg)
     };
+
+    // Unknown secret module: fail-closed, with a paste-ready `{ env: ... }` stub.
+    let errs = build(config::SecretRef {
+        module: "vault".to_string(),
+        settings: serde_json::Map::new(),
+    })
+    .expect_err("an unknown secret module on the admin token must fail validation");
     assert!(
-        validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok(),
-        "an admin_token with a non-blank core must validate (we do not reject surrounding space)"
+        errs.iter()
+            .any(|e| e.contains("auth.admin_auth admin-tokens token")
+                && e.contains("secret module 'vault'")
+                && e.contains("{ env: MY_SECRET_VAR }")),
+        "expected an unknown-secret-module error with the env stub; got: {errs:?}"
+    );
+
+    // env module WITHOUT settings.key: the ref can never resolve; must fail naming the shape.
+    let errs = build(config::SecretRef {
+        module: "env".to_string(),
+        settings: serde_json::Map::new(),
+    })
+    .expect_err("an env secret ref without settings.key must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("auth.admin_auth admin-tokens token")
+                && e.contains("requires settings.key")),
+        "expected the env-shape error; got: {errs:?}"
+    );
+
+    // A well-formed `{ env: VAR }` ref validates (the value is deliberately NOT resolved here:
+    // CI validates structure without secrets present).
+    #[cfg(feature = "auth-admin-tokens")]
+    assert!(
+        build(config::SecretRef::env("BUSBAR_ADMIN_TOKEN")).is_ok(),
+        "a well-formed env admin-token ref must validate"
     );
 }
 
@@ -1536,228 +1419,126 @@ fn test_validate_governance_rejects_whitespace_only_admin_token() {
 /// module is a loud boot error (a silently-disabled admin API is a lockout, never acceptable).
 #[cfg(not(feature = "auth-admin-tokens"))]
 #[test]
-fn test_validate_governance_rejects_admin_token_without_module() {
-    let gov = crate::config::GovernanceCfg {
-        store: "memory".to_string(),
-        admin_token: Some("tok".to_string()),
-        ..Default::default()
-    };
-    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
-        .expect_err("must be a boot error");
+fn test_validate_rejects_admin_token_without_module() {
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    let mut auth = config::AuthCfg::default_none();
+    let mut entry = config::AuthChainEntry::bare(config::ADMIN_TOKENS_MODULE);
+    entry.token = Some(config::SecretRef::env("BUSBAR_ADMIN_TOKEN"));
+    auth.admin_auth = vec![entry];
+    cfg.auth = Some(auth);
+    let errs = validate(&cfg).expect_err("must be a boot error");
     assert!(
         errs.iter().any(|e| e.contains("auth-admin-tokens")),
         "{errs:?}"
     );
 }
 
-// Admin-token behavior — requires the compile-removable `admin-tokens` module.
-#[cfg(feature = "auth-admin-tokens")]
 #[test]
-fn test_validate_governance_ok_when_enabled_with_admin_token() {
-    let gov = config::GovernanceCfg {
-        store: "memory".to_string(),
-        db_path: "busbar-governance.db".to_string(),
-        price_per_request_cents: 1,
-        rate_card: None,
-        budget_groups: Default::default(),
-        admin_token: Some("an-operator-secret".to_string()),
-        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-    };
-    assert!(
-        validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok(),
-        "enabled governance WITH an admin_token must validate"
-    );
-}
-
-#[test]
-fn test_validate_governance_rejects_zero_rate_sweep_interval() {
-    // `rate_sweep_interval: 0` is rejected fail-loud rather than silently disabling the rate-map
-    // eviction sweep (which would ride on the non-obvious `u32::is_multiple_of(0) == false`).
-    let gov = config::GovernanceCfg {
-        store: "memory".to_string(),
-        db_path: "busbar-governance.db".to_string(),
-        price_per_request_cents: 1,
-        rate_card: None,
-        budget_groups: Default::default(),
-        admin_token: Some("an-operator-secret".to_string()),
-        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        rate_sweep_interval: 0,
-        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-    };
-    let err = validate_governance(&gov, None, &Default::default(), &Default::default())
-        .expect_err("rate_sweep_interval: 0 must be rejected at validation");
-    assert!(
-        err.iter().any(|e| e.contains("rate_sweep_interval")),
-        "the error must name the offending key, got: {err:?}"
-    );
-}
-
-#[test]
-fn test_validate_governance_disabled_carries_no_requirement() {
-    // A disabled governance block (the admin surface is inert) must not require an admin_token.
-    let gov = config::GovernanceCfg {
-        store: "memory".to_string(),
-        db_path: "busbar-governance.db".to_string(),
-        price_per_request_cents: 1,
-        rate_card: None,
-        budget_groups: Default::default(),
-        admin_token: None,
-        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-    };
-    assert!(
-        validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok(),
-        "disabled governance carries no admin_token requirement"
-    );
-}
-
-fn auth_cfg(mode: &str) -> config::AuthCfg {
-    let (chain, upstream): (Vec<String>, crate::auth::UpstreamCreds) = match mode {
-        "token" => (vec!["tokens".to_string()], crate::auth::UpstreamCreds::Own),
-        "none" => (vec![], crate::auth::UpstreamCreds::Own),
-        "passthrough" => (vec![], crate::auth::UpstreamCreds::Passthrough),
-        other => panic!("invalid auth mode in test: {other}"),
-    };
-    config::AuthCfg {
-        chain,
-        upstream_credentials: upstream,
-        client_tokens: vec![],
-        modules: std::collections::HashMap::new(),
-    }
-}
-
-#[test]
-fn test_validate_governance_rejects_passthrough_combination() {
-    // Regression: active governance (admin_token set) + upstream_credentials: passthrough is
-    // self-contradictory.
-    // Governance supersedes passthrough (every request must resolve to an enabled virtual key),
-    // so an operator who believes they are in passthrough silently rejects every caller lacking
-    // a virtual key — a behaviour inversion that must fail loud at boot, not pass to a runtime
-    // warning.
-    {
-        let mode = "passthrough";
-        let gov = config::GovernanceCfg {
-            store: "memory".to_string(),
-            db_path: "busbar-governance.db".to_string(),
-            price_per_request_cents: 1,
-            rate_card: None,
-            budget_groups: Default::default(),
-            admin_token: Some("an-operator-secret".to_string()),
-            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-        };
-        let errs = validate_governance(
-            &gov,
-            Some(&auth_cfg(mode)),
-            &Default::default(),
-            &Default::default(),
-        )
-        .expect_err("governance + passthrough must be rejected at boot");
-        assert!(
-            errs.iter().any(
-                |e| e.contains("upstream_credentials: passthrough") && e.contains("governance")
-            ),
-            "expected a governance+passthrough rejection for mode {mode:?}; got: {errs:?}"
-        );
-    }
-}
-
-// Admin-token behavior — requires the compile-removable `admin-tokens` module.
-#[cfg(feature = "auth-admin-tokens")]
-#[test]
-fn test_validate_governance_allows_token_and_none_modes() {
-    // governance + auth.mode=token (or none) is the supported pairing and must NOT be rejected
-    // on the passthrough ground.
-    for mode in ["token", "none"] {
-        let gov = config::GovernanceCfg {
-            store: "memory".to_string(),
-            db_path: "busbar-governance.db".to_string(),
-            price_per_request_cents: 1,
-            rate_card: None,
-            budget_groups: Default::default(),
-            admin_token: Some("an-operator-secret".to_string()),
-            sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-            rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-            usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-        };
-        assert!(
-            validate_governance(
-                &gov,
-                Some(&auth_cfg(mode)),
-                &Default::default(),
-                &Default::default()
-            )
-            .is_ok(),
-            "governance + auth.mode={mode} must validate"
-        );
-    }
-}
-
-#[test]
-fn test_validate_governance_passthrough_ignored_when_disabled() {
-    // A DISABLED governance block carries no requirement, so even auth.mode=passthrough is fine
-    // (governance is inert — passthrough semantics apply unchanged).
-    let gov = config::GovernanceCfg {
-        store: "memory".to_string(),
-        db_path: "busbar-governance.db".to_string(),
-        price_per_request_cents: 1,
-        rate_card: None,
-        budget_groups: Default::default(),
-        admin_token: None,
-        sqlite_busy_timeout_ms: crate::config::DEFAULT_SQLITE_BUSY_TIMEOUT_MS,
-        rate_sweep_interval: crate::config::DEFAULT_RATE_SWEEP_INTERVAL,
-        usage_flush_interval_ms: crate::config::DEFAULT_USAGE_FLUSH_INTERVAL_MS,
-    };
-    assert!(
-        validate_governance(
-            &gov,
-            Some(&auth_cfg("passthrough")),
-            &Default::default(),
-            &Default::default()
-        )
-        .is_ok(),
-        "disabled governance + passthrough must validate (governance inert)"
-    );
-}
-
-#[test]
-fn test_validate_rejects_token_mode_with_no_tokens() {
+fn test_validate_rejects_zero_rate_sweep_interval() {
+    // `advanced.rate_sweep_interval: 0` (formerly governance.rate_sweep_interval) is rejected
+    // fail-loud rather than silently disabling the rate-map eviction sweep (which would ride on
+    // the non-obvious `u32::is_multiple_of(0) == false`). The message names the NEW config path.
     let (providers, models, pools) = valid_maps();
     let mut cfg = make_root_cfg(providers, models, pools);
-    cfg.auth = Some(make_auth("token", vec![]));
-    let errs = validate(&cfg).expect_err("token mode with no tokens must fail validation");
+    cfg.limits.rate_sweep_interval = 0;
+    let err = validate(&cfg).expect_err("rate_sweep_interval: 0 must be rejected at validation");
+    assert!(
+        err.iter()
+            .any(|e| e.contains("advanced.rate_sweep_interval")),
+        "the error must name advanced.rate_sweep_interval, got: {err:?}"
+    );
+    // The default (non-zero) value carries no error.
+    cfg.limits.rate_sweep_interval = crate::config::DEFAULT_RATE_SWEEP_INTERVAL;
+    if let Err(errs) = validate(&cfg) {
+        assert!(
+            !errs.iter().any(|e| e.contains("rate_sweep_interval")),
+            "the default sweep interval must not error; got: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn test_validate_chain_tokens_module_removed_message() {
+    // The 1.4.x static-token allowlist modules (`tokens` / `static-tokens`) are GONE in 1.5.0. A
+    // chain still naming one must fail with the REMOVED-in-1.5.0 migration message pointing at
+    // `keys` - never a silently-dropped auth module (which would open the relay). This is the
+    // heir of the "token mode requires client tokens" family: the whole surface is removed.
+    for legacy in ["tokens", "static-tokens"] {
+        let (providers, models, pools) = valid_maps();
+        let mut cfg = make_root_cfg(providers, models, pools);
+        cfg.auth = Some(make_auth_chain(&[legacy], crate::auth::UpstreamCreds::Own));
+        let errs = validate(&cfg)
+            .unwrap_err_or_default(format!("chain module '{legacy}' must fail validation"));
+        assert!(
+            errs.iter().any(|e| e.contains(&format!("'{legacy}'"))
+                && e.contains("REMOVED")
+                && e.contains("1.5.0")
+                && e.contains("keys")),
+            "expected the REMOVED-in-1.5.0 message for '{legacy}' naming `keys`; got: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn test_validate_chain_unknown_module_rejected_keys_accepted() {
+    // FAIL-CLOSED: an unknown chain module is a hard boot error (a typo must never silently
+    // drop an auth module); the built-in `keys` module and the empty chain both validate.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(make_auth_chain(&["okta"], crate::auth::UpstreamCreds::Own));
+    let errs = validate(&cfg).expect_err("an unknown chain module must fail validation");
     assert!(
         errs.iter()
-            .any(|e| e.contains("the tokens module requires at least one client token")),
-        "expected a token-mode lockout error; got: {errs:?}"
+            .any(|e| e.contains("auth.chain names unknown module 'okta'")),
+        "expected an unknown-module error naming 'okta'; got: {errs:?}"
     );
-}
 
-#[cfg(feature = "auth-tokens")]
-#[test]
-fn test_validate_token_mode_with_tokens_ok() {
-    // The allowlist form satisfies the requirement (the legacy single-token form was removed in
-    // 1.0.0; see `test_legacy_token_is_rejected_at_parse`).
+    // `keys` (the built-in signed-key verifier) is accepted.
     let (providers, models, pools) = valid_maps();
     let mut cfg = make_root_cfg(providers, models, pools);
-    cfg.auth = Some(make_auth("token", vec!["secret"]));
+    cfg.auth = Some(make_auth_chain(&["keys"], crate::auth::UpstreamCreds::Own));
     assert!(
         validate(&cfg).is_ok(),
-        "token mode with at least one client token must validate"
+        "auth.chain: [keys] must validate; got: {:?}",
+        validate(&cfg)
+    );
+
+    // The empty chain (open front door) carries no requirement.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(make_auth_chain(&[], crate::auth::UpstreamCreds::Own));
+    assert!(
+        validate(&cfg).is_ok(),
+        "an empty auth chain must validate (open front door)"
     );
 }
 
 #[test]
-fn test_legacy_token_is_rejected_at_parse() {
-    // 1.0.0 MIGRATION: the legacy single-token `token:` field was REMOVED. `AuthCfg` is now
-    // `#[serde(deny_unknown_fields)]`, so a full config that still sets `auth.token` is REJECTED
-    // AT PARSE (the config-LOAD entry point) with serde's "unknown field `token`" — never a
-    // silent credential drop and never a deferred validate-time check. This is the load-level
-    // companion to `config::tests::test_legacy_token_key_is_rejected_at_parse`.
+fn test_validate_token_on_non_admin_tokens_entry_rejected() {
+    // `token:` is the admin-tokens operator credential; on any other chain entry it is inert and
+    // almost certainly a misplaced secret. Fail loud, with the paste-ready relocation stub.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    let mut auth = config::AuthCfg::default_none();
+    let mut entry = config::AuthChainEntry::bare("keys");
+    entry.token = Some(config::SecretRef::env("MISPLACED_SECRET"));
+    auth.chain = vec![entry];
+    cfg.auth = Some(auth);
+    let errs = validate(&cfg).expect_err("token on a non-admin-tokens entry must fail validation");
+    assert!(
+        errs.iter().any(|e| e.contains("auth chain entry 'keys'")
+            && e.contains("`token:`")
+            && e.contains("admin-tokens")),
+        "expected a misplaced-token error with the admin-tokens relocation hint; got: {errs:?}"
+    );
+}
+
+#[test]
+fn test_legacy_auth_keys_are_rejected_at_parse() {
+    // CLEAN BREAK: the removed 1.4.x auth keys (`mode:`, `token:`, `client_tokens:`, `modules:`)
+    // are rejected AT PARSE by `AuthCfg`'s deny_unknown_fields - never a silent credential drop
+    // and never a deferred validate-time check.
     let yaml = r#"
 listen: "0.0.0.0:8080"
 auth:
@@ -1766,23 +1547,41 @@ auth:
   client_tokens: ["real-secret"]
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
 models:
   claude:
     provider: anthropic
     max_concurrent: 10
 "#;
     let err = serde_yaml::from_str::<crate::config::DeployCfg>(yaml)
-        .expect_err("a config setting the removed `token` field must fail to parse");
+        .expect_err("a config setting the removed auth keys must fail to parse");
     let msg = err.to_string();
     assert!(
-        msg.contains("unknown field") && msg.contains("token"),
-        "expected serde's unknown-field error naming `token` at parse; got: {msg}"
+        msg.contains("unknown field"),
+        "expected serde's unknown-field error at parse; got: {msg}"
     );
     // The rejected secret value is NEVER echoed back in the parse error.
     assert!(
         !msg.contains("stale-legacy-secret"),
         "the parse error must not leak the configured token value; got: {msg}"
+    );
+
+    // The removed `api_key_env:` provider key is likewise a parse error (renamed to
+    // `api_key: { env: ... }`).
+    let yaml2 = r#"
+listen: "0.0.0.0:8080"
+providers:
+  anthropic:
+    api_key_env: ANTHROPIC_KEY
+models:
+  claude:
+    provider: anthropic
+"#;
+    let err2 = serde_yaml::from_str::<crate::config::DeployCfg>(yaml2)
+        .expect_err("the removed api_key_env key must fail to parse");
+    assert!(
+        err2.to_string().contains("unknown field"),
+        "expected an unknown-field error for api_key_env; got: {err2}"
     );
 }
 
@@ -1850,7 +1649,10 @@ fn test_validate_passthrough_warns_on_nonempty_configured_key() {
     models.insert("leakymodel".to_string(), make_model("leaky", 10));
     models.insert("bedrockmodel".to_string(), make_model("bedrock", 10));
     let mut cfg = make_root_cfg(providers, models, HashMap::new());
-    cfg.auth = Some(make_auth("passthrough", vec![]));
+    cfg.auth = Some(make_auth_chain(
+        &[],
+        crate::auth::UpstreamCreds::Passthrough,
+    ));
 
     let cap = WarnCapture::default();
     let subscriber = tracing_subscriber::registry().with(cap.clone());
@@ -1898,7 +1700,10 @@ fn test_validate_passthrough_no_warn_when_all_keys_empty() {
     let mut models = HashMap::new();
     models.insert("m".to_string(), make_model("p", 10));
     let mut cfg = make_root_cfg(providers, models, HashMap::new());
-    cfg.auth = Some(make_auth("passthrough", vec![]));
+    cfg.auth = Some(make_auth_chain(
+        &[],
+        crate::auth::UpstreamCreds::Passthrough,
+    ));
 
     let cap = WarnCapture::default();
     let subscriber = tracing_subscriber::registry().with(cap.clone());
@@ -1913,13 +1718,14 @@ fn test_validate_passthrough_no_warn_when_all_keys_empty() {
 }
 
 #[test]
-fn test_validate_none_mode_with_no_tokens_ok() {
+fn test_validate_empty_chain_carries_no_requirement() {
+    // The 1.4.x "mode: none" posture is an EMPTY chain now: no auth module, no requirement.
     let (providers, models, pools) = valid_maps();
     let mut cfg = make_root_cfg(providers, models, pools);
-    cfg.auth = Some(make_auth("none", vec![]));
+    cfg.auth = Some(make_auth_chain(&[], crate::auth::UpstreamCreds::Own));
     assert!(
         validate(&cfg).is_ok(),
-        "mode 'none' carries no token requirement"
+        "an empty auth chain carries no token requirement"
     );
 }
 
@@ -2476,9 +2282,9 @@ fn test_validate_rejects_unknown_fallback_pool() {
     let (providers, models, _) = valid_maps();
     let mut pools = HashMap::new();
     let mut pool = make_pool(vec![make_member("mymodel")]);
-    pool.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:does_not_exist".to_string(),
-    });
+    pool.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool(
+        "does_not_exist".to_string(),
+    ));
     pools.insert("mypool".to_string(), pool);
     let cfg = make_root_cfg(providers, models, pools);
     let errs = validate(&cfg).expect_err("on_exhausted referencing an unknown pool must fail");
@@ -2491,26 +2297,32 @@ fn test_validate_rejects_unknown_fallback_pool() {
     );
 }
 
-/// M4 (validate/boot drift): a MALFORMED `on_exhausted.action` (`OnExhausted::parse` -> Err) dies at
-/// boot in main.rs but was previously ignored by `--validate` (`if let Ok(..)`). `--validate` must
-/// catch it too - a config that boot rejects can never pass the dry-run.
+/// The 1.5.0 heir of the malformed-action drift test (M4): `on_exhausted` is a STRUCTURED enum
+/// now, so a malformed action (`bogus`, or the retired `fallback_pool:name` string form) is
+/// rejected AT PARSE - it can never reach validate() or boot at all, closing the drift by
+/// construction. The three well-formed spellings parse to the expected variants.
 #[test]
-fn test_validate_rejects_malformed_on_exhausted_action() {
-    let (providers, models, _) = valid_maps();
-    let mut pools = HashMap::new();
-    let mut pool = make_pool(vec![make_member("mymodel")]);
-    pool.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "bogus".to_string(),
-    });
-    pools.insert("mypool".to_string(), pool);
-    let cfg = make_root_cfg(providers, models, pools);
-    let errs =
-        validate(&cfg).expect_err("a malformed on_exhausted action must fail --validate, not boot");
+fn test_on_exhausted_is_structured_and_rejects_malformed_at_parse() {
     assert!(
-        errs.iter()
-            .any(|e| e.contains("invalid on_exhausted action") && e.contains("bogus")),
-        "expected a malformed-action validation error (parity with main.rs boot); got: {errs:?}"
+        serde_yaml::from_str::<config::OnExhaustedCfg>("bogus").is_err(),
+        "an unknown on_exhausted keyword must fail to parse"
     );
+    assert!(
+        serde_yaml::from_str::<config::OnExhaustedCfg>("\"fallback_pool:backup\"").is_err(),
+        "the retired string form 'fallback_pool:name' must fail to parse (structured form only)"
+    );
+    assert!(matches!(
+        serde_yaml::from_str::<config::OnExhaustedCfg>("reject").unwrap(),
+        config::OnExhaustedCfg::Reject
+    ));
+    assert!(matches!(
+        serde_yaml::from_str::<config::OnExhaustedCfg>("least_bad").unwrap(),
+        config::OnExhaustedCfg::LeastBad
+    ));
+    match serde_yaml::from_str::<config::OnExhaustedCfg>("{ fallback_pool: backup }").unwrap() {
+        config::OnExhaustedCfg::FallbackPool(name) => assert_eq!(name, "backup"),
+        other => panic!("expected FallbackPool, got {other:?}"),
+    }
 }
 
 #[test]
@@ -2518,9 +2330,7 @@ fn test_validate_accepts_existing_fallback_pool() {
     let (providers, models, _) = valid_maps();
     let mut pools = HashMap::new();
     let mut pool = make_pool(vec![make_member("mymodel")]);
-    pool.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:backup".to_string(),
-    });
+    pool.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("backup".to_string()));
     pools.insert("mypool".to_string(), pool);
     // The referenced fallback pool exists → no error.
     pools.insert(
@@ -2541,9 +2351,8 @@ fn test_validate_rejects_self_referential_fallback_pool() {
     let (providers, models, _) = valid_maps();
     let mut pools = HashMap::new();
     let mut pool = make_pool(vec![make_member("mymodel")]);
-    pool.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:mypool".to_string(), // points at its own name
-    });
+    // points at its own name
+    pool.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("mypool".to_string()));
     pools.insert("mypool".to_string(), pool);
     let cfg = make_root_cfg(providers, models, pools);
     let errs = validate(&cfg).expect_err("a self-referential fallback pool must fail validation");
@@ -2569,13 +2378,9 @@ fn test_validate_rejects_two_pool_fallback_cycle() {
     let (providers, models, _) = valid_maps();
     let mut pools = HashMap::new();
     let mut a = make_pool(vec![make_member("mymodel")]);
-    a.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:pool_b".to_string(),
-    });
+    a.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("pool_b".to_string()));
     let mut b = make_pool(vec![make_member("mymodel")]);
-    b.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:pool_a".to_string(),
-    });
+    b.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("pool_a".to_string()));
     pools.insert("pool_a".to_string(), a);
     pools.insert("pool_b".to_string(), b);
     let cfg = make_root_cfg(providers, models, pools);
@@ -2603,9 +2408,7 @@ fn test_validate_rejects_three_pool_fallback_cycle() {
     let mut pools = HashMap::new();
     for (name, next) in [("p1", "p2"), ("p2", "p3"), ("p3", "p1")] {
         let mut p = make_pool(vec![make_member("mymodel")]);
-        p.on_exhausted = Some(config::OnExhaustedCfg {
-            action: format!("fallback_pool:{next}"),
-        });
+        p.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool(next.to_string()));
         pools.insert(name.to_string(), p);
     }
     let cfg = make_root_cfg(providers, models, pools);
@@ -2628,13 +2431,9 @@ fn test_validate_accepts_acyclic_fallback_chain() {
     let (providers, models, _) = valid_maps();
     let mut pools = HashMap::new();
     let mut a = make_pool(vec![make_member("mymodel")]);
-    a.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:chain_b".to_string(),
-    });
+    a.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("chain_b".to_string()));
     let mut b = make_pool(vec![make_member("mymodel")]);
-    b.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:chain_c".to_string(),
-    });
+    b.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("chain_c".to_string()));
     let c = make_pool(vec![make_member("mymodel")]);
     pools.insert("chain_a".to_string(), a);
     pools.insert("chain_b".to_string(), b);
@@ -2655,13 +2454,9 @@ fn test_validate_accepts_diamond_fallback_no_cycle() {
     let (providers, models, _) = valid_maps();
     let mut pools = HashMap::new();
     let mut a = make_pool(vec![make_member("mymodel")]);
-    a.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:dia_c".to_string(),
-    });
+    a.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("dia_c".to_string()));
     let mut b = make_pool(vec![make_member("mymodel")]);
-    b.on_exhausted = Some(config::OnExhaustedCfg {
-        action: "fallback_pool:dia_c".to_string(),
-    });
+    b.on_exhausted = Some(config::OnExhaustedCfg::FallbackPool("dia_c".to_string()));
     let c = make_pool(vec![make_member("mymodel")]);
     pools.insert("dia_a".to_string(), a);
     pools.insert("dia_b".to_string(), b);
@@ -3627,43 +3422,47 @@ fn test_path_override_composition_under_metadata_rules() {
         "well-formed leading-slash path on a public host must validate"
     );
 }
+// ---- Cost-model validation (1.5.0): rate_card completeness + groups tree + store + secrets ----
+// The dissolved 1.4.x governance block's checks live in validate_cost_model(&RootCfg) now and run
+// inside the ONE shared validate() that boot and --validate both call.
 
-// ─── Cost-model validation (1.5.0): rate card completeness + budget groups + paste-ready stubs ───
-
-/// Build a models map with one entry (optionally carrying an `upstream_model` override).
-fn one_model(
-    name: &str,
-    upstream: Option<&str>,
-) -> std::collections::HashMap<String, crate::config::ModelCfg> {
-    let yaml = match upstream {
-        Some(u) => format!("provider: p\nupstream_model: {u}"),
-        None => "provider: p".to_string(),
-    };
-    std::collections::HashMap::from([(name.to_string(), serde_yaml::from_str(&yaml).unwrap())])
+/// A valid single-provider/model/pool RootCfg for the cost-surface tests (provider `p`, models as
+/// named, pool `pool1` over the first model).
+fn cost_cfg(model_names: &[&str]) -> RootCfg {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "p".to_string(),
+        make_provider("anthropic", "https://api.example.com", "API_KEY"),
+    );
+    let mut models = HashMap::new();
+    for name in model_names {
+        models.insert(name.to_string(), make_model("p", 10));
+    }
+    let mut pools = HashMap::new();
+    if let Some(first) = model_names.first() {
+        pools.insert("pool1".to_string(), make_pool(vec![make_member(first)]));
+    }
+    make_root_cfg(providers, models, pools)
 }
 
-#[allow(clippy::field_reassign_with_default)]
-fn gov_with_rate_card(entries: &[&str]) -> crate::config::GovernanceCfg {
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.rate_card = Some(
-        entries
-            .iter()
-            .map(|m| (m.to_string(), crate::config::RateEntryCfg::default()))
-            .collect(),
-    );
-    gov
+/// A zeroed rate card over the given CONFIG model names.
+fn rate_card_of(entries: &[&str]) -> std::collections::BTreeMap<String, config::RateEntryCfg> {
+    entries
+        .iter()
+        .map(|m| (m.to_string(), config::RateEntryCfg::default()))
+        .collect()
 }
 
 /// ALL-OR-NOTHING completeness: `rate_card` present with a configured model missing FAILS, and the
-/// error carries a COPY-PASTEABLE zeroed YAML stub of exactly the missing model (post-
-/// `upstream_model` name). The absent-card config passes (token pricing 0, legacy posture).
+/// error carries a COPY-PASTEABLE zeroed YAML stub of exactly the missing CONFIG model name. A card
+/// entry naming a model that does not exist is dead config and errors too. The absent-card config
+/// passes (token pricing 0), and a complete card passes.
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn test_validate_rate_card_completeness_fails_closed_with_paste_stub() {
-    let models = one_model("claude-opus-4", None);
-    let gov = gov_with_rate_card(&["some-other-model"]);
-    let errs = validate_governance(&gov, None, &models, &Default::default())
-        .expect_err("a configured model without a rate entry must fail validation");
+    let mut cfg = cost_cfg(&["claude-opus-4"]);
+    cfg.rate_card = Some(rate_card_of(&["some-other-model"]));
+    let errs =
+        validate(&cfg).expect_err("a configured model without a rate entry must fail validation");
     let joined = errs.join("\n");
     assert!(
         joined.contains("rate_card is present but 1 configured model has no rate entry"),
@@ -3675,202 +3474,612 @@ fn test_validate_rate_card_completeness_fails_closed_with_paste_stub() {
         ),
         "must print the paste-ready zeroed stub for exactly the missing model: {joined}"
     );
+    // The card entry naming a NON-EXISTENT model is dead config (almost always a typo).
+    assert!(
+        joined.contains("rate_card names model 'some-other-model'")
+            && joined.contains("not defined under models:"),
+        "a card entry for an unknown model must error: {joined}"
+    );
 
     // Complete card passes.
-    let gov_ok = gov_with_rate_card(&["claude-opus-4"]);
+    let mut cfg_ok = cost_cfg(&["claude-opus-4"]);
+    cfg_ok.rate_card = Some(rate_card_of(&["claude-opus-4"]));
     assert!(
-        validate_governance(&gov_ok, None, &models, &Default::default()).is_ok(),
-        "a complete rate card passes"
+        validate(&cfg_ok).is_ok(),
+        "a complete rate card passes; got: {:?}",
+        validate(&cfg_ok)
     );
 
     // Absent card passes regardless (token pricing is 0 for every model - the OFF arm).
-    let gov_absent = crate::config::GovernanceCfg::default();
-    assert!(validate_governance(&gov_absent, None, &models, &Default::default()).is_ok());
+    let cfg_absent = cost_cfg(&["claude-opus-4"]);
+    assert!(validate(&cfg_absent).is_ok());
 }
 
-/// Completeness resolves through `upstream_model`: the card must price the RESOLVED upstream name
-/// (the runtime rate-lookup key), not the config alias.
+/// EVERY missing model is stubbed (sorted), not just the first - the operator pastes once.
 #[test]
-fn test_validate_rate_card_completeness_uses_upstream_model() {
-    let models = one_model("smart", Some("gpt-5"));
-    // Card prices the ALIAS, not the resolved upstream name -> the upstream name is missing.
-    let errs = validate_governance(
-        &gov_with_rate_card(&["smart"]),
-        None,
-        &models,
-        &Default::default(),
-    )
-    .expect_err("the resolved upstream name must be priced");
+fn test_validate_rate_card_stubs_every_missing_model() {
+    let mut cfg = cost_cfg(&["alpha", "long-model-name"]);
+    // rate_card {} with two configured models: both missing.
+    cfg.rate_card = Some(rate_card_of(&[]));
+    let errs = validate(&cfg).expect_err("two unpriced models must fail validation");
+    let joined = errs.join("\n");
     assert!(
-        errs.join("\n").contains("gpt-5:"),
-        "stub names the upstream model: {errs:?}"
+        joined.contains("2 configured models have no rate entry"),
+        "the count must be plural and exact: {joined}"
     );
-    // Card pricing the upstream name passes.
-    assert!(validate_governance(
-        &gov_with_rate_card(&["gpt-5"]),
-        None,
-        &models,
-        &Default::default()
-    )
-    .is_ok());
+    for m in ["alpha:", "long-model-name:"] {
+        assert!(
+            joined.contains(m),
+            "the stub must name missing model '{m}': {joined}"
+        );
+    }
 }
 
-/// Malformed rates (NaN / negative) are rejected naming the exact config path + tier.
+/// The card is keyed by CONFIG model name (S5): two providers serving one upstream are two
+/// `models:` entries with two card entries, and `upstream_model` does NOT change the rate key.
+/// (The 1.4.x behavior priced the resolved upstream name; that resolution is identity now.)
 #[test]
-#[allow(clippy::field_reassign_with_default)]
+fn test_validate_rate_card_keyed_by_config_name_not_upstream() {
+    let mut cfg = cost_cfg(&["smart"]);
+    cfg.models.get_mut("smart").unwrap().upstream_model = Some("gpt-5".to_string());
+
+    // Pricing the CONFIG name passes.
+    cfg.rate_card = Some(rate_card_of(&["smart"]));
+    assert!(
+        validate(&cfg).is_ok(),
+        "the card is keyed by config model name; got: {:?}",
+        validate(&cfg)
+    );
+
+    // Pricing the UPSTREAM name fails both ways: `smart` is unpriced and `gpt-5` is unknown.
+    cfg.rate_card = Some(rate_card_of(&["gpt-5"]));
+    let errs = validate(&cfg).expect_err("pricing the upstream name must fail");
+    let joined = errs.join("\n");
+    assert!(
+        joined.contains("smart:"),
+        "stub names the config model: {joined}"
+    );
+    assert!(
+        joined.contains("rate_card names model 'gpt-5'"),
+        "the upstream-keyed entry is flagged unknown: {joined}"
+    );
+}
+
+/// Malformed rates (NaN / negative / infinite) are rejected naming the exact config path + tier.
+#[test]
 fn test_validate_rate_card_rejects_nan_and_negative_rates() {
-    let models = one_model("m", None);
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.rate_card = Some(std::collections::BTreeMap::from([(
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.rate_card = Some(std::collections::BTreeMap::from([(
         "m".to_string(),
-        crate::config::RateEntryCfg {
+        config::RateEntryCfg {
             input_utok: f64::NAN,
             output_utok: -1.0,
-            cache_read_utok: 0.0,
+            cache_read_utok: f64::INFINITY,
             cache_write_utok: 0.0,
         },
     )]));
-    let errs = validate_governance(&gov, None, &models, &Default::default())
-        .expect_err("NaN/negative rates must fail");
+    let errs = validate(&cfg).expect_err("NaN/negative/infinite rates must fail");
     let joined = errs.join("\n");
+    assert!(joined.contains("rate_card['m'].input_utok"), "{joined}");
+    assert!(joined.contains("rate_card['m'].output_utok"), "{joined}");
     assert!(
-        joined.contains("governance.rate_card['m'].input_utok"),
+        joined.contains("rate_card['m'].cache_read_utok"),
         "{joined}"
     );
     assert!(
-        joined.contains("governance.rate_card['m'].output_utok"),
-        "{joined}"
+        !joined.contains("rate_card['m'].cache_write_utok"),
+        "a well-formed tier (0) must not error: {joined}"
     );
 }
 
-/// budget_groups validation: a missing parent fails with a PASTE-READY stub of the missing group;
-/// an invalid period prints the valid set + a corrected line; a cycle names the exact path
-/// (instruction, not stub - it is not mechanically fixable); depth > 8 is rejected.
+/// A negative `per_request_fee` would CREDIT every request - rejected; 0 (default) and positive
+/// values pass.
 #[test]
-#[allow(clippy::field_reassign_with_default)]
-fn test_validate_budget_groups_faults_are_named_with_fixes() {
-    let mk = |cap: i64, period: &str, parent: Option<&str>| crate::config::BudgetGroupCfg {
-        max_budget_cents: cap,
-        budget_period: period.to_string(),
-        parent: parent.map(String::from),
-    };
+fn test_validate_rejects_negative_per_request_fee() {
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.per_request_fee = -1;
+    let errs = validate(&cfg).expect_err("a negative per_request_fee must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("per_request_fee must be >= 0") && e.contains("-1")),
+        "expected the negative-fee error naming the value; got: {errs:?}"
+    );
+    for ok in [0, 1, 250] {
+        let mut cfg = cost_cfg(&["m"]);
+        cfg.per_request_fee = ok;
+        assert!(validate(&cfg).is_ok(), "per_request_fee {ok} must validate");
+    }
+}
 
-    // Missing parent -> paste-ready stub.
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.budget_groups =
-        std::collections::BTreeMap::from([("bob".to_string(), mk(500, "monthly", Some("growth")))]);
-    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
-        .expect_err("missing parent must fail");
+/// An empty `store.module` names no store at all - rejected; the compiled-in `memory` module and
+/// an ABSENT store block (ephemeral RAM store) both pass.
+#[test]
+fn test_validate_rejects_empty_store_module() {
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.store = Some(config::StoreCfg {
+        module: "   ".to_string(),
+        settings: serde_json::Map::new(),
+    });
+    let errs = validate(&cfg).expect_err("an empty store.module must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("store.module must be non-empty")),
+        "expected the empty-store-module error; got: {errs:?}"
+    );
+
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.store = Some(config::StoreCfg::default()); // module: memory
+    assert!(validate(&cfg).is_ok(), "store.module: memory must validate");
+
+    let cfg = cost_cfg(&["m"]); // store: None (block absent)
+    assert!(
+        validate(&cfg).is_ok(),
+        "an absent store block must validate"
+    );
+}
+
+// ---- groups (S3): the ONE limit tree - parents exist, acyclic, depth <= 8, sane amounts ----
+
+/// Build a GroupCfg with the given parent and limits.
+fn group(parent: Option<&str>, limits: Vec<crate::config::groups::LimitCfg>) -> config::GroupCfg {
+    config::GroupCfg {
+        parent: parent.map(String::from),
+        enabled: true,
+        limits,
+    }
+}
+
+fn limit_requests_per_minute(amount: u64) -> crate::config::groups::LimitCfg {
+    crate::config::groups::LimitCfg {
+        metric: crate::config::groups::LimitMetric::Requests,
+        amount,
+        per: Some(crate::config::groups::LimitWindow::Minute),
+    }
+}
+
+/// groups faults are named with fixes: a missing parent gets a PASTE-READY stub; a cycle names
+/// the exact path; depth > 8 is rejected; a zero-amount limit is rejected (it rejects every
+/// request); a valid nested hierarchy passes. (Heir of the budget_groups validation family.)
+#[test]
+fn test_validate_groups_faults_are_named_with_fixes() {
+    // Missing parent -> paste-ready stub of the missing group.
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.groups.insert(
+        "bob".to_string(),
+        group(Some("growth"), vec![limit_requests_per_minute(500)]),
+    );
+    let errs = validate(&cfg).expect_err("missing parent must fail");
     let joined = errs.join("\n");
     assert!(
-        joined.contains("growth: { max_budget_cents: 0, budget_period: monthly }"),
+        joined.contains("groups.bob names parent 'growth', which does not exist"),
+        "missing parent is named: {joined}"
+    );
+    assert!(
+        joined.contains("Paste this under groups")
+            && joined.contains("growth:")
+            && joined.contains("- { requests: 0, per: minute }"),
         "missing parent gets a paste-ready stub: {joined}"
     );
 
-    // Invalid period -> the valid set + a corrected line.
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.budget_groups =
-        std::collections::BTreeMap::from([("t".to_string(), mk(100, "weekly", None))]);
-    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
-        .expect_err("invalid period must fail");
-    let joined = errs.join("\n");
+    // Cycle -> detected and the diagnostic names the path.
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.groups.insert("a".to_string(), group(Some("b"), vec![]));
+    cfg.groups.insert("b".to_string(), group(Some("a"), vec![]));
+    let errs = validate(&cfg).expect_err("a groups cycle must fail");
     assert!(
-        joined.contains("\"total\", \"daily\", \"monthly\""),
-        "{joined}"
-    );
-    assert!(
-        joined.contains("t: { max_budget_cents: 100, budget_period: monthly }"),
-        "{joined}"
+        errs.iter()
+            .any(|e| e.contains("CYCLIC") && e.contains("a -> b")),
+        "the cycle diagnostic must name the path: {errs:?}"
     );
 
-    // Cycle -> the exact offending path, reported ONCE.
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.budget_groups = std::collections::BTreeMap::from([
-        ("a".to_string(), mk(1, "total", Some("b"))),
-        ("b".to_string(), mk(1, "total", Some("a"))),
-    ]);
-    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
-        .expect_err("a cycle must fail");
-    let cycles: Vec<&String> = errs.iter().filter(|e| e.contains("CYCLE")).collect();
-    assert_eq!(cycles.len(), 1, "one cycle = one error: {errs:?}");
-    assert!(cycles[0].contains("a -> b -> a"), "{cycles:?}");
-
-    // Depth > 8 rejected.
-    let mut gov = crate::config::GovernanceCfg::default();
-    let mut groups = std::collections::BTreeMap::new();
+    // Depth > 8 rejected (a 10-deep chain).
+    let mut cfg = cost_cfg(&["m"]);
     for i in 0..10 {
         let parent = if i == 9 {
             None
         } else {
             Some(format!("g{}", i + 1))
         };
-        groups.insert(
+        cfg.groups.insert(
             format!("g{i}"),
-            crate::config::BudgetGroupCfg {
-                max_budget_cents: 1,
-                budget_period: "total".to_string(),
+            config::GroupCfg {
                 parent,
+                enabled: true,
+                limits: vec![],
             },
         );
     }
-    gov.budget_groups = groups;
-    let errs = validate_governance(&gov, None, &Default::default(), &Default::default())
-        .expect_err("a 10-deep chain must fail the depth cap");
+    let errs = validate(&cfg).expect_err("a 10-deep chain must fail the depth cap");
     assert!(errs.join("\n").contains("maximum depth"), "{errs:?}");
 
+    // Zero-amount limit -> rejects every request through the group; must fail loud, and the
+    // message must name the metric and teach the `enabled: false` freeze alternative.
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.groups.insert(
+        "team".to_string(),
+        group(None, vec![limit_requests_per_minute(0)]),
+    );
+    let errs = validate(&cfg).expect_err("a zero-amount limit must fail");
+    assert!(
+        errs.iter().any(|e| e.contains("groups.team")
+            && e.contains("`requests` limit of 0")
+            && e.contains("enabled:")),
+        "expected the zero-amount limit error with the freeze hint; got: {errs:?}"
+    );
+
     // A valid nested hierarchy passes.
-    let mut gov = crate::config::GovernanceCfg::default();
-    gov.budget_groups = std::collections::BTreeMap::from([
-        ("acme".to_string(), mk(10_000_000, "monthly", None)),
-        ("growth".to_string(), mk(2_000_000, "monthly", Some("acme"))),
-        ("bob".to_string(), mk(500_000, "monthly", Some("growth"))),
-    ]);
-    assert!(validate_governance(&gov, None, &Default::default(), &Default::default()).is_ok());
+    let mut cfg = cost_cfg(&["m"]);
+    cfg.groups.insert(
+        "acme".to_string(),
+        group(None, vec![limit_requests_per_minute(10_000)]),
+    );
+    cfg.groups.insert(
+        "growth".to_string(),
+        group(Some("acme"), vec![limit_requests_per_minute(2_000)]),
+    );
+    cfg.groups.insert(
+        "bob".to_string(),
+        group(Some("growth"), vec![limit_requests_per_minute(500)]),
+    );
+    assert!(
+        validate(&cfg).is_ok(),
+        "a valid nested groups tree must validate; got: {:?}",
+        validate(&cfg)
+    );
 }
 
-/// A pool-member 4-tier billing override with NO rate_card is rejected (pricing is all-or-nothing);
-/// conflicting overrides for one model across pools are rejected naming both pools.
+/// CLEAN BREAK (S5/C4): the 1.4.x pool-member keys are GONE - `cost_per_mtok:` (rate_card is the
+/// only cost source) and `target:` (renamed `model:`) both fail AT PARSE via deny_unknown_fields.
 #[test]
-fn test_validate_member_tiered_override_rules() {
-    let models = one_model("m", None);
-    let pool_yaml =
-        "members:\n  - target: m\n    cost_per_mtok: { input_utok: 1.0, output_utok: 2.0 }\n";
-    let pools = std::collections::HashMap::from([(
-        "p1".to_string(),
-        serde_yaml::from_str::<crate::config::PoolCfg>(pool_yaml).unwrap(),
-    )]);
-
-    // No card at all -> the override is an error naming the all-or-nothing rule.
-    let gov = crate::config::GovernanceCfg::default();
-    let errs = validate_governance(&gov, None, &models, &pools)
-        .expect_err("a tiered override without a rate_card must fail");
-    assert!(errs.join("\n").contains("all-or-nothing"), "{errs:?}");
-
-    // With a card, the override itself PRICES the model (no completeness error for 'm').
-    let gov = gov_with_rate_card(&[]);
+fn test_removed_member_keys_rejected_at_parse() {
+    let legacy_cost =
+        "members:\n  - model: m\n    cost_per_mtok: { input_utok: 1.0, output_utok: 2.0 }\n";
+    let err = serde_yaml::from_str::<config::PoolCfg>(legacy_cost)
+        .expect_err("the removed cost_per_mtok member key must fail to parse");
     assert!(
-        validate_governance(&gov, None, &models, &pools).is_ok(),
-        "a member override satisfies completeness for its model"
+        err.to_string().contains("unknown field"),
+        "expected an unknown-field error for cost_per_mtok; got: {err}"
     );
 
-    // Two pools overriding the SAME model with DIFFERENT rates conflict.
-    let pool2_yaml =
-        "members:\n  - target: m\n    cost_per_mtok: { input_utok: 9.0, output_utok: 9.0 }\n";
-    let pools2 = std::collections::HashMap::from([
-        (
-            "p1".to_string(),
-            serde_yaml::from_str::<crate::config::PoolCfg>(pool_yaml).unwrap(),
-        ),
-        (
-            "p2".to_string(),
-            serde_yaml::from_str::<crate::config::PoolCfg>(pool2_yaml).unwrap(),
-        ),
-    ]);
-    let errs = validate_governance(&gov_with_rate_card(&[]), None, &models, &pools2)
-        .expect_err("conflicting member overrides must fail");
+    let legacy_target = "members:\n  - target: m\n";
+    let err = serde_yaml::from_str::<config::PoolCfg>(legacy_target)
+        .expect_err("the retired target: member key must fail to parse");
+    assert!(
+        err.to_string().contains("unknown field"),
+        "expected an unknown-field error for target; got: {err}"
+    );
+
+    // The 1.5.0 spelling parses.
+    let ok = serde_yaml::from_str::<config::PoolCfg>("members:\n  - model: m\n").unwrap();
+    assert_eq!(ok.members[0].model, "m");
+}
+
+// ---- role_bindings (S4): nested by module; module active; scopes parse; groups exist ----
+
+/// One binding under `module` for `role`, in an AuthCfg whose data-plane chain is `chain`.
+fn auth_with_binding(
+    chain: &[&str],
+    module: &str,
+    role: &str,
+    binding: config::RoleBindingCfg,
+) -> config::AuthCfg {
+    let mut auth = make_auth_chain(chain, crate::auth::UpstreamCreds::Own);
+    auth.role_bindings.insert(
+        module.to_string(),
+        std::collections::BTreeMap::from([(role.to_string(), binding)]),
+    );
+    auth
+}
+
+/// A binding under a module that appears in NO chain is dead config (grants nothing) - fail loud
+/// with the paste-ready chain stub; the same binding under an active module passes.
+#[test]
+fn test_validate_role_binding_module_must_be_in_a_chain() {
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(auth_with_binding(
+        &["keys"],
+        "oidc", // not in chain or admin_auth
+        "platform",
+        config::RoleBindingCfg::default(),
+    ));
+    let errs = validate(&cfg).expect_err("a binding under an inactive module must fail");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("role_bindings names module 'oidc'")
+                && e.contains("neither auth.chain nor auth.admin_auth")
+                && e.contains("chain:")),
+        "expected the inactive-module error with the chain paste stub; got: {errs:?}"
+    );
+
+    // The same binding under the ACTIVE `keys` module carries no such error.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(auth_with_binding(
+        &["keys"],
+        "keys",
+        "platform",
+        config::RoleBindingCfg::default(),
+    ));
+    assert!(
+        validate(&cfg).is_ok(),
+        "a binding under an active chain module must validate; got: {:?}",
+        validate(&cfg)
+    );
+}
+
+/// A binding's `group:` must exist in the top-level `groups:` tree - fail loud with the
+/// paste-ready group stub; binding to an existing group passes.
+#[test]
+fn test_validate_role_binding_group_must_exist() {
+    let binding = config::RoleBindingCfg {
+        allowed_pools: None,
+        group: Some("squad".to_string()),
+        admin_scope: None,
+    };
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(auth_with_binding(&["keys"], "keys", "dev", binding.clone()));
+    let errs = validate(&cfg).expect_err("a binding to a nonexistent group must fail");
     let joined = errs.join("\n");
     assert!(
-        joined.contains("p1") && joined.contains("p2"),
-        "names both pools: {joined}"
+        joined.contains("role_bindings.keys.dev names group 'squad'")
+            && joined.contains("Paste this under groups")
+            && joined.contains("squad:"),
+        "expected the missing-group error with the paste-ready stub; got: {joined}"
     );
+
+    // With the group defined, the binding passes.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(auth_with_binding(&["keys"], "keys", "dev", binding));
+    cfg.groups.insert(
+        "squad".to_string(),
+        group(None, vec![limit_requests_per_minute(100)]),
+    );
+    assert!(
+        validate(&cfg).is_ok(),
+        "a binding to an existing group must validate; got: {:?}",
+        validate(&cfg)
+    );
+}
+
+/// A role name shadowing the reserved operator principal id (`admin`) is rejected.
+#[test]
+fn test_validate_role_binding_reserved_role_name_rejected() {
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.auth = Some(auth_with_binding(
+        &["keys"],
+        "keys",
+        "admin",
+        config::RoleBindingCfg::default(),
+    ));
+    let errs = validate(&cfg).expect_err("a role named 'admin' must fail validation");
+    assert!(
+        errs.iter().any(|e| e.contains("role_bindings.keys")
+            && e.contains("'admin'")
+            && e.contains("reserved")),
+        "expected the reserved-role-name error; got: {errs:?}"
+    );
+}
+
+// ---- secret-module resolvability (C2): every SecretRef's MODULE must be known ----
+
+/// Unknown secret modules on the provider api_key and the TLS blocks are fail-closed errors
+/// naming the exact config path with a paste-ready `{ env: ... }` stub; env/file refs missing
+/// their required setting fail too. Well-formed env/file refs pass (values are NOT resolved).
+#[test]
+fn test_validate_secret_module_resolvability() {
+    // providers.*.api_key with an unknown module.
+    let (mut providers, models, pools) = valid_maps();
+    providers.get_mut("myprovider").unwrap().api_key = config::SecretRef {
+        module: "vault".to_string(),
+        settings: serde_json::Map::new(),
+    };
+    let cfg = make_root_cfg(providers, models, pools);
+    let errs = validate(&cfg).expect_err("an unknown secret module must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("providers.myprovider.api_key")
+                && e.contains("secret module 'vault'")
+                && e.contains("{ env: MY_SECRET_VAR }")),
+        "expected the unknown-secret-module error with the env stub; got: {errs:?}"
+    );
+
+    // tls.cert / tls.key / tls.client_ca each checked; a file ref missing settings.path fails.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.tls = Some(config::TlsCfg {
+        cert: config::SecretRef {
+            module: "vault".to_string(),
+            settings: serde_json::Map::new(),
+        },
+        key: config::SecretRef {
+            module: "file".to_string(),
+            settings: serde_json::Map::new(), // missing settings.path
+        },
+        client_ca: Some(config::SecretRef {
+            module: "env".to_string(),
+            settings: serde_json::Map::new(), // missing settings.key
+        }),
+    });
+    let errs = validate(&cfg).expect_err("bad tls secret refs must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("tls.cert") && e.contains("secret module 'vault'")),
+        "tls.cert unknown module must error; got: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("tls.key") && e.contains("requires settings.path")),
+        "tls.key file ref without settings.path must error; got: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("tls.client_ca") && e.contains("requires settings.key")),
+        "tls.client_ca env ref without settings.key must error; got: {errs:?}"
+    );
+
+    // Well-formed env/file refs pass without resolving the values (CI has no secrets present).
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    cfg.tls = Some(config::TlsCfg {
+        cert: config::SecretRef::file("/run/secrets/tls-cert.pem"),
+        key: config::SecretRef::file("/run/secrets/tls-key.pem"),
+        client_ca: Some(config::SecretRef::env("BUSBAR_CLIENT_CA_PEM")),
+    });
+    assert!(
+        validate(&cfg).is_ok(),
+        "well-formed tls secret refs must validate; got: {:?}",
+        validate(&cfg)
+    );
+
+    // auth.signing_key is checked through the same seam.
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    let mut auth = config::AuthCfg::default_none();
+    auth.signing_key = Some(config::SecretRef {
+        module: "vault".to_string(),
+        settings: serde_json::Map::new(),
+    });
+    cfg.auth = Some(auth);
+    let errs = validate(&cfg).expect_err("an unknown signing_key module must fail validation");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("auth.signing_key") && e.contains("secret module 'vault'")),
+        "auth.signing_key unknown module must error; got: {errs:?}"
+    );
+}
+
+// ---- --validate == boot: validation runs on the RESOLVED RootCfg ----
+
+/// Resolve a DeployCfg yaml through `config::resolve` (the boot path) with a minimal catalog
+/// containing the `anthropic` provider def.
+fn resolve_yaml(yaml: &str) -> Result<RootCfg, Vec<String>> {
+    let deploy: config::DeployCfg =
+        serde_yaml::from_str(yaml).expect("the test DeployCfg yaml must parse");
+    let def: config::ProviderDef = serde_yaml::from_str(
+        "protocol: anthropic\nbase_url: https://api.anthropic.com\nerror_map:\n  \"400\": client_error\n",
+    )
+    .unwrap();
+    let defs = HashMap::from([("anthropic".to_string(), def)]);
+    config::resolve(&deploy, &defs)
+}
+
+/// `--validate` and boot share ONE pipeline: DeployCfg yaml -> config::resolve -> RootCfg ->
+/// validate(). A fully wired 1.5.0 config (chain, role_bindings, groups, rate_card, store,
+/// advanced) resolves and validates clean end to end.
+#[test]
+fn test_validate_runs_on_resolved_root_cfg_clean_config() {
+    let yaml = r#"
+listen: "0.0.0.0:8080"
+auth:
+  chain:
+    - keys
+  role_bindings:
+    keys:
+      platform:
+        allowed_pools: [main]
+        group: eng
+providers:
+  anthropic:
+    api_key: { env: ANTHROPIC_API_KEY }
+models:
+  claude:
+    provider: anthropic
+pools:
+  main:
+    members:
+      - model: claude
+groups:
+  eng:
+    limits:
+      - { requests: 500, per: minute }
+rate_card:
+  claude: { input_utok: 3.0, output_utok: 15.0 }
+per_request_fee: 1
+store:
+  module: memory
+advanced:
+  rate_sweep_interval: 256
+"#;
+    let cfg = resolve_yaml(yaml).expect("the clean config must resolve");
+    assert!(
+        validate(&cfg).is_ok(),
+        "the resolved clean config must validate; got: {:?}",
+        validate(&cfg)
+    );
+    // The resolution really produced the new-surface fields validate() reads.
+    assert_eq!(cfg.per_request_fee, 1);
+    assert!(cfg.rate_card.as_ref().unwrap().contains_key("claude"));
+    assert!(cfg.groups.contains_key("eng"));
+    assert_eq!(cfg.store.as_ref().unwrap().module, "memory");
+    assert_eq!(cfg.limits.rate_sweep_interval, 256);
+}
+
+/// The faulty twin: every NEW cost/auth-surface fault in one resolved config is collected by the
+/// SAME validate() call boot uses (collect-all, no first-error short-circuit).
+#[test]
+fn test_validate_runs_on_resolved_root_cfg_collects_new_surface_faults() {
+    let yaml = r#"
+listen: "0.0.0.0:8080"
+auth:
+  chain:
+    - keys
+  role_bindings:
+    oidc:
+      platform:
+        group: ghost-group
+providers:
+  anthropic:
+    api_key: { env: ANTHROPIC_API_KEY }
+models:
+  claude:
+    provider: anthropic
+  haiku:
+    provider: anthropic
+pools:
+  main:
+    members:
+      - model: claude
+groups:
+  frozen:
+    limits:
+      - { requests: 0, per: minute }
+rate_card:
+  claude: { input_utok: 3.0, output_utok: 15.0 }
+per_request_fee: -5
+store:
+  module: ""
+advanced:
+  rate_sweep_interval: 0
+"#;
+    let cfg =
+        resolve_yaml(yaml).expect("the faulty config still RESOLVES (faults are validate-time)");
+    let errs = validate(&cfg).expect_err("the resolved faulty config must fail validation");
+    let joined = errs.join("\n");
+    // rate_card completeness (haiku unpriced) with the paste stub.
+    assert!(
+        joined.contains("haiku:") && joined.contains("no rate entry"),
+        "{joined}"
+    );
+    // role_bindings module inactive + group missing.
+    assert!(
+        joined.contains("role_bindings names module 'oidc'"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("role_bindings.oidc.platform names group 'ghost-group'"),
+        "{joined}"
+    );
+    // groups zero-amount limit.
+    assert!(joined.contains("groups.frozen"), "{joined}");
+    // per_request_fee, store.module, advanced.rate_sweep_interval.
+    assert!(joined.contains("per_request_fee must be >= 0"), "{joined}");
+    assert!(
+        joined.contains("store.module must be non-empty"),
+        "{joined}"
+    );
+    assert!(joined.contains("advanced.rate_sweep_interval"), "{joined}");
 }
