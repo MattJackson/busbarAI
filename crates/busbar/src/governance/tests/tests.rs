@@ -2477,3 +2477,207 @@ fn test_budget_state_projects_the_whole_chain() {
     assert_eq!(state[1].budget_period, "monthly");
     assert_eq!(state[2].bucket_id, "group:acme");
 }
+
+/// P3 signed-token keys, end to end at the GovState seam: mint -> verify -> revoke/delete/tamper/
+/// rotate/expiry. These drive the real `mint_signed`/`verify_token`/`revoke` path over the memory
+/// store (with its durable denylist), so the whole stateless-verify + denylist contract is proven.
+mod signed_token {
+    use crate::governance::signing::{TokenSigner, DEFAULT_KID};
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    use std::sync::Arc;
+
+    fn gov() -> Arc<GovState> {
+        let store = Arc::new(MemoryStore::new());
+        let signer = TokenSigner::from_secret_bytes(&[9u8; 32], DEFAULT_KID);
+        Arc::new(
+            GovState::new_with_signer(store, Some("admintok".into()), Some(signer)).expect("gov"),
+        )
+    }
+
+    fn spec(name: &str, group: Option<&str>, pools: Vec<&str>) -> NewKeySpec {
+        NewKeySpec {
+            name: name.into(),
+            allowed_pools: pools.into_iter().map(str::to_string).collect(),
+            max_budget_cents: None,
+            budget_period: "total".into(),
+            rpm_limit: None,
+            tpm_limit: None,
+            budget_group: group.map(str::to_string),
+            labels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Mint issues a signed token; verify resolves the binding by `sub`; the binding carries the
+    /// group + pools and NO inline limits.
+    #[test]
+    fn mint_then_verify_resolves_the_binding() {
+        let g = gov();
+        let (binding, token) = g
+            .mint_signed(spec("bob", Some("growth"), vec!["fast"]), 2_000, 1_000)
+            .expect("mint");
+        assert!(token.starts_with("bbk_"), "token carries the prefix");
+        assert!(binding.id.starts_with("vk_"));
+        assert_eq!(binding.budget_group.as_deref(), Some("growth"));
+        assert_eq!(binding.allowed_pools, vec!["fast".to_string()]);
+        // Keys carry no inline limits (S1).
+        assert_eq!(binding.max_budget_cents, None);
+        assert_eq!(binding.rpm_limit, None);
+
+        let resolved = g.verify_token(&token, 1_500).expect("verify");
+        assert_eq!(resolved.id, binding.id);
+        assert_eq!(resolved.budget_group.as_deref(), Some("growth"));
+    }
+
+    /// A key with NO group is authed + unlimited (the binding resolves, group is None).
+    #[test]
+    fn no_group_key_is_authed_unlimited() {
+        let g = gov();
+        let (_b, token) = g
+            .mint_signed(spec("free", None, vec![]), 2_000, 1_000)
+            .expect("mint");
+        let resolved = g.verify_token(&token, 1_500).expect("verify");
+        assert_eq!(resolved.budget_group, None);
+        // Empty allowed_pools = all pools (the runtime "all" encoding).
+        assert!(resolved.allowed_pools.is_empty());
+    }
+
+    /// An EXPIRED token is rejected by verify (stateless).
+    #[test]
+    fn expired_token_is_rejected() {
+        let g = gov();
+        let (_b, token) = g
+            .mint_signed(spec("bob", None, vec![]), 1_000, 500)
+            .expect("mint");
+        assert!(g.verify_token(&token, 999).is_some(), "valid before exp");
+        assert!(g.verify_token(&token, 1_000).is_none(), "rejected at exp");
+        assert!(g.verify_token(&token, 5_000).is_none(), "rejected past exp");
+    }
+
+    /// A TAMPERED token fails verify (signature check).
+    #[test]
+    fn tampered_token_is_rejected() {
+        let g = gov();
+        let (_b, token) = g
+            .mint_signed(spec("bob", None, vec![]), 2_000, 1_000)
+            .expect("mint");
+        let mut chars: Vec<char> = token.chars().collect();
+        // Flip a char in the middle (the payload segment).
+        let mid = chars.len() / 2;
+        chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
+        let tampered: String = chars.into_iter().collect();
+        assert!(g.verify_token(&tampered, 1_500).is_none());
+    }
+
+    /// REVOKE denylists the subject WITHOUT deleting the binding: verify now returns None, the
+    /// binding still exists, and `is_revoked` reports true. Idempotent.
+    #[test]
+    fn revoke_denylists_and_keeps_binding() {
+        let g = gov();
+        let (binding, token) = g
+            .mint_signed(spec("bob", None, vec![]), 2_000, 1_000)
+            .expect("mint");
+        assert!(g.verify_token(&token, 1_500).is_some());
+        g.revoke(&binding.id, "test").expect("revoke");
+        g.revoke(&binding.id, "again").expect("idempotent");
+        assert!(g.is_revoked(&binding.id));
+        assert!(
+            g.verify_token(&token, 1_500).is_none(),
+            "a revoked subject's token is rejected"
+        );
+        // The binding row still exists (revoke keeps history).
+        assert!(g.all_keys().unwrap().iter().any(|k| k.id == binding.id));
+    }
+
+    /// The denylist is DURABLE: a fresh GovState over the SAME store re-hydrates the revocation, so
+    /// a restart keeps a revoked token rejected.
+    #[test]
+    fn revocation_survives_restart() {
+        let store = Arc::new(MemoryStore::new());
+        let signer = TokenSigner::from_secret_bytes(&[9u8; 32], DEFAULT_KID);
+        let g = Arc::new(
+            GovState::new_with_signer(store.clone(), Some("t".into()), Some(signer)).unwrap(),
+        );
+        let (binding, token) = g
+            .mint_signed(spec("bob", None, vec![]), 5_000, 1_000)
+            .expect("mint");
+        g.revoke(&binding.id, "test").expect("revoke");
+
+        // Restart: new GovState, same store + same signing key.
+        let signer2 = TokenSigner::from_secret_bytes(&[9u8; 32], DEFAULT_KID);
+        let g2 =
+            Arc::new(GovState::new_with_signer(store, Some("t".into()), Some(signer2)).unwrap());
+        assert!(g2.is_revoked(&binding.id), "denylist re-hydrated at boot");
+        assert!(
+            g2.verify_token(&token, 1_500).is_none(),
+            "the revoked token is still rejected after restart"
+        );
+    }
+
+    /// FLEET / ROTATION: a token minted by node A verifies on node B when both share the signing
+    /// key; after B rotates to a DIFFERENT key, A's token fails on B (the signature/kid no longer
+    /// matches).
+    #[test]
+    fn token_verifies_across_shared_key_and_fails_after_rotation() {
+        let store_a = Arc::new(MemoryStore::new());
+        let key_a = TokenSigner::from_secret_bytes(&[1u8; 32], DEFAULT_KID);
+        let node_a = Arc::new(
+            GovState::new_with_signer(store_a.clone(), Some("t".into()), Some(key_a)).unwrap(),
+        );
+        let (binding, token) = node_a
+            .mint_signed(spec("bob", None, vec![]), 5_000, 1_000)
+            .expect("mint");
+
+        // Node B shares the SAME signing key + a store that also has the binding (shared durable
+        // store in a real fleet; here we re-put the binding so lookup_by_sub resolves).
+        let store_b = Arc::new(MemoryStore::new());
+        {
+            use busbar_api::Store;
+            store_b.put_key(&binding).unwrap();
+        }
+        let key_b_same = TokenSigner::from_secret_bytes(&[1u8; 32], DEFAULT_KID);
+        let node_b = Arc::new(
+            GovState::new_with_signer(store_b.clone(), Some("t".into()), Some(key_b_same)).unwrap(),
+        );
+        assert!(
+            node_b.verify_token(&token, 1_500).is_some(),
+            "a token signed by the shared key verifies on another node"
+        );
+
+        // Node B ROTATES to a different signing key: the old token no longer verifies.
+        let key_b_rotated = TokenSigner::from_secret_bytes(&[2u8; 32], DEFAULT_KID);
+        let node_b2 = Arc::new(
+            GovState::new_with_signer(store_b, Some("t".into()), Some(key_b_rotated)).unwrap(),
+        );
+        assert!(
+            node_b2.verify_token(&token, 1_500).is_none(),
+            "after rotation, a token signed by the old key is rejected (revoke-all)"
+        );
+    }
+
+    /// mint_signed_with_aws issues both a token and an AWS credential for the same subject.
+    #[test]
+    fn mint_with_aws_issues_token_and_credential() {
+        let g = gov();
+        let (binding, token, akid, secret) = g
+            .mint_signed_with_aws(spec("bob", None, vec![]), 2_000, 1_000)
+            .expect("mint+aws");
+        assert!(token.starts_with("bbk_"));
+        assert!(akid.starts_with("AKIA"));
+        assert!(!secret.is_empty());
+        // The AWS credential resolves back to the same subject.
+        let entry = g.lookup_by_access_key_id(&akid).expect("akid resolves");
+        assert_eq!(entry.key.id, binding.id);
+    }
+
+    /// Minting without a signer fails closed (no token can be issued).
+    #[test]
+    fn mint_without_signer_fails_closed() {
+        let store = Arc::new(MemoryStore::new());
+        let g = Arc::new(GovState::new(store, Some("t".into())).unwrap());
+        assert!(!g.signing_enabled());
+        let err = g
+            .mint_signed(spec("bob", None, vec![]), 2_000, 1_000)
+            .unwrap_err();
+        assert!(err.0.contains("no signing key"), "got {}", err.0);
+    }
+}

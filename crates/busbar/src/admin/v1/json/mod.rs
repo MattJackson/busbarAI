@@ -97,6 +97,13 @@ impl AdminTransport for JsonV1 {
             )
             .route("/keys/{id}/usage", get(crate::admin::key_usage))
             .route("/keys/{id}/rotate", post(crate::admin::rotate_key))
+            // 1.5.0 signed-token keys: revoke a key (denylist, keep the binding) and rotate the
+            // busbar key-signing key (revoke-all).
+            .route("/keys/{id}/revoke", post(crate::admin::revoke_key))
+            .route(
+                "/signing-key/rotate",
+                post(crate::admin::rotate_signing_key),
+            )
             // EVERY response on this surface speaks the frozen envelope — including an unmatched
             // path (404 `not_found`) and a matched path with the wrong method (405
             // `method_not_allowed`). Without these, axum's nest semantics leak an empty-body 405

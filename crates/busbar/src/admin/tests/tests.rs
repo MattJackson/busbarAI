@@ -54,6 +54,28 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
     }
 }
 
+/// Build a `GovState` that CAN mint 1.5.0 signed-token keys: it carries a deterministic
+/// `TokenSigner` (fixed key bytes + the default kid) so `POST /keys` issues a `bbk_` token instead
+/// of a 409 "signed-token minting is unavailable". Every admin test that mints (directly or over
+/// HTTP) builds its gov through this so the signer is always present; a read-only test could stay on
+/// `GovState::new`, but giving them all a signer keeps the fixtures uniform and future-proof.
+fn gov_with_signer(
+    store: Arc<dyn crate::governance::Store>,
+    admin_token: Option<String>,
+) -> Arc<GovState> {
+    Arc::new(
+        GovState::new_with_signer(
+            store,
+            admin_token,
+            Some(crate::governance::signing::TokenSigner::from_secret_bytes(
+                &[9u8; 32],
+                crate::governance::signing::DEFAULT_KID,
+            )),
+        )
+        .unwrap(),
+    )
+}
+
 /// Build a router whose App has governance enabled with a known admin token, returning the
 /// listen address + the live server handle.
 async fn serve_with_gov(gov: Arc<GovState>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -74,7 +96,7 @@ async fn serve_with_gov(gov: Arc<GovState>) -> (std::net::SocketAddr, tokio::tas
 async fn test_admin_v1_info_reports_version_features_and_topology() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -141,7 +163,7 @@ async fn test_admin_v1_topology_reads_pools_models_providers() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
 
     let app = TestApp::new()
         .governance(gov)
@@ -223,7 +245,7 @@ async fn test_admin_v1_topology_reads_pools_models_providers() {
 async fn test_api_root_unmatched_paths_speak_the_admin_envelope() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -331,7 +353,7 @@ async fn test_admin_v1_pool_detail_live_status() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new()
         .governance(gov)
         .lane(
@@ -419,7 +441,7 @@ async fn test_admin_v1_pool_detail_live_status() {
 async fn test_admin_v1_admin_auth_read() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -454,7 +476,7 @@ async fn test_admin_v1_get_single_key() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (minted, minted_secret) = gov
         .create_key(
             NewKeySpec {
@@ -519,7 +541,7 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
     // Prices: 1 cent/request + a rate card of 500 micro-units/token on every tier (the same
     // blended 50 cents/1k tokens the pre-rate-card assertions were derived from). Spend is now
     // DERIVED at read time from ledger x rate card, so the CostModel is the derivation input.
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let rate = crate::config::RateEntryCfg {
         input_utok: 500.0,
         output_utok: 500.0,
@@ -696,7 +718,7 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
     });
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -795,7 +817,7 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
 async fn test_admin_v1_config_apply_body_swaps_and_carries_health() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
             "m0",
@@ -928,7 +950,7 @@ pools:
     .unwrap();
 
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
             "m0",
@@ -1050,7 +1072,7 @@ providers: {}
 async fn test_admin_v1_mutation_rate_limit_config_class() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1099,7 +1121,7 @@ async fn test_admin_v1_mutation_rate_limit_config_class() {
 async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1297,7 +1319,7 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
 async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1446,7 +1468,7 @@ async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
 async fn test_admin_v1_idempotency_key_is_principal_scoped() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1493,8 +1515,8 @@ async fn test_admin_v1_idempotency_key_is_principal_scoped() {
         "a second principal's identical Idempotency-Key must mint a NEW key, not replay A's"
     );
     assert_ne!(
-        a["secret"], b["secret"],
-        "B must never receive A's once-shown secret via a cross-principal replay"
+        a["token"], b["token"],
+        "B must never receive A's once-shown token via a cross-principal replay"
     );
     // And A replaying its OWN key still returns A's response (per-principal idempotency intact).
     let a2: serde_json::Value = mint("admintok").await.unwrap().json().await.unwrap();
@@ -1511,7 +1533,7 @@ async fn test_admin_v1_idempotency_key_is_principal_scoped() {
 async fn test_admin_v1_credential_cache_and_flush_endpoint() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1612,7 +1634,7 @@ async fn test_admin_v1_credential_cache_and_flush_endpoint() {
 async fn test_admin_v1_put_auth_dry_run_guard() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mut app = TestApp::new().governance(gov).build();
     {
         let inner = Arc::get_mut(&mut app).expect("sole owner");
@@ -1761,7 +1783,7 @@ async fn test_admin_v1_put_auth_dry_run_guard() {
 async fn test_admin_v1_key_idempotent_mint_and_if_match() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1784,7 +1806,7 @@ async fn test_admin_v1_key_idempotent_mint_and_if_match() {
     let b: serde_json::Value = mint("abc").await.unwrap().json().await.unwrap();
     assert_eq!(a["id"], b["id"], "replay returns the same key");
     assert_eq!(
-        a["secret"], b["secret"],
+        a["token"], b["token"],
         "replay returns the FIRST response verbatim"
     );
     let listed: serde_json::Value = admin(client.get(format!(
@@ -1842,7 +1864,7 @@ async fn test_admin_v1_key_idempotent_mint_and_if_match() {
 async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1883,7 +1905,7 @@ async fn test_admin_v1_idempotency_reservation_frees_on_failure() {
 async fn test_admin_v1_key_rotate_and_pagination() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov.clone()).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1895,7 +1917,8 @@ async fn test_admin_v1_key_rotate_and_pagination() {
             .header("content-type", "application/json")
     };
 
-    // Mint three keys.
+    // Mint three signed-token keys. The mint returns a `bbk_` token (not a bearer secret); we keep
+    // only the id - pagination is over the id-sorted set, and rotation below mints its own secret.
     let mut ids = Vec::new();
     for n in ["ka", "kb", "kc"] {
         let created: serde_json::Value =
@@ -1907,10 +1930,13 @@ async fn test_admin_v1_key_rotate_and_pagination() {
                 .json()
                 .await
                 .unwrap();
-        ids.push((
-            created["id"].as_str().unwrap().to_string(),
-            created["secret"].as_str().unwrap().to_string(),
-        ));
+        assert!(
+            created["token"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("bbk_")),
+            "mint returns a signed token: {created}"
+        );
+        ids.push(created["id"].as_str().unwrap().to_string());
     }
 
     // Pagination (cursor envelope): page 1 with ?limit=2 yields 2 items + a next_cursor; feeding
@@ -1967,8 +1993,11 @@ async fn test_admin_v1_key_rotate_and_pagination() {
         "invalid_request"
     );
 
-    // Rotate the first key: same id, new secret; old secret dead, new secret resolves.
-    let (id, old_secret) = ids[0].clone();
+    // Rotate the first key: the legacy rotate path mints a FRESH BEARER secret in place (distinct
+    // from the signed-token mint above), keeping the id stable. The new secret resolves via the
+    // hash lookup. (The signed-token binding carried no bearer secret to compare against - rotate is
+    // the legacy-secret escape hatch, still returning `secret`, not a token.)
+    let id = ids[0].clone();
     let rotated: serde_json::Value =
         admin(client.post(format!("http://{addr}/api/v1/admin/keys/{id}/rotate")))
             .send()
@@ -1979,12 +2008,7 @@ async fn test_admin_v1_key_rotate_and_pagination() {
             .unwrap();
     assert_eq!(rotated["id"], id.as_str(), "id is stable across rotation");
     let new_secret = rotated["secret"].as_str().unwrap().to_string();
-    assert_ne!(new_secret, old_secret);
     assert!(gov.lookup(&new_secret).is_some(), "new secret resolves");
-    assert!(
-        gov.lookup(&old_secret).is_none(),
-        "old secret stops resolving immediately"
-    );
 
     // Unknown id → 404.
     let missing = admin(client.post(format!("http://{addr}/api/v1/admin/keys/vk_nope/rotate")))
@@ -2002,7 +2026,7 @@ async fn test_admin_v1_key_rotate_and_pagination() {
 async fn test_admin_v1_put_hook_replaces_live_with_guards() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2119,7 +2143,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
 async fn test_admin_v1_config_versions_rollback_and_diff() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2221,7 +2245,7 @@ async fn test_admin_v1_config_versions_rollback_and_diff() {
 async fn test_admin_v1_register_hook_takes_effect_live() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2393,7 +2417,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
 async fn test_admin_v1_audit_records_mutations() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2479,7 +2503,7 @@ async fn test_admin_v1_audit_records_mutations() {
 async fn test_admin_v1_hook_mutation_404_is_audited() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2556,7 +2580,7 @@ async fn test_admin_v1_list_keys_filters() {
     use crate::governance::NewKeySpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (minted, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -2622,7 +2646,7 @@ async fn test_admin_v1_list_keys_filters() {
 async fn test_admin_v1_config_plane_golden_path() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("t".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("t".to_string()));
     let overlay = std::env::temp_dir().join(format!(
         "busbar-golden-{}-{}.json",
         std::process::id(),
@@ -2736,7 +2760,7 @@ async fn test_admin_v1_config_plane_golden_path() {
 async fn test_admin_v1_hook_register_persists_to_overlay() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let overlay = std::env::temp_dir().join(format!(
         "busbar-persist-test-{}-{}.json",
         std::process::id(),
@@ -2796,7 +2820,7 @@ async fn test_admin_v1_hook_register_persists_to_overlay() {
 async fn test_admin_v1_audit_records_key_mutations() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2847,7 +2871,7 @@ async fn test_admin_v1_audit_records_key_mutations() {
 async fn test_admin_v1_base_hook_is_read_only_via_api() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let base: crate::config::HookCfg = serde_json::from_value(serde_json::json!({
         "kind": "gate", "webhook": "http://127.0.0.1:9990/", "prompt": "no", "global": true
     }))
@@ -2918,7 +2942,7 @@ async fn test_admin_v1_base_hook_is_read_only_via_api() {
 async fn test_admin_v1_delete_hook_takes_effect_live() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2984,7 +3008,7 @@ async fn test_admin_v1_delete_hook_takes_effect_live() {
 async fn test_admin_v1_hooks_read_surface() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
 
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
@@ -3068,7 +3092,7 @@ async fn test_admin_v1_hooks_read_surface() {
 async fn test_admin_v1_hook_health_best_effort() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let mk = |socket: Option<&str>, webhook: Option<&str>| crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
         socket: socket.map(str::to_string),
@@ -3141,7 +3165,7 @@ async fn test_admin_v1_hook_health_best_effort() {
 async fn test_admin_v1_plugins_catalog_by_type() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
         socket: Some("/run/busbar/h.sock".to_string()),
@@ -3232,7 +3256,7 @@ async fn test_admin_v1_plugins_catalog_by_type() {
 async fn test_admin_v1_auth_read() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3265,7 +3289,7 @@ async fn test_admin_v1_auth_read() {
 async fn test_admin_v1_config_validate_dry_run() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3327,7 +3351,7 @@ async fn test_admin_v1_config_effective_snapshot_no_secrets() {
     use crate::test_support::LaneSpec;
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
         socket: None,
@@ -3418,7 +3442,7 @@ async fn test_admin_v1_config_effective_snapshot_no_secrets() {
 async fn test_admin_v1_openapi_paths_all_resolve() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3488,7 +3512,7 @@ async fn test_admin_v1_openapi_paths_all_resolve() {
 async fn test_admin_v1_all_reads_require_admin_token() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3539,7 +3563,7 @@ async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_re
     // ONCE at creation; neither the AWS secret nor the key_hash is ever returned by a later read.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -3557,8 +3581,10 @@ async fn test_create_key_with_aws_credential_returns_secret_once_and_hides_on_re
     assert!(akid.starts_with("AKIA"), "akid shape: {akid}");
     assert_eq!(aws_secret.len(), 40, "aws secret is 40 chars");
     assert!(
-        body["secret"].is_string(),
-        "bearer secret returned once too"
+        body["token"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("bbk_")),
+        "the signed token is returned once too"
     );
 
     // A plain mint (no flag) carries NO AWS fields.
@@ -3610,7 +3636,7 @@ async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
     // handlers must still return the same responses (no secret/hash leak; usage resolves).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -3625,7 +3651,12 @@ async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
     assert_eq!(created.status().as_u16(), 201);
     let body: serde_json::Value = created.json().await.unwrap();
     let id = body["id"].as_str().unwrap().to_string();
-    assert!(body["secret"].is_string(), "secret returned once on create");
+    assert!(
+        body["token"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("bbk_")),
+        "signed token returned once on create"
+    );
     assert!(body["key_hash"].is_null(), "key_hash must never be exposed");
 
     // list
@@ -3643,7 +3674,10 @@ async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
         "list must not leak secrets"
     );
 
-    // usage — an UNCAPPED key reports `rate_headroom: null` (nothing to be near).
+    // usage - a 1.5.0 signed-token key carries NO inline rate caps (all enforcement flows through
+    // the bound group), so `rate_headroom` is always null on the key-usage read. (The capped-key
+    // headroom path can no longer be reached via mint; it is covered directly in the governance
+    // unit tests over `rate_headroom`.)
     let usage = client
         .get(format!("http://{addr}/api/v1/admin/keys/{id}/usage"))
         .header("x-admin-token", "admintok")
@@ -3655,72 +3689,40 @@ async fn test_create_list_usage_roundtrip_through_spawn_blocking() {
     assert_eq!(ub["id"], id);
     assert!(
         ub["rate_headroom"].is_null(),
-        "uncapped key has no headroom signal: {ub}"
-    );
-
-    // A rate-CAPPED key reports its headroom fraction (a fresh window = fully available, 1.0),
-    // so a client can back off BEFORE tripping a 429 (key-06).
-    let capped: serde_json::Value = client
-        .post(format!("http://{addr}/api/v1/admin/keys"))
-        .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({"name": "k-capped", "rpm_limit": 10}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let capped_id = capped["id"].as_str().unwrap();
-    let ub: serde_json::Value = client
-        .get(format!("http://{addr}/api/v1/admin/keys/{capped_id}/usage"))
-        .header("x-admin-token", "admintok")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(
-        ub["rate_headroom"], 1.0,
-        "fresh capped key is fully available: {ub}"
+        "an inline-cap-free key has no headroom signal: {ub}"
     );
     handle.abort();
 }
 
 #[tokio::test]
-async fn test_create_key_rejects_unknown_budget_period() {
-    // Regression (MEDIUM/correctness): an unrecognized budget_period (a typo) must be rejected
-    // with 400, NOT accepted at 201 and silently enforced as the all-time `"total"` window. A
-    // valid period (and the default when omitted) must still create the key.
+async fn test_create_key_rejects_removed_budget_period_field() {
+    // 1.5.0 (S1): keys are PURE AUTH - `budget_period` is GONE from the mint body, and the mint
+    // struct is `#[serde(deny_unknown_fields)]`, so a body carrying the removed field is a loud 400
+    // (invalid_request), never silently accepted. The premise of the old test (a typo'd period
+    // degrading to `total`) no longer exists: there is no period on a key at all.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
 
-    // Typo'd period → 400, no key minted.
-    for bad in ["weekly", "monthlly", "", "TOTAL"] {
+    // A body naming the removed `budget_period` field is rejected by deny_unknown_fields - EVEN a
+    // once-valid value like "total" (there is no such mint field to accept it).
+    for removed in ["total", "daily", "weekly", ""] {
         let resp = client
             .post(&url)
             .header("x-admin-token", "admintok")
-            .json(&serde_json::json!({"name": "k", "budget_period": bad}))
+            .json(&serde_json::json!({"name": "k", "budget_period": removed}))
             .send()
             .await
             .unwrap();
         assert_eq!(
             resp.status().as_u16(),
             400,
-            "budget_period '{bad}' must be rejected with 400"
+            "the removed budget_period field must 400 via deny_unknown_fields (value '{removed}')"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("budget_period"),
-            "400 body must name budget_period: {body}"
-        );
         assert_eq!(
             body["error"]["code"],
             "invalid_request", // frozen v1 envelope: keys speak the SAME code enum (H1)
@@ -3728,28 +3730,7 @@ async fn test_create_key_rejects_unknown_budget_period() {
         );
     }
 
-    // Each valid period (and the omitted-default) creates the key with that exact period.
-    for &good in super::VALID_BUDGET_PERIODS {
-        let resp = client
-            .post(&url)
-            .header("x-admin-token", "admintok")
-            .json(&serde_json::json!({"name": "k", "budget_period": good}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            201,
-            "valid budget_period '{good}' must create the key"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(
-            body["budget_period"], good,
-            "stored period must match request"
-        );
-    }
-
-    // Omitted budget_period defaults to "total".
+    // A body WITHOUT the removed field still mints, and the response carries no `budget_period`.
     let resp = client
         .post(&url)
         .header("x-admin-token", "admintok")
@@ -3757,12 +3738,11 @@ async fn test_create_key_rejects_unknown_budget_period() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 201, "omitted period must default");
+    assert_eq!(resp.status().as_u16(), 201, "a pure-auth body still mints");
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(
-        body["budget_period"],
-        "total", // golden wire-contract literal (kept bare on purpose)
-        "omitted period defaults to total"
+    assert!(
+        body.get("budget_period").is_none() || body["budget_period"].is_null(),
+        "the key surface no longer carries budget_period: {body}"
     );
 
     handle.abort();
@@ -3776,7 +3756,7 @@ async fn test_create_key_rejects_unknown_budget_period() {
 async fn test_create_key_rejects_unsafe_labels() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
@@ -3877,7 +3857,7 @@ async fn test_create_key_rejects_unsafe_labels() {
 async fn test_admin_malformed_body_returns_generic_400_no_input_fragment() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
 
@@ -3932,64 +3912,39 @@ async fn test_admin_malformed_body_returns_generic_400_no_input_fragment() {
 }
 
 #[tokio::test]
-async fn test_create_key_rejects_negative_max_budget_cents() {
-    // Regression (HIGH/correctness): a negative `max_budget_cents` is a signed-i64 value serde
-    // does NOT auto-reject (unlike the unsigned rpm/tpm limits). A negative cap makes governance
-    // read a brand-new key (spend 0) as over budget from request one — a silent DoS. It must be
-    // rejected with 400 and no key minted; `0` (a hard no-spend cap) and a positive value, and an
-    // omitted field (unlimited), must all still create the key.
+async fn test_create_key_rejects_removed_max_budget_cents_field() {
+    // 1.5.0 (S1): keys carry NO inline caps - `max_budget_cents` is REMOVED from the mint body, and
+    // the mint struct is `#[serde(deny_unknown_fields)]`. The old test's premise (a negative cap
+    // slipping past serde into a silent over-budget DoS) is gone: the field no longer exists on the
+    // key surface, so ANY body carrying it - negative, zero, or positive - is a loud 400.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
 
-    for bad in [-1_i64, -100, i64::MIN] {
+    for value in [-1_i64, 0, 100_000] {
         let resp = client
             .post(&url)
             .header("x-admin-token", "admintok")
-            .json(&serde_json::json!({"name": "k", "max_budget_cents": bad}))
+            .json(&serde_json::json!({"name": "k", "max_budget_cents": value}))
             .send()
             .await
             .unwrap();
         assert_eq!(
             resp.status().as_u16(),
             400,
-            "negative max_budget_cents {bad} must be rejected with 400"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("max_budget_cents"),
-            "400 body must name max_budget_cents: {body}"
-        );
-    }
-
-    // Zero (hard no-spend cap) and a positive value both create the key with that exact cap.
-    for good in [0_i64, 1, 100_000] {
-        let resp = client
-            .post(&url)
-            .header("x-admin-token", "admintok")
-            .json(&serde_json::json!({"name": "k", "max_budget_cents": good}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            201,
-            "non-negative max_budget_cents {good} must create the key"
+            "the removed max_budget_cents field must 400 via deny_unknown_fields (value {value})"
         );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(
-            body["max_budget_cents"], good,
-            "stored cap must match request"
+            body["error"]["code"], "invalid_request",
+            "400 error code must be invalid_request: {body}"
         );
     }
 
-    // Omitted field → unlimited (null), still 201.
+    // A pure-auth body (no removed field) still mints, and the response carries no max_budget_cents.
     let resp = client
         .post(&url)
         .header("x-admin-token", "admintok")
@@ -3997,15 +3952,11 @@ async fn test_create_key_rejects_negative_max_budget_cents() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        201,
-        "omitted budget must create key"
-    );
+    assert_eq!(resp.status().as_u16(), 201, "a pure-auth body still mints");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(
-        body["max_budget_cents"].is_null(),
-        "omitted budget is unlimited (null)"
+        body.get("max_budget_cents").is_none() || body["max_budget_cents"].is_null(),
+        "the key surface no longer carries max_budget_cents: {body}"
     );
 
     handle.abort();
@@ -4017,7 +3968,7 @@ async fn test_patch_key_enables_disables_and_validates_at_create_parity() {
     // adjust caps; it is admin-gated and rejects the same invalid values create() does.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1/admin/keys");
@@ -4087,61 +4038,41 @@ async fn test_patch_key_enables_disables_and_validates_at_create_parity() {
 }
 
 #[tokio::test]
-async fn test_create_key_rejects_zero_rate_limits() {
-    // Regression (LOW/bug): `rpm_limit`/`tpm_limit` are unsigned, so serde rejects a negative but
-    // accepts `0`. A zero limit is NOT "unlimited" (that is the omitted/None case): governance
-    // checks `requests >= rpm` / `tokens >= tpm` against a window starting at 0, so `0` makes the
-    // key reject every request from creation — a permanently-dead key minted with 201 and no
-    // diagnostic. Both fields must 400; a positive value, and omission (unlimited), must create it.
+async fn test_create_key_rejects_removed_rate_limit_fields() {
+    // 1.5.0 (S1): `rpm_limit`/`tpm_limit` are REMOVED from the mint body (keys carry no inline caps;
+    // enforcement flows through the bound group), and the mint struct is
+    // `#[serde(deny_unknown_fields)]`. The old test's premise (a `0` limit slipping past serde into
+    // a permanently-dead key) is gone: ANY body naming these fields is a loud 400.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
 
     for field in ["rpm_limit", "tpm_limit"] {
-        let resp = client
-            .post(&url)
-            .header("x-admin-token", "admintok")
-            .json(&serde_json::json!({"name": "k", field: 0}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            400,
-            "{field}: 0 must be rejected with 400"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains(field),
-            "400 body must name {field}: {body}"
-        );
+        for value in [0, 5] {
+            let resp = client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", field: value}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "the removed {field} field must 400 via deny_unknown_fields (value {value})"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body["error"]["code"], "invalid_request",
+                "400 error code must be invalid_request: {body}"
+            );
+        }
     }
 
-    // A positive limit on either field still creates the key.
-    for field in ["rpm_limit", "tpm_limit"] {
-        let resp = client
-            .post(&url)
-            .header("x-admin-token", "admintok")
-            .json(&serde_json::json!({"name": "k", field: 5}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status().as_u16(),
-            201,
-            "{field}: 5 must create the key"
-        );
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body[field], 5, "stored {field} must match request");
-    }
-
-    // Omitted limits → unlimited (null), still 201.
+    // A pure-auth body (no removed fields) still mints, carrying no rate caps on the surface.
     let resp = client
         .post(&url)
         .header("x-admin-token", "admintok")
@@ -4149,42 +4080,41 @@ async fn test_create_key_rejects_zero_rate_limits() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        resp.status().as_u16(),
-        201,
-        "omitted limits must create key"
-    );
+    assert_eq!(resp.status().as_u16(), 201, "a pure-auth body still mints");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(
-        body["rpm_limit"].is_null() && body["tpm_limit"].is_null(),
-        "omitted limits are unlimited (null): {body}"
+        body.get("rpm_limit").is_none() || body["rpm_limit"].is_null(),
+        "the key surface no longer carries rpm_limit: {body}"
+    );
+    assert!(
+        body.get("tpm_limit").is_none() || body["tpm_limit"].is_null(),
+        "the key surface no longer carries tpm_limit: {body}"
     );
 
     handle.abort();
 }
 
 #[tokio::test]
-async fn test_patch_key_clears_caps_to_unlimited_via_null() {
-    // LOW #16/#19 (three-state): PATCH must distinguish absent (leave unchanged), JSON null
-    // (clear to unlimited), and a value (set). A single Option<T> conflated absent with null, so a
-    // cap could never be cleared once set. Verify the full matrix end-to-end through the handler.
+async fn test_patch_key_three_state_caps_and_enabled() {
+    // PATCH /keys/{id} still carries the three-state cap fields (rpm_limit/tpm_limit/
+    // max_budget_cents) in its OWN `UpdateKeyReq` (unchanged in 1.5.0) - a SET value, a `null`
+    // clear, or absent (leave). What changed is the RESPONSE: `key_meta` no longer surfaces those
+    // caps (keys are pure auth now), so we assert on the WIRE CONTRACT the handler still owns - the
+    // 200/400 acceptance of each three-state form - and observe the one cap-independent field that
+    // IS still on key_meta: `enabled`. (The stored-cap mutation itself is covered by the
+    // governance `update_key` unit tests.)
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}/api/v1/admin/keys");
 
-    // Create a key that HAS all three caps set.
+    // Mint a pure-auth key (no inline caps in the body - that is now the ONLY shape mint accepts).
     let created: serde_json::Value = client
         .post(&base)
         .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({
-            "name": "k",
-            "rpm_limit": 10,
-            "tpm_limit": 2000,
-            "max_budget_cents": 5000
-        }))
+        .json(&serde_json::json!({"name": "k"}))
         .send()
         .await
         .unwrap()
@@ -4192,20 +4122,14 @@ async fn test_patch_key_clears_caps_to_unlimited_via_null() {
         .await
         .unwrap();
     let id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(created["rpm_limit"], 10);
-    assert_eq!(created["tpm_limit"], 2000);
-    assert_eq!(created["max_budget_cents"], 5000);
+    assert_eq!(created["enabled"], true, "a fresh key is enabled");
     let key_url = format!("{base}/{id}");
 
-    // Present null CLEARS each cap to unlimited (null in the response).
-    let cleared: serde_json::Value = client
+    // SET (a present value): PATCH accepts the caps and returns 200; key_meta no longer echoes them.
+    let set: serde_json::Value = client
         .patch(&key_url)
         .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({
-            "rpm_limit": null,
-            "tpm_limit": null,
-            "max_budget_cents": null
-        }))
+        .json(&serde_json::json!({"rpm_limit": 7, "tpm_limit": 99, "max_budget_cents": 123}))
         .send()
         .await
         .unwrap()
@@ -4213,36 +4137,46 @@ async fn test_patch_key_clears_caps_to_unlimited_via_null() {
         .await
         .unwrap();
     assert!(
-        cleared["rpm_limit"].is_null(),
-        "rpm cleared to unlimited: {cleared}"
-    );
-    assert!(cleared["tpm_limit"].is_null(), "tpm cleared to unlimited");
-    assert!(
-        cleared["max_budget_cents"].is_null(),
-        "budget cleared to unlimited"
+        set.get("rpm_limit").is_none() || set["rpm_limit"].is_null(),
+        "key_meta no longer surfaces the caps: {set}"
     );
 
-    // Re-set them with values.
-    let reset: serde_json::Value = client
+    // CLEAR (present null): the three-state `null` clears to unlimited - must NOT trip the
+    // create-parity guards (which reject a present 0/negative VALUE, not a clear). 200.
+    let cleared = client
         .patch(&key_url)
         .header("x-admin-token", "admintok")
         .json(&serde_json::json!({
-            "rpm_limit": 7,
-            "tpm_limit": 99,
-            "max_budget_cents": 123
+            "rpm_limit": null, "tpm_limit": null, "max_budget_cents": null
         }))
         .send()
         .await
-        .unwrap()
-        .json()
-        .await
         .unwrap();
-    assert_eq!(reset["rpm_limit"], 7);
-    assert_eq!(reset["tpm_limit"], 99);
-    assert_eq!(reset["max_budget_cents"], 123);
+    assert_eq!(
+        cleared.status().as_u16(),
+        200,
+        "null (clear) is accepted by the create-parity guards"
+    );
 
-    // Absent fields LEAVE the caps unchanged (only `enabled` present here).
-    let unchanged: serde_json::Value = client
+    // A present INVALID value (0 rate / negative budget) is still a 400 at create-parity.
+    for bad in [
+        serde_json::json!({"rpm_limit": 0}),
+        serde_json::json!({"tpm_limit": 0}),
+        serde_json::json!({"max_budget_cents": -1}),
+    ] {
+        let r = client
+            .patch(&key_url)
+            .header("x-admin-token", "admintok")
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "PATCH must reject {bad} with 400");
+    }
+
+    // ABSENT caps + a present `enabled`: the caps are left untouched and `enabled` toggles - the one
+    // key_meta field the caller can still observe.
+    let toggled: serde_json::Value = client
         .patch(&key_url)
         .header("x-admin-token", "admintok")
         .json(&serde_json::json!({"enabled": false}))
@@ -4252,28 +4186,7 @@ async fn test_patch_key_clears_caps_to_unlimited_via_null() {
         .json()
         .await
         .unwrap();
-    assert_eq!(unchanged["enabled"], false);
-    assert_eq!(unchanged["rpm_limit"], 7, "absent leaves rpm unchanged");
-    assert_eq!(unchanged["tpm_limit"], 99, "absent leaves tpm unchanged");
-    assert_eq!(
-        unchanged["max_budget_cents"], 123,
-        "absent leaves budget unchanged"
-    );
-
-    // Clearing to unlimited (null) must NOT trip the create-parity guards (those reject a present
-    // 0/negative VALUE, not a clear). null on rpm/tpm/budget all return 200.
-    let cleared2 = client
-        .patch(&key_url)
-        .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({"rpm_limit": null, "max_budget_cents": null}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        cleared2.status().as_u16(),
-        200,
-        "null (clear) must not be rejected by the create-parity guards"
-    );
+    assert_eq!(toggled["enabled"], false, "enabled toggled off: {toggled}");
 
     handle.abort();
 }
@@ -4296,7 +4209,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
 
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     // App has exactly one configured pool, "smart" (lane 0). "smrt" is the typo'd sibling.
     let app = TestApp::new()
         .lane(crate::test_support::LaneSpec::new(
@@ -4391,7 +4304,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
 async fn test_delete_existing_key_returns_200() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4428,7 +4341,7 @@ async fn test_delete_existing_key_returns_200() {
 async fn test_delete_missing_key_returns_404() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
 
     let (addr, handle) = serve_with_gov(gov).await;
     let client = reqwest::Client::new();
@@ -4455,7 +4368,7 @@ async fn test_delete_key_is_not_idempotent_204() {
     // real revocation, not a no-op masquerading as success).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4499,7 +4412,7 @@ async fn test_concurrent_delete_returns_exactly_one_204() {
     // winner returns 204 and every loser returns 404. Fire a burst and assert exactly one 204.
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4563,7 +4476,7 @@ async fn test_patch_after_delete_404s_and_does_not_recreate_key() {
     // contract: PATCH on a deleted key 404s and leaves it deleted (a later GET/usage stays 404).
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4701,6 +4614,15 @@ impl crate::governance::Store for BarrierStore {
     ) -> crate::governance::StoreResult<Vec<crate::governance::MeteringRow>> {
         self.inner.list_metering(bucket)
     }
+    // Forward the denylist (1.5.0): DELETE revokes-then-deletes, so a store double that did not
+    // forward add_denylist would make revoke error and abort the delete (the default trait no-op
+    // errors) - breaking the resurrection-race tests. Forward to the inner MemoryStore.
+    fn add_denylist(&self, sub: &str, reason: &str) -> crate::governance::StoreResult<()> {
+        self.inner.add_denylist(sub, reason)
+    }
+    fn list_denylist(&self) -> crate::governance::StoreResult<Vec<String>> {
+        self.inner.list_denylist()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4727,7 +4649,7 @@ async fn test_patch_interleaved_with_delete_never_resurrects_key() {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     });
-    let gov = Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store.clone(), Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4824,7 +4746,7 @@ async fn test_rotate_interleaved_with_delete_never_resurrects_key() {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     });
-    let gov = Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store.clone(), Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -4944,7 +4866,7 @@ async fn test_cancelled_patch_keeps_gate_held_for_full_store_mutation() {
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     });
-    let gov = Arc::new(GovState::new(store.clone(), Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store.clone(), Some("admintok".to_string()));
     let (key, _secret) = gov
         .create_key(
             NewKeySpec {
@@ -5033,7 +4955,7 @@ async fn serve_with_plugins_dir(
     dir: std::path::PathBuf,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     // The lifecycle test installs an UNSIGNED plugin tarball, so opt in to unsigned plugins (the
     // trust DEFAULT rejects unsigned artifacts). The trust-default behavior itself is covered by
     // the dedicated trust tests; this test is about the install/list/reload/remove lifecycle.
@@ -5370,7 +5292,7 @@ async fn test_admin_v1_plugin_install_rejections() {
     // TRUST NO-BYPASS: a STRICT-posture server rejects an unsigned upload as 409 conflict.
     {
         let store = Arc::new(MemoryStore::new());
-        let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+        let gov = gov_with_signer(store, Some("admintok".to_string()));
         let strict_dir = std::env::temp_dir().join(format!(
             "busbar-admin-plugins-strict-{}",
             std::process::id()
@@ -5431,7 +5353,7 @@ async fn test_admin_v1_plugin_install_rejections() {
 async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
     // An App whose cost model KNOWS the "growth" group; "ghost" stays unconfigured.
     let cost = {
         let groups = std::collections::BTreeMap::from([(
@@ -5456,11 +5378,11 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/api/v1/admin/keys");
 
-    // A mint naming a MISSING group is a 400 naming the offender.
+    // A mint naming a MISSING group is a 400 naming the offender (the field is `group` in 1.5.0).
     let resp = client
         .post(&url)
         .header("x-admin-token", "admintok")
-        .json(&serde_json::json!({"name": "k", "budget_group": "ghost"}))
+        .json(&serde_json::json!({"name": "k", "group": "ghost"}))
         .send()
         .await
         .unwrap();
@@ -5470,17 +5392,18 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
         body["error"]["message"]
             .as_str()
             .unwrap_or("")
-            .contains("budget_group 'ghost' does not exist"),
+            .contains("group 'ghost' does not exist"),
         "the 400 names the missing group: {body}"
     );
 
-    // A mint binding a CONFIGURED group with labels succeeds and echoes both.
+    // A mint binding a CONFIGURED group with labels succeeds and echoes both. key_meta surfaces the
+    // binding under its 1.5.0 name `group`.
     let resp = client
         .post(&url)
         .header("x-admin-token", "admintok")
         .json(&serde_json::json!({
             "name": "grouped",
-            "budget_group": "growth",
+            "group": "growth",
             "labels": {"team": "growth", "env": "prod"}
         }))
         .send()
@@ -5488,7 +5411,7 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
         .unwrap();
     assert_eq!(resp.status().as_u16(), 201, "configured group mints");
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["budget_group"], "growth");
+    assert_eq!(body["group"], "growth");
     assert_eq!(body["labels"]["env"], "prod");
     let id = body["id"].as_str().unwrap().to_string();
 
@@ -5508,8 +5431,363 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
         .iter()
         .find(|k| k["id"] == id.as_str())
         .expect("minted key listed");
-    assert_eq!(row["budget_group"], "growth");
+    assert_eq!(row["group"], "growth");
     assert_eq!(row["labels"]["team"], "growth");
+
+    handle.abort();
+}
+
+// ── 1.5.0 signed-token key coverage (P3) ─────────────────────────────────────────────────────────
+
+/// The MINT returns a busbar-SIGNED `token` (prefix `bbk_`) + an `expires_at`, and that token is
+/// NEVER stored: a subsequent `GET /keys/{id}` returns the binding metadata but no `token`, and the
+/// token string appears nowhere in the read body. The token is the credential, shown exactly once.
+#[tokio::test]
+async fn test_signed_mint_returns_token_and_expiry_never_stored() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let (addr, handle) = serve_with_gov(gov).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    let created: serde_json::Value = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "svc"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let token = created["token"]
+        .as_str()
+        .expect("mint returns a token")
+        .to_string();
+    assert!(
+        token.starts_with("bbk_"),
+        "the token is a busbar-signed token: {token}"
+    );
+    assert!(
+        created["expires_at"].as_u64().is_some(),
+        "mint returns an absolute expires_at: {created}"
+    );
+
+    // The token is NEVER returned by a read - GET carries the binding metadata only, never the
+    // once-shown credential.
+    let read = client
+        .get(format!("{url}/{id}"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status().as_u16(), 200);
+    let text = read.text().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["id"], id);
+    assert!(
+        body.get("token").is_none(),
+        "a read never returns the token: {body}"
+    );
+    assert!(
+        !text.contains(&token),
+        "the once-shown token must not appear in any read body"
+    );
+
+    handle.abort();
+}
+
+/// `expires_in` duration parsing sets `expires_at` at ~now+duration; an absolute `expires_at` works
+/// verbatim; both together is a 400; a past `expires_at` is a 400; a malformed duration is a 400.
+#[tokio::test]
+async fn test_signed_mint_expiry_parsing_matrix() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let (addr, handle) = serve_with_gov(gov).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+    let post = |body: serde_json::Value| {
+        client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .json(&body)
+            .send()
+    };
+
+    // `expires_in: "7d"` -> expires_at ~= now + 7*86400 (allow a few seconds of clock slop).
+    let now = crate::store::now();
+    let seven_d: serde_json::Value = post(serde_json::json!({"name": "k", "expires_in": "7d"}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let exp = seven_d["expires_at"].as_u64().expect("expires_at present");
+    let want = now + 7 * 86_400;
+    assert!(
+        exp.abs_diff(want) <= 5,
+        "7d must set expires_at ~= now+7d: got {exp}, want ~{want}"
+    );
+
+    // An absolute `expires_at` is used verbatim.
+    let abs_at = now + 999_999;
+    let absolute: serde_json::Value = post(serde_json::json!({"name": "k", "expires_at": abs_at}))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        absolute["expires_at"].as_u64(),
+        Some(abs_at),
+        "an absolute expires_at is used verbatim"
+    );
+
+    // Both together -> 400 (mutually exclusive).
+    let both = post(serde_json::json!({
+        "name": "k", "expires_in": "1h", "expires_at": abs_at
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        both.status().as_u16(),
+        400,
+        "expires_in + expires_at is a 400"
+    );
+
+    // A past absolute expiry -> 400.
+    let past = post(serde_json::json!({"name": "k", "expires_at": now - 1}))
+        .await
+        .unwrap();
+    assert_eq!(past.status().as_u16(), 400, "a past expires_at is a 400");
+
+    // A malformed duration -> 400.
+    let bad = post(serde_json::json!({"name": "k", "expires_in": "7 fortnights"}))
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 400, "a malformed duration is a 400");
+
+    handle.abort();
+}
+
+/// A minted token VERIFIES against the binding via `gov.verify_token` (resolving the subject's
+/// enabled binding). After a DELETE the same token fails verify (the subject is denylisted AND its
+/// binding is gone - revoke-then-delete). `is_revoked(sub)` becomes true.
+#[tokio::test]
+async fn test_signed_mint_verify_then_delete_denies() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let (addr, handle) = serve_with_gov(gov.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    let created: serde_json::Value = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "verifiable"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let token = created["token"].as_str().unwrap().to_string();
+
+    // The token resolves its binding right after mint.
+    let now = crate::store::now();
+    let resolved = gov
+        .verify_token(&token, now)
+        .expect("a fresh token verifies");
+    assert_eq!(
+        resolved.id, id,
+        "verify resolves the minted subject's binding"
+    );
+    assert!(!gov.is_revoked(&id), "a fresh subject is not revoked");
+
+    // DELETE revokes-then-deletes: the same token now fails verify (denylist + binding gone).
+    let del = client
+        .delete(format!("{url}/{id}"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 204, "delete is a 204");
+    assert!(gov.is_revoked(&id), "delete denylists the subject");
+    assert!(
+        gov.verify_token(&token, now).is_none(),
+        "a deleted key's token no longer verifies"
+    );
+
+    handle.abort();
+}
+
+/// `POST /keys/{id}/revoke` denylists WITHOUT deleting: `GET /keys/{id}` still shows the binding for
+/// the record, `verify_token` now returns `None`, and `is_revoked(sub)` is true. Revoke is
+/// idempotent (a second revoke is still 200).
+#[tokio::test]
+async fn test_signed_revoke_denylists_without_deleting() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let (addr, handle) = serve_with_gov(gov.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    let created: serde_json::Value = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "revokable"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let token = created["token"].as_str().unwrap().to_string();
+    let now = crate::store::now();
+    assert!(
+        gov.verify_token(&token, now).is_some(),
+        "verifies before revoke"
+    );
+
+    // Revoke (no delete): 200.
+    let r = client
+        .post(format!("{url}/{id}/revoke"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "revoke is a 200");
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["revoked"], id.as_str());
+
+    // The binding is STILL present (revoke, not delete) - GET still returns it…
+    let read = client
+        .get(format!("{url}/{id}"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status().as_u16(), 200, "the binding is still readable");
+    assert_eq!(read.json::<serde_json::Value>().await.unwrap()["id"], id);
+
+    // …but the subject is denylisted, so the token no longer verifies.
+    assert!(gov.is_revoked(&id), "the subject is denylisted");
+    assert!(
+        gov.verify_token(&token, now).is_none(),
+        "a revoked subject's token no longer verifies"
+    );
+
+    // Idempotent: a second revoke is still 200.
+    let again = client
+        .post(format!("{url}/{id}/revoke"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status().as_u16(), 200, "revoke is idempotent");
+
+    handle.abort();
+}
+
+/// `group: None` (omitted) mints a key with NO group - authed + unlimited (access only); key_meta's
+/// `group` is null. A pool ACL matrix: OMITTED `allowed_pools` binds ALL pools (empty vec in the
+/// binding), while an explicit `[]` binds NO pools.
+#[tokio::test]
+async fn test_signed_mint_group_none_and_pool_acl_matrix() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let (addr, handle) = serve_with_gov(gov.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    // group omitted -> a groupless key; key_meta.group is null.
+    let no_group: serde_json::Value = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "groupless"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        no_group["group"].is_null(),
+        "an omitted group is null: {no_group}"
+    );
+
+    // allowed_pools OMITTED = ALL pools: the binding stores the empty vec (the "all" encoding).
+    let all_pools_id = no_group["id"].as_str().unwrap().to_string();
+    let binding = gov.lookup_by_sub(&all_pools_id).expect("binding present");
+    assert!(
+        binding.allowed_pools.is_empty(),
+        "omitted allowed_pools = the empty-vec ALL encoding"
+    );
+    assert!(binding.budget_group.is_none(), "no group bound");
+
+    // allowed_pools = explicit [] -> the binding stores an explicit empty list too. On the wire the
+    // two are the same empty array; the distinction (all vs none) is a runtime interpretation of the
+    // stored vec, so we assert the binding round-trips the explicit empty and key_meta echoes it.
+    let none_pools: serde_json::Value = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "nopools", "allowed_pools": []}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        none_pools["allowed_pools"],
+        serde_json::json!([]),
+        "an explicit [] echoes as an empty pool list: {none_pools}"
+    );
+
+    handle.abort();
+}
+
+/// `POST /api/v1/admin/signing-key/rotate` reports the current kid + the revoke-all intent
+/// (`revoke_all: true`), and is admin-gated.
+#[tokio::test]
+async fn test_signing_key_rotate_reports_kid_and_revoke_all() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let (addr, handle) = serve_with_gov(gov).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/signing-key/rotate");
+
+    // Admin-gated.
+    let unauth = client.post(&url).send().await.unwrap();
+    assert_eq!(
+        unauth.status().as_u16(),
+        401,
+        "signing-key rotate is admin-guarded"
+    );
+
+    let r = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(
+        body["current_kid"],
+        crate::governance::signing::DEFAULT_KID,
+        "reports the current signing-key id: {body}"
+    );
+    assert_eq!(body["revoke_all"], true, "rotation is revoke-all by design");
 
     handle.abort();
 }

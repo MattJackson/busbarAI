@@ -48,6 +48,7 @@ pub(crate) const BUDGET_PERIOD_HOUR: &str = "hour";
 /// The `"vk_"` prefix prepended to the 16-hex-char hash prefix to form a virtual-key id.
 const VK_ID_PREFIX: &str = "vk_";
 /// Number of hex characters from the SHA-256 hash used as the suffix of a virtual-key id.
+#[cfg_attr(not(test), allow(dead_code))]
 const VK_ID_HASH_PREFIX_LEN: usize = 16;
 /// The `"sk-bb-"` prefix for bearer secrets returned by `generate_secret`.
 const SK_SECRET_PREFIX: &str = "sk-bb-";
@@ -340,6 +341,18 @@ pub(crate) struct GovState {
     /// stores raw tokens and spend derives at read time, so there is no remainder to carry and no
     /// O(n) carry sweep to amortize.
     budget: Sharded<BudgetCell>,
+    /// The busbar TOKEN SIGNER (1.5.0, S1/S2): mints signed `{sub, exp, kid}` key tokens. `Some`
+    /// once a signing key is resolved/generated at boot; `None` in the (test) path that constructs
+    /// GovState without signing (SigV4-only / legacy-hash tests).
+    signer: Option<crate::governance::signing::TokenSigner>,
+    /// The STATELESS token VERIFIER (public keyset). Verifies a presented token's signature + expiry
+    /// before any store read; policy is then resolved by `sub`. `Some` iff `signer` is.
+    verifier: Option<crate::governance::signing::TokenVerifier>,
+    /// The revocation DENYLIST as an in-memory set of subject ids, hydrated from the store at boot
+    /// and updated live on revoke. A verified token whose `sub` is present is rejected - the ONLY
+    /// state the otherwise-stateless verify path reads. Under an `RwLock` (read on the hot path,
+    /// write only on revoke).
+    denylist: RwLock<std::collections::HashSet<String>>,
 }
 
 /// Parameters for minting a new virtual key (from the management API).
@@ -356,6 +369,7 @@ pub(crate) struct NewKeySpec {
     pub(crate) labels: std::collections::BTreeMap<String, String>,
 }
 
+pub(crate) mod signing;
 mod state;
 
 /// THE GOVERNANCE RE-KEY for a ROLE-CARRYING principal (an external auth module's verdict): a

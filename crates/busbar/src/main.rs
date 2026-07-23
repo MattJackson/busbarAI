@@ -1487,6 +1487,113 @@ fn store_plugin_cfg_json(g: &config::StoreCfg) -> String {
     serde_json::Value::Object(g.settings.clone()).to_string()
 }
 
+/// Resolve the KEY-SIGNING key (S2, 1.5.0). When `auth.signing_key` is set, resolve it via the
+/// secret seam to the ed25519 secret material (32 raw bytes, or 64 hex chars). When ABSENT,
+/// GENERATE a keypair on first boot and PERSIST it 0600 beside the config (dev zero-config), so a
+/// restart reuses the same key and previously-minted tokens keep verifying. Fleet deployments set
+/// `auth.signing_key` to a shared secret so every node shares the key. Returns `None` only when
+/// governance itself is not going to sign (there is no auth block AND no generated-key path is
+/// desired) - in practice a signer is always produced so mint works out of the box.
+///
+/// FAIL-CLOSED: a configured-but-unresolvable / malformed signing key refuses boot.
+fn resolve_signing_key(
+    auth: Option<&config::AuthCfg>,
+    resolver: &config::secret::SecretResolver,
+    config_path: Option<&std::path::Path>,
+) -> Result<Option<governance::signing::TokenSigner>, String> {
+    use governance::signing::{TokenSigner, DEFAULT_KID};
+
+    // Parse resolved bytes into a 32-byte ed25519 secret: accept RAW 32 bytes or 64 hex chars.
+    fn parse_secret(bytes: &[u8]) -> Result<[u8; 32], String> {
+        if bytes.len() == 32 {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(bytes);
+            return Ok(out);
+        }
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            let s = s.trim();
+            if s.len() == 64 {
+                if let Ok(v) = hex::decode(s) {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&v);
+                    return Ok(out);
+                }
+            }
+        }
+        Err(
+            "auth.signing_key must resolve to a 32-byte ed25519 secret key (raw 32 bytes or 64 hex \
+             characters)"
+                .to_string(),
+        )
+    }
+
+    if let Some(sk) = auth.and_then(|a| a.signing_key.as_ref()) {
+        let bytes = resolver
+            .resolve(sk)
+            .map_err(|e| format!("auth.signing_key did not resolve: {e}"))?;
+        let secret = parse_secret(&bytes)?;
+        return Ok(Some(TokenSigner::from_secret_bytes(&secret, DEFAULT_KID)));
+    }
+
+    // No configured signing key: generate-and-persist 0600 for dev zero-config. The persistence
+    // path sits beside the config file (or the CWD when running ephemerally) so a restart reuses
+    // it. If the file already exists (a prior boot generated it), LOAD it instead of regenerating -
+    // otherwise every restart would invalidate every outstanding token.
+    let key_path = config_path
+        .and_then(|p| p.parent())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("busbar-signing.key");
+    match std::fs::read(&key_path) {
+        Ok(bytes) => {
+            let secret = parse_secret(&bytes).map_err(|e| {
+                format!(
+                    "the persisted signing key at '{}' is invalid: {e}. Remove it to regenerate \
+                     (this invalidates every outstanding key), or provide auth.signing_key.",
+                    key_path.display()
+                )
+            })?;
+            tracing::info!(path = %key_path.display(), "loaded the persisted signing key");
+            Ok(Some(TokenSigner::from_secret_bytes(&secret, DEFAULT_KID)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let signer = TokenSigner::generate(DEFAULT_KID)
+                .map_err(|e| format!("could not generate a signing key: {e}"))?;
+            persist_signing_key(&key_path, &signer.secret_bytes())?;
+            tracing::warn!(
+                path = %key_path.display(),
+                "no auth.signing_key configured - GENERATED an ed25519 signing key and persisted it \
+                 0600 (dev zero-config). For a fleet, set auth.signing_key to a shared secret so \
+                 every node shares the key."
+            );
+            Ok(Some(signer))
+        }
+        Err(e) => Err(format!(
+            "cannot read the persisted signing key '{}': {e}",
+            key_path.display()
+        )),
+    }
+}
+
+/// Persist a generated signing key 0600 (owner read/write only) via a temp-file + rename so a
+/// concurrent reader never sees a torn key. On Unix the mode is set BEFORE the rename; on other
+/// platforms the OS default applies (best-effort). The bytes are hex-encoded (64 chars) so the file
+/// is a plain text secret an operator can also drop in via `auth.signing_key: { file: ... }`.
+fn persist_signing_key(path: &std::path::Path, secret: &[u8; 32]) -> Result<(), String> {
+    let tmp = path.with_extension("key.tmp");
+    let hex = hex::encode(secret);
+    std::fs::write(&tmp, hex.as_bytes())
+        .map_err(|e| format!("cannot write signing key '{}': {e}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("cannot chmod 0600 signing key '{}': {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("cannot install signing key '{}': {e}", path.display()))?;
+    Ok(())
+}
+
 /// Build the [`config::secret::SecretResolver`] the engine resolves every secret reference through:
 /// the built-in `env`/`file` modules inline, and any OTHER module name via a loaded `kind: secret`
 /// plugin from `registry` (opened per resolution; a secret module is off every hot path so the
@@ -2061,7 +2168,15 @@ pub(crate) fn build_app_from_config(
                 })?),
                 None => None,
             };
-        match governance::GovState::new(store, admin_token.clone()) {
+        // The KEY-SIGNING key (S2): resolve `auth.signing_key` (a secret ref) to 32 ed25519 secret
+        // bytes; ABSENT => GENERATE a keypair on first boot and persist it 0600 (dev zero-config).
+        // Fleet deployments provide it (shared) so every node verifies the same tokens.
+        let signer = resolve_signing_key(
+            cfg.auth.as_ref(),
+            &secret_resolver,
+            config_paths.0.as_deref(),
+        )?;
+        match governance::GovState::new_with_signer(store, admin_token.clone(), signer) {
             Ok(gs) => {
                 let gs = Arc::new(gs);
                 // BOOT-ONLY crash-recovery: hydrate the in-memory token-ledger cells (key buckets +

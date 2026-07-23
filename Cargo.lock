@@ -224,6 +224,7 @@ dependencies = [
  "busbar-store-sqlite",
  "bytes",
  "crc32fast",
+ "ed25519-dalek",
  "futures",
  "getrandom 0.3.4",
  "hex",

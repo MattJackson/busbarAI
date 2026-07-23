@@ -1044,7 +1044,15 @@ pub(crate) async fn auth_middleware(
         let Some(client_token) = client_token.as_deref().filter(|t| !t.is_empty()) else {
             return Err(unauthorized_with_completion_taps(&app, &path));
         };
-        match gov.lookup(client_token) {
+        // 1.5.0 SIGNED-TOKEN KEYS (S1): a busbar-minted key is a signed token verified statelessly
+        // (signature + expiry + revocation-denylist), then policy is resolved by `sub`. Verify it
+        // FIRST (it carries the `bbk_` prefix, so `verify_token` cheaply rejects a non-token and
+        // this falls through to the legacy hash lookup for any credential that is not a busbar
+        // token). A tampered/expired/revoked token, or one for a deleted key, is `None` = 401.
+        let resolved_key = gov
+            .verify_token(client_token, crate::store::now())
+            .or_else(|| gov.lookup(client_token));
+        match resolved_key {
             Some(key) if key.enabled => {
                 // The governance principal: id = the virtual-key id (stable), name = its label.
                 req.extensions_mut().insert(AuthPrincipal(Some(Principal {

@@ -66,35 +66,65 @@ use crate::governance::{NewKeySpec, VirtualKey};
 /// to serialize would be worse than proceeding.
 static EXISTENCE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// `POST /keys` body (1.5.0 signed-token keys, S1): PURE AUTH + a signed expiring token. A minted
+/// key is a busbar-signed `{sub, exp, kid}` token, returned ONCE. No rpm/tpm/budget on a key - all
+/// enforcement flows through the bound `group`. `#[serde(deny_unknown_fields)]` so the removed
+/// 1.4.x fields (max_budget_cents/rpm_limit/tpm_limit/budget_period) fail loudly.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateKeyReq {
     name: String,
+    /// The `groups:` bucket this key binds to (at most one). Validated to EXIST at mint - a key
+    /// naming a missing group is a 400. A key with NO group is authed + unlimited (access only).
     #[serde(default)]
-    allowed_pools: Vec<String>,
+    group: Option<String>,
+    /// Pools this key may target. OMITTED = ALL pools; an explicit `[]` = NO pools (C6).
     #[serde(default)]
-    max_budget_cents: Option<i64>,
-    #[serde(default)]
-    budget_period: Option<String>,
-    #[serde(default)]
-    rpm_limit: Option<u32>,
-    #[serde(default)]
-    tpm_limit: Option<u32>,
-    /// When true, ALSO issue an AWS-style access-key-id + secret access key (the MinIO/S3-compatible
-    /// model) so a Bedrock-SDK client can authenticate to this key via inbound SigV4. Both the
-    /// `aws_access_key_id` and the `aws_secret_access_key` are returned ONCE here at creation; the
-    /// SECRET is never exposed again by any read API (mirroring the bearer `secret`). Defaults to false.
-    #[serde(default)]
-    issue_aws_credential: bool,
-    /// The `governance.budget_groups` bucket this key charges into (in addition to its own inline
-    /// budget above, which stays the innermost bucket). Validated to EXIST at mint - a key naming a
-    /// missing group is a 400 naming the offender. Named `budget_group`, never bare `group` (that
-    /// name belongs to the auth `group_map` concept with opposite union semantics).
-    #[serde(default)]
-    budget_group: Option<String>,
-    /// Optional mint-time labels (e.g. `{"team": "growth"}`) echoed onto this key's metric series
-    /// so external dashboards can aggregate by them; never interpreted by enforcement.
+    allowed_pools: Option<Vec<String>>,
+    /// Optional mint-time labels echoed onto this key's metric series; never interpreted by
+    /// enforcement.
     #[serde(default)]
     labels: std::collections::BTreeMap<String, String>,
+    /// Token lifetime as a duration string (`7d`, `24h`, `30m`, `3600s`) - the token's `exp` is
+    /// `now + expires_in`. Mutually exclusive with `expires_at`. Absent (and no `expires_at`) => a
+    /// sane long default (see `DEFAULT_KEY_TTL_SECS`).
+    #[serde(default)]
+    expires_in: Option<String>,
+    /// Token expiry as an absolute Unix-seconds timestamp. Mutually exclusive with `expires_in`.
+    #[serde(default)]
+    expires_at: Option<u64>,
+    /// When true, ALSO issue an AWS-style access-key-id + secret access key (the MinIO/S3-compatible
+    /// model) so a Bedrock-SDK client can authenticate via inbound SigV4. Both are returned ONCE.
+    #[serde(default)]
+    issue_aws_credential: bool,
+}
+
+/// The default signed-token lifetime when the mint body specifies neither `expires_in` nor
+/// `expires_at`: 90 days. Long enough that routine use does not churn, short enough that a leaked
+/// token is not valid forever (the 1.x posture: keys never expired).
+const DEFAULT_KEY_TTL_SECS: u64 = 90 * 86_400;
+
+/// Parse a duration string (`<n><unit>`, unit in s|m|h|d) to seconds. Bounded so an absurd value
+/// cannot overflow the `exp` computation.
+fn parse_duration_secs(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| "duration needs a unit (s|m|h|d), e.g. 7d".to_string())?,
+    );
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration '{s}': expected <number><s|m|h|d>"))?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        other => return Err(format!("invalid duration unit '{other}': use s|m|h|d")),
+    };
+    n.checked_mul(mult)
+        .filter(|v| *v <= 10 * 365 * 86_400)
+        .ok_or_else(|| "duration is too large (max 10 years)".to_string())
 }
 
 /// The budget periods `governance::budget_window` actually enforces. An unrecognized value (a typo
@@ -104,6 +134,7 @@ struct CreateKeyReq {
 /// another. Validate at the ingress (key creation) so an operator gets a 400 with the allowed set
 /// instead of a silently-misenforcing key. Kept in lock-step with the arms of
 /// `governance::budget_window`.
+#[cfg_attr(not(test), allow(dead_code))]
 const VALID_BUDGET_PERIODS: &[&str] = &[
     crate::governance::BUDGET_PERIOD_TOTAL,
     crate::governance::BUDGET_PERIOD_DAILY,
@@ -300,17 +331,16 @@ fn parse_key_if_match(headers: &axum::http::HeaderMap) -> Result<Option<String>,
 }
 
 fn key_meta(k: &VirtualKey) -> Value {
+    // 1.5.0 keys are PURE AUTH bindings: id / name / allowed_pools / group / labels. The inline
+    // budget/rate fields are gone from the surface (all enforcement flows through the bound group);
+    // the `group` field surfaces the binding's `budget_group` under its 1.5.0 name.
     json!({
         "id": k.id,
         "name": k.name,
         "allowed_pools": k.allowed_pools,
-        "max_budget_cents": k.max_budget_cents,
-        "budget_period": k.budget_period,
-        "rpm_limit": k.rpm_limit,
-        "tpm_limit": k.tpm_limit,
+        "group": k.budget_group,
         "enabled": k.enabled,
         "created_at": k.created_at,
-        "budget_group": k.budget_group,
         "labels": k.labels,
     })
 }
@@ -505,116 +535,95 @@ pub(crate) async fn create_key(
     if let Err(msg) = validate_mint_labels(&req.labels) {
         return error_response(StatusCode::BAD_REQUEST, ERR_TYPE_INVALID_REQUEST, msg);
     }
-    // Default to the all-time `"total"` window when omitted; otherwise the value MUST be one
-    // `governance::budget_window` enforces. Reject an unrecognized period with 400 rather than
-    // letting it persist and silently degrade to `"total"` at evaluation time (a key whose stored
-    // metadata disagrees with the cap it actually enforces).
-    let budget_period = req
-        .budget_period
-        .unwrap_or_else(|| VALID_BUDGET_PERIODS[0].to_string());
-    if !VALID_BUDGET_PERIODS.contains(&budget_period.as_str()) {
+    // SIGNED-TOKEN keys require a signing key (S2). Without one, mint cannot issue a token - fail
+    // loud rather than persist a binding no token can be issued for.
+    if !gov.signing_enabled() {
         return error_response(
-            StatusCode::BAD_REQUEST,
-            ERR_TYPE_INVALID_REQUEST,
-            // Do NOT echo the caller-supplied value back in the error body (matches every other 400).
-            format!("invalid budget_period: must be one of {VALID_BUDGET_PERIODS:?}"),
+            StatusCode::CONFLICT,
+            ERR_TYPE_CONFLICT,
+            "signed-token minting is unavailable: no signing key is configured (set \
+             auth.signing_key, or let busbar generate one on first boot)",
         );
     }
-    // Reject a negative budget at the ingress. `max_budget_cents` is a signed `i64` (the store column
-    // is signed and the field is optional/unset = unlimited), so serde does NOT reject a negative the
-    // way it auto-rejects the unsigned `rpm_limit`/`tpm_limit: u32` fields below. A negative cap is
-    // not "unlimited"; governance evaluates `spend_cents >= max_budget_cents`, so `max_budget_cents:
-    // -1` makes a brand-new key (spend 0) read as over budget from its first request — a silent,
-    // unrecoverable DoS that still echoes 201 + the bogus value. A typo like `-100` for a $1 cap is
-    // the realistic source. Bound it to `>= 0` (0 = a hard "no spend allowed" cap, still a coherent
-    // semantic) and 400 otherwise. The `rpm_limit`/`tpm_limit` siblings are unsigned, so a negative
-    // for them is already a 400 at deserialization — no parallel range check is reachable here.
-    if let Some(budget) = req.max_budget_cents {
-        if budget < 0 {
+    // `expires_in` and `expires_at` are mutually exclusive; resolve the token expiry (Unix secs).
+    let now = crate::store::now();
+    let exp = match (req.expires_in.as_deref(), req.expires_at) {
+        (Some(_), Some(_)) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 ERR_TYPE_INVALID_REQUEST,
-                "max_budget_cents must be >= 0",
+                "expires_in and expires_at are mutually exclusive; set at most one",
             );
         }
-    }
-    // Reject a zero rate limit. `rpm_limit`/`tpm_limit` are unsigned, so serde already rejects a
-    // negative at deserialization, but `0` parses fine and is NOT "unlimited" — omitting the field
-    // (None) is the unlimited semantic. Governance evaluates `requests >= rpm` / `tokens >= tpm` on a
-    // window that starts at 0, so `rpm_limit: 0` (0 >= 0) or `tpm_limit: 0` (0 >= 0) makes the key
-    // reject every request from creation: a permanently-unusable key minted with a 201 and no
-    // diagnostic. A literal `0` is almost always a typo for "no limit" (which is None/omitted). 400
-    // both so the operator gets a coherent error instead of a dead key. Any positive value, and an
-    // omitted field (unlimited), still create the key.
-    if req.rpm_limit == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            ERR_TYPE_INVALID_REQUEST,
-            "rpm_limit must be >= 1 (omit the field for unlimited)",
-        );
-    }
-    if req.tpm_limit == Some(0) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            ERR_TYPE_INVALID_REQUEST,
-            "tpm_limit must be >= 1 (omit the field for unlimited)",
-        );
-    }
-    // NON-FATAL ingress diagnostic for `allowed_pools`. Unlike the rejections above, an
-    // allowed-pools entry that names no currently-configured pool is NOT a 400: minting a key whose
-    // pool will be configured later is a legitimate, supported workflow (key first, pool wired
-    // afterward), so the store accepts any string. But an entry that matches no configured pool is
-    // far more often a typo (`"smrt"` for `"smart"`) than a deliberate forward reference, and a
-    // typo'd allow-entry silently scopes the key to a pool it can never reach. Surface it at the
-    // ingress with a `tracing::warn!` (matching the module's validate-at-ingress convention) so the
-    // typo is visible in logs, while still creating the key — the forward-reference case stays
-    // unbroken. `app.pools` is the authoritative set of configured pool names (see `state::App`).
-    for pool in &req.allowed_pools {
+        (Some(dur), None) => match parse_duration_secs(dur) {
+            Ok(secs) => now.saturating_add(secs),
+            Err(msg) => {
+                return error_response(StatusCode::BAD_REQUEST, ERR_TYPE_INVALID_REQUEST, msg)
+            }
+        },
+        (None, Some(at)) => {
+            if at <= now {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    ERR_TYPE_INVALID_REQUEST,
+                    "expires_at is in the past",
+                );
+            }
+            at
+        }
+        (None, None) => now.saturating_add(DEFAULT_KEY_TTL_SECS),
+    };
+    // `allowed_pools`: OMITTED = all pools (empty vec = the runtime "all" encoding); an explicit
+    // `[]` = NO pools; a list scopes it. NON-FATAL typo diagnostic on each named pool.
+    let allowed_pools = req.allowed_pools.unwrap_or_default();
+    for pool in &allowed_pools {
         if !app.pools.contains_key(pool) {
             tracing::warn!(
                 pool = %pool,
                 key_name = %req.name,
                 "create_key: allowed_pools entry names no configured pool (possible typo; \
-                 key still created — configure the pool later to activate this entry)"
+                 key still created - configure the pool later to activate this entry)"
             );
         }
     }
-    // MINT-TIME fail-closed check: a `budget_group` must exist in governance.budget_groups NOW - a
+    // MINT-TIME fail-closed check: a bound `group` must exist in the top-level groups block NOW - a
     // dangling binding would make every request on the new key fail closed at admission. 400 with
-    // the offender named (mirrors the boot-side check over stored keys).
-    if let Some(group) = req.budget_group.as_deref() {
+    // the offender named (mirrors the boot-side check over stored keys). A key with NO group is
+    // authed + unlimited (access only).
+    if let Some(group) = req.group.as_deref() {
         if app.cost.group_named(group).is_none() {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 ERR_TYPE_INVALID_REQUEST,
                 format!(
-                    "budget_group '{group}' does not exist in governance.budget_groups; \
-                     configure it first (e.g. {group}: {{ max_budget_cents: 0, budget_period: monthly }})"
+                    "group '{group}' does not exist in the top-level groups block; configure it \
+                     first (e.g. {group}: {{ limits: [ {{ budget: 0, per: month }} ] }})"
                 ),
             );
         }
     }
     let spec = NewKeySpec {
         name: req.name,
-        allowed_pools: req.allowed_pools,
-        max_budget_cents: req.max_budget_cents,
-        budget_period,
-        rpm_limit: req.rpm_limit,
-        tpm_limit: req.tpm_limit,
-        budget_group: req.budget_group,
+        allowed_pools,
+        // Keys carry NO inline limits (S1); enforcement flows through the bound group.
+        max_budget_cents: None,
+        budget_period: crate::governance::BUDGET_PERIOD_TOTAL.to_string(),
+        rpm_limit: None,
+        tpm_limit: None,
+        budget_group: req.group,
         labels: req.labels,
     };
     // Offload the blocking store write off the Tokio worker thread (matches the request-path
     // discipline in governance::charge_within_budget_async / offload_store_write).
     let gov = gov.clone();
-    let now = crate::store::now();
     let issue_aws = req.issue_aws_credential;
     // When AWS credentials are requested, mint via `create_key_with_aws` (issues the AccessKeyId +
     // secret access key alongside the bearer secret). Otherwise the unchanged bearer-only mint.
     if issue_aws {
-        let res = tokio::task::spawn_blocking(move || gov.create_key_with_aws(spec, now)).await;
+        let res =
+            tokio::task::spawn_blocking(move || gov.mint_signed_with_aws(spec, exp, now)).await;
         match res {
-            Ok(Ok((key, secret, access_key_id, secret_access_key))) => {
+            Ok(Ok((key, token, access_key_id, secret_access_key))) => {
                 audit::AUDIT.record_by(
                     "key.create",
                     &format!("key:{}", key.id),
@@ -622,10 +631,11 @@ pub(crate) async fn create_key(
                     &actor,
                 );
                 let mut body = key_meta(&key);
-                body["secret"] = json!(secret); // bearer secret, shown exactly once
-                                                // The AccessKeyId is NOT secret (it travels in plaintext in the SigV4 header), but it
-                                                // is returned here at creation. The AWS SECRET access key is shown ONCE here only —
-                                                // never returned by any read API, mirroring the bearer `secret`.
+                // The busbar-SIGNED token IS the key credential (S1), shown exactly once.
+                body["token"] = json!(token);
+                body["expires_at"] = json!(exp);
+                // The AccessKeyId is NOT secret (it travels in plaintext in the SigV4 header); the
+                // AWS SECRET access key is shown ONCE here only, mirroring the token.
                 body["aws_access_key_id"] = json!(access_key_id);
                 body["aws_secret_access_key"] = json!(secret_access_key);
                 if let Some(ref ck) = idem_ckey {
@@ -634,8 +644,6 @@ pub(crate) async fn create_key(
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(ck.clone(), (crate::store::now(), body.clone()));
                 }
-                // Mint committed and the sentinel replaced by the real body — disarm the guard so
-                // it does not remove the now-cached response.
                 if let Some(g) = idem_reservation.as_mut() {
                     g.committed = true;
                 }
@@ -645,9 +653,9 @@ pub(crate) async fn create_key(
             Err(e) => join_error("create_key", &e),
         }
     } else {
-        let res = tokio::task::spawn_blocking(move || gov.create_key(spec, now)).await;
+        let res = tokio::task::spawn_blocking(move || gov.mint_signed(spec, exp, now)).await;
         match res {
-            Ok(Ok((key, secret))) => {
+            Ok(Ok((key, token))) => {
                 audit::AUDIT.record_by(
                     "key.create",
                     &format!("key:{}", key.id),
@@ -655,15 +663,14 @@ pub(crate) async fn create_key(
                     &actor,
                 );
                 let mut body = key_meta(&key);
-                body["secret"] = json!(secret); // shown exactly once
+                body["token"] = json!(token); // the signed token, shown exactly once
+                body["expires_at"] = json!(exp);
                 if let Some(ref ck) = idem_ckey {
                     app.idempotency_cache
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(ck.clone(), (crate::store::now(), body.clone()));
                 }
-                // Mint committed and the sentinel replaced by the real body — disarm the guard so
-                // it does not remove the now-cached response.
                 if let Some(g) = idem_reservation.as_mut() {
                     g.committed = true;
                 }
@@ -1029,6 +1036,92 @@ pub(crate) async fn rotate_key(
     }
 }
 
+/// POST /api/v1/admin/keys/{id}/revoke - REVOKE a signed-token key WITHOUT deleting its binding /
+/// usage history (1.5.0). Adds the subject to the durable revocation denylist so every outstanding
+/// token for it is rejected immediately (stateless verify + denylist read), while `GET /keys/{id}`
+/// still shows the (now-revoked) binding for the record. Idempotent - revoking an already-revoked
+/// key is 200. `DELETE /keys/{id}` is the revoke-AND-forget variant.
+pub(crate) async fn revoke_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(id): Path<String>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let Some(gov) = &app.governance else {
+        return disabled_write();
+    };
+    if let Some(resp) = reject_overlong_id(&id) {
+        return resp;
+    }
+    let gov = gov.clone();
+    let id_for_task = id.clone();
+    // The subject must name an existing binding (a revoke for a nonexistent key is a 404, not a
+    // silent denylist entry for a typo'd id). Then denylist it durably.
+    let res = tokio::task::spawn_blocking(move || -> crate::governance::StoreResult<bool> {
+        let exists = gov.all_keys()?.iter().any(|k| k.id == id_for_task);
+        if !exists {
+            return Ok(false);
+        }
+        gov.revoke(&id_for_task, "revoked via admin API")?;
+        Ok(true)
+    })
+    .await;
+    let resource = format!("key:{id}");
+    match res {
+        Ok(Ok(true)) => {
+            audit::AUDIT.record_by("key.revoke", &resource, audit::OUTCOME_APPLIED, &actor);
+            json_response(StatusCode::OK, json!({ "revoked": id }))
+        }
+        Ok(Ok(false)) => {
+            audit::AUDIT.record_by("key.revoke", &resource, audit::OUTCOME_REJECTED, &actor);
+            error_response(StatusCode::NOT_FOUND, ERR_TYPE_NOT_FOUND, "key not found")
+        }
+        Ok(Err(e)) => internal_error("revoke_key", &e),
+        Err(e) => join_error("revoke_key", &e),
+    }
+}
+
+/// POST /api/v1/admin/signing-key/rotate - ROTATE the busbar key-signing key (S2). Rotation is
+/// REVOKE-ALL by design: a new signing key means every token minted under the OLD key stops
+/// verifying (its `kid`/signature no longer matches), so every outstanding key must be re-minted.
+/// 1.5.0 is single-key, so this reports the intent and the current kid; the actual key swap is an
+/// operator action (replace `auth.signing_key` / the persisted key file and restart or reload) so
+/// that a fleet rotates in lockstep. Returns the current kid and the revoke-all warning; a future
+/// keyset makes this a live in-process swap.
+pub(crate) async fn rotate_signing_key(
+    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let Some(gov) = &app.governance else {
+        return disabled_write();
+    };
+    let Some(kid) = gov.signing_kid() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            ERR_TYPE_CONFLICT,
+            "no signing key is configured; nothing to rotate",
+        );
+    };
+    audit::AUDIT.record_by(
+        "signing_key.rotate",
+        "signing-key",
+        audit::OUTCOME_APPLIED,
+        &actor,
+    );
+    json_response(
+        StatusCode::OK,
+        json!({
+            "current_kid": kid,
+            "revoke_all": true,
+            "message": "rotating the signing key REVOKES ALL outstanding keys (every token must be \
+                        re-minted). 1.5.0 is single-key: replace auth.signing_key (or the persisted \
+                        signing-key file) with fresh material and restart/reload every node in \
+                        lockstep, then re-mint keys."
+        }),
+    )
+}
+
 /// GET /api/v1/admin/keys/{id} — one key's metadata (id/name/pools/budgets/limits/enabled; never the
 /// secret or key_hash). 404 when no key with `id` exists. Fills the single-key read gap in the key
 /// surface (design-admin-api-v1 §2.1); it stays on the legacy `{type}` envelope + `key_meta` shape so
@@ -1204,6 +1297,13 @@ pub(crate) async fn delete_key(
                         return Ok(DeleteOutcome::EtagStale);
                     }
                 }
+                // REVOKE-THEN-DELETE (1.5.0): add the subject to the denylist BEFORE removing the
+                // binding, so a signed token for this key is rejected even in the window between
+                // the denylist write and the binding removal (and stays rejected via the durable
+                // denylist even if a stale in-memory binding lingered on another node). A denylist
+                // write failure is fatal to the delete (fail-closed: never report a delete that did
+                // not durably revoke).
+                gov.revoke(&id_for_task, "key deleted")?;
                 gov.delete_key(&id_for_task)
                     .map(|()| DeleteOutcome::Deleted)
             }

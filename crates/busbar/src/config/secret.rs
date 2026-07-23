@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The SECRET REFERENCE type (CLEAN-CONFIG rule C2): every secret/external value in the config is
-//! `{ module: <secret-module>, settings: {…} }` — a reference to a SECRET MODULE (`kind: secret`
+//! `{ module: <secret-module>, settings: {…} }` - a reference to a SECRET MODULE (`kind: secret`
 //! plugin), never the secret itself. The built-in modules are `env` (settings.key names an
 //! environment variable) and `file` (settings.path names a file whose contents are the secret);
 //! third-party modules (vault, cloud secret managers, …) load through the plugin system.
@@ -14,7 +14,7 @@
 //! cert:    { file: /run/secrets/tls-cert.pem } # ⇒ { module: file, settings: { path: /run/secrets/tls-cert.pem } }
 //! ```
 //!
-//! A `SecretRef` holds NO secret material — only the module name and its opaque settings — so it is
+//! A `SecretRef` holds NO secret material - only the module name and its opaque settings - so it is
 //! safe to derive `Debug`/`Clone` on it and on every struct embedding it. Resolution (turning the
 //! ref into bytes) happens at boot/first-use through the secret-resolver seam and is FAIL-CLOSED:
 //! an unknown module or a failed resolution is a hard error, never an empty secret.
@@ -34,7 +34,7 @@ pub(crate) const SECRET_ENV_SETTING_KEY: &str = "key";
 pub(crate) const SECRET_FILE_SETTING_PATH: &str = "path";
 
 /// A reference to a secret, resolved through a secret MODULE. See the module docs for the accepted
-/// YAML spellings. `settings` is the module's own (opaque) config — busbar passes it through
+/// YAML spellings. `settings` is the module's own (opaque) config - busbar passes it through
 /// verbatim and never interprets it beyond the built-ins.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(crate) struct SecretRef {
@@ -325,7 +325,7 @@ impl SecretResolver {
 }
 
 /// P1-internal BUILT-IN resolution of a secret reference to its raw bytes: `env` reads the
-/// environment variable; `file` reads the file. Any other module name is FAIL-CLOSED here — the
+/// environment variable; `file` reads the file. Any other module name is FAIL-CLOSED here - the
 /// full secret-plugin resolver (third-party `kind: secret` modules through the plugin trust
 /// pipeline) is layered on top of this by [`SecretResolver`], which falls back to these built-ins
 /// by these exact names.
@@ -390,7 +390,7 @@ fn self_file_path_checked(secret: &SecretRef) -> Result<Option<String>, String> 
     }
 }
 
-/// Resolve a secret reference to a UTF-8 STRING (trailing newline trimmed — the universal
+/// Resolve a secret reference to a UTF-8 STRING (trailing newline trimmed - the universal
 /// file-delivered-secret convention). Fail-closed on non-UTF-8.
 pub(crate) fn resolve_builtin_string(secret: &SecretRef) -> Result<String, String> {
     let bytes = resolve_builtin(secret)?;

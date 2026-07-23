@@ -129,6 +129,10 @@ sha2 = "0.11.0"
 hmac = "0.13.0"
 hex = "0.4.3"
 getrandom = "0.3"
+# ed25519 for the busbar-signed virtual-key TOKENS (P3): the same primitive the plugin-signing
+# path uses, already in the graph. Mint signs a compact `{sub, exp, kid}` token; verify checks the
+# signature statelessly. `rand_core` is pulled for keypair generation on first boot.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 # CRC32 for the AWS `application/vnd.amazon.eventstream` encoder (Bedrock ingress streaming): AWS
 # SDK clients validate both the prelude and message CRC32 on every frame, so the encoder needs a
 # correct, fast CRC32. `crc32fast` is small, dependency-light, and the de-facto standard.

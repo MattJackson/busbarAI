@@ -1593,7 +1593,14 @@ async fn test_governance_admin_api() {
 
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
-    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    // A signing key is required to MINT signed-token keys (1.5.0).
+    let signer = crate::governance::signing::TokenSigner::from_secret_bytes(
+        &[9u8; 32],
+        crate::governance::signing::DEFAULT_KID,
+    );
+    let gov = Arc::new(
+        GovState::new_with_signer(store, Some("admintok".to_string()), Some(signer)).unwrap(),
+    );
 
     let app = TestApp::new().governance(gov).build();
 
@@ -1615,18 +1622,20 @@ async fn test_governance_admin_api() {
 
     // Create a key with the admin token.
     let r = client
-            .post(format!("{base}/api/v1/admin/keys"))
-            .bearer_auth("admintok")
-            .json(&serde_json::json!({"name": "team-a", "allowed_pools": ["allowedpool"], "rpm_limit": 5}))
-            .send()
-            .await
-            .unwrap();
+        .post(format!("{base}/api/v1/admin/keys"))
+        .bearer_auth("admintok")
+        .json(&serde_json::json!({"name": "team-a", "allowed_pools": ["allowedpool"]}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status().as_u16(), 201, "admin create → 201");
     let created: serde_json::Value = r.json().await.unwrap();
     let id = created["id"].as_str().unwrap().to_string();
-    let secret = created["secret"].as_str().unwrap().to_string();
-    assert!(secret.starts_with("sk-bb-"), "secret returned once");
+    // The key credential is a busbar-SIGNED token (1.5.0), returned once - never a stored secret.
+    let secret = created["token"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("bbk_"), "signed token returned once");
     assert!(created.get("key_hash").is_none(), "hash never returned");
+    assert!(created.get("secret").is_none(), "no legacy secret in 1.5.0");
 
     // List shows it (no hash).
     let r = client

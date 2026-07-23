@@ -1,9 +1,29 @@
 use super::*;
 
 impl GovState {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(store: Arc<dyn Store>, admin_token: Option<String>) -> StoreResult<Self> {
+        Self::new_with_signer(store, admin_token, None)
+    }
+
+    /// Construct a `GovState` with an optional TOKEN SIGNER (1.5.0 signed-token keys). `Some` at
+    /// boot (a signing key resolved from `auth.signing_key` or generated on first boot); `None` in
+    /// tests that exercise the SigV4/legacy-hash paths only. Hydrates the revocation denylist set
+    /// from the store so a restart resumes with every revoked subject still denied.
+    pub(crate) fn new_with_signer(
+        store: Arc<dyn Store>,
+        admin_token: Option<String>,
+        signer: Option<crate::governance::signing::TokenSigner>,
+    ) -> StoreResult<Self> {
         let by_hash = Self::load(store.as_ref())?;
         let by_access_key_id = Self::load_by_access_key_id(store.as_ref(), &by_hash)?;
+        let verifier = signer
+            .as_ref()
+            .map(|s| crate::governance::signing::TokenVerifier::single(s.kid(), s.verifying_key()));
+        // Hydrate the denylist. A store with no denylist support returns empty (nothing revoked);
+        // a durable one returns every persisted revoked subject.
+        let denylist: std::collections::HashSet<String> =
+            store.list_denylist()?.into_iter().collect();
         Ok(Self {
             store,
             caches: RwLock::new(GovCaches {
@@ -15,7 +35,179 @@ impl GovState {
                 .as_ref()
                 .map(|t| crate::sigv4::sha256_hex(t.as_bytes())),
             budget: Sharded::new(),
+            signer,
+            verifier,
+            denylist: RwLock::new(denylist),
         })
+    }
+
+    /// Whether signed-token minting is available (a signing key was resolved at boot).
+    pub(crate) fn signing_enabled(&self) -> bool {
+        self.signer.is_some()
+    }
+
+    /// VERIFY a presented signed token (1.5.0): signature + expiry (stateless) + the `sub` not on
+    /// the revocation denylist, then resolve the policy binding by `sub`. Returns the bound
+    /// `VirtualKey` (the binding record: id/group/allowed_pools/labels; no inline limits) on
+    /// success. `None` = not a valid+authorized busbar token OR no signer configured OR the sub
+    /// resolves to no binding (a token for a deleted key). The distinction is logged, never
+    /// surfaced (no enumeration oracle - the auth path maps every `None` to one opaque 401).
+    pub(crate) fn verify_token(&self, token: &str, now: u64) -> Option<Arc<VirtualKey>> {
+        let verifier = self.verifier.as_ref()?;
+        let claims = match verifier.verify(token, now) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(reason = %e, "signed-token verify rejected");
+                return None;
+            }
+        };
+        // Revocation: the ONE state read on the otherwise-stateless path.
+        if self
+            .denylist
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&claims.sub)
+        {
+            tracing::debug!(sub = %claims.sub, "signed-token rejected: subject is revoked");
+            return None;
+        }
+        // Resolve policy by `sub` (the key id). The binding lives in the `by_sub` index.
+        match self.lookup_by_sub(&claims.sub) {
+            Some(key) if key.enabled => Some(key),
+            _ => {
+                tracing::debug!(sub = %claims.sub, "signed-token subject has no enabled binding");
+                None
+            }
+        }
+    }
+
+    /// Resolve a policy binding by its subject id (the key id / token `sub`). O(1) index read.
+    pub(crate) fn lookup_by_sub(&self, sub: &str) -> Option<Arc<VirtualKey>> {
+        self.caches_read()
+            .by_hash
+            .values()
+            .find(|k| k.id == sub)
+            .cloned()
+    }
+
+    /// REVOKE a signed-token key by subject id: persist to the store denylist AND update the
+    /// in-memory set so the next verify rejects it immediately. Idempotent. A store-write failure
+    /// is propagated (a revoke that did not durably persist must FAIL LOUD, never report success -
+    /// a "revoked" token still valid after a restart is a security hole).
+    pub(crate) fn revoke(&self, sub: &str, reason: &str) -> StoreResult<()> {
+        self.store.add_denylist(sub, reason)?;
+        self.denylist
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sub.to_string());
+        Ok(())
+    }
+
+    /// Whether `sub` is currently revoked (for the admin read / tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_revoked(&self, sub: &str) -> bool {
+        self.denylist
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(sub)
+    }
+
+    /// MINT a signed-token key (1.5.0): persist the policy BINDING row (subject id -> group,
+    /// allowed_pools, labels; NO inline limits - keys are pure auth) and issue a busbar-SIGNED
+    /// token `{sub, exp, kid}` for it. Returns `(binding, token)`; the token is shown ONCE. The
+    /// subject id is a fresh unguessable `vk_<hex>` from the OS CSPRNG (its own bucket namespace).
+    /// FAIL-CLOSED: no signer configured is an error (a key with no token is useless).
+    pub(crate) fn mint_signed(
+        &self,
+        spec: NewKeySpec,
+        exp: u64,
+        now: u64,
+    ) -> StoreResult<(VirtualKey, String)> {
+        let Some(signer) = self.signer.as_ref() else {
+            return Err(StoreError(
+                "signed-token minting is unavailable: no signing key is configured".to_string(),
+            ));
+        };
+        // A fresh random subject id (256-bit CSPRNG draw -> `vk_<16 hex>`). Unlike the legacy hash
+        // path, the id is NOT derived from a secret (the token is the credential); it is a random
+        // handle, so there is no id/hash prefix-collision hazard - but keep the `vk_` bucket
+        // namespace so ledger/rate buckets stay consistent with the enforcement machinery.
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw).map_err(|e| StoreError(format!("CSPRNG unavailable: {e}")))?;
+        let id = format!("{VK_ID_PREFIX}{}", hex::encode(raw));
+        let binding = VirtualKey {
+            id: id.clone(),
+            // Not a credential: signed tokens are stateless. Kept non-empty + unique-per-key so a
+            // durable store's UNIQUE(key_hash) constraint is satisfied; never used to authenticate.
+            key_hash: format!("binding:{id}"),
+            name: spec.name,
+            allowed_pools: spec.allowed_pools,
+            // Keys carry NO inline limits (S1): all enforcement flows through the bound group.
+            max_budget_cents: None,
+            budget_period: BUDGET_PERIOD_TOTAL.to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: now,
+            budget_group: spec.budget_group,
+            labels: spec.labels,
+        };
+        self.store.put_key(&binding)?;
+        self.refresh()?;
+        let token = signer.mint(&id, exp);
+        Ok((binding, token))
+    }
+
+    /// MINT a signed-token key that ALSO carries an AWS-style credential for inbound SigV4 (the
+    /// MinIO/S3-compatible model). Persists the binding + AWS credential atomically and issues the
+    /// signed token. Returns `(binding, token, aws_access_key_id, aws_secret_access_key)` - the
+    /// token and the AWS secret are shown ONCE. See `mint_signed` for the binding shape.
+    pub(crate) fn mint_signed_with_aws(
+        &self,
+        spec: NewKeySpec,
+        exp: u64,
+        now: u64,
+    ) -> StoreResult<(VirtualKey, String, String, String)> {
+        let Some(signer) = self.signer.as_ref() else {
+            return Err(StoreError(
+                "signed-token minting is unavailable: no signing key is configured".to_string(),
+            ));
+        };
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw).map_err(|e| StoreError(format!("CSPRNG unavailable: {e}")))?;
+        let id = format!("{VK_ID_PREFIX}{}", hex::encode(raw));
+        let access_key_id = generate_aws_access_key_id().store()?;
+        let secret_access_key = generate_aws_secret_access_key().store()?;
+        let binding = VirtualKey {
+            id: id.clone(),
+            key_hash: format!("binding:{id}"),
+            name: spec.name,
+            allowed_pools: spec.allowed_pools,
+            max_budget_cents: None,
+            budget_period: BUDGET_PERIOD_TOTAL.to_string(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: now,
+            budget_group: spec.budget_group,
+            labels: spec.labels,
+        };
+        self.store.put_key_with_aws_credential(
+            &binding,
+            &AwsCredential {
+                access_key_id: access_key_id.clone(),
+                key_id: id.clone(),
+                secret_access_key: secret_access_key.clone(),
+            },
+        )?;
+        self.refresh()?;
+        let token = signer.mint(&id, exp);
+        Ok((binding, token, access_key_id, secret_access_key))
+    }
+
+    /// The signing key id (`kid`) this node stamps into minted tokens, if signing is enabled.
+    pub(crate) fn signing_kid(&self) -> Option<&str> {
+        self.signer.as_ref().map(|s| s.kid())
     }
 
     /// Run a best-effort, FIRE-AND-FORGET store write WITHOUT blocking the async executor thread.
@@ -240,6 +432,7 @@ impl GovState {
 
     /// Mint a new virtual key, persist it, refresh the cache, and return `(key, plaintext
     /// secret)`. The secret is shown to the caller ONCE here and never stored (only its hash is).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_key(
         &self,
         spec: NewKeySpec,
@@ -295,6 +488,7 @@ impl GovState {
     /// columns on `VirtualKey` — this ties the credential to the key without changing the `VirtualKey`
     /// row shape. The bearer key row is persisted first, then the AWS credential; both then refresh
     /// the in-memory caches so the AccessKeyId resolves on the next request.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_key_with_aws(
         &self,
         spec: NewKeySpec,
@@ -342,6 +536,7 @@ impl GovState {
     /// while differing on `key_hash`. If `id` already exists under a DIFFERENT `key_hash`, refuse
     /// (rather than let `put_key` overwrite an unrelated key's row). An `id` that is free, or that
     /// already holds the SAME `key_hash` (an idempotent re-mint of the identical secret), is allowed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn ensure_id_free_for_hash(&self, id: &str, hash: &str) -> StoreResult<()> {
         if let Some(existing) = self.store.get_key(id)? {
             if existing.key_hash != hash {

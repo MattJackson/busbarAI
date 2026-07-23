@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The top-level `groups:` block — THE one limit tree (CLEAN-CONFIG S3). A group is a named
+//! The top-level `groups:` block - THE one limit tree (CLEAN-CONFIG S3). A group is a named
 //! enforcement bucket: an ordered list of generic LIMITS plus an optional `parent` forming an
 //! acyclic chain (depth <= 8, validated). Enforcement (P4) walks the chain and ANDs every bucket;
-//! `enabled: false` freezes a group (history kept). Keys are PURE AUTH and carry no limits — a key
+//! `enabled: false` freezes a group (history kept). Keys are PURE AUTH and carry no limits - a key
 //! binds to at most one group (`group:` at mint), and a key with no group is authed + unlimited.
 //!
 //! A limit is `{ <metric>: <amount>, per: <window> }` with exactly ONE metric key:
@@ -13,12 +13,12 @@
 //! limits:
 //!   - { requests: 500, per: minute }
 //!   - { budget: 1000000, per: month }
-//!   - { concurrent: 5 }              # instantaneous — no `per`
+//!   - { concurrent: 5 }              # instantaneous - no `per`
 //! ```
 //!
 //! metrics: `requests` | `tokens` | `budget` | `concurrent`. windows (C8, nouns):
 //! `minute` | `hour` | `day` | `month` | `total`. `concurrent` is an in-flight gauge and takes NO
-//! `per`; the three windowed metrics REQUIRE one (a windowless cap is ambiguous — fail loudly).
+//! `per`; the three windowed metrics REQUIRE one (a windowless cap is ambiguous - fail loudly).
 
 use std::fmt;
 
@@ -55,7 +55,7 @@ pub(crate) enum LimitMetric {
     Tokens,
     /// Spend (cents, abstract minor units, derived from the ledger x rate_card) per window.
     Budget,
-    /// In-flight request gauge — instantaneous, no window.
+    /// In-flight request gauge - instantaneous, no window.
     Concurrent,
 }
 
@@ -186,7 +186,7 @@ impl<'de> Deserialize<'de> for LimitCfg {
 }
 
 /// Validate the whole `groups:` tree: parents exist, acyclic, depth <= 8. Returns paste-ready
-/// errors in the config_validate style. Pure — shared verbatim by boot and `--validate` so the two
+/// errors in the config_validate style. Pure - shared verbatim by boot and `--validate` so the two
 /// cannot drift.
 pub(crate) fn validate_groups(
     groups: &std::collections::BTreeMap<String, GroupCfg>,
