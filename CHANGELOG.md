@@ -11,8 +11,10 @@ item under **Changed**.
 
 ## [Unreleased]
 
-
-## [1.5.0], 2026-07-22
+<!-- These are the pending 1.5.0 release notes. Per .github/workflows/cut-release.yml, release
+     notes live under [Unreleased]; dispatching the release runs roll_changelog.py, which promotes
+     this section to `## [1.5.0], <cut-date>` and stamps the real date. Do NOT hard-code a dated
+     [1.5.0] header here — that collides with the auto-promotion at tag time. -->
 
 The config / identity / cost REDESIGN release. 1.5.0 is a deliberate, tooled, BREAKING-FOR-OPERATORS
 step: the config format changed shape (run `busbar --migrate-config`), and every 1.4.x virtual key
@@ -65,6 +67,26 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   on_error?, prompt?, user?, priority?, at? }`. The socket/webhook transports are built-in hook
   MODULES (`settings.path` / `settings.url`), so out-of-process hooks persist; the registry and
   the `global:`/`default:` flags are gone (subsumed by the two lists).
+- **RUNTIME-MUTABLE GROUPS on the Admin API - self-service governance.** The `groups:` limit tree
+  is now editable live over the Admin API, so per-team and per-user budgets change without a
+  restart: `GET /api/v1/admin/groups` + `GET/POST/PUT/PATCH/DELETE /api/v1/admin/groups/{name}`.
+  A write is VALIDATE-AT-THE-DOOR (the whole tree is re-checked - parent exists, acyclic, depth -
+  so an invalid edit is a 400 that changes nothing), then the enforcement projection is rebuilt in
+  place (limits live on the next request) while the token LEDGER survives, so past accrual is
+  preserved. `PATCH` is the ergonomic per-field verb ("raise Alice's budget" = send just `limits`;
+  "freeze a team" = `enabled: false`). Because a group is `{ parent?, enabled, limits, child_default? }`
+  and org/team/user are the SAME primitive, **a user is just a leaf group** parented to their team:
+  a personal budget is the leaf's own limits, always sub-capped by the team ceiling (the chain ANDs,
+  so over-allocating personal budgets can never sum past the team pool). Every mutation is audited,
+  bumps `config_version` (optimistic concurrency via `If-Match`), and is written to the config
+  OVERLAY so it survives a restart; a base-config group is file-owned (a 409 - edit config.yaml).
+  New optional `groups.<g>.child_default` seeds the limits of children auto-provisioned under a
+  group (nearest-ancestor-wins).
+- **Config OVERLAY substrate (`BUSBAR_CONFIG_OVERLAY`).** Admin-API config mutations layer onto a
+  busbar-owned overlay file (never the operator's base `config.yaml`); the effective config = base
+  + overlay, re-merged at boot and re-validated on every hot-apply. Atomic write (temp + rename),
+  per-section tombstones for deletions, and a loud refusal to overwrite a corrupt overlay. This is
+  what makes the runtime-mutable groups (above) durable across restarts.
 - **`auth.role_bindings` NESTED BY MODULE.** `role_bindings.<module>.<role> ->
   { allowed_pools?, group?, admin_scope? }` - pure auth. A role asserted by one module can never
   ride another module's binding (`ad.platform` != `oidc.platform`); an unbound role grants
