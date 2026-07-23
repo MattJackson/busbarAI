@@ -249,8 +249,8 @@ pools:
 #   otlp_endpoint            — export OpenTelemetry traces (OTLP/HTTP) to a collector.
 #   request_log_webhook_url  — fire-and-forget a JSON request-log POST per request.
 #   emit_server_timing       — emit the `Server-Timing: busbar;dur=<ms>` response header (default
-#                              true). Set false to suppress it entirely (it is an in-band busbar
-#                              fingerprint you may want to hide for backend indistinguishability).
+#                              false; set true to enable). It is an in-band busbar fingerprint, off
+#                              by design so it cannot undercut backend indistinguishability.
 # observability:
 #   otlp_endpoint: "http://localhost:4318/v1/traces"
 #   request_log_webhook_url: "https://logs.example.com/busbar"

@@ -127,7 +127,7 @@ Save this as `config.yaml` in your working directory.
 | `models.<name>.provider` | Which provider entry in the `providers` block this model calls |
 | `models.<name>.max_concurrent` | Optional per-lane concurrency limiter: max simultaneous in-flight requests to this model. Omit for unbounded (the default); set a value ≥ 1 to cap. |
 
-`providers` and `models` are the only required sections. `listen` defaults to `0.0.0.0:8080`. `auth` defaults to `none` (open relay) when omitted, fine for local dev, not for production.
+`providers` and `models` are the only required sections. `listen` defaults to `0.0.0.0:8080`. `auth` defaults to an empty chain (`chain: []`), an open relay, when omitted, fine for local dev, not for production.
 
 ---
 
