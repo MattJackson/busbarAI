@@ -42,9 +42,9 @@ The ONE limit tree. Keys carry no limits; every cap lives here.
 ```yaml
 groups:
   <name>:
-    parent: <group>          # optional; acyclic
-    enabled: true            # false = freeze this group (and every descendant's traffic)
-    limits:
+    parent: <group>          # optional (default: none); acyclic
+    enabled: true            # default: true, omit it; false = freeze this group (and every descendant's traffic)
+    limits:                  # default: [] (an inherit-only group, capped by its parent chain)
       - { requests: 500, per: minute }   # requests|tokens|budget need a per: window
       - { budget: 1000000, per: month }
       - { concurrent: 5 }                # instantaneous in-flight cap: NO per:
