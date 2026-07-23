@@ -460,6 +460,59 @@ fn chain_and_parent_blocks_child_and_charges_nothing() {
     assert_eq!(child.requests, 2);
 }
 
+/// PHASE 1 runtime-mutation bridge (task #100): a per-user leaf ADDED at runtime via
+/// `CostModel::with_groups` — the exact rebuild `build_with_group` performs on a `POST /groups` —
+/// enforces exactly like a boot-resolved tree. The team ceiling ANDs ABOVE the leaf, so a generous
+/// personal budget can never let the user spend past the team cap (the over-allocation SAFETY
+/// property). Proves "self-issue a key / raise a budget at runtime" yields live, chain-correct
+/// enforcement — the machinery the whole self-service story rests on.
+#[test]
+fn runtime_added_user_leaf_is_capped_by_the_team_ceiling() {
+    let g = gov();
+    // Boot-time tree: only the team ceiling exists (2 requests/min).
+    let base = model(&[(
+        "team",
+        group_cfg(
+            None,
+            true,
+            vec![limit(LimitMetric::Requests, 2, Some(LimitWindow::Minute))],
+        ),
+    )]);
+    // Runtime add of `user:bob` under team with a DELIBERATELY LOOSER personal cap (5/min) — the map
+    // build_with_group hands to with_groups after a self-mint / budget raise.
+    let mut map: BTreeMap<String, GroupCfg> = BTreeMap::new();
+    map.insert(
+        "team".into(),
+        group_cfg(
+            None,
+            true,
+            vec![limit(LimitMetric::Requests, 2, Some(LimitWindow::Minute))],
+        ),
+    );
+    map.insert(
+        "user:bob".into(),
+        group_cfg(
+            Some("team"),
+            true,
+            vec![limit(LimitMetric::Requests, 5, Some(LimitWindow::Minute))],
+        ),
+    );
+    let cm = base.with_groups(&map);
+    let k = key("vk_bob", Some("user:bob"));
+    let now = 1_700_000_000;
+    // Two admissions fit under the team ceiling; the third is blocked by TEAM, not bob's 5-cap —
+    // the personal budget cannot exceed the shared team pool no matter how generously it's set.
+    g.try_admit(&cm, &k, now).expect("1st");
+    g.try_admit(&cm, &k, now).expect("2nd");
+    assert_blocked(
+        g.try_admit(&cm, &k, now).unwrap_err(),
+        "team",
+        "requests",
+        Some("minute"),
+        true,
+    );
+}
+
 /// `enabled: false` FREEZES a group: every request through it (directly or via a descendant) is
 /// rejected as Disabled, before anything is charged; history is kept.
 #[test]
