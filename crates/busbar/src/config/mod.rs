@@ -11,6 +11,8 @@ pub(crate) mod overlay;
 
 /// The top-level `groups:` limit tree (S3): GroupCfg + the generic limit shape.
 pub(crate) mod groups;
+/// The 1.4.x -> 1.5.0 config migrator + the loud fail-closed 1.x detector (P9).
+pub(crate) mod migrate;
 /// The secret-reference type (C2): `{ module, settings }` + the `{env}`/`{file}` sugar.
 pub(crate) mod secret;
 
@@ -1594,7 +1596,7 @@ pub(crate) struct DeployCfg {
     /// The durable store as `{ module, settings }` (S6). Absent = the ephemeral RAM store.
     #[serde(default)]
     pub(crate) store: Option<StoreCfg>,
-    /// Internal tuning knobs (formerly `governance.rate_sweep_interval` / `usage_flush_interval_ms`).
+    /// Internal tuning knobs (the `advanced:` block).
     #[serde(default)]
     pub(crate) advanced: AdvancedCfg,
     /// Optional observability sinks (OTLP traces + request-log webhook). Metrics
@@ -1658,7 +1660,7 @@ pub(crate) struct SecurityCfg {
 pub(crate) struct PluginsCfg {
     /// MASTER SWITCH, default FALSE. When false (or the whole `plugins:` block is absent), NO
     /// plugin is ever loaded — a tarball dropped into the directory is INERT. Referencing a plugin
-    /// while disabled (`governance.store:` other than `memory`) is a BOOT ERROR naming this flag.
+    /// while disabled (`store.module:` other than `memory`) is a BOOT ERROR naming this flag.
     #[serde(default)]
     pub(crate) enabled: bool,
     /// Directory the signed plugin tarballs live in. Default `plugins` (relative to the working

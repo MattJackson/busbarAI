@@ -216,7 +216,6 @@ dependencies = [
  "base64",
  "busbar-api",
  "busbar-auth-admin-tokens",
- "busbar-auth-tokens",
  "busbar-hooks-ranking",
  "busbar-plugin-loader",
  "busbar-plugin-sign",
@@ -274,13 +273,6 @@ dependencies = [
 
 [[package]]
 name = "busbar-auth-admin-tokens"
-version = "1.5.0"
-dependencies = [
- "busbar-api",
-]
-
-[[package]]
-name = "busbar-auth-tokens"
 version = "1.5.0"
 dependencies = [
  "busbar-api",

@@ -1677,7 +1677,7 @@ fn test_removed_top_level_blocks_rejected() {
             "hooks:\n  my-gate:\n    kind: gate\n    socket: /s\n",
             "hooks",
         ),
-        ("group_map:\n  eng:\n    budget_group: eng\n", "group_map"),
+        ("group_map:\n  eng:\n    group: eng\n", "group_map"),
         ("admin_auth: [admin-tokens]\n", "admin_auth"),
     ] {
         let yaml = format!("providers: {{}}\nmodels: {{}}\n{block}");

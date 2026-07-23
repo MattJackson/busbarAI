@@ -35,7 +35,6 @@ busbar-plugin-loader = { path = "../plugin-loader" }
 busbar-plugin-sign = { path = "../plugin-sign" }
 # The built-in plugins, each its own workspace crate under auth/<name>/ or hooks/<name>/ — optional
 # so the matching feature (below) compiles each IN or OUT of the binary.
-busbar-auth-tokens = { path = "../auth-tokens", optional = true }
 busbar-auth-admin-tokens = { path = "../auth-admin-tokens", optional = true }
 busbar-hooks-ranking = { path = "../hooks-ranking", optional = true }
 axum = "0.8"
@@ -187,13 +186,10 @@ tikv-jemalloc-ctl = "0.6"
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
 
 [features]
-# The built-in `tokens` auth plugin is a DEFAULT-ON, REMOVABLE feature — compliance by compilation.
-# A `--no-default-features` build contains NO client-token auth code at all (the module, its
-# constant-time fold, and the allowlist are absent from the binary, provable by attestation +
-# symbols). `auth.chain: [tokens]` then BOOT-ERRORS instead of silently opening. A regulated
-# deployment ships tokens OUT and wires its own auth module (SAML/AD/OIDC) in the private repo.
-default = ["auth-tokens", "auth-admin-tokens", "hooks-ranking"]
-auth-tokens = ["dep:busbar-auth-tokens"]
+# 1.5.0 (S8): the static-token allowlist module is REMOVED entirely - data-plane auth is the
+# built-in `keys` signed-token verifier plus IdP auth modules. Nothing static-token-shaped is
+# compiled into any build.
+default = ["auth-admin-tokens", "hooks-ranking"]
 # The built-in `admin-tokens` ADMIN auth plugin (the single operator admin token) — same
 # default-on, removable, compliance-by-compilation stance. Removed, `admin_auth: [admin-tokens]`
 # (the default) boot-errors and an external admin module must be wired.

@@ -1297,7 +1297,7 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
     }
     // The error-body buffer cap must be >= 1 byte (0 would buffer nothing, losing every upstream
     // error body). The pool-idle, gauge-limit, and probe defaults are all safe at any value (0
-    // pool-idle = no keep-alive; 0 gauge limit = emit none). `governance.rate_sweep_interval == 0` is
+    // pool-idle = no keep-alive; 0 gauge limit = emit none). `advanced.rate_sweep_interval == 0` is
     // rejected separately in `validate_governance` — a 0 there would disable the rate-map eviction
     // sweep, so it is a hard error rather than a silently-accepted default.
     if limits.upstream_error_body_max_bytes < 1 {
