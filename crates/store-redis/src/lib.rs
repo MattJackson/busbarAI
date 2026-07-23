@@ -39,10 +39,14 @@
 //!
 //! A single mutex-guarded synchronous connection used off the request hot path (key CRUD + the
 //! write-behind usage flush). A DROPPED connection (server restart, idle timeout, network blip) is
-//! transparently re-established: each operation retries exactly ONCE on a connection-level error by
-//! reopening from the client before failing. `rediss://` URLs use TLS (rustls, ring provider,
-//! OS-native roots). Error strings are SCRUBBED of the URL password before they leave this crate,
-//! so a connection failure can never leak the secret into logs.
+//! transparently re-established: a READ / idempotent op retries exactly ONCE on a connection-level
+//! error by reopening from the client before failing. A NON-IDEMPOTENT write cascade
+//! (`add_usage`/`add_metering`: HINCRBY `MULTI`/`EXEC`) does NOT auto-retry - a lost-reply timeout
+//! may have already committed the EXEC server-side, so a retry would double-apply the delta; instead
+//! the error surfaces and the write-behind flusher re-derives the correct total from the baseline on
+//! the next tick (exactly-once on error). `rediss://` URLs use TLS (rustls, ring provider, OS-native
+//! roots). Error strings are SCRUBBED of the URL password before they leave this crate, so a
+//! connection failure can never leak the secret into logs.
 //!
 //! ## Data growth (documented, deliberate)
 //!
@@ -185,26 +189,94 @@ impl RedisStore {
             c.scan_match::<_, String>("busbar:*")?
                 .collect::<Result<Vec<String>, _>>()
         })?;
-        if !existing.is_empty() {
-            self.with_conn(|c| {
-                let mut pipe = redis::pipe();
-                pipe.atomic();
-                for k in &existing {
-                    pipe.del(k).ignore();
-                }
-                pipe.query::<()>(c)
-            })?;
+        if existing.is_empty() {
+            // A fresh namespace: just mark it v2.
+            return self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION));
         }
+        // M2 (data-loss): the marker is absent (or pre-v2) but `busbar:*` DATA exists. The old code
+        // WIPED the whole namespace unconditionally - so a marker EVICTED under `maxmemory
+        // allkeys-*` (while the v2 data survived) destroyed a healthy database on the next boot.
+        // Only wipe when LEGACY-SHAPED keys are actually present (a pre-v2 build's `busbar:usage:*`
+        // HASH carried a `spend_cents` field that the v2 token-ledger shape never has). If data
+        // exists but is NOT legacy-shaped and the marker is absent, we CANNOT prove it is safe to
+        // wipe - REFUSE to boot loudly rather than silently destroy it.
+        if !self.namespace_is_legacy_shaped(&existing)? {
+            return Err(StoreError(format!(
+                "redis: found {} busbar:* keys but no '{SCHEMA_KEY}' marker, and the data is NOT \
+                 legacy (pre-1.5.0) shaped. Refusing to wipe a namespace that may be a healthy v2 \
+                 database whose schema marker was evicted (e.g. under `maxmemory allkeys-*`). \
+                 Restore the marker with `SET {SCHEMA_KEY} {SCHEMA_VERSION}` if this IS a v2 \
+                 database, or clear the busbar:* namespace deliberately if it is not.",
+                existing.len()
+            )));
+        }
+        // Confirmed legacy: a bump-not-migrate wipe (1.5.0 is unreleased).
+        self.with_conn(|c| {
+            let mut pipe = redis::pipe();
+            pipe.atomic();
+            for k in &existing {
+                pipe.del(k).ignore();
+            }
+            pipe.query::<()>(c)
+        })?;
         self.with_conn(|c| c.set::<_, _, ()>(SCHEMA_KEY, SCHEMA_VERSION))
+    }
+
+    /// M2: is the `busbar:*` namespace shaped like a PRE-v2 (legacy 1.4.x) store? The distinguishing
+    /// marker is a `busbar:usage:*` HASH carrying the legacy `spend_cents` field, which the v2
+    /// token-ledger usage shape (`requests` + `m:<model>:<tier>`) never has. Returns true only when
+    /// such a key is actually observed - so an ambiguous/unknown namespace is treated as NOT legacy
+    /// (fail-closed: refuse to wipe rather than guess).
+    fn namespace_is_legacy_shaped(&self, existing: &[String]) -> StoreResult<bool> {
+        for k in existing {
+            // Only usage hashes carried the legacy field; skip everything else quickly.
+            if !k.starts_with("busbar:usage:") {
+                continue;
+            }
+            let has_legacy: bool = self
+                .with_conn(|c| c.hexists(k, "spend_cents"))
+                .unwrap_or(false);
+            if has_legacy {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Run `f` against the live connection, transparently reconnecting ONCE on a connection-level
     /// error (dropped socket / IO / timeout). The single retry re-runs `f` on the fresh connection;
-    /// a second failure (or any command-level error) surfaces, password-scrubbed. Every operation
-    /// in this crate funnels through here, so reconnect + scrub are uniform.
+    /// a second failure (or any command-level error) surfaces, password-scrubbed.
+    ///
+    /// M3 (over-bill): the one-shot retry is SAFE ONLY for READ / idempotent ops. It is UNSAFE for a
+    /// non-idempotent write cascade (`add_usage`/`add_metering` are HINCRBY MULTI/EXEC): a LOST-REPLY
+    /// TIMEOUT means the EXEC may already have committed on the server, so re-running `f` would
+    /// DOUBLE-APPLY the delta permanently (over-bill). Mutating cascades therefore use
+    /// `with_conn_no_retry`, which returns the error so the write-behind flusher re-derives the
+    /// correct total from the baseline on the next tick (exactly-once on error).
     fn with_conn<T>(
         &self,
+        f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
+    ) -> StoreResult<T> {
+        self.run(f, true)
+    }
+
+    /// Like `with_conn` but with NO reconnect-retry - for non-idempotent write cascades where a
+    /// lost-reply timeout must NOT be retried (see the M3 note on `with_conn`). A connection-level
+    /// error surfaces so the caller (the flusher) re-derives from baseline instead of double-applying.
+    fn with_conn_no_retry<T>(
+        &self,
+        f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
+    ) -> StoreResult<T> {
+        self.run(f, false)
+    }
+
+    /// Shared connection driver. `retry` gates the one-shot reconnect-and-retry (safe only for
+    /// idempotent ops - see `with_conn`). Every operation in this crate funnels through here, so
+    /// reconnect + scrub are uniform.
+    fn run<T>(
+        &self,
         mut f: impl FnMut(&mut Connection) -> redis::RedisResult<T>,
+        retry: bool,
     ) -> StoreResult<T> {
         let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         // (Re)establish if the previous operation dropped the connection.
@@ -218,7 +290,7 @@ impl RedisStore {
         let conn = guard.as_mut().expect("connection just ensured");
         match f(conn) {
             Ok(v) => Ok(v),
-            Err(e) if is_connection_error(&e) => {
+            Err(e) if retry && is_connection_error(&e) => {
                 // Drop the dead connection and retry exactly once on a fresh one.
                 *guard = None;
                 let mut fresh = self
@@ -233,7 +305,14 @@ impl RedisStore {
                     Err(e2) => Err(self.err(e2, "retry after reconnect")),
                 }
             }
-            Err(e) => Err(self.err(e, "command")),
+            Err(e) => {
+                // A connection-level failure (retried or not) leaves the guard's connection suspect;
+                // drop it so the NEXT op reconnects cleanly rather than reusing a dead socket.
+                if is_connection_error(&e) {
+                    *guard = None;
+                }
+                Err(self.err(e, "command"))
+            }
         }
     }
 
@@ -408,7 +487,9 @@ impl Store for RedisStore {
         // true fleet total instead of last-writer-wins overwriting each other. No dollar delta
         // crosses this wire. (A transient negative is clamped to 0 on read - see the crate doc.)
         let k = usage_key(bucket_id, window_start);
-        self.with_conn(|c| {
+        // M3: NON-IDEMPOTENT HINCRBY cascade - no auto-retry (a lost-reply timeout must not
+        // double-apply; the flusher re-derives from baseline on error).
+        self.with_conn_no_retry(|c| {
             let mut pipe = redis::pipe();
             pipe.atomic();
             pipe.cmd("HINCRBY")
@@ -442,7 +523,9 @@ impl Store for RedisStore {
         // One atomic MULTI/EXEC: index the row + HINCRBY the four token fields and the request
         // count + persist the identity fields (idempotent HSET). Accumulation without a
         // read-modify-write race, and no partially-written row on failure.
-        self.with_conn(|c| {
+        // M3: NON-IDEMPOTENT HINCRBY cascade - no auto-retry (a lost-reply timeout must not
+        // double-apply; the flusher re-derives from baseline on error).
+        self.with_conn_no_retry(|c| {
             redis::pipe()
                 .atomic()
                 .sadd(&set, &row)
@@ -933,5 +1016,113 @@ mod tests {
             .expect("operation after a dropped connection must transparently reconnect");
         assert!(got.is_some());
         store.delete_key("vk_reconn").unwrap();
+    }
+
+    /// M3 (over-bill): a NON-IDEMPOTENT write cascade (add_usage / add_metering) must NOT auto-retry
+    /// on a connection error - a lost-reply timeout could have already committed the EXEC server-side,
+    /// so a retry would DOUBLE-APPLY the delta permanently. We drop the pooled connection (server-side
+    /// QUIT), then a mutating op must ERROR (no transparent retry) while a subsequent READ reconnects.
+    #[test]
+    fn mutating_op_does_not_auto_retry_after_dropped_connection() {
+        let Some(store) = live_store() else { return };
+        let bucket_id = "vk_m3_noretry";
+        let window = 1_700_000_000_u64;
+        let _ = store.with_conn(|c| c.del::<_, ()>(usage_key(bucket_id, window)));
+
+        let delta = || busbar_api::UsageDelta {
+            requests: 1,
+            models: vec![busbar_api::ModelTokensDelta {
+                model: "gpt-x".into(),
+                tokens: busbar_api::TierTokensDelta {
+                    input: 10,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                },
+            }],
+        };
+
+        // Kill the pooled connection so the very next command hits a dead socket.
+        {
+            let mut guard = store.conn.lock().unwrap();
+            if let Some(conn) = guard.as_mut() {
+                let _ = redis::cmd("QUIT").query::<String>(conn);
+            }
+        }
+        // The mutating op must ERROR (a read WOULD have transparently reconnected). If it instead
+        // returned Ok, that means a silent reconnect+retry ran - the exact double-apply hazard.
+        let res = store.add_usage(bucket_id, window, &delta());
+        assert!(
+            res.is_err(),
+            "a non-idempotent write cascade must NOT auto-retry on a connection error (over-bill \
+             hazard); it must surface the error so the flusher re-derives from baseline"
+        );
+
+        // A subsequent READ reconnects cleanly (the dropped connection was cleared), and - proof the
+        // failed write did NOT apply - the counter is still absent/zero.
+        let ledger = store.get_usage(bucket_id, window).expect("read reconnects");
+        assert_eq!(
+            ledger.requests, 0,
+            "the un-retried write must not have applied (exactly-once on error)"
+        );
+
+        // A fresh mutating op now succeeds on the healthy connection (baseline re-derive path).
+        store
+            .add_usage(bucket_id, window, &delta())
+            .expect("write succeeds on a healthy connection");
+        assert_eq!(store.get_usage(bucket_id, window).unwrap().requests, 1);
+        let _ = store.with_conn(|c| c.del::<_, ()>(usage_key(bucket_id, window)));
+    }
+
+    /// M2 (data-loss): busbar:* DATA present + schema marker ABSENT + the data is NOT legacy-shaped
+    /// (a healthy v2 namespace whose marker was evicted under `maxmemory allkeys-*`) must REFUSE to
+    /// boot - never silently WIPE. And the inverse: a genuinely legacy-shaped namespace (a
+    /// `busbar:usage:*` HASH carrying the pre-v2 `spend_cents` field) IS wiped and re-marked.
+    #[test]
+    fn migrate_refuses_to_wipe_non_legacy_namespace_with_missing_marker() {
+        let Some(store) = live_store() else { return };
+        // Simulate a v2 namespace whose marker was evicted: v2-shaped usage data, no busbar:schema.
+        let vk_id = "vk_m2_v2";
+        let ukey = usage_key(vk_id, 1_700_000_100);
+        store
+            .with_conn(|c| {
+                redis::pipe()
+                    .hset(&ukey, "requests", 5_i64)
+                    .ignore()
+                    .hset(&ukey, model_field("gpt-x", "input"), 10_i64)
+                    .ignore()
+                    .del(SCHEMA_KEY)
+                    .ignore()
+                    .query::<()>(c)
+            })
+            .unwrap();
+
+        // migrate() must REFUSE (Err), leaving the data intact - not wipe it.
+        let err = store
+            .migrate()
+            .expect_err("a non-legacy namespace with a missing marker must refuse to boot");
+        assert!(
+            err.0.contains("Refusing to wipe"),
+            "expected a loud refuse-to-wipe error, got: {}",
+            err.0
+        );
+        let still: i64 = store.with_conn(|c| c.hget(&ukey, "requests")).unwrap();
+        assert_eq!(
+            still, 5,
+            "the v2 data must survive - migrate() must not wipe it"
+        );
+
+        // Now make it genuinely LEGACY-shaped (add the pre-v2 spend_cents field) and confirm a wipe.
+        store
+            .with_conn(|c| c.hset::<_, _, _, ()>(&ukey, "spend_cents", 42_i64))
+            .unwrap();
+        store.with_conn(|c| c.del::<_, ()>(SCHEMA_KEY)).unwrap();
+        store
+            .migrate()
+            .expect("a legacy-shaped namespace migrates (wipe + re-mark)");
+        let gone: Option<i64> = store.with_conn(|c| c.hget(&ukey, "requests")).unwrap();
+        assert!(gone.is_none(), "the legacy key must be wiped");
+        let marker: Option<i64> = store.with_conn(|c| c.get(SCHEMA_KEY)).unwrap();
+        assert_eq!(marker, Some(SCHEMA_VERSION), "re-marked v2 after the wipe");
     }
 }
