@@ -5,7 +5,7 @@ Busbar keeps serving through provider failures. That reliability is not one feat
 **Structure**: how you describe your backends ([Core concepts](/docs/pools/)):
 
 - **[Pools](/docs/pools/)** - group backends into one named target with weighting and automatic failover.
-- **[Routing policies](/docs/routing/)** - choose which member serves each request: cheapest, fastest, least busy, or your own logic.
+- **[Routing hooks](/docs/hooks/)** - choose which member serves each request: cheapest, fastest, least busy, or your own logic.
 
 **Resilience**: what happens when a backend misbehaves (the guides in this section):
 
@@ -21,7 +21,7 @@ The rest of this page ties them together with one production-like configuration.
 
 ## End-to-end worked example
 
-The following config creates a production-like setup: a weighted primary pool with fast failover and a cheap overflow, context-length failover between members, session affinity, aggressive tripping with a low streak threshold, and governance-enforced per-team rate limits.
+The following config creates a production-like setup: a weighted primary pool with fast failover and a cheap overflow, context-length failover between members, session affinity, aggressive tripping with a low streak threshold, and active governance with a per-model rate card so per-key spend is priced from real token counts.
 
 ```yaml
 listen: "0.0.0.0:8080"
@@ -117,12 +117,20 @@ What this achieves:
 - **Session affinity**: callers with `x-session-id` headers stay pinned to the same member while it is healthy.
 - **Overflow**: if all primary members are exhausted, traffic spills to `claude-haiku`. If haiku is also exhausted, `least_bad` picks the member with the soonest recovery rather than returning 503.
 - **Health probing**: `anthropic` lanes are re-probed on trip (`mode: dead`), so a recovered Anthropic backend is brought back promptly without waiting for organic traffic to probe it.
-- **Governance**: each team gets a virtual key with per-pool ACLs and token-based rate limits. Mint keys with `POST /api/v1/admin/keys`.
+- **Governance**: each team gets a virtual key with per-pool ACLs, RPM/TPM limits, and a budget derived from the rate card above. Bind a key to a `budget_group` to cap a whole team or org above the key. Mint keys with `POST /api/v1/admin/keys`.
 
-To mint a key for a team:
+To mint a key for a team, optionally binding it to a budget group that caps the team above the key. First declare the group under `governance.budget_groups`:
+
+```yaml
+governance:
+  budget_groups:
+    search-team: { max_budget_cents: 2000000, budget_period: monthly }   # $20k/mo cap over every search key
+```
+
+Then mint a key bound to it, with a label for external reporting:
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/admin/keys \
+curl -s -X POST http://localhost:8081/api/v1/admin/keys \
   -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -130,8 +138,13 @@ curl -s -X POST http://localhost:8080/api/v1/admin/keys \
         "allowed_pools": ["primary", "overflow"],
         "tpm_limit": 500000,
         "rpm_limit": 300,
-        "budget_period": "monthly"
+        "max_budget_cents": 500000,
+        "budget_period": "monthly",
+        "budget_group": "search-team",
+        "labels": {"team": "search"}
       }'
 ```
+
+Admission now walks the key's own $5k/mo budget and the `search-team` group's $20k/mo cap; the request passes only when both are under cap, and a 429 names whichever one blocked. The `labels` ride onto the key's metric series so Grafana can `sum by (team)` without busbar knowing what a team is.
 
 The response's `secret` field (`sk-bb-…`) is what the team uses as their API key pointed at busbar. They set it wherever they previously set their Anthropic/OpenAI key. Busbar handles the rest.

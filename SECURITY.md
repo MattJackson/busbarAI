@@ -33,7 +33,7 @@ Issues of particular interest include:
 
 - Credential leakage (logs, error bodies, `/stats`, responses relayed to clients).
 - Authentication bypass on Busbar's own front-door auth (including timing-based).
-- SSRF via a config-controlled upstream (`base_url` / `path` / `path_base` / `token_url`).
+- SSRF via a config-controlled upstream (`base_url` / `path` / `path_base` / `token_url`) or a hook `webhook:` URL.
 - AWS SigV4 outbound-signing correctness (signed-vs-sent divergence).
 - Admin-plane isolation (reaching the control plane from the data port).
 - Request smuggling / routing confusion between pools, models, or providers.
@@ -43,6 +43,6 @@ Issues of particular interest include:
 
 ## Supported versions
 
-Busbar is at 1.4.0 (stable). Security fixes are applied to the latest `main` and
+Busbar is at 1.5.0 (stable). Security fixes are applied to the latest `main` and
 the most recent tagged release. Pin to a tag for production use, and verify your
 download with the recipes at <https://getbusbar.com/security/>.

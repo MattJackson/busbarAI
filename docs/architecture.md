@@ -142,34 +142,52 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
 - `/healthz` is always open (liveness probes must not require a token).
 - `/metrics` is **not** exempted, Prometheus telemetry (lane/pool topology,
   per-protocol counters, error rates) is an information-disclosure surface, so it
-  goes through the same auth check as any other route. It requires a valid client
-  token in `token` mode (or a virtual key under governance), and is admitted
-  unconditionally only in `none`/`passthrough` mode. Restrict at the network layer
-  if you need unauthenticated scraping.
-- `/admin/*` requires the governance **admin token** (as `Authorization: Bearer` or
-  `X-Admin-Token`); disabled (401) if no admin token is configured.
-- With **governance active** (a `governance.admin_token` is configured), the caller's
-  bearer token must resolve to an enabled virtual key, which is attached to the request
-  for downstream ACL/budget checks.
-- With governance **inert** (no admin token, the default), the static `AuthMode` applies
-  (`token` allowlist, `passthrough`, or `none`), exactly as if governance were absent. The
-  caller's bearer token is threaded through for passthrough forwarding.
-- **Bedrock ingress** has two modes depending on whether governance is active:
-  - *Governance inert* (`passthrough` or `none`): `extract_client_token` reads only bearer-style carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or ignored (none).
-  - *Governance active* (`token` mode + `governance.admin_token` set): `crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4` intercepts requests that carry `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus body-hash integrity (`x-amz-content-sha256`), and, on success, attaches the resolved virtual key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id` + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with `"issue_aws_credential": true`. Note: `crates/busbar/src/sigv4.rs` provides signing primitives; the inbound verifier lives in `crates/busbar/src/auth/mod.rs`.
+  goes through the same auth check as any other route. It is gated by the data-plane
+  auth chain (`auth.chain`): a request must satisfy some module in the chain (the
+  built-in `tokens` allowlist, or a virtual key under governance). With an empty chain
+  (`chain: []`) the check admits unconditionally and `/metrics` is effectively open, so
+  restrict it at the network layer if you need unauthenticated scraping.
+- The admin API (`/api/v1/admin/*`) does not run on the data plane at all. It is served
+  on a **physically separate listener**, `admin_listen` (default `127.0.0.1:8081`, loopback),
+  and gated by its own chain, `admin_auth` (default `[admin-tokens]`). An admin token
+  arrives as `Authorization: Bearer` or `X-Admin-Token`; no valid admin credential means
+  a 401. Because the socket is separate, a caller on the data port can never reach the
+  control plane. Exposing `admin_listen` off loopback is a boot error unless you set
+  `admin_tls.client_ca_file` (mTLS on the admin listener) or the explicit `admin_insecure`
+  waiver (for operators fronting admin with their own mesh).
+- On the data plane, the caller's bearer token is threaded through the request. Whether
+  busbar signs the upstream call with its own lane key or forwards the caller's credential
+  is a separate config knob, `upstream_credentials:` (`Own`, the default, vs `Passthrough`),
+  independent of which auth module ran at the front door. Under governance the resolved
+  virtual key is attached for downstream ACL and budget checks.
+- **Bedrock ingress** takes one of two paths. When the data-plane chain does not verify a
+  caller (an empty chain, passthrough egress), `extract_client_token` reads only bearer-style
+  carriers and ignores the SigV4 header, which is forwarded upstream (passthrough) or dropped.
+  When governance is active, `crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4` intercepts
+  requests carrying `Authorization: AWS4-HMAC-SHA256`, verifies the full SigV4 signature plus
+  body-hash integrity (`x-amz-content-sha256`), and on success attaches the resolved virtual
+  key's `GovCtx` so all governance checks apply. The AWS credential pair (`aws_access_key_id`
+  + `aws_secret_access_key`) is minted via `POST /api/v1/admin/keys` with
+  `"issue_aws_credential": true`. `crates/busbar/src/sigv4.rs` provides signing primitives;
+  the inbound verifier lives in `crates/busbar/src/auth/mod.rs`.
 
 ### 3. Governance checks
 
 When a virtual key is resolved, the route handler enforces, in order:
 allowed-pools (`403`), budget (`429`, or `400` for Bedrock ingress), and rate
-limits (`429` + `Retry-After`) *before* forwarding. Budget exhaustion does **not**
+limits (`429` + `Retry-After`) *before* forwarding. The budget check walks the
+key's whole chain (the key's own bucket, then its `budget_group`, then that
+group's parent, up to the root) and admits only if every bucket is under cap; the
+429 names which bucket blocked. Budget exhaustion does **not**
 emit `402`: no upstream vendor returns `402` for an over-quota condition, so a
 `402` would be a router-side tell. Instead each ingress writer maps to its native
 quota shape: `429` (`insufficient_quota`) for OpenAI / Responses / Anthropic /
 Gemini / Cohere, and `400` (`ServiceQuotaExceededException`) for Bedrock. The flat
-per-request fee is charged at request completion;
-token-based spend is charged when the response stream completes (token-accurate
-accounting). See [operations.md](operations.md).
+per-request fee is charged at admission; the token counts land on the ledger when
+the response stream completes. Spend itself is never stored: it is derived at read
+time from the accumulated per-model tokens times the current `governance.rate_card`,
+so a rate correction re-prices past and present windows on the next read. See
+[operations.md](operations.md).
 
 ### 4. Pool / lane selection
 

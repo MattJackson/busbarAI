@@ -240,13 +240,18 @@ approximate, but eligibility filtering and long-run proportionality hold. See
   `Err(retry_after_secs)` (→ 429) when over RPM or TPM. TPM is enforced against
   tokens accrued *so far* in the window; since tokens are fed post-response from
   the usage tap, TPM reflects the prior responses' tokens.
-- **SqliteStore.** The ADR-0009 durable impl behind the `Store` trait: a single
-  mutex-guarded `rusqlite::Connection`; `virtual_keys` plus the token-ledger pair
-  `usage_windows` (per-bucket request counts) and `usage_ledger` (per-bucket,
-  per-model tier tokens), `INSERT … ON CONFLICT … DO UPDATE` upserts for key CRUD
-  and additive ledger accumulation (schema v2, tracked in `PRAGMA user_version`). It is embedded + statically linked, preserving the
-  single-binary story; the `Store` trait leaves room for a `PostgresStore` for
-  multi-node later.
+- **Store backends.** The default `store: memory` is the compiled-in ephemeral RAM
+  store (keys, the token ledger, and audit reset on restart); it needs no plugin and
+  is the admission-path source of truth. Durability is opt-in: `sqlite`, `postgres`,
+  and `redis` each ship as a signed store plugin behind the same `Store` trait.
+  Every backend persists the token ledger only, never a derived dollar: `virtual_keys`
+  plus the ledger pair `usage_windows` (per-bucket request counts) and `usage_ledger`
+  (per-bucket, per-model tier tokens), with additive upserts (`INSERT … ON CONFLICT
+  … DO UPDATE` on sqlite/postgres, `MULTI/EXEC` cascades on redis) for key CRUD and
+  ledger accumulation (schema v2). SQLite is embedded and statically linked, so the
+  single-binary story survives even the durable case; postgres and redis are the
+  cluster-shared options (keys/ledger/audit shared, hard cap still enforced per node
+  and reconciled through additive flushes).
 - **Enforcement order** (in `crates/busbar/src/ingress/mod.rs`, before forwarding): allowed-pools
   (`pool_allowed` → 403) → budget (`is_over_budget` → 429, or 400 for Bedrock
   ingress) → rate (`check_rate` → 429 + `Retry-After`). Over-budget never returns

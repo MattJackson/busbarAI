@@ -53,7 +53,7 @@ GET /metrics
 Authorization: Bearer <client-token-or-virtual-key>
 ```
 
-Prometheus text exposition (`text/plain; version=0.0.4`). Goes through the same auth check as other routes, it is treated as an information-disclosure surface (it reveals pool structure, lane names, and failure rates). In `none`/`passthrough` mode the auth check admits unconditionally, so `/metrics` is effectively open under those modes; restrict it at the network layer if that matters for your threat model.
+Prometheus text exposition (`text/plain; version=0.0.4`). Goes through the same auth check as other routes, it is treated as an information-disclosure surface (it reveals pool structure, lane names, and failure rates). With no auth chain (`auth.chain: []`), the check admits unconditionally, so `/metrics` is effectively open. Restrict it at the network layer if that matters for your threat model.
 
 Always enabled; no config needed.
 
@@ -74,11 +74,16 @@ Always enabled; no config needed.
 | `busbar_bucket_tokens` | gauge | `bucket`, `model`, `tier` (+ mint labels on key buckets) | Per-(bucket, model, tier) token counters for the bucket's current budget window, from the token ledger. `bucket` is a virtual-key id or `group:<name>`; `tier` ∈ `input`\|`output`\|`cache_read`\|`cache_write`. The raw material for any external per-model cost dashboard (multiply by your own catalog). |
 | `busbar_bucket_spend_cents` | gauge | `bucket` | Derived spend per BUDGET-GROUP bucket (tokens x current rate card; the flat fee counts against key buckets) for its current window. |
 | `busbar_bucket_budget_remaining_cents` | gauge | `bucket` | Budget-group cap minus derived spend. The external-alerting hook: point Alertmanager at 80% burn - busbar ships the hard 100% stop only, alerts live outside the core. |
-
-**Mint labels.** Key labels attached at mint (`labels: {"team": "growth"}`) are echoed verbatim onto that key's gauge series, so Grafana can `sum by (team)` and Alertmanager can fire per team without busbar knowing what a team is. Label keys are operator-chosen at mint (admin-plane bounded), never request bytes.
 | `busbar_lane_state` | gauge | `pool`, `lane` | Per-(pool, lane-index) circuit-breaker health: `0` = Closed (healthy), `1` = HalfOpen (cooling, probe admitted), `2` = Open (tripped). Side-effect-free at scrape time. |
 | `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a routing policy produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
 | `busbar_route_policy_rejections_total` | counter | `pool`, `policy`, `status` | Requests deliberately rejected by a routing hook's `reject` verb (a 4xx to the caller, no upstream dispatched). A guardrail saying no, not a failure. |
+| `busbar_billing_truncated_total` | counter | none | A same-protocol non-stream response whose billing-side buffer hit the translate-body cap before the terminal `usage` block, so tokens could not be parsed and the request billed zero. The client response is unaffected; only the billing side-channel was capped. Alert on a non-zero rate to catch an over-cap billing gap. |
+| `busbar_tap_notifications_dropped_total` | counter | none | A fire-and-forget tap notification dropped because the in-flight cap was reached (slow or unreachable tap endpoint). Global backpressure, not per-request. Alert on a non-zero rate. |
+| `busbar_webhook_logs_dropped_total` | counter | none | A request-log webhook delivery shed because the bounded delivery pool was saturated (the endpoint is slow or unreachable). Global backpressure. A non-zero rate means logs are being dropped silently. |
+
+**Mint labels.** Key labels attached at mint (`labels: {"team": "growth"}`) are echoed verbatim onto that key's gauge series, so Grafana can `sum by (team)` and Alertmanager can fire per team without busbar knowing what a team is. Label keys are operator-chosen at mint (admin-plane bounded), never request bytes.
+
+**Spend is derived, and the hard cap is per node.** Every spend gauge above is recomputed at scrape time from the token ledger and the current `governance.rate_card`; nothing dollar-shaped is stored, so a rate correction re-prices what you see on the next scrape. When N busbar nodes share a durable store, each node scrapes its own in-memory window counters and enforces the budget hard cap per node (fleet-wide the effective ceiling is up to ~N times a configured cap between flushes; see [operations.md](operations.md)).
 
 The `pool` label is always a configured pool name or the sentinel `unresolved` (for routes that did not resolve to a pool). It is never a raw client-supplied model string, which would create unbounded label cardinality.
 

@@ -11,12 +11,13 @@ All tests are **in-crate** and run under `cargo test`. There is no `tests/`
 directory of integration binaries. Two patterns:
 
 - **Per-module `#[cfg(test)] mod tests`**: unit tests next to the code they cover
-  (`store.rs` breaker FSM, `breaker.rs` classification, `sigv4.rs` against AWS's
-  published worked example, `governance.rs` key/budget/rate, `config.rs` parsing,
-  `ingress/mod.rs` affinity, `proto/*.rs` translation round-trips, etc.).
-- **The `test_support.rs` harness**: a shared `#[cfg(test)] mod test_support`
-  with the `MockServer` mock-upstream and the bulk of the end-to-end forwarding
-  tests.
+  (`store/` breaker FSM, `breaker.rs` classification, `sigv4.rs` against AWS's
+  published worked example, `governance/` key/budget/rate, `config/` parsing,
+  `ingress/` affinity, `proto/` translation round-trips, etc.). Most modules keep
+  their tests in a `tests/` submodule (e.g. `store/tests/`, `governance/tests/`).
+- **The `test_support/` harness**: a shared `#[cfg(test)] mod test_support`
+  with the `MockServer` mock-upstream and the `TestApp` / `LaneSpec` builders used
+  by the end-to-end forwarding tests.
 
 ## The MockServer harness (`crates/busbar/src/test_support/mod.rs`)
 
@@ -63,9 +64,9 @@ server.shutdown().await;                          // aborts the task
 ## Injecting time into the breaker FSM
 
 Breaker/cooldown tests must not depend on wall-clock. The breaker reads time via
-`store::now()` (the public crate function at `crates/busbar/src/store/mod.rs:61`), which under
-`#[cfg(test)]` is shadowed inside `InMemoryStore` by a private `now_secs()` that
-delegates to `now_for_test()`:
+`store::now()` (the crate function in `crates/busbar/src/store/mod.rs`), which under
+`#[cfg(test)]` is shadowed inside `InMemoryStore` (`store/in_memory.rs`) to delegate
+to a thread-local `now_for_test()`:
 
 - `set_now_for_test(t)` pins the test clock to `t` (epoch seconds).
 - `now_for_test()` returns the pinned value (falling back to real `now()` if
@@ -92,18 +93,29 @@ context-length must **not** move the breaker (assert `streak`/`err` unchanged vi
 
 ## Governance tests
 
-`governance.rs` tests use `SqliteStore::open_in_memory()` (no temp files):
-key CRUD round-trips, `budget_window` period math (total/daily/monthly),
-`is_over_budget` + `record_request` accumulation, `check_rate` RPM windows, and
-token-cost accrual via `record_tokens`. These run against the `Store` trait /
-`GovState` directly, not through HTTP.
+`governance/tests/` runs against `GovState` and a `Store` backend directly, not
+through HTTP. The backend is the compiled-in `MemoryStore` (`busbar-store-memory`),
+built with `Arc::new(MemoryStore::new())` and wrapped in `GovState::new(store, None)`
+(no durable file). Tests cover key CRUD via `create_key`, budget-window period math,
+atomic charge-and-cap through `try_charge_request_within_budget` plus `refund_request`
+(and the concurrent-overshoot guard on the store's `charge_within_budget`), the derived
+token cost model (`gov.rate_card` / `budget_groups` / `price_per_request_cents` against a
+`CostModel`), and metering accrual via `record_metering`. (`busbar-store-sqlite`'s own
+`SqliteStore::open_in_memory()` round-trips live in that plugin crate's tests, not here.)
 
 ## Writing a new forwarding integration test
 
-Drive `forward_with_pool` (or the thin `forward` wrapper) against a `MockServer`.
-The skeleton (adapted from `test_support.rs`'s `test_non_stream_json_relay`):
+Drive `forward_with_pool` (or one of its `_keyed` / `_parsed` variants) against a
+`MockServer`. Don't hand-write an `App` literal: the struct carries many hook/gate
+fields and grows over releases, so build it with the `TestApp` builder in
+`test_support/mod.rs`, which fills the rest from defaults. A lane is described by a
+`LaneSpec` (model, protocol, upstream base URL, plus optional overrides). The empty
+auth chain is the default when you set no `.auth(...)` (there is no `AuthMode`; the
+old `mode: none`/`passthrough` distinction is now `.upstream_creds(...)`).
 
 ```rust
+use crate::test_support::{LaneSpec, MockResponse, MockServer, MockServerState, TestApp};
+
 #[tokio::test]
 async fn my_forwarding_test() {
     crate::metrics::init();                       // so the forward path's counters record
@@ -115,50 +127,42 @@ async fn my_forwarding_test() {
     });
     let server = MockServer::new(state.clone()).await;
 
-    // 1. a LaneData (lane-global state) and a Lane (runtime) pointing at the mock
-    let lane_data = LaneData { model: "m".into(), provider: "p".into(), max: 10,
-        sem: Arc::new(tokio::sync::Semaphore::new(10)), limited: false, budget: -1,
-        cooldown_until: 0, streak: 0, dead: false, dead_reason: String::new(),
-        ok: 0, err: 0, client_fault: 0 };
-    let lane = Lane { model: "m".into(), provider: "p".into(),
-        base_url: server.base_url(), api_key: "k".into(),
-        protocol: Arc::new(crate::proto::Protocol::anthropic()), max: 10,
-        error_map: Arc::new(HashMap::new()), context_max: None,
-        path: None, auth: None, health: None, default_max_tokens: None };
+    // Build the App: one lane pointing at the mock, one pool over lane 0. Auth
+    // defaults to the empty chain; governance/cost default to off.
+    let app = TestApp::new()
+        .lane(LaneSpec::new(
+            "m",
+            crate::proto::Protocol::anthropic(),
+            &server.base_url(),
+        ))
+        .pool("default", &[(0, 1)])               // (lane_index, weight)
+        .build();
 
-    // 2. assemble App (store from the lane_data, governance/observability off)
-    let app = Arc::new(App {
-        lanes: vec![lane],
-        store: Arc::new(InMemoryStore::new(vec![lane_data])),
-        by_model: HashMap::from([("m".into(), 0)]),
-        pools: HashMap::from([("default".into(), vec![WeightedLane { idx: 0, weight: 1 }])]),
-        client: Client::builder().timeout(Duration::from_secs(30)).build().unwrap(),
-        auth: Arc::new(AuthMiddleware::new(&AuthCfg::default_none())),
-        auth_mode: crate::auth::AuthMode::None,
-        failover_cfg: None, pool_runtime: HashMap::new(),
-        fallback_pools: HashMap::new(), on_exhausted_cfgs: HashMap::new(),
-        governance: None,
-    });
-
-    // 3. drive it
     let body = serde_json::to_vec(&json!({
         "model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100
     })).unwrap();
     let resp = forward_with_pool(
         app.clone(),
-        vec![WeightedLane { idx: 0, weight: 1 }],
+        vec![crate::state::WeightedLane { reasoning: None, idx: 0, weight: 1, attempt_timeout_ms: None }],
         body.into(),
-        None,            // caller_token (passthrough only)
-        "default",       // pool name -> picks the per-pool breaker cell
-        None,            // affinity key
-        "anthropic",     // ingress protocol
-        None,            // usage sink (governance off)
-    ).await;
+        None,                    // caller_token (passthrough only)
+        "default",               // pool name -> picks the per-pool breaker cell
+        None,                    // affinity key
+        "anthropic",             // ingress protocol
+        crate::handlers::CHAT,   // the operation (Op)
+        None,                    // usage sink (governance off)
+    )
+    .await;
 
     assert_eq!(resp.status().as_u16(), 200);
     server.shutdown().await;
 }
 ```
+
+`TestApp` exposes builder methods for the other seams: `.governance(...)`, `.cost(...)`,
+`.failover(...)`, `.fallback_pool(...)`, `.on_exhausted(...)`, `.upstream_creds(...)`,
+and `.hook(...)` / `.global_hook(...)`. See `crates/busbar/src/proxy/tests/` (e.g.
+`forward_once_pool_cell_tests.rs`) for complete worked tests using exactly this shape.
 
 Patterns this enables:
 
@@ -187,7 +191,7 @@ Patterns this enables:
   that override is now optional (any path resolves to the same handler), since the
   same-protocol relay keys off the upstream Content-Type, not the URL. See
   `test_bedrock_same_protocol_stream_passthrough_forwards_upstream_request_id`
-  in `crates/busbar/src/ingress/mod.rs` for the full pattern.
+  in `crates/busbar/src/ingress/tests/tests.rs` for the full pattern.
 - **on_exhausted**: populate `on_exhausted_cfgs` with `LeastBad` /
   `FallbackPool(..)` and pre-trip all members; assert the configured behavior
   (and loop-guarding for fallback chains).
