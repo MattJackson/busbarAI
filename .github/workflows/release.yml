@@ -97,20 +97,85 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `pgo: true` routes a HOST-NATIVE target through scripts/pgo-build.sh (PGO is MANDATORY for
+        # release: the same fail-closed build docker.yml ships). PGO needs the instrumented binary
+        # to run ON THE RUNNER to train, so only the targets whose arch matches the runner's are
+        # PGO'd: x86_64-linux on the x86_64 ubuntu runner, and aarch64-darwin on the arm64 macos
+        # runner. The cross targets (aarch64-linux built on an x86_64 host, x86_64-darwin on an arm64
+        # host) and windows cannot self-train, so they keep the plain --release build.
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            pgo: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+            pgo: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
       - uses: actions/checkout@v7
 
+      # ── PGO path (host-native targets): the release binaries users download ARE PGO-optimized ──
+      # scripts/pgo-build.sh runs the three-phase PGO build (instrumented -> on-host training ->
+      # optimized) exactly as docker.yml does, FAIL-CLOSED: if any PGO phase fails the script exits
+      # non-zero and the job FAILS (it never falls back to a plain build). This closes the
+      # "PGO mandatory for release" drift where the GitHub-Release binaries were plain --release.
+      - name: Build busbar (PGO, required/fail-closed)
+        if: ${{ matrix.pgo }}
+        env:
+          BUSBAR_RELEASE_PUBKEY: ${{ vars.BUSBAR_RELEASE_PUBKEY }}
+          PGO_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          scripts/pgo-build.sh
+          file "target/pgo/${{ matrix.target }}/release/busbar"
+
+      # POSITIVE PGO GATE: pgo-build.sh writes this marker ONLY after a non-empty merged profile fed
+      # a successful -Cprofile-use build. Asserting it here (not just the script exit code) means a
+      # release cannot ship a non-PGO host binary and still pass. (Mirrors docker.yml's gate.)
+      - name: Verify PGO was applied (marker gate)
+        if: ${{ matrix.pgo }}
+        run: |
+          set -euo pipefail
+          marker="target/pgo/${{ matrix.target }}/release/busbar.pgo-verified"
+          if [ ! -s "$marker" ]; then
+            echo "::error::PGO proof marker missing or empty at $marker - refusing to ship a non-PGO binary" >&2
+            exit 1
+          fi
+          echo "--- PGO proof marker ---"
+          cat "$marker"
+          grep -q '^pgo-verified=1$' "$marker" || { echo "::error::marker not marked verified" >&2; exit 1; }
+          bytes="$(grep '^profile_bytes=' "$marker" | cut -d= -f2)"
+          raw="$(grep '^profraw_count=' "$marker" | cut -d= -f2)"
+          if [ -z "$bytes" ] || [ "$bytes" -le 0 ] 2>/dev/null; then
+            echo "::error::merged profile was empty (profile_bytes=$bytes) - build was not PGO-optimized" >&2
+            exit 1
+          fi
+          if [ -z "$raw" ] || [ "$raw" -le 0 ] 2>/dev/null; then
+            echo "::error::no .profraw files fed the profile (profraw_count=$raw) - build was not PGO-optimized" >&2
+            exit 1
+          fi
+          echo "PGO verified: ${bytes} bytes of merged profile from ${raw} .profraw file(s)."
+
+      # Archive the PGO binary into the SAME `busbar-<target>.tar.gz` name the plain path produces and
+      # upload it to the Release, so the attestation glob below covers it identically.
+      - name: Package and upload busbar (PGO)
+        if: ${{ matrix.pgo }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bin="target/pgo/${{ matrix.target }}/release/busbar"
+          archive="busbar-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "$(dirname "$bin")" busbar
+          gh release upload "${GITHUB_REF_NAME}" "$archive" \
+            --repo "${GITHUB_REPOSITORY}" --clobber
+
+      # ── Plain path (cross / windows targets that cannot self-train for PGO) ──
       # Builds --release for the target (installing the toolchain + cross-linker as
       # needed), tarballs the `busbar` binary, and uploads it to the Release for this tag.
       #
@@ -123,6 +188,7 @@ jobs:
       # (private). Until provisioned, release binaries embed no key and first-party plugin
       # verification is unavailable (plugins still load via the third-party/unsigned paths).
       - name: Build and upload busbar
+        if: ${{ !matrix.pgo }}
         uses: taiki-e/upload-rust-binary-action@v1
         env:
           BUSBAR_RELEASE_PUBKEY: ${{ vars.BUSBAR_RELEASE_PUBKEY }}
