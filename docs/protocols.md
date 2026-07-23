@@ -363,7 +363,7 @@ The six protocols split into two groups based on where the target model (or pool
 
 The `"model"` field is in the JSON body. Busbar reads it, resolves it, and begins the forwarding pipeline. The `"stream"` intent is also in the body (`"stream": true`).
 
-These three protocols share one ingress implementation (`route::ingress_body_model`). The only difference between them is the protocol name and the shape of their native error envelopes.
+These three protocols share one ingress implementation (`ingress::ingress_body_model`). The only difference between them is the protocol name and the shape of their native error envelopes.
 
 ### Path-model protocols: `gemini`, `bedrock`
 
@@ -376,7 +376,7 @@ Because the body does not carry `"model"` or `"stream"`, Busbar injects them int
 
 ### `anthropic`, routed by path, handled separately
 
-Anthropic ingress takes its pool-or-model name from the URL (`{name}` in `/{name}/v1/messages`), so like the path-model protocols the model field in the Anthropic body does not drive routing. But it is handled by its own handlers rather than the shared body/path-model code: `route::named` for `/{name}/v1/messages` and `route::adhoc` for the two-segment ad-hoc form (`/{provider}/{model}/v1/messages`).
+Anthropic ingress takes its pool-or-model name from the URL (`{name}` in `/{name}/v1/messages`), so like the path-model protocols the model field in the Anthropic body does not drive routing. But it is handled by its own handlers rather than the shared body/path-model code: `ingress::named` for `/{name}/v1/messages` and `ingress::adhoc` for the two-segment ad-hoc form (`/{provider}/{model}/v1/messages`).
 
 ---
 
@@ -598,7 +598,7 @@ print(response.choices[0].message.content)
 
 2. Busbar's auth middleware reads `Authorization: Bearer my-local-token`, matches it against `client_tokens`, and admits the request.
 
-3. The route handler (`route::openai_ingress`) reads `"model": "fast"` from the body, resolves `fast` against the pool table, and picks `claude-sonnet` via SWRR.
+3. The route handler (`ingress::openai_ingress`) reads `"model": "fast"` from the body, resolves `fast` against the pool table, and picks `claude-sonnet` via SWRR.
 
 4. `claude-sonnet` maps to the `anthropic` provider (egress protocol `anthropic`). Ingress protocol is `openai`. They differ: translation runs.
 
