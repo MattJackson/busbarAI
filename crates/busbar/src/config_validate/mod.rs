@@ -735,31 +735,41 @@ pub(crate) fn validate_with_unset(
         // configured pool parses fine but silently misses at runtime (proxy engine's
         // `fallback_pools.get(name)` returns None) and cascades to a generic 503 — the configured
         // degraded-routing policy never engages, with no boot diagnostic. Mirror the member-target
-        // resolution check and fail loud. (A malformed action string already `die`s in main.rs at
-        // parse time; here we only catch the well-formed-but-dangling case.)
+        // resolution check and fail loud.
+        //
+        // M4 (validate/boot drift): a MALFORMED action string (`OnExhausted::parse` -> Err) dies in
+        // main.rs at boot but was previously SILENTLY IGNORED here (`if let Ok(..)`), so `--validate`
+        // passed a config boot would reject - the cardinal validate/boot-drift sin. Match main.rs:
+        // surface the parse error into `errors` so `--validate` catches it too.
         if let Some(on_exhausted) = &pool_cfg.on_exhausted {
-            if let Ok(crate::config::OnExhausted::FallbackPool(target)) =
-                crate::config::OnExhausted::parse(&on_exhausted.action)
-            {
-                if !cfg.pools.contains_key(&target) {
-                    errors.push(format!(
-                        "pool '{}' on_exhausted references unknown fallback pool '{}'",
-                        pool_name, target
-                    ));
-                } else if target == *pool_name {
-                    // Self-referential fallback (pool A -> fallback A): the runtime loop guard
-                    // (proxy engine `RequestCtx::visited_pools`) silently terminates the chain on the
-                    // re-entry, so the configured degraded-routing policy never actually engages — A
-                    // exhausts, "falls back" to itself, is recognised as already-visited, and 503s.
-                    // A fallback pointing at its own owner is never meaningful; reject it at boot
-                    // rather than ship a self-cancelling policy with no diagnostic. (This is the
-                    // length-1 case the general cycle walk below would also catch, called out
-                    // explicitly for a precise diagnostic.)
-                    errors.push(format!(
-                        "pool '{}' on_exhausted references itself as its fallback pool ('{}'); a self-referential fallback never engages — the runtime loop guard terminates it on re-entry — so it 503s exactly as having no fallback would. Point it at a different pool or remove on_exhausted",
-                        pool_name, target
-                    ));
+            match crate::config::OnExhausted::parse(&on_exhausted.action) {
+                Err(e) => errors.push(format!(
+                    "pool '{}' has invalid on_exhausted action '{}': {}",
+                    pool_name, on_exhausted.action, e
+                )),
+                Ok(crate::config::OnExhausted::FallbackPool(target)) => {
+                    if !cfg.pools.contains_key(&target) {
+                        errors.push(format!(
+                            "pool '{}' on_exhausted references unknown fallback pool '{}'",
+                            pool_name, target
+                        ));
+                    } else if target == *pool_name {
+                        // Self-referential fallback (pool A -> fallback A): the runtime loop guard
+                        // (proxy engine `RequestCtx::visited_pools`) silently terminates the chain on
+                        // the re-entry, so the configured degraded-routing policy never actually
+                        // engages: A exhausts, "falls back" to itself, is recognised as
+                        // already-visited, and 503s. A fallback pointing at its own owner is never
+                        // meaningful; reject it at boot rather than ship a self-cancelling policy with
+                        // no diagnostic. (This is the length-1 case the general cycle walk below would
+                        // also catch, called out explicitly for a precise diagnostic.)
+                        errors.push(format!(
+                            "pool '{}' on_exhausted references itself as its fallback pool ('{}'); a self-referential fallback never engages (the runtime loop guard terminates it on re-entry) so it 503s exactly as having no fallback would. Point it at a different pool or remove on_exhausted",
+                            pool_name, target
+                        ));
+                    }
                 }
+                // Any other well-formed action (e.g. status:503) needs no dangling-target check.
+                Ok(_) => {}
             }
         }
 

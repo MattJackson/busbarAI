@@ -2491,6 +2491,28 @@ fn test_validate_rejects_unknown_fallback_pool() {
     );
 }
 
+/// M4 (validate/boot drift): a MALFORMED `on_exhausted.action` (`OnExhausted::parse` -> Err) dies at
+/// boot in main.rs but was previously ignored by `--validate` (`if let Ok(..)`). `--validate` must
+/// catch it too - a config that boot rejects can never pass the dry-run.
+#[test]
+fn test_validate_rejects_malformed_on_exhausted_action() {
+    let (providers, models, _) = valid_maps();
+    let mut pools = HashMap::new();
+    let mut pool = make_pool(vec![make_member("mymodel")]);
+    pool.on_exhausted = Some(config::OnExhaustedCfg {
+        action: "bogus".to_string(),
+    });
+    pools.insert("mypool".to_string(), pool);
+    let cfg = make_root_cfg(providers, models, pools);
+    let errs =
+        validate(&cfg).expect_err("a malformed on_exhausted action must fail --validate, not boot");
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("invalid on_exhausted action") && e.contains("bogus")),
+        "expected a malformed-action validation error (parity with main.rs boot); got: {errs:?}"
+    );
+}
+
 #[test]
 fn test_validate_accepts_existing_fallback_pool() {
     let (providers, models, _) = valid_maps();
