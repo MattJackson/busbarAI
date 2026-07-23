@@ -85,6 +85,7 @@ Grants are a monotonic trust ladder (`no ⊂ ro ⊂ rw`) and are **immutable aft
 
 - **The request projection**: `pool`, `ingress_protocol`, `message_count`, `has_tools`, `total_chars` (a size signal; token counts do not exist pre-dispatch), `max_tokens`, `stream`. With `prompt: ro`/`rw`, also the flattened `system` + `messages` text. With `user: ro`, also caller identity.
 - **The candidate projection**: one entry per healthy member: `cost_per_mtok` (operator-declared), `latency_ms` (rolling EWMA), `available_concurrency` (free slots now), `budget_remaining`, `rate_headroom` (fraction, from governance), and your `tier`/`tags` labels. The full task/latency/cost/quality picture, every signal a built-in strategy ranks on is on the wire, so an external hook can implement any of them identically.
+- **The budget-chain state** (when governance is active and the request carries a virtual key): the whole enforcement chain the request must clear, one entry per bucket from the key's own bucket out through every ancestor budget group, each `{bucket_id, budget_group?, spend_micros_at_current_rate, remaining_micros, window}`. `spend_micros_at_current_rate` is derived at hook-call time from the token ledger times the current `governance.rate_card` (micro-units, 10,000 per cent). This is the read surface for budget-aware routing: a gate can see how close the key or its team is to a cap and downshift to a cheaper `tier`. Busbar exposes the state only; the routing policy lives entirely in your hook.
 
 ## The gate reply arms
 
