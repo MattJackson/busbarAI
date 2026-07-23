@@ -2015,21 +2015,36 @@ pub(crate) fn build_app_from_config(
                 // BOOT-ONLY crash-recovery: hydrate the in-memory token-ledger cells (key buckets +
                 // budget-group buckets) from the durable store so a restart resumes enforcement from
                 // the persisted ledger. A no-op for the empty RAM store.
-                gs.hydrate_budgets(&cost, crate::store::now());
+                // M9 (fail-open): a store error here is FATAL - resuming with empty (reset) budget
+                // cells would let a maxed-out key spend its whole cap again. Fail boot loudly.
+                if let Err(e) = gs.hydrate_budgets(&cost, crate::store::now()) {
+                    return Err(format!(
+                        "governance boot: budget hydration failed ({e}); refusing to start with an \
+                         unenforced (reset) ledger. Fix the durable store and restart."
+                    ));
+                }
                 // BOOT FAIL-CLOSED: every stored key naming a budget_group must resolve in THIS
                 // config (mint validates it; a shared durable store can carry keys minted under a
                 // config another node no longer has). A dangling reference is a boot error naming
                 // the offender with the paste-ready fix.
-                if let Ok(keys) = gs.all_keys() {
-                    for k in &keys {
-                        if let Some(group) = k.budget_group.as_deref() {
-                            if cost.group_named(group).is_none() {
-                                return Err(format!(
-                                    "virtual key '{}' names budget_group '{group}', which does not exist in governance.budget_groups.\n\
-                                     Paste this under governance.budget_groups and set a real cap:\n\n    {group}: {{ max_budget_cents: 0, budget_period: monthly }}\n",
-                                    k.id
-                                ));
-                            }
+                // M9: a store error reading the keys here must NOT be swallowed (the old `if let
+                // Ok(keys)` skipped the whole dangling-reference check on error, so a boot-time store
+                // blip published a config whose keys were never validated). Propagate it - fail boot.
+                let keys = gs.all_keys().map_err(|e| {
+                    format!(
+                        "governance boot: could not read stored keys to validate budget_group \
+                         references ({e}); refusing to start unvalidated. Fix the durable store and \
+                         restart."
+                    )
+                })?;
+                for k in &keys {
+                    if let Some(group) = k.budget_group.as_deref() {
+                        if cost.group_named(group).is_none() {
+                            return Err(format!(
+                                "virtual key '{}' names budget_group '{group}', which does not exist in governance.budget_groups.\n\
+                                 Paste this under governance.budget_groups and set a real cap:\n\n    {group}: {{ max_budget_cents: 0, budget_period: monthly }}\n",
+                                k.id
+                            ));
                         }
                     }
                 }

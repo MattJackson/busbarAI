@@ -439,15 +439,19 @@ impl GovState {
     /// already holds those values, possibly including other nodes' accruals - the first flush must
     /// send only the LOCAL delta accrued after boot). Runs OFF the hot path exactly once per fresh
     /// `GovState` (never on a config reload/apply - the prior `Arc<GovState>` keeps its live
-    /// cells). Best-effort: a store error on any bucket logs and continues (never panics).
-    pub(crate) fn hydrate_budgets(&self, cost: &crate::cost::CostModel, now: u64) {
-        let keys = match self.store.list_keys() {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(error = %e, "budget hydration: list_keys failed; starting with empty ledger cells");
-                Vec::new()
-            }
-        };
+    /// cells).
+    ///
+    /// M9 (boot fail-open): a store error here is FATAL, not best-effort. The old code warned and
+    /// started with EMPTY cells on a `list_keys`/`get_usage` failure, which silently RESET every
+    /// budget to zero - a transient store blip at boot would let a maxed-out key spend its whole cap
+    /// again. Propagate any store error so boot fails loudly (the supervisor restarts) rather than
+    /// resuming with an unenforced ledger. Returns `Ok(())` only when every bucket hydrated cleanly.
+    pub(crate) fn hydrate_budgets(
+        &self,
+        cost: &crate::cost::CostModel,
+        now: u64,
+    ) -> StoreResult<()> {
+        let keys = self.store.list_keys()?;
         let key_buckets = keys
             .iter()
             .map(|k| (k.id.as_str(), k.budget_period.as_str()));
@@ -457,32 +461,27 @@ impl GovState {
             .map(|g| (g.bucket_id.as_str(), g.budget_period.as_str()));
         for (bucket_id, period) in key_buckets.chain(group_buckets) {
             let window = budget_window(period, now);
-            match self.store.get_usage(bucket_id, window) {
-                Ok(ledger) => {
-                    if ledger.requests == 0 && ledger.models.is_empty() {
-                        continue;
-                    }
-                    let mut cell = BudgetCell::fresh(window);
-                    cell.requests = ledger.requests;
-                    cell.flushed_requests = ledger.requests;
-                    cell.models = ledger
-                        .models
-                        .iter()
-                        .map(|m| ModelCell {
-                            model: std::sync::Arc::from(m.model.as_str()),
-                            cur: m.tokens,
-                            flushed: m.tokens,
-                        })
-                        .collect();
-                    self.budget
-                        .write(bucket_id)
-                        .insert(bucket_id.to_string(), cell);
-                }
-                Err(e) => {
-                    tracing::warn!(bucket = %bucket_id, error = %e, "budget hydration: get_usage failed; bucket starts at zero");
-                }
+            let ledger = self.store.get_usage(bucket_id, window)?;
+            if ledger.requests == 0 && ledger.models.is_empty() {
+                continue;
             }
+            let mut cell = BudgetCell::fresh(window);
+            cell.requests = ledger.requests;
+            cell.flushed_requests = ledger.requests;
+            cell.models = ledger
+                .models
+                .iter()
+                .map(|m| ModelCell {
+                    model: std::sync::Arc::from(m.model.as_str()),
+                    cur: m.tokens,
+                    flushed: m.tokens,
+                })
+                .collect();
+            self.budget
+                .write(bucket_id)
+                .insert(bucket_id.to_string(), cell);
         }
+        Ok(())
     }
 
     /// Current-window DERIVED usage for a key (`None` if the key does not exist): spend is

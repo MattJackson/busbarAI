@@ -1001,7 +1001,8 @@ async fn test_governance_budget_over_quota() {
     // Enforcement is now IN-MEMORY (authoritative): hydrate the budget cells from the store — exactly
     // as boot does — so the admission gate sees the pre-seeded over-budget spend. (Without this the
     // store seed would be invisible to the in-memory gate and the request would be admitted.)
-    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0);
+    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0)
+        .expect("hydrate");
 
     let app = TestApp::new().governance(gov).build();
 
@@ -1096,7 +1097,8 @@ async fn over_budget_router() -> (
     let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
     // Enforcement is IN-MEMORY (authoritative): hydrate the budget cells from the durable store — as
     // boot does — so the pre-seeded over-budget spend is visible to the admission gate.
-    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0);
+    gov.hydrate_budgets(&crate::cost::CostModel::flat(1), 0)
+        .expect("hydrate");
 
     let app = TestApp::new().governance(gov).build();
     let router = crate::build_router(app);

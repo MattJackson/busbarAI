@@ -2386,13 +2386,81 @@ fn test_hydrate_budgets_restores_group_buckets() {
         )]);
         crate::cost::CostModel::resolve_parts(&g, &Default::default(), &Default::default())
     };
-    gov2.hydrate_budgets(&card, at);
+    gov2.hydrate_budgets(&card, at).expect("hydrate");
     assert_eq!(
         gov2.try_charge_request_within_budget(&card, &k, at),
         Err(BudgetBlocked::Group("team".to_string())),
         "post-restart enforcement resumes from the PERSISTED group ledger (25c derived >= 25c cap)"
     );
     let _ = cost;
+}
+
+/// M9 (boot fail-open): `hydrate_budgets` must PROPAGATE a store error, not warn-and-reset to empty
+/// cells. A store that fails `get_usage` (a boot-time blip) previously left budgets at ZERO, letting
+/// a maxed-out key spend its whole cap again. Now the error surfaces (boot fails).
+#[test]
+#[allow(clippy::field_reassign_with_default)]
+fn test_hydrate_budgets_propagates_store_error() {
+    use busbar_api::{StoreError, StoreResult, UsageLedger, VirtualKey};
+
+    /// A store that delegates to an inner MemoryStore but FAILS `get_usage` (simulating a boot blip).
+    struct FailGetUsage {
+        inner: MemoryStore,
+    }
+    impl Store for FailGetUsage {
+        fn put_key(&self, k: &VirtualKey) -> StoreResult<()> {
+            self.inner.put_key(k)
+        }
+        fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
+            self.inner.get_key(id)
+        }
+        fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+            self.inner.list_keys()
+        }
+        fn delete_key(&self, id: &str) -> StoreResult<()> {
+            self.inner.delete_key(id)
+        }
+        fn get_usage(&self, _bucket_id: &str, _window: u64) -> StoreResult<UsageLedger> {
+            Err(StoreError("simulated store blip on get_usage".into()))
+        }
+        fn put_usage(&self, b: &str, w: u64, l: &UsageLedger) -> StoreResult<()> {
+            self.inner.put_usage(b, w, l)
+        }
+        fn add_metering(&self, d: &busbar_api::MeteringDelta) -> StoreResult<()> {
+            self.inner.add_metering(d)
+        }
+        fn list_metering(&self, bucket: u64) -> StoreResult<Vec<busbar_api::MeteringRow>> {
+            self.inner.list_metering(bucket)
+        }
+    }
+
+    let inner = MemoryStore::new();
+    let mut k = sample_key("vk_m9", "m9_h");
+    k.max_budget_cents = Some(10);
+    k.budget_period = BUDGET_PERIOD_TOTAL.to_string();
+    inner.put_key(&k).unwrap();
+    let store: Arc<dyn Store> = Arc::new(FailGetUsage { inner });
+    // The key must have a non-empty ledger so hydration actually reaches get_usage.
+    store
+        .put_usage(
+            "vk_m9",
+            budget_window(BUDGET_PERIOD_TOTAL, 0),
+            &UsageLedger {
+                requests: 1,
+                models: vec![],
+            },
+        )
+        .ok(); // put_usage delegates to inner; ignore if the fault store had returned Err (it doesn't)
+    let gov = GovState::new(store, None).unwrap();
+    let err = gov
+        .hydrate_budgets(&crate::cost::CostModel::flat(1), 0)
+        .expect_err(
+            "a store get_usage error must PROPAGATE (fail boot), not reset budgets to zero",
+        );
+    assert!(
+        err.to_string().contains("simulated store blip"),
+        "the store error must surface verbatim; got: {err}"
+    );
 }
 
 /// The HOOK SEAM projection: `budget_state` reports the key bucket + every ancestor group with
