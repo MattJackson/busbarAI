@@ -45,6 +45,13 @@ impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
     }
 }
 
+/// True when a postgres error is SQLSTATE 42P01 (`undefined_table`) - the ONE case migrate() treats
+/// as an unversioned (version 0) database. Every other error class (connection, timeout, permission)
+/// is transient/fatal and must never be read as "fresh DB". See migrate()'s H1 note.
+fn is_undefined_table(e: &postgres::Error) -> bool {
+    e.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
+}
+
 /// Store schema version, mirrored from the SQLite backend's `PRAGMA user_version` in a tiny
 /// `busbar_schema` table. v2 = the 1.5.0 token-ledger cost model (see the SQLite backend's
 /// `SCHEMA_VERSION` doc). 1.5.0 is unreleased, so a pre-v2 database is dropped and recreated - a
@@ -174,38 +181,53 @@ impl PostgresStore {
         // still carries the legacy `usage_counters` table, or a `virtual_keys` without the v2
         // columns - is DROPPED and recreated (1.5.0 is unreleased: bump, not migrate). A fresh or
         // already-v2 database passes straight through the idempotent CREATEs.
-        let version: i64 = client
-            .query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
-            .ok()
-            .flatten()
-            .map(|r| r.get(0))
-            .unwrap_or(0);
+        //
+        // H1 (data-loss): the version read must never CONFLATE a transient read error with a fresh
+        // DB. We ensure the version table exists FIRST, then read; a *transient* read failure
+        // (connection blip, lock timeout, permission) PROPAGATES and fails boot rather than
+        // defaulting to 0 and dropping every governance table on a healthy v2 DB. Only a genuine
+        // "relation does not exist" (SQLSTATE 42P01) counts as an unversioned (version 0) database.
+        client
+            .batch_execute("CREATE TABLE IF NOT EXISTS busbar_schema (version BIGINT PRIMARY KEY)")
+            .store()?;
+        let version: i64 =
+            match client.query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[]) {
+                Ok(Some(r)) => r.get(0),
+                // No rows -> an empty (freshly created) version table -> version 0.
+                Ok(None) => 0,
+                // A genuinely-absent table is the only non-fatal "unversioned" signal (version 0). Any
+                // OTHER error (transient/connection/permission) MUST fail boot - never silently 0.
+                Err(e) if is_undefined_table(&e) => 0,
+                Err(e) => return Err(StoreError(e.to_string())),
+            };
+        // Wrap the legacy DROP + full CREATE + version-INSERT in ONE transaction so a crash between
+        // the drop and the recreate cannot leave a half-initialised DB that a re-run re-drops (L3).
+        let mut tx = client.transaction().store()?;
         if version < SCHEMA_VERSION {
-            let legacy: bool = client
+            let legacy: bool = tx
                 .query_one("SELECT to_regclass('usage_counters') IS NOT NULL OR to_regclass('virtual_keys') IS NOT NULL", &[])
                 .store()?
                 .get(0);
             if legacy {
-                client
-                    .batch_execute(
-                        "DROP TABLE IF EXISTS virtual_keys;
+                tx.batch_execute(
+                    "DROP TABLE IF EXISTS virtual_keys;
                          DROP TABLE IF EXISTS aws_credentials;
                          DROP TABLE IF EXISTS usage_counters;
                          DROP TABLE IF EXISTS usage_windows;
                          DROP TABLE IF EXISTS usage_ledger;
                          DROP TABLE IF EXISTS usage_metering;
                          DROP TABLE IF EXISTS audit_log;",
-                    )
-                    .store()?;
+                )
+                .store()?;
             }
         }
-        client.batch_execute(SCHEMA).store()?;
-        client
-            .execute(
-                "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
-                &[&SCHEMA_VERSION],
-            )
-            .store()?;
+        tx.batch_execute(SCHEMA).store()?;
+        tx.execute(
+            "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
+            &[&SCHEMA_VERSION],
+        )
+        .store()?;
+        tx.commit().store()?;
         Ok(())
     }
 }
@@ -899,5 +921,88 @@ mod tests {
                 .any(|c| c.access_key_id == "AKIA_PG_TEST"),
             "delete_key must cascade to the AWS credentials (credential cleanup, P1 #6)"
         );
+    }
+
+    /// H1 (data-loss regression): migrate() must NEVER conflate a transient version-read error with
+    /// a fresh (unversioned) database. Only SQLSTATE 42P01 (`undefined_table`) counts as version 0;
+    /// every OTHER error class (connection/timeout/permission/syntax) is fatal and must PROPAGATE so
+    /// boot fails LOUDLY rather than defaulting to 0 and dropping every governance table on a healthy
+    /// v2 DB. This test builds REAL driver errors from a live connection and asserts the classifier:
+    /// a genuine missing-table error is version-0; any other error is NOT (so migrate returns Err).
+    /// Gated on `BUSBAR_TEST_POSTGRES_URL` (skips locally, HARD-FAILS in CI - same policy as the
+    /// round-trip test).
+    #[test]
+    fn migrate_version_read_error_is_not_treated_as_fresh_db() {
+        let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var_os("CI").is_some() => {
+                panic!(
+                    "BUSBAR_TEST_POSTGRES_URL is unset under CI: refusing to silently skip the H1 \
+                     data-loss regression (see .github/workflows/ci.yml)."
+                );
+            }
+            Err(_) => {
+                eprintln!("skip: set BUSBAR_TEST_POSTGRES_URL to run the H1 migrate regression");
+                return;
+            }
+        };
+        // Migrate first so `busbar_schema` exists - the undefined-COLUMN probe below then isolates
+        // a non-42P01 error class (a missing table would itself be 42P01 and confuse the assertion).
+        let store = PostgresStore::connect(&url).expect("connect+migrate");
+        let mut client = Client::connect(&url, NoTls).expect("connect");
+
+        // A genuine missing table (42P01) is the ONLY error migrate() may read as "version 0".
+        let missing = client
+            .query_opt("SELECT MAX(version) FROM busbar_no_such_table_zzz_h1", &[])
+            .expect_err("querying a missing table must error");
+        assert!(
+            is_undefined_table(&missing),
+            "a missing-table read must classify as undefined_table (version 0), got {:?}",
+            missing.code()
+        );
+
+        // A DIFFERENT error class (undefined COLUMN, 42703) against the EXISTING busbar_schema table
+        // must NOT be read as version 0 - migrate() propagates it and fails boot. This is the exact
+        // class the old `.ok().flatten()...unwrap_or(0)` swallowed, then dropped every table.
+        let other = client
+            .query_opt("SELECT no_such_column_zzz_h1 FROM busbar_schema", &[])
+            .expect_err("querying a missing column must error");
+        assert_eq!(
+            other.code(),
+            Some(&postgres::error::SqlState::UNDEFINED_COLUMN),
+            "sanity: the probe hits the missing-column class, not a missing-table"
+        );
+        assert!(
+            !is_undefined_table(&other),
+            "a non-missing-table error must NOT classify as version 0 (must fail boot), got {:?}",
+            other.code()
+        );
+
+        // End to end: a healthy v2 DB carrying data survives a re-run of migrate() (connect() runs
+        // it). Seed a key, reconnect (re-migrate), and assert the key is STILL there - the legacy
+        // DROP path never fires on a correctly-read v2 version.
+        let key = VirtualKey {
+            id: "vk_h1".into(),
+            key_hash: "h1_hash".into(),
+            name: "h1".into(),
+            allowed_pools: vec![],
+            max_budget_cents: None,
+            budget_period: "total".into(),
+            rpm_limit: None,
+            tpm_limit: None,
+            enabled: true,
+            created_at: 1,
+            budget_group: None,
+            labels: std::collections::BTreeMap::new(),
+        };
+        let _ = store.delete_key("vk_h1");
+        store.put_key(&key).unwrap();
+        drop(store);
+        let store2 = PostgresStore::connect(&url).expect("re-connect+re-migrate");
+        assert!(
+            store2.get_key("vk_h1").unwrap().is_some(),
+            "a healthy v2 DB must NOT be dropped by a migrate() re-run"
+        );
+        store2.delete_key("vk_h1").unwrap();
     }
 }
