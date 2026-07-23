@@ -128,6 +128,70 @@ const ERR_TYPE_VERSION_CONFLICT: &str = "version_conflict_error";
 const MAX_KEY_NAME_LEN: usize = 256;
 const MAX_KEY_ID_LEN: usize = 64;
 
+// M6/F2 (scrape break): mint-time `labels` are echoed VERBATIM as Prometheus label names on every
+// key metric series (metrics.rs `base_labels`). An unvalidated map is a scrape-integrity hole:
+//   - a label named `key`/`bucket`/`model`/`tier` (the RESERVED names busbar itself attaches)
+//     duplicates a label on the series, which breaks the WHOLE /metrics exposition (a duplicate
+//     label name is invalid Prometheus text -> every scrape fails, not just this key);
+//   - a name that is not a valid Prometheus label name (`^[a-zA-Z_][a-zA-Z0-9_]*$`) is rejected by
+//     the exposition encoder for the same all-or-nothing effect;
+//   - an unbounded count / length bloats every scrape and the store row.
+// So validate at the mint ingress (the one write path) and 400 anything unsafe.
+/// Label names busbar itself attaches to key metric series - an operator label may not shadow them.
+const RESERVED_METRIC_LABELS: &[&str] = &["key", "bucket", "model", "tier"];
+const MAX_LABEL_COUNT: usize = 16;
+const MAX_LABEL_NAME_LEN: usize = 64;
+const MAX_LABEL_VALUE_LEN: usize = 256;
+
+/// Validate the mint-time `labels` map. Returns `Err(message)` (a 400 body) for a reserved/invalid
+/// name, an over-count map, or an over-long name/value. `Ok(())` when every label is scrape-safe.
+fn validate_mint_labels(labels: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+    if labels.len() > MAX_LABEL_COUNT {
+        return Err(format!(
+            "too many labels: {} (max {MAX_LABEL_COUNT})",
+            labels.len()
+        ));
+    }
+    for (name, value) in labels {
+        if RESERVED_METRIC_LABELS.contains(&name.as_str()) {
+            return Err(format!(
+                "label name '{name}' is reserved (busbar attaches it to metric series); \
+                 reserved names are {RESERVED_METRIC_LABELS:?}"
+            ));
+        }
+        if name.len() > MAX_LABEL_NAME_LEN {
+            return Err(format!(
+                "label name is {} chars; must be <= {MAX_LABEL_NAME_LEN}",
+                name.len()
+            ));
+        }
+        if !is_valid_label_name(name) {
+            return Err(format!(
+                "label name '{name}' is not a valid Prometheus label name \
+                 (must match ^[a-zA-Z_][a-zA-Z0-9_]*$)"
+            ));
+        }
+        if value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(format!(
+                "label '{name}' value is {} chars; must be <= {MAX_LABEL_VALUE_LEN}",
+                value.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A valid Prometheus label name: `^[a-zA-Z_][a-zA-Z0-9_]*$` (non-empty, ASCII-alnum + underscore,
+/// never leading with a digit). Hand-rolled to avoid a regex dependency on the mint path.
+fn is_valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false, // empty or bad first char
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
 fn json_response(status: StatusCode, body: Value) -> Response {
     (
         status,
@@ -434,6 +498,12 @@ pub(crate) async fn create_key(
             ERR_TYPE_INVALID_REQUEST,
             "name must be <= 256 characters",
         );
+    }
+    // M6/F2: labels are echoed verbatim as Prometheus label NAMES on this key's metric series; an
+    // unsafe name (reserved, or not a valid label name) or an oversized map breaks the WHOLE scrape.
+    // Reject at the mint ingress (see `validate_mint_labels`).
+    if let Err(msg) = validate_mint_labels(&req.labels) {
+        return error_response(StatusCode::BAD_REQUEST, ERR_TYPE_INVALID_REQUEST, msg);
     }
     // Default to the all-time `"total"` window when omitted; otherwise the value MUST be one
     // `governance::budget_window` enforces. Reject an unrecognized period with 400 rather than

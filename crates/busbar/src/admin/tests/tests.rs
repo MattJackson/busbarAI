@@ -3756,6 +3756,107 @@ async fn test_create_key_rejects_unknown_budget_period() {
     handle.abort();
 }
 
+/// M6/F2 (scrape break): mint-time labels are echoed VERBATIM as Prometheus label names on this
+/// key's metric series. A RESERVED label name (key/bucket/model/tier), a non-conforming label name,
+/// an oversized map (> 16), or an over-long name/value must be rejected with 400 (never minted) so
+/// the whole /metrics exposition can't be broken by one key. A well-formed label set still mints.
+#[tokio::test]
+async fn test_create_key_rejects_unsafe_labels() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let (addr, handle) = serve_with_gov(gov).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    let post = |labels: serde_json::Value| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .post(&url)
+                .header("x-admin-token", "admintok")
+                .json(&serde_json::json!({"name": "k", "labels": labels}))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // A `key` label (reserved) => 400.
+    let resp = post(serde_json::json!({"key": "oops"})).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "a reserved 'key' label must be rejected"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reserved"),
+        "400 body must name the reserved-label reason: {body}"
+    );
+
+    // Each other reserved name is equally rejected.
+    for reserved in ["bucket", "model", "tier"] {
+        let resp = post(serde_json::json!({ reserved: "x" })).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "reserved label '{reserved}' must be rejected"
+        );
+    }
+
+    // 100 labels => over the cap => 400.
+    let mut many = serde_json::Map::new();
+    for i in 0..100 {
+        many.insert(format!("l{i}"), serde_json::json!("v"));
+    }
+    let resp = post(serde_json::Value::Object(many)).await;
+    assert_eq!(resp.status().as_u16(), 400, "100 labels must be rejected");
+    assert!(
+        resp.json::<serde_json::Value>().await.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("too many labels"),
+    );
+
+    // A label name that is not a valid Prometheus label name => 400.
+    let resp = post(serde_json::json!({"team-name": "growth"})).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "an invalid label name (hyphen) must be rejected"
+    );
+    // A name that leads with a digit is also invalid.
+    let resp = post(serde_json::json!({"1team": "growth"})).await;
+    assert_eq!(resp.status().as_u16(), 400, "leading-digit name rejected");
+
+    // An over-long label value => 400.
+    let resp = post(serde_json::json!({"team": "x".repeat(257)})).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "an over-long label value must be rejected"
+    );
+
+    // A well-formed label set still mints (201) and round-trips.
+    let resp = post(serde_json::json!({"team": "growth", "env": "prod"})).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "a valid label set must still mint"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["labels"]["team"], "growth");
+    assert_eq!(body["labels"]["env"], "prod");
+
+    handle.abort();
+}
+
 /// MED (no-raw-parse-error / secret-leak): a malformed admin create/update body must produce a
 /// GENERIC 400 whose body contains NEITHER serde error prose NOR any fragment of the offending
 /// input. The create-key body carries SECRETS (an AWS secret_access_key, the bearer being minted),
