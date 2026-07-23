@@ -678,11 +678,28 @@ impl Store for RedisStore {
 
     fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
         // The audit log's durable home: a SORTED SET scored by `seq` (the engine's monotonic
-        // sequence), each member the JSON record. ZADD upserts on the member; using `seq` as the
-        // score keeps the set ordered for list_audit. A replay of the same record is a no-op.
+        // sequence), each member the JSON record. `seq` is the record's IDENTITY (the SQL backends'
+        // PRIMARY KEY), so a re-append of an existing seq must UPSERT ON seq - overwriting whatever
+        // record currently sits at that score. A bare ZADD upserts on the MEMBER (the JSON bytes),
+        // so re-appending the same seq with a DIFFERENT payload (e.g. a corrected hash) would leave
+        // TWO members at one score - a duplicate audit entry and a divergence from the SQL backends
+        // (whose test asserts the replay overwrites the digest). Do it as ONE atomic MULTI/EXEC:
+        // drop any member already at this exact score, then add the new one.
         let json = serde_json::to_string(entry)
             .map_err(|e| StoreError(format!("audit encode failed: {e}")))?;
-        self.with_conn(|c| c.zadd(AUDIT_ZSET, &json, clamp(entry.seq)))
+        let score = clamp(entry.seq);
+        self.with_conn(|c| {
+            redis::pipe()
+                .atomic()
+                .cmd("ZREMRANGEBYSCORE")
+                .arg(AUDIT_ZSET)
+                .arg(score)
+                .arg(score)
+                .ignore()
+                .zadd(AUDIT_ZSET, &json, score)
+                .ignore()
+                .query(c)
+        })
     }
 
     fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
@@ -922,6 +939,22 @@ mod tests {
         assert_eq!(audit.len(), 2);
         assert_eq!((audit[0].seq, audit[1].seq), (1, 2), "oldest-first by seq");
         assert_eq!(audit[1].prev_hash, "h1");
+
+        // REGRESSION (append_audit upserts on SEQ, not member): a re-append of an EXISTING seq with a
+        // DIFFERENT payload (a corrected hash) must OVERWRITE the record at that seq, never leave two
+        // members at one score. A bare ZADD (upsert-on-member) would produce a duplicate seq-2 row and
+        // diverge from the SQL backends (whose replay overwrites the digest). ZREMRANGEBYSCORE+ZADD.
+        store.append_audit(&rec(2, "h1", "h2b")).unwrap();
+        let replayed = store.list_audit().unwrap();
+        assert_eq!(
+            replayed.len(),
+            2,
+            "re-appending an existing seq must upsert on seq, never add a duplicate"
+        );
+        assert_eq!(
+            replayed[1].hash, "h2b",
+            "the replayed record overwrites the prior digest (SQL-backend parity)"
+        );
 
         // Attach an AWS credential so the delete cascade over credentials is actually exercised.
         let cred = AwsCredential {
