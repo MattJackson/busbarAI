@@ -22,6 +22,8 @@
 
 use std::fmt;
 
+use std::collections::BTreeMap;
+
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
@@ -259,7 +261,9 @@ pub(crate) fn validate_groups(
     groups: &std::collections::BTreeMap<String, GroupCfg>,
     errors: &mut Vec<String>,
 ) {
-    /// Chain-walk depth ceiling (root counts as 1).
+    // A policy ceiling on hierarchy depth (root counts as 1). NOT what makes the walk terminate — the
+    // visited-path check below detects cycles regardless. It bounds per-request chain-walk cost and
+    // rejects absurd trees; the exact value is a product choice, not a correctness constant.
     const MAX_GROUP_DEPTH: usize = 8;
 
     for (name, group) in groups {
@@ -299,6 +303,51 @@ pub(crate) fn validate_groups(
             }
             cursor = groups.get(cur).and_then(|g| g.parent.as_deref());
         }
+    }
+}
+
+/// Resolve the `child_default` template for a new child provisioned under `parent`, NEAREST-ANCESTOR
+/// WINS: walk up the chain from `parent` and return the first group that sets a `child_default`.
+/// `None` means no ancestor sets one -> the new child is inherit-only (no limits of its own, capped
+/// solely by the parent chain). An unknown `parent` yields `None`.
+///
+/// Config reaching here is validated ACYCLIC, so the walk terminates on its own; the `groups.len()`
+/// bound is a principled backstop (a distinct-node walk cannot exceed the number of groups without
+/// revisiting one, i.e. a cycle) — deliberately NOT the arbitrary depth policy constant.
+// Wired by the Phase 1 groups-provisioning handler (task #100); staged here with its logic + tests.
+#[allow(dead_code)]
+pub(crate) fn resolve_child_default<'a>(
+    groups: &'a BTreeMap<String, GroupCfg>,
+    parent: &str,
+) -> Option<&'a ChildDefault> {
+    let mut cursor = Some(parent);
+    for _ in 0..=groups.len() {
+        let name = cursor?;
+        let g = groups.get(name)?;
+        if let Some(cd) = &g.child_default {
+            return Some(cd);
+        }
+        cursor = g.parent.as_deref();
+    }
+    None
+}
+
+/// Build the leaf group to auto-provision as a child under `parent` (e.g. a `user:<sub>` leaf on first
+/// self-mint): `parent` set, enabled, and limits copied from the nearest-ancestor `child_default`
+/// (inherit-only -> empty limits when no ancestor sets one). The caller persists it via the overlay
+/// (`overlay::persist_groups`) and binds the new key to it; the enforcement chain then caps the leaf by
+/// `leaf ∩ parent ∩ ...`. Pure: does not mutate `groups`. `child_default` on the leaf itself is left
+/// unset (a per-user leaf is not itself a template source).
+// Wired by the Phase 1 groups-provisioning handler (task #100); staged here with its logic + tests.
+#[allow(dead_code)]
+pub(crate) fn provision_child(groups: &BTreeMap<String, GroupCfg>, parent: &str) -> GroupCfg {
+    let limits = resolve_child_default(groups, parent)
+        .map(|cd| cd.limits.clone())
+        .unwrap_or_default();
+    GroupCfg {
+        parent: Some(parent.to_string()),
+        limits,
+        ..Default::default()
     }
 }
 
@@ -396,5 +445,78 @@ child_default:
         let out = serde_yaml::to_string(&budget).unwrap();
         let back: LimitCfg = serde_yaml::from_str(&out).unwrap();
         assert_eq!(budget, back);
+    }
+
+    /// An org → team tree where engineering sets its own child_default, accounting inherits the org's,
+    /// and an isolated group has none anywhere up the chain.
+    fn tree() -> BTreeMap<String, GroupCfg> {
+        serde_yaml::from_str(
+            "
+acme:
+  limits: [ { budget: 5000000, per: month } ]
+  child_default: { limits: [ { budget: 500, per: month } ] }
+engineering:
+  parent: acme
+  child_default: { limits: [ { budget: 2000, per: month } ] }
+accounting:
+  parent: acme
+isolated:
+  limits: [ { requests: 10, per: minute } ]
+",
+        )
+        .expect("tree parses")
+    }
+
+    #[test]
+    fn resolve_child_default_walks_to_nearest_ancestor() {
+        let g = tree();
+        // engineering sets its own → used directly.
+        assert_eq!(
+            resolve_child_default(&g, "engineering").unwrap().limits[0].amount,
+            2000
+        );
+        // accounting has none → nearest ancestor with a template is acme (500).
+        assert_eq!(
+            resolve_child_default(&g, "accounting").unwrap().limits[0].amount,
+            500
+        );
+        // no template anywhere up the chain → None (inherit-only).
+        assert!(resolve_child_default(&g, "isolated").is_none());
+        // unknown parent → None, not a panic.
+        assert!(resolve_child_default(&g, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn provision_child_builds_leaf_from_nearest_default() {
+        let g = tree();
+
+        let eng = provision_child(&g, "engineering");
+        assert_eq!(eng.parent.as_deref(), Some("engineering"));
+        assert_eq!(eng.limits.len(), 1);
+        assert_eq!(eng.limits[0].metric, LimitMetric::Budget);
+        assert_eq!(eng.limits[0].amount, 2000);
+        assert!(
+            eng.child_default.is_none(),
+            "a provisioned leaf is not itself a template source"
+        );
+        assert!(eng.enabled, "a provisioned leaf is enabled");
+
+        // accounting inherits acme's company-wide default.
+        let acct = provision_child(&g, "accounting");
+        assert_eq!(acct.parent.as_deref(), Some("accounting"));
+        assert_eq!(acct.limits[0].amount, 500);
+
+        // isolated: no ancestor template → inherit-only leaf (empty limits, capped only by the chain).
+        let iso = provision_child(&g, "isolated");
+        assert_eq!(iso.parent.as_deref(), Some("isolated"));
+        assert!(
+            iso.limits.is_empty(),
+            "inherit-only leaf carries no own limits"
+        );
+
+        // unknown parent → graceful inherit-only leaf bound to that (to-be-created) parent.
+        let unknown = provision_child(&g, "nope");
+        assert_eq!(unknown.parent.as_deref(), Some("nope"));
+        assert!(unknown.limits.is_empty());
     }
 }
