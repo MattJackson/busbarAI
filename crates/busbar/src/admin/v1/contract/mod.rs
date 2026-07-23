@@ -660,7 +660,7 @@ pub(crate) struct EffectiveConfigView {
 /// The denomination reported alongside every `spend_micros` in the admin usage response. A SINGLE
 /// source of truth so a future removal (returning to the currency-agnostic stance) is one line.
 /// Emitted ONLY on `GET /api/v1/admin/usage` (the `currency` field of `UsageView`), never on the
-/// per-key views — those stay currency-agnostic raw-split ledgers.
+/// per-key views (those stay currency-agnostic raw-split ledgers).
 pub(crate) const USAGE_CURRENCY: &str = "USD";
 
 /// Serialize helper: `UsageView::currency` is a fixed contract constant, not a stored field.

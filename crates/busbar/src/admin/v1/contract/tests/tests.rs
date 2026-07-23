@@ -110,7 +110,7 @@ fn admin_error_codes_and_statuses_are_frozen() {
 
 /// F1 CONTRACT: the admin usage response ALWAYS serializes `currency: "USD"`, sourced from the
 /// single `USAGE_CURRENCY` const (so a future removal is one line). Emitted ONLY on `UsageView`
-/// (the `GET /api/v1/admin/usage` surface) — the per-key/per-model ledger views stay
+/// (the `GET /api/v1/admin/usage` surface); the per-key/per-model ledger views stay
 /// currency-agnostic. Regression: the audit/cost pass dropped this field, breaking the
 /// contract + the committed openapi.json.
 #[test]
