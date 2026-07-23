@@ -53,11 +53,11 @@ Each request carries a per-request failover budget: a wall-clock deadline and a 
 pools:
   resilient:
     members:
-      - target: primary-model
+      - model: primary-model
         weight: 3
-      - target: fallback-model
+      - model: fallback-model
         weight: 1
-      - target: last-resort-model
+      - model: last-resort-model
         weight: 1
     failover:
       timeout_secs: 30     # wall-clock budget across all hops; default 120
@@ -82,9 +82,9 @@ When a request is too large for a member (the provider returns a context-length 
 pools:
   long-context:
     members:
-      - target: claude-haiku
+      - model: claude-haiku
         context_max: 200000
-      - target: gemini-2.5-flash
+      - model: gemini-2.5-flash
         context_max: 1048576
 ```
 
@@ -100,8 +100,8 @@ Pin a session to one member while it remains healthy:
 pools:
   smart:
     members:
-      - target: claude-sonnet
-      - target: gpt-4o
+      - model: claude-sonnet
+      - model: gpt-4o
     affinity:
       mode: session
       header_name: x-session-id    # default
@@ -119,16 +119,14 @@ When all candidates are unavailable, tripped, excluded, or at-capacity, the pool
 pools:
   primary:
     members:
-      - target: fast-model
-      - target: fallback-model
-    on_exhausted:
-      action: fallback_pool:overflow    # try another pool
+      - model: fast-model
+      - model: fallback-model
+    on_exhausted: { fallback_pool: overflow }   # try another pool
 
   overflow:
     members:
-      - target: cheap-model
-    on_exhausted:
-      action: least_bad    # degraded but not a hard error
+      - model: cheap-model
+    on_exhausted: least_bad    # degraded but not a hard error
 ```
 
 | Action | Behavior |

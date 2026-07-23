@@ -75,7 +75,7 @@ docker run -d -p 8080:8080 \
   getbusbar/busbar
 ```
 
-The provider catalog ships inside the image at `/etc/busbar/providers.yaml`, so you only mount `config.yaml` (written in [Step 2](#step-2-write-a-minimal-config)). Pin an exact version (`getbusbar/busbar:1.5.0`) or ride `latest`. If you enable governance, give it a writable volume (e.g. `-v busbar-data:/var/lib/busbar` with `db_path: /var/lib/busbar/governance.db`).
+The provider catalog ships inside the image at `/etc/busbar/providers.yaml`, so you only mount `config.yaml` (written in [Step 2](#step-2-write-a-minimal-config)). Pin an exact version (`getbusbar/busbar:1.5.0`) or ride `latest`. If you use a durable store, give it a writable volume (e.g. `-v busbar-data:/var/lib/busbar` with `store.settings.db_path: /var/lib/busbar/governance.db`).
 
 **Or build from source** (requires Rust 1.87+):
 
@@ -94,7 +94,7 @@ Busbar reads two YAML files:
 - `providers.yaml`: the shipped provider catalog (protocol, `base_url`, error maps). You almost never edit this. The one-line installer fetches it for you, or grab it from [getbusbar.com/providers.yaml](https://getbusbar.com/providers.yaml).
 - `config.yaml`, your deployment: which providers to activate, their key env-var names, your models, and optionally pools.
 
-**Important: keys are never written into config.** `api_key_env` names the *environment variable* that holds a provider's key; Busbar reads the key from there at startup. (Separately, `${VAR}` tokens elsewhere in `config.yaml` are also expanded from the environment at load time.) An unset referenced variable is a loud startup failure, not a silent skip.
+**Important: keys are never written into config.** `api_key: { env: VAR }` is a secret REFERENCE naming the *environment variable* that holds a provider's key; Busbar resolves it at startup (a `{ file: /path }` reference or a secret plugin work the same way). (Separately, `${VAR}` tokens elsewhere in `config.yaml` are expanded from the environment at load time.) An unset referenced variable is a loud startup failure, not a silent skip.
 
 ### Minimal `config.yaml` (one provider, one model, no auth)
 
@@ -104,7 +104,7 @@ This is the smallest config that boots and serves requests. Use it on a local ma
 # config.yaml (dev/minimal, no client auth gate)
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY   # the NAME of the env var to read the key from, NOT the key itself
+    api_key: { env: ANTHROPIC_KEY }   # the NAME of the env var to read the key from, NOT the key itself
 
 models:
   claude-sonnet:
@@ -113,7 +113,7 @@ models:
 
 `provider` is the only required field on a model. `max_concurrent` (a per-lane concurrency limiter) is optional and defaults to unbounded; add it only when you want to cap in-flight requests to a model.
 
-The key itself is never in this file. `api_key_env: ANTHROPIC_KEY` tells Busbar "read this provider's key from the `$ANTHROPIC_KEY` environment variable at startup", so you set the real secret in your environment ([Step 3](#step-3-set-environment-variables-and-run)), and `config.yaml` stays safe to commit and share.
+The key itself is never in this file. `api_key: { env: ANTHROPIC_KEY` } tells Busbar "read this provider's key from the `$ANTHROPIC_KEY` environment variable at startup", so you set the real secret in your environment ([Step 3](#step-3-set-environment-variables-and-run)), and `config.yaml` stays safe to commit and share.
 
 Save this as `config.yaml` in your working directory.
 
@@ -123,7 +123,7 @@ Save this as `config.yaml` in your working directory.
 
 | Field | What it does |
 |---|---|
-| `providers.<name>.api_key_env` | Name of the environment variable holding this provider's API key |
+| `providers.<name>.api_key` | A secret reference to this provider's API key (`{ env: VAR }` / `{ file: /path }` / a secret plugin) |
 | `models.<name>.provider` | Which provider entry in the `providers` block this model calls |
 | `models.<name>.max_concurrent` | Optional per-lane concurrency limiter: max simultaneous in-flight requests to this model. Omit for unbounded (the default); set a value ≥ 1 to cap. |
 
@@ -134,7 +134,7 @@ Save this as `config.yaml` in your working directory.
 ## Step 3: Set environment variables and run
 
 ```bash
-# the actual secret, this is what `api_key_env: ANTHROPIC_KEY` in config.yaml points at
+# the actual secret, this is what `api_key: { env: ANTHROPIC_KEY` } in config.yaml points at
 export ANTHROPIC_KEY=sk-ant-...
 
 BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./busbar
@@ -233,15 +233,16 @@ Once the single-provider setup is working, extend the config to introduce a pool
 ```yaml
 # config.yaml, two providers, two models, one pool, with client auth
 auth:
-  chain: [tokens]
-  client_tokens:
-    - "${BUSBAR_CLIENT_TOKEN}"
+  chain:
+    - keys                                 # callers present minted signed keys
+  admin_auth:
+    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }
 
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
   openai:
-    api_key_env: OPENAI_KEY
+    api_key: { env: OPENAI_KEY }
 
 models:
   claude-sonnet:
@@ -254,20 +255,25 @@ models:
 pools:
   smart:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 2
-      - target: gpt-4o
+      - model: gpt-4o
         weight: 1
 ```
 
-Set the additional environment variables and restart busbar:
+Set the additional environment variables, restart busbar, and mint a caller key (shown once):
 
 ```bash
 export ANTHROPIC_KEY=sk-ant-...
 export OPENAI_KEY=sk-...
-export BUSBAR_CLIENT_TOKEN=your-token-here
+export BUSBAR_ADMIN_TOKEN=your-admin-token
 
 BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./busbar
+
+# Mint a signed key for your app (expires in 90 days by default):
+BUSBAR_CLIENT_TOKEN=$(curl -s -X POST http://127.0.0.1:8081/api/v1/admin/keys \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"quickstart"}' | jq -r .secret)
 ```
 
 Now call the pool by name. Both ingress styles work against a pool:
@@ -311,7 +317,7 @@ curl -s http://localhost:8080/stats \
   -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN" | jq .
 ```
 
-`/stats` goes through the auth middleware, so under `auth.chain: [tokens]` (or governance) it requires a valid token; under `chain: []` it is open. It returns a per-lane snapshot: `model`, `provider`, `max_concurrent`, `inflight`, `free_slots`, `ok`/`err`/`client_fault` counts, `usable`, `dead`, `dead_reason`, `cooldown_remaining_s`, `streak`, and `budget`. A governance key restricted to specific `allowed_pools` only sees the pools and lanes it can reach.
+`/stats` goes through the auth middleware, so with a non-empty `auth.chain` it requires a valid key; under `chain: []` it is open. It returns a per-lane snapshot: `model`, `provider`, `max_concurrent`, `inflight`, `free_slots`, `ok`/`err`/`client_fault` counts, `usable`, `dead`, `dead_reason`, `cooldown_remaining_s`, `streak`, and `budget`. A key restricted to specific `allowed_pools` only sees the pools and lanes it can reach.
 
 **Prometheus metrics** (`/metrics`):
 
@@ -320,7 +326,7 @@ curl -s http://localhost:8080/metrics \
   -H "Authorization: Bearer $BUSBAR_CLIENT_TOKEN"
 ```
 
-Prometheus scrape exposition. Like `/stats`, `/metrics` is subject to the auth middleware (it is *not* auth-exempt, telemetry is a fingerprinting surface), so it requires a token under `token`/governance mode and is open under `none`/`passthrough`. Key metrics: `busbar_requests_total`, `busbar_upstream_failures_total`, `busbar_breaker_trips_total`, `busbar_request_duration_seconds`, `busbar_translations_total`.
+Prometheus scrape exposition. Like `/stats`, `/metrics` is subject to the auth middleware (it is *not* auth-exempt, telemetry is a fingerprinting surface), so it requires a key with a non-empty chain and is open under `chain: []`. Key metrics: `busbar_requests_total`, `busbar_upstream_failures_total`, `busbar_breaker_trips_total`, `busbar_request_duration_seconds`, `busbar_translations_total`.
 
 ---
 
@@ -340,7 +346,7 @@ auth:
 
 The caller's own token (`Authorization: Bearer`, `x-api-key`, or `x-goog-api-key`) is forwarded directly to the upstream provider. Use this when each caller has their own provider key and you want Busbar purely for routing and protocol translation, not credential management.
 
-Note: `passthrough` is incompatible with an active governance engine (`governance.admin_token` set); validation rejects the combination.
+Note: with `passthrough` busbar forwards the caller's credential and holds no upstream keys; a caller with a bad key can hard-down a lane for everyone (30 minutes), so use it deliberately.
 
 ### Bedrock egress (Busbar signs requests with SigV4)
 
@@ -349,7 +355,7 @@ Add a Bedrock provider. The key env var holds `ACCESS_KEY_ID:SECRET_ACCESS_KEY` 
 ```yaml
 providers:
   bedrock:
-    api_key_env: AWS_BEDROCK_CREDS
+    api_key: { env: AWS_BEDROCK_CREDS }
 
 models:
   claude-bedrock:
@@ -365,8 +371,8 @@ Busbar signs each outbound request with SigV4 (region parsed from the host); you
 
 **Bedrock ingress** (acting as a Bedrock endpoint for native AWS SDK clients) has two tracks:
 
-- **Without governance** (`auth.chain: []` with `upstream_credentials: passthrough`, or `chain: []` alone): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (plain `chain: []`).
-- **With active governance** (`auth.chain: [tokens]` + `governance.admin_token` set): Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's budget / RPM / TPM / allowed-pools. No `passthrough` required.
+- **Open/passthrough** (`auth.chain: []`, optionally with `upstream_credentials: passthrough`): Busbar does not verify the inbound SigV4 signature. The credential is forwarded upstream (passthrough) or ignored (plain `chain: []`).
+- **With keys** (`auth.chain: [keys]`): Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`). Mint a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response includes `aws_access_key_id` + `aws_secret_access_key` (shown once). Configure your Bedrock SDK with those credentials: Busbar verifies the signature, then enforces the key's group limits and pool ACL. No `passthrough` required.
 
 ### Injecting `max_tokens` for cross-protocol calls
 
@@ -388,8 +394,8 @@ A caller-supplied `max_tokens` is always preserved; this only applies when the f
 
 Before taking Busbar out of dev mode:
 
-- [ ] Set `auth.chain: [tokens]` with at least one `client_tokens` entry (or enable governance for per-key virtual tokens)
-- [ ] Enable inbound TLS: add a `tls` block (`cert_file` + `key_file`) so the client↔Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca_file` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
+- [ ] Set `auth.chain: [keys]` and mint a signed key per caller (keys expire; default 90 days)
+- [ ] Enable inbound TLS: add a `tls` block (`cert` + `key` secret references) so the client-to-Busbar hop is encrypted, and, for zero-trust deployments, set `client_ca` to require client certs (mTLS). See [`docs/operations.md#inbound-tls--mutual-tls-mtls`](operations.md#inbound-tls--mutual-tls-mtls)
 - [ ] Consider setting `max_concurrent` on models where you want to cap in-flight load to your provider tier (optional; omitted = unbounded)
 - [ ] Set `max_requests` to `-1` (unlimited lifetime budget) or a finite positive budget per model
 - [ ] Run `busbar --validate` (in CI and before every deploy/reload): parses and validates both YAML files with no server, no network, and no secrets required. Exit `0` = valid, `1` = errors. See [`operations.md#validating-configuration-busbar---validate`](operations.md#validating-configuration-busbar---validate)
@@ -404,5 +410,5 @@ Before taking Busbar out of dev mode:
 - **Full config reference**: every field, default, and validation rule ([`docs/configuration.md`](configuration.md))
 - **Pools, breakers, and failover**: weighting, breaker tuning, session affinity, context-length failover, and exhaustion policies ([`docs/configuration.md#pools`](configuration.md#pools))
 - **Running in production**: TLS termination, systemd, Docker, `/stats` monitoring, and breaker diagnosis ([`docs/operations.md`](operations.md))
-- **Governance**: virtual keys, per-key budgets and rate limits, and the `/admin` API ([`docs/operations.md`](operations.md))
+- **Governance**: signed expiring keys, group limits, and the `/admin` API ([`docs/operations.md`](operations.md))
 - **Architecture**: how the IR works, the six-protocol model, and why `f64` instead of `f32` ([`docs/architecture.md`](architecture.md))

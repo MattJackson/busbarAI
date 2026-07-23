@@ -15,33 +15,41 @@ Busbar keeps serving through provider failures. That reliability is not one feat
 
 **Control**: who may spend what ([Governance](/docs/guides/governance/)):
 
-- **[Governance and limits](/docs/guides/governance/)** - virtual keys, budgets, rate limits, and pool access control.
+- **[Governance and limits](/docs/guides/governance/)** - signed expiring keys, hierarchical group limits (requests / tokens / budget / concurrency), and pool access control.
 
 The rest of this page ties them together with one production-like configuration.
 
 ## End-to-end worked example
 
-The following config creates a production-like setup: a weighted primary pool with fast failover and a cheap overflow, context-length failover between members, session affinity, aggressive tripping with a low streak threshold, and active governance with a per-model rate card so per-key spend is priced from real token counts.
+The following config creates a production-like setup: a weighted primary pool with fast failover and a cheap overflow, context-length failover between members, session affinity, aggressive tripping with a low streak threshold, and governance with a group limit tree plus a per-model rate card so spend is priced from real token counts.
 
 ```yaml
 listen: "0.0.0.0:8080"
 
 auth:
-  chain: [tokens]
-  client_tokens:
-    - "${BUSBAR_CLIENT_TOKEN}"
+  chain:
+    - keys                                 # built-in signed-key verifier: callers present minted keys
+  admin_auth:
+    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }
+
+groups:
+  search-team:
+    limits:
+      - { requests: 300, per: minute }
+      - { tokens: 500000, per: minute }
+      - { budget: 2000000, per: month }    # $20k/mo cap over every search key
 
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
     health:
       mode: dead
       interval_secs: 30
       timeout_secs: 5
   openai:
-    api_key_env: OPENAI_KEY
+    api_key: { env: OPENAI_KEY }
   gemini:
-    api_key_env: GEMINI_KEY
+    api_key: { env: GEMINI_KEY }
 
 models:
   claude-sonnet:
@@ -64,12 +72,12 @@ models:
 pools:
   primary:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 5
         context_max: 200000
-      - target: gpt-4o
+      - model: gpt-4o
         weight: 3
-      - target: gemini-flash
+      - model: gemini-flash
         weight: 2
         context_max: 1048576
     affinity:
@@ -84,29 +92,27 @@ pools:
     failover:
       timeout_secs: 30
       max_hops: 3
-    on_exhausted:
-      action: fallback_pool:overflow
+    on_exhausted: { fallback_pool: overflow }
 
   overflow:
     members:
-      - target: claude-haiku
+      - model: claude-haiku
         weight: 1
-    on_exhausted:
-      action: least_bad        # degraded but available; never hard-503
+    on_exhausted: least_bad    # degraded but available; never hard-503
 
 plugins:
   enabled: true                          # the durable store is a signed plugin tarball in plugins/
 
-governance:
-  store: sqlite                          # durable (the busbar-store-sqlite plugin); omit for the RAM default
-  db_path: /var/lib/busbar/governance.db
-  admin_token: "${BUSBAR_ADMIN_TOKEN}"   # setting this ACTIVATES enforcement
-  price_per_request_cents: 0
-  rate_card:                             # per-model token pricing, micro-units per token
-    claude-sonnet: { input_utok: 3.0, output_utok: 15.0 }
-    gpt-4o:        { input_utok: 2.5, output_utok: 10.0 }
-    gemini-flash:  { input_utok: 0.15, output_utok: 0.6 }
-    claude-haiku:  { input_utok: 0.8, output_utok: 4.0 }
+store:
+  module: sqlite                         # durable (the busbar-store-sqlite plugin); omit for the RAM default
+  settings: { db_path: /var/lib/busbar/governance.db }
+
+rate_card:                               # per-model token pricing, micro-units per token
+  claude-sonnet: { input_utok: 3.0, output_utok: 15.0 }
+  gpt-4o:        { input_utok: 2.5, output_utok: 10.0 }
+  gemini-flash:  { input_utok: 0.15, output_utok: 0.6 }
+  claude-haiku:  { input_utok: 0.8, output_utok: 4.0 }
+per_request_fee: 0
 ```
 
 What this achieves:
@@ -117,17 +123,9 @@ What this achieves:
 - **Session affinity**: callers with `x-session-id` headers stay pinned to the same member while it is healthy.
 - **Overflow**: if all primary members are exhausted, traffic spills to `claude-haiku`. If haiku is also exhausted, `least_bad` picks the member with the soonest recovery rather than returning 503.
 - **Health probing**: `anthropic` lanes are re-probed on trip (`mode: dead`), so a recovered Anthropic backend is brought back promptly without waiting for organic traffic to probe it.
-- **Governance**: each team gets a virtual key with per-pool ACLs, RPM/TPM limits, and a budget derived from the rate card above. Bind a key to a `budget_group` to cap a whole team or org above the key. Mint keys with `POST /api/v1/admin/keys`.
+- **Governance**: each team gets a signed, expiring virtual key bound to a `groups:` entry: every limit (requests, tokens, budget, concurrency) lives on the group, and the spend derives from the rate card above. Mint keys with `POST /api/v1/admin/keys`.
 
-To mint a key for a team, optionally binding it to a budget group that caps the team above the key. First declare the group under `governance.budget_groups`:
-
-```yaml
-governance:
-  budget_groups:
-    search-team: { max_budget_cents: 2000000, budget_period: monthly }   # $20k/mo cap over every search key
-```
-
-Then mint a key bound to it, with a label for external reporting:
+To mint a key for the search team, bind it to the `search-team` group declared above, with a label for external reporting:
 
 ```bash
 curl -s -X POST http://localhost:8081/api/v1/admin/keys \
@@ -135,16 +133,13 @@ curl -s -X POST http://localhost:8081/api/v1/admin/keys \
   -H "Content-Type: application/json" \
   -d '{
         "name": "team-search",
+        "group": "search-team",
         "allowed_pools": ["primary", "overflow"],
-        "tpm_limit": 500000,
-        "rpm_limit": 300,
-        "max_budget_cents": 500000,
-        "budget_period": "monthly",
-        "budget_group": "search-team",
+        "expires_in": "90d",
         "labels": {"team": "search"}
       }'
 ```
 
-Admission now walks the key's own $5k/mo budget and the `search-team` group's $20k/mo cap; the request passes only when both are under cap, and a 429 names whichever one blocked. The `labels` ride onto the key's metric series so Grafana can `sum by (team)` without busbar knowing what a team is.
+Admission now walks the `search-team` group's chain (300 requests/min AND 500k tokens/min AND $20k/mo, and any ancestor group's limits too); the request passes only when every limit is under cap, and the rejection names exactly which bucket blocked (group + metric + window). The `labels` ride onto the key's metric series so Grafana can `sum by (team)` without busbar knowing what a team is.
 
-The response's `secret` field (`sk-bb-…`) is what the team uses as their API key pointed at busbar. They set it wherever they previously set their Anthropic/OpenAI key. Busbar handles the rest.
+The response's signed token (shown once, expires in 90 days) is what the team uses as their API key pointed at busbar. They set it wherever they previously set their Anthropic/OpenAI key. Busbar handles the rest.

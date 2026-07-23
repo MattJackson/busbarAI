@@ -56,13 +56,13 @@ Name a **selection strategy** in the pool's `hooks:` list and it decides the ord
 | Strategy (named in `hooks:`) | Picks the member with... |
 |---|---|
 | `weighted` (default) | the next weighted turn (SWRR). Zero overhead, identical to naming no strategy. |
-| `cheapest` | the lowest `cost_per_mtok`. |
+| `cheapest` | the lowest cost, derived from the model's `rate_card` entry as `(input_utok + output_utok) / 2`. |
 | `fastest` | the lowest measured latency (rolling EWMA). |
 | `least_busy` | the most free concurrency. |
 | `usage` | the most rate-limit headroom. |
 | an **ordering gate hook** | the order your own compiled socket hook or HTTPS webhook returns (a `kind: gate` replying with the `order` arm). |
 
-A pool names at most one strategy plus any number of gates in one `hooks: [...]` list, e.g. `hooks: [cheapest, pii-guard]`. External ordering logic is a hook, not a pool key: the pre-1.3 `route:` / `policy:` / `route: script` (embedded Rhai) keys were **removed** and are now hard startup errors (see [Migrating to 1.3](migration-1.3.md)). Every strategy and the ordering-hook contract live in the [Hooks guide](hooks.md) and the pool-hooks reference in [Configuration](configuration.md#pool-hooks-ordering-and-gates). The rest of this page is about pool *structure*: members, weights, failover, and affinity.
+A pool names at most one strategy (a bare name) plus any number of inline hook module refs in one `hooks: [...]` list, e.g. `hooks: [cheapest, { module: socket, settings: { path: /run/pii.sock } }]`. External ordering logic is a hook instance named inline, not a pool key: the pre-1.3 `route:` / `policy:` keys and the 1.4.x top-level `hooks:` registry were **removed** and are hard startup errors. Every strategy and the ordering-hook contract live in the [Hooks guide](hooks.md) and the pool-hooks reference in [Configuration](configuration.md#pool-hooks-ordering-and-gates). The rest of this page is about pool *structure*: members, weights, failover, and affinity.
 
 ## Config reference
 
@@ -71,7 +71,7 @@ A pool names at most one strategy plus any number of gates in one `hooks: [...]`
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `members` | list | required | The lanes in this pool (see below). |
-| `hooks` | list | `[]` | This pool's ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`, at most one) plus any gates, referenced by name from the top-level `hooks:` registry. |
+| `hooks` | list | `[]` | This pool's ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`, at most one, a bare name) plus any gates as inline module refs (`{ module: webhook\|socket\|<plugin>, settings: {...} }`). |
 | `affinity` | object | none | `mode: session` pins a session to a lane by `header_name` (default `x-session-id`). |
 
 See the [Hooks guide](/docs/hooks/) for every selection strategy, the ordering-hook contract, and the full hook model, [Circuit breaker](/docs/circuit-breaker/#circuit-breaker-configuration) for the per-pool `breaker` block, and [In-flight failover](/docs/failover/) for `failover` and `on_exhausted`.
@@ -84,10 +84,9 @@ See the [Hooks guide](/docs/hooks/) for every selection strategy, the ordering-h
 | `weight` | integer | `1` | Relative SWRR share over healthy members. Must be ≥ 1. |
 | `context_max` | integer | none | This lane's context window; requests larger than it fail over to a bigger lane. |
 | `tier` | string | none | Routing tier label (e.g. `primary`, `overflow`); read by policies. |
-| `cost_per_mtok` | float | none | Cost per million tokens; drives the `cheapest` policy. |
 | `tags` | list | `[]` | Free-form labels read by ordering/gate hooks. |
 
-`tier`, `cost_per_mtok`, and `tags` are consumed by the selection strategies and ordering hooks; see [What a gate receives](hooks.md#what-a-gate-receives) for the full signal set each candidate carries.
+`tier` and `tags` are consumed by the selection strategies and ordering hooks (each candidate's cost signal derives from the top-level `rate_card`); see [What a gate receives](hooks.md#what-a-gate-receives) for the full signal set each candidate carries.
 
 ## Multi-protocol pools
 
@@ -101,9 +100,9 @@ See the [Hooks guide](/docs/hooks/) for every selection strategy, the ordering-h
 pools:
   chat:
     members:
-      - { target: gpt-4o,        weight: 8 }   # ~80% of traffic
-      - { target: claude-sonnet, weight: 2 }   # ~20%
-      - { target: gemini-pro,    weight: 1 }   # picks up load when the others trip
+      - { model: gpt-4o,        weight: 8 }   # ~80% of traffic
+      - { model: claude-sonnet, weight: 2 }   # ~20%
+      - { model: gemini-pro,    weight: 1 }   # picks up load when the others trip
 ```
 
 ### Same model, two providers (cross-provider failover)
@@ -113,12 +112,12 @@ Run one real model behind two providers. The keys differ; `upstream_model` carri
 ```yaml
 models:
   sonnet-anthropic: { provider: anthropic,         max_concurrent: 20, upstream_model: claude-3-5-sonnet-20241022 }
-  sonnet-bedrock:   { provider: bedrock-us-east-1, max_concurrent: 10, upstream_model: anthropic.claude-3-5-sonnet-20241022-v2:0 }
+  sonnet-bedrock:   { provider: bedrock-us-east-1, max_concurrent: 10, upstream_model: "anthropic.claude-3-5-sonnet-20241022-v2:0" }
 pools:
   sonnet:
     members:
-      - { target: sonnet-anthropic, weight: 3 }   # primary
-      - { target: sonnet-bedrock,   weight: 1 }   # same model, other cloud
+      - { model: sonnet-anthropic, weight: 3 }   # primary
+      - { model: sonnet-bedrock,   weight: 1 }   # same model, other cloud
 ```
 
 ### Context-length failover
@@ -127,8 +126,8 @@ pools:
 pools:
   long-context:
     members:
-      - { target: gpt-4o,        context_max: 128000,  weight: 3 }
-      - { target: gemini-15-pro, context_max: 2000000, weight: 1 }   # over-128k requests land here
+      - { model: gpt-4o,        context_max: 128000,  weight: 3 }
+      - { model: gemini-15-pro, context_max: 2000000, weight: 1 }   # over-128k requests land here
 ```
 
 ### Sticky sessions
@@ -140,8 +139,8 @@ pools:
       mode: session
       header_name: x-session-id      # defaults to x-session-id if omitted
     members:
-      - { target: gpt-4o,        weight: 1 }
-      - { target: claude-sonnet, weight: 1 }
+      - { model: gpt-4o,        weight: 1 }
+      - { model: claude-sonnet, weight: 1 }
 ```
 
 ### Cost-, latency-, and custom-based routing

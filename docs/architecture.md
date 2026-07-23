@@ -144,7 +144,7 @@ Management/observability routes (`/stats`, `/healthz`, `/metrics`,
   per-protocol counters, error rates) is an information-disclosure surface, so it
   goes through the same auth check as any other route. It is gated by the data-plane
   auth chain (`auth.chain`): a request must satisfy some module in the chain (the
-  built-in `tokens` allowlist, or a virtual key under governance). With an empty chain
+  built-in `keys` signed-token verifier, or an IdP auth module). With an empty chain
   (`chain: []`) the check admits unconditionally and `/metrics` is effectively open, so
   restrict it at the network layer if you need unauthenticated scraping.
 - The admin API (`/api/v1/admin/*`) does not run on the data plane at all. It is served
@@ -185,7 +185,7 @@ quota shape: `429` (`insufficient_quota`) for OpenAI / Responses / Anthropic /
 Gemini / Cohere, and `400` (`ServiceQuotaExceededException`) for Bedrock. The flat
 per-request fee is charged at admission; the token counts land on the ledger when
 the response stream completes. Spend itself is never stored: it is derived at read
-time from the accumulated per-model tokens times the current `governance.rate_card`,
+time from the accumulated per-model tokens times the current top-level `rate_card`,
 so a rate correction re-prices past and present windows on the next read. See
 [operations.md](operations.md).
 

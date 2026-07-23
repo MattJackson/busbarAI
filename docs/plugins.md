@@ -2,7 +2,7 @@
 
 busbar ships as one small static binary (about 9.4 MB) with nothing compiled in that you did not
 ask for: no SQLite, no Postgres, no Redis. The default deploy needs no plugins at all. When you do
-need more, a durable governance store today, auth or hook backends as those consumers land, you add
+need more, a durable store, a secret backend, auth or hook modules, you add
 exactly that capability as a signed plugin tarball dropped into a directory. Lightweight by
 default, extend when needed.
 
@@ -40,7 +40,7 @@ One plugin is one `.tar.gz` per (plugin, target) containing exactly two members:
   "abi_version": 1,
   "sha256": "<64-hex sha256 of the cdylib bytes>",
   "signature": "<128-hex ed25519 signature over the canonical manifest>",
-  "description": "busbar redis governance store plugin",
+  "description": "busbar redis store plugin",
   "homepage": "",
   "license": "Apache-2.0"
 }
@@ -52,7 +52,7 @@ be altered or swapped independently. Identity comes from the signed manifest, ne
 you can name the tarball anything.
 
 `name` is the canonical identity (`[a-z0-9-]+`, e.g. `busbar-store-redis`); `alias` is the short
-config name (`redis`). `governance.store:` accepts either. `kind` is `store`, `auth`, or `hook`.
+config name (`redis`). `store.module:` accepts either. `kind` is `store`, `secret`, `auth`, or `hook`.
 `version` is strict semver. `abi_version` declares which busbar C ABI generation the cdylib was
 built against (currently `1` for every kind).
 
@@ -73,13 +73,13 @@ plugins:
   min_versions:
     acme-store-dynamo: "2.0.0"
 
-governance:
-  store: redis           # alias or canonical name, resolved against the signed manifests
-  db_path: "rediss://:password@redis.internal:6380/0"
+store:
+  module: redis          # alias or canonical name, resolved against the signed manifests
+  settings: { url: "rediss://:password@redis.internal:6380/0" }
 ```
 
 With `enabled: false` (or the block absent) a tarball in the directory is inert: busbar does not
-read it, and referencing a plugin store (`governance.store: redis`) fails boot with an error naming
+read it, and referencing a plugin store (`store.module: redis`) fails boot with an error naming
 `plugins.enabled`. See [configuration.md](configuration.md#plugins) for the field reference.
 
 ## Building a plugin
@@ -99,7 +99,7 @@ implementation), adapt the JSON config busbar passes at open, and let the SDK em
 use busbar_api::Store;
 
 fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
-    // `cfg` is the JSON blob busbar builds from `governance.*` (db_path/url/busy_timeout_ms).
+    // `cfg` is the store's own `settings` map, passed through verbatim as JSON.
     let v: serde_json::Value = serde_json::from_str(cfg).map_err(|e| e.to_string())?;
     let url = v.get("url").and_then(|x| x.as_str()).ok_or("missing url")?;
     Ok(Box::new(MyStore::connect(url)?))
@@ -212,7 +212,7 @@ into the binary.
 $ busbar --list-plugins
 plugins dir: plugins (plugins.enabled: true)
 FILE                               NAME                     ALIAS        KIND   VERSION   SIGNATURE                STATUS
-busbar-store-redis-1.5.0.tar.gz    busbar-store-redis       redis        store  1.5.0     first-party              LOADS (governance.store: redis)
+busbar-store-redis-1.5.0.tar.gz    busbar-store-redis       redis        store  1.5.0     first-party              LOADS (store.module: redis)
 busbar-store-sqlite-1.5.0.tar.gz   busbar-store-sqlite      sqlite       store  1.5.0     first-party              ready
 acme-store-dynamo-1.0.0.tar.gz     acme-store-dynamo        dynamo       store  1.0.0     unknown-publisher        SKIPPED: publisher 'acme' is not in the allowlist; ...
 old-redis.tar.gz                   busbar-store-redis       redis        store  1.2.0     trusted (below floor)    REJECTED: ... (anti-downgrade)

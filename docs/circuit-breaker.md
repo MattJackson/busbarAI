@@ -154,7 +154,7 @@ Default cooldowns (no `breaker:` block, or block present with fields omitted): `
 
 A hard-down lane is still recoverable: a successful active health probe (or the organic half-open probe on cooldown expiry) brings it back automatically, no restart needed. Hard-down deliberately does **not** set the permanent `dead` flag (that would block recovery).
 
-After an auth or billing hard-down, `/stats` shows the lane with `usable: false`, a non-zero `cooldown_remaining_s`, and a `dead_reason` describing the fault (an `auth rejected …` or `billing / insufficient balance` message) rather than `dead: true`. Fix the credential (`api_key_env`) for an auth fault or fund the account for a billing fault, and Busbar recovers on the next successful probe.
+After an auth or billing hard-down, `/stats` shows the lane with `usable: false`, a non-zero `cooldown_remaining_s`, and a `dead_reason` describing the fault (an `auth rejected …` or `billing / insufficient balance` message) rather than `dead: true`. Fix the credential behind the provider's `api_key` reference for an auth fault or fund the account for a billing fault, and Busbar recovers on the next successful probe.
 
 ## Circuit breaker configuration
 
@@ -164,7 +164,7 @@ Full reference: all fields optional, values shown are defaults:
 pools:
   my-pool:
     members:
-      - target: my-model
+      - model: my-model
     breaker:
       base_cooldown_secs: 15    # first cooldown after a trip
       max_cooldown_secs: 120    # ceiling for exponential backoff
@@ -189,7 +189,7 @@ Configure per provider in `config.yaml`:
 ```yaml
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
     health:
       mode: dead           # or: active, none
       interval_secs: 30    # default

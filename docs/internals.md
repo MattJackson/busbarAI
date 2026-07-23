@@ -220,27 +220,28 @@ approximate, but eligibility filtering and long-run proportionality hold. See
 `crates/busbar/src/governance/mod.rs` is a **separate** durable store from the hot in-memory
 `StateStore`; it holds only bounded enforcement state.
 
-- **Key storage / hashing.** A virtual key's secret is generated from 16 bytes of
-  the OS CSPRNG (`getrandom`), formatted `sk-bb-<hex>`. Only its **SHA-256 hex** is
-  stored (`key_hash`); the plaintext is returned **once** at creation and never
-  persisted. The key id is `vk_<first 16 hex of the hash>`. Lookup on the hot path
-  hashes the presented secret and hits an in-memory `by_hash` cache (a `RwLock`
-  map), not the DB; the cache is refreshed after any management-API mutation.
-- **Budget windows.** `budget_window(period, now)` maps to an epoch window start:
-  `total` → `0` (one all-time window), `daily` → UTC midnight, `monthly` → UTC
-  first-of-month (computed with Howard Hinnant's civil-date algorithms, no date
-  crate). The store accumulates a TOKEN LEDGER per (bucket, window, model, tier);
-  spend is DERIVED at check/read time as `requests x price_per_request_cents +
-  tier tokens x governance.rate_card rates` (integer nano-unit math; no stored
-  dollar). Admission derives every bucket in the key's budget-group chain fresh and
-  compares against each `max_budget_cents` - correcting a rate is a config edit,
-  never a data migration.
-- **Rate windows.** RPM/TPM are **in-memory, fixed 60s** windows per key
-  (`RateState`), not persisted, single-node only. `check_rate` returns
-  `Err(retry_after_secs)` (→ 429) when over RPM or TPM. TPM is enforced against
-  tokens accrued *so far* in the window; since tokens are fed post-response from
-  the usage tap, TPM reflects the prior responses' tokens.
-- **Store backends.** The default `store: memory` is the compiled-in ephemeral RAM
+- **Keys are signed tokens.** A minted key is a busbar-signed `{sub, exp, kid}` token
+  (ed25519, `auth.signing_key`), returned **once** and never stored; the store holds
+  only the pure-auth BINDING row (`id`, `allowed_pools`, `group`, `labels`) plus the
+  revocation denylist. Verification on the hot path is stateless (signature + expiry)
+  plus an in-memory denylist read; policy resolves from the `by_hash`/`by_sub` caches
+  (a `RwLock` map), not the DB; the caches refresh after any management-API mutation.
+- **Windows.** `budget_window(window, now)` maps a C8 window noun to an epoch window
+  start: `total` → `0` (one all-time window), `minute`/`hour` → the UTC minute/hour,
+  `day` → UTC midnight, `month` → UTC first-of-month (computed with Howard Hinnant's
+  civil-date algorithms, no date crate). The store accumulates a TOKEN LEDGER per
+  (bucket, window, model, tier); spend is DERIVED at check/read time as
+  `requests x per_request_fee + tier tokens x rate_card rates` (integer nano-unit
+  math; no stored dollar). Correcting a rate is a config edit, never a data migration.
+- **The generic limit engine.** `GovState::try_admit` resolves the key's group chain
+  into per-(group, window) enforcement buckets (`group:<name>@<window>`) and ANDs
+  every limit atomically: `requests` (precise, +1 at admission), `tokens`
+  (best-effort post-paid, the old TPM posture), `budget` (derived spend), and the
+  per-group `concurrent` in-flight gauge (RAII holds released at stream end). The
+  rejection names the exact blocking (group, metric, window); a frozen group
+  (`enabled: false`) rejects before anything is charged. Windows are in-memory,
+  per-node, reconciled durably by additive flushes.
+- **Store backends.** The default `store.module: memory` is the compiled-in ephemeral RAM
   store (keys, the token ledger, and audit reset on restart); it needs no plugin and
   is the admission-path source of truth. Durability is opt-in: `sqlite`, `postgres`,
   and `redis` each ship as a signed store plugin behind the same `Store` trait.
@@ -248,16 +249,17 @@ approximate, but eligibility filtering and long-run proportionality hold. See
   plus the ledger pair `usage_windows` (per-bucket request counts) and `usage_ledger`
   (per-bucket, per-model tier tokens), with additive upserts (`INSERT … ON CONFLICT
   … DO UPDATE` on sqlite/postgres, `MULTI/EXEC` cascades on redis) for key CRUD and
-  ledger accumulation (schema v2). SQLite is embedded and statically linked, so the
+  ledger accumulation (schema v3). SQLite is embedded and statically linked, so the
   single-binary story survives even the durable case; postgres and redis are the
   cluster-shared options (keys/ledger/audit shared, hard cap still enforced per node
   and reconciled through additive flushes).
 - **Enforcement order** (in `crates/busbar/src/ingress/mod.rs`, before forwarding): allowed-pools
-  (`pool_allowed` → 403) → budget (`is_over_budget` → 429, or 400 for Bedrock
-  ingress) → rate (`check_rate` → 429 + `Retry-After`). Over-budget never returns
-  402 (no vendor does); the body `error.type` is `insufficient_quota`. The auth
-  middleware resolves the virtual
-  key first (`crates/busbar/src/auth/mod.rs`); `/admin/*` is guarded by the separate admin token,
-  not a virtual key.
+  (`pool_allowed` → 403) → the unpriced-model check (400 with a present rate card) →
+  the atomic group-limit admission (`try_admit`: requests/tokens/concurrent → 429
+  (+ `Retry-After` for rolling windows), budget → the vendor quota status (400 for
+  Bedrock ingress), a frozen group → 403). Over-budget never returns 402 (no vendor
+  does); the body `error.type` is `insufficient_quota`. The auth middleware resolves
+  the virtual key first (`crates/busbar/src/auth/mod.rs`); `/admin/*` is guarded by
+  the separate admin chain (`auth.admin_auth`), not a data-plane key.
 
 See [operations.md](operations.md) for the operator-facing governance/admin view.

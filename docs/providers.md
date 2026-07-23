@@ -13,12 +13,12 @@ Providers live in `providers.yaml` as a map of name → definition. The shipped 
 | `error_map` | no | Provider-specific **JSON** error codes → a canonical disposition: one of `auth`, `billing`, `rate_limit`, `context_length`, `overloaded`, `server_error`, `timeout`, `network`, or `client_error` (the shipped catalog mostly uses `billing`/`rate_limit`). HTTP-status errors (429/5xx/401/…) are classified automatically without this. |
 | `path` | no | Override the upstream request path appended to `base_url`: for providers that embed an API version in `base_url`. Static, ignores the per-request model. |
 | `path_base` | no | For URL-model protocols (Gemini): override the hardcoded base segment (`/v1beta/models`) while keeping the per-request `/{model}:verb` suffix, e.g. to reach Google Vertex AI's project/location-scoped layout. |
-| `auth` | no | The egress auth mechanism, when a backend doesn't use its protocol's native auth. One of: `bearer` (default) · `api-key` (header style) · `jwt-bearer` (OAuth 2.0 JWT-bearer, RFC 7523, mints + auto-refreshes a token from a service-account key; e.g. Google Vertex AI) · `oauth-client-credentials` (OAuth 2.0 client-credentials, RFC 6749 §4.4, `api_key_env` holds `client_id:client_secret`; e.g. Azure OpenAI via Entra ID). |
+| `auth` | no | The egress auth mechanism, when a backend doesn't use its protocol's native auth. One of: `bearer` (default) · `api-key` (header style) · `jwt-bearer` (OAuth 2.0 JWT-bearer, RFC 7523, mints + auto-refreshes a token from a service-account key; e.g. Google Vertex AI) · `oauth-client-credentials` (OAuth 2.0 client-credentials, RFC 6749 §4.4, the `api_key` reference resolves to `client_id:client_secret`; e.g. Azure OpenAI via Entra ID). |
 | `token_url` | no | OAuth token endpoint for `auth: oauth-client-credentials`. Required for that auth style. |
 | `scope` | no | OAuth scope for `auth: oauth-client-credentials`. Required for that auth style. |
 | `health` | no | Optional health-probe configuration. |
 
-The API key is **not** in this file. `config.yaml` supplies it by naming the environment variable that holds it (`api_key_env`), so secrets never live in config.
+The API key is **not** in this file. `config.yaml` supplies it as a secret reference (`api_key: { env: VAR }` / `{ file: /path }` / a secret plugin), so secrets never live in config.
 
 ## Add one in three steps
 
@@ -39,7 +39,7 @@ my-provider:
 
 ```yaml
 providers:
-  my-provider: { api_key_env: MY_PROVIDER_KEY }
+  my-provider: { api_key: { env: MY_PROVIDER_KEY } }
 
 models:
   my-model: { provider: my-provider, max_concurrent: 20 }
@@ -116,17 +116,17 @@ azure-entra:
   auth: oauth-client-credentials
   token_url: https://login.microsoftonline.com/MY-TENANT/oauth2/v2.0/token
   scope: https://cognitiveservices.azure.com/.default
-  api_key_env: AZURE_ENTRA_CREDS      # value = "client_id:client_secret"
+  api_key: { env: AZURE_ENTRA_CREDS }      # value = "client_id:client_secret"
 
 # Google Vertex AI (Gemini): the same gemini protocol at a project/location-scoped URL, authed with a
 # self-minting OAuth token instead of an API key. `path_base` reshapes the URL; `auth: jwt-bearer`
-# mints + auto-refreshes a bearer from the service-account key in `api_key_env` (inline JSON or a path).
+# mints + auto-refreshes a bearer from the service-account key the `api_key` reference resolves to (inline JSON or a path).
 gemini-vertex:
   protocol: gemini
   base_url: https://us-central1-aiplatform.googleapis.com
   path_base: /v1/projects/YOUR_PROJECT/locations/us-central1/publishers/google/models
   auth: jwt-bearer
-  api_key_env: VERTEX_SA_KEY
+  api_key: { env: VERTEX_SA_KEY }
   error_map:
     RESOURCE_EXHAUSTED: rate_limit
 
@@ -137,7 +137,7 @@ claude-vertex:
   base_url: https://us-central1-aiplatform.googleapis.com
   path_base: /v1/projects/YOUR_PROJECT/locations/us-central1/publishers/anthropic/models
   auth: jwt-bearer
-  api_key_env: VERTEX_SA_KEY
+  api_key: { env: VERTEX_SA_KEY }
   error_map: {}
 ```
 

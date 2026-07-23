@@ -251,7 +251,7 @@ POST /v1beta/models/{model}:streamGenerateContent
 
 Both the stable `/v1/` and the beta `/v1beta/` path prefixes are accepted by the same handler (registered as `/v1/models/{*rest}` and `/v1beta/models/{*rest}`). The Google `google-generativeai` and `google-genai` SDKs use either surface depending on the version and the method called; Busbar accepts both so you do not need to know which one your SDK version issues.
 
-**Auth carrier (ingress):** `x-goog-api-key: <token>` (the header the Gemini SDK sends). Busbar also accepts `Authorization: Bearer` on this route (any of Busbar's carriers validate the same token). Under `token` or governance mode, the value is matched against your Busbar client tokens: not forwarded to Google.
+**Auth carrier (ingress):** `x-goog-api-key: <token>` (the header the Gemini SDK sends). Busbar also accepts `Authorization: Bearer` on this route (any of Busbar's carriers validate the same token). With a non-empty `auth.chain`, the value is verified as a Busbar key: not forwarded to Google.
 
 **Auth header (egress to Gemini backend):** `x-goog-api-key: <key>`.
 
@@ -288,13 +288,13 @@ POST /model/{model_id}/converse
 POST /model/{model_id}/converse-stream
 ```
 
-**Auth carrier (ingress):** AWS SDKs sign requests with SigV4 (`Authorization: AWS4-HMAC-SHA256 ...`). Busbar supports two tracks for Bedrock ingress depending on whether governance is enabled.
+**Auth carrier (ingress):** AWS SDKs sign requests with SigV4 (`Authorization: AWS4-HMAC-SHA256 ...`). Busbar supports two tracks for Bedrock ingress depending on the auth chain.
 
-**Track A: Without governance (`auth.chain: []`, with `upstream_credentials: passthrough` or without):** Busbar does not verify the inbound SigV4 signature. Bearer-style carriers (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`) are the only tokens Busbar's auth middleware reads in these modes. The SigV4 header is forwarded upstream to the Bedrock backend (`upstream_credentials: passthrough`) or ignored entirely (plain `chain: []`). Use this when you want AWS SDK clients to target Busbar as a transparent Bedrock proxy with pooling and failover but without per-key governance controls.
+**Track A: Open/passthrough (`auth.chain: []`, with `upstream_credentials: passthrough` or without):** Busbar does not verify the inbound SigV4 signature. Bearer-style carriers (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`) are the only tokens Busbar's auth middleware reads in these modes. The SigV4 header is forwarded upstream to the Bedrock backend (`upstream_credentials: passthrough`) or ignored entirely (plain `chain: []`). Use this when you want AWS SDK clients to target Busbar as a transparent Bedrock proxy with pooling and failover but without per-key governance controls.
 
-**Track B: With active governance (`auth.chain: [tokens]` + `governance.admin_token` set):** Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`). An operator mints a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response returns an `aws_access_key_id` + `aws_secret_access_key` alongside the usual bearer `secret` (both shown once, never again). The Bedrock SDK authenticates with that credential pair, Busbar verifies the signature and body integrity (`x-amz-content-sha256`), then attaches the same `GovCtx` a bearer request would, so budget / RPM / TPM / allowed-pools all apply. No passthrough is required; governance and Bedrock-ingress coexist.
+**Track B: With keys (`auth.chain: [keys]`):** Busbar verifies the inbound SigV4 signature natively (`crates/busbar/src/auth/mod.rs` `verify_bedrock_sigv4`). An operator mints a virtual key with `"issue_aws_credential": true` via `POST /api/v1/admin/keys`; the response returns an `aws_access_key_id` + `aws_secret_access_key` alongside the signed token (both shown once, never again). The Bedrock SDK authenticates with that credential pair, Busbar verifies the signature and body integrity (`x-amz-content-sha256`), then attaches the same `GovCtx` a bearer request would, so the key's group limits and pool ACL all apply. No passthrough is required.
 
-**Auth header (egress to Bedrock backend):** Per-request AWS SigV4, computed by Busbar using the key from the lane's `api_key_env` environment variable. The key format is `ACCESS_KEY_ID:SECRET_ACCESS_KEY` (or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN` for temporary credentials): Busbar splits on up to three colon-separated parts. The region is parsed from the Bedrock `base_url` hostname.
+**Auth header (egress to Bedrock backend):** Per-request AWS SigV4, computed by Busbar using the credential the lane's `api_key` reference resolves to. The key format is `ACCESS_KEY_ID:SECRET_ACCESS_KEY` (or `ACCESS_KEY_ID:SECRET_ACCESS_KEY:SESSION_TOKEN` for temporary credentials): Busbar splits on up to three colon-separated parts. The region is parsed from the Bedrock `base_url` hostname.
 
 **Upstream paths:** `POST /model/{model}/converse` (non-stream) and `POST /model/{model}/converse-stream` (stream).
 
@@ -539,12 +539,13 @@ On same-protocol routes, none of the above applies. The request body is forwarde
 listen: "0.0.0.0:8080"
 
 auth:
-  chain: [tokens]
-  client_tokens: ["${BUSBAR_TOKEN}"]
+  chain: [keys]        # callers present minted signed keys
+  admin_auth:
+    - admin-tokens: { token: { env: BUSBAR_ADMIN_TOKEN } }
 
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
 
 models:
   claude-sonnet:
@@ -555,23 +556,29 @@ models:
 pools:
   fast:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 1
 ```
 
 ```bash
-export BUSBAR_TOKEN=my-local-token
+export BUSBAR_ADMIN_TOKEN=my-admin-token
 export ANTHROPIC_KEY=sk-ant-...
 BUSBAR_PROVIDERS=./providers.yaml BUSBAR_CONFIG=./config.yaml ./busbar
+
+# Mint a caller key (the signed token is shown once):
+BUSBAR_TOKEN=$(curl -s -X POST http://127.0.0.1:8081/api/v1/admin/keys \
+  -H "Authorization: Bearer $BUSBAR_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"local-dev"}' | jq -r .secret)
 ```
 
 ### 2. Call it with the OpenAI SDK
 
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI(
-    api_key="my-local-token",   # your busbar token, not an OpenAI key
+    api_key=os.environ["BUSBAR_TOKEN"],   # your minted busbar key, not an OpenAI key
     base_url="http://localhost:8080",
 )
 
@@ -596,7 +603,7 @@ print(response.choices[0].message.content)
    }
    ```
 
-2. Busbar's auth middleware reads `Authorization: Bearer my-local-token`, matches it against `client_tokens`, and admits the request.
+2. Busbar's auth middleware reads `Authorization: Bearer <token>`, verifies the signed key (signature + expiry + denylist), and admits the request.
 
 3. The route handler (`ingress::openai_ingress`) reads `"model": "fast"` from the body, resolves `fast` against the pool table, and picks `claude-sonnet` via SWRR.
 
@@ -664,9 +671,9 @@ print(response.choices[0].message.content)
 ```yaml
 providers:
   anthropic:
-    api_key_env: ANTHROPIC_KEY
+    api_key: { env: ANTHROPIC_KEY }
   gemini:
-    api_key_env: GEMINI_KEY
+    api_key: { env: GEMINI_KEY }
 
 models:
   claude-sonnet:
@@ -681,9 +688,9 @@ models:
 pools:
   smart:
     members:
-      - target: claude-sonnet
+      - model: claude-sonnet
         weight: 3
-      - target: gemini-flash
+      - model: gemini-flash
         weight: 1
 ```
 
@@ -747,4 +754,4 @@ A heterogeneous pool (members spanning more than one egress protocol) emits a wa
 | `responses` | `POST /v1/responses` | `http://busbar:8080` | `Authorization: Bearer` |
 | `cohere` | `POST /v2/chat` | `http://busbar:8080` | `Authorization: Bearer` |
 | `gemini` | `POST /v1[beta]/models/{model}:generateContent[Stream]` | `http://busbar:8080` (via `api_endpoint`) | `x-goog-api-key` |
-| `bedrock` | `POST /model/{model_id}/converse[-stream]` | `http://busbar:8080` (via `endpoint_url`) | SigV4, with governance: minted `aws_access_key_id`/`aws_secret_access_key` (verified by Busbar); without governance: `auth.chain: []` (+ `upstream_credentials: passthrough` to forward creds) |
+| `bedrock` | `POST /model/{model_id}/converse[-stream]` | `http://busbar:8080` (via `endpoint_url`) | SigV4, with keys: minted `aws_access_key_id`/`aws_secret_access_key` (verified by Busbar); open mode: `auth.chain: []` (+ `upstream_credentials: passthrough` to forward creds) |

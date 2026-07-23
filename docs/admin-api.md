@@ -23,7 +23,7 @@ A missing or wrong credential is `401 unauthorized` (in the same JSON error enve
 | `hooks-register` | reads + hook-definition mutations (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/admin/hooks`) |
 | `full` | everything else: keys, config apply/reload/rollback, the admin auth chain, cache flush |
 
-The operator admin token holds `full`. Group-carrying principals (external modules) get the most permissive `admin_scope` their groups map to in `group_map:` (capped by the module's `max_admin_scope:`); unmapped groups grant nothing. Insufficient scope is `403 forbidden` naming the scope that would have sufficed. Unknown HTTP methods fail closed to `full`.
+The operator admin token holds `full`. Role-carrying principals (external modules) get the most permissive `admin_scope` their roles bind to under `auth.role_bindings.<module>` (capped by the module's `max_admin_scope:`); unbound roles grant nothing. Insufficient scope is `403 forbidden` naming the scope that would have sufficed. Unknown HTTP methods fail closed to `full`.
 
 One **body-derived refinement**: a `hooks-register` principal may define hooks but not wire them into a security-critical path. Registering, replacing, retuning, or deleting a hook that sees content or identity (`prompt`/`user` above `no`) or sets `global: true` requires `full`. A narrow automation token cannot reach caller content by the back door.
 
@@ -158,9 +158,9 @@ The fleet FinOps read. Design principle: busbar exposes the **raw inputs of cost
 ```
 
 - **One bucket, always.** A response is exactly one fixed UTC-day metering bucket (`window` is `[start, end)` epoch seconds). `?window=<bucket-start-epoch>` selects a past bucket (default: the current one); a value that isn't a bucket start, or is in the future, is `400`. Billing periods aggregate client-side from day buckets: raw counts are stored, so the math is exact.
-- **The ledger rule:** `spend_micros` (MICRO-units of the abstract cost unit, integer math - busbar attaches **no currency**; the unit is whatever the operator priced `governance.rate_card` in, and denomination/display is the consumer's concern) is a **mutable estimate** derived at read time per model from the *current* rate card plus the flat per-request fee (a rate correction re-prices history on the next read). Never store it as a ledger charge; **bill from the raw token split**. With no `rate_card` configured, the token component derives to 0 and only the flat fee contributes.
+- **The ledger rule:** `spend_micros` (MICRO-units of the abstract cost unit, integer math - busbar attaches **no currency**; the unit is whatever the operator priced the top-level `rate_card` in, and denomination/display is the consumer's concern) is a **mutable estimate** derived at read time per model from the *current* rate card plus the flat per-request fee (a rate correction re-prices history on the next read). Never store it as a ledger charge; **bill from the raw token split**. With no `rate_card` configured, the token component derives to 0 and only the flat fee contributes.
 - `by_key` is capped at the top 1000 rows by spend; `by_key_truncated` says the cap fired, and `others` (present exactly then) carries the summed remainder, so `total == sum(by_key) + others` always holds. `by_model` is never capped. A deleted key's history keeps its `id` (`name` goes `null`).
-- `as_of` marks read freshness (counters accumulate live). With governance disabled the aggregations are truthfully empty. Key ids/names only, never a token.
+- `as_of` marks read freshness (counters accumulate live). With no keys minted the aggregations are truthfully empty. Key ids/names only, never a token.
 
 Per-key budget *enforcement* state lives on `GET /keys/{id}/usage`, not here.
 
@@ -168,21 +168,21 @@ Per-key budget *enforcement* state lives on `GET /keys/{id}/usage`, not here.
 
 ## Keys
 
-The virtual-key surface at `/api/v1/admin/keys` (requires governance; `full` scope for mutations). Key metadata is `{id, name, allowed_pools, max_budget_cents, budget_period, rpm_limit, tpm_limit, enabled, created_at, budget_group, labels}`, never the secret or hash.
+The virtual-key surface at `/api/v1/admin/keys` (`full` scope for mutations). Key metadata is `{id, name, allowed_pools, group, enabled, created_at, labels}` (`allowed_pools: null` = all pools, `[]` = none), never the secret or hash. Keys are PURE AUTH: every limit lives on the bound group.
 
 | Endpoint | Does |
 |---|---|
-| `POST /keys` | Mint a key: `201`, body is the metadata plus **`secret`, returned exactly once**. `budget_period` ∈ `total`\|`daily`\|`monthly` (default `total`); a negative budget or a zero rate cap is `400` at the door (not a silently dead key). `budget_group` binds the key into a `governance.budget_groups` enforcement chain and must name a configured group (`400` naming the offender otherwise); `labels` (`{"team": "growth"}`) are echoed onto the key's metric series, never interpreted by enforcement. `issue_aws_credential: true` also returns a once-shown `aws_access_key_id` + `aws_secret_access_key` for SigV4 clients |
+| `POST /keys` | Mint a key: `201`, body is the metadata plus the **signed token, returned exactly once**. Body: `{name, group?, allowed_pools?, labels?, expires_in\|expires_at?, issue_aws_credential?}` (default expiry 90d). `group` binds the key into the `groups:` limit chain and must name a configured group (`400` naming the offender otherwise); `allowed_pools` omitted = all pools, `[]` = none (the intent is stored verbatim); `labels` (`{"team": "growth"}`) are echoed onto the key's metric series, never interpreted by enforcement. `issue_aws_credential: true` also returns a once-shown `aws_access_key_id` + `aws_secret_access_key` for SigV4 clients |
 | `GET /keys` | List metadata, id-sorted. Strict filters (`?enabled=true\|false`, `?prefix=vk_ab`) where an unparseable value is a `400`, never a silently dropped filter. Cursor-paginated |
 | `GET /keys/{id}` | One key's metadata + its `ETag` header (16 hex chars) |
-| `PATCH /keys/{id}` | Adjust `enabled`, `rpm_limit`, `tpm_limit`, `max_budget_cents`. The caps are three-state: absent = unchanged, `null` = clear to unlimited, value = set (create-parity validated). Honors `If-Match` |
+| `PATCH /keys/{id}` | Adjust `enabled` and/or `group`. `group` is three-state: absent = unchanged, `null` = unbind (authed + unlimited), value = rebind to an existing group (mint-parity validated). The 1.4.x cap fields are rejected. Honors `If-Match` |
 | `DELETE /keys/{id}` | Revoke: **`204 No Content`**; the key stops resolving immediately. Honors `If-Match`; `404` for an unknown id |
 | `POST /keys/{id}/rotate` | Mint a **fresh secret in place**: `200`, same id (budgets, rate windows, usage history, audit attribution carry over), the old secret stops resolving immediately, the new secret is shown exactly once. An attached AWS credential is untouched |
-| `GET /keys/{id}/usage` | The **enforcement view**: `{id, budget_period, window_start, as_of, spend_cents, tokens, requests, rate_headroom}`, counters against the key's own budget window (labeled, so a consumer can align and reset-detect). `spend_cents` is DERIVED at read time from the key bucket's token ledger x the current `rate_card` plus fee x requests (reprice-on-read; nothing dollar-shaped is stored). `rate_headroom`: the fraction `[0,1]` of the tightest RPM/TPM cap left in the current 60s window (`null` = uncapped), back off *before* tripping a 429 |
+| `GET /keys/{id}/usage` | The **attribution view**: `{id, budget_period: "total", window_start: 0, as_of, group, spend_cents, tokens, requests, rate_headroom}`, the key's all-time attribution counters (its limits, if any, live on the bound group's own windows). `spend_cents` is DERIVED at read time from the key bucket's token ledger x the current `rate_card` plus fee x requests (reprice-on-read; nothing dollar-shaped is stored). `rate_headroom`: the fraction `[0,1]` of the tightest `requests`/`tokens` limit across the group chain left in each limit's own window (`null` = no such limit), back off *before* tripping a 429 |
 
 **Idempotency.** `POST /keys` and `POST /keys/{id}/rotate` accept an **`Idempotency-Key`** header: a retried request with the same key inside the ~10-minute window returns the first response verbatim (including the once-shown secret) instead of double-minting. The cache is scoped per principal (and per operation + key id for rotate), so no other admin's identical header value can replay your secret. A concurrent request while the first is still in flight is a terminal `409 conflict`.
 
-**Governance off**, one unambiguous rule: `GET /keys` answers `200` with an empty page (the keyspace is truthfully empty), single-resource reads answer `404 not_found` (also truthful), and every write answers `409 conflict` with an actionable message (enable `governance:` in config.yaml).
+With no store/keys, one unambiguous rule: `GET /keys` answers `200` with an empty page (the keyspace is truthfully empty), single-resource reads answer `404 not_found` (also truthful), and writes answer with an actionable message.
 
 ---
 

@@ -68,9 +68,11 @@ Always enabled; no config needed.
 | `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout`, `connect`, `transient_upstream`, `attempt_timeout`, `hard_down`, or `context_length`. A high rate on one pool indicates a flapping member. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. Useful for auditing unexpected protocol conversion. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency including failover hops. |
-| `busbar_key_spend_cents` | gauge | `key` + mint labels | Per-virtual-key DERIVED spend (abstract minor units) for the current budget window, recomputed at scrape time from the token ledger x the current `governance.rate_card` plus the flat fee (reprice-on-read). Only emitted when governance is enabled. Use for burn-rate alerting. |
+| `busbar_key_spend_cents` | gauge | `key` + mint labels | Per-virtual-key DERIVED spend (abstract minor units, all-time attribution bucket), recomputed at scrape time from the token ledger x the current `rate_card` plus the flat fee (reprice-on-read). |
+| `busbar_bucket_spend_cents` | gauge | `bucket`, `group`, `window` | Derived spend per (group, window) enforcement bucket (`bucket` = `group:<name>@<window>`). |
+| `busbar_bucket_budget_remaining_cents` | gauge | `bucket`, `group`, `window` | Budget cap minus derived spend, only for buckets with a `budget` limit. Use for burn-rate alerting. |
 | `busbar_key_budget_remaining_cents` | gauge | `key` + mint labels | Max budget minus current derived spend for keys with a `max_budget_cents` cap. Only emitted for capped keys. Drive Prometheus budget-burn alerts. |
-| `busbar_key_tokens_total` | gauge | `key` + mint labels | Accumulated tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
+| `busbar_key_tokens_total` | gauge | `key` + mint labels | Accumulated tokens consumed by each virtual key (all-time attribution bucket). |
 | `busbar_bucket_tokens` | gauge | `bucket`, `model`, `tier` (+ mint labels on key buckets) | Per-(bucket, model, tier) token counters for the bucket's current budget window, from the token ledger. `bucket` is a virtual-key id or `group:<name>`; `tier` ∈ `input`\|`output`\|`cache_read`\|`cache_write`. The raw material for any external per-model cost dashboard (multiply by your own catalog). |
 | `busbar_bucket_spend_cents` | gauge | `bucket` | Derived spend per BUDGET-GROUP bucket (tokens x current rate card; the flat fee counts against key buckets) for its current window. |
 | `busbar_bucket_budget_remaining_cents` | gauge | `bucket` | Budget-group cap minus derived spend. The external-alerting hook: point Alertmanager at 80% burn - busbar ships the hard 100% stop only, alerts live outside the core. |
@@ -83,10 +85,10 @@ Always enabled; no config needed.
 
 **Mint labels.** Key labels attached at mint (`labels: {"team": "growth"}`) are echoed verbatim onto that key's gauge series, so Grafana can `sum by (team)` and Alertmanager can fire per team without busbar knowing what a team is. Label keys are operator-chosen at mint (admin-plane bounded), never request bytes.
 
-**Spend is derived, and the hard cap is per node.** Every spend gauge above is recomputed at scrape time from the token ledger and the current `governance.rate_card`; nothing dollar-shaped is stored, so a rate correction re-prices what you see on the next scrape. When N busbar nodes share a durable store, each node scrapes its own in-memory window counters and enforces the budget hard cap per node (fleet-wide the effective ceiling is up to ~N times a configured cap between flushes; see [operations.md](operations.md)).
+**Spend is derived, and the hard cap is per node.** Every spend gauge above is recomputed at scrape time from the token ledger and the current `rate_card`; nothing dollar-shaped is stored, so a rate correction re-prices what you see on the next scrape. When N busbar nodes share a durable store, each node scrapes its own in-memory window counters and enforces the budget hard cap per node (fleet-wide the effective ceiling is up to ~N times a configured cap between flushes; see [operations.md](operations.md)).
 
 The `pool` label is always a configured pool name or the sentinel `unresolved` (for routes that did not resolve to a pool). It is never a raw client-supplied model string, which would create unbounded label cardinality.
 
-An OTLP traces sink (`observability.otlp_endpoint`) and a request-log webhook (`observability.request_log_webhook_url`) are available for deeper observability. Both are validated at startup against SSRF blocklists (no RFC-1918, loopback, or cloud-metadata targets, except OTLP allows plaintext `http://` to loopback for a local collector). See [configuration.md](configuration.md#observability).
+An OTLP traces sink (`observability.otlp_url`) and a request-log webhook (`observability.request_log_webhook_url`) are available for deeper observability. Both are validated at startup against SSRF blocklists (no RFC-1918, loopback, or cloud-metadata targets, except OTLP allows plaintext `http://` to loopback for a local collector). See [configuration.md](configuration.md#observability).
 
 ---

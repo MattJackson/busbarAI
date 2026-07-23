@@ -15,31 +15,39 @@ Every hook is one of two kinds. That is the only structural distinction: the res
 
 A **tap** watches: logging, audit, metering, shipping records to a SIEM. It can never delay or change a request. A **gate** decides: it can reject the request, restrict which pool members may serve it, re-order the failover walk, or rewrite the request body. The PII guard, the smart router, and the Headroom compressor are all gates: same wire, same timing, same fail-safe, different reply arm.
 
-## The registry
+## Inline instances (no registry)
 
-Hooks are defined once, by name, in a top-level `hooks:` block, then attached where you want them:
+A hook instance is defined INLINE where it runs: in a pool's `hooks: [...]` list or in the
+top-level `global_hooks: [...]` list (there is no separate registry block; a hook is a plugin, and
+its instance is a module ref at its point of use):
 
 ```yaml
-hooks:
-  request-log:  { kind: tap,  socket: /run/busbar/log.sock, prompt: ro }
-  pii-guard:    { kind: gate, socket: /run/busbar/pii.sock, prompt: ro, on_error: reject }
-  smart-router: { kind: gate, socket: /run/busbar/router.sock }          # returns `order`
-  headroom:     { kind: gate, socket: /run/busbar/headroom.sock, prompt: rw, global: true }
-
-global_hooks: [request-log, pii-guard]     # attach to EVERY request
+global_hooks:                              # attach to EVERY request, ordered
+  - { module: socket, settings: { path: /run/busbar/log.sock }, kind: tap, prompt: ro }
+  - { module: socket, settings: { path: /run/busbar/pii.sock },
+      kind: gate, prompt: ro, on_error: reject }
 
 pools:
   my-pool:
-    hooks: [cheapest, smart-router]        # this pool's base ordering + a gate
+    hooks:
+      - cheapest                           # this pool's base ordering strategy (a bare name)
+      - { module: socket, settings: { path: /run/busbar/router.sock } }   # a gate: returns `order`
     members:
-      - target: claude-opus
-      - target: claude-opus-bedrock
+      - model: claude-opus
+      - model: claude-opus-bedrock
         tags: ["baa"]
 ```
 
-Each hook declares **exactly one transport**: `socket` (an absolute Unix-socket path; lazy-connect, so the hook may start after Busbar) or `webhook` (an `https://` URL, validated at boot against the SSRF blocklist: loopback sidecars allowed, RFC-1918 / link-local / CGNAT / cloud-metadata rejected).
+The `module` names the transport: the built-in `socket` (`settings.path`, an absolute Unix-socket
+path; lazy-connect, so the hook may start after Busbar) or `webhook` (`settings.url`, an
+`https://` URL, validated at boot against the SSRF blocklist: loopback sidecars allowed,
+RFC-1918 / link-local / CGNAT / cloud-metadata rejected), or a loaded `kind: hook` plugin.
 
-**Attach a hook** three ways: name it in a pool's `hooks:` list, list it in `global_hooks:`, or set `global: true` on the definition (sugar for "add me to `global_hooks`"). A pool's `hooks:` list carries its ordering strategy (`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`) and any number of gates.
+**Attach a hook** two ways: an inline ref in a pool's `hooks:` list (fires for that pool) or in
+`global_hooks:` (fires on every request). A pool's `hooks:` list carries its ordering strategy
+(`weighted`/`cheapest`/`fastest`/`least_busy`/`usage`, a bare name, at most one) and any number of
+gates. In a pool list an unmarked ref defaults to `kind: gate`; in `global_hooks` it defaults to
+`kind: tap`.
 
 **Gates fire concurrently.** All of a request's decision gates (the pool's own and every global) fire at once against the same candidate set, then reconcile deterministically: any **reject** wins (the lowest-`priority` gate's status/message surfaces), **restrict**s intersect, and with several **order**s the last in the priority chain wins, re-validated against the post-restrict set. Added latency is the slowest gate, not the sum.
 
@@ -84,8 +92,8 @@ Grants are a monotonic trust ladder (`no ⊂ ro ⊂ rw`) and are **immutable aft
 ### What a gate receives
 
 - **The request projection**: `pool`, `ingress_protocol`, `message_count`, `has_tools`, `total_chars` (a size signal; token counts do not exist pre-dispatch), `max_tokens`, `stream`. With `prompt: ro`/`rw`, also the flattened `system` + `messages` text. With `user: ro`, also caller identity.
-- **The candidate projection**: one entry per healthy member: `cost_per_mtok` (operator-declared), `latency_ms` (rolling EWMA), `available_concurrency` (free slots now), `budget_remaining`, `rate_headroom` (fraction, from governance), and your `tier`/`tags` labels. The full task/latency/cost/quality picture, every signal a built-in strategy ranks on is on the wire, so an external hook can implement any of them identically.
-- **The budget-chain state** (when governance is active and the request carries a virtual key): the whole enforcement chain the request must clear, one entry per bucket from the key's own bucket out through every ancestor budget group, each `{bucket_id, budget_group?, spend_micros_at_current_rate, remaining_micros, window}`. `spend_micros_at_current_rate` is derived at hook-call time from the token ledger times the current `governance.rate_card` (micro-units, 10,000 per cent). This is the read surface for budget-aware routing: a gate can see how close the key or its team is to a cap and downshift to a cheaper `tier`. Busbar exposes the state only; the routing policy lives entirely in your hook.
+- **The candidate projection**: one entry per healthy member: `cost_per_mtok` (derived from the model's `rate_card` entry), `latency_ms` (rolling EWMA), `available_concurrency` (free slots now), `budget_remaining`, `rate_headroom` (fraction: the tightest requests/tokens limit headroom across the key's group chain), and your `tier`/`tags` labels. The full task/latency/cost/quality picture, every signal a built-in strategy ranks on is on the wire, so an external hook can implement any of them identically.
+- **The budget-chain state** (when the request carries a virtual key): the whole enforcement chain the request must clear, one entry per bucket from the key's own attribution bucket out through every ancestor group's budget-window buckets (`bucket_id` = `group:<name>@<window>`), each `{bucket_id, budget_group?, spend_micros_at_current_rate, remaining_micros, window_start, budget_period}`. `spend_micros_at_current_rate` is derived at hook-call time from the token ledger times the current top-level `rate_card` (micro-units, 10,000 per cent). This is the read surface for budget-aware routing: a gate can see how close the key or its team is to a cap and downshift to a cheaper `tier`. Busbar exposes the state only; the routing policy lives entirely in your hook.
 
 ## The gate reply arms
 
@@ -97,10 +105,10 @@ A gate answers with exactly one of:
 - **order** (`{"order": [idx, ...]}`): rank the surviving candidates, most-preferred first (omitted members are demoted, not excluded). That order becomes the failover walk: Busbar tries your first choice, and on a pre-first-byte failure walks to your second. You choose the order; the breaker, concurrency caps, and failover budget still apply.
 - **rewrite** (`{"rewrite": {"messages": [...], "tools": [...]}}`): replace the request body (compression, redaction). Requires `prompt: rw`. Note the asymmetry: a hook *receives* messages as `{role, text}` (the flattened projection) but *replies* in body form (`{role, content}`); the system prompt is not rewritable; and a socket reply is capped at 64 KiB, which bounds very large rewrites. Body-only: a rewrite never changes routing, the principal, or the target dialect. It fires **before dispatch and before the routing decision**, so both the decision and every upstream see the rewritten body, and it persists across failover. Token accounting (budgets, metrics) is on the provider-reported usage of the rewritten body: the savings are real and measured. A malformed/oversized rewrite follows `on_error` (default: proceed with the body **unmodified**; a broken compressor never corrupts a request).
 
-## Defaults and ordering
+## Ordering
 
-- **`default: true`** on an ordering gate makes it the base ordering that any pool which named none inherits, replacing the built-in `weighted` floor (exactly as `auth: [sso]` replaces the built-in `tokens`). At most one hook may be the default (a boot error names both otherwise); a pool that named its own base keeps its choice, and a pool's own gates layer ON TOP of whatever base it has. No default set ⇒ the zero-cost inline `weighted` backstop.
 - **`priority: <n>`** is the one ordering knob: it orders the rewrite transform chain (each rewrite sees the prior's output) and tie-breaks the concurrent decision reconcile: which reject's message surfaces, and which `order` counts as "last". Ties keep globals first, then config order.
+- A pool that names no strategy gets the zero-cost inline `weighted` backstop. (The 1.4.x `default: true` registry flag is gone with the registry: name the base strategy per pool.)
 
 ## What Busbar guarantees when a hook misbehaves
 
@@ -112,7 +120,7 @@ A gate answers with exactly one of:
 | `on_error: weighted` | Falls back to the weighted floor: a broken hook is indistinguishable from no hook. Behaviorally identical to `nothing` (in the concurrent reconcile both mean "didn't participate"); the two names exist so a config reads correctly: `weighted` for ordering gates, `nothing` for everything else. |
 | `on_error: first` | Config order, deterministic |
 | `on_error: reject` | Fail closed with a 503, for security gates, where an unscreened request is worse than none. Docs mandate this for security gates. |
-| `on_error: <hook-name>` | **A named fallback**: when this gate fails, that hook fires in its place (its decision is honored exactly as a primary's, projected per **its own** grants). Its own `on_error` chains further; Busbar proves at boot that every chain terminates: an unknown name, a tap, or a cycle is a startup error. `weighted`/`reject`/`first` are the reserved chain terminals; a ranking strategy name (`cheapest`, …) is also a valid, infallible fallback. |
+| `on_error: { hook: <name> }` | **A named fallback** (structured ref): when this gate fails, that hook fires in its place (its decision is honored exactly as a primary's, projected per **its own** grants). Its own `on_error` chains further; Busbar proves at boot that every chain terminates: an unknown name, a tap, or a cycle is a startup error. `weighted`/`reject`/`first` are the reserved chain terminals; a ranking strategy name (`cheapest`, …) is also a valid, infallible fallback. |
 
 A `tap`, being fire-and-forget, has no `on_error` to speak of: its reply is discarded, its errors swallowed, its delivery bounded and dropped-under-pressure. It can never delay, reorder, or fail a request.
 
@@ -146,7 +154,7 @@ changes. The rules a hook author must know:
 ## Management messages: `configure`, `describe`, `status`
 
 - **`configure`**: Busbar pushes the hook's opaque `settings` map, stamped with the hook's
-  **registry name**, a `settings_version`, and Busbar's version. It is the **first message on every
+  **instance name**, a `settings_version`, and Busbar's version. It is the **first message on every
   socket connection, always**, including a hook with no settings (an empty `settings: {}` is valid
   desired-state), so a (re)started hook always hears its identity, current settings, and Busbar's
   version before any traffic. It is also pushed live by

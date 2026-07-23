@@ -125,4 +125,8 @@ that dies inside that window can still be rerouted invisibly. Costs up to *T* ms
 added TTFT, so it will be opt-in per pool and default to off (today's behavior).
 Not yet built; no config surface exists for it.
 
-APIs and config are stable at 1.0.0 under Semantic Versioning, no breaking change without a major-version bump.
+The SemVer-stable contract is the RUNTIME: the data-plane HTTP surface and the six wire protocols do
+not break without a major-version bump. The config format is an operator deployment artifact outside
+that freeze: it may change between releases, always with a migration path (`busbar --migrate-config`)
+and a loud fail-closed boot on an outdated config. The admin API carries its own contract version
+(`/api/v1/admin`).

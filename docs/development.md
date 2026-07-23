@@ -29,7 +29,7 @@ and the two common extension tasks.
 | `proto/mod.rs` | The protocol seam: `ProtocolReader` / `ProtocolWriter` traits, `Protocol`, `ProtocolRegistry`, `SigningContext`, `probe_body` default. `proto/detect.rs` sniffs the ingress protocol; `proto/openai_family.rs` holds the shared OpenAI-family bits; `proto/stream.rs` is the cross-protocol stream translator and SSE reframing. |
 | `proto/{anthropic,openai_chat,openai_responses,gemini,bedrock,cohere}/` | One folder-module per protocol: each holds the Reader (wire→IR + error extraction) and Writer (IR→wire + auth + paths). Bedrock's writer overrides `sign_request` for SigV4. |
 | `sigv4.rs` | Hand-rolled AWS SigV4 (RustCrypto sha2 + hmac, no AWS SDK): `sign_v4`, `signing_key`, `uri_encode_path`, `format_amz_time`, `sha256_hex`. |
-| `governance/mod.rs` | Virtual keys + budgets + rate limits (ADR-0009): `GovState`, `VirtualKey`, budget/rate windows, key hashing, and the token-ledger cost model. The governance `Store` trait itself lives in the `busbar-api` crate (`crates/api/src/store.rs`); concrete backends are separate crates (`busbar-store-memory` compiled in by default, `busbar-store-sqlite` / `-postgres` / `-redis` as static or dynamically-loaded plugins chosen by `governance.store`). |
+| `governance/mod.rs` | Signed virtual keys + the generic group limit engine (ADR-0009): `GovState`, `VirtualKey`, `try_admit` over the per-(group, window) buckets, the revocation denylist, and the token-ledger cost model. The governance `Store` trait itself lives in the `busbar-api` crate (`crates/api/src/store.rs`); concrete backends are separate crates (`busbar-store-memory` compiled in by default, `busbar-store-sqlite` / `-postgres` / `-redis` as static or dynamically-loaded plugins chosen by `store.module`). |
 | `admin/` | The admin API: `admin/mod.rs` mounts the `/api/v1/admin/*` handlers (keys, usage, config, hooks, plugins) on the separate admin listener, `admin/v1/` is the frozen JSON contract, and `admin/rate.rs` / `admin/audit.rs` carry admin rate-limiting and the hash-chained audit log. |
 | `health.rs` | Active health probing (`spawn_probers`, `probe_lane` using each protocol's `probe_body`) and the `/stats` + `/healthz` handlers. |
 | `metrics.rs` | Prometheus recorder init + the `busbar_*` metric name constants. |
@@ -69,7 +69,7 @@ Busbar reads two YAML files, located via env vars:
 
 Both files support `${VAR}` interpolation expanded at load time; an unset
 referenced variable is a hard startup failure. Provider keys are supplied via the
-env vars named by each provider's `api_key_env`, never written into the files.
+env vars (or files/secret plugins) named by each provider's `api_key` secret reference, never written into the files.
 
 ```bash
 export BUSBAR_CLIENT_TOKEN=dev-token
@@ -151,7 +151,7 @@ key) and point a model at it:
 ```yaml
 providers:
   my-provider:
-    api_key_env: MY_PROVIDER_KEY
+    api_key: { env: MY_PROVIDER_KEY }
 models:
   my-model:
     provider: my-provider

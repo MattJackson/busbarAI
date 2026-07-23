@@ -12,190 +12,261 @@ item under **Changed**.
 ## [Unreleased]
 
 
-## [1.5.0], 2026-07-20
+## [1.5.0], 2026-07-22
+
+The config / identity / cost REDESIGN release. 1.5.0 is a deliberate, tooled, BREAKING-FOR-OPERATORS
+step: the config format changed shape (run `busbar --migrate-config`), and every 1.4.x virtual key
+stops working and must be re-minted. It is still a MINOR version because the SemVer contract is
+now stated honestly (see **Changed**): the frozen surface is the RUNTIME an application integrates
+against (the data-plane HTTP surface + the six wire protocols), which does NOT break here - an app
+posting to `/v1/chat/completions` is byte-identical. The key re-mint is a CREDENTIAL ROTATION and
+the release's security headline: 1.x keys never expired; 1.5.0 keys are signed tokens that do.
 
 ### Added
 
-- **The 1.5.0 cost model: tokens are the ledger, dollars are derived.** The governance store now
-  accumulates an immutable TOKEN LEDGER per (bucket, window, model, tier) - input, output,
-  cache-read, and cache-write tokens, each priced differently - and every spend figure
-  (enforcement, admin reads, metrics, hooks) is COMPUTED at read time as
-  `tokens x governance.rate_card + requests x price_per_request_cents`. Nothing dollar-shaped is
-  stored or crosses the store wire, so correcting a rate is a config edit + reload: historical and
+- **The clean 1.5.0 config.** One governing principle: the object that OWNS a concept is the ONLY
+  place it is defined, and the same KIND of thing is expressed the same WAY everywhere. `module` +
+  `settings` for every loadable unit (store, secret, auth, hook); ONE limit shape; ONE secret
+  shape; reference fields name the referenced thing (`model`, `group`, `provider`, `module`);
+  windows are nouns (`minute|hour|day|month|total`); `on_X` handlers are keyword-bare or
+  structured refs; an OMITTED list means "all" and an explicit `[]` means "none", everywhere.
+  Every operator struct rejects unknown fields (a typo fails boot, never a silent no-op). The
+  canonical example lives at `examples/clean-config-1.5.0.yaml` and boots under `busbar
+  --validate`.
+- **`groups:` - the ONE limit tree.** A group is a named enforcement bucket: `{ parent?, enabled,
+  limits: [...] }`, forming an acyclic chain (depth <= 8). A limit is generic:
+  `{ requests|tokens|budget: <amount>, per: <window> }`, or `{ concurrent: <n> }` (instantaneous
+  in-flight gauge, no window). Admission walks the chain UP through `parent` and ANDs EVERY limit
+  of EVERY group atomically (all-or-nothing charging); the rejection NAMES the exact blocking
+  bucket (group + metric + window) with `Retry-After` for rolling windows. `enabled: false`
+  FREEZES a group (and every descendant) while keeping its history. Requests are enforced
+  precisely; tokens are best-effort post-paid (the old TPM posture); budget derives at check time
+  from the token ledger x the current rate card + the flat fee; `concurrent` holds release
+  automatically when the response stream completes.
+- **KEYS ARE PURE AUTH + THEY EXPIRE.** A minted key is a busbar-SIGNED token `{sub, exp, kid}`
+  (ed25519). Verify = signature + expiry (stateless) + a small revocation denylist; policy (the
+  bound `group`, `allowed_pools`) is resolved from the store by `sub`, so policy is mutable
+  without re-issuing the credential. Keys carry NO limits - a key resolves to a group, and a key
+  with no group is authed + unlimited (access only). Mint body:
+  `{ name, group?, allowed_pools?, labels?, expires_in|expires_at?, issue_aws_credential? }`
+  (default lifetime 90 days). Revoke = denylist entry, live across every store backend. The
+  signing key is `auth.signing_key` (a secret reference, fleet-shared); absent, busbar generates
+  one 0600 on first boot. Rotating it revokes every outstanding key.
+- **SECRETS ARE PLUGINS (`kind: secret`).** Every secret value in config is a secret REFERENCE:
+  `{ env: VAR }`, `{ file: /path }` (the built-in secret modules), or
+  `{ module: <secret-plugin>, settings: {...} }` for third-party sources (vault, cloud secret
+  managers) loaded through the same signed-plugin trust pipeline. Applies to provider `api_key`,
+  `auth.signing_key`, the admin token, and every TLS cert/key/CA. No `*_env` suffix fields
+  remain.
+- **HOOKS ARE PLUGINS - no `hooks:` registry block.** A hook INSTANCE is referenced inline where
+  it runs: in `pools.<p>.hooks` (ordered) and `global_hooks` (ordered). A bare name is a built-in
+  ordering strategy (`weighted | cheapest | fastest | least_busy | usage`); everything else is a
+  module ref `{ module: webhook|socket|<kind: hook plugin>, settings: {...}, kind?, timeout_ms?,
+  on_error?, prompt?, user?, priority?, at? }`. The socket/webhook transports are built-in hook
+  MODULES (`settings.path` / `settings.url`), so out-of-process hooks persist; the registry and
+  the `global:`/`default:` flags are gone (subsumed by the two lists).
+- **`auth.role_bindings` NESTED BY MODULE.** `role_bindings.<module>.<role> ->
+  { allowed_pools?, group?, admin_scope? }` - pure auth. A role asserted by one module can never
+  ride another module's binding (`ad.platform` != `oidc.platform`); an unbound role grants
+  nothing (fail closed). Admin access = a role's `admin_scope` (ceilinged by the asserting
+  module's `max_admin_scope`) OR the `admin-tokens` operator credential, now a secret reference
+  under the module entry itself.
+- **The 1.5.0 cost model: tokens are the ledger, dollars are derived.** The store accumulates an
+  immutable TOKEN LEDGER per (bucket, window, model, tier) - input, output, cache-read,
+  cache-write - and every spend figure (enforcement, admin reads, metrics, hooks) is COMPUTED at
+  read time as `tokens x rate_card + requests x per_request_fee`. Nothing dollar-shaped is stored
+  or crosses the store wire, so correcting a rate is a config edit + reload: historical and
   future derived spend become right on the next read, with no re-billing and no data migration.
   (Honest limit: repricing cannot un-make PAST admit/reject decisions taken under a wrong rate.)
-- **Per-model rate card (`governance.rate_card`).** Per-model, per-tier token rates in MICRO-units
-  per token of an ABSTRACT cost unit (busbar attaches no currency; denomination is the consumer's
-  display concern). ALL-OR-NOTHING: absent = every model's tokens price at 0 (budgets count only
-  the flat per-request fee); present = authoritative and COMPLETE - every configured model must
-  have an entry or boot/`--validate` fail, printing a copy-pasteable zeroed YAML stub of exactly
-  the missing models. A request for an arbitrary passthrough model with no rate is rejected
-  pre-forward. A pool member's `cost_per_mtok` also accepts the 4-tier map form as a per-member
-  billing override for its resolved upstream model (the bare number stays a routing-only signal).
-- **Budget groups (`governance.budget_groups`).** Nestable enforcement buckets above the per-key
-  budget: `name: { max_budget_cents, budget_period, parent? }` (acyclic, parents-exist, depth <= 8,
-  all validated with paste-ready fixes). A key binds with the mint field `budget_group` (named to
-  never collide with the auth `group_map`, whose union semantics are the opposite) and keeps its
-  optional inline budget as the innermost bucket. Admission walks the whole chain atomically -
-  AND / most-restrictive, all-or-nothing charging - and the 429 `insufficient_quota` NAMES the
-  exhausted bucket ("budget group 'growth' exhausted"). Each bucket evaluates its own
-  `budget_period` window. A key naming a missing group fails closed (mint 400, boot error with a
-  paste-ready stub, runtime 429).
-- **Mint-time key `labels`.** `POST /keys` accepts `labels: {"team": "growth"}`, echoed verbatim
-  onto the key's Prometheus series so external dashboards `sum by (team)` and Alertmanager fires
-  at 80% burn without busbar knowing what a team is.
-- **Cost-model metrics.** `busbar_bucket_tokens{bucket, model, tier}` scrape gauges for key and
-  budget-group buckets (the raw material for external per-model cost dashboards), plus derived
-  `busbar_bucket_spend_cents` / `busbar_bucket_budget_remaining_cents` per group at the current
-  rate card. All emission stays on the scrape path, never the admit decision.
-- **Budget state on the routing hook seam.** `RoutingContext.budget` (and the webhook/socket wire's
-  `context.budget`) carries `{bucket_id, budget_group?, spend_micros_at_current_rate,
-  remaining_micros?, window_start, budget_period}` for the caller key and every ancestor group, so
-  a hook can downshift to a cheaper model as a bucket nears its cap. Busbar ships the READ surface
-  only; routing policy stays in the hook.
-- **Paste-ready `--validate` fixes (binary-wide UX rule).** Every validate failure with a
-  mechanical fix prints the exact snippet to paste (missing rate-card entries -> zeroed stubs,
-  missing budget-group parents -> a stub group, invalid periods -> the valid set plus a corrected
-  line); non-mechanical faults (a parent-chain cycle) print the exact offending path plus the
-  minimal instruction.
+- **Top-level `rate_card:` - the ONLY cost source.** Per-model, per-tier token rates in
+  MICRO-units per token of an ABSTRACT cost unit (busbar attaches no currency). ALL-OR-NOTHING:
+  absent = every model's tokens price at 0 (budgets count only `per_request_fee`); present =
+  authoritative and COMPLETE - every configured model must have an entry or boot/`--validate`
+  fail with a paste-ready zeroed stub. A request for an arbitrary passthrough model with no rate
+  is rejected pre-forward. Routing's `cheapest` strategy derives its scalar from the card; pool
+  members carry no cost.
+- **`busbar --migrate-config <old.yaml>`.** Mechanically converts the deterministic 1.4.x
+  changes (`governance:` -> `store`/`rate_card`/`per_request_fee`/`groups`/`advanced`;
+  `group_map` -> `role_bindings` with inline caps moved into a generated `groups:` entry;
+  `api_key_env` -> `api_key: { env: ... }`; member `target` -> `model`; the `hooks:` registry ->
+  inline refs; breaker/failover aliases; `price_per_1k_tokens_cents` -> synthesized `rate_card`;
+  `otlp_endpoint` -> `otlp_url`) and prints TODO comments where a human must decide, with a LOUD
+  warning on every `allowed_pools: []` occurrence (its meaning FLIPPED: it used to mean all
+  pools, it now means none). Zero side effects: the new YAML goes to stdout, the change summary
+  to stderr.
+- **Loud fail-closed boot on a 1.x config.** Boot AND `--validate` detect the 1.x structural
+  markers (a `governance:` block, `auth.group_map:`, `auth.mode:`, a top-level `hooks:` block,
+  `*_env` secret fields, `target:` in a pool member) and REFUSE to start: "this looks like a
+  busbar 1.x config; run `busbar --migrate-config` and review the flagged items." Nothing from
+  1.x can boot-and-silently-flip semantics.
+- **Store plugins: durable backends load from a dynamic library, and the default binary is
+  lean.** SQLite, Postgres, and Redis stores ship as signed plugin tarballs loaded in-process at
+  boot over a versioned store C ABI when `store.module` names them (`memory`, the compiled-in RAM
+  store, is the zero-setup default). New workspace crates: `busbar-plugin-abi`,
+  `busbar-plugin-sdk` (`export_store_plugin!`), `busbar-plugin-loader` (all FFI `unsafe`
+  isolated; the engine keeps `forbid(unsafe_code)`). Store calls are write-behind, off the
+  request hot path. Postgres/Redis are the shared multi-node stores (keys, usage, audit,
+  denylist cluster-shared); the budget hard cap remains per-node between additive flushes
+  (documented fleet honesty).
+- **The dynamic plugin system: one signed tarball per plugin, a top-level `plugins.*` block, and
+  a three-phase fail-closed load pipeline.** Store, secret, auth, and hook plugins share ONE
+  artifact format, ONE trust model, ONE loader, discriminated by the manifest `kind`. Phase 1
+  STRUCTURAL (in-memory unpack, manifest completeness, sha256, abi gate - any invalid tarball in
+  an enabled dir aborts boot naming file + reason); phase 2 TRUST (busbar's release key is
+  EMBEDDED - first-party plugins verify with zero config and are auto-floored at the binary's
+  version; `trust.publishers` allowlists third-party ed25519 keys; `trust.allow_unsigned` /
+  `trust.allow_third_party` are EXPLICIT opt-ins, both default `false`, and an untrusted plugin
+  is logged and SKIPPED - never `dlopen`ed); phase 3 CONFLICT (no two loadable plugins share a
+  name/alias). The loader maps EXACTLY the verified bytes (`memfd_create` on Linux; a private
+  `0700` staging dir elsewhere) - a pre-existing on-disk library is never loaded, closing the
+  verify-then-load TOCTOU. `plugins.min_versions` adds per-plugin anti-downgrade floors.
+- **Admin plugin API.** The admin surface manages the plugin catalog over its own versioned
+  contract: list/inspect installed plugins (manifest, signature verdict, load status), install a
+  signed tarball, and remove one - with the same trust pipeline as boot (an untrusted upload is
+  refused, never loaded) and same-name/different-file conflicts rejected.
+- **`busbar --validate` covers the whole new surface** with paste-ready fixes: rate-card
+  completeness (zeroed stubs of exactly the missing models), groups tree faults (missing parent
+  stub, cycle path, depth), role_bindings module/role checks, secret-module resolvability, key
+  group existence, plugin pre-flight (consistency, trust, three-phase scan, store resolution) -
+  the SAME code path boot runs, so a clean `--validate` means a clean boot. New
+  `busbar --list-plugins` prints the manifest-only inventory without loading plugin code.
+- **Limit-dimension metrics.** Scrape-time gauges are keyed by the new enforcement dimensions:
+  `busbar_bucket_spend_cents` / `busbar_bucket_budget_remaining_cents` /
+  `busbar_bucket_tokens{model,tier}` carry `{bucket, group, window}` labels, one series per
+  (group, window) bucket, all derived from the token ledger at the CURRENT rate card at scrape
+  time. Mint-time key `labels` (e.g. `{"team": "growth"}`) echo onto per-key series so external
+  dashboards `sum by (team)` without busbar knowing what a team is.
+- **Budget state on the routing hook seam.** `RoutingContext.budget` (and the webhook/socket
+  wire's `context.budget`) carries `{bucket_id, budget_group?, spend_micros_at_current_rate,
+  remaining_micros?, window_start, budget_period}` for the caller key and every ancestor group
+  bucket, so a hook can downshift to a cheaper model as a bucket nears its cap.
+- **PGO release builds.** Host-native release binaries are built through a profile-guided
+  optimization pipeline (instrument, replay a representative traffic profile, rebuild), as part
+  of the standard release workflow.
 
 ### Changed
 
-- **Store contract + plugin ABI v2 (breaking, pre-release).** `busbar_api::Usage` (the scalar
-  `{spend_cents, tokens, requests}`) is replaced by the token-ledger shapes
-  (`UsageLedger`/`UsageDelta` with per-model `TierTokens`); `Store::{get,put,add}_usage` re-key
-  from `key_id` to `bucket_id` (key buckets and budget-group buckets share the machinery) and
-  carry NO dollar field. `add_usage` ships per-(model, tier) signed token deltas (the
-  fleet-additive cross-node flush; each node derives spend locally from its own rate card). The
-  store plugin ABI is v2; sqlite (`PRAGMA user_version`), postgres (`busbar_schema`), and
-  redis (`busbar:schema`) stamp schema v2 and DROP a pre-v2 dev schema on open (there was no
-  earlier stable cost-model schema to migrate from).
-- **`VirtualKey` grows `budget_group` + `labels`** (serde-defaulted; pre-cost-model persisted rows
-  keep deserializing).
-- **Admin usage reads derive per model.** `GET /usage` prices each metering row at the current
-  rate card (plus the flat fee) instead of a blended per-1k price, and the response no longer
-  carries a `currency` field - `spend_micros` is denominated in the operator's abstract cost unit.
-- **Docs corrected alongside (audited overstatements).** Budget accuracy is now stated as
-  derived-from-the-rate-card (not "token-accurate" flat pricing); budget scoping is per-key /
-  per-budget-group (not "per team"); the governance store default is documented as in-memory (not
-  SQLite); the budget hard cap carries the per-node fleet caveat everywhere it is described.
-- **Governance is now always available; `governance.enabled` is removed.** Governance no longer has an
-  on/off switch. It is always present and simply INERT until an admin token is set and virtual keys are
-  minted (a default deploy with no admin token behaves exactly as "off" did, with identical RAM). The
-  durable-store backend is now the choice, via **`governance.store`**: `memory` (default, ephemeral RAM,
-  zero-setup) or a durable backend (`sqlite`, `postgres`, or `redis`) that persists to `db_path`. The
-  engine names storage only through the `Store` contract; every backend is a swappable crate
-  (`busbar-store-memory`, `busbar-store-sqlite`, `busbar-store-postgres`, `busbar-store-redis`), the
-  durable ones also shipping as loadable plugins (see **Added**).
-- **Migration.** A config that sets `governance.enabled` will fail to start (unknown field). Remove it.
-  **If you relied on SQLite persistence, you must now set `governance.store: sqlite`**, otherwise
-  governance defaults to the ephemeral in-memory store and keys/budgets reset on restart. On the RAM
-  default, busbar logs a startup warning to that effect.
-
-### Added
-
-- **Store plugins: durable backends load from a dynamic library, and the default binary is lean.** The
-  SQLite store is no longer compiled into the engine; it ships as a droppable plugin
-  (`libbusbar_store_sqlite_plugin.{so,dll,dylib}`) that busbar loads in-process at boot over a stable,
-  versioned **store C ABI** when `governance.store: sqlite`. That drops the bundled ~4.7 MB SQLite C
-  amalgamation from the default build (**release binary ~14 MB → ~9.4 MB**). New workspace crates:
-  `busbar-plugin-abi` (the frozen ABI, five extern-C symbols carrying JSON `StoreRequest`/`Response`),
-  `busbar-plugin-sdk` (`export_store_plugin!` to author a store in Rust and build it as a `cdylib`), and
-  `busbar-plugin-loader` (the `libloading` loader; all FFI `unsafe` is isolated here, so the engine keeps
-  its `forbid(unsafe_code)` guarantee). A store call is JSON over the C ABI, off the request hot path
-  (write-behind), so it never touches latency. The same store crate also links statically, so a build can
-  compile a backend straight in, no `cfg` sprawl.
-- **The dynamic plugin system: one signed tarball per plugin, a top-level `plugins.*` block, and a
-  three-phase fail-closed load pipeline.** A plugin is a plugin: store, auth, and hook plugins share
-  ONE artifact format, ONE trust model, ONE loader, discriminated only by the manifest `kind` field.
-  Each plugin ships as a single signed `.tar.gz` containing exactly the cdylib and its signed
-  `manifest.json` (`name`, `alias`, `kind`, `version`, `publisher`, `abi_version`, `sha256` of the
-  library, and an ed25519 `signature` over the whole manifest) — identity comes from the SIGNED
-  manifest, never the filename. Configuration moved OUT of `governance` into a top-level block:
-
-  - **`plugins.enabled` (MASTER SWITCH, default `false`)**: with it off (or the block absent) NO
-    plugin is ever loaded — a dropped-in tarball is inert. Referencing a plugin store while it is
-    off (`governance.store: redis` etc.) is a boot error naming the flag.
-  - **`plugins.dir` (default `plugins`)**: where the tarballs live.
-  - **`plugins.trust`**: busbar's own release PUBLIC key is EMBEDDED in the binary — first-party
-    (busbar-signed) plugins verify with ZERO configuration, and their versions are automatically
-    floored at the running binary's version (a validly-signed but old first-party release cannot be
-    replayed). `trust.publishers` allowlists THIRD-PARTY ed25519 keys; `trust.allow_unsigned` /
-    `trust.allow_third_party` (both default `false`) are the explicit opt-ins for everything else.
-  - **`plugins.min_versions`**: per-plugin anti-downgrade floors (third-party; first-party is
-    automatic), keyed by the manifest name.
-
-  Loading is three-phase and FAIL-CLOSED: (1) STRUCTURAL — the tarball unpacks fully in memory
-  (bounded, hardened), the manifest parses and is complete/well-formed, `sha256(lib)` matches, and
-  the `abi_version` is supported; ANY invalid tarball in an enabled plugins dir aborts boot with the
-  file and reason named. (2) TRUST — signature vs the embedded key / allowlist / opt-ins;
-  untrusted plugins are logged and SKIPPED (never `dlopen`ed). (3) CONFLICT — no two loadable
-  plugins may share a name or alias (you cannot run `redis` and a third-party `redis` at once); any
-  collision aborts boot naming both. Only then is a plugin registered, addressable by canonical
-  name AND alias. The loader maps EXACTLY the verified bytes: `memfd_create` on Linux (zero disk
-  files) or a per-process private `0700` staging dir elsewhere (unload-then-remove on shutdown,
-  dead-pid sweep at boot); a pre-existing on-disk library is never loaded.
-- **`busbar --validate` now validates the plugin surface too**, running the SAME pre-flight
-  pipeline boot runs (consistency, trust policy, three-phase scan, store resolution) with zero side
-  effects and no `dlopen` — if `--validate` passes, boot's plugin half succeeds; if it fails, it
-  names exactly what is wrong. New **`busbar --list-plugins`** prints a manifest-only inventory
-  (name/alias/kind/version, signature verdict, load status with the exact skip/invalid reason)
-  without ever loading plugin code.
-- **Distribution pipeline.** The release workflow builds, signs (with the `BUSBAR_SIGN_KEY` CI
-  secret), and packages one store-plugin tarball per (plugin, target) and attaches them to the
-  GitHub Release with build-provenance attestations; release binaries embed the matching public key
-  (`BUSBAR_RELEASE_PUBKEY`). New `busbar-plugin-pack` CLI (`pack` / `keygen`) for the pipeline and
-  for third-party plugin authors.
-- **Postgres store plugin (`governance.store: postgres`)**: the shared, multi-node durable store:
-  one Postgres behind a fleet of busbar nodes, so virtual keys, accumulated usage, and the audit
-  log are shared across the cluster. Install the `busbar-store-postgres` plugin tarball and set
-  `governance.db_path` to a `postgres://` URL. Same `Store` contract as SQLite, drop-in
-  interchangeable. **Fleet-budget honesty:** the budget HARD CAP is enforced PER NODE from each
-  node's in-memory counters (the 1.5.0 admission perf win) and reconciled durably via additive
-  flushes — the shared store holds the true fleet total, but with N nodes splitting traffic the
-  effective cap is up to ~N times the configured value until flushes reconcile. Keys, usage, and
-  audit are genuinely cluster-shared; the hard cap is not a synchronous cluster-wide gate.
-- **Redis store plugin (`governance.store: redis`)**: a second shared, multi-node durable store
-  with the same contract and the same per-node-cap / cluster-shared-data semantics as Postgres.
-  Install the `busbar-store-redis` plugin tarball and set `governance.db_path` to a `redis://`
-  (or TLS `rediss://`) URL.
-- **Migration.** A durable store (`governance.store: sqlite` / `postgres` / `redis`, or any
-  third-party store by its manifest name) now requires `plugins.enabled: true` and its signed
-  plugin tarball in `plugins.dir`, or busbar fails to start with a message naming the flag/plugin.
-  The default `store: memory` needs no plugin. The 1.5.0-dev `governance.plugins_dir` and
-  `governance.trust.*` keys moved to the top-level `plugins.*` block (`plugins.dir`,
-  `plugins.trust.allow_unsigned` / `allow_third_party` / `publishers`, `plugins.min_versions`).
-- **`governance.usage_flush_interval_ms` (default 100)**: write-behind flush cadence (ms) for the
-  in-memory governance usage/budget counters. On an ungraceful crash (`kill -9` / power loss) at most this
-  window of accrued spend/requests can be lost; a graceful shutdown flushes fully.
-
-### Changed
-
-- **Governance budget enforcement is now in-memory on the request path.** The per-request budget
-  check-and-charge is an atomic in-memory hard cap (mirroring the existing rate limiter); SQLite became a
-  write-behind durability layer (boot-hydrate, a background flush every `usage_flush_interval_ms`, and a
-  final flush on graceful shutdown). Admission no longer performs (or awaits) a SQLite write, removing the
-  per-request fsync from the hot path, which lifts the single-node governed-throughput ceiling by a
-  large multiple (the exact factor depends on storage and workload; see the external benchmark harness at
-  [`GetBusbar/benchmarking`](https://github.com/GetBusbar/benchmarking) for the reproducible measurement).
-  The flat-fee cap remains a hard cap; token cost is still reconciled post-response, bounded to one
-  in-flight request.
-- **Migration.** The `governance.budget_on_store_error` key has been **removed** and the governance config
-  rejects unknown fields, so a config that still sets it will fail to start. Delete the key. The guarantee it
-  offered (a hard cap even when the store errors) is now unconditional, because admission never touches the
-  store.
+- **THE SEMVER CONTRACT IS REDEFINED (and this is what makes 1.5.0 a minor).** The stable,
+  SemVer-protected contract is the RUNTIME: the data-plane HTTP surface an application
+  integrates against and the six wire-protocol contracts. The `config.yaml` is an OPERATOR
+  deployment artifact (nginx/postgres/envoy precedent), explicitly OUTSIDE the SemVer freeze: it
+  may change between releases, always with a migration path (`busbar --migrate-config`) and a
+  loud fail-closed boot on an outdated config - never a silent behavior change. The admin API is
+  its own versioned contract (`/api/v1/admin`); a break there is expressed by the admin contract
+  version, not the binary version. Existing keys stopping is a credential rotation (see the
+  release header), not an API break. README/docs state the same scope.
+- **Migration (operator steps).** 1) `busbar --migrate-config old-config.yaml >
+  config-1.5.yaml`, review every WARNING/TODO comment (especially each `allowed_pools: []`
+  occurrence - the all->none flip), `busbar --validate`. 2) Re-mint every virtual key
+  (`POST /api/v1/admin/keys`) and roll the new signed tokens out to callers; 1.4.x bearer
+  secrets and static `client_tokens` no longer authenticate. 3) A durable store is dropped and
+  recreated on first open (schema v3; 1.5.0 shipped no earlier stable schema): usage history
+  resets with the schema.
+- **The admin `keys` resource is pure auth.** `key_meta` is
+  `{id, name, allowed_pools, group, enabled, created_at, labels}` (`allowed_pools: null` = all
+  pools, `[]` = none). `PATCH /keys/{id}` takes `{enabled?, group??}` (three-state group:
+  absent = unchanged, `null` = unbind, value = rebind to an existing group); the 1.4.x cap
+  fields are rejected. `GET /keys/{id}/usage` reports the key's all-time attribution bucket +
+  chain-derived `rate_headroom`.
+- **Store contract + plugin ABI v3 (breaking, pre-release).** v2 (this cycle): the scalar
+  `Usage` became the per-(model, tier) token ledger (`UsageLedger`/`UsageDelta`), re-keyed from
+  `key_id` to `bucket_id`, with additive fleet flushes. v3 (this release): `VirtualKey` is pure
+  auth - inline limits dropped, `budget_group` renamed `group`, `allowed_pools` re-encoded as
+  nullable (C6), and the denylist surface added. sqlite (`PRAGMA user_version`), postgres
+  (`busbar_schema`), and redis (`busbar:schema`) stamp schema v3 and DROP a pre-v3 dev schema on
+  open (1.5.0 unreleased: no stable schema existed to migrate).
+- **Governance is always available; enforcement is in-memory on the request path.** No on/off
+  switch: governance is inert until keys exist. The per-request admission is an atomic in-memory
+  check-and-charge over the whole group chain (no store round-trip, no await); the durable store
+  is a write-behind layer (boot-hydrate, periodic additive flush, final flush on graceful
+  shutdown). Group ledger buckets are per-(group, window): `group:<name>@<window>`.
+- **Docs corrected alongside (audited overstatements).** Budget accuracy is stated as
+  derived-from-the-rate-card; scoping is per-key attribution / per-group enforcement; the store
+  default is documented as in-memory; the budget hard cap carries the per-node fleet caveat
+  everywhere it is described.
 
 ### Removed
 
-- **`governance.price_per_1k_tokens_cents`.** The flat blended token price is gone;
-  `governance.rate_card` is the ONLY token-pricing mechanism (`price_per_request_cents` stays -
-  the flat per-call surcharge, charged pre-forward at admission). **Migration:** delete the key
-  (a stale key is a loud unknown-field boot error) and, to keep pricing tokens, add a `rate_card`
-  entry per configured model; a former `price_per_1k_tokens_cents: N` is equivalent to
-  `input_utok/output_utok/cache_read_utok/cache_write_utok: N * 10` (N cents per 1k tokens =
-  10 N micro-units per token) on every tier.
-- **`governance.budget_on_store_error`**: obsolete (see **Migration** under **Changed**): in-memory
-  admission cannot incur a store error, so the fail-open/closed knob no longer has a failure to govern.
+- **The `governance:` block.** Its contents dissolved: `governance.store`/`db_path` ->
+  `store: { module, settings }`; `governance.rate_card` -> top-level `rate_card`;
+  `governance.price_per_request_cents` -> `per_request_fee`; `governance.budget_groups` ->
+  `groups` (broadened to the generic limit tree); `governance.admin_token` -> the `admin-tokens`
+  module's `token` secret ref; `governance.rate_sweep_interval`/`usage_flush_interval_ms` ->
+  `advanced`. `governance.enabled` and `governance.budget_on_store_error` are gone (always-on,
+  and admission never touches the store).
+- **Static tokens.** The `tokens`/`static-tokens` allowlist module and `auth.client_tokens` are
+  REMOVED. Data-plane auth = the built-in `keys` signed-token verifier + IdP auth modules.
+- **Per-key limits.** `rpm_limit`, `tpm_limit`, `max_budget_cents`, `budget_period` are gone
+  from mint, PATCH, the store schema, and the key metadata: every limit lives on the bound
+  group. The per-key `busbar_key_budget_remaining_cents` gauge is gone with them (use the group
+  bucket gauges).
+- **The top-level `hooks:` registry block** and the hook `global:`/`default:` flags (inline refs
+  in `pools.<p>.hooks` / `global_hooks` subsume all three).
+- **Config aliases.** `window_s` (-> `window_secs`), `n` (-> `consecutive_n`), `deadline_secs`
+  (-> `timeout_secs`), `cap` (-> `max_hops`), `otlp_endpoint` (-> `otlp_url`), member `target`
+  (-> `model`), `api_key_env` (-> `api_key: { env: ... }`), `auth.mode` (-> `auth.chain` /
+  `auth.upstream_credentials`). One canonical name each; unknown keys fail boot.
+- **`cost_per_mtok` on pool members and `governance.price_per_1k_tokens_cents`.** `rate_card`
+  is the only cost source (`--migrate-config` synthesizes equivalent card entries from the flat
+  price and flags them for review).
+
+### Fixed
+
+- **Budget-cell straddle wipe.** A request straddling a window boundary could rewind a NEWER
+  live budget cell to its older admission window, zeroing the live window's accrued
+  tokens/requests and flush baselines; the atomic chain charge and accrual paths now only reset
+  genuinely stale cells.
+- **Derived-spend integer wrap.** An adversarially large ledger (u64-scale tokens x a large
+  configured rate) could push the cent total past `i64::MAX` and wrap NEGATIVE, deriving as free
+  and bypassing every budget cap; derivation now saturates at `i64::MAX` (blocks, fail-closed).
+- **Requests-limit refund escape.** The flat per-request fee bills 2xx only (a non-2xx outcome
+  refunds it), while the `requests` limit counts admissions. Backing both with one counter would
+  let a caller escape the requests cap by hammering FAILING requests (each refunds its own slot,
+  so the cap only ever counted successes). The ledger now tracks the admission count (never
+  refunded, the requests-limit truth) separately from the billable count (the fee base, refunded
+  on non-2xx).
+- **Boot fail-open on budget hydration.** A store error while hydrating accrued ledgers at boot
+  silently started with EMPTY cells (a maxed-out key could spend its whole cap again); boot now
+  fails loudly instead of resuming unenforced.
+- **Bucket-namespace collisions.** IdP-influenced principal ids shaped like `vk_...` or
+  `group:...` could alias a real key's or group's ledger bucket; both prefixes are reserved and
+  such principals are refused a synthetic key (fail closed).
+- **mTLS typo hole.** Operator structs (`tls:`, providers, limits, metrics, routing...) now
+  reject unknown fields, so a typo like `client_c:` for `client_ca:` fails boot instead of
+  silently disabling mTLS.
+- **Write-behind flush lost-update.** Concurrent budget flushes could double-send an in-flight
+  delta against an un-advanced baseline; flushes are serialized (skip-if-still-flushing;
+  shutdown waits for the in-flight flush).
+- **Durable-audit gaps + unbounded restore.** Transient durable-write failures self-heal, and
+  the boot restore reads only the bounded tail it keeps.
+- **Store correctness batch.** Redis: `append_audit` upserted on the wrong key (duplicate audit
+  entries), non-idempotent writes are no longer retried, the schema-wipe guard cannot fire on an
+  evicted marker, atomic multi-key writes + reconnect + TLS support. Postgres: a transient
+  version-read error is never conflated with a fresh database; `GREATEST` parameters carry
+  explicit `::bigint` casts. All stores scrub DSN passwords (raw and percent-decoded) from every
+  error string.
+- **Admin hardening batch.** Mint-time `labels` are validated at the ingress (protecting
+  Prometheus exposition); a same-name-different-file plugin install is rejected; plugin-scan
+  errors propagate instead of vanishing; a malformed `on_exhausted` is caught by `--validate`;
+  the admin `UsageView` regained its documented `currency` field.
+
+### Security
+
+- **Keys expire and revoke (the release headline).** 1.x virtual keys never expired: a leaked
+  bearer secret was valid forever unless an operator noticed. 1.5.0 keys are signed tokens with
+  a mandatory expiry (default 90 days), stateless verification, and a durable revocation
+  denylist that is enforced fleet-wide and survives restarts. Rotating the signing key revokes
+  everything at once. Upgrading forces the rotation.
+- **Plugin supply-chain hardening.** Untrusted plugin code is NEVER executed: unsigned,
+  tampered, or unknown-publisher tarballs are logged and skipped without being `dlopen`ed
+  (`trust.allow_unsigned` / `trust.allow_third_party` are explicit opt-ins, both default
+  `false` - safe by default). The loader maps exactly the verified bytes (memfd / private
+  staging dir), closing the verify-then-load TOCTOU; first-party plugins are automatically
+  floored at the binary's version and third-party floors are configurable
+  (`plugins.min_versions`), closing signed-but-old downgrade replays.
+- **Env-var YAML injection closed.** Interpolated `${VAR}` values are rejected if they carry
+  YAML-structural control characters, so a compromised environment cannot splice extra config
+  nodes (e.g. widen an auth allowlist) through a quoted scalar.
 
 ## [1.4.1], 2026-07-20
 

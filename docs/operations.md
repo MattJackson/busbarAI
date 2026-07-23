@@ -14,7 +14,7 @@ variables.
 | `BUSBAR_PROVIDERS` | `/etc/busbar/providers.yaml` | Path to the provider catalog. |
 | `BUSBAR_CONFIG` | `/etc/busbar/config.yaml` | Path to the deployment config. |
 | `BUSBAR_WORKER_THREADS` | one per available core | Size of the async worker pool. See below. |
-| Provider key vars | n/a | Named by each provider's `api_key_env` (e.g. `ANTHROPIC_KEY`). |
+| Provider key vars | n/a | Named by each provider's `api_key: { env: ... }` reference (e.g. `ANTHROPIC_KEY`). |
 | Token/secret vars | n/a | Anything referenced via `${VAR}` in either file (client tokens, admin token, …). |
 
 **Worker threads and scaling.** Busbar's request path is CPU-bound (parse, translate, serialize), so
@@ -125,8 +125,8 @@ directly exposed to untrusted networks is not recommended.
 | Endpoint | Auth | Meaning |
 |---|---|---|
 | `GET /healthz` | open | `200 ok` if **any** lane is usable; `503` otherwise. Use for liveness/readiness probes. |
-| `GET /metrics` | client token (or virtual key) | Prometheus exposition; requires auth in `token`/governance mode, always open in `none`/`passthrough` mode. Restrict at the network layer if unauthenticated scraping is needed. |
-| `GET /stats` | client token (or virtual key) | Per-lane health snapshot + pool membership, JSON. |
+| `GET /metrics` | virtual key | Prometheus exposition; requires a valid key with a non-empty `auth.chain`, open under `chain: []`. Restrict at the network layer if unauthenticated scraping is needed. |
+| `GET /stats` | virtual key | Per-lane health snapshot + pool membership, JSON. |
 
 `/stats` returns, per lane: `model`, `provider`, `max_concurrent`, `inflight`,
 `free_slots`, `ok`, `err`, `usable`, `dead`, `dead_reason`, `cooldown_remaining_s`,
@@ -134,7 +134,7 @@ directly exposed to untrusted networks is not recommended.
 
 ## Running multiple instances (HA)
 
-Busbar is **stateless** (unless governance is enabled, see below), so the robust
+Busbar is **stateless** (apart from governance ledgers, see below), so the robust
 production shape is **N instances behind a load balancer**, each configured
 identically, each health-checked on `GET /healthz`. Any instance serves any request;
 lose one and the LB routes around it. On Kubernetes this is `replicaCount` + the
@@ -161,9 +161,9 @@ Three things are worth understanding before you scale out:
   ceiling, run a single instance (scale vertically); the proxy path itself scales
   horizontally without this caveat.
 
-So: for a stateless (no-governance) gateway, scale out freely behind an LB. With
-governance, either accept the per-node cap semantics over a shared store, or keep
-enforcement on one instance and scale the box, not the count.
+So: for a gateway without group limits, scale out freely behind an LB. With limits,
+either accept the per-node cap semantics over a shared store, or keep enforcement on
+one instance and scale the box, not the count.
 
 ## Metrics to watch
 
@@ -178,19 +178,20 @@ All metrics are Prometheus counters/histograms exposed at `/metrics`.
 | `busbar_failovers_total` | counter | `pool`, `reason` | `reason` is `timeout` / `connect` / `transient_upstream` / `attempt_timeout` / `hard_down` / `context_length`. |
 | `busbar_translations_total` | counter | `from`, `to` | Cross-protocol translation hops. |
 | `busbar_request_duration_seconds` | histogram | `ingress_protocol`, `pool` | End-to-end latency. |
-| `busbar_key_spend_cents` | gauge | `key` | Per-virtual-key spend in cents for the current budget window. Only emitted when governance is enabled. |
-| `busbar_key_budget_remaining_cents` | gauge | `key` | Max budget minus current spend for capped keys. Enables Prometheus burn-rate alerting. Only emitted for keys with a `max_budget_cents` cap. |
-| `busbar_key_tokens_total` | gauge | `key` | Tokens consumed by each virtual key in the current budget window. Only emitted when governance is enabled. |
+| `busbar_key_spend_cents` | gauge | `key` (+ mint labels) | Per-virtual-key derived spend in cents (all-time attribution bucket; spend derives from the token ledger x the current rate card at scrape time). |
+| `busbar_key_tokens_total` | gauge | `key` (+ mint labels) | Tokens consumed by each virtual key (all-time attribution bucket). |
+| `busbar_bucket_spend_cents` | gauge | `bucket`, `group`, `window` | Derived spend per (group, window) enforcement bucket (`bucket` = `group:<name>@<window>`). |
+| `busbar_bucket_budget_remaining_cents` | gauge | `bucket`, `group`, `window` | Budget cap minus derived spend, only for buckets carrying a `budget` limit. Enables Prometheus burn-rate alerting per group. |
+| `busbar_bucket_tokens` | gauge | `bucket`, `group`, `window`, `model`, `tier` | Per-(bucket, model, tier) token counters (the raw material for external cost dashboards). |
 | `busbar_lane_state` | gauge | `pool`, `lane` | Circuit-breaker health per lane: `0` = Closed, `1` = HalfOpen, `2` = Open (tripped). Side-effect-free at scrape. |
 | `busbar_route_policy_selections_total` | counter | `pool`, `policy` | Requests where a selection strategy (a native strategy or a gate hook) produced a usable ranked order. Only incremented on a successful `Order` outcome; abstains and on-error fallbacks are not counted. |
 | `busbar_route_policy_rejections_total` | counter | `pool`, `policy`, `status` | Requests deliberately rejected by a routing hook's `reject` verb (a 4xx to the caller, no upstream dispatched). A guardrail saying no, not a failure. |
 | `busbar_webhook_logs_dropped_total` | counter | n/a | Request-log webhook deliveries shed because the in-flight delivery pool was saturated (a slow/unreachable webhook endpoint). A non-zero rate means request logs are being silently dropped, scale the endpoint or alert. |
 | `busbar_billing_truncated_total` | counter | n/a | Same-protocol non-stream responses whose body exceeded the translate-body cap, so the terminal `usage` frame was missed and the request billed zero tokens (the client still got a full response). A non-zero rate signals an over-cap billing gap. |
 
-`/metrics` requires a valid client token in `token` mode (or a virtual key under
-governance), it is treated as an information-disclosure surface and goes through
-the same auth check as other routes. Only `none`/`passthrough` mode admits scrapes
-unconditionally. Restrict it at the network layer (firewall, reverse proxy) if you
+`/metrics` requires a valid key with a non-empty `auth.chain`, it is treated as an
+information-disclosure surface and goes through the same auth check as other routes.
+Only `chain: []` admits scrapes unconditionally. Restrict it at the network layer (firewall, reverse proxy) if you
 need unauthenticated scraping under your threat model.
 
 ## Circuit breaker
@@ -324,7 +325,7 @@ When all members are unusable, the pool's `on_exhausted` action decides:
   cooldown expiry.
 - `least_bad`, serve the member whose cooldown expires soonest (degraded, logged
   loudly).
-- `fallback_pool:<name>`, route to another pool (loop-guarded).
+- `{ fallback_pool: <name> }`, route to another pool (loop-guarded).
 
 If `outcome="exhausted"` (503) is climbing in `busbar_requests_total`, check
 `/stats` for dead/tripped lanes and consider a `fallback_pool` or `least_bad` policy
@@ -332,21 +333,19 @@ for graceful degradation.
 
 ## Governance & the admin API
 
-When governance is **active** (a `governance.admin_token` is set), clients authenticate
-with **virtual keys** and the static `auth` tokens no longer apply to proxied requests.
-With no admin token governance is inert and the static `auth` chain applies unchanged.
-Keys are managed over the
-admin API, guarded by `governance.admin_token` (sent as `Authorization: Bearer
-<admin_token>` or `X-Admin-Token: <admin_token>`). With no admin token configured,
-the admin API returns `401`.
+Data-plane callers authenticate with **signed, expiring virtual keys** (the built-in `keys`
+verifier in `auth.chain`). Keys are managed over the admin API on the separate `admin_listen`,
+guarded by `auth.admin_auth` (the built-in `admin-tokens` operator credential, sent as
+`Authorization: Bearer <admin_token>` or `X-Admin-Token: <admin_token>`, or an IdP role with
+`admin_scope`).
 
 | Method · Route | Purpose |
 |---|---|
-| `POST /api/v1/admin/keys` | Mint a virtual key. The plaintext secret is returned **once**. Pass `"issue_aws_credential": true` to also mint an AWS credential pair for Bedrock-SDK clients (see below). |
-| `GET /api/v1/admin/keys` | List key metadata (never secrets/hashes). |
-| `GET /api/v1/admin/keys/{id}/usage` | Current-window usage: `spend_cents`, `tokens`, `requests`. |
-| `PATCH /api/v1/admin/keys/{id}` | Update key fields (budget, rate limits, allowed pools). Three-state: absent = unchanged, `null` = clear to unlimited, value = set. |
-| `DELETE /api/v1/admin/keys/{id}` | Revoke a key. |
+| `POST /api/v1/admin/keys` | Mint a key. The signed token is returned **once**. Pass `"issue_aws_credential": true` to also mint an AWS credential pair for Bedrock-SDK clients (see below). |
+| `GET /api/v1/admin/keys` | List key metadata: `{id, name, allowed_pools, group, enabled, created_at, labels}` (never secrets). |
+| `GET /api/v1/admin/keys/{id}/usage` | All-time attribution counters: `spend_cents`, `tokens`, `requests`, plus chain-derived `rate_headroom`. |
+| `PATCH /api/v1/admin/keys/{id}` | `{enabled?, group??}`: freeze/unfreeze, or rebind/unbind the group. Three-state group: absent = unchanged, `null` = unbind, value = rebind. |
+| `DELETE /api/v1/admin/keys/{id}` | Revoke: the key's subject joins the durable denylist (immediate, survives restart). |
 
 ### Creating a key
 
@@ -356,49 +355,45 @@ curl -s -X POST http://localhost:8081/api/v1/admin/keys \
   -H "content-type: application/json" \
   -d '{
         "name": "team-search",
+        "group": "search-team",
         "allowed_pools": ["fast", "overflow"],
-        "max_budget_cents": 50000,
-        "budget_period": "monthly",
-        "rpm_limit": 600,
-        "tpm_limit": 200000
+        "expires_in": "90d",
+        "labels": {"team": "search"}
       }'
 ```
 
-Create-key fields:
+Create-key fields (keys are PURE AUTH: every limit lives on the bound group):
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | n/a | Required label. |
-| `allowed_pools` | list<string> | `[]` | Pools/models this key may target. Empty = all allowed. Violations → `403`. |
-| `max_budget_cents` | integer | none | Spend cap for the budget window; exceeded → `429` (or `400` for Bedrock ingress). |
-| `budget_period` | string | `total` | `total` (all-time), `daily` (UTC midnight), or `monthly` (UTC first-of-month). |
-| `rpm_limit` | integer | none | Requests per 60s window; exceeded → `429` + `Retry-After`. |
-| `tpm_limit` | integer | none | Tokens per 60s window; exceeded → `429` + `Retry-After`. |
-| `issue_aws_credential` | bool | `false` | When `true`, also issues an AWS-style `aws_access_key_id` + `aws_secret_access_key` for inbound SigV4 auth (Bedrock SDK clients). Both fields are returned **once** in the 201 response alongside the bearer `secret` and never again. See [Bedrock ingress with governance](protocols.md#bedrock). |
+| `group` | string | none | The `groups:` entry this key charges through (must exist; 400 otherwise). Omitted = authed + unlimited. |
+| `allowed_pools` | list<string> | omitted = all | Pools/models this key may target. OMITTED = all pools; an explicit `[]` = NO pools. Violations → `403`. |
+| `expires_in` / `expires_at` | duration / epoch | `90d` | Token lifetime (mutually exclusive). Keys EXPIRE: re-mint or rotate before expiry. |
+| `labels` | map | `{}` | Echoed onto the key's metric series (e.g. `sum by (team)`); never interpreted by enforcement. |
+| `issue_aws_credential` | bool | `false` | When `true`, also issues an AWS-style `aws_access_key_id` + `aws_secret_access_key` for inbound SigV4 auth (Bedrock SDK clients). Both fields are returned **once** in the 201 response alongside the signed token and never again. See [Bedrock ingress](protocols.md#bedrock). |
 
 ### Enforcement model
 
-- **Allowed-pools / budget / rate** are checked before forwarding (`403` /
-  `429` (or `400` for Bedrock ingress) / `429` respectively). Budget exhaustion is
-  not a distinct `402`: it surfaces as the vendor-native quota status with
-  `error.type: insufficient_quota` in the body, so it stays indistinguishable from
-  a real upstream quota error.
-- **Budget** enforcement derives spend from the TOKEN LEDGER at admission time: a
-  flat `price_per_request_cents` is charged (as +1 request) atomically pre-forward,
-  and the response's per-(model, tier) token split is ledgered at stream end from the
-  upstream's reported usage. Spend = requests x fee + tokens x `governance.rate_card`
-  rates, recomputed on every check - with no rate card configured, tokens price at 0
-  and only the flat fee counts. A key bound to a `budget_group` must also pass every
-  ancestor group's cap (AND semantics); the 429 names the exhausted bucket.
-- **Rate windows** are per-key, in-memory, fixed 60s windows (single-node; not yet
-  distributed across replicas). RPM is enforced precisely; TPM is enforced against
-  tokens accrued in the window from prior responses.
-- **Budget windows** default to in-memory (ephemeral); configure a durable store
-  plugin (`governance.store: sqlite|postgres|redis` + `db_path`) to persist the
-  token ledger across restarts.
+- **Verification is stateless**: signature + expiry + the revocation denylist; policy (group,
+  pools) resolves from the store by the token's subject, so a PATCH takes effect without
+  re-issuing the credential.
+- **Admission walks the bound group's chain** and ANDs every limit of every group: `requests`
+  (precise, `429` + `Retry-After`), `tokens` (best-effort post-paid, `429` + `Retry-After`),
+  `budget` (derived spend, the vendor-native quota status with `error.type:
+  insufficient_quota`; Bedrock signals over-budget as `400`), `concurrent` (in-flight gauge,
+  `429`). The rejection names the exact blocking bucket (group + metric + window). A frozen
+  group (`enabled: false`) rejects with `403`.
+- **Spend derives from the TOKEN LEDGER**: a flat `per_request_fee` is charged (as +1 request)
+  atomically pre-forward, and the response's per-(model, tier) token split is ledgered at
+  stream end. Spend = requests x fee + tokens x `rate_card` rates, recomputed on every check;
+  with no rate card, tokens price at 0 and only the flat fee counts.
+- **Ledgers default to in-memory** (ephemeral); configure a durable store plugin
+  (`store: { module: sqlite|postgres|redis, settings: {...} }`) to persist keys, usage, and
+  the denylist across restarts.
 
-> Rate (RPM/TPM) windows are per-process, and the budget hard cap is enforced
-> per node even over a shared store (see the fleet caveat above).
+> Limit windows are per-process, and the caps are enforced per node even over a shared store
+> (see the fleet caveat above).
 
 ## Troubleshooting
 
@@ -406,8 +401,8 @@ Create-key fields:
 |---|---|
 | `503` on every request | `/stats`, are all lanes `dead` or in cooldown? Check `dead_reason`. |
 | A lane stuck `dead` with `billing` reason | Upstream wallet/quota; the lane recovers on a successful probe once funded. Consider `health.mode: dead`. |
-| A lane stuck `dead` with `auth` reason | Wrong/expired key in the provider's `api_key_env`. |
-| `429` from busbar itself | A virtual key hit a limit. The body's `error.type` distinguishes the cause: `rate_limit_error` = RPM/TPM cap; `insufficient_quota` = over budget for its window (Bedrock ingress signals over-budget as `400` instead). Check `GET /api/v1/admin/keys/{id}/usage`. |
+| A lane stuck `dead` with `auth` reason | Wrong/expired credential behind the provider's `api_key` reference. |
+| `429` from busbar itself | A group limit blocked. The body's `error.type` distinguishes the cause: `rate_limit_error` = requests/tokens/concurrent limit (the message names group + metric + window); `insufficient_quota` = a budget limit (Bedrock ingress signals over-budget as `400` instead). Check `GET /api/v1/admin/keys/{id}/usage`. |
 | `403` from busbar | The virtual key's `allowed_pools` doesn't include the target. |
 | Startup panic: "unset environment variable" | A `${VAR}` (possibly in a comment) isn't exported. |
 | Startup panic: "not found in providers.yaml" | A `config.yaml` provider name isn't in the catalog. |

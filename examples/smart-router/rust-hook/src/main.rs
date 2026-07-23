@@ -5,7 +5,8 @@
 //! line back: the order to try the lanes in. That's the whole job.
 //!
 //! Run it:            cargo run --release -- /run/busbar/router.sock
-//! Point busbar at it:  hooks: { smart-router: { kind: gate, socket: /run/busbar/router.sock } }
+//! Point busbar at it:  an inline hook ref on the pool
+//!                      hooks: [ { module: socket, settings: { path: /run/busbar/router.sock }, kind: gate } ]
 //!
 //! If this process is slow, wrong, or dead, busbar falls back per the hook's `on_error` after
 //! its `timeout_ms` (default 1 ms). Kill it mid-traffic and requests keep flowing.

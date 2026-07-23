@@ -19,7 +19,7 @@
 
 Busbar sits between your application and every AI provider. Point any SDK at one URL (OpenAI, Anthropic, Gemini, Bedrock, Cohere, or the Responses API) and Busbar routes each request to the backends you chose, translating losslessly between protocols where they differ: chat, embeddings, images, audio, and moderations. When a provider fails, it keeps serving.
 
-> **Stable.** The API, config schema, and the six wire-protocol contracts are frozen under Semantic Versioning. Every release ships an SBOM and a build-provenance attestation. Apache-2.0. (Current version: the Release badge above — never hand-written, so it can't go stale.)
+> **Stable.** The SemVer-protected contract is the RUNTIME: the data-plane HTTP surface your application integrates against and the six wire-protocol contracts. Those do not break inside a major version. The `config.yaml` is an OPERATOR deployment artifact (like nginx or postgres config), explicitly outside the SemVer freeze: it MAY change between releases, always with a migration path (`busbar --migrate-config`) and a loud fail-closed boot on an outdated config, never a silent behavior change. The admin API carries its own contract version (`/api/v1/admin`); a break there is expressed by that contract version, not the binary version. Every release ships an SBOM and a build-provenance attestation. Apache-2.0. (Current version: the Release badge above, never hand-written, so it can't go stale.)
 
 ---
 
@@ -47,7 +47,7 @@ That request left your app as OpenAI. It may have been served by Anthropic, and 
 - **Weighted pools** with smooth weighted round-robin, session affinity, and per-lane concurrency caps → [Reliability](https://getbusbar.com/docs/reliability/)
 - **Routing policies.** Five built-ins, or your own logic as a webhook or Rhai script. A policy sees each member's cost, latency, live concurrency, budget, and rate headroom, and a failing policy falls back instead of blocking → [Routing](https://getbusbar.com/docs/routing/)
 - **Native TLS and optional mTLS**, terminated by Busbar itself, with no reverse proxy in front → [Security](https://getbusbar.com/docs/security/)
-- **Governance** when you want it: virtual keys, budgets, RPM/TPM limits, spend tracking → [Governance](https://getbusbar.com/docs/guides/governance/)
+- **Governance** when you want it: signed expiring keys, hierarchical groups with request / token / budget / concurrency limits, spend tracking → [Governance](https://getbusbar.com/docs/guides/governance/)
 - **A verified provider catalog**, plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/docs/providers/)
 - **Hardening throughout**: SSRF guards, constant-time auth, SHA-256 key storage, secrets never logged → [SECURITY.md](SECURITY.md)
 - **Observability** over open standards: Prometheus `/metrics`, OTLP traces, a per-request audit webhook → [Configuration](https://getbusbar.com/docs/configuration/)
@@ -66,11 +66,11 @@ A minimal `config.yaml`. Keys come from environment variables; the config names 
 
 ```yaml
 providers:
-  anthropic: { api_key_env: ANTHROPIC_KEY }          # the NAME of the env var, not the key
+  anthropic: { api_key: { env: ANTHROPIC_KEY } }     # the NAME of the env var, not the key
 models:
   claude: { provider: anthropic, max_concurrent: 10 }
 pools:
-  fast: { members: [ { target: claude, weight: 1 } ] }
+  fast: { members: [ { model: claude, weight: 1 } ] }
 ```
 
 ```bash
