@@ -48,6 +48,8 @@ groups:
       - { requests: 500, per: minute }   # requests|tokens|budget need a per: window
       - { budget: 1000000, per: month }
       - { budget: 5000, per: month, pool: frontier }   # optional pool: = per-(group, pool) accounting
+      - { budget: 5000, per: month, pool: value,
+          on_exhaust: downgrade, downgrade_to: frontier-lite }  # budget dry → reroute, don't refuse
       - { concurrent: 5 }                # instantaneous in-flight cap: NO per:, NO pool:
 ```
 

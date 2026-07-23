@@ -41,6 +41,8 @@ fn limit(metric: LimitMetric, amount: u64, per: Option<LimitWindow>) -> LimitCfg
         amount,
         per,
         pool: None,
+        on_exhaust: None,
+        downgrade_to: None,
     }
 }
 

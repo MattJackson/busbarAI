@@ -787,6 +787,8 @@ mod tests {
                         amount: 100,
                         per: Some(crate::config::groups::LimitWindow::Minute),
                         pool: None,
+                        on_exhaust: None,
+                        downgrade_to: None,
                     }],
                     ..Default::default()
                 },
@@ -852,6 +854,8 @@ mod tests {
                     amount: 1_000,
                     per: Some(crate::config::groups::LimitWindow::Total),
                     pool: None,
+                    on_exhaust: None,
+                    downgrade_to: None,
                 }],
                 ..Default::default()
             },

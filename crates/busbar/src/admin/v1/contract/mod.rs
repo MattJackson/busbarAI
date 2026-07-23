@@ -436,6 +436,12 @@ pub(crate) struct LimitView {
     /// only that pool's traffic, per `(group, pool)`); absent for a group-wide limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pool: Option<String>,
+    /// The budget-exhaustion behavior: `block` or `downgrade`. Absent = block (the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) on_exhaust: Option<&'static str>,
+    /// Where `on_exhaust: downgrade` sends exhausted traffic. Present iff downgrading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) downgrade_to: Option<String>,
 }
 
 impl LimitView {
@@ -446,6 +452,11 @@ impl LimitView {
             amount: l.amount,
             per: l.per.map(|w| w.as_str()),
             pool: l.pool.clone(),
+            on_exhaust: l.on_exhaust.map(|e| match e {
+                crate::config::groups::OnExhaust::Block => "block",
+                crate::config::groups::OnExhaust::Downgrade => "downgrade",
+            }),
+            downgrade_to: l.downgrade_to.clone(),
         }
     }
 }

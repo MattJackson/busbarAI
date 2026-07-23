@@ -351,6 +351,27 @@ non-2xx refunds mirror the admission exactly: they touch only the buckets the re
 charged. The named pool must exist in `pools:` — a dangling qualifier fails validation (it would
 be an unenforced budget).
 
+**Budgets that teach (`on_exhaust: downgrade`).** A pool-scoped `budget` limit may declare what
+its exhaustion does instead of refusing:
+
+```yaml
+groups:
+  dev-team:
+    limits:
+      - { budget: 5000, per: month, pool: frontier,
+          on_exhaust: downgrade, downgrade_to: value }   # exhausted → reroute, don't refuse
+      - { budget: 5000, per: month, pool: value }
+```
+
+When the frontier budget runs dry, a frontier request is **re-admitted and dispatched through
+`value`** — the caller's expensive calls get cheaper, not blocked. The charge lands on the
+effective pool's buckets (accounting follows the traffic), the key's pool ACL is re-checked on
+every hop (a downgrade can never route a key into a pool it may not use — a denied hop falls back
+to the plain quota rejection), and cascades are cycle-bounded. Absent (or `on_exhaust: block`),
+exhaustion rejects with the vendor's quota status — today's default. `downgrade` requires
+`downgrade_to:` naming a different existing pool, a `pool:` scope, and the `budget` metric (all
+validated at the door).
+
 ---
 
 ### `rate_card` and `per_request_fee`

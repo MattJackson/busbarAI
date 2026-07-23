@@ -21,6 +21,8 @@ fn limit(metric: LimitMetric, amount: u64, per: Option<LimitWindow>) -> LimitCfg
         amount,
         per,
         pool: None,
+        on_exhaust: None,
+        downgrade_to: None,
     }
 }
 
@@ -100,6 +102,7 @@ fn assert_blocked(
             metric: m,
             window: w,
             pool: _,
+            downgrade_to: _,
             retry_after,
         } => {
             assert_eq!(g, group, "blocking group");
@@ -689,6 +692,8 @@ fn pooled(metric: LimitMetric, amount: u64, per: LimitWindow, pool: &str) -> Lim
         amount,
         per: Some(per),
         pool: Some(pool.to_string()),
+        on_exhaust: None,
+        downgrade_to: None,
     }
 }
 
@@ -725,6 +730,7 @@ fn pool_scoped_budgets_account_independently() {
             metric: "budget",
             window: Some("day"),
             pool: Some(pool),
+            downgrade_to: None,
             retry_after: Some(_),
         } => {
             assert_eq!(group, "team");
@@ -841,4 +847,54 @@ fn pool_scoped_accrual_and_refund_mirror_the_charge() {
     g2.refund_request(&cm2, &k, "frontier", now);
     g2.try_admit(&cm2, &k, "frontier", now)
         .expect("the refunded fee re-opened frontier's bucket");
+}
+
+/// §6c budget-that-teaches, engine side: a budget block whose limit declared `on_exhaust:
+/// downgrade` NAMES the downgrade pool in the rejection (ingress re-admits there); the most
+/// restrictive of two merged budgets is the one whose behavior governs; and a plain budget
+/// block still carries no downgrade.
+#[test]
+fn budget_block_carries_downgrade_target() {
+    let g = gov();
+    let mut teach = pooled(LimitMetric::Budget, 25, LimitWindow::Day, "frontier");
+    teach.on_exhaust = Some(crate::config::groups::OnExhaust::Downgrade);
+    teach.downgrade_to = Some("value".to_string());
+    let cm = model_with_card(&[("team", group_cfg(None, true, vec![teach]))], 10, &[]);
+    let k = key("vk_dg", Some("team"));
+    let now = 1_700_000_000;
+    g.try_admit(&cm, &k, "frontier", now).expect("1st");
+    g.try_admit(&cm, &k, "frontier", now).expect("2nd");
+    match g.try_admit(&cm, &k, "frontier", now).unwrap_err() {
+        LimitBlocked::Limit {
+            metric: "budget",
+            downgrade_to: Some(to),
+            ..
+        } => assert_eq!(to, "value", "the block names where the traffic should go"),
+        other => panic!("expected a downgrade-carrying budget block, got {other:?}"),
+    }
+    // The downgrade pool itself admits (its buckets are untouched).
+    g.try_admit(&cm, &k, "value", now)
+        .expect("the value pool is not capped here");
+
+    // MERGE rule: two budgets on one (window, pool) - the tighter (25) declares downgrade, the
+    // looser (100) does not; the tighter cap is the one that blocks, so its downgrade governs.
+    let g2 = gov();
+    let mut tight = pooled(LimitMetric::Budget, 25, LimitWindow::Day, "frontier");
+    tight.on_exhaust = Some(crate::config::groups::OnExhaust::Downgrade);
+    tight.downgrade_to = Some("value".to_string());
+    let loose = pooled(LimitMetric::Budget, 100, LimitWindow::Day, "frontier");
+    let cm2 = model_with_card(
+        &[("team", group_cfg(None, true, vec![loose, tight]))],
+        10,
+        &[],
+    );
+    g2.try_admit(&cm2, &k, "frontier", now).expect("1st");
+    g2.try_admit(&cm2, &k, "frontier", now).expect("2nd");
+    match g2.try_admit(&cm2, &k, "frontier", now).unwrap_err() {
+        LimitBlocked::Limit {
+            downgrade_to: Some(to),
+            ..
+        } => assert_eq!(to, "value"),
+        other => panic!("the tighter budget's downgrade governs, got {other:?}"),
+    }
 }

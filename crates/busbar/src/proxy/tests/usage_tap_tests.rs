@@ -227,6 +227,8 @@ fn test_nonstream_token_fee_uses_charged_at_window_not_clock() {
                 amount: 1_000_000,
                 per: Some(crate::config::groups::LimitWindow::Day),
                 pool: None,
+                on_exhaust: None,
+                downgrade_to: None,
             }],
             ..Default::default()
         },

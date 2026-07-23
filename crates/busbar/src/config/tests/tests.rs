@@ -1693,6 +1693,59 @@ fn test_group_limit_pool_qualifier() {
     assert!(err.to_string().contains("duplicate"), "{err}");
 }
 
+/// The `on_exhaust` pair (§6c): parses + round-trips on a pool-scoped budget; every malformed
+/// coupling fails AT PARSE with a teaching error (downgrade without a target, a dangling target
+/// without downgrade, a non-budget metric, a group-wide budget, a self-referential target).
+#[test]
+fn test_group_limit_on_exhaust_qualifier() {
+    use crate::config::groups::{LimitCfg, OnExhaust};
+
+    let l: LimitCfg = serde_yaml::from_str(
+        "{ budget: 5000, per: month, pool: frontier, on_exhaust: downgrade, downgrade_to: value }",
+    )
+    .expect("a full downgrade limit parses");
+    assert_eq!(l.on_exhaust, Some(OnExhaust::Downgrade));
+    assert_eq!(l.downgrade_to.as_deref(), Some("value"));
+    let yaml = serde_yaml::to_string(&l).expect("serializes");
+    let back: LimitCfg = serde_yaml::from_str(&yaml).expect("reparses");
+    assert_eq!(back, l, "overlay round-trip must be exact: {yaml}");
+
+    // An explicit `block` (the spelled-out default) also survives the round-trip.
+    let b: LimitCfg = serde_yaml::from_str("{ budget: 5, per: month, pool: p, on_exhaust: block }")
+        .expect("explicit block parses");
+    let byaml = serde_yaml::to_string(&b).expect("serializes");
+    assert_eq!(
+        serde_yaml::from_str::<LimitCfg>(&byaml).expect("reparses"),
+        b
+    );
+
+    for (yaml, needle) in [
+        (
+            "{ budget: 5, per: month, pool: p, on_exhaust: downgrade }",
+            "requires `downgrade_to",
+        ),
+        (
+            "{ budget: 5, per: month, pool: p, downgrade_to: q }",
+            "only makes sense with",
+        ),
+        (
+            "{ requests: 5, per: month, pool: p, on_exhaust: downgrade, downgrade_to: q }",
+            "BUDGET-exhaustion",
+        ),
+        (
+            "{ budget: 5, per: month, on_exhaust: downgrade, downgrade_to: q }",
+            "requires a `pool:` scope",
+        ),
+        (
+            "{ budget: 5, per: month, pool: p, on_exhaust: downgrade, downgrade_to: p }",
+            "DIFFERENT pool",
+        ),
+    ] {
+        let err = serde_yaml::from_str::<LimitCfg>(yaml).expect_err(yaml);
+        assert!(err.to_string().contains(needle), "{yaml}: {err}");
+    }
+}
+
 // ── top-level DeployCfg surface (S3/S5/S6) ───────────────────────────────────────────────────────
 
 /// The REMOVED top-level blocks are rejected by deny_unknown_fields: `governance:` (split into

@@ -112,6 +112,11 @@ pub(crate) struct GroupBucket {
     /// `Some(pool)` = this bucket accounts ONLY traffic dispatched through that pool (limits
     /// carrying `pool: <name>`); `None` = group-wide (every request through the group).
     pub(crate) pool: Option<String>,
+    /// Where BUDGET-exhausted traffic goes instead of a rejection (`on_exhaust: downgrade,
+    /// downgrade_to: <pool>` on the governing budget limit). `None` = block (the default). When
+    /// several budget limits merge into this bucket, the MOST RESTRICTIVE (minimum) cap's
+    /// behavior governs - it is the one that actually blocks.
+    pub(crate) downgrade_to: Option<String>,
 }
 
 /// One resolved group: its enabled flag, in-flight cap, per-window enforcement buckets, and parent
@@ -147,6 +152,8 @@ pub(crate) struct ChainBucket<'a> {
     /// `Some(pool)` = the bucket is pool-scoped: it checks/charges/accrues ONLY when the request
     /// was dispatched through that pool. `None` = applies to every request through the group.
     pub(crate) pool: Option<&'a str>,
+    /// The budget limit's `downgrade_to` pool, when it declared `on_exhaust: downgrade`.
+    pub(crate) downgrade_to: Option<&'a str>,
 }
 
 impl ChainBucket<'_> {
@@ -290,6 +297,7 @@ impl CostModel {
                                         tokens_cap: None,
                                         budget_cap: None,
                                         pool: l.pool.clone(),
+                                        downgrade_to: None,
                                     });
                                     buckets.last_mut().expect("just pushed")
                                 }
@@ -304,6 +312,12 @@ impl CostModel {
                                 LimitMetric::Tokens => bucket.tokens_cap = min_u(bucket.tokens_cap),
                                 LimitMetric::Budget => {
                                     let amount = i64::try_from(l.amount).unwrap_or(i64::MAX);
+                                    // The MOST RESTRICTIVE budget's exhaustion behavior governs:
+                                    // it is the cap that actually blocks, so its downgrade (or
+                                    // its absence = block) is what fires.
+                                    if bucket.budget_cap.is_none_or(|c| amount < c) {
+                                        bucket.downgrade_to = l.downgrade_to.clone();
+                                    }
                                     bucket.budget_cap = Some(
                                         bucket.budget_cap.map_or(amount, |c: i64| c.min(amount)),
                                     );
@@ -476,6 +490,7 @@ impl CostModel {
             tokens_cap: None,
             budget_cap: None,
             pool: None,
+            downgrade_to: None,
         });
         let mut groups: Vec<usize> = Vec::new();
         let mut next = match key.group.as_deref() {
@@ -502,6 +517,7 @@ impl CostModel {
                     tokens_cap: b.tokens_cap,
                     budget_cap: b.budget_cap,
                     pool: b.pool.as_deref(),
+                    downgrade_to: b.downgrade_to.as_deref(),
                 });
             }
             next = g.parent;

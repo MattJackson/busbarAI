@@ -3636,6 +3636,8 @@ fn limit_requests_per_minute(amount: u64) -> crate::config::groups::LimitCfg {
         amount,
         per: Some(crate::config::groups::LimitWindow::Minute),
         pool: None,
+        on_exhaust: None,
+        downgrade_to: None,
     }
 }
 

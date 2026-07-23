@@ -57,6 +57,15 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   `BudgetBucketState` and the Admin groups read (`LimitView`) carry the pool scope. Also gone:
   the arbitrary 8-level group-depth ceiling (the cycle check is what bounds the walk; hierarchy
   depth is the operator's call).
+- **Budgets that teach (`on_exhaust: downgrade`).** A pool-scoped budget limit may declare
+  `on_exhaust: downgrade, downgrade_to: <pool>`: when it runs dry, the request is RE-ADMITTED and
+  DISPATCHED through the downgrade pool instead of refused - the dev's expensive calls get
+  cheaper, not blocked (teach by gravity; omit for today's hard rejection, teach by friction).
+  The charge lands on the effective pool's buckets (accounting follows the traffic), the key's
+  pool ACL re-runs on every hop (an exhaustion can never route a key into a pool it may not use),
+  and cascades are cycle-bounded. Where several budgets merge into one bucket, the most
+  restrictive cap's behavior governs. Validated at the door: `downgrade` needs a different,
+  existing `downgrade_to` pool, a `pool:` scope, and the `budget` metric.
 - **KEYS ARE PURE AUTH + THEY EXPIRE.** A minted key is a busbar-SIGNED token `{sub, exp, kid}`
   (ed25519). Verify = signature + expiry (stateless) + a small revocation denylist; policy (the
   bound `group`, `allowed_pools`) is resolved from the store by `sub`, so policy is mutable

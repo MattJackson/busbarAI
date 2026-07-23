@@ -921,6 +921,7 @@ impl GovState {
                     metric: "concurrent",
                     window: None,
                     pool: None,
+                    downgrade_to: None,
                     retry_after: None,
                 });
             }
@@ -1035,6 +1036,11 @@ impl GovState {
                     metric,
                     window: Some(bucket.window),
                     pool: bucket.pool.map(String::from),
+                    // `on_exhaust` is declared on (and validated against) the BUDGET metric
+                    // only; a requests/tokens block on the same bucket still blocks.
+                    downgrade_to: (metric == "budget")
+                        .then(|| bucket.downgrade_to.map(String::from))
+                        .flatten(),
                     retry_after: super::window_end(bucket.window, now)
                         .map(|end| end.saturating_sub(now).max(1)),
                 });

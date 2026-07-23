@@ -196,11 +196,14 @@ pub(crate) async fn operation_resolved(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let admit = match governance_guard(app, gov, proto, model, started, charged_at) {
+    let (admit, downgraded) = match governance_guard(app, gov, proto, model, started, charged_at) {
         Err(resp) => return *resp,
-        Ok(admit) => admit,
+        Ok(admitted) => admitted,
     };
     let charged = admit.is_some();
+    // A budget downgrade (§6c) re-pooled the admission: dispatch through the pool the charge
+    // actually landed on, not the one the client asked for.
+    let model = downgraded.as_deref().unwrap_or(model);
 
     let (cands, pool_name): (Vec<WeightedLane>, &str) = if let Some(c) = app.pools.get(model) {
         (c.clone(), model)

@@ -2806,6 +2806,8 @@ mod patch_tests {
             amount: cents,
             per: Some(LimitWindow::Month),
             pool: None,
+            on_exhaust: None,
+            downgrade_to: None,
         }
     }
 

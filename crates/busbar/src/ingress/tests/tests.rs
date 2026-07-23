@@ -466,6 +466,8 @@ async fn test_admit_check_uses_charged_at_window_not_clock() {
                 amount: 30,
                 per: Some(crate::config::groups::LimitWindow::Day),
                 pool: None,
+                on_exhaust: None,
+                downgrade_to: None,
             }],
             ..Default::default()
         },
@@ -3113,7 +3115,7 @@ async fn test_governance_guard_passes_when_allowed() {
         crate::store::now(),
     );
     assert!(
-        matches!(passed, Ok(Some(_))),
+        matches!(passed, Ok((Some(_), _))),
         "an allowed, in-limits request is admitted AND charged (Ok(Some(grant)))"
     );
 }
@@ -3290,6 +3292,8 @@ fn governed_app_over_budget() -> (Arc<App>, crate::governance::VirtualKey) {
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Total),
                 pool: None,
+                on_exhaust: None,
+                downgrade_to: None,
             }],
             ..Default::default()
         },
@@ -3328,6 +3332,8 @@ fn governed_app_rate_limited() -> (Arc<App>, crate::governance::VirtualKey) {
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Minute),
                 pool: None,
+                on_exhaust: None,
+                downgrade_to: None,
             }],
             ..Default::default()
         },
@@ -5376,6 +5382,8 @@ async fn governed_limit_router(
             amount: 0,
             per: Some(LimitWindow::Minute),
             pool: None,
+            on_exhaust: None,
+            downgrade_to: None,
         }
     } else {
         LimitCfg {
@@ -5383,6 +5391,8 @@ async fn governed_limit_router(
             amount: 0,
             per: Some(LimitWindow::Total),
             pool: None,
+            on_exhaust: None,
+            downgrade_to: None,
         }
     };
     let groups = std::collections::BTreeMap::from([(
@@ -5708,6 +5718,8 @@ fn governed_app_group_blocked() -> (Arc<App>, crate::governance::VirtualKey) {
                 amount: 0,
                 per: Some(crate::config::groups::LimitWindow::Total),
                 pool: None,
+                on_exhaust: None,
+                downgrade_to: None,
             }],
             ..Default::default()
         },
@@ -5853,4 +5865,99 @@ async fn test_unpriced_passthrough_model_rejected_when_rate_card_present() {
         crate::store::now(),
     );
     assert!(ok.is_ok(), "a priced configured lane admits");
+}
+
+// ─── Budget downgrade at the ingress boundary (§6c on_exhaust: downgrade) ────────────────────────
+
+/// Governance-enabled App with pools `frontier` + `value` and a group whose frontier budget
+/// (25c/day at a 10c flat fee) declares `on_exhaust: downgrade, downgrade_to: value`.
+#[allow(clippy::field_reassign_with_default)]
+fn governed_app_downgrade(
+    allowed_pools: Option<Vec<String>>,
+) -> (Arc<App>, crate::governance::VirtualKey) {
+    use crate::governance::{GovState, MemoryStore, NewKeySpec};
+    let store = Arc::new(MemoryStore::new());
+    let gov = Arc::new(GovState::new(store, Some("admintok".to_string())).unwrap());
+    let groups = std::collections::BTreeMap::from([(
+        "team".to_string(),
+        crate::config::GroupCfg {
+            parent: None,
+            enabled: true,
+            limits: vec![crate::config::groups::LimitCfg {
+                metric: crate::config::groups::LimitMetric::Budget,
+                amount: 25,
+                per: Some(crate::config::groups::LimitWindow::Day),
+                pool: Some("frontier".to_string()),
+                on_exhaust: Some(crate::config::groups::OnExhaust::Downgrade),
+                downgrade_to: Some("value".to_string()),
+            }],
+            ..Default::default()
+        },
+    )]);
+    let cost = crate::cost::CostModel::resolve_parts(None, 10, &groups);
+    let (key, _secret) = gov
+        .create_key(
+            NewKeySpec {
+                name: "dev".to_string(),
+                allowed_pools,
+                group: Some("team".to_string()),
+                labels: Default::default(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+    let mut app = minimal_app();
+    let inner = Arc::get_mut(&mut app).expect("sole owner");
+    inner.governance = Some(gov);
+    inner.cost = std::sync::Arc::new(cost);
+    inner.pools.insert("frontier".to_string(), vec![]);
+    inner.pools.insert("value".to_string(), vec![]);
+    (app, key)
+}
+
+/// Exhausting the frontier budget DOWNGRADES instead of rejecting: the admission lands on the
+/// `value` pool (returned as the effective pool so dispatch follows), and the charge lands on
+/// value's participation set - the caller keeps working, on the cheaper tier.
+#[tokio::test]
+async fn test_budget_exhaustion_downgrades_pool() {
+    let (app, key) = governed_app_downgrade(None);
+    let gov = crate::governance::GovCtx {
+        key: Some(std::sync::Arc::new(key.clone())),
+    };
+    let at = crate::store::now();
+    // fee=10, cap=25: two frontier admissions spend 20; the 3rd would reach 30 > 25.
+    for i in 0..2 {
+        let (grant, effective) = admit_check(&app, &gov, "openai", "frontier", at)
+            .unwrap_or_else(|_| panic!("admission {i} under the frontier cap"));
+        assert!(grant.is_some());
+        assert_eq!(effective, None, "no downgrade while under the cap");
+    }
+    let (grant, effective) =
+        admit_check(&app, &gov, "openai", "frontier", at).expect("downgraded, not rejected");
+    assert!(grant.is_some(), "the downgraded admission still charges");
+    assert_eq!(
+        effective.as_deref(),
+        Some("value"),
+        "dispatch must follow the charge to the downgrade pool"
+    );
+}
+
+/// The downgrade re-runs the key's pool ACL: a key restricted to `frontier` can NEVER be routed
+/// into `value` by exhaustion - the request falls back to the plain budget rejection.
+#[tokio::test]
+async fn test_downgrade_never_bypasses_pool_acl() {
+    let (app, key) = governed_app_downgrade(Some(vec!["frontier".to_string()]));
+    let gov = crate::governance::GovCtx {
+        key: Some(std::sync::Arc::new(key.clone())),
+    };
+    let at = crate::store::now();
+    assert!(admit_check(&app, &gov, "openai", "frontier", at).is_ok());
+    assert!(admit_check(&app, &gov, "openai", "frontier", at).is_ok());
+    let resp = admit_check(&app, &gov, "openai", "frontier", at)
+        .expect_err("ACL-blocked downgrade must fall back to the budget rejection");
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the caller sees the plain quota rejection, not a leaked pool"
+    );
 }

@@ -1922,6 +1922,8 @@ mod tests {
             amount: cents,
             per: Some(per),
             pool: None,
+            on_exhaust: None,
+            downgrade_to: None,
         }
     }
 

@@ -149,6 +149,23 @@ pub(crate) struct LimitCfg {
     /// per `(group, pool)`. `None` = group-wide (every request charges it). ALWAYS `None` for
     /// `concurrent`. The pool's existence is validated against the config's `pools:` at the door.
     pub(crate) pool: Option<String>,
+    /// What BUDGET exhaustion does (§6c "budgets that teach"): `block` (the default when absent -
+    /// today's 429/quota rejection) or `downgrade` (the request re-admits and dispatches through
+    /// `downgrade_to` instead of being refused - expensive calls get cheaper, not blocked).
+    /// `downgrade` requires `downgrade_to` + a `pool:` scope + the `budget` metric (validated).
+    pub(crate) on_exhaust: Option<OnExhaust>,
+    /// The pool a `downgrade` sends exhausted traffic to. Present iff `on_exhaust: downgrade`.
+    pub(crate) downgrade_to: Option<String>,
+}
+
+/// The budget-exhaustion behavior a limit may declare (see [`LimitCfg::on_exhaust`]).
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OnExhaust {
+    /// Refuse the request (429 / the vendor's quota status) - the default.
+    Block,
+    /// Re-route the request through `downgrade_to` instead of refusing it.
+    Downgrade,
 }
 
 impl<'de> Deserialize<'de> for LimitCfg {
@@ -177,6 +194,8 @@ impl<'de> Deserialize<'de> for LimitCfg {
                 let mut metric: Option<(LimitMetric, u64)> = None;
                 let mut per: Option<LimitWindow> = None;
                 let mut pool: Option<String> = None;
+                let mut on_exhaust: Option<OnExhaust> = None;
+                let mut downgrade_to: Option<String> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     let named = match key.as_str() {
@@ -198,10 +217,33 @@ impl<'de> Deserialize<'de> for LimitCfg {
                             pool = Some(map.next_value()?);
                             None
                         }
+                        "on_exhaust" => {
+                            if on_exhaust.is_some() {
+                                return Err(de::Error::duplicate_field("on_exhaust"));
+                            }
+                            on_exhaust = Some(map.next_value()?);
+                            None
+                        }
+                        "downgrade_to" => {
+                            if downgrade_to.is_some() {
+                                return Err(de::Error::duplicate_field("downgrade_to"));
+                            }
+                            downgrade_to = Some(map.next_value()?);
+                            None
+                        }
                         other => {
                             return Err(de::Error::unknown_field(
                                 other,
-                                &["requests", "tokens", "budget", "concurrent", "per", "pool"],
+                                &[
+                                    "requests",
+                                    "tokens",
+                                    "budget",
+                                    "concurrent",
+                                    "per",
+                                    "pool",
+                                    "on_exhaust",
+                                    "downgrade_to",
+                                ],
                             ));
                         }
                     };
@@ -230,6 +272,38 @@ impl<'de> Deserialize<'de> for LimitCfg {
                          qualifier; remove `pool`",
                     ));
                 }
+                // The exhaustion pair is shape-checked HERE (metric + coupling are parse-time
+                // facts); the pools' existence is validated with the tree.
+                if on_exhaust == Some(OnExhaust::Downgrade) && downgrade_to.is_none() {
+                    return Err(de::Error::custom(
+                        "`on_exhaust: downgrade` requires `downgrade_to: <pool>` - where should \
+                         the exhausted traffic go?",
+                    ));
+                }
+                if downgrade_to.is_some() && on_exhaust != Some(OnExhaust::Downgrade) {
+                    return Err(de::Error::custom(
+                        "`downgrade_to` only makes sense with `on_exhaust: downgrade`",
+                    ));
+                }
+                if on_exhaust.is_some() && metric != LimitMetric::Budget {
+                    return Err(de::Error::custom(format!(
+                        "`on_exhaust` is a BUDGET-exhaustion behavior; a `{}` limit does not \
+                         take it",
+                        metric.as_str()
+                    )));
+                }
+                if on_exhaust == Some(OnExhaust::Downgrade) && pool.is_none() {
+                    return Err(de::Error::custom(
+                        "`on_exhaust: downgrade` requires a `pool:` scope on the limit - a \
+                         GROUP-WIDE budget charges every pool, so there is nowhere cheaper to \
+                         send the traffic",
+                    ));
+                }
+                if on_exhaust == Some(OnExhaust::Downgrade) && downgrade_to == pool {
+                    return Err(de::Error::custom(
+                        "`downgrade_to` must name a DIFFERENT pool than the limit's own `pool:`",
+                    ));
+                }
                 match (metric, per) {
                     (LimitMetric::Concurrent, Some(_)) => Err(de::Error::custom(
                         "`concurrent` is an instantaneous in-flight cap and takes NO `per:` \
@@ -240,6 +314,8 @@ impl<'de> Deserialize<'de> for LimitCfg {
                         amount,
                         per: None,
                         pool: None,
+                        on_exhaust: None,
+                        downgrade_to: None,
                     }),
                     (_, None) => Err(de::Error::custom(format!(
                         "a `{}` limit requires a `per:` window \
@@ -251,6 +327,8 @@ impl<'de> Deserialize<'de> for LimitCfg {
                         amount,
                         per: Some(window),
                         pool,
+                        on_exhaust,
+                        downgrade_to,
                     }),
                 }
             }
@@ -271,7 +349,11 @@ impl Serialize for LimitCfg {
     where
         S: Serializer,
     {
-        let len = 1 + usize::from(self.per.is_some()) + usize::from(self.pool.is_some());
+        let len = 1
+            + usize::from(self.per.is_some())
+            + usize::from(self.pool.is_some())
+            + usize::from(self.on_exhaust.is_some())
+            + usize::from(self.downgrade_to.is_some());
         let mut map = serializer.serialize_map(Some(len))?;
         map.serialize_entry(self.metric.as_str(), &self.amount)?;
         if let Some(window) = self.per {
@@ -279,6 +361,12 @@ impl Serialize for LimitCfg {
         }
         if let Some(pool) = &self.pool {
             map.serialize_entry("pool", pool)?;
+        }
+        if let Some(on_exhaust) = self.on_exhaust {
+            map.serialize_entry("on_exhaust", &on_exhaust)?;
+        }
+        if let Some(to) = &self.downgrade_to {
+            map.serialize_entry("downgrade_to", to)?;
         }
         map.end()
     }
@@ -309,6 +397,14 @@ pub(crate) fn validate_groups(
                         "groups.{name}.{field} has `pool: {pool}`, but no such pool exists; \
                          name a pool from the top-level `pools:` section or drop the qualifier \
                          for a group-wide limit"
+                    ));
+                }
+            }
+            if let Some(to) = &limit.downgrade_to {
+                if !pool_exists(to) {
+                    errors.push(format!(
+                        "groups.{name}.{field} has `downgrade_to: {to}`, but no such pool \
+                         exists; exhausted traffic needs a real pool to land on"
                     ));
                 }
             }

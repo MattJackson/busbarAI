@@ -188,6 +188,8 @@ fn budget_group_cfg(cap: i64, period: &str, parent: Option<&str>) -> crate::conf
             amount: u64::try_from(cap).unwrap_or(0),
             per: Some(per),
             pool: None,
+            on_exhaust: None,
+            downgrade_to: None,
         }],
         ..Default::default()
     }
@@ -395,6 +397,7 @@ async fn test_try_admit_rejects_at_group_cap() {
             metric: "budget",
             window: Some("total"),
             pool: None,
+            downgrade_to: None,
             retry_after: None,
         },
         "3rd (would be 3c > 2c cap) rejected atomically, naming the exact bucket"
@@ -1197,6 +1200,8 @@ fn test_rate_headroom_reports_fraction_remaining() {
                     amount: 0,
                     per: Some(LimitWindow::Minute),
                     pool: None,
+                    on_exhaust: None,
+                    downgrade_to: None,
                 }],
                 ..Default::default()
             },
@@ -1224,12 +1229,16 @@ fn test_rate_headroom_reports_fraction_remaining() {
                         amount: 4,
                         per: Some(LimitWindow::Minute),
                         pool: None,
+                        on_exhaust: None,
+                        downgrade_to: None,
                     },
                     LimitCfg {
                         metric: LimitMetric::Tokens,
                         amount: 100_000,
                         per: Some(LimitWindow::Minute),
                         pool: None,
+                        on_exhaust: None,
+                        downgrade_to: None,
                     },
                 ],
                 ..Default::default()
@@ -1823,6 +1832,7 @@ fn test_chain_enforcement_rejects_naming_the_blocking_group() {
             metric: "budget",
             window: Some("month"),
             pool: None,
+            downgrade_to: None,
             retry_after: crate::governance::window_end("month", at)
                 .map(|end| end.saturating_sub(at).max(1)),
         },
@@ -1900,6 +1910,7 @@ fn test_group_token_spend_blocks_chain_admission() {
             metric: "budget",
             window: Some("total"),
             pool: None,
+            downgrade_to: None,
             retry_after: None,
         } => assert_eq!(group, "team"),
         other => panic!("expected team's budget to block, got {other:?}"),

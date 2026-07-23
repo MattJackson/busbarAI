@@ -1153,9 +1153,23 @@
             "minimum": 0,
             "type": "integer"
           },
+          "downgrade_to": {
+            "description": "Where `on_exhaust: downgrade` sends exhausted traffic. Present iff downgrading.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metric": {
             "description": "One of `requests` | `tokens` | `budget` | `concurrent`.",
             "type": "string"
+          },
+          "on_exhaust": {
+            "description": "The budget-exhaustion behavior: `block` or `downgrade`. Absent = block (the default).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "per": {
             "description": "The accounting window: `minute` | `hour` | `day` | `month` | `total`. Absent for `concurrent`.",
