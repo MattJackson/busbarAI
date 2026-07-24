@@ -35,9 +35,17 @@ pub use busbar_api::Store as StoreTrait;
 /// The store handle behind the opaque `*mut c_void` that crosses the ABI: a boxed trait object.
 type BoxedStore = Box<dyn Store>;
 
-/// Return the ABI version this SDK builds against (a plugin exports it as `busbar_store_abi_version`).
+/// Return the store PAYLOAD schema version this SDK builds against (the manifest `abi_version` a
+/// `kind: store` plugin declares). NOT the transport version — see [`transport_version`].
 pub fn abi_version() -> u32 {
     ABI_VERSION
+}
+
+/// The frozen kind-neutral TRANSPORT version this SDK builds against — a plugin exports it as
+/// `busbar_abi()`. Frozen at [`busbar_plugin_abi::TRANSPORT_VERSION`] (=1); distinct from the per-kind
+/// payload schema version ([`abi_version`] / [`secret_abi_version`]).
+pub fn transport_version() -> u32 {
+    busbar_plugin_abi::TRANSPORT_VERSION
 }
 
 /// Run one [`StoreRequest`] against a `Store`. The single match that maps the wire enum to the trait
@@ -244,6 +252,163 @@ pub unsafe fn close_impl(handle: *mut c_void) {
     drop(Box::from_raw(handle as *mut BoxedStore));
 }
 
+// ── AUTH-plugin glue (`kind: auth`) ──────────────────────────────────────────────────────────────
+// Mirrors the store glue: same six-symbol shape via `export_plugin!`, its own handle type
+// (`Box<dyn AuthModule>`) and the identity-only auth wire. A denied credential is a SUCCESSFUL call
+// (`Reject`/`Pass` ride the OK payload); only a malformed request / encode failure is a protocol error.
+
+/// The auth handle behind the opaque `*mut c_void`: a boxed [`busbar_api::AuthModule`].
+type BoxedAuth = Box<dyn busbar_api::AuthModule>;
+
+/// The auth PAYLOAD schema version this SDK builds against (the manifest `abi_version` a `kind: auth`
+/// plugin declares). NOT the transport version — see [`transport_version`].
+pub fn auth_abi_version() -> u32 {
+    1
+}
+
+/// Run one [`busbar_plugin_abi::auth::AuthRequest`] against an `AuthModule` — the single match that
+/// maps the wire enum to the trait, unit-testable without FFI. An empty `credential` (no usable
+/// credential presented) is passed to `authenticate(None)`.
+pub fn dispatch_auth(
+    module: &dyn busbar_api::AuthModule,
+    req: busbar_plugin_abi::auth::AuthRequest,
+) -> busbar_plugin_abi::auth::AuthResponse {
+    use busbar_plugin_abi::auth::{AuthRequest, AuthResponse};
+    match req {
+        AuthRequest::Name => AuthResponse::Name(module.name().to_string()),
+        AuthRequest::Cacheable => AuthResponse::Cacheable(module.cacheable()),
+        AuthRequest::Authenticate { credential } => {
+            let candidate = if credential.is_empty() {
+                None
+            } else {
+                Some(credential.as_str())
+            };
+            AuthResponse::from_outcome(module.authenticate(candidate))
+        }
+    }
+}
+
+/// `busbar_open` body for an auth plugin — build a `Box<dyn AuthModule>` from the JSON config.
+///
+/// # Safety
+/// Pointers must be valid per the ABI (see [`open_impl`]).
+pub unsafe fn auth_open_impl(
+    cfg: *const u8,
+    cfg_len: usize,
+    out_handle: *mut *mut c_void,
+    out_err: *mut *mut u8,
+    out_err_len: *mut usize,
+    ctor: fn(&str) -> Result<BoxedAuth, String>,
+) -> i32 {
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if cfg_len == 0 {
+            &[]
+        } else if cfg.is_null() {
+            return Err((String::from("null config pointer"), true));
+        } else {
+            std::slice::from_raw_parts(cfg, cfg_len)
+        };
+        let s = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return Err((String::from("config is not valid UTF-8"), true)),
+        };
+        ctor(s).map_err(|msg| (msg, false))
+    }));
+    match res {
+        Ok(Ok(module)) => {
+            let handle = Box::into_raw(Box::new(module)) as *mut c_void;
+            if !out_handle.is_null() {
+                *out_handle = handle;
+            }
+            STATUS_OK
+        }
+        Ok(Err((msg, protocol))) => {
+            write_buf(msg.into_bytes(), out_err, out_err_len);
+            if protocol {
+                STATUS_PROTOCOL
+            } else {
+                STATUS_ERR
+            }
+        }
+        Err(_) => STATUS_PROTOCOL,
+    }
+}
+
+/// `busbar_call` body for an auth plugin — deserialize an [`busbar_plugin_abi::auth::AuthRequest`],
+/// dispatch, serialize the [`busbar_plugin_abi::auth::AuthResponse`]. Panics are caught.
+///
+/// # Safety
+/// `handle` must be a live handle from [`auth_open_impl`]; buffers per the ABI.
+pub unsafe fn auth_call_impl(
+    handle: *mut c_void,
+    req: *const u8,
+    req_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if handle.is_null() {
+        return STATUS_PROTOCOL;
+    }
+    let module: &BoxedAuth = &*(handle as *const BoxedAuth);
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if req_len == 0 {
+            &[]
+        } else if req.is_null() {
+            return Err((String::from("null request pointer"), true));
+        } else {
+            std::slice::from_raw_parts(req, req_len)
+        };
+        let request: busbar_plugin_abi::auth::AuthRequest = match serde_json::from_slice(bytes) {
+            Ok(r) => r,
+            Err(e) => return Err((format!("malformed request JSON: {e}"), true)),
+        };
+        let resp = dispatch_auth(module.as_ref(), request);
+        serde_json::to_vec(&resp).map_err(|e| (format!("response encode failed: {e}"), true))
+    }));
+    match res {
+        Ok(Ok(payload)) => {
+            write_buf(payload, out, out_len);
+            STATUS_OK
+        }
+        Ok(Err((msg, protocol))) => {
+            write_buf(msg.into_bytes(), out, out_len);
+            if protocol {
+                STATUS_PROTOCOL
+            } else {
+                STATUS_ERR
+            }
+        }
+        Err(_) => STATUS_PROTOCOL,
+    }
+}
+
+/// `busbar_close` body for an auth plugin — drop the module instance. Idempotent on null.
+///
+/// # Safety
+/// `handle` must be a live handle from [`auth_open_impl`] not already closed.
+pub unsafe fn auth_close_impl(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle as *mut BoxedAuth));
+}
+
+/// Emit an `auth`-kind cdylib plugin from `$ctor` (a
+/// `fn(&str) -> Result<Box<dyn busbar_api::AuthModule>, String>`). Expands through
+/// [`export_plugin!`], stamping `busbar_plugin_kind() == "auth"` + the six neutral symbols.
+#[macro_export]
+macro_rules! export_auth_plugin {
+    ($ctor:path) => {
+        $crate::export_plugin!(
+            kind = "auth",
+            open = $crate::auth_open_impl,
+            call = $crate::auth_call_impl,
+            close = $crate::auth_close_impl,
+            ctor = $ctor,
+        );
+    };
+}
+
 // ── SECRET-plugin glue (`kind: secret`) ─────────────────────────────────────────────────────────
 // Mirrors the store glue one-to-one: same five-symbol shape, same panic-catching impl style, its
 // own handle type (`Box<dyn SecretModule>`) and its own tiny request enum.
@@ -377,108 +542,105 @@ pub unsafe fn secret_close_impl(handle: *mut c_void) {
     drop(Box::from_raw(handle as *mut BoxedSecret));
 }
 
-/// Emit the five `extern "C"` SECRET-plugin symbols, wiring them to `$ctor` (a
-/// `fn(&str) -> Result<Box<dyn busbar_api::SecretModule>, String>`). Put this at the crate root of
-/// a `cdylib` plugin whose manifest declares `kind: secret`.
+/// The ONE macro that stamps a plugin's KIND and emits the SIX kind-neutral `extern "C"` symbols
+/// (`busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`, `busbar_free`, `busbar_close`),
+/// wiring `open`/`call`/`close` to the caller-supplied bodies. The per-kind `export_*_plugin!`
+/// convenience macros expand through this — a plugin author normally calls those, not this directly.
+///
+/// - `$kind` — a `&'static str` kind (`"store"` | `"secret"` | `"auth"`), stamped into
+///   `busbar_plugin_kind()` as a NUL-terminated string.
+/// - `$open`/`$call`/`$close` — paths to the SDK `*_impl` bodies for this kind (the FFI unsafe lives
+///   there, unit-tested; the macro is a thin per-plugin wrapper).
+/// - `$ctor` — the plugin's `fn(&str) -> Result<Box<dyn Trait>, String>` constructor.
 #[macro_export]
-macro_rules! export_secret_plugin {
-    ($ctor:path) => {
+macro_rules! export_plugin {
+    (kind = $kind:expr, open = $open:path, call = $call:path, close = $close:path, ctor = $ctor:path $(,)?) => {
+        /// # Safety
+        /// Read only by the busbar loader as the frozen TRANSPORT handshake.
         #[no_mangle]
-        pub extern "C" fn busbar_secret_abi_version() -> u32 {
-            $crate::secret_abi_version()
+        pub extern "C" fn busbar_abi() -> u32 {
+            $crate::transport_version()
+        }
+
+        /// # Safety
+        /// The returned pointer is to a `'static` NUL-terminated string owned by this library.
+        #[no_mangle]
+        pub extern "C" fn busbar_plugin_kind() -> *const u8 {
+            const KIND_NUL: &str = concat!($kind, "\0");
+            KIND_NUL.as_ptr()
         }
 
         /// # Safety
         /// Called only by the busbar loader with ABI-valid pointers.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_open(
+        pub unsafe extern "C" fn busbar_open(
             cfg: *const u8,
             cfg_len: usize,
             out_handle: *mut *mut ::core::ffi::c_void,
             out_err: *mut *mut u8,
             out_err_len: *mut usize,
         ) -> i32 {
-            $crate::secret_open_impl(cfg, cfg_len, out_handle, out_err, out_err_len, $ctor)
+            $open(cfg, cfg_len, out_handle, out_err, out_err_len, $ctor)
         }
 
         /// # Safety
         /// Called only by the busbar loader with a live handle and ABI-valid pointers.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_call(
+        pub unsafe extern "C" fn busbar_call(
             handle: *mut ::core::ffi::c_void,
             req: *const u8,
             req_len: usize,
             out: *mut *mut u8,
             out_len: *mut usize,
         ) -> i32 {
-            $crate::secret_call_impl(handle, req, req_len, out, out_len)
+            $call(handle, req, req_len, out, out_len)
         }
 
         /// # Safety
         /// Called only by the busbar loader with a buffer this plugin returned.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_free(ptr: *mut u8, len: usize) {
+        pub unsafe extern "C" fn busbar_free(ptr: *mut u8, len: usize) {
             $crate::free_impl(ptr, len)
         }
 
         /// # Safety
         /// Called only by the busbar loader with a live handle, once.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_close(handle: *mut ::core::ffi::c_void) {
-            $crate::secret_close_impl(handle)
+        pub unsafe extern "C" fn busbar_close(handle: *mut ::core::ffi::c_void) {
+            $close(handle)
         }
     };
 }
 
-/// Emit the five `extern "C"` store-plugin symbols, wiring them to `$ctor` (a
-/// `fn(&str) -> Result<Box<dyn Store>, String>`). Put this at the crate root of a `cdylib` plugin.
+/// Emit a `secret`-kind cdylib plugin from `$ctor` (a
+/// `fn(&str) -> Result<Box<dyn busbar_api::SecretModule>, String>`). Expands through
+/// [`export_plugin!`], stamping `busbar_plugin_kind() == "secret"` + the six neutral symbols.
+#[macro_export]
+macro_rules! export_secret_plugin {
+    ($ctor:path) => {
+        $crate::export_plugin!(
+            kind = "secret",
+            open = $crate::secret_open_impl,
+            call = $crate::secret_call_impl,
+            close = $crate::secret_close_impl,
+            ctor = $ctor,
+        );
+    };
+}
+
+/// Emit a `store`-kind cdylib plugin from `$ctor` (a `fn(&str) -> Result<Box<dyn Store>, String>`).
+/// Expands through [`export_plugin!`], stamping `busbar_plugin_kind() == "store"` + the six neutral
+/// symbols.
 #[macro_export]
 macro_rules! export_store_plugin {
     ($ctor:path) => {
-        #[no_mangle]
-        pub extern "C" fn busbar_store_abi_version() -> u32 {
-            $crate::abi_version()
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with ABI-valid pointers.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_open(
-            cfg: *const u8,
-            cfg_len: usize,
-            out_handle: *mut *mut ::core::ffi::c_void,
-            out_err: *mut *mut u8,
-            out_err_len: *mut usize,
-        ) -> i32 {
-            $crate::open_impl(cfg, cfg_len, out_handle, out_err, out_err_len, $ctor)
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with a live handle and ABI-valid pointers.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_call(
-            handle: *mut ::core::ffi::c_void,
-            req: *const u8,
-            req_len: usize,
-            out: *mut *mut u8,
-            out_len: *mut usize,
-        ) -> i32 {
-            $crate::call_impl(handle, req, req_len, out, out_len)
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with a buffer this plugin returned.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_free(ptr: *mut u8, len: usize) {
-            $crate::free_impl(ptr, len)
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with a live handle, once.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_close(handle: *mut ::core::ffi::c_void) {
-            $crate::close_impl(handle)
-        }
+        $crate::export_plugin!(
+            kind = "store",
+            open = $crate::open_impl,
+            call = $crate::call_impl,
+            close = $crate::close_impl,
+            ctor = $ctor,
+        );
     };
 }
 

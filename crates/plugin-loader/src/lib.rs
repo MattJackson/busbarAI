@@ -23,62 +23,58 @@ use busbar_api::{
     UsageDelta, UsageLedger, VirtualKey,
 };
 use busbar_plugin_abi::{
-    symbol, CallFn, CloseFn, FreeFn, StoreRequest, StoreResponse, ABI_VERSION, STATUS_OK,
+    kind as abi_kind, symbol, CallFn, CloseFn, FreeFn, PluginKindFn, StoreRequest, StoreResponse,
+    MAX_PLUGIN_RESPONSE_LEN, STATUS_OK, TRANSPORT_VERSION,
 };
 use libloading::Library;
 use std::os::raw::c_void;
 use std::path::Path;
 
+pub mod auth;
 pub mod registry;
 mod stage;
 pub mod tarball;
 
+pub use auth::DynAuth;
 pub use registry::{
     inventory as inventory_tarballs, scan_and_validate, supported_abi, InventoryEntry,
     LoadablePlugin, PluginRegistry, SkippedPlugin,
 };
 pub use stage::sweep_dead_staging;
 
-/// Hard cap on the byte length the engine will materialize from a single plugin `call` response —
-/// defense-in-depth against a plugin (buggy or adversarial) declaring a huge `out_len` and forcing an
-/// unbounded engine allocation (OOM). 256 MiB is orders of magnitude past any real governance
-/// response (key lists / audit logs are KBs–MBs), so a legitimate reply never trips it.
-const MAX_PLUGIN_RESPONSE_LEN: usize = 256 * 1024 * 1024;
-
-/// A `Store` backend loaded from a dynamic library. Holds the resolved C fn pointers, the opaque
-/// per-instance handle, and — crucially — the [`Library`] itself so the code the fn pointers point
-/// into stays mapped for the store's whole life.
-pub struct DynStore {
+/// The resolved core C fn pointers + the opaque handle + the mapped library + staging backing, shared
+/// by every kind's typed wrapper. The KIND is bound at construction (cross-checked against the signed
+/// manifest) and then carried by the typed `DynStore`/`DynSecret`/`DynAuth`.
+struct RawPlugin {
     handle: *mut c_void,
     call: CallFn,
     free: FreeFn,
     close: CloseFn,
-    /// The plugin path, for diagnostics.
+    /// The plugin name/path, for diagnostics.
     path: String,
-    /// The loaded library. Declared BEFORE `_backing` so it drops FIRST (Rust drops fields in
-    /// declaration order, AFTER the manual `Drop::drop` below has `close`d the handle). Unloading the
-    /// library before the staged backing is released is what makes the Windows cleanup work: the DLL
-    /// is unmapped/unlocked first, so the staged file can then be removed instead of failing against
-    /// a still-mapped file and leaking the temp. (UNLOAD then REMOVE, per the loader contract.)
+    /// The mapped library. Declared BEFORE `_backing` so it drops FIRST (fields drop in declaration
+    /// order, AFTER `Drop::drop` closes the handle) — the UNLOAD-then-REMOVE order Windows requires.
     _lib: Library,
-    /// The staging backing this load (Linux memfd, or a file in the per-process private temp dir)
-    /// when the library was loaded from in-memory verified bytes ([`load_store_from_bytes`]) rather
-    /// than a path. Dropping it releases the resource; it MUST drop after `_lib` (see above).
-    /// `None` for a plain path load.
+    /// The staging backing (Linux memfd / private-temp file) for a from-bytes load; `None` for a path
+    /// load. MUST drop after `_lib`.
     _backing: Option<stage::Staged>,
 }
 
-// SAFETY: the backend behind the handle is a `Box<dyn Store>`, which the `Store` contract requires to
-// be `Send + Sync`; the handle is just an opaque pointer to that object, and every call is dispatched
-// through the plugin's own (thread-safe) implementation. The raw fn pointers are plain code addresses.
-unsafe impl Send for DynStore {}
-unsafe impl Sync for DynStore {}
+// SAFETY: every kind's backend is a `Box<dyn Trait>` the trait contract requires to be `Send + Sync`;
+// the handle is an opaque pointer to it and the raw fn pointers are plain code addresses.
+unsafe impl Send for RawPlugin {}
+unsafe impl Sync for RawPlugin {}
 
-impl DynStore {
-    /// Serialize a request, ship it across the C ABI, copy + free the response buffer, and decode.
-    fn call_raw(&self, req: StoreRequest) -> StoreResult<StoreResponse> {
-        let payload = serde_json::to_vec(&req)
-            .map_err(|e| StoreError(format!("plugin request encode failed: {e}")))?;
+impl RawPlugin {
+    /// The ONE generic transport primitive: serialize `req`, ship it across the kind-neutral `call`,
+    /// cap-check + copy + free the response buffer, and decode it as `Resp`. Replaces the duplicated
+    /// per-kind wire calls — store, secret, and auth all go through this; only the TYPES differ.
+    fn transport_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        &self,
+        req: &Req,
+    ) -> Result<Resp, String> {
+        let payload =
+            serde_json::to_vec(req).map_err(|e| format!("plugin request encode failed: {e}"))?;
         let mut out: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
         let status = unsafe {
@@ -90,20 +86,13 @@ impl DynStore {
                 &mut out_len,
             )
         };
-        // DEFENSE-IN-DEPTH cap on the plugin-declared response length. The plugin is trusted
-        // operator-placed code, but a bug (or an adversarial build) that returns a huge `out_len`
-        // would have the engine `to_vec()` an unbounded allocation and OOM. Refuse an over-cap length
-        // BEFORE allocating — but still hand the buffer back to the plugin to `free` so we never leak
-        // its allocation. The cap is far past any real governance response (a full key/audit list is
-        // KBs–MBs), so it never rejects a legitimate reply.
+        // Cap-reject BEFORE reading; still hand the buffer back to the plugin to free (it owns it).
         if let Err(msg) = response_len_ok(out_len, &self.path) {
             if !out.is_null() {
                 unsafe { (self.free)(out, out_len) };
             }
-            return Err(StoreError(msg));
+            return Err(msg);
         }
-        // Copy the out buffer into engine-owned memory, then hand it back to the plugin to free (the
-        // plugin allocated it; only the plugin may free it).
         let bytes = if out.is_null() || out_len == 0 {
             Vec::new()
         } else {
@@ -114,15 +103,147 @@ impl DynStore {
         }
         if status == STATUS_OK {
             serde_json::from_slice(&bytes)
-                .map_err(|e| StoreError(format!("plugin response decode failed: {e}")))
+                .map_err(|e| format!("plugin response decode failed: {e}"))
         } else {
             let msg = String::from_utf8_lossy(&bytes).into_owned();
-            Err(StoreError(if msg.is_empty() {
+            Err(if msg.is_empty() {
                 format!("plugin '{}' call failed (status {status})", self.path)
             } else {
                 msg
-            }))
+            })
         }
+    }
+}
+
+impl Drop for RawPlugin {
+    fn drop(&mut self) {
+        unsafe { (self.close)(self.handle) };
+    }
+}
+
+/// Resolve + validate a mapped library against the frozen contract (transport version, kind symbol ==
+/// `expected_kind` == the signed-manifest kind), then `open` it and assemble a [`RawPlugin`]. Shared
+/// by every kind's `wire_up_*`. `manifest_kind` is the trust-verified signed-manifest `kind` that the
+/// exported `busbar_plugin_kind()` is cross-checked against (mismatch = hard fail-closed load error).
+fn wire_up_raw(
+    lib: Library,
+    cfg_json: &str,
+    display: String,
+    expected_kind: &str,
+    manifest_kind: &str,
+    backing: Option<stage::Staged>,
+) -> Result<RawPlugin, String> {
+    // ── 1. Transport handshake FIRST — refuse a non-matching transport before resolving open/call. ──
+    let transport = unsafe {
+        let f = lib
+            .get::<busbar_plugin_abi::AbiFn>(symbol::ABI)
+            .map_err(|_| format!("'{display}' is not a busbar plugin (no busbar_abi symbol)"))?;
+        (*f)()
+    };
+    if transport != TRANSPORT_VERSION {
+        return Err(format!(
+            "plugin '{display}' targets transport ABI v{transport}, engine speaks v{TRANSPORT_VERSION}"
+        ));
+    }
+
+    // ── 2. Kind bound at load — read the exported kind, cross-check it against the seam AND the
+    //       signed manifest. Any disagreement is a hard fail-closed load error naming both. ──
+    let exported_kind = read_plugin_kind(&lib, &display)?;
+    if exported_kind != expected_kind {
+        return Err(format!(
+            "plugin '{display}' exports kind '{exported_kind}' but is being loaded as '{expected_kind}'"
+        ));
+    }
+    if exported_kind != manifest_kind {
+        return Err(format!(
+            "plugin '{display}' kind mismatch: exported symbol says '{exported_kind}', signed \
+             manifest says '{manifest_kind}' — refusing to load"
+        ));
+    }
+
+    // ── 3. Resolve the operational symbols (copied out as plain fn pointers; valid while mapped). ──
+    let (open, call, free, close) = unsafe {
+        let open = *lib
+            .get::<busbar_plugin_abi::OpenFn>(symbol::OPEN)
+            .map_err(|e| format!("plugin '{display}' missing busbar_open: {e}"))?;
+        let call = *lib
+            .get::<CallFn>(symbol::CALL)
+            .map_err(|e| format!("plugin '{display}' missing busbar_call: {e}"))?;
+        let free = *lib
+            .get::<FreeFn>(symbol::FREE)
+            .map_err(|e| format!("plugin '{display}' missing busbar_free: {e}"))?;
+        let close = *lib
+            .get::<CloseFn>(symbol::CLOSE)
+            .map_err(|e| format!("plugin '{display}' missing busbar_close: {e}"))?;
+        (open, call, free, close)
+    };
+
+    // ── 4. open: construct the instance from the JSON config. ──
+    let mut handle: *mut c_void = std::ptr::null_mut();
+    let mut err: *mut u8 = std::ptr::null_mut();
+    let mut err_len: usize = 0;
+    let status = unsafe {
+        open(
+            cfg_json.as_ptr(),
+            cfg_json.len(),
+            &mut handle,
+            &mut err,
+            &mut err_len,
+        )
+    };
+    if status != STATUS_OK || handle.is_null() {
+        let msg = if err.is_null() || err_len == 0 {
+            format!("status {status}")
+        } else {
+            let m = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(err, err_len) })
+                .into_owned();
+            unsafe { free(err, err_len) };
+            m
+        };
+        return Err(format!("plugin '{display}' open failed: {msg}"));
+    }
+
+    Ok(RawPlugin {
+        handle,
+        call,
+        free,
+        close,
+        path: display,
+        _lib: lib,
+        _backing: backing,
+    })
+}
+
+/// Read `busbar_plugin_kind()` from a mapped library into an owned `String`.
+fn read_plugin_kind(lib: &Library, display: &str) -> Result<String, String> {
+    let ptr = unsafe {
+        let f = lib.get::<PluginKindFn>(symbol::PLUGIN_KIND).map_err(|_| {
+            format!("'{display}' is not a busbar plugin (no busbar_plugin_kind symbol)")
+        })?;
+        (*f)()
+    };
+    if ptr.is_null() {
+        return Err(format!("plugin '{display}' returned a null kind string"));
+    }
+    // SAFETY: the plugin contract requires a NUL-terminated 'static string.
+    let cstr = unsafe { std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char) };
+    cstr.to_str()
+        .map(str::to_string)
+        .map_err(|_| format!("plugin '{display}' kind string is not valid UTF-8"))
+}
+
+/// A `Store` backend loaded from a dynamic library over the kind-neutral ABI. Wraps a [`RawPlugin`]
+/// whose kind was bound to `store` at load, so every `Store` method is a typed `transport_call`.
+pub struct DynStore {
+    raw: RawPlugin,
+}
+
+impl DynStore {
+    /// Serialize a request, ship it across the kind-neutral C ABI, decode the response.
+    fn call_raw(&self, req: StoreRequest) -> StoreResult<StoreResponse> {
+        self.raw
+            .transport_call::<StoreRequest, StoreResponse>(&req)
+            .map_err(StoreError)
     }
 }
 
@@ -316,91 +437,20 @@ impl Store for DynStore {
     }
 }
 
-impl Drop for DynStore {
-    fn drop(&mut self) {
-        // Close the instance while the library is still mapped (fields drop after this runs). Field
-        // drop order is declaration order: `_lib` is declared BEFORE `_backing`, so the library
-        // unloads FIRST and the backing temp file is removed AFTER (essential on Windows, where the
-        // file cannot be deleted while the DLL is still mapped).
-        unsafe { (self.close)(self.handle) };
-    }
-}
-
 impl std::fmt::Debug for DynStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynStore")
-            .field("path", &self.path)
+            .field("path", &self.raw.path)
             .finish()
     }
 }
 
 // ── SECRET plugins (`kind: secret`) ─────────────────────────────────────────────────────────────
 
-/// A [`busbar_api::SecretModule`] loaded from a dynamic library. Mirrors [`DynStore`]: resolved C
-/// fn pointers + opaque handle + the mapped [`Library`] (declared before `_backing`; see DynStore's
-/// field-order contract).
+/// A [`busbar_api::SecretModule`] loaded from a dynamic library over the kind-neutral ABI. Wraps a
+/// [`RawPlugin`] whose kind was bound to `secret` at load.
 pub struct DynSecret {
-    handle: *mut c_void,
-    call: CallFn,
-    free: FreeFn,
-    close: CloseFn,
-    /// The plugin name/path, for diagnostics.
-    path: String,
-    _lib: Library,
-    _backing: Option<stage::Staged>,
-}
-
-// SAFETY: the backend behind the handle is a `Box<dyn SecretModule>` (`Send + Sync` by contract);
-// the handle is an opaque pointer to it and the raw fn pointers are plain code addresses.
-unsafe impl Send for DynSecret {}
-unsafe impl Sync for DynSecret {}
-
-impl DynSecret {
-    /// Serialize a request, ship it across the C ABI, copy + free the response buffer, and decode.
-    fn call_raw(
-        &self,
-        req: busbar_plugin_abi::SecretRequest,
-    ) -> Result<busbar_plugin_abi::SecretResponse, busbar_api::SecretError> {
-        let payload = serde_json::to_vec(&req)
-            .map_err(|e| busbar_api::SecretError(format!("plugin request encode failed: {e}")))?;
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut out_len: usize = 0;
-        let status = unsafe {
-            (self.call)(
-                self.handle,
-                payload.as_ptr(),
-                payload.len(),
-                &mut out,
-                &mut out_len,
-            )
-        };
-        // Same defense-in-depth response-length cap as the store wire (see DynStore::call_raw).
-        if let Err(msg) = response_len_ok(out_len, &self.path) {
-            if !out.is_null() {
-                unsafe { (self.free)(out, out_len) };
-            }
-            return Err(busbar_api::SecretError(msg));
-        }
-        let bytes = if out.is_null() || out_len == 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec()
-        };
-        if !out.is_null() {
-            unsafe { (self.free)(out, out_len) };
-        }
-        if status == STATUS_OK {
-            serde_json::from_slice(&bytes)
-                .map_err(|e| busbar_api::SecretError(format!("plugin response decode failed: {e}")))
-        } else {
-            let msg = String::from_utf8_lossy(&bytes).into_owned();
-            Err(busbar_api::SecretError(if msg.is_empty() {
-                format!("plugin '{}' call failed (status {status})", self.path)
-            } else {
-                msg
-            }))
-        }
-    }
+    raw: RawPlugin,
 }
 
 impl busbar_api::SecretModule for DynSecret {
@@ -408,108 +458,46 @@ impl busbar_api::SecretModule for DynSecret {
         &self,
         settings: &serde_json::Map<String, serde_json::Value>,
     ) -> busbar_api::SecretResult<Vec<u8>> {
-        match self.call_raw(busbar_plugin_abi::SecretRequest::Resolve {
+        let req = busbar_plugin_abi::SecretRequest::Resolve {
             settings: settings.clone(),
-        })? {
+        };
+        match self
+            .raw
+            .transport_call::<_, busbar_plugin_abi::SecretResponse>(&req)
+            .map_err(busbar_api::SecretError)?
+        {
             busbar_plugin_abi::SecretResponse::Bytes(b) => Ok(b),
         }
-    }
-}
-
-impl Drop for DynSecret {
-    fn drop(&mut self) {
-        // Close while the library is still mapped (fields drop after this; `_lib` before `_backing`).
-        unsafe { (self.close)(self.handle) };
     }
 }
 
 impl std::fmt::Debug for DynSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynSecret")
-            .field("path", &self.path)
+            .field("path", &self.raw.path)
             .finish()
     }
 }
 
 /// Load a SECRET module from EXACTLY the verified library `bytes` (the TOCTOU-safe entrypoint;
-/// see [`load_store_from_bytes`] for the staging contract). `cfg_json` is the module-level config
-/// passed to its `open` (usually `{}`; per-reference settings ride each `resolve`).
+/// see [`load_store_from_bytes`] for the staging contract). `manifest_kind` is the trust-verified
+/// signed-manifest `kind`, cross-checked against the library's exported `busbar_plugin_kind()`.
 pub fn load_secret_from_bytes(
     bytes: &[u8],
     cfg_json: &str,
     display: &str,
+    manifest_kind: &str,
 ) -> Result<Box<dyn busbar_api::SecretModule>, String> {
     let (lib, staged) = stage::load_library_from_bytes(bytes, display)?;
-    wire_up_secret(lib, cfg_json, display.to_string(), Some(staged))
-}
-
-/// Shared core for a secret plugin: ABI handshake, symbol resolution, `open`, assemble [`DynSecret`].
-fn wire_up_secret(
-    lib: Library,
-    cfg_json: &str,
-    display: String,
-    backing: Option<stage::Staged>,
-) -> Result<Box<dyn busbar_api::SecretModule>, String> {
-    use busbar_plugin_abi::{secret_symbol, SECRET_ABI_VERSION};
-    let abi_version = unsafe {
-        let f = lib
-            .get::<busbar_plugin_abi::AbiVersionFn>(secret_symbol::ABI_VERSION)
-            .map_err(|_| format!("'{display}' is not a busbar secret plugin (no ABI symbol)"))?;
-        (*f)()
-    };
-    if abi_version != SECRET_ABI_VERSION {
-        return Err(format!(
-            "plugin '{display}' targets secret ABI v{abi_version}, engine speaks \
-             v{SECRET_ABI_VERSION}"
-        ));
-    }
-    let (open, call, free, close) = unsafe {
-        let open = *lib
-            .get::<busbar_plugin_abi::OpenFn>(secret_symbol::OPEN)
-            .map_err(|e| format!("plugin '{display}' missing open: {e}"))?;
-        let call = *lib
-            .get::<CallFn>(secret_symbol::CALL)
-            .map_err(|e| format!("plugin '{display}' missing call: {e}"))?;
-        let free = *lib
-            .get::<FreeFn>(secret_symbol::FREE)
-            .map_err(|e| format!("plugin '{display}' missing free: {e}"))?;
-        let close = *lib
-            .get::<CloseFn>(secret_symbol::CLOSE)
-            .map_err(|e| format!("plugin '{display}' missing close: {e}"))?;
-        (open, call, free, close)
-    };
-    let mut handle: *mut c_void = std::ptr::null_mut();
-    let mut err: *mut u8 = std::ptr::null_mut();
-    let mut err_len: usize = 0;
-    let status = unsafe {
-        open(
-            cfg_json.as_ptr(),
-            cfg_json.len(),
-            &mut handle,
-            &mut err,
-            &mut err_len,
-        )
-    };
-    if status != STATUS_OK || handle.is_null() {
-        let msg = if err.is_null() || err_len == 0 {
-            format!("status {status}")
-        } else {
-            let m = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(err, err_len) })
-                .into_owned();
-            unsafe { free(err, err_len) };
-            m
-        };
-        return Err(format!("plugin '{display}' open failed: {msg}"));
-    }
-    Ok(Box::new(DynSecret {
-        handle,
-        call,
-        free,
-        close,
-        path: display,
-        _lib: lib,
-        _backing: backing,
-    }))
+    let raw = wire_up_raw(
+        lib,
+        cfg_json,
+        display.to_string(),
+        abi_kind::SECRET,
+        manifest_kind,
+        Some(staged),
+    )?;
+    Ok(Box::new(DynSecret { raw }))
 }
 
 /// Load a store backend from the dynamic library at `lib_path`, passing `cfg_json` to its `open`.
@@ -524,7 +512,18 @@ pub fn load_store(lib_path: &Path, cfg_json: &str) -> Result<Box<dyn Store>, Str
     // plugins dir, not the request path.
     let lib = unsafe { Library::new(lib_path) }
         .map_err(|e| format!("failed to load plugin '{display}': {e}"))?;
-    wire_up_store(lib, cfg_json, display, None)
+    // A bare path load has no signed manifest to cross-check; the seam's expected kind (`store`) is
+    // the authority, so pass it as the manifest kind too (the exported-kind == expected-kind gate
+    // still enforces the library is a store). The trust-verified from-bytes path is the real gate.
+    let raw = wire_up_raw(
+        lib,
+        cfg_json,
+        display,
+        abi_kind::STORE,
+        abi_kind::STORE,
+        None,
+    )?;
+    Ok(Box::new(DynStore { raw }))
 }
 
 /// Load a store backend from EXACTLY the library `bytes` supplied — the TOCTOU-safe entrypoint.
@@ -546,89 +545,24 @@ pub fn load_store(lib_path: &Path, cfg_json: &str) -> Result<Box<dyn Store>, Str
 ///   owner-created private dir, so only an attacker who already owns that dir (i.e. the same user)
 ///   could interfere; a hostile `TMPDIR` base remains the operator's responsibility.
 ///
-/// `display` is a human label for diagnostics (typically the plugin's canonical name).
+/// `display` is a human label for diagnostics (typically the plugin's canonical name); `manifest_kind`
+/// is the trust-verified signed-manifest `kind`, cross-checked against `busbar_plugin_kind()`.
 pub fn load_store_from_bytes(
     bytes: &[u8],
     cfg_json: &str,
     display: &str,
+    manifest_kind: &str,
 ) -> Result<Box<dyn Store>, String> {
     let (lib, staged) = stage::load_library_from_bytes(bytes, display)?;
-    wire_up_store(lib, cfg_json, display.to_string(), Some(staged))
-}
-
-/// Shared core: given an already-opened [`Library`], run the ABI handshake, resolve the operational
-/// symbols, call `open` with the config, and assemble the [`DynStore`]. `backing` is the staging
-/// guard for a from-bytes load (kept alive for the store's life), or `None` for a path load.
-fn wire_up_store(
-    lib: Library,
-    cfg_json: &str,
-    display: String,
-    backing: Option<stage::Staged>,
-) -> Result<Box<dyn Store>, String> {
-    // ── ABI handshake: refuse anything that isn't a matching-version busbar store plugin ──
-    let abi_version = unsafe {
-        let f = lib
-            .get::<busbar_plugin_abi::AbiVersionFn>(symbol::ABI_VERSION)
-            .map_err(|_| format!("'{display}' is not a busbar store plugin (no ABI symbol)"))?;
-        (*f)()
-    };
-    if abi_version != ABI_VERSION {
-        return Err(format!(
-            "plugin '{display}' targets store ABI v{abi_version}, engine speaks v{ABI_VERSION}"
-        ));
-    }
-
-    // Resolve the operational symbols (copied out as plain fn pointers; valid while `lib` is mapped).
-    let (open, call, free, close) = unsafe {
-        let open = *lib
-            .get::<busbar_plugin_abi::OpenFn>(symbol::OPEN)
-            .map_err(|e| format!("plugin '{display}' missing open: {e}"))?;
-        let call = *lib
-            .get::<CallFn>(symbol::CALL)
-            .map_err(|e| format!("plugin '{display}' missing call: {e}"))?;
-        let free = *lib
-            .get::<FreeFn>(symbol::FREE)
-            .map_err(|e| format!("plugin '{display}' missing free: {e}"))?;
-        let close = *lib
-            .get::<CloseFn>(symbol::CLOSE)
-            .map_err(|e| format!("plugin '{display}' missing close: {e}"))?;
-        (open, call, free, close)
-    };
-
-    // ── open: construct the store instance from the JSON config ──
-    let mut handle: *mut c_void = std::ptr::null_mut();
-    let mut err: *mut u8 = std::ptr::null_mut();
-    let mut err_len: usize = 0;
-    let status = unsafe {
-        open(
-            cfg_json.as_ptr(),
-            cfg_json.len(),
-            &mut handle,
-            &mut err,
-            &mut err_len,
-        )
-    };
-    if status != STATUS_OK || handle.is_null() {
-        let msg = if err.is_null() || err_len == 0 {
-            format!("status {status}")
-        } else {
-            let m = String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(err, err_len) })
-                .into_owned();
-            unsafe { free(err, err_len) };
-            m
-        };
-        return Err(format!("plugin '{display}' open failed: {msg}"));
-    }
-
-    Ok(Box::new(DynStore {
-        handle,
-        call,
-        free,
-        close,
-        path: display,
-        _lib: lib,
-        _backing: backing,
-    }))
+    let raw = wire_up_raw(
+        lib,
+        cfg_json,
+        display.to_string(),
+        abi_kind::STORE,
+        manifest_kind,
+        Some(staged),
+    )?;
+    Ok(Box::new(DynStore { raw }))
 }
 
 /// The platform-native filename for a store plugin built from `crate_name` (e.g. `store_sqlite_plugin`
@@ -649,40 +583,47 @@ pub fn plugin_library_filename(crate_snake: &str) -> String {
     }
 }
 
-/// Validate that a library is a busbar store plugin the engine can speak to — it exports the ABI
-/// handshake and targets a matching ABI version — WITHOUT constructing a store (no `open`). Returns
-/// the plugin's ABI version. Used to vet an uploaded artifact before writing it into the plugins
-/// directory, and to inventory the directory.
+/// Validate that a library is a busbar plugin the engine can speak to — it exports the TRANSPORT
+/// handshake at a matching version, a supported kind, and all operational symbols — WITHOUT
+/// constructing an instance (no `open`). Returns the transport ABI version. Used to vet an uploaded
+/// artifact before writing it into the plugins directory, and to inventory the directory.
 pub fn validate_plugin(lib_path: &Path) -> Result<u32, String> {
     let display = lib_path.display().to_string();
     // SAFETY: loading runs the library's init code — the same trust as loading it to serve, which is
     // itself the trust of compiling it in. The path is operator/admin-supplied, never request data.
     let lib = unsafe { Library::new(lib_path) }
         .map_err(|e| format!("failed to load plugin '{display}': {e}"))?;
-    let abi_version = unsafe {
+    let transport = unsafe {
         let f = lib
-            .get::<busbar_plugin_abi::AbiVersionFn>(symbol::ABI_VERSION)
-            .map_err(|_| format!("'{display}' is not a busbar store plugin (no ABI symbol)"))?;
+            .get::<busbar_plugin_abi::AbiFn>(symbol::ABI)
+            .map_err(|_| format!("'{display}' is not a busbar plugin (no busbar_abi symbol)"))?;
         (*f)()
     };
-    if abi_version != ABI_VERSION {
+    if transport != TRANSPORT_VERSION {
         return Err(format!(
-            "plugin '{display}' targets store ABI v{abi_version}, engine speaks v{ABI_VERSION}"
+            "plugin '{display}' targets transport ABI v{transport}, engine speaks v{TRANSPORT_VERSION}"
+        ));
+    }
+    // The exported kind must be one the engine supports (a range exists for it).
+    let plugin_kind = read_plugin_kind(&lib, &display)?;
+    if supported_abi(&plugin_kind).is_empty() {
+        return Err(format!(
+            "plugin '{display}' declares unsupported kind '{plugin_kind}'"
         ));
     }
     // Confirm the operational symbols resolve too, so a half-built library is caught here rather than
     // at first use.
     unsafe {
         lib.get::<busbar_plugin_abi::OpenFn>(symbol::OPEN)
-            .map_err(|e| format!("plugin '{display}' missing open: {e}"))?;
+            .map_err(|e| format!("plugin '{display}' missing busbar_open: {e}"))?;
         lib.get::<CallFn>(symbol::CALL)
-            .map_err(|e| format!("plugin '{display}' missing call: {e}"))?;
+            .map_err(|e| format!("plugin '{display}' missing busbar_call: {e}"))?;
         lib.get::<FreeFn>(symbol::FREE)
-            .map_err(|e| format!("plugin '{display}' missing free: {e}"))?;
+            .map_err(|e| format!("plugin '{display}' missing busbar_free: {e}"))?;
         lib.get::<CloseFn>(symbol::CLOSE)
-            .map_err(|e| format!("plugin '{display}' missing close: {e}"))?;
+            .map_err(|e| format!("plugin '{display}' missing busbar_close: {e}"))?;
     }
-    Ok(abi_version)
+    Ok(transport)
 }
 
 /// One entry in a plugins-directory inventory: the library filename and whether it validated as a
@@ -948,7 +889,7 @@ mod tests {
             eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
             return;
         };
-        assert_eq!(validate_plugin(&path).expect("validate"), ABI_VERSION);
+        assert_eq!(validate_plugin(&path).expect("validate"), TRANSPORT_VERSION);
 
         let dir = path.parent().unwrap();
         let inv = inventory(dir);
@@ -957,7 +898,7 @@ mod tests {
             .find(|p| p.file.contains("busbar_store_sqlite_plugin"))
             .expect("sqlite plugin in inventory");
         assert!(sqlite.valid);
-        assert_eq!(sqlite.abi_version, Some(ABI_VERSION));
+        assert_eq!(sqlite.abi_version, Some(TRANSPORT_VERSION));
         assert!(sqlite.error.is_none());
     }
 
@@ -993,9 +934,13 @@ mod tests {
             return;
         };
         let bytes = std::fs::read(&path).expect("read sqlite cdylib");
-        let store =
-            load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "sqlite-from-bytes")
-                .expect("load from verified bytes");
+        let store = load_store_from_bytes(
+            &bytes,
+            r#"{"db_path": ":memory:"}"#,
+            "sqlite-from-bytes",
+            "store",
+        )
+        .expect("load from verified bytes");
         let key = VirtualKey {
             id: "vk_b".into(),
             key_hash: "h".into(),
@@ -1038,8 +983,9 @@ mod tests {
             "the swapped-in junk is not a loadable plugin (path load sees the swap)"
         );
         // ...but the from-bytes load, fed the bytes we verified BEFORE the swap, loads fine.
-        let store = load_store_from_bytes(&verified, r#"{"db_path": ":memory:"}"#, "toctou")
-            .expect("verified bytes still load despite the on-disk swap");
+        let store =
+            load_store_from_bytes(&verified, r#"{"db_path": ":memory:"}"#, "toctou", "store")
+                .expect("verified bytes still load despite the on-disk swap");
         assert!(store.list_keys().expect("list over the ABI").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1075,9 +1021,13 @@ mod tests {
         };
         let before = count_staged();
         {
-            let store =
-                load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "no-leak-check")
-                    .expect("load from bytes");
+            let store = load_store_from_bytes(
+                &bytes,
+                r#"{"db_path": ":memory:"}"#,
+                "no-leak-check",
+                "store",
+            )
+            .expect("load from bytes");
             assert!(store.list_keys().expect("list").is_empty());
         } // store drops here -> library unloads, then the staged backing is released.
         let after = count_staged();
@@ -1113,8 +1063,9 @@ mod tests {
                 .count()
         };
         let before = staged_dirs();
-        let store = load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "memfd-check")
-            .expect("memfd load");
+        let store =
+            load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "memfd-check", "store")
+                .expect("memfd load");
         assert!(store.list_keys().expect("list").is_empty());
         assert_eq!(
             staged_dirs(),

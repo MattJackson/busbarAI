@@ -279,6 +279,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-auth-oidc"
+version = "1.5.0"
+dependencies = [
+ "base64",
+ "busbar-api",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "busbar-auth-oidc-plugin"
+version = "1.5.0"
+dependencies = [
+ "busbar-api",
+ "busbar-auth-oidc",
+ "busbar-plugin-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "busbar-hooks-ranking"
 version = "1.5.0"
 dependencies = [
@@ -310,6 +333,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
+ "tracing",
 ]
 
 [[package]]
@@ -2163,6 +2187,7 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
