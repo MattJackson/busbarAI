@@ -184,38 +184,47 @@ modules remain as out-of-process hook options for operators who want process iso
 
 ## Hook plugins (`kind: hook`)
 
-A hook plugin implements the `busbar_api::Hook` trait, returning `HookOutcome` from each op
-(`Decide`, `Transform`, `Notify`, `Configure`, `Describe`, `Status`). The SDK emits the ABI glue:
+A hook plugin implements the SDK's `HookHandler` trait: one method per op, each receiving the op's
+payload as the opaque projection `serde_json::Value` the engine built and returning the reply object
+the engine parses through its existing fail-closed normalizers. Every method has a default, so a
+trivial hook implements only the ops it cares about (a ranking gate implements just `decide`; a
+compressor just `transform`); the rest degrade to the safe abstain/no-op replies the engine already
+treats as fail-open. The SDK emits the ABI glue:
 
 ```rust
-// crate-type = ["cdylib"]; deps: busbar-api, busbar-plugin-sdk, serde_json
-use busbar_api::{Hook, HookOp, HookOutcome};
+// crate-type = ["cdylib"]; deps: busbar-plugin-sdk, serde_json
+use busbar_plugin_sdk::HookHandler;
 
 struct MyGate { /* … */ }
-impl Hook for MyGate {
-    fn call(&self, op: HookOp) -> HookOutcome {
-        match op {
-            HookOp::Decide(ctx) => {
-                if ctx.request.total_chars > 100_000 {
-                    HookOutcome::Reject { status: 413, message: "prompt too large".into() }
-                } else {
-                    HookOutcome::Abstain
-                }
-            }
-            _ => HookOutcome::Abstain,
+impl HookHandler for MyGate {
+    // `decide` — rank candidates / return a verdict. Return `{}` to abstain.
+    fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
+        let too_big = payload["request"]["total_chars"].as_u64().unwrap_or(0) > 100_000;
+        if too_big {
+            serde_json::json!({ "reject": { "status": 413, "message": "prompt too large" } })
+        } else {
+            serde_json::json!({})
         }
     }
+    // Unimplemented ops (`transform`/`notify`/`configure`/`describe`/`status`) use the trait defaults.
 }
 
-fn open(cfg: &str) -> Result<Box<dyn Hook>, String> {
+fn open(cfg: &str) -> Result<Box<dyn HookHandler>, String> {
+    // `cfg` is the hook instance's own `settings:` map, passed through verbatim as JSON.
     Ok(Box::new(MyGate::from_config(cfg)?))
 }
 busbar_plugin_sdk::export_hook_plugin!(open);
 ```
 
-`export_hook_plugin!` emits the six extern-C hybrid ABI symbols. Operations ride `busbar_call` as
-op-discriminated JSON (the same `decide`/`transform`/`notify`/`configure`/`describe`/`status` payload
-as the socket/webhook wire).
+`export_hook_plugin!` emits the six extern-C hybrid ABI symbols. Every op rides the one `busbar_call`
+as an op-discriminated JSON envelope — the same `decide`/`transform`/`notify`/`configure`/`describe`/
+`status` payload contract as the socket/webhook wire, lifted verbatim, so a hook's semantics are
+identical whichever transport carries them. The engine translates each `HookHandler` method into a
+`busbar_call` and parses the reply through the ONE `hooks::wire` fail-closed normalizer, so the
+dlopen and out-of-process seams can never diverge on reject-precedence, the status clamp, or
+restrict/rewrite parsing. A hook never sees `prompt`/`user` content it was not granted: the engine
+projects those keys into `payload` only when BOTH the operator grant and the signed-manifest `needs`
+allow it.
 
 Pack with grant declarations (the core enforces the actual projection; the plugin cannot self-grant
 above what it declares):
