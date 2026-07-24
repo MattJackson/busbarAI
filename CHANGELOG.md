@@ -87,7 +87,9 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   module ref `{ module: webhook|socket|<kind: hook plugin>, settings: {...}, kind?, timeout_ms?,
   on_error?, prompt?, user?, priority?, at? }`. The socket/webhook transports are built-in hook
   MODULES (`settings.path` / `settings.url`), so out-of-process hooks persist; the registry and
-  the `global:`/`default:` flags are gone (subsumed by the two lists).
+  the `global:`/`default:` flags are gone (subsumed by the two lists). `module: webhook|socket`
+  refs are the out-of-process transport modules; a `kind: hook` plugin name routes through the
+  plugin loader and runs in-process over the hybrid ABI (see the Unified plugin model entry below).
 - **RUNTIME-MUTABLE GROUPS on the Admin API - self-service governance.** The `groups:` limit tree
   is now editable live over the Admin API, so per-team and per-user budgets change without a
   restart: `GET /api/v1/admin/groups` + `GET/POST/PUT/PATCH/DELETE /api/v1/admin/groups/{name}`.
@@ -248,6 +250,43 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   now accumulate in per-thread cells (the telemetry bank) and are drained into the recorder at
   scrape time, taking span and counter updates off the shared atomic path on every request.
 
+- **Unified plugin model — hooks are `kind: hook` dlopen plugins.** The old socket/webhook hook
+  transport is RETIRED as the only mechanism; hooks now load as signed in-process plugins over the
+  frozen hybrid ABI (the same six kind-neutral symbols: `busbar_abi` / `busbar_plugin_kind` /
+  `busbar_open` / `busbar_call` / `busbar_free` / `busbar_close`). Kind is bound at load via the
+  signed manifest `kind` field cross-checked against `busbar_plugin_kind()`. Trust is
+  signature-based, not process-isolation. The socket and webhook transports remain as built-in hook
+  modules for operators who want out-of-process hooks. A plugin cannot self-grant access: the
+  signed manifest `needs` field declares intent at pack time; the core enforces the actual
+  projection. `busbar_plugin_sdk::export_hook_plugin!` is the SDK macro.
+- **Headroom and webrequest — the two shipped 1.5.0 hook plugins.** Headroom
+  (`busbar-headroom-hook`) is a first-party `kind: hook` prompt-compression rewrite gate that
+  reduces context before dispatch, saving tokens and latency. Webrequest
+  (`busbar-webrequest-hook`) is a first-party signed HTTP-forwarder hook — the isolation story for
+  code you don't want in-process: it forwards the routing projection to an operator-run HTTPS
+  sidecar, so the operator gets out-of-process isolation without running an untrusted library in
+  busbar's address space. Both plugins are signed by release CI and auto-trusted by the embedded
+  key.
+- **Full-config coverage (`GET`/`PUT /api/v1/admin/config/settings`).** Every `RootCfg` section
+  is now API-settable and overlay-persisted. `GET` returns the current overlay root-section state;
+  `PUT` accepts any subset of the root config (`rate_card`, `per_request_fee`, `security`,
+  `limits`, `observability`, `advanced`, `metrics`, `health`, `routing`, `listen`, `tls`,
+  `admin_listen`, `admin_tls`, `store`, …), merges it into the overlay, re-resolves, and swaps in.
+  `config.yaml` is never written (persistence is the busbar overlay, atomic temp+rename). The
+  response names which fields are **live** (rate_card, per_request_fee, security, limits,
+  observability, advanced, metrics, health, routing — hot-applied immediately) and which are
+  **restart-to-apply** (listen/admin_listen socket binds, tls/admin_tls binds, admin_insecure,
+  store backend — bound once at process start, store reused across hot reloads; stored durably but
+  take effect on next restart).
+- **Hot plugin reload + explicit rollback.** `POST /api/v1/admin/plugins/reload` is now a live hot
+  swap: re-runs the fail-closed plugin pipeline from disk+overlay, rebuilds the registry and
+  `kind: hook` transports, and old libraries drain then unmap — no restart. Fail-closed: a bad
+  artifact leaves old plugins serving. `POST /api/v1/admin/plugins/rollback` is an explicit,
+  audited, If-Match-guarded rollback (body: `{"file": "<tarball-filename>"}`) that pins a prior
+  version and lowers the anti-downgrade floor **only for the operator's action** — automatic silent
+  downgrade stays refused. Both are Full scope and audited. **Store-backend live swap is NOT in
+  1.5.0**; a store module change still requires a restart.
+
 ### Changed
 
 - **THE SEMVER CONTRACT IS REDEFINED (and this is what makes 1.5.0 a minor).** The stable,
@@ -291,6 +330,9 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
 
 ### Removed
 
+- **Hooks-as-socket/webhook as the ONLY hook model retired.** The retired out-of-process-only
+  hook model (where every hook ran in a separate process) is replaced by the unified plugin model.
+  Socket and webhook persist as built-in transport modules but are no longer the only option.
 - **The `governance:` block.** Its contents dissolved: `governance.store`/`db_path` ->
   `store: { module, settings }`; `governance.rate_card` -> top-level `rate_card`;
   `governance.price_per_request_cents` -> `per_request_fee`; `governance.budget_groups` ->
