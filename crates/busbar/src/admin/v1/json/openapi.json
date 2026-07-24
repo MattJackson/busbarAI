@@ -1366,6 +1366,30 @@
         ],
         "type": "object"
       },
+      "OverlayResetView": {
+        "description": "`DELETE /overlay/{section}` — per-section overlay reset result: the section reverted, the\nresulting config version, and whether anything changed (`false` = the section had no overlay state,\nan idempotent no-op).",
+        "properties": {
+          "changed": {
+            "description": "`true` when the reset discarded overlay mutations; `false` for an already-empty section.",
+            "type": "boolean"
+          },
+          "config_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reset": {
+            "description": "The section that was reset (`groups` | `hooks`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reset",
+          "config_version",
+          "changed"
+        ],
+        "type": "object"
+      },
       "Page_GroupView": {
         "description": "A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain\n(design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.",
         "properties": {
@@ -4920,6 +4944,13 @@
         ],
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverlayResetView"
+                }
+              }
+            },
             "description": "`{reset, config_version, changed}` — changed:false when the section had no overlay state"
           },
           "400": {

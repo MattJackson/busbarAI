@@ -5883,3 +5883,504 @@ async fn test_signing_key_rotate_reports_kid_and_revoke_all() {
 
     handle.abort();
 }
+
+// ── per-section overlay RESET (DELETE /overlay/{section}) ──────────────────────────────────────────
+
+/// Write a minimal on-disk config.yaml (with one base group `team`) + providers.yaml under a fresh
+/// temp dir, returning `(dir, config_path, providers_path)`. The reset endpoint re-reads disk truth,
+/// so a reset test needs real files to revert to. Caller removes the dir.
+fn write_reset_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "busbar-reset-{}-{}-{}",
+        tag,
+        std::process::id(),
+        crate::store::now()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let providers_path = dir.join("providers.yaml");
+    let config_path = dir.join("config.yaml");
+    std::fs::write(
+        &providers_path,
+        "test-provider:
+  protocol: anthropic
+  base_url: http://127.0.0.1:1/
+  api_key_env: BUSBAR_TEST_RESET_NO_SUCH_KEY
+",
+    )
+    .unwrap();
+    // Base config: one model/pool + a base group `team` with a month budget. This IS the truth a
+    // reset reverts to.
+    std::fs::write(
+        &config_path,
+        "listen: 127.0.0.1:0
+providers:
+  test-provider:
+    api_key: { env: BUSBAR_TEST_RESET_NO_SUCH_KEY }
+models:
+  m0:
+    provider: test-provider
+    max_concurrent: 4
+pools:
+  p:
+    members:
+      - model: m0
+groups:
+  team:
+    limits:
+      - { budget: 20000, per: month }
+",
+    )
+    .unwrap();
+    (dir, config_path, providers_path)
+}
+
+/// RESET GROUPS after a runtime group POST: the runtime group is gone, the cost model reflects base
+/// (only `team` remains), the config version bumped, and the mutation is audited + version-logged.
+/// The overlay file's groups section is cleared while the (empty) hooks section is preserved.
+#[tokio::test]
+async fn test_admin_v1_overlay_reset_groups_reverts_to_base() {
+    crate::metrics::init();
+    let (dir, config_path, providers_path) = write_reset_fixture("groups");
+    let overlay = dir.join("overlay.json");
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let mut app = TestApp::new()
+        .governance(gov)
+        .overlay_path(overlay.clone())
+        // The live App starts consistent with disk: `team` is a base group.
+        .group(
+            "team",
+            crate::config::GroupCfg {
+                limits: vec![serde_yaml::from_str("{ budget: 20000, per: month }").unwrap()],
+                ..Default::default()
+            },
+        )
+        .build();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.config_path = Some(config_path.clone());
+        inner.providers_path = Some(providers_path.clone());
+    }
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    // Create a runtime leaf group parented to the base `team`.
+    let created = admin(client.post(format!("http://{addr}/api/v1/admin/groups")))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "name": "user:alice",
+                "config": {"parent": "team", "limits": [{"budget": 5000, "per": "month"}]}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status().as_u16(), 201, "{:?}", created.text().await);
+    // It is live in the group tree + written to the overlay.
+    let listed: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/groups")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["name"] == "user:alice"),
+        "the runtime group is live before the reset"
+    );
+    assert!(
+        crate::config::overlay::read(&overlay)
+            .expect("overlay written")
+            .groups
+            .contains_key("user:alice"),
+        "the runtime group is in the overlay before the reset"
+    );
+    let ver_before: serde_json::Value =
+        admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let v_before = ver_before["config_version"].as_u64().unwrap();
+
+    // RESET the groups section.
+    let reset = admin(client.delete(format!("http://{addr}/api/v1/admin/overlay/groups")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status().as_u16(), 200, "{:?}", reset.text().await);
+    let body: serde_json::Value = reset.json().await.unwrap();
+    assert_eq!(body["reset"], "groups");
+    assert_eq!(body["changed"], true, "the reset discarded a mutation");
+    let v_after = body["config_version"].as_u64().unwrap();
+    assert!(v_after > v_before, "the reset bumped the config version");
+
+    // The runtime group is gone; only the base `team` remains.
+    let after: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/groups")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = after["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["team"],
+        "reverted to base groups only: {names:?}"
+    );
+
+    // The overlay's groups section is cleared on disk (the durable half survives a restart).
+    let doc = crate::config::overlay::read(&overlay).expect("overlay still present");
+    assert!(
+        doc.groups.is_empty() && doc.deleted_groups.is_empty(),
+        "the overlay groups section is cleared"
+    );
+
+    // Audited + version-logged.
+    let audit: serde_json::Value = admin(client.get(format!(
+        "http://{addr}/api/v1/admin/audit?action=overlay.reset"
+    )))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    // The audit log is a process-global static shared across parallel tests, so match on BOTH the
+    // resource AND the applied outcome (another test may log an `overlay:groups`/rejected first).
+    assert!(
+        audit["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["resource"] == "overlay:groups" && e["outcome"] == "applied"),
+        "the applied reset is audited"
+    );
+    let versions: serde_json::Value =
+        admin(client.get(format!("http://{addr}/api/v1/admin/config/versions")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(
+        versions["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("overlay.reset groups"))),
+        "the reset landed a version-log entry"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RESET HOOKS after a runtime hook change restores base hooks: a runtime-registered hook is gone
+/// after the reset and the base (disk) hook surface is what remains.
+#[tokio::test]
+async fn test_admin_v1_overlay_reset_hooks_reverts_to_base() {
+    crate::metrics::init();
+    let (dir, config_path, providers_path) = write_reset_fixture("hooks");
+    let overlay = dir.join("overlay.json");
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let mut app = TestApp::new()
+        .governance(gov)
+        .overlay_path(overlay.clone())
+        .build();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.config_path = Some(config_path.clone());
+        inner.providers_path = Some(providers_path.clone());
+    }
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    // Register a runtime hook (the base config declares none).
+    let created = admin(client.post(format!("http://{addr}/api/v1/admin/hooks")))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "name": "runtime_gate",
+                "config": {"kind": "gate", "webhook": "http://127.0.0.1:9982/", "global": true}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status().as_u16(), 201, "{:?}", created.text().await);
+    assert!(
+        crate::config::overlay::read(&overlay)
+            .expect("overlay written")
+            .hooks
+            .contains_key("runtime_gate"),
+        "runtime hook in the overlay before the reset"
+    );
+
+    // RESET hooks.
+    let reset = admin(client.delete(format!("http://{addr}/api/v1/admin/overlay/hooks")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status().as_u16(), 200, "{:?}", reset.text().await);
+    assert_eq!(
+        reset.json::<serde_json::Value>().await.unwrap()["reset"],
+        "hooks"
+    );
+
+    // The runtime hook is gone; the base hook surface (empty here) is restored.
+    let hooks: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/hooks")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        hooks["items"].as_array().unwrap().is_empty(),
+        "the runtime hook is discarded, base hooks restored: {hooks}"
+    );
+    let doc = crate::config::overlay::read(&overlay).expect("overlay present");
+    assert!(
+        doc.hooks.is_empty() && doc.global_hooks.is_empty() && doc.deleted.is_empty(),
+        "the overlay hooks section is cleared"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stale `If-Match` on the reset is a `version_conflict` (409) that changes nothing — the same
+/// optimistic-concurrency guard every config-plane mutation honors.
+#[tokio::test]
+async fn test_admin_v1_overlay_reset_stale_if_match_conflicts() {
+    crate::metrics::init();
+    let (dir, config_path, providers_path) = write_reset_fixture("ifmatch");
+    let overlay = dir.join("overlay.json");
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let mut app = TestApp::new()
+        .governance(gov)
+        .overlay_path(overlay.clone())
+        .group(
+            "team",
+            crate::config::GroupCfg {
+                limits: vec![serde_yaml::from_str("{ budget: 20000, per: month }").unwrap()],
+                ..Default::default()
+            },
+        )
+        .build();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.config_path = Some(config_path.clone());
+        inner.providers_path = Some(providers_path.clone());
+    }
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    // Put SOMETHING in the overlay so the reset is not the empty-section no-op path.
+    admin(client.post(format!("http://{addr}/api/v1/admin/groups")))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({"name": "user:bob", "config": {"parent": "team"}}).to_string())
+        .send()
+        .await
+        .unwrap();
+
+    // A deliberately-stale If-Match (0 is never the current version after a mutation).
+    let stale = admin(client.delete(format!("http://{addr}/api/v1/admin/overlay/groups")))
+        .header("If-Match", "\"0\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status().as_u16(), 409);
+    assert_eq!(
+        stale.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+        "version_conflict"
+    );
+    // Nothing changed: the runtime group is still there.
+    let listed: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/groups")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["name"] == "user:bob"),
+        "a rejected reset changes nothing"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unknown section name is a `400 invalid_request` — only `groups`|`hooks` are valid.
+#[tokio::test]
+async fn test_admin_v1_overlay_reset_unknown_section_400() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let app = TestApp::new().governance(gov).build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    for bad in ["auth", "plugins", "Groups", "keys"] {
+        let r = client
+            .delete(format!("http://{addr}/api/v1/admin/overlay/{bad}"))
+            .header("x-admin-token", "admintok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "`{bad}` is not a valid section");
+        assert_eq!(
+            r.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "invalid_request"
+        );
+    }
+
+    handle.abort();
+}
+
+/// An EMPTY section (no overlay entries/tombstones) is an idempotent success no-op: `changed:false`
+/// and the config version does NOT bump. Works even with no config files on disk (nothing persisted
+/// ⇒ every section is definitionally already at base).
+#[tokio::test]
+async fn test_admin_v1_overlay_reset_empty_section_is_idempotent_noop() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let overlay = std::env::temp_dir().join(format!(
+        "busbar-reset-empty-{}-{}.json",
+        std::process::id(),
+        crate::store::now()
+    ));
+    let _ = std::fs::remove_file(&overlay);
+    let app = TestApp::new()
+        .governance(gov)
+        .overlay_path(overlay.clone())
+        .build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    let v_before: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // No overlay writes have happened → both sections are empty. A reset is a clean no-op success.
+    for section in ["groups", "hooks"] {
+        let r = admin(client.delete(format!("http://{addr}/api/v1/admin/overlay/{section}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            200,
+            "empty {section} reset is a success"
+        );
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(
+            body["changed"], false,
+            "an empty-section reset changes nothing"
+        );
+    }
+    let v_after: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v_before["config_version"], v_after["config_version"],
+        "an idempotent no-op reset does not bump the version"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_file(&overlay);
+}
+
+/// SCOPE: a section reset is a FULL-scope mutation (the `/overlay/*` fallthrough in the scope
+/// matrix), so a read-only principal is forbidden. The matrix is the ONE source the middleware
+/// enforces, so asserting it here is the authoritative scope check; the surface is also
+/// admin-guarded (an unauthenticated caller never even reaches the scope check).
+#[tokio::test]
+async fn test_admin_v1_overlay_reset_requires_full_scope() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let app = TestApp::new().governance(gov).build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    // The scope matrix requires `full` for DELETE /overlay/{section} — a read-only (or
+    // hooks-register) principal cannot pass it.
+    for section in ["groups", "hooks"] {
+        let scope = crate::admin::v1::contract::required_scope(
+            &axum::http::Method::DELETE,
+            &format!("/api/v1/admin/overlay/{section}"),
+        );
+        assert_eq!(
+            scope.as_str(),
+            "full",
+            "a {section} reset is a full-scope mutation"
+        );
+    }
+    // And an unauthenticated caller is rejected (admin-guarded) — the surface never leaks.
+    let unauth = client
+        .delete(format!("http://{addr}/api/v1/admin/overlay/groups"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status().as_u16(), 401, "the reset is admin-guarded");
+
+    handle.abort();
+}

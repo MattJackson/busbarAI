@@ -121,6 +121,18 @@ pub(crate) struct ConfigRollbackView {
     pub(crate) config_version: u64,
 }
 
+/// `DELETE /overlay/{section}` — per-section overlay reset result: the section reverted, the
+/// resulting config version, and whether anything changed (`false` = the section had no overlay state,
+/// an idempotent no-op).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct OverlayResetView {
+    /// The section that was reset (`groups` | `hooks`).
+    pub(crate) reset: String,
+    pub(crate) config_version: u64,
+    /// `true` when the reset discarded overlay mutations; `false` for an already-empty section.
+    pub(crate) changed: bool,
+}
+
 /// `POST /auth/cache/flush` — number of cached credential-decision entries dropped.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct CacheFlushView {

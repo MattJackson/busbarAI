@@ -985,7 +985,10 @@ pub(crate) async fn reset_overlay_section(
         crate::build_app_from_config(
             cfg,
             loaded.deploy.plugins.clone(),
-            loaded.overlay_path,
+            // Preserve the LIVE overlay path (not the env-derived one `load_config_from_disk`
+            // returns) — the reset rewrites the same overlay file the running App uses, exactly as
+            // `config/apply` preserves `current.overlay_path`.
+            current.overlay_path.clone(),
             base_hook_names,
             base_group_names,
             (Some(config_path), Some(providers_path)),
@@ -2818,6 +2821,12 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/config/apply", "post", "200", sview::ConfigApplyView);
     typed!("/config/reload", "post", "200", sview::ConfigReloadView);
     typed!("/config/rollback", "post", "200", sview::ConfigRollbackView);
+    typed!(
+        "/overlay/{section}",
+        "delete",
+        "200",
+        sview::OverlayResetView
+    );
     typed!("/config/diff", "get", "200", sview::ConfigDiffView);
     typed!(
         "/config/versions",
