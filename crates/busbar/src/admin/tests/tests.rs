@@ -6738,3 +6738,403 @@ async fn test_admin_v1_overlay_reset_requires_full_scope() {
 
     handle.abort();
 }
+
+// ── /config/settings — 1.5.0 full-config coverage (the overlay `root` section) ──────────────────────
+
+/// Build an overlay-backed app wired to on-disk config files (the `write_reset_fixture` truth), spin
+/// up an HTTP server, and return everything the `/config/settings` tests need. The app starts on base
+/// config (no root overlay), so a `PUT /config/settings` is the first root mutation.
+async fn settings_test_app(
+    tag: &str,
+) -> (
+    std::path::PathBuf,   // temp dir (caller removes)
+    std::path::PathBuf,   // overlay path
+    std::net::SocketAddr, // server addr
+    tokio::task::JoinHandle<()>,
+) {
+    crate::metrics::init();
+    // A per-test tag keeps parallel `/config/settings` tests on DISTINCT temp dirs (the fixture dir
+    // is keyed on pid + coarse timestamp, which collides for same-second parallel starts).
+    let (dir, config_path, providers_path) = write_reset_fixture(&format!("settings-{tag}"));
+    let overlay = dir.join("overlay.json");
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let mut app = TestApp::new()
+        .governance(gov)
+        .overlay_path(overlay.clone())
+        .build();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.config_path = Some(config_path.clone());
+        inner.providers_path = Some(providers_path.clone());
+    }
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (dir, overlay, addr, handle)
+}
+
+/// ROUND-TRIP + RESTART SURVIVAL: a `PUT /config/settings` with LIVE-swappable sections (rate_card +
+/// per_request_fee + a limits field) applies live (200, version bumps), is written to the overlay
+/// `root` section, is reflected by `GET /config/settings`, and — crucially — survives a
+/// `POST /config/reload` (the restart-equivalent disk re-read). Audited + version-logged.
+#[tokio::test]
+async fn test_admin_v1_config_settings_round_trip_survives_reload() {
+    let (dir, overlay, addr, handle) = settings_test_app("roundtrip").await;
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    let before: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let v_before = before["config_version"].as_u64().unwrap();
+
+    // PUT live-swappable sections only.
+    let put = admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "per_request_fee": 7,
+                "rate_card": { "m0": { "input_utok": 1.5, "output_utok": 2.0 } },
+                "limits": { "max_inbound_concurrent": 512 }
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status().as_u16(), 200, "{:?}", put.text().await);
+    let body: serde_json::Value =
+        admin(client.get(format!("http://{addr}/api/v1/admin/config/settings")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(body["settings"]["per_request_fee"], 7);
+    assert_eq!(body["settings"]["limits"]["max_inbound_concurrent"], 512);
+    assert!(
+        body["settings"]["rate_card"]["m0"].is_object(),
+        "rate_card round-trips"
+    );
+
+    // The overlay `root` section is on disk (the durable half).
+    let doc = crate::config::overlay::read(&overlay).expect("overlay written");
+    let root = doc.root.expect("root section present");
+    assert_eq!(root.per_request_fee, Some(7));
+
+    // The version bumped (a live swap happened).
+    let after: serde_json::Value = admin(client.get(format!("http://{addr}/api/v1/admin/info")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        after["config_version"].as_u64().unwrap() > v_before,
+        "the PUT bumped the config version"
+    );
+
+    // RESTART EQUIVALENT: re-run the BOOT disk-load pipeline (the exact path a fresh process takes)
+    // and confirm the overlay root re-merges onto the base DeployCfg — the settings survive a
+    // restart. (`config/reload` over HTTP resolves the overlay path from the `BUSBAR_CONFIG_OVERLAY`
+    // env var, which the direct-App test harness does not set; this asserts the same merge that boot
+    // performs, without a process-global env var that would race parallel tests.)
+    {
+        let config_path = dir.join("config.yaml");
+        let providers_path = dir.join("providers.yaml");
+        let mut loaded = crate::load_config_from_disk(
+            &config_path,
+            &providers_path,
+            false,
+            crate::config::EnvSubst::Strict,
+        )
+        .expect("disk reload");
+        // Simulate the env-derived overlay read (boot reads it via BUSBAR_CONFIG_OVERLAY).
+        loaded.overlay_doc = crate::config::overlay::read(&overlay);
+        assert_eq!(
+            loaded.deploy.per_request_fee, 0,
+            "base config.yaml has no fee (the override lives only in the overlay)"
+        );
+        if let Some(doc) = loaded.overlay_doc.as_ref() {
+            crate::config::overlay::apply_root_to_deploy(&mut loaded.deploy, doc);
+        }
+        assert_eq!(
+            loaded.deploy.per_request_fee, 7,
+            "the root overlay re-merges onto base at boot (survives a restart)"
+        );
+    }
+
+    // Audited (applied) + version-logged.
+    let audit: serde_json::Value = admin(client.get(format!(
+        "http://{addr}/api/v1/admin/audit?action=config.settings"
+    )))
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        audit["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["resource"] == "config:settings" && e["outcome"] == "applied"),
+        "the applied PUT is audited"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PROCESS-LEVEL flagging: a `PUT` touching a socket-rebind field (`listen`) and the durable `store`
+/// backend stores them durably but flags them `reload_to_apply` (they cannot hot-swap), while a
+/// live-swappable field in the SAME request is not flagged. The note explains the split.
+#[tokio::test]
+async fn test_admin_v1_config_settings_process_level_flagged_reload_to_apply() {
+    let (dir, overlay, addr, handle) = settings_test_app("proclevel").await;
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    let put = admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "store": { "module": "memory" },
+                "per_request_fee": 3
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status().as_u16(), 200, "{:?}", put.text().await);
+    let body: serde_json::Value = put.json().await.unwrap();
+    let flagged: Vec<&str> = body["reload_to_apply"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        flagged.contains(&"listen") && flagged.contains(&"store"),
+        "process-level binds flagged reload-to-apply: {flagged:?}"
+    );
+    assert!(
+        !flagged.contains(&"per_request_fee"),
+        "a live-swappable field is NOT flagged: {flagged:?}"
+    );
+    assert!(
+        body["note"].as_str().unwrap().contains("reload"),
+        "the note explains the reload-to-apply split"
+    );
+    // But they ARE durably stored (the overlay carries the new listen).
+    let doc = crate::config::overlay::read(&overlay).expect("overlay written");
+    assert_eq!(
+        doc.root.unwrap().listen.as_deref(),
+        Some("127.0.0.1:0"),
+        "the reload-to-apply field is still durably persisted"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PARTIAL UPDATE: a second `PUT` naming only `per_request_fee` preserves the earlier `rate_card`
+/// override (partial-merge semantics, like a group PATCH).
+#[tokio::test]
+async fn test_admin_v1_config_settings_partial_update_preserves_prior() {
+    let (dir, _overlay, addr, handle) = settings_test_app("partial").await;
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "rate_card": { "m0": { "input_utok": 9.0 } } }).to_string())
+        .send()
+        .await
+        .unwrap();
+    admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "per_request_fee": 5 }).to_string())
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value =
+        admin(client.get(format!("http://{addr}/api/v1/admin/config/settings")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(body["settings"]["per_request_fee"], 5, "new field set");
+    assert!(
+        body["settings"]["rate_card"]["m0"].is_object(),
+        "the earlier rate_card override is preserved by the partial update"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RESET: `DELETE /overlay/root` discards the root overrides and reverts to base config.yaml — the
+/// overlay `root` section is cleared on disk (the sibling hooks/groups sections would survive).
+#[tokio::test]
+async fn test_admin_v1_config_settings_reset_reverts_to_base() {
+    let (dir, overlay, addr, handle) = settings_test_app("reset").await;
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "per_request_fee": 42 }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        crate::config::overlay::read(&overlay)
+            .and_then(|d| d.root)
+            .is_some(),
+        "root override present before reset"
+    );
+
+    let reset = admin(client.delete(format!("http://{addr}/api/v1/admin/overlay/root")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status().as_u16(), 200, "{:?}", reset.text().await);
+    let body: serde_json::Value = reset.json().await.unwrap();
+    assert_eq!(body["reset"], "root");
+    assert_eq!(
+        body["changed"], true,
+        "the reset discarded the root override"
+    );
+
+    // Root section cleared on disk; GET reflects base (empty overrides).
+    assert!(
+        crate::config::overlay::read(&overlay)
+            .and_then(|d| d.root)
+            .is_none(),
+        "the overlay root section is cleared"
+    );
+    let after: serde_json::Value =
+        admin(client.get(format!("http://{addr}/api/v1/admin/config/settings")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(
+        after["settings"]["per_request_fee"].is_null(),
+        "no root override after reset (base config.yaml stands)"
+    );
+
+    // A second reset is an idempotent no-op (changed:false).
+    let again: serde_json::Value =
+        admin(client.delete(format!("http://{addr}/api/v1/admin/overlay/root")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        again["changed"], false,
+        "an already-empty root reset is a no-op"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ETAG / If-Match: a stale `If-Match` on the PUT is a 409 version_conflict that changes nothing.
+#[tokio::test]
+async fn test_admin_v1_config_settings_stale_if_match_conflicts() {
+    let (dir, _overlay, addr, handle) = settings_test_app("ifmatch").await;
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    // A wildly-stale version number.
+    let stale = admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .header("if-match", "\"999999\"")
+        .body(serde_json::json!({ "per_request_fee": 1 }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status().as_u16(), 409, "stale If-Match is a conflict");
+    let body: serde_json::Value = stale.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "version_conflict");
+
+    // A GET emits the config-plane ETag a caller chains off.
+    let get = admin(client.get(format!("http://{addr}/api/v1/admin/config/settings")))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        get.headers().get("etag").is_some(),
+        "GET /config/settings carries the config-plane ETag"
+    );
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A typo'd root field is a loud 400 (deny_unknown_fields), audited as rejected — never a silent
+/// no-op. An invalid config after merge would likewise 400 and change nothing.
+#[tokio::test]
+async fn test_admin_v1_config_settings_unknown_field_400() {
+    let (dir, _overlay, addr, handle) = settings_test_app("badfield").await;
+    let client = reqwest::Client::new();
+    let admin = |r: reqwest::RequestBuilder| r.header("x-admin-token", "admintok");
+
+    let bad = admin(client.put(format!("http://{addr}/api/v1/admin/config/settings")))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "lissten": "0.0.0.0:9000" }).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 400, "a typo'd field is rejected");
+    let body: serde_json::Value = bad.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    handle.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SCOPE: `PUT /config/settings` is a FULL-scope mutation (the config-plane fallthrough), `GET` is
+/// read-only — the matrix the middleware enforces.
+#[test]
+fn test_config_settings_scope_matrix() {
+    use axum::http::Method;
+    assert_eq!(
+        crate::admin::v1::contract::required_scope(&Method::PUT, "/api/v1/admin/config/settings")
+            .as_str(),
+        "full",
+        "PUT /config/settings is a full-scope mutation"
+    );
+    assert_eq!(
+        crate::admin::v1::contract::required_scope(&Method::GET, "/api/v1/admin/config/settings")
+            .as_str(),
+        "read-only",
+        "GET /config/settings is read-only"
+    );
+    // And `root` is a valid reset section requiring full scope.
+    assert_eq!(
+        crate::admin::v1::contract::required_scope(&Method::DELETE, "/api/v1/admin/overlay/root")
+            .as_str(),
+        "full",
+        "a root reset is a full-scope mutation"
+    );
+}
