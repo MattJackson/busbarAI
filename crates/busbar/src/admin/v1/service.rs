@@ -1650,6 +1650,7 @@ mod tests {
             description: String::new(),
             homepage: String::new(),
             license: String::new(),
+            needs: Default::default(),
         }
     }
 

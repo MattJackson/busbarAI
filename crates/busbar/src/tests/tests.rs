@@ -696,6 +696,7 @@ pub(crate) fn plugin_manifest(
         description: String::new(),
         homepage: String::new(),
         license: String::new(),
+        needs: Default::default(),
     }
 }
 

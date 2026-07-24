@@ -145,6 +145,9 @@ fn pack(args: &[String]) -> ExitCode {
             description: flags.get("description").cloned().unwrap_or_default(),
             homepage: flags.get("homepage").cloned().unwrap_or_default(),
             license: flags.get("license").cloned().unwrap_or_default(),
+            // Declared-intent (`needs:`) is authored in a hook's source manifest, not synthesized by
+            // the ad-hoc packer flags; default to "asks for nothing" here.
+            needs: Default::default(),
         };
         let lib_bytes =
             std::fs::read(&lib_path).map_err(|e| format!("cannot read --lib '{lib_path}': {e}"))?;
@@ -242,6 +245,7 @@ mod tests {
             description: String::new(),
             homepage: String::new(),
             license: String::new(),
+            needs: Default::default(),
         };
         let signed = sign(&key, m, lib);
         busbar_plugin_sign::validate_structure(&signed, lib, &busbar_plugin_loader::supported_abi)

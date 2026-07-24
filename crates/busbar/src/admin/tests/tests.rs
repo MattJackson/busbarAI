@@ -5092,6 +5092,7 @@ fn admin_test_tarball_versioned(name: &str, alias: &str, version: &str) -> Vec<u
         description: String::new(),
         homepage: String::new(),
         license: String::new(),
+        needs: Default::default(),
     };
     busbar_plugin_loader::tarball::package(&m, "lib.so", lib).unwrap()
 }

@@ -183,6 +183,7 @@ mod tests {
             description: String::new(),
             homepage: String::new(),
             license: "Apache-2.0".into(),
+            needs: Default::default(),
         }
     }
 

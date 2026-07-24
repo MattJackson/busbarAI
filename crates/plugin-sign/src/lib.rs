@@ -116,6 +116,63 @@ pub struct Manifest {
     /// SPDX license id (display only; signed).
     #[serde(default)]
     pub license: String,
+    /// ADVISORY declared intent (`kind: hook` only): what caller content the plugin ASKS to receive
+    /// (`needs.prompt`, `needs.user`). SIGNED (covered by the signature, so it cannot be spoofed) and
+    /// surfaced to the admin at register/load so they know what a grant would expose. It is ADVISORY:
+    /// the operator's config grant remains the ENFORCEMENT — the core projects `prompt`/`user` ONLY
+    /// when BOTH the manifest declares the need AND the operator grants it (belt-and-suspenders). A
+    /// plugin that never declares a need can never be handed content, even on a fat-fingered grant.
+    /// Absent (`{}`) for non-hook kinds and for hooks that ask for nothing. Serde-default so older
+    /// manifests (and every non-hook plugin) parse unchanged.
+    #[serde(default)]
+    pub needs: HookNeeds,
+}
+
+/// The advisory declared-intent block a `kind: hook` plugin's manifest may carry (`needs:`). Each
+/// axis mirrors the operator grant ladder but is only a REQUEST — the operator grant enforces. Fields
+/// serde-default to `no` so a manifest omitting `needs` (or omitting an axis) declares no need.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HookNeeds {
+    /// Declared PROMPT need: `no` (default) | `ro` (asks to read prompt content) | `rw` (asks to
+    /// read + rewrite). The core sends prompt content only when this is at/above the operator's
+    /// grant intent AND the operator grants it.
+    pub prompt: NeedLevel,
+    /// Declared caller-IDENTITY need: `no` (default) | `ro` (asks for the key id/name + end-user).
+    pub user: NeedLevel,
+}
+
+impl HookNeeds {
+    /// Does the plugin declare ANY content need? Used to surface intent at register/load.
+    pub fn declares_any(&self) -> bool {
+        self.prompt != NeedLevel::No || self.user != NeedLevel::No
+    }
+}
+
+/// One axis of a hook manifest's declared intent — the SAME `no ⊂ ro ⊂ rw` ladder the operator grant
+/// uses, so the core can compare "declared" against "granted" directly. `rw` is meaningful only on the
+/// `prompt` axis (identity is never rewritten); on `user` it reads as "at least ro".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeedLevel {
+    /// Declares no need for this content (the default).
+    #[default]
+    No,
+    /// Asks to READ this content.
+    Ro,
+    /// Asks to read AND rewrite (prompt axis only).
+    Rw,
+}
+
+impl NeedLevel {
+    /// Whether the plugin declared it needs to READ this axis (`ro` or `rw`).
+    pub fn wants_read(self) -> bool {
+        !matches!(self, NeedLevel::No)
+    }
+    /// Whether the plugin declared it needs to REWRITE (prompt axis; `rw`).
+    pub fn wants_rewrite(self) -> bool {
+        matches!(self, NeedLevel::Rw)
+    }
 }
 
 /// How a plugin was permitted to load when it is NOT signed by a trusted key - the operator's
@@ -534,7 +591,39 @@ mod tests {
             description: "A store plugin".to_string(),
             homepage: "https://example.dev".to_string(),
             license: "Apache-2.0".to_string(),
+            needs: HookNeeds::default(),
         }
+    }
+
+    /// The advisory `needs:` intent is SIGNED (covered by the canonical bytes) so it cannot be
+    /// spoofed, and a manifest omitting it parses with the default "asks for nothing". `NeedLevel`
+    /// exposes the read/rewrite predicates the core compares against the operator grant.
+    #[test]
+    fn hook_needs_is_signed_and_defaults_to_none() {
+        // Default (absent) needs → declares nothing.
+        let n = HookNeeds::default();
+        assert!(!n.declares_any());
+        assert!(!n.prompt.wants_read());
+
+        // A declared prompt:rw need round-trips through JSON and reads as read+rewrite.
+        let json = r#"{"prompt":"rw","user":"ro"}"#;
+        let parsed: HookNeeds = serde_json::from_str(json).unwrap();
+        assert!(parsed.declares_any());
+        assert!(parsed.prompt.wants_read() && parsed.prompt.wants_rewrite());
+        assert!(parsed.user.wants_read() && !parsed.user.wants_rewrite());
+
+        // It is covered by the signature: changing `needs` after signing breaks verification.
+        let key = test_key(9);
+        let mut m = manifest("busbar-hook-x", "x", "busbar");
+        m.kind = "hook".into();
+        let signed = sign(&key, m, b"lib");
+        let mut tampered = signed.clone();
+        tampered.needs = parsed;
+        assert!(
+            signature_ok(&tampered, b"lib", &key.verifying_key()).is_err(),
+            "altering the declared intent after signing must fail verification"
+        );
+        assert!(signature_ok(&signed, b"lib", &key.verifying_key()).is_ok());
     }
 
     fn abi(_kind: &str) -> &'static [u32] {
