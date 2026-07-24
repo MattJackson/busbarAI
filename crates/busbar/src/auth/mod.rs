@@ -168,7 +168,7 @@ impl AuthMiddleware {
                     // opaque config, pushed verbatim. FAIL-CLOSED — surface the load error so boot
                     // (or an apply/reload) aborts rather than silently dropping the module.
                     // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) against the secret
-                    // store BEFORE the settings cross the ABI (ADR-0007). FAIL-CLOSED: an
+                    // store BEFORE the settings cross the ABI (ADR-0010). FAIL-CLOSED: an
                     // unresolvable ref aborts the chain build rather than handing the plugin a
                     // dangling reference.
                     let resolved =

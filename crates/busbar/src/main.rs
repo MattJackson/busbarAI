@@ -2410,7 +2410,7 @@ pub(crate) fn build_app_from_config(
                 Arc::new(governance::MemoryStore::new())
             } else {
                 // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) against the secret
-                // store BEFORE the settings cross the ABI (ADR-0007). FAIL-CLOSED: an unresolvable
+                // store BEFORE the settings cross the ABI (ADR-0010). FAIL-CLOSED: an unresolvable
                 // ref refuses the store load rather than handing the plugin a dangling reference.
                 let resolved = config::secret::resolve_settings(&g.settings, &secret_resolver)
                     .map_err(|e| format!("store '{}' settings: {e}", g.module))?;

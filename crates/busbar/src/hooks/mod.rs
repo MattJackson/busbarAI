@@ -63,7 +63,7 @@ pub(crate) struct HookEnv {
     pub(crate) registry: std::sync::Arc<busbar_plugin_loader::PluginRegistry>,
     pub(crate) projectors: std::sync::Arc<busbar_plugin_loader::hook::HookProjectors>,
     /// The secret resolver used to turn any SecretRef-typed hook setting (e.g. a `licenseKey`) into
-    /// its raw value BEFORE the settings cross the ABI at open/configure (ADR-0007). Shared with the
+    /// its raw value BEFORE the settings cross the ABI at open/configure (ADR-0010). Shared with the
     /// store/auth open paths; the same fail-closed resolver.
     pub(crate) secret_resolver: std::sync::Arc<crate::config::secret::SecretResolver>,
 }
@@ -358,7 +358,7 @@ fn gate_transport_named(
     _settings_version: u64,
 ) -> Option<Arc<dyn RoutingPolicy>> {
     // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) against the secret store BEFORE the
-    // settings cross the ABI (ADR-0007). A resolution failure is treated exactly like a failed load:
+    // settings cross the ABI (ADR-0010). A resolution failure is treated exactly like a failed load:
     // the gate degrades to absent (the existing fail-open-to-the-request posture of this runtime
     // safety net). The FAIL-CLOSED guarantee lives in the plugin pre-flight, which refuses boot/reload
     // on an unresolvable hook secret before this path is ever taken.
@@ -401,7 +401,7 @@ pub(crate) async fn push_configure(
     env: &HookEnv,
 ) -> Result<(), String> {
     // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) before the settings cross the ABI
-    // (ADR-0007). FAIL-CLOSED: an unresolvable ref is NOT committed — the plugin never receives a
+    // (ADR-0010). FAIL-CLOSED: an unresolvable ref is NOT committed — the plugin never receives a
     // dangling reference on a settings push.
     let resolved = env
         .resolve_hook_settings(&hook.settings)

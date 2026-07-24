@@ -94,6 +94,72 @@ fn alice_settings() -> serde_json::Map<String, serde_json::Value> {
         .clone()
 }
 
+/// The static-auth settings with a `licenseKey` spelled as the given SecretRef value (raw JSON for
+/// the ref, e.g. `{ "env": "VAR" }`). Proves the ENGINE resolves the ref before the plugin sees it.
+fn alice_settings_with_license_ref(
+    license_ref: serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut s = alice_settings();
+    s.insert("licenseKey".to_string(), license_ref);
+    s
+}
+
+/// PLUGIN LICENSING E2E (ADR-0010): a `licenseKey` spelled as a SecretRef (`{ env: VAR }`) is
+/// RESOLVED by the engine to the raw key and DELIVERED to the plugin, which validates it ITSELF and
+/// loads. Conversely, an UNRESOLVABLE license ref fails the load FAIL-CLOSED — the plugin is never
+/// handed a dangling reference. Proves the whole path: SecretRef-in-settings → resolve → deliver →
+/// plugin self-validates.
+#[test]
+fn auth_plugin_license_key_secret_ref_is_resolved_and_delivered() {
+    let dir = tmp_plugin_dir("auth-plugin-license");
+    if !write_static_auth(&dir, "static.tar.gz", "acme-auth-static", "lic-auth") {
+        eprintln!("skip: static-auth plugin cdylib not built (run under --workspace)");
+        return;
+    }
+    let plugins = plugins_cfg_allow_unsigned(&dir);
+
+    // A VALID license delivered via an env SecretRef: the engine resolves `{ env: VAR }` to the demo
+    // key BEFORE open, the plugin validates its own license, and the chain loads.
+    let ok_var = format!("BUSBAR_PLUGIN_LICENSE_OK_{}", std::process::id());
+    std::env::set_var(&ok_var, "LICENSE-OK");
+    let cfg = chain_with(
+        "lic-auth",
+        alice_settings_with_license_ref(serde_json::json!({ "env": ok_var })),
+    );
+    let registry = crate::plugins_preflight(None, Some(&cfg), &Default::default(), &plugins)
+        .expect("preflight resolves the kind:auth plugin");
+    let mw = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .expect("a resolvable, valid licenseKey is delivered and the plugin loads");
+    assert_eq!(mw.chain_names(), vec!["static-auth"], "plugin loaded");
+    std::env::remove_var(&ok_var);
+
+    // FAIL-CLOSED: the SAME license ref, now UNRESOLVABLE (env unset), refuses the chain build — the
+    // plugin is never handed the unresolved ref. The error names the field, never a secret value.
+    let err = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .expect_err("an unresolvable licenseKey ref fails the load fail-closed");
+    assert!(
+        err.contains("licenseKey") && err.contains("did not resolve"),
+        "fail-closed, names the setting: {err}"
+    );
+    // The overlay/config still holds the REFERENCE, never the resolved secret: SecretRef serializes
+    // the ref, so a licenseKey setting serialized back out is the env ref, not `LICENSE-OK`.
+    let serialized = serde_json::to_string(&cfg.chain[0].settings).expect("serialize settings");
+    assert!(
+        serialized.contains(&ok_var) && !serialized.contains("LICENSE-OK"),
+        "config keeps the ref, never the resolved secret: {serialized}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// FULL CHAIN, REAL CDYLIB: `auth.chain: [my-auth]` loads the static-auth plugin over the loader;
 /// the valid token identifies as `alice/platform`, an invalid/absent credential fail-closed-denies.
 #[test]

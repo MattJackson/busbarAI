@@ -325,7 +325,7 @@ impl SecretResolver {
 }
 
 /// The well-known plugin-settings keys carrying a LICENSE credential (1.5.0 plugin-licensing
-/// convention, ADR-0007). The core does NOT enforce licensing - a plugin validates its OWN license.
+/// convention, ADR-0010). The core does NOT enforce licensing - a plugin validates its OWN license.
 /// These names exist only so operators have a documented, first-class spelling; like any other
 /// setting they MAY be a [`SecretRef`], which [`resolve_settings`] resolves to the raw key before it
 /// crosses the ABI, so a license key never has to sit in plaintext config.

@@ -13,6 +13,16 @@
 //! ```json
 //! { "token": "sekret", "id": "alice", "roles": ["platform"] }
 //! ```
+//!
+//! ## Plugin licensing demo (ADR-0010)
+//!
+//! To exercise the plugin-licensing model, this plugin ALSO reads an optional `licenseKey` setting
+//! and VALIDATES it ITSELF — the core enforces nothing; it only DELIVERS the setting. Because the
+//! operator can spell `licenseKey` as a SecretRef (`{ env: … }` / `{ file: … }` / a `kind: secret`
+//! module), the engine RESOLVES it to the raw key before `open` (a raw license never sits in
+//! plaintext config). Validation here is deliberately trivial (the well-known demo key
+//! `LICENSE-OK`); a real plugin would verify a signature/expiry. A present-but-invalid `licenseKey`
+//! is a load error — the plugin, not the gateway, decides its own licensing policy.
 
 use busbar_api::{constant_time_eq, AuthModule, AuthOutcome, Principal};
 use serde::Deserialize;
@@ -27,6 +37,32 @@ struct StaticConfig {
     /// The roles asserted for that principal (mapped to policy via `role_bindings.<module>`).
     #[serde(default)]
     roles: Vec<String>,
+    /// OPTIONAL plugin license key (ADR-0010). The engine resolves this from a SecretRef before
+    /// `open`, so by the time it reaches the plugin it is the RAW key. The plugin validates it
+    /// ITSELF (below); the core enforces nothing.
+    #[serde(default, rename = "licenseKey")]
+    license_key: Option<String>,
+}
+
+/// The well-known DEMO license value this plugin accepts. A real plugin would verify a signature /
+/// expiry / entitlement; the point under test is that the resolved key REACHES the plugin, so the
+/// check is a trivial constant compare.
+const DEMO_VALID_LICENSE: &str = "LICENSE-OK";
+
+/// The plugin's OWN license validation (ADR-0010): the core is license-agnostic, so licensing policy
+/// lives here. An ABSENT `licenseKey` is fine (unlicensed/free tier); a PRESENT one must be valid or
+/// the plugin refuses to load. The key arrives already resolved (the engine turned any SecretRef into
+/// the raw value before `open`), so this never sees a `{ env: … }` reference.
+fn validate_license(license_key: Option<&str>) -> Result<(), String> {
+    match license_key {
+        None => Ok(()),
+        Some(k) if k == DEMO_VALID_LICENSE => Ok(()),
+        Some(_) => Err(
+            "static-auth plugin: the delivered licenseKey is not valid for this plugin (the plugin \
+             validates its own license; the value is not echoed)"
+                .to_string(),
+        ),
+    }
 }
 
 /// A static-token identity module: the configured `token` → `Identify(id, roles)`; anything else
@@ -70,6 +106,9 @@ fn open(cfg: &str) -> Result<Box<dyn AuthModule>, String> {
     if c.token.is_empty() || c.id.is_empty() {
         return Err("static-auth plugin config needs a non-empty `token` and `id`".to_string());
     }
+    // The plugin validates its OWN license (ADR-0010). The engine has already resolved any SecretRef
+    // `licenseKey` to its raw value; a present-but-invalid license is a load error.
+    validate_license(c.license_key.as_deref())?;
     Ok(Box::new(StaticModule {
         token: c.token,
         id: c.id,
@@ -78,3 +117,37 @@ fn open(cfg: &str) -> Result<Box<dyn AuthModule>, String> {
 }
 
 busbar_plugin_sdk::export_auth_plugin!(open);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The plugin validates its OWN license: absent is fine (free tier), the well-known demo value
+    /// loads, and any other present value is a load error — the plugin, not the core, decides.
+    #[test]
+    fn plugin_validates_its_own_license() {
+        assert!(validate_license(None).is_ok(), "absent license = free tier");
+        assert!(
+            validate_license(Some(DEMO_VALID_LICENSE)).is_ok(),
+            "the delivered valid key loads"
+        );
+        let err = validate_license(Some("LICENSE-WRONG")).unwrap_err();
+        assert!(err.contains("not valid"), "invalid license refuses: {err}");
+    }
+
+    /// `open` delivers the (already-resolved) licenseKey into validation: a valid key loads the
+    /// module; an invalid one refuses. Proves the plugin reads `licenseKey` from its settings.
+    #[test]
+    fn open_reads_and_validates_delivered_license_key() {
+        let base = |lic: &str| {
+            format!(r#"{{ "token": "t", "id": "a", "roles": [], "licenseKey": "{lic}" }}"#)
+        };
+        assert!(open(&base(DEMO_VALID_LICENSE)).is_ok(), "valid key loads");
+        match open(&base("LICENSE-WRONG")) {
+            Err(e) => assert!(e.contains("not valid"), "refuses invalid license: {e}"),
+            Ok(_) => panic!("an invalid delivered license must refuse load"),
+        }
+        // No licenseKey at all still loads (unlicensed tier).
+        assert!(open(r#"{ "token": "t", "id": "a" }"#).is_ok());
+    }
+}
