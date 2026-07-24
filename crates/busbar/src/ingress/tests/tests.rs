@@ -21,6 +21,11 @@ fn test_query_has_alt_sse() {
 /// Minimal governance-off App for exercising `finish` in isolation.
 fn minimal_app() -> Arc<App> {
     Arc::new(App {
+        tslots: Arc::new(crate::telemetry::AppSlots::build(
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )),
         lanes: vec![],
         store: Arc::new(crate::store::InMemoryStore::new(vec![])),
         by_model: std::collections::HashMap::new(),

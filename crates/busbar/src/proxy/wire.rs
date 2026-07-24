@@ -358,13 +358,9 @@ pub(crate) fn translate_request_cross_protocol(
     // reports whether it truly changed the body.
     let mut pristine = true;
     if ingress_protocol != egress_name {
-        // one cross-protocol translation hop for this request.
-        metrics::counter!(
-            crate::metrics::TRANSLATIONS_TOTAL,
-            "from" => ingress_protocol.to_string(),
-            "to" => egress_name.to_string()
-        )
-        .increment(1);
+        // one cross-protocol translation hop for this request (telemetry bank: per-thread cell,
+        // fixed protocol×protocol slot table — no label allocation on the hop).
+        crate::telemetry::translation(ingress_protocol, egress_name);
         // Cross-protocol: translate the request body through the superset IR.
         let Some(_ingress_proto) = crate::proto::protocol_for(ingress_protocol) else {
             return Err(Box::new(ingress_error(

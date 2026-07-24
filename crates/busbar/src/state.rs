@@ -137,6 +137,13 @@ pub(crate) struct PoolRuntime {
 /// while in-flight requests keep serving on the old snapshot and the SAME breaker/latency state.
 #[derive(Clone)]
 pub(crate) struct App {
+    /// TELEMETRY BANK slots for THIS config generation (see `telemetry.rs`): every hot-path metric
+    /// site resolves its pre-registered per-thread slot through this table instead of building a
+    /// recorder key per emission. Rebuilt whenever a new snapshot changes the pool/lane label space
+    /// (`build_app` / config apply); identical label sets re-intern to the same process-lifetime
+    /// slots, so counts accumulate monotonically across generations. Observation only — THE RULE:
+    /// enforcement counts never go through the bank.
+    pub(crate) tslots: Arc<crate::telemetry::AppSlots>,
     pub(crate) lanes: Vec<Lane>,
     pub(crate) store: Arc<dyn StateStore>,
     pub(crate) by_model: HashMap<String, usize>,

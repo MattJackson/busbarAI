@@ -277,7 +277,7 @@ static DURATION_HANDLES: OnceLock<RwLock<HashMap<Box<str>, metrics::Histogram>>>
 /// Gating handle caching on this guarantees a cached handle can never be bound to the no-op recorder
 /// that stands in before install.
 #[inline]
-fn recorder_installed() -> bool {
+pub(crate) fn recorder_installed() -> bool {
     matches!(HANDLE.get(), Some(Some(_)))
 }
 
@@ -359,11 +359,18 @@ pub(crate) fn record_request_duration(ingress_protocol: &str, pool: &str, second
 }
 
 /// Render the current Prometheus exposition text. Empty until `init()` has run.
+///
+/// Flushes the TELEMETRY BANK (per-thread hot-path cells; see `telemetry.rs`) into the recorder
+/// first, so every scrape — and every test that reads the exposition — observes up-to-date totals
+/// for the banked hot-path counters/histograms alongside the macro-emitted ones.
 pub(crate) fn render() -> String {
     // Outer `None` = `init()` not yet run; inner `None` = recorder install failed. Both render an
     // empty exposition rather than panicking.
     match HANDLE.get() {
-        Some(Some(h)) => h.render(),
+        Some(Some(h)) => {
+            crate::telemetry::flush_to_recorder();
+            h.render()
+        }
         _ => String::new(),
     }
 }

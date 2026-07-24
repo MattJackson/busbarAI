@@ -348,21 +348,10 @@ pub(crate) async fn forward_once(
                         emit_breaker_trip(app, pool, i);
                     }
                     app.store.release_probe_in(pool, i);
-                    metrics::counter!(
-                        crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                        "pool" => pool.to_string(),
-                        "lane" => app.lanes[i].model.clone(),
-                        "disposition" => DISPOSITION_ATTEMPT_TIMEOUT
-                    )
-                    .increment(1);
+                    crate::telemetry::upstream_failure(app, pool, i, DISPOSITION_ATTEMPT_TIMEOUT);
                     // Parity with the organic path: a degraded-path attempt-timeout is a failover
                     // (the caller tries the next candidate), so count it under FAILOVERS_TOTAL too.
-                    metrics::counter!(
-                        crate::metrics::FAILOVERS_TOTAL,
-                        "pool" => pool.to_string(),
-                        "reason" => DISPOSITION_ATTEMPT_TIMEOUT
-                    )
-                    .increment(1);
+                    crate::telemetry::failover(app, pool, DISPOSITION_ATTEMPT_TIMEOUT);
                     return Err(());
                 }
             }

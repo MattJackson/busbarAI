@@ -999,18 +999,13 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         // Resolves to the routed lane's model name on the default (`""`) cell so these series
         // correlate with REQUESTS_TOTAL (which labels model-routed traffic by model, not `""`);
         // the breaker-cell key below stays `pool_name` (`""`) — only the metric LABEL is decoupled.
-        // Held as a borrow (no up-front allocation); each metric emit owns it (`.to_owned()`) only on
-        // the branch that actually fires, so an attempt allocates the label once per emitted series
-        // instead of eagerly building a `String` and cloning it at every (mostly-unreached) site.
+        // Held as a borrow; every metric emit below goes through the TELEMETRY BANK (telemetry.rs),
+        // which resolves `(metric_pool, i)` to this generation's pre-registered per-thread slots —
+        // no label allocation and no shared-atomic contention on the walk.
         let metric_pool: &str = metric_pool_label(&app, pool_name, i);
 
         // count this upstream attempt (re-entrant across failover hops — each is a real attempt).
-        metrics::counter!(
-            crate::metrics::UPSTREAM_ATTEMPTS_TOTAL,
-            "pool" => metric_pool.to_owned(),
-            "lane" => app.lanes[i].model.clone()
-        )
-        .increment(1);
+        crate::telemetry::upstream_attempt(&app, metric_pool, i);
         tracing::debug!(pool = %pool_name, lane = %app.lanes[i].model, "upstream attempt");
 
         let egress_name = app.lanes[i].protocol.name();
@@ -1236,19 +1231,13 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                         if tripped {
                             emit_breaker_trip(&app, pool_name, i);
                         }
-                        metrics::counter!(
-                            crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                            "pool" => metric_pool.to_owned(),
-                            "lane" => app.lanes[i].model.clone(),
-                            "disposition" => DISPOSITION_ATTEMPT_TIMEOUT
-                        )
-                        .increment(1);
-                        metrics::counter!(
-                            crate::metrics::FAILOVERS_TOTAL,
-                            "pool" => metric_pool.to_owned(),
-                            "reason" => DISPOSITION_ATTEMPT_TIMEOUT
-                        )
-                        .increment(1);
+                        crate::telemetry::upstream_failure(
+                            &app,
+                            metric_pool,
+                            i,
+                            DISPOSITION_ATTEMPT_TIMEOUT,
+                        );
+                        crate::telemetry::failover(&app, metric_pool, DISPOSITION_ATTEMPT_TIMEOUT);
                         tracing::warn!(
                             pool = %pool_name,
                             lane = %app.lanes[i].model,
@@ -1285,19 +1274,8 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                 if tripped {
                     emit_breaker_trip(&app, pool_name, i);
                 }
-                metrics::counter!(
-                    crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                    "pool" => metric_pool.to_owned(),
-                    "lane" => app.lanes[i].model.clone(),
-                    "disposition" => DISPOSITION_TRANSIENT
-                )
-                .increment(1);
-                metrics::counter!(
-                    crate::metrics::FAILOVERS_TOTAL,
-                    "pool" => metric_pool.to_owned(),
-                    "reason" => err_type.to_string()
-                )
-                .increment(1);
+                crate::telemetry::upstream_failure(&app, metric_pool, i, DISPOSITION_TRANSIENT);
+                crate::telemetry::failover(&app, metric_pool, err_type);
                 last_failure = Some(err_type);
                 drop(permit);
                 continue;
@@ -1518,19 +1496,13 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                             if tripped {
                                 emit_breaker_trip(&app, pool_name, i);
                             }
-                            metrics::counter!(
-                                crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "lane" => app.lanes[i].model.clone(),
-                                "disposition" => DISPOSITION_TRANSIENT
-                            )
-                            .increment(1);
-                            metrics::counter!(
-                                crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "reason" => DISPOSITION_TRANSIENT
-                            )
-                            .increment(1);
+                            crate::telemetry::upstream_failure(
+                                &app,
+                                metric_pool,
+                                i,
+                                DISPOSITION_TRANSIENT,
+                            );
+                            crate::telemetry::failover(&app, metric_pool, DISPOSITION_TRANSIENT);
                             last_failure = Some(DISPOSITION_TRANSIENT);
                             drop(permit);
                             continue;
@@ -1574,21 +1546,15 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                             // on `newly_tripped` stops BREAKER_TRIPS_TOTAL inflating once per cooldown
                             // for a stuck lane (the metric's "once per logical trip" contract).
                             if newly_tripped {
-                                metrics::counter!(
-                                    crate::metrics::BREAKER_TRIPS_TOTAL,
-                                    "pool" => metric_pool.to_owned(),
-                                    "lane" => app.lanes[i].model.clone()
-                                )
-                                .increment(1);
+                                crate::telemetry::breaker_trip(&app, metric_pool, i);
                             }
                             tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, reason = %reason, "lane hard-down (breaker trip)");
-                            metrics::counter!(
-                                crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "lane" => app.lanes[i].model.clone(),
-                                "disposition" => DISPOSITION_HARD_DOWN
-                            )
-                            .increment(1);
+                            crate::telemetry::upstream_failure(
+                                &app,
+                                metric_pool,
+                                i,
+                                DISPOSITION_HARD_DOWN,
+                            );
                             drop(permit);
 
                             // For auth failures: return error to caller. In NON-passthrough mode the
@@ -1630,12 +1596,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                             }
 
                             // For billing hard downs: continue to next lane (failover)
-                            metrics::counter!(
-                                crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "reason" => DISPOSITION_HARD_DOWN
-                            )
-                            .increment(1);
+                            crate::telemetry::failover(&app, metric_pool, DISPOSITION_HARD_DOWN);
                             last_failure = Some(DISPOSITION_HARD_DOWN);
                             continue;
                         }
@@ -1661,19 +1622,17 @@ pub(crate) async fn forward_with_pool_parsed_inner(
                                 }
                             }
 
-                            metrics::counter!(
-                                crate::metrics::UPSTREAM_FAILURES_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "lane" => app.lanes[i].model.clone(),
-                                "disposition" => DISPOSITION_CONTEXT_LENGTH
-                            )
-                            .increment(1);
-                            metrics::counter!(
-                                crate::metrics::FAILOVERS_TOTAL,
-                                "pool" => metric_pool.to_owned(),
-                                "reason" => DISPOSITION_CONTEXT_LENGTH
-                            )
-                            .increment(1);
+                            crate::telemetry::upstream_failure(
+                                &app,
+                                metric_pool,
+                                i,
+                                DISPOSITION_CONTEXT_LENGTH,
+                            );
+                            crate::telemetry::failover(
+                                &app,
+                                metric_pool,
+                                DISPOSITION_CONTEXT_LENGTH,
+                            );
                             // Probe class guard: ContextLength is a client-fault variant (the request
                             // is too large for THIS lane's window) — no breaker penalty, so nothing
                             // records an outcome to clear `probe_in_flight`. If this lane won the

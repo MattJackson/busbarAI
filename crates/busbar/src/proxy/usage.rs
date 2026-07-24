@@ -93,12 +93,7 @@ pub(crate) fn metric_pool_label<'a>(app: &'a Arc<App>, pool_name: &'a str, i: us
 /// `pool` label is the bounded, operator-controlled canonical pool name, or the routed model name for
 /// the default (`""`) cell (LOW #25; see `metric_pool_label`) so it correlates with REQUESTS_TOTAL.
 pub(crate) fn emit_breaker_trip(app: &Arc<App>, pool_name: &str, i: usize) {
-    metrics::counter!(
-        crate::metrics::BREAKER_TRIPS_TOTAL,
-        "pool" => metric_pool_label(app, pool_name, i).to_owned(),
-        "lane" => app.lanes[i].model.clone()
-    )
-    .increment(1);
+    crate::telemetry::breaker_trip(app, metric_pool_label(app, pool_name, i), i);
     tracing::warn!(pool = %pool_name, lane = %app.lanes[i].model, "lane breaker tripped (Closed→Open)");
 }
 
