@@ -2627,6 +2627,97 @@ async fn test_admin_v1_list_keys_filters() {
     handle.abort();
 }
 
+/// `GET /api/v1/admin/keys?group=<name>` (§6d): exact bound-group filter — returns the keys BOUND
+/// to that group and nothing else (not another group's, not a groupless key). A name no group
+/// registry carries is a valid EMPTY 200, never a 400/404 — deliberately no existence check, so a
+/// key whose group another node's config dropped stays findable (that dangling state is exactly
+/// what an operator hunts). Composes with `?enabled=`.
+#[tokio::test]
+async fn test_admin_v1_list_keys_group_filter() {
+    use crate::governance::NewKeySpec;
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let mint = |name: &str, group: Option<&str>| {
+        gov.create_key(
+            NewKeySpec {
+                name: name.to_string(),
+                allowed_pools: None,
+                group: group.map(String::from),
+                labels: Default::default(),
+            },
+            crate::store::now(),
+        )
+        .unwrap()
+        .0
+    };
+    // No registry existence check applies at the store seam either: these groups exist nowhere.
+    let alpha = mint("alpha-key", Some("alpha"));
+    let _beta = mint("beta-key", Some("beta"));
+    let _loose = mint("groupless-key", None);
+    let (addr, handle) = serve_with_gov(gov).await;
+    let client = reqwest::Client::new();
+    let get = |query: String| {
+        let url = format!("http://{addr}/api/v1/admin/keys{query}");
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .header("x-admin-token", "admintok")
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+
+    // ?group=alpha → exactly the alpha-bound key.
+    let by_group = get("?group=alpha".into()).await;
+    let items = by_group["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "only the alpha-bound key: {by_group}");
+    assert_eq!(items[0]["id"], alpha.id);
+    assert_eq!(items[0]["group"], "alpha");
+
+    // A group NO key is bound to (and no registry carries) → 200 with an empty page.
+    let ghost = client
+        .get(format!("http://{addr}/api/v1/admin/keys?group=ghost"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ghost.status().as_u16(),
+        200,
+        "a nonexistent group filter is a valid empty read, not an error"
+    );
+    let ghost: serde_json::Value = ghost.json().await.unwrap();
+    assert_eq!(ghost["items"].as_array().unwrap().len(), 0);
+
+    // Composes with ?enabled=: disable the alpha key, then split it out by state.
+    let patched = client
+        .patch(format!("http://{addr}/api/v1/admin/keys/{}", alpha.id))
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patched.status().as_u16(), 200, "disable the alpha key");
+    let on = get("?group=alpha&enabled=true".into()).await;
+    assert_eq!(
+        on["items"].as_array().unwrap().len(),
+        0,
+        "the (disabled) alpha key drops out of enabled=true: {on}"
+    );
+    let off = get("?group=alpha&enabled=false".into()).await;
+    let off_items = off["items"].as_array().unwrap();
+    assert_eq!(off_items.len(), 1, "and shows under enabled=false: {off}");
+    assert_eq!(off_items[0]["id"], alpha.id);
+
+    handle.abort();
+}
+
 /// GOLDEN PATH: the whole config plane working together in one flow — register → live + version
 /// bump + audit + persist → delete → gone + version bump + audit. A coherent-flow regression anchor
 /// for the marquee feature (catches integration breaks the per-feature tests miss).
