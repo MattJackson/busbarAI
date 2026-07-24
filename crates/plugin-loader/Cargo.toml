@@ -12,6 +12,11 @@ busbar-api = { path = "../api" }
 busbar-plugin-abi = { path = "../plugin-abi" }
 busbar-plugin-sign = { path = "../plugin-sign" }
 libloading = "0.8"
+# The kind:hook seam: `DlopenPolicy` implements the async `busbar_api::RoutingPolicy` trait, running
+# the blocking `busbar_call` on `spawn_blocking` (a hook gate can be CPU-heavy). `async-trait` matches
+# the engine's; `tokio` is `rt` only (spawn_blocking + timeout) — no runtime is started in this crate.
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Structured logging for the auth seam's fail-closed rejections (a misbehaving auth plugin is logged,

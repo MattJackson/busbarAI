@@ -31,11 +31,13 @@ use std::os::raw::c_void;
 use std::path::Path;
 
 pub mod auth;
+pub mod hook;
 pub mod registry;
 mod stage;
 pub mod tarball;
 
 pub use auth::DynAuth;
+pub use hook::DlopenPolicy;
 pub use registry::{
     inventory as inventory_tarballs, scan_and_validate, supported_abi, InventoryEntry,
     LoadablePlugin, PluginRegistry, SkippedPlugin,
@@ -69,7 +71,7 @@ impl RawPlugin {
     /// The ONE generic transport primitive: serialize `req`, ship it across the kind-neutral `call`,
     /// cap-check + copy + free the response buffer, and decode it as `Resp`. Replaces the duplicated
     /// per-kind wire calls — store, secret, and auth all go through this; only the TYPES differ.
-    fn transport_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+    pub(crate) fn transport_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
         req: &Req,
     ) -> Result<Resp, String> {

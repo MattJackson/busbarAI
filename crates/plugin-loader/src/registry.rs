@@ -50,9 +50,13 @@ pub fn supported_abi(kind: &str) -> &'static [u32] {
         // A `kind: auth` plugin is a first-class identity provider (the engine's auth chain consumes
         // `Box<dyn AuthModule>` via `open_auth`). Payload schema v1.
         "auth" => &[1, 1],
-        // hook plugins share the manifest + trust + registry machinery; their C ABI contract is a v1
-        // placeholder until the engine grows a dynamic hook consumer (hooks are out-of-process today).
-        "hook" => &[1, 1],
+        // A `kind: hook` plugin is an in-process routing policy (the engine's routing/hook chains
+        // consume `Arc<dyn RoutingPolicy>` via `open_hook`). The 1.5.0 replacement for the retired
+        // out-of-process socket/webhook hook transport. Payload schema v1.
+        "hook" => &[
+            busbar_plugin_abi::hook::HOOK_ABI_VERSION,
+            busbar_plugin_abi::hook::HOOK_ABI_VERSION,
+        ],
         _ => &[],
     }
 }
@@ -217,6 +221,52 @@ impl PluginRegistry {
             cfg_json,
             &p.manifest.name,
             &p.manifest.kind,
+        )
+    }
+
+    /// Open a HOOK plugin resolved by name or alias: verifies the resolved plugin's `kind` is `hook`,
+    /// then loads the VERIFIED bytes over the kind-neutral C ABI and `open`s it with `cfg_json`,
+    /// returning `Arc<dyn RoutingPolicy>` — the seam the engine's routing/hook chains consume. Same
+    /// trust and load pipeline as store/secret/auth; only the kind (and consuming seam) differs.
+    /// `name` is the hook's registry name (metrics id); `projectors` are the engine's fail-closed
+    /// projection/parse closures. FAIL-CLOSED on any resolution/kind/load failure.
+    pub fn open_hook(
+        &self,
+        name_or_alias: &str,
+        cfg_json: &str,
+        name: &str,
+        projectors: std::sync::Arc<crate::hook::HookProjectors>,
+    ) -> Result<std::sync::Arc<dyn busbar_api::RoutingPolicy>, String> {
+        let Some(p) = self.resolve(name_or_alias) else {
+            return Err(match self.unresolved_reason(name_or_alias) {
+                Some(s) => format!(
+                    "plugin '{name_or_alias}' is present ({}) but was not loaded: {}",
+                    s.file, s.reason
+                ),
+                None => format!(
+                    "no plugin named or aliased '{name_or_alias}' is available (loadable plugins: \
+                     [{}])",
+                    self.loadable
+                        .iter()
+                        .map(|p| p.manifest.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        };
+        if p.manifest.kind != "hook" {
+            return Err(format!(
+                "plugin '{}' has kind '{}', not 'hook' - it cannot serve as a routing hook",
+                p.manifest.name, p.manifest.kind
+            ));
+        }
+        crate::hook::load_hook_from_bytes(
+            &p.lib_bytes,
+            cfg_json,
+            &p.manifest.name,
+            &p.manifest.kind,
+            name,
+            projectors,
         )
     }
 
