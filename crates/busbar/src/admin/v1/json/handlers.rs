@@ -88,6 +88,18 @@ pub(crate) async fn get_group(
     )
 }
 
+/// `GET /api/v1/admin/groups/{name}/usage` — the group's derived current-window usage per
+/// enforcement bucket vs its caps (§6d, the self-service dashboard read; 404 if unknown).
+pub(crate) async fn get_group_usage(
+    State(handle): State<Arc<AppHandle>>,
+    Path(name): Path<String>,
+) -> Response {
+    respond(
+        StatusCode::OK,
+        service(&handle).get_group_usage(&name).await,
+    )
+}
+
 /// `GET /api/v1/admin/hooks/{name}/health` — best-effort transport reachability (404 if unregistered).
 pub(crate) async fn hook_health(
     State(handle): State<Arc<AppHandle>>,
@@ -1620,7 +1632,7 @@ pub(crate) async fn patch_hook_settings(
     // PUSH first, COMMIT on ack — a hook that never acked never sees committed state it doesn't
     // hold (§6.5: no partial config ever goes live). The client is captured here; the load() that
     // feeds the actual swap is re-taken AFTER the await, under the mutation lock.
-    let client = current.client.clone();
+    let client = current.client.get().clone();
     if let Err(e) = crate::hooks::push_configure(&updated, &name, settings_version, &client).await {
         audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::Validation(format!(
@@ -1683,7 +1695,7 @@ pub(crate) async fn hook_schema(
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
     let schema =
-        crate::hooks::fetch_schema(&name, hook, current.config_version, &current.client).await;
+        crate::hooks::fetch_schema(&name, hook, current.config_version, current.client.get()).await;
     ok_json(StatusCode::OK, &json!({ "name": name, "schema": schema }))
 }
 
@@ -1702,7 +1714,8 @@ pub(crate) async fn hook_status(
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
     let desired_version = current.config_version;
-    let reported = crate::hooks::fetch_status(&name, hook, desired_version, &current.client).await;
+    let reported =
+        crate::hooks::fetch_status(&name, hook, desired_version, current.client.get()).await;
     let as_of = crate::store::now();
     let body = match reported {
         Some(r) => {
@@ -2069,6 +2082,23 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
+        ap("/groups/{name}/usage"),
+        json!({
+            "get": {
+                "summary": "The group's derived current-window usage per (window, pool) enforcement bucket vs its caps — the self-service dashboard read (spend derives from the token ledger x the CURRENT rate card at read time)",
+                "security": [{"adminToken": []}],
+                "parameters": [{
+                    "name": "name", "in": "path", "required": true,
+                    "schema": {"type": "string"}
+                }],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Unknown group (error code `not_found`)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
         ap("/hooks/{name}/health"),
         json!({
             "get": {
@@ -2262,7 +2292,7 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         ap("/keys"),
         json!({
             "get": {
-                "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=. Paginate: ?limit=, ?cursor= (opaque)",
+                "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=, ?group= (keys bound to a group — a `user:<sub>` leaf's keys are one person's). Paginate: ?limit=, ?cursor= (opaque)",
                 "security": [{"adminToken": []}],
                 "responses": {
                     "200": {"description": "`{items, next_cursor}` — the cursor page envelope (next_cursor null at end)"},
@@ -2614,6 +2644,12 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/groups/{name}", "get", "200", GroupView);
     typed!("/groups/{name}", "put", "200", GroupView);
     typed!("/groups/{name}", "patch", "200", GroupView);
+    typed!(
+        "/groups/{name}/usage",
+        "get",
+        "200",
+        crate::admin::v1::contract::GroupUsageView
+    );
     // Auth & credentials.
     typed!("/auth", "get", "200", AuthView);
     typed!(PATH_ADMIN_AUTH, "get", "200", AdminAuthView);

@@ -78,6 +78,7 @@ impl AdminTransport for JsonV1 {
                     .patch(patch_group)
                     .delete(delete_group),
             )
+            .route("/groups/{name}/usage", get(get_group_usage))
             .route("/plugins", get(list_plugins).post(install_plugin))
             .route("/plugins/reload", post(reload_plugins))
             .route("/plugins/{file}", axum::routing::delete(remove_plugin))

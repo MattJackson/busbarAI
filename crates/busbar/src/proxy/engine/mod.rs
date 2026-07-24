@@ -1237,6 +1237,7 @@ pub(crate) async fn forward_with_pool_parsed_inner(
         let _cb_reqwest = crate::profile::start(crate::profile::Stage::CbReqwest);
         let mut req = app
             .client
+            .get()
             .post(format!("{base}{wire_path}"))
             .headers(convert_headers(auth))
             .header(CONTENT_TYPE, egress_ct)

@@ -277,41 +277,41 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
     );
     next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Completion,
     );
     next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
     );
     Ok(next)
@@ -334,41 +334,41 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
     next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
     );
     next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Completion,
     );
     next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
     );
     Ok(next)
@@ -502,41 +502,41 @@ pub(crate) fn build_with_registry(
     next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
     );
     next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
         crate::config::HookStage::Completion,
     );
     next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        &next.client,
+        next.client.get(),
         next.config_version,
     );
     Ok(next)
@@ -742,6 +742,53 @@ impl AdminService {
             .get(name)
             .map(|cfg| GroupView::from_cfg(name, cfg))
             .ok_or_else(|| AdminError::NotFound(format!("group `{name}`")))
+    }
+
+    /// `GET /api/v1/admin/groups/{name}/usage` — the group's derived current-window usage per
+    /// enforcement bucket vs its caps (§6d, the self-service dashboard read). Read scope.
+    /// `not_found` for an unknown group; governance off = every bucket reads zero (the caps are
+    /// still projected — the definition exists even when nothing enforces).
+    pub(crate) async fn get_group_usage(
+        &self,
+        name: &str,
+    ) -> Result<crate::admin::v1::contract::GroupUsageView, AdminError> {
+        use crate::admin::v1::contract::{GroupBucketUsageView, GroupUsageView};
+        let Some(rt) = self.app.cost.group_named(name) else {
+            return Err(AdminError::NotFound(format!("group `{name}`")));
+        };
+        let now = crate::store::now();
+        let mut buckets = Vec::with_capacity(rt.buckets.len());
+        for b in &rt.buckets {
+            let usage = match &self.app.governance {
+                Some(gov) => gov
+                    .derived_bucket_usage(&self.app.cost, &b.bucket_id, b.window, false, now)
+                    .map_err(|e| {
+                        tracing::error!(group = name, bucket = %b.bucket_id, err = %e,
+                            "group usage read failed");
+                        AdminError::Internal
+                    })?,
+                None => Default::default(),
+            };
+            buckets.push(GroupBucketUsageView {
+                window: b.window,
+                pool: b.pool.clone(),
+                requests: usage.requests,
+                tokens: usage.tokens,
+                spend_cents: usage.spend_cents,
+                requests_cap: b.requests_cap,
+                tokens_cap: b.tokens_cap,
+                budget_cap: b.budget_cap,
+                budget_remaining_cents: b
+                    .budget_cap
+                    .map(|cap| cap.saturating_sub(usage.spend_cents).max(0)),
+            });
+        }
+        Ok(GroupUsageView {
+            group: name.to_string(),
+            enabled: rt.enabled,
+            buckets,
+            as_of: now,
+        })
     }
 
     /// `GET /api/v1/admin/plugins?type=auth|hooks` — the plugin catalog for one TYPE. Read

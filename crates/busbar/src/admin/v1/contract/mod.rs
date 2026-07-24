@@ -477,6 +477,52 @@ impl GroupView {
     }
 }
 
+/// `GET /groups/{name}/usage` — one group's DERIVED current-window usage, one row per
+/// enforcement bucket (each `(window, pool?)` its limits materialise), against that bucket's
+/// caps. The §6d dashboard read: spend/tokens/requests per tier vs the budgets, straight off the
+/// ledger x the CURRENT rate card (reprice-on-read, nothing stored). The customer's self-service
+/// tool consumes this per group (`user:<sub>` leaf = one person's view) and re-scopes it.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct GroupUsageView {
+    /// The group name (echoed from the path).
+    pub(crate) group: String,
+    /// `false` = the group is FROZEN (`enabled: false`): every request through it rejects.
+    pub(crate) enabled: bool,
+    /// One row per enforcement bucket, in the group's resolved bucket order. Empty for a group
+    /// with only a `concurrent` limit (or none) — there is no windowed ledger to read.
+    pub(crate) buckets: Vec<GroupBucketUsageView>,
+    /// Epoch seconds the read was taken at (the windows below are current AS OF this instant).
+    pub(crate) as_of: u64,
+}
+
+/// One `(window, pool?)` enforcement bucket's usage vs caps inside a [`GroupUsageView`].
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct GroupBucketUsageView {
+    /// The accounting window: `minute` | `hour` | `day` | `month` | `total`.
+    pub(crate) window: &'static str,
+    /// The pool scope for a pool-qualified bucket; absent for a group-wide bucket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) pool: Option<String>,
+    /// Requests admitted this window (the requests-limit truth: failures are not refunded).
+    pub(crate) requests: u64,
+    /// Total tokens ledgered this window (all tiers).
+    pub(crate) tokens: u64,
+    /// Spend derived at read time (tokens x current rate card), abstract cents.
+    pub(crate) spend_cents: i64,
+    /// The bucket's caps, when configured (absent = uncapped on that metric).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) requests_cap: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tokens_cap: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) budget_cap: Option<i64>,
+    /// Cents left under `budget_cap` (floored at 0); absent when no budget cap is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) budget_remaining_cents: Option<i64>,
+}
+
 /// The transport half of a `HookView`: which wire the hook speaks and its target (socket path or
 /// webhook URL — operator config, not a secret). Exactly one of `socket`/`webhook` is set.
 #[derive(Debug, Clone, Serialize)]

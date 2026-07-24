@@ -25,7 +25,7 @@ fn minimal_app() -> Arc<App> {
         store: Arc::new(crate::store::InMemoryStore::new(vec![])),
         by_model: std::collections::HashMap::new(),
         pools: std::collections::HashMap::new(),
-        client: reqwest::Client::new(),
+        client: crate::state::UpstreamClients::build(1, reqwest::Client::new),
         auth: Arc::new(crate::auth::AuthMiddleware::new(
             &crate::config::AuthCfg::default_none(),
         )),

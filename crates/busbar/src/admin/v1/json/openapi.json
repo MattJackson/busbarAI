@@ -616,6 +616,111 @@
         ],
         "type": "object"
       },
+      "GroupBucketUsageView": {
+        "description": "One `(window, pool?)` enforcement bucket's usage vs caps inside a [`GroupUsageView`].",
+        "properties": {
+          "budget_cap": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "budget_remaining_cents": {
+            "description": "Cents left under `budget_cap` (floored at 0); absent when no budget cap is set.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pool": {
+            "description": "The pool scope for a pool-qualified bucket; absent for a group-wide bucket.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requests": {
+            "description": "Requests admitted this window (the requests-limit truth: failures are not refunded).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requests_cap": {
+            "description": "The bucket's caps, when configured (absent = uncapped on that metric).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "spend_cents": {
+            "description": "Spend derived at read time (tokens x current rate card), abstract cents.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "tokens": {
+            "description": "Total tokens ledgered this window (all tiers).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_cap": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "window": {
+            "description": "The accounting window: `minute` | `hour` | `day` | `month` | `total`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "window",
+          "requests",
+          "tokens",
+          "spend_cents"
+        ],
+        "type": "object"
+      },
+      "GroupUsageView": {
+        "description": "`GET /groups/{name}/usage` — one group's DERIVED current-window usage, one row per\nenforcement bucket (each `(window, pool?)` its limits materialise), against that bucket's\ncaps. The §6d dashboard read: spend/tokens/requests per tier vs the budgets, straight off the\nledger x the CURRENT rate card (reprice-on-read, nothing stored). The customer's self-service\ntool consumes this per group (`user:<sub>` leaf = one person's view) and re-scopes it.",
+        "properties": {
+          "as_of": {
+            "description": "Epoch seconds the read was taken at (the windows below are current AS OF this instant).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "buckets": {
+            "description": "One row per enforcement bucket, in the group's resolved bucket order. Empty for a group\nwith only a `concurrent` limit (or none) — there is no windowed ledger to read.",
+            "items": {
+              "$ref": "#/components/schemas/GroupBucketUsageView"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "description": "`false` = the group is FROZEN (`enabled: false`): every request through it rejects.",
+            "type": "boolean"
+          },
+          "group": {
+            "description": "The group name (echoed from the path).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group",
+          "enabled",
+          "buckets",
+          "as_of"
+        ],
+        "type": "object"
+      },
       "GroupView": {
         "description": "A group definition in the registry read (`GET /api/v1/admin/groups`,\n`GET /api/v1/admin/groups/{name}`) — the limit-tree read surface. Projects the `groups:` config\nentry faithfully (parent chain, enabled freeze flag, the ordered limits, the `child_default`\nbudget template for auto-provisioned children), never a secret. This is the READ shape; the\nWRITE verbs accept a `GroupCfg` verbatim (paste a config.yaml group block). Additive-only.",
         "properties": {
@@ -3299,6 +3404,72 @@
         "x-busbar-required-scope": "full"
       }
     },
+    "/api/v1/admin/groups/{name}/usage": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupUsageView"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown group (error code `not_found`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "The group's derived current-window usage per (window, pool) enforcement bucket vs its caps — the self-service dashboard read (spend derives from the token ledger x the CURRENT rate card at read time)",
+        "x-busbar-required-scope": "read-only"
+      }
+    },
     "/api/v1/admin/hooks": {
       "get": {
         "responses": {
@@ -4134,7 +4305,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=. Paginate: ?limit=, ?cursor= (opaque)",
+        "summary": "List virtual keys (metadata only; never secrets). Filters: ?enabled=, ?prefix=, ?group= (keys bound to a group — a `user:<sub>` leaf's keys are one person's). Paginate: ?limit=, ?cursor= (opaque)",
         "x-busbar-required-scope": "read-only"
       },
       "post": {

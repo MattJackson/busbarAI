@@ -806,7 +806,9 @@ pub(crate) async fn update_key(
 }
 
 /// GET /api/v1/admin/keys — list key metadata (no secrets/hashes). Optional filters (design-admin-api-v1
-/// §2.1): `?enabled=true|false` (by enabled state), `?prefix=vk_ab` (by key-id prefix).
+/// §2.1): `?enabled=true|false` (by enabled state), `?prefix=vk_ab` (by key-id prefix),
+/// `?group=<name>` (keys bound to that group — §6d: a `user:<sub>` leaf's keys are one person's
+/// keys; a team group's are the team's; the customer's self-service tool re-scopes from here).
 pub(crate) async fn list_keys(
     crate::state::CurrentApp(app): crate::state::CurrentApp,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -830,6 +832,10 @@ pub(crate) async fn list_keys(
         },
     };
     let prefix = q.get("prefix").cloned();
+    // Group filter: exact bound-group match. No existence check against the registry — a key can
+    // reference a group another node's config no longer has, and listing "keys of `g`" must still
+    // find them (that dangling state is exactly what an operator would be hunting).
+    let group = q.get("group").cloned();
     // PAGINATION (design-admin-api-v1 §0.4): the ONE cursor envelope shared by every admin list —
     // `?limit=` bounds the page, `?cursor=` (opaque) resumes after the prior one, and the response is
     // `{items, next_cursor}` (next_cursor present iff more rows remain). No `total`, no `?offset=` —
@@ -877,6 +883,11 @@ pub(crate) async fn list_keys(
                 .iter()
                 .filter(|k| enabled.is_none_or(|e| k.enabled == e))
                 .filter(|k| prefix.as_deref().is_none_or(|p| k.id.starts_with(p)))
+                .filter(|k| {
+                    group
+                        .as_deref()
+                        .is_none_or(|g| k.group.as_deref() == Some(g))
+                })
                 .collect();
             // Deterministic page boundaries: sort by id (the store's iteration order is not a
             // pagination contract).

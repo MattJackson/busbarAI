@@ -805,7 +805,9 @@ impl TestApp {
             store: std::sync::Arc::new(crate::store::InMemoryStore::new(lane_data)),
             by_model,
             pools: self.pools,
-            client: reqwest::Client::builder().build().unwrap(),
+            client: crate::state::UpstreamClients::build(1, || {
+                reqwest::Client::builder().build().unwrap()
+            }),
             auth,
             rewrite_hooks: Vec::new(),
             tap_hooks: Vec::new(),

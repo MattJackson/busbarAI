@@ -118,7 +118,7 @@ pub(crate) fn render(app: &Arc<crate::state::App>) -> String {
                 name.clone(),
                 hook.clone(),
                 app.config_version,
-                app.client.clone(),
+                app.client.get().clone(),
             ));
         }
     }

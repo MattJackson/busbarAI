@@ -299,6 +299,7 @@ pub(crate) async fn forward_once(
     };
     let mut req = app
         .client
+        .get()
         .post(format!("{base}{wire_path}"))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, egress_ct)

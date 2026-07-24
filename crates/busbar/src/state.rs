@@ -130,6 +130,57 @@ pub(crate) struct PoolRuntime {
     pub(crate) rewrite_hooks: Vec<(std::time::Duration, Arc<dyn crate::hooks::RoutingPolicy>)>,
 }
 
+/// The upstream HTTP client, SHARDED: N identical `reqwest::Client`s, each owning its own
+/// connection pool, one selected per thread. ONE shared client meant one pool mutex that every
+/// request crossed twice (connection checkout + checkin) across every worker — a lock convoy
+/// that grows with core count (measured: throughput fell ~36% from concurrency 64 → 1024 on a
+/// 4-core pin, and inverted busbar's standing against per-worker-sharded gateways on 32-thread
+/// x86). Each worker thread is assigned one shard on first use and keeps it: warm connections
+/// and TLS sessions stay worker-local, and each shard's pool lock is contended by ~1/Nth of the
+/// threads. NOT configurable — the shard count derives from the machine (`min(cores, 16)`,
+/// power of two) and the per-host idle budget is divided across shards so the TOTAL kept-alive
+/// sockets toward any upstream are unchanged.
+#[derive(Clone)]
+pub(crate) struct UpstreamClients {
+    shards: Arc<[Client]>,
+}
+
+impl UpstreamClients {
+    /// The shard count for this machine: `min(available cores, 16)` rounded up to a power of two
+    /// (so shard selection is a mask, not a modulo). 16 caps the idle-socket multiplication on
+    /// very wide boxes; beyond ~16 shards the residual per-shard contention is negligible.
+    pub(crate) fn shard_count() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .next_power_of_two()
+            .min(16)
+    }
+
+    /// Build N shards from a builder factory (each shard is an IDENTICAL client; reqwest clients
+    /// cannot be cloned into independent pools, so the builder runs once per shard).
+    pub(crate) fn build(count: usize, mut make: impl FnMut() -> Client) -> Self {
+        let shards: Arc<[Client]> = (0..count.max(1)).map(|_| make()).collect();
+        UpstreamClients { shards }
+    }
+
+    /// This thread's client. Threads are assigned shards round-robin on FIRST use and keep the
+    /// assignment for their lifetime (a tokio worker's requests always reuse its own shard's
+    /// warm connections). The assignment counter is the only shared write, paid once per thread
+    /// per process lifetime — never per request.
+    pub(crate) fn get(&self) -> &Client {
+        static NEXT_THREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! {
+            static SHARD: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
+        }
+        let idx = SHARD.with(|s| {
+            *s.get_or_init(|| NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        });
+        // Mask, not modulo: the count is a power of two by construction (and >= 1).
+        &self.shards[idx & (self.shards.len() - 1)]
+    }
+}
+
 /// `Clone` is the config-apply enabler: cloning an `App` shares the live-state `Arc`s (store, auth,
 /// governance, client — the things that must SURVIVE a config change) and deep-copies the
 /// config-derived collections (lanes, pools, hooks, …). So `apply` builds the next snapshot as
@@ -142,7 +193,7 @@ pub(crate) struct App {
     pub(crate) by_model: HashMap<String, usize>,
     /// Pool members, each carrying a lane index and its configured weight.
     pub(crate) pools: HashMap<String, Vec<WeightedLane>>,
-    pub(crate) client: Client,
+    pub(crate) client: UpstreamClients,
     pub(crate) auth: Arc<crate::auth::AuthMiddleware>,
     /// GLOBAL rewrite hooks — the `prompt: rw` gates named in `global_hooks`, resolved to their
     /// transports and sorted by ascending `priority` (the transform-chain order). Fired before

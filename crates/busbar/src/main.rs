@@ -795,7 +795,7 @@ async fn run() {
     // configure the request-log webhook (reusing the pooled client). No-op if unset.
     observability::configure_webhook(
         observability_cfg.request_log_webhook_url.clone(),
-        app.client.clone(),
+        app.client.get().clone(),
     );
 
     // Spawn the active health probers (one per lane with a probing mode). No-op when every lane is
@@ -2048,9 +2048,11 @@ pub(crate) fn build_app_from_config(
     // so it mirrors the pools map (any pool can be a fallback target).
     let fallback_pools = pools.clone();
 
-    // The shared upstream HTTP client, built ONCE. Constructed before the pool-runtime loop so the
-    // webhook routing transport can reuse it (a clone shares the connection pool + the `redirect:none`
-    // SSRF posture); the same client is then moved into `App` below.
+    // The upstream HTTP client, built ONCE — as N per-thread SHARDS (see `UpstreamClients`): each
+    // worker thread keeps its own client/pool, so no request ever crosses another core's pool
+    // lock. Constructed before the pool-runtime loop so the webhook routing transport can reuse
+    // it (a shard clone shares that shard's connection pool + the `redirect:none` SSRF posture);
+    // the sharded set is then moved into `App` below.
     let upstream_client = if let Some(p) = prior {
         // REUSED across applies: the pooled connections + their kept-alive upstream sockets.
         p.client.clone()
@@ -2074,68 +2076,79 @@ pub(crate) fn build_app_from_config(
         // once at client-build time.
         let http1_only = std::env::var_os("BUSBAR_UPSTREAM_HTTP1_ONLY")
             .is_some_and(|v| v != "0" && !v.is_empty());
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(
-            cfg.limits.upstream_request_timeout_secs,
-        ));
-        builder = builder
-            // Bound the TCP connect separately from the coarse overall timeout: a stalled SYN would
-            // otherwise hang up to the streaming `.timeout()` (minutes) before failover kicks in.
-            .connect_timeout(Duration::from_secs(10))
-            // Keep idle upstream sockets alive so a middlebox silently dropping a long-idle
-            // keep-alive connection is detected proactively, not discovered as a spurious failure on
-            // the next request (added latency + a needless failover hop).
-            .tcp_keepalive(Duration::from_secs(60))
-            // Disable Nagle's algorithm on the EGRESS sockets. Busbar writes a whole request body in
-            // one shot and then immediately awaits the response, so Nagle has nothing to coalesce —
-            // but on a small body it interacts with the peer's delayed-ACK to hold the final segment
-            // for up to ~40 ms waiting for an ACK that only arrives once the peer's timer fires. That
-            // manifests as a bimodal tail-latency spike (a native SDK, which also sets TCP_NODELAY,
-            // never sees it) and is pure added latency on the request path. Inbound accepted sockets
-            // already set this (tls.rs serve loops); this brings the egress leg to parity. `axum`'s
-            // own serve() defaults nodelay on; reqwest does NOT, so it must be set explicitly.
-            .tcp_nodelay(true)
-            // HTTP/2 to the upstream, NEGOTIATED via ALPN (NOT prior-knowledge): over TLS the client
-            // offers `h2,http/1.1` and uses whichever the backend accepts, so an h2-capable provider
-            // (Anthropic, OpenAI, Vertex, Bedrock all speak h2) multiplexes many concurrent requests
-            // over ONE connection — collapsing the per-request connect+TLS handshake and the socket /
-            // epoll pressure that caps proxy RPS on a core-bound box — while an HTTP/1-only backend
-            // transparently stays on h1. By DEFAULT we do NOT call `.http2_prior_knowledge()` (that
-            // would FORCE h2 and break every h1 upstream and a plaintext h1 mock) — it is applied only
-            // when the cleartext-h2c opt-in below is set. H2 keep-alive pings keep a multiplexed
-            // connection healthy through idle gaps without the h1 trick of holding N sockets open. No
-            // behavior change against an h1-only upstream on the default (ALPN) path.
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_timeout(Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .pool_max_idle_per_host(cfg.limits.pool_max_idle_per_host)
-            // Idle keep-alive lifetime — EXPLICIT 300s default, replacing reqwest's implicit 90s:
-            // the warm working set (amortized TCP+TLS handshakes / h2 sessions) survives
-            // inter-burst gaps of a few minutes instead of being reaped and re-paid as cold
-            // handshakes when the next burst lands. Safe at 300s because `tcp_keepalive(60s)`
-            // above actively validates idle sockets (a silently-dropped connection is caught by
-            // the probe, not by a failed request), and bounded by `pool_max_idle_per_host` + OS
-            // reclamation. Operator-tunable via `limits.pool_idle_timeout_secs`.
-            .pool_idle_timeout(Duration::from_secs(cfg.limits.pool_idle_timeout_secs))
-            // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
-            // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
-            // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
-            // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
-            // localhost, RFC1918) and busbar would follow it — forwarding the signed request
-            // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
-            // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
-            // normal operation, so disabling redirect following entirely closes the vector at no cost.
-            .redirect(reqwest::redirect::Policy::none());
-        // Cleartext h2c opt-in (bench / in-mesh): FORCE h2 without ALPN. Default-off; when set, every
-        // upstream must speak h2c. Applied last so it overrides the ALPN default above.
-        if h2_prior_knowledge {
-            builder = builder.http2_prior_knowledge();
-        }
-        // HTTP/1-only escape hatch: pin the client to h1 (no ALPN h2 offer). Applied last so it
-        // wins over both the ALPN default and the h2c opt-in above.
-        if http1_only {
-            builder = builder.http1_only();
-        }
-        builder.build().expect("build upstream HTTP client")
+        let shard_count = crate::state::UpstreamClients::shard_count();
+        // The per-host idle budget is divided across shards so the TOTAL kept-alive sockets
+        // toward any single upstream stay at the configured value (never below 1 per shard).
+        let idle_per_host_per_shard = cfg
+            .limits
+            .pool_max_idle_per_host
+            .div_ceil(shard_count)
+            .max(1);
+        let make_one = || {
+            let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(
+                cfg.limits.upstream_request_timeout_secs,
+            ));
+            builder = builder
+                // Bound the TCP connect separately from the coarse overall timeout: a stalled SYN would
+                // otherwise hang up to the streaming `.timeout()` (minutes) before failover kicks in.
+                .connect_timeout(Duration::from_secs(10))
+                // Keep idle upstream sockets alive so a middlebox silently dropping a long-idle
+                // keep-alive connection is detected proactively, not discovered as a spurious failure on
+                // the next request (added latency + a needless failover hop).
+                .tcp_keepalive(Duration::from_secs(60))
+                // Disable Nagle's algorithm on the EGRESS sockets. Busbar writes a whole request body in
+                // one shot and then immediately awaits the response, so Nagle has nothing to coalesce —
+                // but on a small body it interacts with the peer's delayed-ACK to hold the final segment
+                // for up to ~40 ms waiting for an ACK that only arrives once the peer's timer fires. That
+                // manifests as a bimodal tail-latency spike (a native SDK, which also sets TCP_NODELAY,
+                // never sees it) and is pure added latency on the request path. Inbound accepted sockets
+                // already set this (tls.rs serve loops); this brings the egress leg to parity. `axum`'s
+                // own serve() defaults nodelay on; reqwest does NOT, so it must be set explicitly.
+                .tcp_nodelay(true)
+                // HTTP/2 to the upstream, NEGOTIATED via ALPN (NOT prior-knowledge): over TLS the client
+                // offers `h2,http/1.1` and uses whichever the backend accepts, so an h2-capable provider
+                // (Anthropic, OpenAI, Vertex, Bedrock all speak h2) multiplexes many concurrent requests
+                // over ONE connection — collapsing the per-request connect+TLS handshake and the socket /
+                // epoll pressure that caps proxy RPS on a core-bound box — while an HTTP/1-only backend
+                // transparently stays on h1. By DEFAULT we do NOT call `.http2_prior_knowledge()` (that
+                // would FORCE h2 and break every h1 upstream and a plaintext h1 mock) — it is applied only
+                // when the cleartext-h2c opt-in below is set. H2 keep-alive pings keep a multiplexed
+                // connection healthy through idle gaps without the h1 trick of holding N sockets open. No
+                // behavior change against an h1-only upstream on the default (ALPN) path.
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .http2_keep_alive_timeout(Duration::from_secs(10))
+                .http2_adaptive_window(true)
+                .pool_max_idle_per_host(idle_per_host_per_shard)
+                // Idle keep-alive lifetime — EXPLICIT 300s default, replacing reqwest's implicit 90s:
+                // the warm working set (amortized TCP+TLS handshakes / h2 sessions) survives
+                // inter-burst gaps of a few minutes instead of being reaped and re-paid as cold
+                // handshakes when the next burst lands. Safe at 300s because `tcp_keepalive(60s)`
+                // above actively validates idle sockets (a silently-dropped connection is caught by
+                // the probe, not by a failed request), and bounded by `pool_max_idle_per_host` + OS
+                // reclamation. Operator-tunable via `limits.pool_idle_timeout_secs`.
+                .pool_idle_timeout(Duration::from_secs(cfg.limits.pool_idle_timeout_secs))
+                // SSRF guard: do NOT follow redirects. The startup SSRF blocklist (config_validate.rs
+                // ssrf_blocked_host) only vets the configured base_url; it does not see redirect targets.
+                // reqwest's default policy follows up to 10 redirects, so a compromised/malicious upstream
+                // could 30x-redirect a vetted base_url to an internal address (169.254.169.254 metadata,
+                // localhost, RFC1918) and busbar would follow it — forwarding the signed request
+                // (x-api-key / SigV4 Authorization on same-host redirects) to the internal target,
+                // defeating the blocklist at runtime. Upstream AI provider APIs do not redirect as part of
+                // normal operation, so disabling redirect following entirely closes the vector at no cost.
+                .redirect(reqwest::redirect::Policy::none());
+            // Cleartext h2c opt-in (bench / in-mesh): FORCE h2 without ALPN. Default-off; when set, every
+            // upstream must speak h2c. Applied last so it overrides the ALPN default above.
+            if h2_prior_knowledge {
+                builder = builder.http2_prior_knowledge();
+            }
+            // HTTP/1-only escape hatch: pin the client to h1 (no ALPN h2 offer). Applied last so it
+            // wins over both the ALPN default and the h2c opt-in above.
+            if http1_only {
+                builder = builder.http1_only();
+            }
+            builder.build().expect("build upstream HTTP client")
+        };
+        crate::state::UpstreamClients::build(shard_count, make_one)
     };
 
     // The `default:` hook (if any) — the base ordering that pools which named none inherit, replacing
@@ -2182,7 +2195,7 @@ pub(crate) fn build_app_from_config(
                 policy: hooks::resolve_pool_ordering(
                     pool_cfg,
                     &cfg.hooks,
-                    &upstream_client,
+                    upstream_client.get(),
                     default_hook.as_deref(),
                     app_config_version,
                 ),
@@ -2191,13 +2204,13 @@ pub(crate) fn build_app_from_config(
                 gates: hooks::resolve_pool_gates(
                     pool_cfg,
                     &cfg.hooks,
-                    &upstream_client,
+                    upstream_client.get(),
                     app_config_version,
                 ),
                 rewrite_hooks: hooks::resolve_pool_rewrites(
                     pool_cfg,
                     &cfg.hooks,
-                    &upstream_client,
+                    upstream_client.get(),
                     app_config_version,
                 ),
             },
@@ -2331,35 +2344,35 @@ pub(crate) fn build_app_from_config(
     let rewrite_hooks = hooks::resolve_rewrite_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        &upstream_client,
+        upstream_client.get(),
         app_config_version,
     );
     // Resolve the global request-stage tap hooks the same way. Empty unless configured.
     let tap_hooks = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        &upstream_client,
+        upstream_client.get(),
         app_config_version,
         config::HookStage::Request,
     );
     let tap_hooks_route = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        &upstream_client,
+        upstream_client.get(),
         app_config_version,
         config::HookStage::Route,
     );
     let tap_hooks_attempt = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        &upstream_client,
+        upstream_client.get(),
         app_config_version,
         config::HookStage::Attempt,
     );
     let tap_hooks_completion = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        &upstream_client,
+        upstream_client.get(),
         app_config_version,
         config::HookStage::Completion,
     );
@@ -2368,7 +2381,7 @@ pub(crate) fn build_app_from_config(
     let global_gates = hooks::resolve_gate_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        &upstream_client,
+        upstream_client.get(),
         app_config_version,
     );
 

@@ -199,6 +199,7 @@ pub(crate) async fn probe_lane(app: &Arc<App>, i: usize, timeout: Duration) {
     let egress_name = lane.protocol.name();
     let res = app
         .client
+        .get()
         .post(format!("{}{}", lane.base_url, wire_path))
         .headers(convert_headers(auth))
         .header(CONTENT_TYPE, crate::proxy::APPLICATION_JSON)
