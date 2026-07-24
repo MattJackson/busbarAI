@@ -45,7 +45,7 @@ That request left your app as OpenAI. It may have been served by Anthropic, and 
 - **Six wire protocols**, lossless in both directions; any client protocol reaches any pool → [Protocols](https://getbusbar.com/docs/protocols/)
 - **Fault-attributed circuit breaking** and streaming-safe in-flight failover → [Reliability](https://getbusbar.com/docs/reliability/)
 - **Weighted pools** with smooth weighted round-robin, session affinity, and per-lane concurrency caps → [Reliability](https://getbusbar.com/docs/reliability/)
-- **Routing policies.** Five built-ins, or your own logic as a webhook or Rhai script. A policy sees each member's cost, latency, live concurrency, budget, and rate headroom, and a failing policy falls back instead of blocking → [Routing](https://getbusbar.com/docs/routing/)
+- **Routing policies.** Five built-ins, your own `kind: hook` plugin, or an out-of-process sidecar (socket or webhook). A policy sees each member's cost, latency, live concurrency, budget, and rate headroom, and a failing policy falls back instead of blocking → [Routing](https://getbusbar.com/docs/routing/)
 - **Native TLS and optional mTLS**, terminated by Busbar itself, with no reverse proxy in front → [Security](https://getbusbar.com/docs/security/)
 - **Governance** when you want it: signed expiring keys, hierarchical groups with request / token / budget / concurrency limits, spend tracking → [Governance](https://getbusbar.com/docs/guides/governance/)
 - **A verified provider catalog**, plus any provider on the six protocols in a few lines of YAML → [Providers](https://getbusbar.com/docs/providers/)
