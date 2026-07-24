@@ -831,39 +831,18 @@ pub(crate) fn validate_with_unset(
     }
 
     // Rule (hooks/registry): every entry in the top-level `hooks:` registry is validated once, here.
-    // A hook declares EXACTLY ONE transport (`socket` XOR `webhook`); a webhook URL must pass the
-    // routing SSRF guard (OTLP loopback carve-out: loopback/localhost sidecars allowed, link-local/
-    // IMDS/RFC1918/CGNAT/cloud-metadata blocked; plaintext http:// only on loopback); a socket path
-    // must be non-empty + ABSOLUTE (a relative path silently depends on busbar's CWD) and the platform
-    // must support Unix domain sockets. Rejected at startup, never a silent degrade.
+    // A hook is now a `kind: hook` dlopen PLUGIN (the out-of-process socket/webhook transports are
+    // retired), so it must name EXACTLY ONE non-empty `plugin:` reference. The plugin's actual
+    // existence + `kind: hook` + trust is resolved against the validated registry at the plugin
+    // pre-flight (`plugins_preflight`, the shared boot path) — the same fail-closed check store/auth
+    // refs get. Here we enforce the structural requirement (a non-empty reference) and the grant/mode
+    // rules below. Rejected at startup, never a silent degrade.
     for (hook_name, hook) in &cfg.hooks {
-        match (hook.socket.as_deref(), hook.webhook.as_deref()) {
-            (None, None) | (Some(""), None) | (None, Some("")) => errors.push(format!(
-                "hook '{hook_name}' declares no transport: set exactly one of `socket` (a Unix \
-                 domain socket path) or `webhook` (an https URL)"
-            )),
-            (Some(_), Some(_)) => errors.push(format!(
-                "hook '{hook_name}' declares BOTH `socket` and `webhook`: a hook has exactly one \
-                 transport"
-            )),
-            (Some(path), None) => {
-                if !cfg!(unix) {
-                    errors.push(format!(
-                        "hook '{hook_name}' uses a `socket` transport, unavailable on this platform \
-                         (Unix domain sockets); use a `webhook` hook here"
-                    ));
-                } else if !path.starts_with('/') {
-                    errors.push(format!(
-                        "hook '{hook_name}' `socket` must be an absolute path (got '{path}'); a \
-                         relative path depends on busbar's working directory"
-                    ));
-                }
-            }
-            (None, Some(url)) => {
-                if let Err(msg) = crate::observability::validate_routing_webhook_url(Some(url)) {
-                    errors.push(format!("hook '{hook_name}' `webhook` is invalid: {msg}"));
-                }
-            }
+        if hook.plugin.trim().is_empty() {
+            errors.push(format!(
+                "hook '{hook_name}' names no plugin: set `plugin:` to a `kind: hook` plugin's \
+                 signed-manifest name or alias"
+            ));
         }
         // `prompt: rw` grants the REWRITE arm, which only a GATE can return — a tap is fire-and-forget
         // and never replies, so `rw` on a tap is a config error (it would silently never rewrite).

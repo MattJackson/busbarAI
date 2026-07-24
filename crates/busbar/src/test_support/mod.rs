@@ -663,6 +663,7 @@ pub(crate) struct TestApp {
     overlay_path: Option<std::path::PathBuf>,
     plugins_dir: Option<std::path::PathBuf>,
     plugins_cfg: Option<crate::config::PluginsCfg>,
+    hook_env: Option<crate::hooks::HookEnv>,
 }
 
 #[allow(dead_code)]
@@ -686,7 +687,15 @@ impl TestApp {
             overlay_path: None,
             plugins_dir: None,
             plugins_cfg: None,
+            hook_env: None,
         }
+    }
+
+    /// Install a hook plugin-resolution env (for hook-transport resolution tests). Defaults to an
+    /// empty registry (a hook's `plugin:` ref resolves to `None`, i.e. gate-absent).
+    pub(crate) fn hook_env(mut self, env: crate::hooks::HookEnv) -> Self {
+        self.hook_env = Some(env);
+        self
     }
 
     /// Point the plugin surface at a specific directory (for the Admin API plugin catalog / install /
@@ -839,6 +848,11 @@ impl TestApp {
             tap_hooks_attempt: Vec::new(),
             tap_hooks_completion: Vec::new(),
             global_gates: Vec::new(),
+            hook_env: self.hook_env.unwrap_or_else(|| {
+                crate::hooks::HookEnv::new(std::sync::Arc::new(
+                    busbar_plugin_loader::PluginRegistry::empty(),
+                ))
+            }),
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
             groups_registry: self.groups_registry,
@@ -881,6 +895,73 @@ impl TestApp {
             .record(0, "system", "boot", &app.hook_registry, &app.global_hooks);
         app
     }
+}
+
+/// Build a [`crate::hooks::HookEnv`] whose registry loads the hermetic `busbar-hook-test-plugin`
+/// cdylib under the given alias(es) (all pointing at the SAME cdylib) with the given declared manifest
+/// `needs`. `None` when the cdylib is not built (the caller skips). Uses the unsigned +
+/// `allow_unsigned` path (tests can't sign with the embedded first-party key) — still the full
+/// scan/trust/load pipeline. Shared by the admin + resolution tests that need a hook to actually load.
+pub(crate) fn test_hook_env(
+    aliases: &[&str],
+    needs: busbar_plugin_sign::HookNeeds,
+) -> Option<crate::hooks::HookEnv> {
+    let cdylib = {
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = exe.parent()?.parent()?;
+        let name = busbar_plugin_loader::plugin_library_filename("busbar_hook_test_plugin");
+        let candidate = profile_dir.join(&name);
+        if !candidate.exists() {
+            if std::env::var_os("CI").is_some() {
+                panic!(
+                    "the hook-test plugin cdylib is not built under CI; refusing to silently skip \
+                     the hook-plugin admin/resolution coverage"
+                );
+            }
+            return None;
+        }
+        candidate
+    };
+    let lib = std::fs::read(&cdylib).expect("read hook cdylib");
+    let dir = std::env::temp_dir().join(format!(
+        "busbar-test-hook-env-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (i, alias) in aliases.iter().enumerate() {
+        let mut m = busbar_plugin_sign::Manifest {
+            name: format!("busbar-hook-test-plugin-{i}"),
+            alias: alias.to_string(),
+            kind: "hook".into(),
+            version: "1.5.0".into(),
+            publisher: "acme".into(),
+            abi_version: *busbar_plugin_loader::supported_abi("hook")
+                .iter()
+                .max()
+                .unwrap(),
+            sha256: String::new(),
+            signature: String::new(),
+            description: String::new(),
+            homepage: String::new(),
+            license: String::new(),
+            needs: needs.clone(),
+        };
+        m.sha256 = busbar_plugin_sign::sha256_hex(&lib);
+        let tarball = busbar_plugin_loader::tarball::package(&m, "lib.so", &lib).unwrap();
+        std::fs::write(dir.join(format!("hook{i}.tar.gz")), tarball).unwrap();
+    }
+    let policy = busbar_plugin_sign::TrustPolicy {
+        binary_version: "1.5.0".into(),
+        allow_unsigned: true,
+        ..Default::default()
+    };
+    let registry = busbar_plugin_loader::scan_and_validate(&dir, &policy).expect("scan");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(crate::hooks::HookEnv::new(std::sync::Arc::new(registry)))
 }
 
 /// THE METRICS RECORDER HARNESS: sum every exposition sample of `name` whose label set contains

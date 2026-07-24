@@ -108,7 +108,7 @@ fn augment_config_error_adds_auth_mode_migration_hint() {
 fn hook_cfg_round_trips_for_overlay_persistence() {
     let src = serde_json::json!({
         "kind": "gate",
-        "webhook": "http://127.0.0.1:8900/",
+        "plugin": "test-hook",
         "prompt": "rw",
         "user": "ro",
         "priority": 7,
@@ -676,7 +676,7 @@ fn test_pool_member_model_key_and_removed_keys() {
 /// A hook's `prompt:` / `user:` grants parse the trust ladder; absent defaults to `no`.
 #[test]
 fn test_hook_access_grants_parse() {
-    let hook: HookCfg = serde_yaml::from_str("kind: gate\nsocket: /s\nprompt: rw\nuser: ro\n")
+    let hook: HookCfg = serde_yaml::from_str("kind: gate\nplugin: p\nprompt: rw\nuser: ro\n")
         .expect("grants must parse");
     assert_eq!(hook.prompt, PromptAccess::Rw);
     assert!(hook.prompt.sends_prompt() && hook.prompt.can_rewrite());
@@ -684,7 +684,7 @@ fn test_hook_access_grants_parse() {
     assert!(hook.user.sends_user());
 
     let bare: HookCfg =
-        serde_yaml::from_str("kind: tap\nsocket: /s\n").expect("bare hook must parse");
+        serde_yaml::from_str("kind: tap\nplugin: p\n").expect("bare hook must parse");
     assert_eq!(bare.prompt, PromptAccess::No, "prompt defaults to no");
     assert_eq!(bare.user, UserAccess::No, "user defaults to no");
     assert!(!bare.prompt.sends_prompt());
@@ -1756,7 +1756,7 @@ fn test_removed_top_level_blocks_rejected() {
     for (block, key) in [
         ("governance:\n  store: memory\n", "governance"),
         (
-            "hooks:\n  my-gate:\n    kind: gate\n    socket: /s\n",
+            "hooks:\n  my-gate:\n    kind: gate\n    plugin: p\n",
             "hooks",
         ),
         ("group_map:\n  eng:\n    group: eng\n", "group_map"),
@@ -1854,52 +1854,59 @@ advanced:
 // ── resolve(): hook-registry synthesis + admin_auth projection (S9) ──────────────────────────────
 
 /// `resolve` synthesizes the runtime hook registry from the inline refs: each pool module ref and
-/// each global ref becomes a named registry entry (module name, `#N` suffix on collision, pools
-/// iterated in SORTED order), pool `gates` and `global_hooks` carry the synthesized names in
-/// config order, pool refs default `kind: gate` and global refs default `kind: tap`, and the
-/// built-in transports project into `HookCfg.webhook` / `HookCfg.socket`.
+/// each global ref becomes a named registry entry (module/plugin name, `#N` suffix on collision,
+/// pools iterated in SORTED order), pool `gates` and `global_hooks` carry the synthesized names in
+/// config order, pool refs default `kind: gate` and global refs default `kind: tap`, and `module:`
+/// projects onto `HookCfg.plugin` with `settings:` carried through OPAQUE.
 #[test]
 fn test_resolve_synthesizes_hook_registry_from_inline_refs() {
     let mut deploy = base_deploy();
     // Pool "b" first in insertion, "a" second: synthesis iterates SORTED, so "a" claims the bare
     // module name and later refs collide into #N suffixes deterministically.
     let pool_b: PoolCfg = serde_yaml::from_str(
-        "members: []\nhooks:\n  - { module: webhook, settings: { url: \"https://b/hook\" } }\n  - { module: socket, settings: { path: /b.sock } }\n",
+        "members: []\nhooks:\n  - { module: audit-plugin, settings: { url: \"https://b/hook\" } }\n  - { module: gate-plugin, settings: { path: /b.sock } }\n",
     )
     .unwrap();
     let pool_a: PoolCfg = serde_yaml::from_str(
-        "members: []\nhooks:\n  - cheapest\n  - { module: webhook, settings: { url: \"https://a/hook\", team: alpha }, kind: tap, timeout_ms: 9, priority: 3 }\n",
+        "members: []\nhooks:\n  - cheapest\n  - { module: audit-plugin, settings: { url: \"https://a/hook\", team: alpha }, kind: tap, timeout_ms: 9, priority: 3 }\n",
     )
     .unwrap();
     deploy.pools.insert("b".to_string(), pool_b);
     deploy.pools.insert("a".to_string(), pool_a);
     deploy.global_hooks = serde_yaml::from_str(
-        "- { module: webhook, settings: { url: \"https://global/audit\" } }\n",
+        "- { module: audit-plugin, settings: { url: \"https://global/audit\" } }\n",
     )
     .unwrap();
 
     let cfg = resolve(&deploy, &HashMap::new()).expect("resolve");
 
-    // Names: pool a (sorted first) claims "webhook"; pool b collides into "webhook#2" and claims
-    // "socket"; the global ref lands "webhook#3".
+    // Names: pool a (sorted first) claims "audit-plugin"; pool b collides into "audit-plugin#2" and
+    // claims "gate-plugin"; the global ref lands "audit-plugin#3".
     let mut names: Vec<&String> = cfg.hooks.keys().collect();
     names.sort();
-    assert_eq!(names, ["socket", "webhook", "webhook#2", "webhook#3"]);
+    assert_eq!(
+        names,
+        [
+            "audit-plugin",
+            "audit-plugin#2",
+            "audit-plugin#3",
+            "gate-plugin"
+        ]
+    );
 
     // Gates carry the synthesized names in config order; base policy survives.
-    assert_eq!(cfg.pools["a"].gates, ["webhook"]);
+    assert_eq!(cfg.pools["a"].gates, ["audit-plugin"]);
     assert_eq!(cfg.pools["a"].policy, PoolPolicy::Cheapest);
-    assert_eq!(cfg.pools["b"].gates, ["webhook#2", "socket"]);
-    assert_eq!(cfg.global_hooks, ["webhook#3"]);
+    assert_eq!(cfg.pools["b"].gates, ["audit-plugin#2", "gate-plugin"]);
+    assert_eq!(cfg.global_hooks, ["audit-plugin#3"]);
 
-    // Transport projection: settings.url -> HookCfg.webhook (consumed OUT of settings; the rest
-    // stays opaque), settings.path -> HookCfg.socket.
-    let a_hook = &cfg.hooks["webhook"];
-    assert_eq!(a_hook.webhook.as_deref(), Some("https://a/hook"));
-    assert!(a_hook.socket.is_none());
-    assert!(
-        a_hook.settings.get("url").is_none(),
-        "the transport key is consumed out of settings"
+    // Plugin projection: module -> HookCfg.plugin; settings carried through OPAQUE (nothing consumed).
+    let a_hook = &cfg.hooks["audit-plugin"];
+    assert_eq!(a_hook.plugin, "audit-plugin");
+    assert_eq!(
+        a_hook.settings.get("url").and_then(|v| v.as_str()),
+        Some("https://a/hook"),
+        "settings stay opaque — nothing is consumed out"
     );
     assert_eq!(
         a_hook.settings.get("team").and_then(|v| v.as_str()),
@@ -1911,8 +1918,8 @@ fn test_resolve_synthesizes_hook_registry_from_inline_refs() {
     assert_eq!(a_hook.timeout_ms, 9);
     assert_eq!(a_hook.priority, 3);
 
-    let b_sock = &cfg.hooks["socket"];
-    assert_eq!(b_sock.socket.as_deref(), Some("/b.sock"));
+    let b_sock = &cfg.hooks["gate-plugin"];
+    assert_eq!(b_sock.plugin, "gate-plugin");
     assert_eq!(b_sock.kind, HookKind::Gate, "pool refs default kind: gate");
     assert_eq!(b_sock.timeout_ms, DEFAULT_POLICY_TIMEOUT_MS);
     assert_eq!(
@@ -1920,51 +1927,28 @@ fn test_resolve_synthesizes_hook_registry_from_inline_refs() {
         "on_error defaults nothing"
     );
 
-    let global = &cfg.hooks["webhook#3"];
+    let global = &cfg.hooks["audit-plugin#3"];
     assert_eq!(global.kind, HookKind::Tap, "global refs default kind: tap");
-    assert_eq!(global.webhook.as_deref(), Some("https://global/audit"));
+    assert_eq!(global.plugin, "audit-plugin");
 }
 
-/// Unknown hook modules (anything but the built-in `webhook` / `socket` transports) are
-/// FAIL-CLOSED resolve() errors naming the offending location, as is a built-in transport missing
-/// its required setting, and a bare built-in name in `global_hooks` (strategies have no global
-/// meaning).
+/// A module ref naming an EMPTY plugin is a FAIL-CLOSED resolve() error naming the offending
+/// location; a bare built-in name in `global_hooks` (strategies have no global meaning) is an error;
+/// and the plugin's real existence/kind is resolved against the registry at the plugin pre-flight.
 #[test]
 fn test_resolve_rejects_bad_hook_refs() {
-    // Unknown module in a pool.
+    // An empty module name (no plugin) in a pool is fail-closed at resolve.
     let mut deploy = base_deploy();
     let pool: PoolCfg = serde_yaml::from_str(
-        "members: []\nhooks:\n  - { module: sidecar, settings: { url: \"https://x/\" } }\n",
+        "members: []\nhooks:\n  - { module: \"  \", settings: { url: \"https://x/\" } }\n",
     )
     .unwrap();
     deploy.pools.insert("p".to_string(), pool);
-    let errs = resolve(&deploy, &HashMap::new()).expect_err("unknown module must fail resolve");
+    let errs = resolve(&deploy, &HashMap::new()).expect_err("empty module must fail resolve");
     let joined = errs.join("\n");
     assert!(
-        joined.contains("pools.p.hooks") && joined.contains("unknown hook module 'sidecar'"),
+        joined.contains("pools.p.hooks") && joined.contains("non-empty"),
         "{joined}"
-    );
-
-    // webhook without settings.url.
-    let mut deploy = base_deploy();
-    let pool: PoolCfg =
-        serde_yaml::from_str("members: []\nhooks:\n  - { module: webhook }\n").unwrap();
-    deploy.pools.insert("p".to_string(), pool);
-    let errs = resolve(&deploy, &HashMap::new()).expect_err("webhook without url must fail");
-    assert!(
-        errs.join("\n").contains("requires settings.url"),
-        "{errs:?}"
-    );
-
-    // socket without settings.path.
-    let mut deploy = base_deploy();
-    let pool: PoolCfg =
-        serde_yaml::from_str("members: []\nhooks:\n  - { module: socket }\n").unwrap();
-    deploy.pools.insert("p".to_string(), pool);
-    let errs = resolve(&deploy, &HashMap::new()).expect_err("socket without path must fail");
-    assert!(
-        errs.join("\n").contains("requires settings.path"),
-        "{errs:?}"
     );
 
     // A bare built-in name under global_hooks is an error (ordering strategies are pool-scoped).

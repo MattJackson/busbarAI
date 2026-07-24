@@ -40,6 +40,9 @@ fn minimal_app() -> Arc<App> {
         tap_hooks_attempt: Vec::new(),
         tap_hooks_completion: Vec::new(),
         global_gates: Vec::new(),
+        hook_env: crate::hooks::HookEnv::new(std::sync::Arc::new(
+            busbar_plugin_loader::PluginRegistry::empty(),
+        )),
         hook_registry: std::collections::HashMap::new(),
         global_hooks: Vec::new(),
         groups_registry: std::collections::BTreeMap::new(),

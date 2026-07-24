@@ -545,4 +545,32 @@ mod tests {
         };
         assert!(err.contains("hook") && err.contains("store"), "got: {err}");
     }
+
+    /// `configure` REQUIRES the plugin to ack the EXACT pushed version. The test-hook plugin acks by
+    /// default, so a matching-version push is `Ok`. (The wrong-version-ack rejection is exercised by
+    /// the ABI dispatch's version echo — a NACK echoes `version+1`, which this exact-match rejects.)
+    #[tokio::test]
+    async fn dlopen_configure_acks_exact_version() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load("{}");
+        policy
+            .configure("h", &serde_json::Map::new(), 5, Duration::from_secs(5))
+            .await
+            .expect("the plugin acks the exact pushed version");
+    }
+
+    /// `notify` (tap) is fire-and-forget over the dlopen seam: it never errors, even on a malformed
+    /// projection (swallowed) — the ported socket "notify is write-only" guarantee.
+    #[tokio::test]
+    async fn dlopen_notify_never_errors() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load("{}");
+        let projection = serde_json::to_vec(&serde_json::json!({"request": {}})).unwrap();
+        policy.notify(&projection, Duration::from_secs(5)).await;
+        policy.notify(b"not json", Duration::from_secs(5)).await; // malformed → swallowed
+    }
 }

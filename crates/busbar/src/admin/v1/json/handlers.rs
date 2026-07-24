@@ -1900,10 +1900,11 @@ pub(crate) async fn patch_hook_settings(
     let pre_push_version = current.config_version;
     let settings_version = pre_push_version.wrapping_add(1);
     // PUSH first, COMMIT on ack — a hook that never acked never sees committed state it doesn't
-    // hold (§6.5: no partial config ever goes live). The client is captured here; the load() that
-    // feeds the actual swap is re-taken AFTER the await, under the mutation lock.
-    let client = current.client.get().clone();
-    if let Err(e) = crate::hooks::push_configure(&updated, &name, settings_version, &client).await {
+    // hold (§6.5: no partial config ever goes live). The hook plugin env is captured here; the load()
+    // that feeds the actual swap is re-taken AFTER the await, under the mutation lock.
+    let hook_env = current.hook_env.clone();
+    if let Err(e) = crate::hooks::push_configure(&updated, &name, settings_version, &hook_env).await
+    {
         audit::AUDIT.record_by("hook.settings", &resource, audit::OUTCOME_REJECTED, &actor);
         return err_json(&AdminError::Validation(format!(
             "hook did not acknowledge the settings push: {e}"
@@ -1965,7 +1966,7 @@ pub(crate) async fn hook_schema(
         return err_json(&AdminError::NotFound(format!("hook `{name}`")));
     };
     let schema =
-        crate::hooks::fetch_schema(&name, hook, current.config_version, current.client.get()).await;
+        crate::hooks::fetch_schema(&name, hook, current.config_version, &current.hook_env).await;
     ok_json(StatusCode::OK, &json!({ "name": name, "schema": schema }))
 }
 
@@ -1985,7 +1986,7 @@ pub(crate) async fn hook_status(
     };
     let desired_version = current.config_version;
     let reported =
-        crate::hooks::fetch_status(&name, hook, desired_version, current.client.get()).await;
+        crate::hooks::fetch_status(&name, hook, desired_version, &current.hook_env).await;
     let as_of = crate::store::now();
     let body = match reported {
         Some(r) => {

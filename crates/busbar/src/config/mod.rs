@@ -598,11 +598,11 @@ fn neg1() -> i64 {
 /// ```yaml
 /// hooks:
 ///   - cheapest                                    # bare BUILT-IN (an ordering strategy)
-///   - { module: webhook, settings: { url: "https://sidecar/hook" }, on_error: reject }
+///   - { module: my-hook-plugin, settings: { url: "https://sidecar/hook" }, on_error: reject }
 /// ```
 ///
 /// A bare name is ONLY a built-in (weighted | cheapest | fastest | least_busy | usage); everything
-/// else is a module ref (`webhook` / `socket` built-in transports, or a `kind: hook` plugin).
+/// else is a module ref naming a `kind: hook` plugin (by signed-manifest name/alias).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HookRefEntry {
     /// A bare built-in name.
@@ -616,11 +616,10 @@ pub(crate) enum HookRefEntry {
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HookModuleRef {
-    /// The hook module: the built-in transports `webhook` (settings.url) / `socket`
-    /// (settings.path), or a `kind: hook` plugin name/alias.
+    /// The hook module: a `kind: hook` plugin's signed-manifest name/alias.
     pub(crate) module: String,
-    /// The module's own opaque settings (busbar never interprets them beyond the built-in
-    /// transport keys).
+    /// The module's own opaque settings (busbar never interprets them; pushed to the plugin via
+    /// `configure`).
     #[serde(default)]
     pub(crate) settings: serde_json::Map<String, serde_json::Value>,
     /// The hook's MODE: `gate` (fire-and-wait; the default for an inline ref - it was named where
@@ -848,8 +847,8 @@ impl<'de> Deserialize<'de> for PoolCfg {
                         return Err(serde::de::Error::custom(format!(
                             "unknown built-in hook '{name}' in a pool `hooks:` list; the bare \
                              built-ins are weighted | cheapest | fastest | least_busy | usage - \
-                             an out-of-process hook is an inline module ref, e.g. `{{ module: \
-                             webhook, settings: {{ url: \"https://…\" }} }}`"
+                             a plugin hook is an inline module ref naming a `kind: hook` plugin, \
+                             e.g. `{{ module: my-hook-plugin, settings: {{ … }} }}`"
                         )));
                     }
                     HookRefEntry::Module(r) => module_hooks.push(r),
@@ -1058,27 +1057,27 @@ fn default_admin_auth() -> Vec<AuthChainEntry> {
     vec![AuthChainEntry::bare(ADMIN_TOKENS_MODULE)]
 }
 
-/// A named entry in the top-level `hooks:` registry — a single hook (tap or gate) and its transport.
-/// One transport per hook: exactly one of `socket` (Unix domain socket, ~8us) or `webhook` (HTTPS
-/// sidecar). Shared runtime knobs carry over from the 1.2.1 policy block. A pool references a GATE by
-/// name via its `hook:` key; global taps/gates via `global_hooks:` (or inline `global: true`).
+/// A named entry in the top-level `hooks:` registry — a single hook (tap or gate) and the `kind: hook`
+/// PLUGIN that backs it. A hook is now a dlopen plugin under the hybrid ABI (the 1.5.0 retirement of
+/// the out-of-process socket/webhook transport): exactly ONE `plugin:` reference names the signed
+/// plugin (by manifest name/alias), loaded like a store/auth plugin. Shared runtime knobs carry over
+/// from the 1.2.1 policy block. A pool references a GATE by name via its `hook:` key; global taps/gates
+/// via `global_hooks:` (or inline `global: true`).
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HookCfg {
     /// The hook's MODE: `tap` (fire-and-forget) or `gate` (fire-and-wait, returns a reply arm).
     pub(crate) kind: HookKind,
-    // ── transport (exactly one) ──────────────────────────────────────────────────────────────────
-    /// Unix domain socket path of the operator-run hook binary. Lazy connect (the hook may start
-    /// after busbar). Unix-only. Mutually exclusive with `webhook`.
-    #[serde(default)]
-    pub(crate) socket: Option<String>,
-    /// HTTPS sidecar URL. Validated by the routing-URL SSRF guard (loopback allowed; IMDS/RFC1918/
-    /// CGNAT/metadata blocked — the OTLP precedent). Mutually exclusive with `socket`.
-    #[serde(default)]
-    pub(crate) webhook: Option<String>,
+    // ── plugin reference (exactly one, required) ─────────────────────────────────────────────────
+    /// The `kind: hook` PLUGIN backing this hook, by signed-manifest name or alias — resolved against
+    /// the same validated plugin registry that store/auth plugins load through (fail-closed: an
+    /// unresolvable or wrong-kind reference refuses to boot). This REPLACES the retired
+    /// `socket`/`webhook` out-of-process transports: a hook now runs in-process behind the frozen
+    /// plugin ABI. Required and non-empty.
+    pub(crate) plugin: String,
     // ── shared runtime knobs ─────────────────────────────────────────────────────────────────────
-    /// Hard wall-clock deadline for a gate decision, in milliseconds (default 1). Co-located socket
-    /// ~8us, webhook ~34us, so 1ms is 20x+ headroom; RAISE it for a hook that hits a DB/network/model.
+    /// Hard wall-clock deadline for a gate decision, in milliseconds (default 1). An in-process gate
+    /// is microseconds; RAISE it for a hook plugin that does real work (a DB/network/model call).
     /// On timeout the decision is coerced to `on_error` and the request proceeds.
     #[serde(default = "default_policy_timeout_ms")]
     pub(crate) timeout_ms: u64,
@@ -1118,9 +1117,9 @@ pub(crate) struct HookCfg {
     /// reconcile.
     #[serde(default)]
     pub(crate) on_empty: Option<PolicyOnError>,
-    /// OPAQUE settings map pushed to the hook via the `configure` wire message (D2): sent as the
-    /// first line on every socket connection and re-pushed (commit-on-ack) by
-    /// `PATCH /api/v1/admin/hooks/{name}/settings`. Busbar never interprets the contents.
+    /// OPAQUE settings map pushed to the hook via the `configure` op (D2): sent to the plugin at
+    /// load and re-pushed (commit-on-ack) by `PATCH /api/v1/admin/hooks/{name}/settings`. Busbar
+    /// never interprets the contents.
     #[serde(default)]
     pub(crate) settings: serde_json::Map<String, serde_json::Value>,
     /// Fire on EVERY request — inline sugar for adding this name to `global_hooks:`. Default false.
@@ -1157,7 +1156,7 @@ pub(crate) struct PoolMember {
     #[serde(default)]
     pub(crate) context_max: Option<usize>,
     /// Operator-declared routing tier (e.g. `"large"`/`"small"`/`"primary"`/`"overflow"`). Projected
-    /// into the routing `Candidate` (via `MemberMeta`) and read by webhook/socket policies.
+    /// into the routing `Candidate` (via `MemberMeta`) and read by hook plugin policies.
     #[serde(default)]
     pub(crate) tier: Option<String>,
     /// Per-ATTEMPT time-to-response-headers cap (ms) for THIS member in THIS pool — overrides the
@@ -1171,7 +1170,7 @@ pub(crate) struct PoolMember {
     #[serde(default)]
     pub(crate) reasoning: Option<bool>,
     /// Free-form operator tags (e.g. `["opus"]`) a policy can match on. Projected into the routing
-    /// `Candidate` and read by webhook/socket policies.
+    /// `Candidate` and read by hook plugin policies.
     ///
     /// NOTE: the 1.4.x `cost_per_mtok:` member field is REMOVED (S5): `rate_card` is the ONLY cost
     /// source, and routing (`cheapest`) derives its scalar from the member's model's rate entry.
@@ -2282,48 +2281,20 @@ impl LimitsResolved {
 /// Resolve DeployCfg + ProviderDef map into resolved RootCfg.
 /// For each deployed provider, look up its definition by name; produce a resolved ProviderCfg
 /// = def's protocol/base_url/error_map (with any config.yaml override applied) + the deployment's api_key_env.
-/// Build a runtime [`HookCfg`] registry entry from one inline module ref. The built-in transports:
-/// `module: webhook` (settings.url - the HTTPS sidecar) and `module: socket` (settings.path - the
-/// Unix domain socket). The transport key is consumed OUT of `settings`; everything remaining is
-/// the module's opaque settings pushed via `configure`. Any other module name is fail-closed.
+/// Build a runtime [`HookCfg`] registry entry from one inline module ref. `module:` now names the
+/// `kind: hook` PLUGIN that backs the hook (by signed-manifest name/alias) — the retired socket/webhook
+/// built-in transports are gone. `settings:` stays fully opaque (pushed to the plugin via `configure`);
+/// nothing is consumed out of it. The plugin reference must be non-empty; an unresolvable/wrong-kind
+/// reference is caught fail-closed at the plugin pre-flight (like a store/auth ref).
 fn hook_cfg_from_ref(r: &HookModuleRef, default_kind: HookKind) -> Result<HookCfg, String> {
-    let mut settings = r.settings.clone();
-    let (socket, webhook) = match r.module.as_str() {
-        "webhook" => {
-            let url = settings
-                .remove("url")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .filter(|u| !u.trim().is_empty())
-                .ok_or_else(|| {
-                    "hook module 'webhook' requires settings.url (the HTTPS sidecar URL)"
-                        .to_string()
-                })?;
-            (None, Some(url))
-        }
-        "socket" => {
-            let path = settings
-                .remove("path")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .filter(|p| !p.trim().is_empty())
-                .ok_or_else(|| {
-                    "hook module 'socket' requires settings.path (the Unix domain socket path)"
-                        .to_string()
-                })?;
-            (Some(path), None)
-        }
-        other => {
-            return Err(format!(
-                "unknown hook module '{other}': the built-in hook modules are `webhook` \
-                 (settings.url) and `socket` (settings.path); a `kind: hook` plugin is referenced \
-                 by its manifest name once loaded (fail-closed: an unresolvable module refuses to \
-                 boot)"
-            ));
-        }
-    };
+    let settings = r.settings.clone();
+    let plugin = r.module.trim().to_string();
+    if plugin.is_empty() {
+        return Err("a hook module ref must name a non-empty `kind: hook` plugin".to_string());
+    }
     Ok(HookCfg {
         kind: r.kind.unwrap_or(default_kind),
-        socket,
-        webhook,
+        plugin,
         timeout_ms: r.timeout_ms.unwrap_or(DEFAULT_POLICY_TIMEOUT_MS),
         on_error: r
             .on_error
@@ -2414,8 +2385,8 @@ pub(crate) fn resolve(
     // runtime hook registry. Each ref becomes a named registry entry (deterministic names: the
     // module name, suffixed `#N` on collision, iterating pools in sorted order); the pool's
     // `gates` list / the resolved `global_hooks` names carry the synthesized names in config
-    // order. Unknown hook modules (anything but the built-in `webhook` / `socket` transports) are
-    // FAIL-CLOSED boot errors.
+    // order. A module ref names a `kind: hook` plugin; an unresolvable/wrong-kind reference is a
+    // FAIL-CLOSED plugin-preflight error (like a store/auth ref).
     let mut hooks_registry: HashMap<String, HookCfg> = HashMap::new();
     let mut pools = deploy.pools.clone();
     let register = |registry: &mut HashMap<String, HookCfg>,
@@ -2469,9 +2440,9 @@ pub(crate) fn resolve(
         match entry {
             HookRefEntry::Builtin(name) => {
                 errors.push(format!(
-                    "global_hooks entry '{name}': a global hook is an inline module ref \
-                     (`{{ module: webhook, settings: {{ url: … }} }}`); bare built-in names are \
-                     pool ordering strategies and have no global meaning"
+                    "global_hooks entry '{name}': a global hook is an inline module ref naming a \
+                     `kind: hook` plugin (`{{ module: my-hook-plugin, settings: {{ … }} }}`); bare \
+                     built-in names are pool ordering strategies and have no global meaning"
                 ));
             }
             HookRefEntry::Module(r) => {

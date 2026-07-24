@@ -178,50 +178,6 @@ pub(crate) struct HookContext<'a> {
     pub(crate) budget: &'a [busbar_api::BudgetBucketState],
 }
 
-/// The CONFIGURE message (D2) — the FIRST line busbar sends on every socket connection (and the
-/// push a settings PATCH makes before committing): the hook's current desired-state settings.
-/// The top-level `configure` KEY (presence, never key order) discriminates it as a management
-/// message; per-request payloads carry the `op` field instead. Idempotent desired-state:
-/// re-sending the same settings must be a no-op for the hook.
-#[derive(Serialize)]
-pub(crate) struct ConfigureMsg<'a> {
-    pub(crate) configure: ConfigureBody<'a>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ConfigureBody<'a> {
-    /// The hook's own registry name (context echo).
-    pub(crate) hook: &'a str,
-    /// The opaque settings map from the hook's registry entry (operator/API-owned).
-    pub(crate) settings: &'a serde_json::Map<String, serde_json::Value>,
-    /// Monotonic settings version (the config_version that committed them) — the ack echoes it.
-    pub(crate) settings_version: u64,
-    pub(crate) busbar_version: &'static str,
-}
-
-/// The hook's configure ACK: `{"ack": {"settings_version": N}}`. Anything else (error, wrong
-/// version, garbage, timeout) is a FAILED configure — a settings PATCH does not commit.
-#[derive(Debug, Deserialize)]
-pub(crate) struct ConfigureAck {
-    pub(crate) ack: Option<ConfigureAckBody>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ConfigureAckBody {
-    pub(crate) settings_version: u64,
-}
-
-/// The DESCRIBE request (D2): `{"describe": true}` — the hook replies its self-description
-/// ENVELOPE: `{"schema": <settings JSON Schema>, "dashboard"?: {"widgets": [...]}}`. ONE
-/// declaration drives both the config form (`schema` — served at
-/// `GET /api/v1/admin/hooks/{name}/schema`) and the plugin dashboard layout (`dashboard`,
-/// reserved for the dashboard read; values come from `status.metrics` — busbar-ui suggestion #2).
-/// Both members optional; unknown members ignored (append-only).
-#[derive(Serialize)]
-pub(crate) struct DescribeMsg {
-    pub(crate) describe: bool,
-}
-
 /// The describe reply envelope, parsed liberally.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct DescribeReply {
@@ -230,20 +186,6 @@ pub(crate) struct DescribeReply {
     #[serde(default)]
     #[allow(dead_code)] // reserved: consumed by the plugin-dashboard read (post-1.3 additive)
     pub(crate) dashboard: Option<serde_json::Value>,
-}
-
-/// The STATUS management message: `{"status": true}` — mirrors `describe`'s key-discriminated
-/// idiom. The hook replies its OBSERVED state: `{"status": {"settings_version"?: N,
-/// "settings"?: {...}, "metrics"?: [<entry>, ...]}}`. `metrics` is an ARRAY of Prometheus-shaped
-/// entries (see [`HookMetric`]) — the shape that carries per-dimension `labels` and `histogram`
-/// distributions a flat map cannot. Every reply key is optional; unknown keys are ignored; a hook
-/// that does not implement `status` replies `{}` (busbar treats empty/absent as "unsupported" and
-/// fails open). This is the control-plane read that lets busbar surface a hook's own settings and
-/// operational data ("Your AI Control Plane" — a dashboard on busbar sees what each plug is doing).
-/// Entries are validated + bounded by busbar (a hostile hook cannot flood or exfiltrate).
-#[derive(Serialize)]
-pub(crate) struct StatusMsg {
-    pub(crate) status: bool,
 }
 
 /// One hook-reported metric entry — a Prometheus/OpenMetrics-shaped observation (parsed liberally;
@@ -584,11 +526,6 @@ pub(crate) fn transform_outcome(parsed: HookResponse) -> busbar_api::TransformOu
 
 /// Reject-status clamp range + fallback: any status outside 400..=499 becomes 403.
 const REJECT_STATUS_DEFAULT: u16 = 403;
-
-/// Shared cap on a routing-hook reply body — one bound for BOTH transports (the socket's
-/// NDJSON reply line and the webhook's response body), so a runaway/hostile hook can never drive
-/// unbounded allocation and the two transports cannot drift on the limit.
-pub(crate) const MAX_HOOK_REPLY_BYTES: usize = 64 * 1024;
 
 /// Clamp a hook-supplied reject status to the client-error range: anything outside 400..=499
 /// becomes `REJECT_STATUS_DEFAULT` (403). Shared by `parse_reject_detail` (the transports' reply

@@ -255,6 +255,12 @@ pub(crate) struct App {
     /// from the RESOLVED transports in `rewrite_hooks`/`tap_hooks` (which the request path fires). Empty
     /// when no hooks are configured. Read-only after construction; the config-plane mutation surface
     /// swaps a new `App` snapshot rather than mutating this in place.
+    /// The plugin-resolution environment for hooks: the validated plugin registry + the shared
+    /// projectors. Threaded to the admin control-plane reads/writes (configure/status/schema) and the
+    /// Prometheus scrape so they open a hook's `kind: hook` plugin the same way the request path's
+    /// resolved transports did. Cheap to clone (Arc-backed). Replaces the retired webhook client the
+    /// out-of-process transport needed.
+    pub(crate) hook_env: crate::hooks::HookEnv,
     pub(crate) hook_registry: HashMap<String, crate::config::HookCfg>,
     /// The `global_hooks:` list — names fired on every request (plus any hook with inline `global:
     /// true`). Carried for the hooks read surface so a definition can report whether it is globally

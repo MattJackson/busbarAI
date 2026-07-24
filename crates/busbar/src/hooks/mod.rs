@@ -7,8 +7,10 @@
 //! ordered **preference** of members — not a single pick. The ordered list feeds the failover loop
 //! Busbar already has (`proxy::pick_among`): if the policy's #1 is tripped / excluded / at
 //! capacity, Busbar walks to #2 using the existing breaker machinery. One transport-agnostic trait
-//! (`RoutingPolicy`); webhook / socket are the out-of-process implementations, and the built-in
-//! ranking hooks (the `hooks/ranking/` workspace crate) are the in-process ones.
+//! (`RoutingPolicy`); a `kind: hook` dlopen PLUGIN (loaded over the hybrid ABI as a `DlopenPolicy`)
+//! is the general out-of-core implementation, and the built-in ranking hooks (the `hooks/ranking/`
+//! workspace crate) are the compiled-in ones. (1.5.0 retired the out-of-process socket/webhook
+//! transports — a hook is now a signed, trusted, in-process plugin.)
 //!
 //! ZERO-COST DEFAULT: a `route: weighted` (default / absent) pool resolves to `ResolvedPolicy::None`
 //! at config load and NEVER constructs any of the projection types or enters this module's async
@@ -17,8 +19,8 @@
 //! This surface is PRODUCTION-WIRED: `proxy::decide_policy_order` builds the `RoutingRequest` +
 //! `Candidate` projections from the live store signals and invokes the resolved policy on every
 //! non-default request; `proxy::pick_among` walks the ranked order through the existing failover
-//! loop. `resolve_policy` (below) constructs the ranking-hook / webhook / socket transports once
-//! at config load.
+//! loop. `resolve_policy` (below) constructs the ranking-hook / dlopen-plugin transports once at
+//! config load.
 
 use std::sync::Arc;
 
@@ -35,26 +37,49 @@ fn policy_timeout(timeout_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+pub(crate) mod plugin;
 pub(crate) mod scrape;
-pub(crate) mod socket;
-pub(crate) mod webhook;
 pub(crate) mod wire;
 
 // The HOOK CONTRACT — the `RoutingPolicy` trait and the read-only projections it is invoked with
 // (`RoutingRequest`, `Candidate`, `RoutingContext`, `RoutingDecision`, …) — lives in the
 // `busbar-api` crate (the one crate both the engine and every plugin build against). Re-exported
 // here so engine-internal paths are unchanged.
+// `PolicyError`/`PolicyResult` are re-exported for the `#[cfg(test)]` hook-seam tests (which
+// implement `RoutingPolicy` against the engine's types); allow the unused-in-non-test warning.
+#[allow(unused_imports)]
 pub(crate) use busbar_api::{
     CallerIdentity, Candidate, PolicyError, PolicyResult, PromptProjection, RoutingContext,
     RoutingDecision, RoutingPolicy, RoutingRequest,
 };
+
+/// The plugin-resolution environment threaded through every hook-transport builder: the validated
+/// plugin registry (the ONLY resolution surface — a hook's `plugin:` ref opens a `DlopenPolicy`
+/// through it) and the shared [`HookProjectors`] every `DlopenPolicy` uses to project the request and
+/// parse the reply through the engine's own fail-closed `wire` normalizers. Cheap to clone (both are
+/// `Arc`-backed); replaces the old `&reqwest::Client` the retired webhook transport needed.
+#[derive(Clone)]
+pub(crate) struct HookEnv {
+    pub(crate) registry: std::sync::Arc<busbar_plugin_loader::PluginRegistry>,
+    pub(crate) projectors: std::sync::Arc<busbar_plugin_loader::hook::HookProjectors>,
+}
+
+impl HookEnv {
+    /// Bundle a registry + the shared projectors into the resolution environment.
+    pub(crate) fn new(registry: std::sync::Arc<busbar_plugin_loader::PluginRegistry>) -> Self {
+        HookEnv {
+            registry,
+            projectors: plugin::projectors(),
+        }
+    }
+}
 
 /// The per-pool routing policy resolved ONCE at config load. `None` is the zero-cost default
 /// (`route: weighted` / absent): no policy object, no projection, the inline SWRR hot path. Stored
 /// on `App` keyed by pool name; the hot path is `if let Some(p) = app.pool_policies.get(pool) { … }`.
 #[derive(Clone)]
 pub(crate) enum ResolvedPolicy {
-    /// A constructed policy object (webhook / socket / native non-weighted) plus its fallback config.
+    /// A constructed policy object (a dlopen hook plugin / native non-weighted) plus its fallback config.
     /// The default SWRR / weighted path is represented as `None` by `resolve_policy` (it constructs no
     /// policy object), so there is no `Weighted` variant — a weighted pool simply has no resolved
     /// policy and takes the inline SWRR branch.
@@ -156,7 +181,7 @@ pub(crate) fn default_hook_name(
 pub(crate) fn resolve_pool_ordering(
     cfg: &crate::config::PoolCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
-    client: &reqwest::Client,
+    env: &HookEnv,
     default_hook: Option<&str>,
     settings_version: u64,
 ) -> Option<ResolvedPolicy> {
@@ -164,7 +189,7 @@ pub(crate) fn resolve_pool_ordering(
         if let Some(name) = default_hook {
             if let Some(hook) = hooks.get(name) {
                 // The default gate becomes this pool's base ordering.
-                return resolve_gate_transport(name, hook, hooks, client, settings_version);
+                return resolve_gate_transport(name, hook, hooks, env, settings_version);
             }
         }
     }
@@ -179,7 +204,7 @@ pub(crate) fn resolve_pool_ordering(
 pub(crate) fn resolve_pool_gates(
     cfg: &crate::config::PoolCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
 ) -> Vec<(u16, ResolvedPolicy)> {
     cfg.gates
@@ -195,7 +220,7 @@ pub(crate) fn resolve_pool_gates(
             if hook.prompt.can_rewrite() {
                 return None;
             }
-            resolve_gate_transport(name, hook, hooks, client, settings_version)
+            resolve_gate_transport(name, hook, hooks, env, settings_version)
                 .map(|rp| (hook.priority, rp))
         })
         .collect()
@@ -209,7 +234,7 @@ pub(crate) fn resolve_pool_gates(
 pub(crate) fn resolve_pool_rewrites(
     cfg: &crate::config::PoolCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
 ) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
     let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
@@ -222,7 +247,7 @@ pub(crate) fn resolve_pool_rewrites(
         }
         if let Some(ResolvedPolicy::Policy {
             policy, timeout, ..
-        }) = resolve_gate_transport(name, hook, hooks, client, settings_version)
+        }) = resolve_gate_transport(name, hook, hooks, env, settings_version)
         {
             ranked.push((hook.priority, timeout, policy));
         }
@@ -231,65 +256,102 @@ pub(crate) fn resolve_pool_rewrites(
     ranked.into_iter().map(|(_, t, p)| (t, p)).collect()
 }
 
-/// Resolve a GATE hook's transport (socket or webhook) into a [`ResolvedPolicy`]. The prompt/identity
-/// projections are gated by the hook's `prompt:`/`user:` grants (`ro`/`rw` send the prompt; `ro` sends
-/// identity). A missing/invalid transport degrades to `None` — config_validate surfaces it loudly.
+/// Resolve a GATE hook into a [`ResolvedPolicy`]. The prompt/identity projections are gated by BOTH
+/// the operator's `prompt:`/`user:` grant AND the plugin's signed-manifest declared intent (`needs:`)
+/// — the belt-and-suspenders projection rule: the core sends content ONLY when both agree
+/// ([`projection_grants`]). A missing/unresolvable plugin degrades to `None` — the plugin pre-flight
+/// surfaces it loudly at boot.
 fn resolve_gate_transport(
     name: &str,
     hook: &crate::config::HookCfg,
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
 ) -> Option<ResolvedPolicy> {
-    let policy = gate_transport_named(name, hook, client, settings_version)?;
-    let (on_error_chain, on_error) = resolve_on_error_chain(hook, hooks, client, settings_version);
+    let policy = gate_transport_named(name, hook, env, settings_version)?;
+    let (on_error_chain, on_error) = resolve_on_error_chain(hook, hooks, env, settings_version);
+    let (send_prompt, send_user) = projection_grants(name, hook, env);
     Some(ResolvedPolicy::Policy {
         policy,
         on_error,
         on_error_chain,
         timeout: policy_timeout(hook.timeout_ms),
-        send_prompt: hook.prompt.sends_prompt(),
-        send_user: hook.user.sends_user(),
+        send_prompt,
+        send_user,
         on_empty: gate_on_empty(hook),
     })
 }
 
-/// The bare transport of a gate, with its IDENTITY — webhook (SSRF-validated at load) or Unix
-/// socket (lazy connect). `name` + `settings_version` feed the socket's configure preamble.
+/// The BELT-AND-SUSPENDERS projection rule: the core projects `prompt`/`user` content into a hook's
+/// wire payload ONLY when BOTH the operator's config grant AND the plugin's signed-manifest declared
+/// intent (`needs:`) allow it. A fat-fingered grant to a plugin that never asked for content is a
+/// no-op (advisory warn); a plugin that asks can still be denied by the operator. Returns
+/// `(send_prompt, send_user)`. When the plugin manifest can't be resolved (validated elsewhere), we
+/// fall back to the operator grant alone — the pre-flight already fails boot on an unresolvable ref,
+/// so this branch is a safety net, never the live path.
+fn projection_grants(name: &str, hook: &crate::config::HookCfg, env: &HookEnv) -> (bool, bool) {
+    let grant_prompt = hook.prompt.sends_prompt();
+    let grant_user = hook.user.sends_user();
+    let Some(p) = env.registry.resolve(&hook.plugin) else {
+        return (grant_prompt, grant_user);
+    };
+    let needs = &p.manifest.needs;
+    let send_prompt = grant_prompt && needs.prompt.wants_read();
+    let send_user = grant_user && needs.user.wants_read();
+    // Surface a fat-fingered grant that the manifest never declared: the projection is a no-op, but
+    // the operator should know the grant is inert (they may have the wrong plugin).
+    if grant_prompt && !needs.prompt.wants_read() {
+        tracing::warn!(
+            hook = %name, plugin = %hook.plugin,
+            "hook grants `prompt` but the plugin manifest declares no prompt need — no prompt \
+             content will be sent (grant is inert)"
+        );
+    }
+    if grant_user && !needs.user.wants_read() {
+        tracing::warn!(
+            hook = %name, plugin = %hook.plugin,
+            "hook grants `user` but the plugin manifest declares no user need — no identity will \
+             be sent (grant is inert)"
+        );
+    }
+    // Surface the declared intent at resolution (register/load visibility).
+    if needs.declares_any() {
+        tracing::info!(
+            hook = %name, plugin = %hook.plugin,
+            needs_prompt = ?needs.prompt, needs_user = ?needs.user,
+            send_prompt, send_user,
+            "hook plugin declared content intent"
+        );
+    }
+    (send_prompt, send_user)
+}
+
+/// Open the `kind: hook` PLUGIN backing this hook as a [`busbar_plugin_loader::DlopenPolicy`] — the
+/// in-process replacement for the retired socket/webhook transports. The plugin's opaque `settings:`
+/// map is its `open` config (verbatim JSON). `name` + `settings_version` are carried for diagnostics
+/// and the configure ack. `None` when the reference doesn't resolve to a loadable `kind: hook`
+/// plugin (the plugin pre-flight already fails boot on that, so a `None` here is a safety net that
+/// degrades to "gate absent", never a stranded request).
 fn gate_transport_named(
     name: &str,
     hook: &crate::config::HookCfg,
-    client: &reqwest::Client,
-    settings_version: u64,
+    env: &HookEnv,
+    _settings_version: u64,
 ) -> Option<Arc<dyn RoutingPolicy>> {
-    if let Some(url) = hook.webhook.as_deref() {
-        let url = crate::observability::validate_routing_webhook_url(Some(url)).ok()?;
-        return Some(Arc::new(webhook::WebhookPolicy::new(url, client.clone())));
+    let cfg_json = serde_json::to_string(&hook.settings).unwrap_or_else(|_| "{}".to_string());
+    match env
+        .registry
+        .open_hook(&hook.plugin, &cfg_json, name, env.projectors.clone())
+    {
+        Ok(policy) => Some(policy),
+        Err(e) => {
+            tracing::warn!(
+                hook = %name, plugin = %hook.plugin, error = %e,
+                "hook plugin failed to load; gate treated as absent (fail-open to the request)"
+            );
+            None
+        }
     }
-    gate_socket_transport(name, hook, settings_version)
-}
-
-/// Wrap a gate's Unix domain socket path as a [`socket::SocketPolicy`]. The configure preamble is
-/// ALWAYS sent on every fresh connection (audit W-H2: the doc always promised "first message on
-/// every socket (re)connection" — an empty `settings: {}` is still valid desired-state, and the
-/// preamble is the ONLY delivery of `busbar_version` most hooks ever see), carrying the hook's
-/// REGISTRY name and the REAL settings version (audit W-M4 — previously path-as-name + hardcoded 0).
-#[cfg(unix)]
-fn gate_socket_transport(
-    name: &str,
-    hook: &crate::config::HookCfg,
-    settings_version: u64,
-) -> Option<Arc<dyn RoutingPolicy>> {
-    let path = hook.socket.as_deref()?;
-    if path.is_empty() {
-        return None;
-    }
-    Some(Arc::new(socket::SocketPolicy::with_configure(
-        path.to_string(),
-        name,
-        &hook.settings,
-        settings_version,
-    )))
 }
 
 /// The configure-push deadline (spec `configure_timeout_ms` default): distinct from the
@@ -302,10 +364,10 @@ pub(crate) async fn push_configure(
     hook: &crate::config::HookCfg,
     name: &str,
     settings_version: u64,
-    client: &reqwest::Client,
+    env: &HookEnv,
 ) -> Result<(), String> {
-    let Some(transport) = gate_transport_named(name, hook, client, settings_version) else {
-        return Err("hook transport unresolvable".to_string());
+    let Some(transport) = gate_transport_named(name, hook, env, settings_version) else {
+        return Err("hook plugin unresolvable".to_string());
     };
     transport
         .configure(
@@ -325,9 +387,9 @@ pub(crate) async fn fetch_status(
     name: &str,
     hook: &crate::config::HookCfg,
     settings_version: u64,
-    client: &reqwest::Client,
+    env: &HookEnv,
 ) -> Option<busbar_api::HookStatus> {
-    let transport = gate_transport_named(name, hook, client, settings_version)?;
+    let transport = gate_transport_named(name, hook, env, settings_version)?;
     transport
         .status(std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS))
         .await
@@ -339,19 +401,16 @@ pub(crate) async fn fetch_schema(
     name: &str,
     hook: &crate::config::HookCfg,
     settings_version: u64,
-    client: &reqwest::Client,
+    env: &HookEnv,
 ) -> Option<serde_json::Value> {
-    let transport = gate_transport_named(name, hook, client, settings_version)?;
-    let reply = transport
+    let transport = gate_transport_named(name, hook, env, settings_version)?;
+    // `DlopenPolicy::describe` returns the schema member ALREADY EXTRACTED from the plugin's
+    // self-description envelope (via the `describe_schema` projector), so the /schema read serves a
+    // SINGLE nest (the endpoint adds its own {name, schema} wrapper). No schema member (incl. the
+    // `{}` unsupported reply) = no schema (the endpoint reports null).
+    transport
         .describe(std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS))
-        .await?;
-    // The describe reply is the self-description ENVELOPE `{schema, dashboard?}` — extract the
-    // schema member for the /schema read (the endpoint adds its own {name, schema} wrapper, so
-    // extracting here is what prevents a double nest). No `schema` member (incl. the `{}`
-    // unsupported reply) = no schema (the endpoint reports null).
-    serde_json::from_value::<crate::hooks::wire::DescribeReply>(reply)
-        .ok()?
-        .schema
+        .await
 }
 
 /// Resolve a hook's `on_error` NAME into its runtime fallback chain + terminal, following the
@@ -363,7 +422,7 @@ pub(crate) async fn fetch_schema(
 fn resolve_on_error_chain<'a>(
     hook: &'a crate::config::HookCfg,
     hooks: &'a std::collections::HashMap<String, crate::config::HookCfg>,
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
 ) -> (Vec<FallbackHook>, crate::config::PolicyOnError) {
     let mut chain: Vec<FallbackHook> = Vec::new();
@@ -395,12 +454,13 @@ fn resolve_on_error_chain<'a>(
         if h.kind != crate::config::HookKind::Gate {
             return (chain, crate::config::PolicyOnError::default());
         }
-        if let Some(policy) = gate_transport_named(current, h, client, settings_version) {
+        if let Some(policy) = gate_transport_named(current, h, env, settings_version) {
+            let (send_prompt, send_user) = projection_grants(current, h, env);
             chain.push(FallbackHook {
                 policy,
                 timeout: policy_timeout(h.timeout_ms),
-                send_prompt: h.prompt.sends_prompt(),
-                send_user: h.user.sends_user(),
+                send_prompt,
+                send_user,
                 on_empty: gate_on_empty(h),
             });
         }
@@ -423,11 +483,11 @@ fn gate_on_empty(hook: &crate::config::HookCfg) -> crate::config::PolicyOnError 
 /// `(per-hook transform deadline, transport)` pairs. The `rw` GRANT IS ENFORCED HERE: a `ro`/`no`
 /// gate (or a tap, or a non-rewrite gate) is skipped, so it can never rewrite — the bidirectional
 /// grant holds by construction, independent of what a hook tries to return. Unresolvable transports
-/// (bad socket/webhook) are skipped; config_validate surfaces those loudly at boot.
+/// (unresolvable plugin refs) are skipped; the plugin pre-flight surfaces those loudly at boot.
 pub(crate) fn resolve_rewrite_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
 ) -> Vec<(std::time::Duration, Arc<dyn RoutingPolicy>)> {
     let mut ranked: Vec<(u16, std::time::Duration, Arc<dyn RoutingPolicy>)> = Vec::new();
@@ -441,7 +501,7 @@ pub(crate) fn resolve_rewrite_hooks(
         }
         if let Some(ResolvedPolicy::Policy {
             policy, timeout, ..
-        }) = resolve_gate_transport(name, hook, hooks, client, settings_version)
+        }) = resolve_gate_transport(name, hook, hooks, env, settings_version)
         {
             ranked.push((hook.priority, timeout, policy));
         }
@@ -458,7 +518,7 @@ pub(crate) fn resolve_rewrite_hooks(
 pub(crate) fn resolve_tap_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
     stage: crate::config::HookStage,
 ) -> Vec<(std::time::Duration, bool, Arc<dyn RoutingPolicy>)> {
@@ -481,7 +541,7 @@ pub(crate) fn resolve_tap_hooks(
             timeout,
             send_prompt,
             ..
-        }) = resolve_gate_transport(name, hook, hooks, client, settings_version)
+        }) = resolve_gate_transport(name, hook, hooks, env, settings_version)
         {
             ranked.push((hook.priority, timeout, send_prompt, policy));
         }
@@ -502,7 +562,7 @@ pub(crate) fn resolve_tap_hooks(
 pub(crate) fn resolve_gate_hooks(
     hooks: &std::collections::HashMap<String, crate::config::HookCfg>,
     global_hooks: &[String],
-    client: &reqwest::Client,
+    env: &HookEnv,
     settings_version: u64,
 ) -> Vec<(u16, ResolvedPolicy)> {
     let mut ranked: Vec<(u16, ResolvedPolicy)> = Vec::new();
@@ -515,27 +575,12 @@ pub(crate) fn resolve_gate_hooks(
         if hook.kind != crate::config::HookKind::Gate || hook.prompt.can_rewrite() {
             continue;
         }
-        if let Some(rp) = resolve_gate_transport(name, hook, hooks, client, settings_version) {
+        if let Some(rp) = resolve_gate_transport(name, hook, hooks, env, settings_version) {
             ranked.push((hook.priority, rp));
         }
     }
     ranked.sort_by_key(|(p, _)| *p);
     ranked
-}
-
-/// Non-unix fallback: `tokio::net::UnixStream` is unix-only, so a socket gate degrades to the default
-/// SWRR with a loud pointer at the webhook transport. The request is never stranded.
-#[cfg(not(unix))]
-fn gate_socket_transport(
-    _name: &str,
-    _hook: &crate::config::HookCfg,
-    _settings_version: u64,
-) -> Option<Arc<dyn RoutingPolicy>> {
-    tracing::warn!(
-        "a socket gate (Unix-domain-socket hook) is not available on this platform; falling back to \
-         weighted. Use a `webhook:` hook for an out-of-process gate here."
-    );
-    None
 }
 
 #[cfg(test)]

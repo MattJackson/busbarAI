@@ -339,7 +339,7 @@ mod tests {
 
     fn gate() -> HookCfg {
         serde_json::from_value(serde_json::json!({
-            "kind": "gate", "webhook": "http://127.0.0.1:8900/", "prompt": "rw", "global": true
+            "kind": "gate", "plugin": "test-hook", "prompt": "rw", "global": true
         }))
         .unwrap()
     }

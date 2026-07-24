@@ -122,41 +122,33 @@ fn validate_plugin_filename(file: &str) -> Result<String, AdminError> {
     Ok(file.to_string())
 }
 
-/// Best-effort reachability probe for a hook's transport, for the health read. NEVER sends a hook
-/// request — it only checks whether the endpoint accepts a connection. A socket gets a short-timeout
-/// `connect` (unix only); a webhook is not probed here (returns `None` with a note — webhooks lazy-
-/// connect per request, and a blind GET/HEAD could have side effects). Returns `(reachable, detail)`.
-async fn probe_transport(cfg: &HookCfg) -> (Option<bool>, Option<String>) {
-    match (&cfg.socket, &cfg.webhook) {
-        (Some(path), _) => {
-            #[cfg(unix)]
-            {
-                // Cap the probe so an unresponsive socket can never stall the admin read.
-                const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
-                match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(path))
-                    .await
-                {
-                    Ok(Ok(_stream)) => (Some(true), None),
-                    Ok(Err(e)) => (Some(false), Some(format!("connect failed: {}", e.kind()))),
-                    Err(_) => (Some(false), Some("connect timed out".to_string())),
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = path;
-                (
-                    None,
-                    Some("socket transport is unix-only; not probed on this host".to_string()),
-                )
-            }
-        }
-        (None, Some(_url)) => (
-            None,
-            Some("webhook is probed on demand at request time, not here".to_string()),
-        ),
-        (None, None) => (
+/// Best-effort reachability probe for a hook's backing plugin, for the health read. A hook is now an
+/// in-process `kind: hook` plugin (the socket/webhook out-of-process transports are retired), so
+/// "reachable" means the referenced plugin RESOLVES to a loadable `kind: hook` plugin in the validated
+/// registry. Returns `(reachable, detail)`: `Some(true)` when it resolves, `Some(false)` with the
+/// reason when it does not.
+async fn probe_transport(
+    cfg: &HookCfg,
+    env: &crate::hooks::HookEnv,
+) -> (Option<bool>, Option<String>) {
+    match env.registry.resolve(&cfg.plugin) {
+        Some(p) if p.manifest.kind == "hook" => (Some(true), None),
+        Some(p) => (
             Some(false),
-            Some("hook defines no transport (socket or webhook)".to_string()),
+            Some(format!(
+                "plugin '{}' resolves to kind '{}', not 'hook'",
+                cfg.plugin, p.manifest.kind
+            )),
+        ),
+        None => (
+            Some(false),
+            Some(match env.registry.unresolved_reason(&cfg.plugin) {
+                Some(sk) => format!(
+                    "plugin '{}' present but not loaded: {}",
+                    cfg.plugin, sk.reason
+                ),
+                None => format!("plugin '{}' is not installed", cfg.plugin),
+            }),
         ),
     }
 }
@@ -231,10 +223,12 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     // The `settings` map rides register/PUT too — cap it here so it is bounded on EVERY write path,
     // not just PATCH (found: audit c1r12 — register/PUT were missing the cap PATCH already had).
     validate_hook_settings_size(&cfg.settings)?;
-    // Exactly one transport: socket XOR webhook.
-    if cfg.socket.is_none() == cfg.webhook.is_none() {
+    // A hook must name exactly one `kind: hook` plugin (the retired socket/webhook transports are
+    // gone). Emptiness is the structural check here; the plugin's existence/kind is validated against
+    // the registry below (register/PUT) and at the plugin pre-flight.
+    if cfg.plugin.trim().is_empty() {
         return Err(AdminError::Validation(
-            "a hook must set exactly one transport: `socket` or `webhook`".into(),
+            "a hook must name a `kind: hook` plugin via `plugin:`".into(),
         ));
     }
     // `prompt: rw` is a rewrite grant, meaningless (and unsafe) on a fire-and-forget tap.
@@ -277,41 +271,41 @@ pub(crate) fn build_with_hook(current: &App, name: &str, cfg: HookCfg) -> Result
     next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
     );
     next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Completion,
     );
     next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
     );
     Ok(next)
@@ -334,41 +328,41 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
     next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
     );
     next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Completion,
     );
     next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
     );
     Ok(next)
@@ -466,9 +460,9 @@ pub(crate) fn build_with_registry(
     global_hooks: Vec<String>,
 ) -> Result<App, AdminError> {
     for (name, cfg) in &registry {
-        if cfg.socket.is_none() == cfg.webhook.is_none() {
+        if cfg.plugin.trim().is_empty() {
             return Err(AdminError::Validation(format!(
-                "hook `{name}` must set exactly one transport: `socket` or `webhook`"
+                "hook `{name}` must name a `kind: hook` plugin via `plugin:`"
             )));
         }
         if cfg.kind == HookKind::Tap && cfg.prompt == PromptAccess::Rw {
@@ -502,41 +496,41 @@ pub(crate) fn build_with_registry(
     next.rewrite_hooks = crate::hooks::resolve_rewrite_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
     );
     next.tap_hooks = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Request,
     );
     next.tap_hooks_route = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Route,
     );
     next.tap_hooks_attempt = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Attempt,
     );
     next.tap_hooks_completion = crate::hooks::resolve_tap_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
         crate::config::HookStage::Completion,
     );
     next.global_gates = crate::hooks::resolve_gate_hooks(
         &next.hook_registry,
         &next.global_hooks,
-        next.client.get(),
+        &next.hook_env,
         next.config_version,
     );
     Ok(next)
@@ -865,7 +859,7 @@ impl AdminService {
                     .hook_registry
                     .iter()
                     .map(|(name, cfg)| {
-                        let target = cfg.socket.clone().or_else(|| cfg.webhook.clone());
+                        let target = Some(cfg.plugin.clone());
                         PluginView::basic(name.clone(), "hooks", "external", Some(true), target)
                     })
                     .collect();
@@ -1363,7 +1357,7 @@ impl AdminService {
             .get(name)
             .ok_or_else(|| AdminError::NotFound(format!("hook `{name}`")))?;
         let view = self.hook_view(name, cfg);
-        let (reachable, detail) = probe_transport(cfg).await;
+        let (reachable, detail) = probe_transport(cfg, &self.app.hook_env).await;
         Ok(HookHealthView {
             name: name.to_string(),
             transport: view.transport,
@@ -1385,10 +1379,12 @@ impl AdminService {
 /// `global` is true when the hook is named in the wiring list OR declares inline `global: true`.
 pub(crate) fn project_hook_view(name: &str, cfg: &HookCfg, global_hooks: &[String]) -> HookView {
     {
-        let (transport_kind, target) = match (&cfg.socket, &cfg.webhook) {
-            (Some(path), _) => ("socket", Some(path.clone())),
-            (None, Some(url)) => ("webhook", Some(url.clone())),
-            (None, None) => ("none", None),
+        // A hook's transport is now the in-process `kind: hook` plugin it references (the retired
+        // socket/webhook transports are gone); report the plugin name as the target.
+        let (transport_kind, target) = if cfg.plugin.trim().is_empty() {
+            ("none", None)
+        } else {
+            ("plugin", Some(cfg.plugin.clone()))
         };
         HookView {
             name: name.to_string(),
@@ -1433,8 +1429,7 @@ mod tests {
     fn hook(kind: HookKind, global: bool) -> HookCfg {
         HookCfg {
             kind,
-            socket: None,
-            webhook: Some("http://127.0.0.1:9971/".to_string()),
+            plugin: "test-hook".to_string(),
             timeout_ms: 5,
             on_error: "weighted".to_string(),
             prompt: PromptAccess::No,
@@ -1453,7 +1448,12 @@ mod tests {
     /// Lanes/store are shared (unchanged), proving the store-constraint-free subset.
     #[test]
     fn build_with_hook_registers_and_wires_global_tap() {
-        let app = TestApp::new().build();
+        let Some(env) = crate::test_support::test_hook_env(&["test-hook"], Default::default())
+        else {
+            eprintln!("skip: hook cdylib not built (run under --workspace)");
+            return;
+        };
+        let app = TestApp::new().hook_env(env).build();
         assert_eq!(app.tap_hooks.len(), 0, "fixture starts with no taps");
         let next = build_with_hook(&app, "logger", hook(HookKind::Tap, true))
             .expect("a valid global tap registers");
@@ -1481,7 +1481,12 @@ mod tests {
     /// reported `global: true`.
     #[test]
     fn build_with_hook_demotes_global_false_removes_wiring() {
-        let app = TestApp::new().build();
+        let Some(env) = crate::test_support::test_hook_env(&["test-hook"], Default::default())
+        else {
+            eprintln!("skip: hook cdylib not built (run under --workspace)");
+            return;
+        };
+        let app = TestApp::new().hook_env(env).build();
         // Register a GLOBAL tap, then PUT the same name with global: false.
         let promoted = build_with_hook(&app, "logger", hook(HookKind::Tap, true))
             .expect("global tap registers");
@@ -1576,7 +1581,7 @@ mod tests {
         ));
 
         let mut no_transport = hook(HookKind::Gate, false);
-        no_transport.webhook = None;
+        no_transport.plugin = String::new();
         assert!(matches!(
             build_with_hook(&app, "x", no_transport),
             Err(AdminError::Validation(_))

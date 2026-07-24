@@ -667,51 +667,22 @@ async fn test_admin_v1_usage_meters_by_model_and_key() {
 /// (the registry shows the new settings); a NACKing hook commits nothing; GET schema proxies
 /// the hook's describe reply.
 #[cfg(unix)]
+/// D2 control plane over the DLOPEN hook seam: registering a hook loads its `kind: hook` plugin; a
+/// settings PATCH pushes `configure` and COMMITS on the plugin's exact-version ack (the test-hook
+/// plugin acks by default); `GET .../schema` proxies the plugin's `describe` self-description
+/// envelope, extracting the `schema` member (single nest). The retired socket/webhook mock is gone —
+/// the plugin IS the transport now. (A NACK/wrong-version ack rejecting the commit is covered at the
+/// DlopenPolicy configure unit level.)
 #[tokio::test]
 async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
     crate::metrics::init();
-    // A fake hook binary: acks configure (echoing the pushed version), answers describe.
-    let dir = std::env::temp_dir().join(format!("busbar-d2-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("hook.sock");
-    let _ = std::fs::remove_file(&sock);
-    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
-    let ack_mode = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let hook_ack = ack_mode.clone();
-    let hook_task = tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let ack = hook_ack.clone();
-            tokio::spawn(async move {
-                let (r, mut w) = stream.into_split();
-                let mut lines = BufReader::new(r).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
-                    let reply = if let Some(c) = v.get("configure") {
-                        if ack.load(std::sync::atomic::Ordering::Relaxed) {
-                            serde_json::json!({"ack": {"settings_version": c["settings_version"]}})
-                        } else {
-                            serde_json::json!({"error": "refused"})
-                        }
-                    } else if v.get("describe").is_some() {
-                        serde_json::json!({"schema": {"type": "object", "properties": {"ratio": {"type": "number"}}}})
-                    } else {
-                        serde_json::json!({})
-                    };
-                    if w.write_all(format!("{reply}\n").as_bytes()).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    });
-
+    let Some(env) = crate::test_support::test_hook_env(&["test-hook"], Default::default()) else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
     let store = Arc::new(MemoryStore::new());
     let gov = gov_with_signer(store, Some("admintok".to_string()));
-    let app = TestApp::new().governance(gov).build();
+    let app = TestApp::new().governance(gov).hook_env(env).build();
     let router = crate::build_router(app);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -722,12 +693,12 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
             .header("content-type", "application/json")
     };
 
-    // Register the hook (overlay), then PATCH its settings — ack mode on: commits.
+    // Register the hook (overlay), then PATCH its settings — the plugin acks: commits.
     let created = admin(client.post(format!("http://{addr}/api/v1/admin/hooks")))
         .body(
             serde_json::json!({
                 "name": "cfg-hook",
-                "config": {"kind": "gate", "socket": sock.to_str().unwrap()}
+                "config": {"kind": "gate", "plugin": "test-hook"}
             })
             .to_string(),
         )
@@ -756,32 +727,8 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
         "committed settings visible: {got}"
     );
 
-    // NACK mode: the push is refused — nothing commits.
-    ack_mode.store(false, std::sync::atomic::Ordering::Relaxed);
-    let refused = admin(client.patch(format!(
-        "http://{addr}/api/v1/admin/hooks/cfg-hook/settings"
-    )))
-    .body(serde_json::json!({"settings": {"ratio": 0.9}}).to_string())
-    .send()
-    .await
-    .unwrap();
-    assert_eq!(refused.status().as_u16(), 400, "nack = not committed");
-    let still: serde_json::Value =
-        admin(client.get(format!("http://{addr}/api/v1/admin/hooks/cfg-hook")))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-    assert_eq!(
-        still["settings"]["ratio"], 0.4,
-        "old settings intact: {still}"
-    );
-
-    // Schema proxy (ack mode back on — the committed settings ride the configure preamble on
-    // the fresh describe connection, and a nacking hook refuses connections by design).
-    ack_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Schema proxy: the plugin's `describe` reply is the {schema, dashboard?} envelope; the engine
+    // EXTRACTS the schema member, so the endpoint serves a SINGLE nest.
     let schema: serde_json::Value =
         admin(client.get(format!("http://{addr}/api/v1/admin/hooks/cfg-hook/schema")))
             .send()
@@ -790,16 +737,12 @@ async fn test_admin_v1_hook_settings_patch_commit_on_ack_and_schema() {
             .json()
             .await
             .unwrap();
-    // The describe reply is the {schema, dashboard?} envelope; the engine EXTRACTS the schema
-    // member, so the endpoint serves a SINGLE nest (the old double-wrap was audit W-H3).
     assert_eq!(
-        schema["schema"]["properties"]["ratio"]["type"], "number",
+        schema["schema"]["properties"]["order"]["type"], "array",
         "describe schema extracted, single nest: {schema}"
     );
 
     serve.abort();
-    hook_task.abort();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `POST /api/v1/admin/config/apply`: a body-carried full config swaps in atomically — the new
@@ -1175,7 +1118,7 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     };
     let hook_body = serde_json::json!({
         "name": "scoped-hook",
-        "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        "config": {"kind": "tap", "plugin": "test-hook"}
     })
     .to_string();
     let key_body = serde_json::json!({"name": "k"}).to_string();
@@ -1244,7 +1187,7 @@ async fn test_admin_v1_scope_ladder_e2e_with_group_mapped_principals() {
     // hooks-register — it registers hooks but still cannot mint keys.
     let capped_hook = serde_json::json!({
         "name": "capped-hook",
-        "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        "config": {"kind": "tap", "plugin": "test-hook"}
     })
     .to_string();
     let r = with(
@@ -1347,7 +1290,7 @@ async fn test_admin_v1_hooks_register_cannot_escalate_via_grants_or_global() {
             .send()
     };
     let base = |extra: serde_json::Value| {
-        let mut c = serde_json::json!({"kind": "gate", "webhook": "http://127.0.0.1:9969/"});
+        let mut c = serde_json::json!({"kind": "gate", "plugin": "test-hook"});
         for (k, v) in extra.as_object().unwrap() {
             c[k] = v.clone();
         }
@@ -2032,10 +1975,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
 
     // PUT on an unknown name is 404 (PUT replaces; POST creates).
     let missing = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/nope")))
-        .body(
-            serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:1/"}})
-                .to_string(),
-        )
+        .body(serde_json::json!({"config": {"kind": "tap", "plugin": "test-hook"}}).to_string())
         .send()
         .await
         .unwrap();
@@ -2046,7 +1986,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
         .body(
             serde_json::json!({
                 "name": "rep",
-                "config": {"kind": "tap", "webhook": "http://127.0.0.1:9971/"}
+                "config": {"kind": "tap", "plugin": "test-hook"}
             })
             .to_string(),
         )
@@ -2055,10 +1995,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
         .unwrap();
     assert_eq!(created.status().as_u16(), 201);
     let replaced = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/rep")))
-        .body(
-            serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9972/"}})
-                .to_string(),
-        )
+        .body(serde_json::json!({"config": {"kind": "tap", "plugin": "test-hook-v2"}}).to_string())
         .send()
         .await
         .unwrap();
@@ -2071,16 +2008,19 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
         .await
         .unwrap();
     assert!(
-        got["transport"].to_string().contains("9972"),
+        got["transport"].to_string().contains("test-hook-v2"),
         "the replacement is live: {got}"
     );
 
     // Grant change via PUT is a 409 (immutability holds on the replace path too).
     let escalate = admin(client.put(format!("http://{addr}/api/v1/admin/hooks/rep")))
-            .body(serde_json::json!({"config": {"kind": "gate", "webhook": "http://127.0.0.1:9972/", "prompt": "rw"}}).to_string())
-            .send()
-            .await
-            .unwrap();
+        .body(
+            serde_json::json!({"config": {"kind": "gate", "plugin": "test-hook", "prompt": "rw"}})
+                .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
     assert_eq!(escalate.status().as_u16(), 409, "grants are immutable");
 
     // Stale If-Match is a 409 conflict (H3: concurrency rides the header).
@@ -2088,7 +2028,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
         .header("if-match", "\"0\"")
         .body(
             serde_json::json!({
-                "config": {"kind": "tap", "webhook": "http://127.0.0.1:9973/"},
+                "config": {"kind": "tap", "plugin": "test-hook"},
             })
             .to_string(),
         )
@@ -2112,7 +2052,7 @@ async fn test_admin_v1_put_hook_replaces_live_with_guards() {
         .header("if-match", etag)
         .body(
             serde_json::json!({
-                "config": {"kind": "tap", "webhook": "http://127.0.0.1:9973/"},
+                "config": {"kind": "tap", "plugin": "test-hook"},
             })
             .to_string(),
         )
@@ -2147,7 +2087,7 @@ async fn test_admin_v1_config_versions_rollback_and_diff() {
     // v1: register a hook. v2: delete it. (Boot floor is v0.)
     let body = serde_json::json!({
         "name": "rbk",
-        "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/"}
+        "config": {"kind": "tap", "plugin": "test-hook"}
     });
     let created = admin(client.post(format!("http://{addr}/api/v1/admin/hooks")))
         .header("content-type", "application/json")
@@ -2262,7 +2202,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
         "name": "compress",
         "config": {
             "kind": "gate",
-            "webhook": "http://127.0.0.1:9977/",
+            "plugin": "test-hook",
             "prompt": "rw",
             "global": true
         }
@@ -2334,7 +2274,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
             .body(
                 serde_json::json!({
                     "name": reserved,
-                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:9977/"}
+                    "config": {"kind": "gate", "plugin": "test-hook"}
                 })
                 .to_string(),
             )
@@ -2360,7 +2300,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
         .body(
             serde_json::json!({
                 "name": "bad",
-                "config": {"kind": "tap", "webhook": "http://127.0.0.1:9977/", "prompt": "rw"}
+                "config": {"kind": "tap", "plugin": "test-hook", "prompt": "rw"}
             })
             .to_string(),
         )
@@ -2382,7 +2322,7 @@ async fn test_admin_v1_register_hook_takes_effect_live() {
         .body(
             serde_json::json!({
                 "name": "compress",
-                "config": {"kind": "gate", "webhook": "http://127.0.0.1:9977/", "prompt": "ro"}
+                "config": {"kind": "gate", "plugin": "test-hook", "prompt": "ro"}
             })
             .to_string(),
         )
@@ -2426,7 +2366,7 @@ async fn test_admin_v1_audit_records_mutations() {
         .body(
             serde_json::json!({
                 "name": name,
-                "config": {"kind": "tap", "webhook": "http://127.0.0.1:9979/", "global": true}
+                "config": {"kind": "tap", "plugin": "test-hook", "global": true}
             })
             .to_string(),
         )
@@ -2511,10 +2451,7 @@ async fn test_admin_v1_hook_mutation_404_is_audited() {
         .put(format!("http://{addr}/api/v1/admin/hooks/{put_name}"))
         .header("x-admin-token", "admintok")
         .header("content-type", "application/json")
-        .body(
-            serde_json::json!({"config": {"kind": "tap", "webhook": "http://127.0.0.1:9978/"}})
-                .to_string(),
-        )
+        .body(serde_json::json!({"config": {"kind": "tap", "plugin": "test-hook"}}).to_string())
         .send()
         .await
         .unwrap();
@@ -2776,7 +2713,7 @@ async fn test_admin_v1_config_plane_golden_path() {
         .header("content-type", "application/json")
         .body(
             serde_json::json!({"name": name, "config":
-                    {"kind": "gate", "webhook": "http://127.0.0.1:9982/", "global": true}})
+                    {"kind": "gate", "plugin": "test-hook", "global": true}})
             .to_string(),
         )
         .send()
@@ -2864,7 +2801,7 @@ async fn test_admin_v1_hook_register_persists_to_overlay() {
         .body(
             serde_json::json!({
                 "name": "persisted_gate",
-                "config": {"kind": "gate", "webhook": "http://127.0.0.1:9981/", "global": true}
+                "config": {"kind": "gate", "plugin": "test-hook", "global": true}
             })
             .to_string(),
         )
@@ -2952,7 +2889,7 @@ async fn test_admin_v1_base_hook_is_read_only_via_api() {
     let store = Arc::new(MemoryStore::new());
     let gov = gov_with_signer(store, Some("admintok".to_string()));
     let base: crate::config::HookCfg = serde_json::from_value(serde_json::json!({
-        "kind": "gate", "webhook": "http://127.0.0.1:9990/", "prompt": "no", "global": true
+        "kind": "gate", "plugin": "test-hook", "prompt": "no", "global": true
     }))
     .unwrap();
     let app = TestApp::new()
@@ -2967,19 +2904,19 @@ async fn test_admin_v1_base_hook_is_read_only_via_api() {
 
     // POST a same-shape definition over the base hook's name → 409 (no silent transport redirect).
     let shadow = client
-            .post(format!("http://{addr}/api/v1/admin/hooks"))
-            .header("x-admin-token", "admintok")
-            .header("content-type", "application/json")
-            .body(
-                serde_json::json!({
-                    "name": "pii-guard",
-                    "config": {"kind": "gate", "webhook": "http://127.0.0.1:6666/", "prompt": "no", "global": true}
-                })
-                .to_string(),
-            )
-            .send()
-            .await
-            .unwrap();
+        .post(format!("http://{addr}/api/v1/admin/hooks"))
+        .header("x-admin-token", "admintok")
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "name": "pii-guard",
+                "config": {"kind": "gate", "plugin": "test-hook", "prompt": "no", "global": true}
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
     assert_eq!(
         shadow.status().as_u16(),
         409,
@@ -3010,7 +2947,7 @@ async fn test_admin_v1_base_hook_is_read_only_via_api() {
         .await
         .unwrap();
     assert!(
-        got["transport"].to_string().contains("9990"),
+        got["transport"].to_string().contains("test-hook"),
         "base hook untouched: {got}"
     );
 }
@@ -3038,7 +2975,7 @@ async fn test_admin_v1_delete_hook_takes_effect_live() {
         .body(
             serde_json::json!({
                 "name": "logger",
-                "config": {"kind": "tap", "webhook": "http://127.0.0.1:9978/", "global": true}
+                "config": {"kind": "tap", "plugin": "test-hook", "global": true}
             })
             .to_string(),
         )
@@ -3091,8 +3028,7 @@ async fn test_admin_v1_hooks_read_surface() {
 
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
-        socket: None,
-        webhook: Some("http://127.0.0.1:9990/".to_string()),
+        plugin: "test-hook".to_string(),
         timeout_ms: 25,
         on_error: "reject".to_string(),
         prompt: crate::config::PromptAccess::Rw,
@@ -3134,8 +3070,8 @@ async fn test_admin_v1_hooks_read_surface() {
     assert_eq!(h["user"], "ro");
     assert_eq!(h["priority"], 7);
     assert_eq!(h["on_error"], "reject");
-    assert_eq!(h["transport"]["kind"], "webhook");
-    assert_eq!(h["transport"]["target"], "http://127.0.0.1:9990/");
+    assert_eq!(h["transport"]["kind"], "plugin");
+    assert_eq!(h["transport"]["target"], "test-hook");
     assert_eq!(
         h["global"], true,
         "named in global_hooks → reported as globally wired"
@@ -3172,10 +3108,9 @@ async fn test_admin_v1_hook_health_best_effort() {
     crate::metrics::init();
     let store = Arc::new(MemoryStore::new());
     let gov = gov_with_signer(store, Some("admintok".to_string()));
-    let mk = |socket: Option<&str>, webhook: Option<&str>| crate::config::HookCfg {
+    let mk = |plugin: &str| crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
-        socket: socket.map(str::to_string),
-        webhook: webhook.map(str::to_string),
+        plugin: plugin.to_string(),
         timeout_ms: 5,
         on_error: "weighted".to_string(),
         prompt: crate::config::PromptAccess::No,
@@ -3189,8 +3124,8 @@ async fn test_admin_v1_hook_health_best_effort() {
     };
     let app = TestApp::new()
         .governance(gov)
-        .hook("web", mk(None, Some("http://127.0.0.1:9980/")))
-        .hook("sock", mk(Some("/nonexistent/busbar-hook.sock"), None))
+        .hook("web", mk("web-hook-plugin"))
+        .hook("sock", mk("sock-hook-plugin"))
         .build();
     let router = crate::build_router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3218,20 +3153,24 @@ async fn test_admin_v1_hook_health_best_effort() {
         "not_found"
     );
 
-    // Webhook → reachable null (not probed here).
+    // A hook whose `kind: hook` plugin is not installed in the (empty test) registry → reachable
+    // false with a "not installed" detail. Both hooks reference plugins now (the retired
+    // socket/webhook transports are gone).
     let web: serde_json::Value = get("web").await.json().await.unwrap();
     assert_eq!(web["name"], "web");
-    assert_eq!(web["transport"]["kind"], "webhook");
-    assert!(web["reachable"].is_null(), "webhook is not probed here");
+    assert_eq!(web["transport"]["kind"], "plugin");
+    assert_eq!(
+        web["reachable"],
+        serde_json::json!(false),
+        "uninstalled plugin is unreachable"
+    );
 
-    // Socket to a nonexistent path → reachable false (best-effort connect failed).
     let sock: serde_json::Value = get("sock").await.json().await.unwrap();
-    assert_eq!(sock["transport"]["kind"], "socket");
-    // On unix the connect fails → Some(false); on non-unix sockets aren't probed → null. Accept both.
-    assert!(
-        sock["reachable"] == serde_json::json!(false) || sock["reachable"].is_null(),
-        "socket to a dead path is unreachable (unix) or unprobed (non-unix): {}",
-        sock["reachable"]
+    assert_eq!(sock["transport"]["kind"], "plugin");
+    assert_eq!(
+        sock["reachable"],
+        serde_json::json!(false),
+        "uninstalled plugin is unreachable"
     );
 
     handle.abort();
@@ -3247,8 +3186,7 @@ async fn test_admin_v1_plugins_catalog_by_type() {
     let gov = gov_with_signer(store, Some("admintok".to_string()));
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
-        socket: Some("/run/busbar/h.sock".to_string()),
-        webhook: None,
+        plugin: "test-hook".to_string(),
         timeout_ms: 5,
         on_error: "weighted".to_string(),
         prompt: crate::config::PromptAccess::No,
@@ -3318,7 +3256,7 @@ async fn test_admin_v1_plugins_catalog_by_type() {
         .expect("external hook listed");
     assert_eq!(ext["loader"], "external");
     assert_eq!(ext["active"], true);
-    assert_eq!(ext["target"], "/run/busbar/h.sock");
+    assert_eq!(ext["target"], "test-hook");
 
     // Unknown type → 400 invalid_request.
     let bad = get("nope").await;
@@ -3433,8 +3371,7 @@ async fn test_admin_v1_config_effective_snapshot_no_secrets() {
     let gov = gov_with_signer(store, Some("admintok".to_string()));
     let gate = crate::config::HookCfg {
         kind: crate::config::HookKind::Gate,
-        socket: None,
-        webhook: Some("http://127.0.0.1:9970/".to_string()),
+        plugin: "test-hook".to_string(),
         timeout_ms: 5,
         on_error: "weighted".to_string(),
         prompt: crate::config::PromptAccess::No,
@@ -5801,7 +5738,7 @@ async fn test_mint_scope_is_sibling_of_hooks_register() {
     };
     let hook_body = serde_json::json!({
         "name": "some-hook",
-        "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+        "config": {"kind": "tap", "plugin": "test-hook"}
     })
     .to_string();
 
@@ -6545,7 +6482,7 @@ async fn test_admin_v1_overlay_reset_hooks_reverts_to_base() {
         .body(
             serde_json::json!({
                 "name": "runtime_gate",
-                "config": {"kind": "gate", "webhook": "http://127.0.0.1:9982/", "global": true}
+                "config": {"kind": "gate", "plugin": "test-hook", "global": true}
             })
             .to_string(),
         )

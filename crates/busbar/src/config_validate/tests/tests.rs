@@ -2669,10 +2669,10 @@ fn test_pool_member_truly_unknown_model_still_reports_unknown_model() {
     );
 }
 
-/// Build a single-pool config whose pool uses `route: webhook` with the given `policy.url`. The
-/// pool has one member targeting a valid model+provider, so the ONLY thing under test is the
-/// routing-webhook URL validation rule.
-fn webhook_pool_cfg(url: Option<&str>) -> RootCfg {
+/// Build a single-pool config whose pool's gate hook names the given `kind: hook` plugin (empty =
+/// no plugin ref). The pool has one member targeting a valid model+provider, so the ONLY thing under
+/// test is the hook plugin-reference validation rule.
+fn plugin_pool_cfg(plugin: &str) -> RootCfg {
     let mut providers = HashMap::new();
     providers.insert(
         "prov".to_string(),
@@ -2685,16 +2685,15 @@ fn webhook_pool_cfg(url: Option<&str>) -> RootCfg {
     let mut pools = HashMap::new();
     pools.insert("p1".to_string(), pool);
     let mut cfg = make_root_cfg(providers, models, pools);
-    cfg.hooks.insert("h".to_string(), gate_hook(None, url, 150));
+    cfg.hooks.insert("h".to_string(), gate_hook(plugin, 150));
     cfg
 }
 
-/// A gate `HookCfg` with the given socket/webhook transport (test builder).
-fn gate_hook(socket: Option<&str>, webhook: Option<&str>, timeout_ms: u64) -> config::HookCfg {
+/// A gate `HookCfg` backed by the given `kind: hook` plugin ref (test builder).
+fn gate_hook(plugin: &str, timeout_ms: u64) -> config::HookCfg {
     config::HookCfg {
         kind: config::HookKind::Gate,
-        socket: socket.map(str::to_string),
-        webhook: webhook.map(str::to_string),
+        plugin: plugin.to_string(),
         timeout_ms,
         on_error: "weighted".to_string(),
         prompt: config::PromptAccess::No,
@@ -2729,7 +2728,7 @@ fn hooks_test_cfg() -> RootCfg {
 #[test]
 fn test_hook_on_error_unknown_name_rejected() {
     let mut cfg = hooks_test_cfg();
-    let mut h = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+    let mut h = gate_hook("test-hook", 150);
     h.on_error = "nonexistent".to_string();
     cfg.hooks.insert("a".to_string(), h);
     let errs = validate(&cfg).expect_err("an unknown on_error name must be rejected");
@@ -2744,9 +2743,9 @@ fn test_hook_on_error_unknown_name_rejected() {
 #[test]
 fn test_hook_on_error_tap_fallback_rejected() {
     let mut cfg = hooks_test_cfg();
-    let mut gate = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+    let mut gate = gate_hook("test-hook", 150);
     gate.on_error = "watcher".to_string();
-    let mut tap = gate_hook(Some("/run/busbar/t.sock"), None, 150);
+    let mut tap = gate_hook("test-hook", 150);
     tap.kind = config::HookKind::Tap;
     cfg.hooks.insert("a".to_string(), gate);
     cfg.hooks.insert("watcher".to_string(), tap);
@@ -2763,9 +2762,9 @@ fn test_hook_on_error_tap_fallback_rejected() {
 fn test_hook_on_error_cycle_rejected() {
     // a -> b -> a
     let mut cfg = hooks_test_cfg();
-    let mut a = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+    let mut a = gate_hook("test-hook", 150);
     a.on_error = "b".to_string();
-    let mut b = gate_hook(Some("/run/busbar/b.sock"), None, 150);
+    let mut b = gate_hook("test-hook", 150);
     b.on_error = "a".to_string();
     cfg.hooks.insert("a".to_string(), a);
     cfg.hooks.insert("b".to_string(), b);
@@ -2777,7 +2776,7 @@ fn test_hook_on_error_cycle_rejected() {
 
     // self-reference
     let mut cfg = hooks_test_cfg();
-    let mut selfy = gate_hook(Some("/run/busbar/s.sock"), None, 150);
+    let mut selfy = gate_hook("test-hook", 150);
     selfy.on_error = "s".to_string();
     cfg.hooks.insert("s".to_string(), selfy);
     let errs = validate(&cfg).expect_err("a self-referencing on_error must be rejected");
@@ -2791,9 +2790,9 @@ fn test_hook_on_error_cycle_rejected() {
 #[test]
 fn test_hook_on_error_terminating_chain_ok() {
     let mut cfg = hooks_test_cfg();
-    let mut a = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+    let mut a = gate_hook("test-hook", 150);
     a.on_error = "b".to_string();
-    let b = gate_hook(Some("/run/busbar/b.sock"), None, 150); // on_error: weighted
+    let b = gate_hook("test-hook", 150); // on_error: weighted
     cfg.hooks.insert("a".to_string(), a);
     cfg.hooks.insert("b".to_string(), b);
     if let Err(errs) = validate(&cfg) {
@@ -2806,7 +2805,7 @@ fn test_hook_on_error_terminating_chain_ok() {
     // A ranking-strategy fallback terminates the chain when the plugin is compiled in; when it
     // is compiled out, naming one is a boot error (compliance-by-compilation).
     let mut cfg = hooks_test_cfg();
-    let mut c = gate_hook(Some("/run/busbar/c.sock"), None, 150);
+    let mut c = gate_hook("test-hook", 150);
     c.on_error = "cheapest".to_string();
     cfg.hooks.insert("c".to_string(), c);
     let result = validate(&cfg);
@@ -2854,10 +2853,8 @@ fn test_hook_reserved_name_rejected() {
             p
         };
         let mut cfg = make_root_cfg(providers, models, pools);
-        cfg.hooks.insert(
-            reserved.to_string(),
-            gate_hook(Some("/run/busbar/h.sock"), None, 150),
-        );
+        cfg.hooks
+            .insert(reserved.to_string(), gate_hook("test-hook", 150));
         let errs = validate(&cfg).expect_err("a reserved hook name must be rejected");
         assert!(
             errs.iter()
@@ -2882,7 +2879,7 @@ fn test_hook_at_most_one_default() {
         p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
         p
     };
-    let mut two = gate_hook(Some("/run/busbar/a.sock"), None, 150);
+    let mut two = gate_hook("test-hook", 150);
     two.default = true;
     let mut cfg = make_root_cfg(providers, models, pools);
     cfg.hooks.insert("rank_a".to_string(), two.clone());
@@ -2919,7 +2916,7 @@ fn test_hook_default_on_tap_rejected() {
         p.insert("p1".to_string(), make_pool(vec![make_member("m1")]));
         p
     };
-    let mut tap = gate_hook(Some("/run/busbar/t.sock"), None, 150);
+    let mut tap = gate_hook("test-hook", 150);
     tap.kind = config::HookKind::Tap;
     tap.default = true;
     let mut cfg = make_root_cfg(providers, models, pools);
@@ -2948,10 +2945,8 @@ fn test_hook_nonreserved_name_ok() {
         p
     };
     let mut cfg = make_root_cfg(providers, models, pools);
-    cfg.hooks.insert(
-        "headroom".to_string(),
-        gate_hook(Some("/run/busbar/h.sock"), None, 150),
-    );
+    cfg.hooks
+        .insert("headroom".to_string(), gate_hook("test-hook", 150));
     if let Err(errs) = validate(&cfg) {
         assert!(
             !errs.iter().any(|e| e.contains("reserved")),
@@ -2960,127 +2955,32 @@ fn test_hook_nonreserved_name_ok() {
     }
 }
 
+/// A hook naming a NON-EMPTY plugin passes the structural hook rule (the plugin's real existence +
+/// `kind: hook` is resolved against the registry at the plugin pre-flight, not here). The retired
+/// webhook/socket SSRF-URL validation is gone — a hook's egress (if any) now lives inside its plugin.
 #[test]
-fn test_webhook_route_allows_loopback_sidecar() {
-    // Loopback / localhost sidecars are the carve-out (the OTLP precedent): plaintext http:// is
-    // permitted on loopback, and https loopback too.
-    for ok in [
-        "http://127.0.0.1:9000/route",
-        "http://localhost:9000/route",
-        "https://localhost:9000/route",
-        "http://[::1]:9000/route",
-    ] {
-        let cfg = webhook_pool_cfg(Some(ok));
-        let res = validate(&cfg);
-        if let Err(errs) = res {
-            assert!(
-                !errs
-                    .iter()
-                    .any(|e| e.contains("hook 'h'") && e.contains("webhook")),
-                "loopback sidecar '{ok}' must pass the routing-webhook guard; got: {errs:?}"
-            );
-        }
-    }
-}
-
-#[test]
-fn test_webhook_route_blocks_internal_and_metadata() {
-    // Internal / cloud-metadata / RFC1918 / link-local targets are blocked even though loopback
-    // is allowed — the routing webhook is NOT routed through the looser-than-base_url path blindly.
-    for bad in [
-        "https://169.254.169.254/route", // IMDS
-        "https://10.0.0.5/route",        // RFC1918
-        "https://metadata.google.internal/route",
-        "http://example.com/route", // plaintext to a non-loopback host
-    ] {
-        let cfg = webhook_pool_cfg(Some(bad));
-        let errs = validate(&cfg)
-            .unwrap_err_or_default(format!("'{bad}' must fail routing-webhook validation"));
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("hook 'h'") && e.contains("webhook")),
-            "internal/plaintext target '{bad}' must be rejected; got: {errs:?}"
-        );
-    }
-}
-
-#[test]
-fn test_webhook_route_requires_url() {
-    // A `route: webhook` pool with no `policy.url` is a misconfiguration caught at startup.
-    let cfg = webhook_pool_cfg(None);
-    let errs = validate(&cfg)
-        .unwrap_err_or_default("missing webhook transport must fail validation".to_string());
-    assert!(
-        errs.iter()
-            .any(|e| e.contains("hook 'h'") && e.contains("no transport")),
-        "a hook with no transport must be reported; got: {errs:?}"
-    );
-}
-
-/// Build a single-pool config whose pool uses `route: socket` with the given `policy.socket`
-/// path. Exercises the routing-socket validation rule (unix platforms).
-#[cfg(unix)]
-fn socket_pool_cfg(socket: Option<&str>) -> RootCfg {
-    let mut providers = HashMap::new();
-    providers.insert(
-        "prov".to_string(),
-        make_provider("anthropic", "https://api.example.com", "API_KEY"),
-    );
-    let mut models = HashMap::new();
-    models.insert("m1".to_string(), make_model("prov", 4));
-    let mut pool = make_pool(vec![make_member("m1")]);
-    pool.gates = vec!["h".to_string()];
-    let mut pools = HashMap::new();
-    pools.insert("p1".to_string(), pool);
-    let mut cfg = make_root_cfg(providers, models, pools);
-    cfg.hooks
-        .insert("h".to_string(), gate_hook(socket, None, 150));
-    cfg
-}
-
-/// `route: socket` with a valid absolute path passes the socket rule (the socket FILE need not
-/// exist — the hook binary may start after busbar; only the path's shape is validated).
-#[cfg(unix)]
-#[test]
-fn test_socket_route_accepts_absolute_path() {
-    let cfg = socket_pool_cfg(Some("/run/busbar/hook.sock"));
+fn test_hook_with_plugin_ref_passes_structural_rule() {
+    let cfg = plugin_pool_cfg("my-hook-plugin");
     if let Err(errs) = validate(&cfg) {
         assert!(
             !errs
                 .iter()
-                .any(|e| e.contains("hook 'h'") && e.contains("socket")),
-            "an absolute socket path must pass the socket rule; got: {errs:?}"
+                .any(|e| e.contains("hook 'h'") && e.contains("names no plugin")),
+            "a hook naming a plugin must pass the structural hook rule; got: {errs:?}"
         );
     }
 }
 
-/// `route: socket` with a missing or empty `policy.socket` is a startup error.
-#[cfg(unix)]
+/// A hook with an EMPTY `plugin:` reference is a startup error (it names no `kind: hook` plugin).
 #[test]
-fn test_socket_route_requires_socket_path() {
-    for missing in [None, Some("")] {
-        let cfg = socket_pool_cfg(missing);
-        let errs = validate(&cfg)
-            .unwrap_err_or_default("missing socket transport must fail validation".to_string());
-        assert!(
-            errs.iter()
-                .any(|e| e.contains("hook 'h'") && e.contains("no transport")),
-            "missing/empty socket path must be reported; got: {errs:?}"
-        );
-    }
-}
-
-/// A RELATIVE `policy.socket` path is a startup error (it would silently depend on busbar's CWD).
-#[cfg(unix)]
-#[test]
-fn test_socket_route_rejects_relative_path() {
-    let cfg = socket_pool_cfg(Some("run/hook.sock"));
+fn test_hook_requires_plugin_ref() {
+    let cfg = plugin_pool_cfg("   ");
     let errs = validate(&cfg)
-        .unwrap_err_or_default("relative socket path must fail validation".to_string());
+        .unwrap_err_or_default("a hook with no plugin ref must fail validation".to_string());
     assert!(
         errs.iter()
-            .any(|e| e.contains("hook 'h'") && e.contains("absolute")),
-        "relative socket path must be reported; got: {errs:?}"
+            .any(|e| e.contains("hook 'h'") && e.contains("names no plugin")),
+        "an empty plugin ref must be reported; got: {errs:?}"
     );
 }
 

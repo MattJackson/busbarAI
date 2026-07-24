@@ -287,6 +287,7 @@ fn validate_config_command() -> i32 {
     let registry = match plugins_preflight(
         loaded.deploy.store.as_ref(),
         cfg.auth.as_ref(),
+        &cfg.hooks,
         &loaded.deploy.plugins,
     ) {
         Ok(r) => r,
@@ -1470,6 +1471,7 @@ pub(crate) fn load_config_from_disk(
 pub(crate) fn plugins_preflight(
     store_cfg: Option<&config::StoreCfg>,
     auth_cfg: Option<&config::AuthCfg>,
+    hooks_cfg: &std::collections::HashMap<String, config::HookCfg>,
     plugins_cfg: &config::PluginsCfg,
 ) -> Result<busbar_plugin_loader::PluginRegistry, String> {
     let store_ref = store_cfg
@@ -1492,6 +1494,16 @@ pub(crate) fn plugins_preflight(
         .unwrap_or_default();
     let has_auth_plugin = !auth_plugin_refs.is_empty();
 
+    // Every hook references a `kind: hook` plugin — the same manifest-only pre-flight the store/auth
+    // refs get. Deduped for the messages, but validated as the set of names each hook declares.
+    let hook_plugin_refs: Vec<String> = {
+        let mut v: Vec<String> = hooks_cfg.values().map(|h| h.plugin.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let has_hook_plugin = !hook_plugin_refs.is_empty();
+
     // 1. Consistency: referencing a plugin store while the master switch is off is a NAMED error.
     if store_is_plugin && !plugins_cfg.enabled {
         return Err(format!(
@@ -1510,6 +1522,18 @@ pub(crate) fn plugins_preflight(
              plugins.enabled is false (the default). Set plugins.enabled: true and place the \
              signed auth plugin tarball(s) in the plugins directory ('{}').",
             auth_plugin_refs.join(", "),
+            plugins_cfg.dir
+        ));
+    }
+
+    // Same consistency gate for a hook plugin: a configured `kind: hook` module cannot load with
+    // the plugin subsystem off — fail-closed, never a silently-absent gate.
+    if has_hook_plugin && !plugins_cfg.enabled {
+        return Err(format!(
+            "the hooks registry names plugin module(s) [{}], which require the plugin subsystem, \
+             but plugins.enabled is false (the default). Set plugins.enabled: true and place the \
+             signed `kind: hook` plugin tarball(s) in the plugins directory ('{}').",
+            hook_plugin_refs.join(", "),
             plugins_cfg.dir
         ));
     }
@@ -1621,6 +1645,43 @@ pub(crate) fn plugins_preflight(
                         "auth.chain module '{auth_ref}' does not match any plugin in '{}' (by \
                          alias or canonical name; loadable: [{}]). Install the `kind: auth` plugin \
                          tarball, or remove it from auth.chain.",
+                        plugins_cfg.dir,
+                        registry
+                            .loadable()
+                            .iter()
+                            .map(|p| p.manifest.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
+
+    // 6. Every hook's `plugin:` ref must resolve to a loadable `kind: hook` plugin. Same manifest-only
+    // resolution as store/auth (no `dlopen` here; the real load happens in `resolve_gate_transport` at
+    // App construction). A missing/wrong-kind/untrusted hook plugin fails `--validate` and boot alike.
+    for hook_ref in &hook_plugin_refs {
+        match registry.resolve(hook_ref) {
+            Some(p) if p.manifest.kind == "hook" => {}
+            Some(p) => {
+                return Err(format!(
+                    "a hook references plugin '{hook_ref}', which resolves to plugin '{}' of kind \
+                     '{}', not a `hook` plugin",
+                    p.manifest.name, p.manifest.kind
+                ));
+            }
+            None => {
+                return Err(match registry.unresolved_reason(hook_ref) {
+                    Some(s) => format!(
+                        "a hook references plugin '{hook_ref}', matching plugin '{}' ({}) but it \
+                         was not loaded: {}",
+                        s.manifest.name, s.file, s.reason
+                    ),
+                    None => format!(
+                        "a hook references plugin '{hook_ref}', which does not match any plugin in \
+                         '{}' (by alias or canonical name; loadable: [{}]). Install the `kind: hook` \
+                         plugin tarball, or remove the hook.",
                         plugins_cfg.dir,
                         registry
                             .loadable()
@@ -1810,6 +1871,7 @@ pub(crate) fn build_app_from_config(
     let plugin_registry = Arc::new(plugins_preflight(
         cfg.store.as_ref(),
         cfg.auth.as_ref(),
+        &cfg.hooks,
         &plugins_cfg,
     )?);
 
@@ -2235,6 +2297,10 @@ pub(crate) fn build_app_from_config(
     // The `default:` hook (if any) — the base ordering that pools which named none inherit, replacing
     // the compiled-in weighted backstop (everything-is-a-hook model). At most one (validated).
     let default_hook = hooks::default_hook_name(&cfg.hooks).map(str::to_string);
+    // The hook plugin-resolution environment: the validated registry + shared projectors. Every hook
+    // `plugin:` ref opens a `DlopenPolicy` through this. Built once and cloned into each resolver and
+    // onto `App` (for the control-plane reads + scrape).
+    let hook_env = hooks::HookEnv::new(plugin_registry.clone());
 
     // Per-pool runtime config (failover/exclusions), keyed by pool name.
     let mut pool_runtime = std::collections::HashMap::new();
@@ -2271,12 +2337,12 @@ pub(crate) fn build_app_from_config(
                     })
                     .collect(),
                 // Resolve the routing policy ONCE here. `weighted` (default) ⇒ `None` ⇒ the zero-cost
-                // inline SWRR path; a `default:` hook replaces that base for pools that named none; the
-                // webhook transport reuses the shared upstream client.
+                // inline SWRR path; a `default:` hook replaces that base for pools that named none; a
+                // `kind: hook` plugin base opens a `DlopenPolicy` through the plugin registry.
                 policy: hooks::resolve_pool_ordering(
                     pool_cfg,
                     &cfg.hooks,
-                    upstream_client.get(),
+                    &hook_env,
                     default_hook.as_deref(),
                     app_config_version,
                 ),
@@ -2285,13 +2351,13 @@ pub(crate) fn build_app_from_config(
                 gates: hooks::resolve_pool_gates(
                     pool_cfg,
                     &cfg.hooks,
-                    upstream_client.get(),
+                    &hook_env,
                     app_config_version,
                 ),
                 rewrite_hooks: hooks::resolve_pool_rewrites(
                     pool_cfg,
                     &cfg.hooks,
-                    upstream_client.get(),
+                    &hook_env,
                     app_config_version,
                 ),
             },
@@ -2422,49 +2488,41 @@ pub(crate) fn build_app_from_config(
 
     // Resolve the global rewrite hooks (prompt: rw gates in global_hooks) into priority-ordered
     // transports ONCE. Empty unless the operator configured a rewrite hook — zero cost by default.
-    let rewrite_hooks = hooks::resolve_rewrite_hooks(
-        &cfg.hooks,
-        &cfg.global_hooks,
-        upstream_client.get(),
-        app_config_version,
-    );
+    let rewrite_hooks =
+        hooks::resolve_rewrite_hooks(&cfg.hooks, &cfg.global_hooks, &hook_env, app_config_version);
     // Resolve the global request-stage tap hooks the same way. Empty unless configured.
     let tap_hooks = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        upstream_client.get(),
+        &hook_env,
         app_config_version,
         config::HookStage::Request,
     );
     let tap_hooks_route = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        upstream_client.get(),
+        &hook_env,
         app_config_version,
         config::HookStage::Route,
     );
     let tap_hooks_attempt = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        upstream_client.get(),
+        &hook_env,
         app_config_version,
         config::HookStage::Attempt,
     );
     let tap_hooks_completion = hooks::resolve_tap_hooks(
         &cfg.hooks,
         &cfg.global_hooks,
-        upstream_client.get(),
+        &hook_env,
         app_config_version,
         config::HookStage::Completion,
     );
     // Resolve the global DECISION gates (non-rewrite gates in global_hooks) — fired for a verdict on
     // every request. Empty unless configured.
-    let global_gates = hooks::resolve_gate_hooks(
-        &cfg.hooks,
-        &cfg.global_hooks,
-        upstream_client.get(),
-        app_config_version,
-    );
+    let global_gates =
+        hooks::resolve_gate_hooks(&cfg.hooks, &cfg.global_hooks, &hook_env, app_config_version);
 
     Ok(App {
         // Telemetry-bank slot table for this generation, registered BEFORE the config-derived
@@ -2483,6 +2541,7 @@ pub(crate) fn build_app_from_config(
         tap_hooks_attempt,
         tap_hooks_completion,
         global_gates,
+        hook_env: hook_env.clone(),
         hook_registry: cfg.hooks.clone(),
         global_hooks: cfg.global_hooks.clone(),
         groups_registry: cfg.groups.clone(),
