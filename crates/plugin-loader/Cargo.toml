@@ -14,6 +14,9 @@ busbar-plugin-sign = { path = "../plugin-sign" }
 libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Structured logging for the auth seam's fail-closed rejections (a misbehaving auth plugin is logged,
+# never admitted). Already the workspace's logging facade; adds no new external crate to the tree.
+tracing = "0.1"
 # Tarball packaging/unpacking for the one-file-per-plugin `.tar.gz` format. flate2 with its
 # pure-Rust backend (miniz_oxide) so static musl release builds need no C zlib.
 tar = "0.4"

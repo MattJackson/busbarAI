@@ -35,9 +35,17 @@ pub use busbar_api::Store as StoreTrait;
 /// The store handle behind the opaque `*mut c_void` that crosses the ABI: a boxed trait object.
 type BoxedStore = Box<dyn Store>;
 
-/// Return the ABI version this SDK builds against (a plugin exports it as `busbar_store_abi_version`).
+/// Return the store PAYLOAD schema version this SDK builds against (the manifest `abi_version` a
+/// `kind: store` plugin declares). NOT the transport version — see [`transport_version`].
 pub fn abi_version() -> u32 {
     ABI_VERSION
+}
+
+/// The frozen kind-neutral TRANSPORT version this SDK builds against — a plugin exports it as
+/// `busbar_abi()`. Frozen at [`busbar_plugin_abi::TRANSPORT_VERSION`] (=1); distinct from the per-kind
+/// payload schema version ([`abi_version`] / [`secret_abi_version`]).
+pub fn transport_version() -> u32 {
+    busbar_plugin_abi::TRANSPORT_VERSION
 }
 
 /// Run one [`StoreRequest`] against a `Store`. The single match that maps the wire enum to the trait
@@ -377,108 +385,105 @@ pub unsafe fn secret_close_impl(handle: *mut c_void) {
     drop(Box::from_raw(handle as *mut BoxedSecret));
 }
 
-/// Emit the five `extern "C"` SECRET-plugin symbols, wiring them to `$ctor` (a
-/// `fn(&str) -> Result<Box<dyn busbar_api::SecretModule>, String>`). Put this at the crate root of
-/// a `cdylib` plugin whose manifest declares `kind: secret`.
+/// The ONE macro that stamps a plugin's KIND and emits the SIX kind-neutral `extern "C"` symbols
+/// (`busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`, `busbar_free`, `busbar_close`),
+/// wiring `open`/`call`/`close` to the caller-supplied bodies. The per-kind `export_*_plugin!`
+/// convenience macros expand through this — a plugin author normally calls those, not this directly.
+///
+/// - `$kind` — a `&'static str` kind (`"store"` | `"secret"` | `"auth"`), stamped into
+///   `busbar_plugin_kind()` as a NUL-terminated string.
+/// - `$open`/`$call`/`$close` — paths to the SDK `*_impl` bodies for this kind (the FFI unsafe lives
+///   there, unit-tested; the macro is a thin per-plugin wrapper).
+/// - `$ctor` — the plugin's `fn(&str) -> Result<Box<dyn Trait>, String>` constructor.
 #[macro_export]
-macro_rules! export_secret_plugin {
-    ($ctor:path) => {
+macro_rules! export_plugin {
+    (kind = $kind:expr, open = $open:path, call = $call:path, close = $close:path, ctor = $ctor:path $(,)?) => {
+        /// # Safety
+        /// Read only by the busbar loader as the frozen TRANSPORT handshake.
         #[no_mangle]
-        pub extern "C" fn busbar_secret_abi_version() -> u32 {
-            $crate::secret_abi_version()
+        pub extern "C" fn busbar_abi() -> u32 {
+            $crate::transport_version()
+        }
+
+        /// # Safety
+        /// The returned pointer is to a `'static` NUL-terminated string owned by this library.
+        #[no_mangle]
+        pub extern "C" fn busbar_plugin_kind() -> *const u8 {
+            const KIND_NUL: &str = concat!($kind, "\0");
+            KIND_NUL.as_ptr()
         }
 
         /// # Safety
         /// Called only by the busbar loader with ABI-valid pointers.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_open(
+        pub unsafe extern "C" fn busbar_open(
             cfg: *const u8,
             cfg_len: usize,
             out_handle: *mut *mut ::core::ffi::c_void,
             out_err: *mut *mut u8,
             out_err_len: *mut usize,
         ) -> i32 {
-            $crate::secret_open_impl(cfg, cfg_len, out_handle, out_err, out_err_len, $ctor)
+            $open(cfg, cfg_len, out_handle, out_err, out_err_len, $ctor)
         }
 
         /// # Safety
         /// Called only by the busbar loader with a live handle and ABI-valid pointers.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_call(
+        pub unsafe extern "C" fn busbar_call(
             handle: *mut ::core::ffi::c_void,
             req: *const u8,
             req_len: usize,
             out: *mut *mut u8,
             out_len: *mut usize,
         ) -> i32 {
-            $crate::secret_call_impl(handle, req, req_len, out, out_len)
+            $call(handle, req, req_len, out, out_len)
         }
 
         /// # Safety
         /// Called only by the busbar loader with a buffer this plugin returned.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_free(ptr: *mut u8, len: usize) {
+        pub unsafe extern "C" fn busbar_free(ptr: *mut u8, len: usize) {
             $crate::free_impl(ptr, len)
         }
 
         /// # Safety
         /// Called only by the busbar loader with a live handle, once.
         #[no_mangle]
-        pub unsafe extern "C" fn busbar_secret_close(handle: *mut ::core::ffi::c_void) {
-            $crate::secret_close_impl(handle)
+        pub unsafe extern "C" fn busbar_close(handle: *mut ::core::ffi::c_void) {
+            $close(handle)
         }
     };
 }
 
-/// Emit the five `extern "C"` store-plugin symbols, wiring them to `$ctor` (a
-/// `fn(&str) -> Result<Box<dyn Store>, String>`). Put this at the crate root of a `cdylib` plugin.
+/// Emit a `secret`-kind cdylib plugin from `$ctor` (a
+/// `fn(&str) -> Result<Box<dyn busbar_api::SecretModule>, String>`). Expands through
+/// [`export_plugin!`], stamping `busbar_plugin_kind() == "secret"` + the six neutral symbols.
+#[macro_export]
+macro_rules! export_secret_plugin {
+    ($ctor:path) => {
+        $crate::export_plugin!(
+            kind = "secret",
+            open = $crate::secret_open_impl,
+            call = $crate::secret_call_impl,
+            close = $crate::secret_close_impl,
+            ctor = $ctor,
+        );
+    };
+}
+
+/// Emit a `store`-kind cdylib plugin from `$ctor` (a `fn(&str) -> Result<Box<dyn Store>, String>`).
+/// Expands through [`export_plugin!`], stamping `busbar_plugin_kind() == "store"` + the six neutral
+/// symbols.
 #[macro_export]
 macro_rules! export_store_plugin {
     ($ctor:path) => {
-        #[no_mangle]
-        pub extern "C" fn busbar_store_abi_version() -> u32 {
-            $crate::abi_version()
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with ABI-valid pointers.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_open(
-            cfg: *const u8,
-            cfg_len: usize,
-            out_handle: *mut *mut ::core::ffi::c_void,
-            out_err: *mut *mut u8,
-            out_err_len: *mut usize,
-        ) -> i32 {
-            $crate::open_impl(cfg, cfg_len, out_handle, out_err, out_err_len, $ctor)
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with a live handle and ABI-valid pointers.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_call(
-            handle: *mut ::core::ffi::c_void,
-            req: *const u8,
-            req_len: usize,
-            out: *mut *mut u8,
-            out_len: *mut usize,
-        ) -> i32 {
-            $crate::call_impl(handle, req, req_len, out, out_len)
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with a buffer this plugin returned.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_free(ptr: *mut u8, len: usize) {
-            $crate::free_impl(ptr, len)
-        }
-
-        /// # Safety
-        /// Called only by the busbar loader with a live handle, once.
-        #[no_mangle]
-        pub unsafe extern "C" fn busbar_store_close(handle: *mut ::core::ffi::c_void) {
-            $crate::close_impl(handle)
-        }
+        $crate::export_plugin!(
+            kind = "store",
+            open = $crate::open_impl,
+            call = $crate::call_impl,
+            close = $crate::close_impl,
+            ctor = $ctor,
+        );
     };
 }
 

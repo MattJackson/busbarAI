@@ -339,12 +339,26 @@ pub fn validate_structure(
             "library bytes do not match the manifest sha256 (integrity failure)".to_string(),
         );
     }
+    // `supported_abi` returns a CONTIGUOUS `[floor, max]` inclusive range (its endpoints) of the
+    // PAYLOAD-schema versions the binary speaks for this kind. Negotiate the manifest's declared
+    // `abi_version` against it: in range → ok; below floor / above max → refuse LOUD naming both.
+    // An empty slice means the kind is unsupported (already caught by KNOWN_KINDS, but fail-closed).
     let supported = supported_abi(&m.kind);
-    if !supported.contains(&m.abi_version) {
-        return Err(format!(
-            "manifest abi_version {} is not supported for kind '{}' by this binary (supported: {supported:?})",
-            m.abi_version, m.kind
-        ));
+    match (supported.first(), supported.last()) {
+        (Some(&floor), Some(&max)) if m.abi_version >= floor && m.abi_version <= max => {}
+        (Some(&floor), Some(&max)) => {
+            return Err(format!(
+                "manifest abi_version {} is not supported for kind '{}' by this binary (supported \
+                 range v{floor}..=v{max})",
+                m.abi_version, m.kind
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "kind '{}' has no supported abi_version range in this binary",
+                m.kind
+            ));
+        }
     }
     Ok(())
 }

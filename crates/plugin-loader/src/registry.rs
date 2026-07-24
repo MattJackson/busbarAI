@@ -28,17 +28,31 @@ use busbar_plugin_sign::{evaluate, validate_structure, Manifest, TrustPolicy, Ve
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The C ABI versions this binary supports per plugin kind. ONE subsystem: `kind` selects the ABI
-/// contract the cdylib must export; everything else (discovery/trust/conflict/registry) is shared.
+/// The per-kind PAYLOAD schema versions this binary supports — a CONTIGUOUS `[floor, max]` inclusive
+/// range of manifest `abi_version` values the engine can speak for `kind` (empty = unknown/unsupported
+/// kind, rejected at scan). This is the PAYLOAD axis (the manifest `abi_version`), NOT the transport
+/// axis: every kind exports the SAME six kind-neutral C symbols at `busbar_abi() == TRANSPORT_VERSION`;
+/// `kind` only selects which payload schema (and engine seam) the cdylib speaks. The range is its
+/// endpoints; contiguity is the contract (every value between is speakable), so an additive schema
+/// bump stays in range and an old plugin of the same kind keeps loading. Store churned its PAYLOAD to
+/// v4 (all payload, zero transport); it is `[4, 4]` until an additive bump widens the floor.
 pub fn supported_abi(kind: &str) -> &'static [u32] {
     match kind {
-        "store" => &[busbar_plugin_abi::ABI_VERSION],
-        // A `kind: secret` plugin exports the secret C ABI (busbar_secret_* symbols) - the same
-        // five-symbol shape as a store plugin, resolving a secret reference's settings to bytes.
-        "secret" => &[busbar_plugin_abi::SECRET_ABI_VERSION],
-        // auth/hook plugins share the manifest + trust + registry machinery today; their C ABI
-        // contracts are v1 placeholders until the engine grows dynamic consumers for those kinds.
-        "auth" | "hook" => &[1],
+        "store" => &[
+            busbar_plugin_abi::ABI_VERSION,
+            busbar_plugin_abi::ABI_VERSION,
+        ],
+        // A `kind: secret` plugin resolves a secret reference's settings to bytes.
+        "secret" => &[
+            busbar_plugin_abi::SECRET_ABI_VERSION,
+            busbar_plugin_abi::SECRET_ABI_VERSION,
+        ],
+        // A `kind: auth` plugin is a first-class identity provider (the engine's auth chain consumes
+        // `Box<dyn AuthModule>` via `open_auth`). Payload schema v1.
+        "auth" => &[1, 1],
+        // hook plugins share the manifest + trust + registry machinery; their C ABI contract is a v1
+        // placeholder until the engine grows a dynamic hook consumer (hooks are out-of-process today).
+        "hook" => &[1, 1],
         _ => &[],
     }
 }
@@ -163,7 +177,47 @@ impl PluginRegistry {
                 p.manifest.name, p.manifest.kind
             ));
         }
-        crate::load_store_from_bytes(&p.lib_bytes, cfg_json, &p.manifest.name)
+        crate::load_store_from_bytes(&p.lib_bytes, cfg_json, &p.manifest.name, &p.manifest.kind)
+    }
+
+    /// Open an AUTH plugin resolved by name or alias: verifies the resolved plugin's `kind` is `auth`,
+    /// then loads the VERIFIED bytes over the kind-neutral C ABI and `open`s it with `cfg_json`,
+    /// returning `Box<dyn AuthModule>` — the seam the engine's auth chain consumes. Same trust and
+    /// load pipeline as store/secret; only the kind (and the consuming seam) differs. FAIL-CLOSED.
+    pub fn open_auth(
+        &self,
+        name_or_alias: &str,
+        cfg_json: &str,
+    ) -> Result<Box<dyn busbar_api::AuthModule>, String> {
+        let Some(p) = self.resolve(name_or_alias) else {
+            return Err(match self.unresolved_reason(name_or_alias) {
+                Some(s) => format!(
+                    "plugin '{name_or_alias}' is present ({}) but was not loaded: {}",
+                    s.file, s.reason
+                ),
+                None => format!(
+                    "no plugin named or aliased '{name_or_alias}' is available (loadable plugins: \
+                     [{}])",
+                    self.loadable
+                        .iter()
+                        .map(|p| p.manifest.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        };
+        if p.manifest.kind != "auth" {
+            return Err(format!(
+                "plugin '{}' has kind '{}', not 'auth' - it cannot serve as an auth module",
+                p.manifest.name, p.manifest.kind
+            ));
+        }
+        crate::auth::load_auth_from_bytes(
+            &p.lib_bytes,
+            cfg_json,
+            &p.manifest.name,
+            &p.manifest.kind,
+        )
     }
 
     /// Open a SECRET plugin resolved by name or alias: verifies the resolved plugin's `kind` is
@@ -199,7 +253,7 @@ impl PluginRegistry {
                 p.manifest.name, p.manifest.kind
             ));
         }
-        crate::load_secret_from_bytes(&p.lib_bytes, cfg_json, &p.manifest.name)
+        crate::load_secret_from_bytes(&p.lib_bytes, cfg_json, &p.manifest.name, &p.manifest.kind)
     }
 }
 
