@@ -103,6 +103,14 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   OVERLAY so it survives a restart; a base-config group is file-owned (a 409 - edit config.yaml).
   New optional `groups.<g>.child_default` seeds the limits of children auto-provisioned under a
   group (nearest-ancestor-wins).
+- **Per-group read surface (§6d).** `GET /api/v1/admin/groups/{name}/usage` returns the group's
+  DERIVED current-window usage, one row per `(window, pool?)` enforcement bucket its limits
+  materialize: `{group, enabled, buckets: [{window, pool?, requests, tokens, spend_cents, ...caps
+  and budget_remaining_cents...}], as_of}`. Spend is repriced at read time from the token ledger x
+  the current `rate_card` (nothing dollar-shaped is stored); `buckets` is empty for a group with
+  only a `concurrent` limit. `GET /api/v1/admin/keys?group=<name>` lists the keys bound to a
+  group — a leaf group's keys are one person's keys; a team group's are the team's (exact
+  bound-group match; no existence check, so dangling references remain findable).
 - **SELF-SERVICE MINT: auto-provision + the delegated `mint` scope.** `POST /api/v1/admin/keys`
   takes an optional `parent`: when `group` names a leaf that does NOT yet exist and `parent` is an
   existing group, the leaf is AUTO-PROVISIONED under it (limits stamped from the nearest-ancestor
@@ -209,6 +217,19 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
 - **PGO release builds.** Host-native release binaries are built through a profile-guided
   optimization pipeline (instrument, replay a representative traffic profile, rebuild), as part
   of the standard release workflow.
+- **Upstream client sharding (perf).** The outbound HTTP client pool is sharded
+  `min(cores, 16)` ways (rounded to a power of two) and each worker thread is pinned to one
+  shard on first use, so the shared pool lock is contended by ~1/N threads. Warm connections
+  and TLS sessions stay worker-local; per-host idle budgets are divided across shards so the
+  TOTAL kept-alive connections are unchanged. The shard count is machine-derived, not
+  configurable.
+- **Semaphore skip for unbounded lanes (perf).** When `max_concurrent` is omitted on a model
+  (the default — unbounded), the admission path skips the semaphore's shared atomics entirely.
+  The `/stats` `inflight` counter for those lanes reads a per-lane fast path instead, so the
+  hot path for the common case never touches a shared atomic.
+- **Per-thread telemetry bank (perf).** Hot-path metrics (request counters, histogram samples)
+  now accumulate in per-thread cells (the telemetry bank) and are drained into the recorder at
+  scrape time, taking span and counter updates off the shared atomic path on every request.
 
 ### Changed
 

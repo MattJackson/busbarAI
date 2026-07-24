@@ -93,6 +93,6 @@ One auth note for Bedrock: Busbar signs outbound Bedrock requests with AWS SigV4
 
 ## Current status
 
-Busbar is licensed **Apache-2.0**. The wire protocol translation, the data-plane HTTP surface, and the circuit breaker model are stable under Semantic Versioning; the config format is an operator artifact with a tooled migration path between releases, and the admin API carries its own contract version. The test suite covers over 1,600 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
+Busbar is licensed **Apache-2.0**. The wire protocol translation, the data-plane HTTP surface, and the circuit breaker model are stable under Semantic Versioning; the config format is an operator artifact with a tooled migration path between releases, and the admin API carries its own contract version. The test suite covers over 2,300 test cases across the protocol translators, breaker FSM, auth middleware, governance enforcement, and config validation.
 
 Apache-2.0 is permissive: use it commercially, modify it privately, redistribute it, with an explicit patent grant and no copyleft obligations.

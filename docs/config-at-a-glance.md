@@ -100,7 +100,7 @@ bucket (group + metric + window).
 |---|---|---|
 | [`security`](configuration.md#security) | SSRF metadata denylist tuning | `{ blocked_metadata_hosts: [], allow_metadata_hosts: [], allow_all_metadata: false }` |
 | [`observability`](configuration.md#observability) | Opt-in sinks | `{ otlp_url?, request_log_webhook_url?, max_inflight_webhook_deliveries: 64, webhook_delivery_timeout_secs: 2, emit_server_timing: false }` |
-| [`limits`](configuration.md#limits) | Global operational caps | `{ upstream_request_timeout_secs: 300, request_body_max_bytes: 33554432, pool_max_idle_per_host: 1024, pool_idle_timeout_secs: 300, max_inbound_concurrent: 8192, hard_down_cooldown_secs: 1800, upstream_error_body_max_bytes: 262144, tls_handshake_timeout_secs: 10, request_body_read_timeout_secs: 30, max_honored_retry_after_secs: 86400, default_max_tokens: 4096, reasoning_effort_budgets: { minimal: 1024, low: 4096, medium: 8192, high: 16384 } }` |
+| [`limits`](configuration.md#limits) | Global operational caps | `{ upstream_request_timeout_secs: 300, request_body_max_bytes: 33554432, pool_max_idle_per_host: 1024, pool_idle_timeout_secs: 300, max_inbound_concurrent: 8192, hard_down_cooldown_secs: 1800, upstream_error_body_max_bytes: 262144, tls_handshake_timeout_secs: 10, request_body_read_timeout_secs: 30, max_honored_retry_after_secs: 86400, default_max_tokens: 4096, max_keys_per_principal: 0, reasoning_effort_budgets: { minimal: 1024, low: 4096, medium: 8192, high: 16384 } }` |
 | `metrics` | Scrape tunables | `{ key_gauge_limit: 2000 }` |
 | [`health`](configuration.md#health-probing) | Process-wide probe fallbacks | `{ default_probe_interval_secs: 30, default_probe_timeout_secs: 5 }` |
 | `routing` | Global default gate deadline | `{ default_policy_timeout_ms: 1 }` |
@@ -108,9 +108,10 @@ bucket (group + metric + window).
 
 ## Not config (but adjacent)
 
-- **[Minting keys](configuration.md#virtual-keys-and-enforcement)**: `POST /api/v1/admin/keys` with `{ name, group?, allowed_pools?, labels?,
+- **[Minting keys](configuration.md#virtual-keys-and-enforcement)**: `POST /api/v1/admin/keys` with `{ name, group?, parent?, allowed_pools?, labels?,
   expires_in|expires_at?, issue_aws_credential? }`; the signed token is shown once and expires
-  (default 90 days).
+  (default 90 days). When `group` names a non-existent leaf and `parent` is an existing group,
+  the leaf is auto-provisioned. Requires `mint` scope or `full`.
 - **[Migrating from 1.4.x](configuration.md#migrating-a-14x-config)**: `busbar --migrate-config old.yaml` prints the converted config with
   TODO/WARNING comments; booting a 1.x config refuses with a named error.
 - **[Validation](configuration.md#startup-validation-summary)**: `busbar --validate` runs the exact boot pipeline (config + plugins) with zero
