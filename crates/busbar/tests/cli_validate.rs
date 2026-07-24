@@ -282,3 +282,71 @@ fn list_plugins_reports_statuses_without_loading() {
     assert!(stdout.contains("INVALID"), "the junk row: {stdout}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Run busbar with an ADDITIONAL `BUSBAR_CONFIG_OVERLAY` pointing at a fixture overlay file — the
+/// 1.5.0 full-config-coverage persistence path a real deployment uses.
+fn run_busbar_with_overlay(dir: &Path, overlay: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_busbar"))
+        .args(args)
+        .env("BUSBAR_CONFIG", dir.join("config.yaml"))
+        .env("BUSBAR_PROVIDERS", dir.join("providers.yaml"))
+        .env("BUSBAR_CONFIG_OVERLAY", overlay)
+        .output()
+        .expect("run busbar");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// 1.5.0 FULL-CONFIG COVERAGE: `--validate` validates the EFFECTIVE config INCLUDING the overlay's
+/// `root` section (API-set single-value config). A root override that resolves but fails semantic
+/// validation (here: a DESCENDING `reasoning_effort_budgets`) must fail `--validate` exactly as a
+/// hand-written config.yaml would — the durable-validation invariant. And `--safe-mode` quarantines
+/// the whole overlay (root included), so the same bad overlay validates clean under safe mode.
+#[test]
+fn validate_applies_and_rejects_a_bad_root_overlay() {
+    let dir = fixture_dir("rootovl");
+    write_configs(&dir, "");
+    let overlay = dir.join("overlay.json");
+    // A root override that RESOLVES fine but FAILS config_validate (budgets must be ascending).
+    std::fs::write(
+        &overlay,
+        r#"{"version":1,"root":{"limits":{"reasoning_effort_budgets":{"minimal":16384,"low":8192,"medium":4096,"high":1024}}}}"#,
+    )
+    .unwrap();
+    let (code, _stdout, stderr) = run_busbar_with_overlay(&dir, &overlay, &["--validate"]);
+    assert_eq!(code, 1, "a bad root overlay fails --validate: {stderr}");
+    assert!(
+        stderr.contains("reasoning_effort_budgets") && stderr.contains("ascending"),
+        "the overlay's root section was validated: {stderr}"
+    );
+    // SAFE MODE quarantines the overlay — the bad root is not applied, so validate is clean.
+    let (code, stdout, stderr) =
+        run_busbar_with_overlay(&dir, &overlay, &["--validate", "--safe-mode"]);
+    assert_eq!(
+        code, 0,
+        "--safe-mode ignores the overlay root: stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("ok: config valid"), "got {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A VALID root overlay (a live-swappable per_request_fee + a well-formed limits override) validates
+/// CLEAN — the effective config resolves + passes semantic validation with the overrides merged in.
+#[test]
+fn validate_ok_on_valid_root_overlay() {
+    let dir = fixture_dir("rootovlok");
+    write_configs(&dir, "");
+    let overlay = dir.join("overlay.json");
+    std::fs::write(
+        &overlay,
+        r#"{"version":1,"root":{"per_request_fee":9,"limits":{"max_inbound_concurrent":256}}}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_busbar_with_overlay(&dir, &overlay, &["--validate"]);
+    assert_eq!(code, 0, "a valid root overlay validates clean: {stderr}");
+    assert!(stdout.contains("ok: config valid"), "got {stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
