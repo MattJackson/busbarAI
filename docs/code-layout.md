@@ -82,7 +82,7 @@ Module names use the product/API vocabulary (ingress, egress, pool, lane, hook, 
 |---|---|
 | `ingress/` | ingress entry handlers (the request comes in here) |
 | `proxy/` | proxies the request to the provider: select lane, translate, call, fail over, stream back |
-| `hooks/` | the hook system: pool routing resolution + hook transports (socket/webhook/wire) |
+| `hooks/` | the hook system: pool routing resolution + hook transports (socket/webhook/dlopen/wire) |
 | `proto/` | wire dialects; `proto::detect` sniffs which dialect a request speaks |
 
 ## Running the lint

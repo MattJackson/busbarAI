@@ -121,7 +121,7 @@ The live endpoint requires a booted, authenticated instance. So that tooling can
 | `GET /hooks/{name}/health` | Best-effort transport reachability (a short-timeout socket connect probe; `reachable` is `null` for webhooks/non-unix, with a `detail` note). Never fires the hook |
 | `GET /hooks/{name}/schema` | The hook's **self-described settings schema** (the `describe` wire message, proxied verbatim; `{"name", "schema": null}` when the hook doesn't answer) |
 | `GET /hooks/{name}/status` | The hook's **observed** state, live-queried over its transport: `{name, desired, reported, drift, metrics, as_of, source}`, the settings it is actually running + their version vs busbar's desired copy, with a **`drift`** verdict (a differing settings version, or a desired key missing/changed in the observed settings; extra self-managed keys are not drift). Self-reported metrics are validated and bounded. `reported`/`drift` are `null` when the hook doesn't answer (fail-open: the desired view still serves) |
-| `GET /plugins?type=auth\|hooks\|store` | The plugin catalog for one type (required parameter). `auth`/`hooks`: compiled-in plugins (feature-gated, from the binary) and external plugins (registered over socket/webhook). `store`: the compiled-in `memory` head plus every signed plugin tarball in `plugins.dir`, each with its manifest metadata (`name`, `version`, `publisher`, `interface_version`) and a re-evaluated trust verdict (`trusted` / `unverified` / `rejected`). MANIFEST-ONLY: listing never `dlopen`s anything, so an untrusted plugin's code cannot run from inspection |
+| `GET /plugins?type=auth\|hooks\|store` | The plugin catalog for one type (required parameter). `auth`/`hooks`: compiled-in plugins (feature-gated, from the binary) and installed `kind:hook` plugin tarballs, each with manifest metadata and trust verdict (`trusted` / `unverified` / `rejected`). `store`: the compiled-in `memory` head plus every signed plugin tarball in `plugins.dir`, each with its manifest metadata (`name`, `version`, `publisher`, `interface_version`) and a re-evaluated trust verdict. MANIFEST-ONLY: listing never `dlopen`s anything, so an untrusted plugin's code cannot run from inspection |
 
 No hook definition ever includes a secret, only the operator-configured transport target.
 
@@ -139,6 +139,8 @@ Module names and modes only, never a token.
 | Endpoint | Returns |
 |---|---|
 | `GET /config` | The effective running config as one redacted snapshot (`version`, auth, pools, models, providers, hooks, `global_hooks`) for drift detection. Carries the config-plane `ETag` |
+| `GET /config/settings` | The current overlay root-section overrides — only the fields the operator has set via API; base `config.yaml` values for the rest. Shape: `{settings: {rate_card?, per_request_fee?, security?, limits?, observability?, advanced?, metrics?, health?, routing?, listen?, admin_listen?, tls?, admin_tls?, admin_insecure?, store?, …}}`. Read-only scope |
+| `PUT /config/settings` | Set any subset of the single-value top-level config sections durably. Body: any subset of the root config object (`rate_card`, `per_request_fee`, `security`, `limits`, `observability`, `advanced`, `metrics`, `health`, `routing`, `listen`, `admin_listen`, `tls`, `admin_tls`, `admin_insecure`, `store`, …). Merged into the overlay, re-resolved, and swapped in. Returns `{settings, reload_to_apply}`. **Live (hot-applied, no restart):** `rate_card`, `per_request_fee`, `security`, `limits`, `observability`, `advanced`, `metrics`, `health`, `routing`. **Restart-to-apply (stored durably; takes effect on next restart):** `listen`, `admin_listen`, `tls`, `admin_tls`, `admin_insecure`, `store` — these are bound once at process start; the store is reused across hot reloads. `config.yaml` is never written; persistence is the busbar overlay (atomic temp+rename). Full scope |
 | `GET /audit` | The admin audit log: every mutation *attempt* with its outcome (`applied`/`rejected`), newest first, attributed to the acting principal. Filters: `?action=hook.register`, `?resource=hook:x` (exact match). Paginated. No secrets |
 | `GET /config/versions` | Version history metadata, newest first: `version`, `ts`, `principal`, `summary`. Paginated |
 | `GET /config/versions/{v}` | One retained version with its full hook-surface snapshot: `{version, ts, principal, summary, hooks, global_hooks}`, hooks projected through the same wire shape as `/hooks`, so one parser covers both. `404` if pruned or never recorded |
@@ -253,7 +255,7 @@ Busbar's config plane is live: an authenticated write takes effect immediately, 
 
 | Endpoint | Does |
 |---|---|
-| `POST /hooks` | Register a hook at runtime. Body `{ "name": "...", "config": { "kind": "gate\|tap", "webhook"\|"socket": "...", ... } }`. **`201` when the name is new; `200` when it replaces an existing overlay hook** (honest upsert). A `global: true` hook is live for the next request. Invalid definitions are `400` and change nothing; a base-config-defined name is a terminal `409` (the API never silently shadows file config) |
+| `POST /hooks` | Register a hook at runtime. Body `{ "name": "...", "config": { "kind": "gate\|tap", "module": "webhook\|socket\|<kind:hook plugin name>", "settings": {...}, ... } }`. **`201` when the name is new; `200` when it replaces an existing overlay hook** (honest upsert). A `global: true` hook is live for the next request. Invalid definitions are `400` and change nothing; a base-config-defined name is a terminal `409` (the API never silently shadows file config) |
 | `PUT /hooks/{name}` | Replace an existing **overlay** hook, live. `404` for an unknown name (PUT replaces; POST creates); terminal `409` for a base-defined hook or a grant change: `kind`/`prompt`/`user` are immutable (delete and re-register to change them) |
 | `DELETE /hooks/{name}` | Remove an overlay hook, live. **`204`** (still carrying the new config ETag); `404` if unregistered; terminal `409` for a base-defined hook. The deletion is tombstoned in the overlay so it survives restart |
 | `PATCH /hooks/{name}/settings` | Push an opaque settings map to the **running** hook and **commit on ack**: busbar sends the `configure` wire message (5s deadline) and only a version-echoing acknowledgment commits the change (audited, versioned, persisted). A nack/timeout commits nothing (`400` names the reason); if another mutation landed during the push, the commit is refused with `409`, retry. Socket hooks also receive committed settings as the first message on every (re)connection, so a restarted hook never runs blind |
@@ -261,9 +263,9 @@ Busbar's config plane is live: an authenticated write takes effect immediately, 
 All hook mutations honor `If-Match` against the config-plane ETag, are audited (including rejections: probing which names exist leaves a trail), recorded in version history, and overlay-persisted.
 
 ```bash
-# Register a global compression gate — live immediately
+# Register a global compression gate — live immediately (using the webhook module)
 curl -s -X POST -H "x-admin-token: $TOK" -H 'content-type: application/json' \
-  --data '{"name":"compress","config":{"kind":"gate","webhook":"http://127.0.0.1:8900/","prompt":"rw","global":true}}' \
+  --data '{"name":"compress","config":{"kind":"gate","module":"webhook","settings":{"url":"https://127.0.0.1:8900/"},"prompt":"rw","global":true}}' \
   http://localhost:8081/api/v1/admin/hooks
 
 # Is it running what we pushed? (desired vs reported, with a drift verdict)
@@ -296,7 +298,8 @@ bypass the trust model:
 |---|---|
 | `POST /plugins` | Install a signed plugin tarball. Body: `{"file": "<name>.tar.gz", "tarball_b64": "<base64 tarball>"}` (`file` is storage-only; identity comes from the signed manifest inside). `201 Created` with `{file, name, interface_version, trust, version, publisher, note}` |
 | `DELETE /plugins/{file}` | Remove a tarball from `plugins.dir` (`204`; `404` if absent). A currently-loaded store keeps running on its loaded handle; removal affects the NEXT load (folder = source of truth) |
-| `POST /plugins/reload` | Re-scan `plugins.dir` and report the reconciled dynamic inventory (manifest-only, same projection as the catalog) |
+| `POST /plugins/reload` | **Live hot swap** (no restart): re-runs the fail-closed plugin pipeline from disk+overlay, rebuilds the registry and `kind: hook` transports, and old libraries drain then unmap. Fail-closed: a bad artifact leaves old plugins serving. Full scope, audited |
+| `POST /plugins/rollback` | Explicit, audited, If-Match-guarded rollback. Body: `{"file": "<tarball-filename>"}`. Pins a prior version and lowers the anti-downgrade floor **only for this operator action** — automatic silent downgrade stays refused. Persists the version pin to the overlay. Full scope, audited |
 
 ```bash
 # Install a signed store plugin tarball (takes effect on the next plugin (re)load)

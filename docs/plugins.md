@@ -174,9 +174,84 @@ The bundled **`oidc`** module (`busbar-auth-oidc-plugin`) is exactly such a plug
 [configuration.md](configuration.md#auth-plugins) for the `auth.chain: [oidc]` + `settings:` recipe
 (including an Entra ID example).
 
-Hook plugin manifests (`kind: hook`) travel through the same discovery, trust, validation, and
-inventory today, but hooks stay **out-of-process** (socket/webhook transports); the in-process
-dynamic hook consumer arrives with its ABI generation.
+Hook plugins (`kind: hook`) load over the same signed hybrid ABI as store, secret, and auth
+plugins. They are in-process dlopen consumers: the hook `cdylib` exports the six kind-neutral C
+symbols (`busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`, `busbar_free`,
+`busbar_close`) and the engine loads and calls it directly. Trust is signature-based, not
+process-based: the manifest `kind` is cross-checked against `busbar_plugin_kind()` at load, and
+the signed `needs` field caps what grants the plugin may receive. The socket and webhook transport
+modules remain as out-of-process hook options for operators who want process isolation.
+
+## Hook plugins (`kind: hook`)
+
+A hook plugin implements the SDK's `HookHandler` trait: one method per op, each receiving the op's
+payload as the opaque projection `serde_json::Value` the engine built and returning the reply object
+the engine parses through its existing fail-closed normalizers. Every method has a default, so a
+trivial hook implements only the ops it cares about (a ranking gate implements just `decide`; a
+compressor just `transform`); the rest degrade to the safe abstain/no-op replies the engine already
+treats as fail-open. The SDK emits the ABI glue:
+
+```rust
+// crate-type = ["cdylib"]; deps: busbar-plugin-sdk, serde_json
+use busbar_plugin_sdk::HookHandler;
+
+struct MyGate { /* … */ }
+impl HookHandler for MyGate {
+    // `decide` — rank candidates / return a verdict. Return `{}` to abstain.
+    fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
+        let too_big = payload["request"]["total_chars"].as_u64().unwrap_or(0) > 100_000;
+        if too_big {
+            serde_json::json!({ "reject": { "status": 413, "message": "prompt too large" } })
+        } else {
+            serde_json::json!({})
+        }
+    }
+    // Unimplemented ops (`transform`/`notify`/`configure`/`describe`/`status`) use the trait defaults.
+}
+
+fn open(cfg: &str) -> Result<Box<dyn HookHandler>, String> {
+    // `cfg` is the hook instance's own `settings:` map, passed through verbatim as JSON.
+    Ok(Box::new(MyGate::from_config(cfg)?))
+}
+busbar_plugin_sdk::export_hook_plugin!(open);
+```
+
+`export_hook_plugin!` emits the six extern-C hybrid ABI symbols. Every op rides the one `busbar_call`
+as an op-discriminated JSON envelope — the same `decide`/`transform`/`notify`/`configure`/`describe`/
+`status` payload contract as the socket/webhook wire, lifted verbatim, so a hook's semantics are
+identical whichever transport carries them. The engine translates each `HookHandler` method into a
+`busbar_call` and parses the reply through the ONE `hooks::wire` fail-closed normalizer, so the
+dlopen and out-of-process seams can never diverge on reject-precedence, the status clamp, or
+restrict/rewrite parsing. A hook never sees `prompt`/`user` content it was not granted: the engine
+projects those keys into `payload` only when BOTH the operator grant and the signed-manifest `needs`
+allow it.
+
+Pack with grant declarations (the core enforces the actual projection; the plugin cannot self-grant
+above what it declares):
+
+```sh
+BUSBAR_SIGN_KEY=9f2c... busbar-plugin-pack pack \
+    --lib target/release/libmy_gate.so \
+    --name acme-pii-hook --alias pii-guard --kind hook \
+    --version 1.0.0 --publisher acme \
+    --needs-prompt ro \          # declare: this plugin reads prompt text
+    --license Apache-2.0 \
+    --out acme-pii-hook-1.0.0-x86_64-linux.tar.gz
+```
+
+**Fail-closed, always:** a configured `kind: hook` module that cannot load (missing/untrusted
+tarball, wrong kind, ABI failure) is a hard error on the config-apply path — a dropped security
+gate never silently disappears. `busbar --validate` catches it manifest-only ahead of boot.
+
+**Shipped first-party hook plugins (1.5.0):**
+
+- **Headroom** (`busbar-headroom-hook`): a `prompt: rw` gate that compresses context before
+  dispatch, saving tokens and latency. Reports `chars_saved_total` via the `status` op.
+- **Webrequest** (`busbar-webrequest-hook`): an HTTP-forwarder gate — the out-of-process isolation
+  path for code you don't want in-process. Forwards the routing projection over HTTPS to an
+  operator-run sidecar (any language). SSRF-guarded, signed by release CI.
+
+Both are auto-trusted by the embedded release key; no `trust.publishers` entry is needed.
 
 ## Signing and packaging
 

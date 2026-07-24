@@ -2,7 +2,23 @@
 
 Busbar owns the request path. Hooks are the sanctioned attachment points on it: the places where your own code sees what Busbar sees and steers what Busbar does. Every hook follows one design rule, enforced structurally rather than by convention: **a hook can steer, observe, or rewrite, but a hook can never break the request path.** A slow, crashed, or wrong hook degrades to a safe default; it never blocks, hangs, or fails a request on its own.
 
-A hook is your own code, a compiled binary on a local Unix domain socket (~8µs per call) or an HTTPS sidecar in any language, running on Busbar's **normalized IR**: the canonical request form Busbar produces after losslessly translating whatever dialect the caller spoke. Write a hook once and it runs against all six protocols and every provider, with failover and circuit breaking underneath it, in one hop.
+In 1.5.0, a hook is a **`kind: hook` dlopen plugin** — the same signed-tarball, hybrid-ABI, in-process model that store, secret, and auth plugins use. Out-of-process hooks remain fully supported through the built-in `socket` and `webhook` transport modules. Write a hook once and it runs against all six protocols and every provider, with failover and circuit breaking underneath it, in one hop.
+
+## Transport options
+
+Two ways to attach your code to the hook path:
+
+| Transport | How it runs | Trust anchor |
+|---|---|---|
+| `kind: hook` plugin (dlopen) | In-process, loaded from a signed tarball at boot or on hot-reload. The hook is a `cdylib` exporting the frozen **hybrid ABI**: `busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`, `busbar_free`, `busbar_close`. Operations ride `busbar_call` as op-discriminated JSON. | ed25519 signature over the signed manifest; kind cross-checked at load |
+| `module: socket` | Out-of-process Unix domain socket binary (~8 µs per call). Busbar sends NDJSON (one line per message). | Socket path access (process isolation) |
+| `module: webhook` | Out-of-process HTTPS sidecar in any language. Busbar POSTs one JSON body per message. URL validated at boot against the SSRF blocklist: loopback sidecars allowed; RFC-1918 / link-local / CGNAT / cloud-metadata rejected. | TLS + HTTPS URL (process isolation) |
+
+**In-process trust is signature-based, not process-based.** A `kind: hook` plugin loads inside busbar's address space, verified by ed25519 against the signed manifest. The socket and webhook transports achieve isolation by running in a separate process. Both postures are legitimate — the right choice depends on whether you want the performance and integration of in-process or the fault isolation of out-of-process. (For out-of-process isolation with a signed, busbar-managed artifact, see [Webrequest](#first-party-hook-plugins-150) below.)
+
+**Admin opt-in required.** A `kind: hook` plugin cannot self-wire into a security-critical path. Wiring a hook with `prompt` above `no` or `global: true` requires `full` admin scope.
+
+**Grants are core-enforced, never plugin-driven.** A plugin cannot self-grant access. The signed manifest `needs` field (set at pack time with `plugin-pack --needs-prompt rw`) declares intent; the core enforces the actual projection. The plugin only sees what the operator AND the declared need allow.
 
 ## Two kinds: tap and gate
 
@@ -31,7 +47,9 @@ pools:
   my-pool:
     hooks:
       - cheapest                           # this pool's base ordering strategy (a bare name)
-      - { module: socket, settings: { path: /run/busbar/router.sock } }   # a gate: returns `order`
+      - { module: socket, settings: { path: /run/busbar/router.sock } }    # socket gate
+      - { module: webhook, settings: { url: "https://hooks.internal/rtr" } } # webhook gate
+      - { module: busbar-headroom-hook }   # kind: hook dlopen plugin (in-process)
     members:
       - model: claude-opus
       - model: claude-opus-bedrock
@@ -41,7 +59,8 @@ pools:
 The `module` names the transport: the built-in `socket` (`settings.path`, an absolute Unix-socket
 path; lazy-connect, so the hook may start after Busbar) or `webhook` (`settings.url`, an
 `https://` URL, validated at boot against the SSRF blocklist: loopback sidecars allowed,
-RFC-1918 / link-local / CGNAT / cloud-metadata rejected), or a loaded `kind: hook` plugin.
+RFC-1918 / link-local / CGNAT / cloud-metadata rejected), or the name of a loaded `kind: hook`
+plugin tarball (e.g. `busbar-headroom-hook`).
 
 **Attach a hook** two ways: an inline ref in a pool's `hooks:` list (fires for that pool) or in
 `global_hooks:` (fires on every request). A pool's `hooks:` list carries its ordering strategy
@@ -89,6 +108,8 @@ By default a hook sees **shapes, not content**: sizes, counts, flags, live lane 
 
 Grants are a monotonic trust ladder (`no ⊂ ro ⊂ rw`) and are **immutable after registration**: you cannot register a hook with `prompt: no`, wire it in, then quietly raise it to `rw`. `rw` on a `tap` is a boot error (a tap never replies, so it can never rewrite).
 
+For `kind: hook` plugins, the manifest `needs` field (set with `--needs-prompt rw` at pack time) declares the maximum grant the plugin may receive. The core enforces the actual projection: the plugin only sees what both its declared needs and the operator's instance grant allow.
+
 ### What a gate receives
 
 - **The request projection**: `pool`, `ingress_protocol`, `message_count`, `has_tools`, `total_chars` (a size signal; token counts do not exist pre-dispatch), `max_tokens`, `stream`. With `prompt: ro`/`rw`, also the flattened `system` + `messages` text. With `user: ro`, also caller identity.
@@ -126,6 +147,8 @@ A `tap`, being fire-and-forget, has no `on_error` to speak of: its reply is disc
 
 ## The wire, precisely
 
+### Socket and webhook transports
+
 One JSON message per line on a socket; one POST body per message on a webhook. The projection is
 **byte-identical across both transports**, so a hook graduates webhook → socket without logic
 changes. The rules a hook author must know:
@@ -151,7 +174,21 @@ changes. The rules a hook author must know:
   request stops, exactly as on the decide path. `restrict`/`order` are decide-path verbs and are
   ignored on a transform reply.
 
+### `kind: hook` plugin ABI
+
+For in-process plugins, the transport is `busbar_call` over the frozen **hybrid ABI** — six
+kind-neutral C symbols: `busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`,
+`busbar_free`, `busbar_close`. (`TRANSPORT_VERSION = 1` is the low-level C signature contract,
+frozen; `abi_version` in the manifest is the per-kind payload version — `HOOK_ABI_VERSION = 1` for
+the hook kind.) Operations are the same op-discriminated JSON payload as socket/webhook: `decide`,
+`transform`, `notify`, `configure`, `describe`, `status`. The serialization is JSON over the C ABI
+rather than NDJSON over a socket, but the payload contract is identical — a hook's decision logic
+is transport-agnostic.
+
 ## Management messages: `configure`, `describe`, `status`
+
+Management messages apply across all transports. On socket and webhook they are NDJSON lines or
+HTTP POSTs; on `kind: hook` plugins they ride `busbar_call` with the same JSON payload.
 
 - **`configure`**: Busbar pushes the hook's opaque `settings` map, stamped with the hook's
   **instance name**, a `settings_version`, and Busbar's version. It is the **first message on every
@@ -214,6 +251,16 @@ delay or fail request traffic: they ride fresh connections, never the request-pa
 On a connection where you only ever receive `notify` (a tap), **never write anything**. Busbar
 does not read tap replies, so even the polite `{}`-for-unknown-ops rule is scoped to
 reply-expected connections; Busbar will never send a reply-expected op on a tap connection.
+
+## First-party hook plugins (1.5.0)
+
+Two `kind: hook` plugins ship signed by release CI and are auto-trusted by the embedded key:
+
+**Headroom** (`busbar-headroom-hook`) is a `kind: hook` prompt-compression rewrite gate. It compresses context before dispatch, saving tokens and latency. Deploy it as a `prompt: rw` gate; it fires before dispatch on the normalized IR, token accounting runs on the rewritten body (the savings are real and measured), and a malformed or slow rewrite proceeds with the original body untouched. It reports `chars_saved_total` and related metrics via the `status` op.
+
+**Webrequest** (`busbar-webrequest-hook`) is a `kind: hook` HTTP-forwarder plugin — the migration path for code you don't want in busbar's address space. It forwards the routing projection over HTTPS to an operator-run sidecar, so you get out-of-process isolation (the sidecar can be any language) without running an untrusted library in-process. The artifact itself is signed and auto-trusted; forwarding is SSRF-guarded; and the sidecar's reply rides the same op-discriminated JSON contract.
+
+Both plugins are installed from the release tarball and enabled under `plugins:` in the normal way. See [plugins.md](./plugins.md) for the artifact and trust model.
 
 ## Managing hooks over the API
 
