@@ -248,7 +248,7 @@ auth:
 |---|---|---|---|---|
 | `signing_key` | secret reference | no | generated on first boot | The ed25519 key busbar signs virtual-key tokens with. Fleet-shared (every node verifying the same tokens resolves the same key). Absent: busbar generates a keypair on first boot and persists it with mode 0600 (dev zero-config). Rotating it revokes every outstanding key. |
 | `upstream_credentials` | string | no | `own` | Whose key hits the provider: `own` (busbar's configured lane credential) or `passthrough` (forward the caller's own token upstream; busbar holds no keys). |
-| `chain` | list of module entries | no | `[]` | The ordered DATA-PLANE authentication chain. Each entry is a bare module name (`- keys`) or a single-key map `- <module>: { max_admin_scope?, settings? }` where `settings` is the module's own opaque config. `[]` (default) is the open front door: development only, loud startup warning. An unknown module name is a startup error. |
+| `chain` | list of module entries | no | `[]` | The ordered DATA-PLANE authentication chain. Each entry is a bare module name (`- keys`) or a single-key map `- <module>: { max_admin_scope?, settings? }` where `settings` is the module's own opaque config. `keys` is the built-in signed-key verifier; **any other name loads a `kind: auth` plugin** from the plugins directory (see [auth plugins](#auth-plugins) below). `[]` (default) is the open front door: development only, loud startup warning. A configured auth plugin that cannot be loaded — missing/untrusted tarball, wrong kind, `plugins.enabled: false`, or an ABI failure — is a **hard startup error** (fail-closed: the front door never silently opens). |
 | `admin_auth` | list of module entries | no | `[admin-tokens]` | The chain gating `/api/v1/admin/*`. The built-in `admin-tokens` module carries the operator credential as a secret reference (`token:`). `[]` = OPEN admin (dev only; loud warning). |
 | `role_bindings` | map | no | `{}` | Role policy, NESTED BY MODULE: `role_bindings.<module>.<role> -> { allowed_pools?, group?, admin_scope? }`. See below. |
 
@@ -283,6 +283,49 @@ another module's binding. An unbound role grants nothing (fail closed).
 Admin access is therefore EITHER a role's `admin_scope` (through an IdP module in `admin_auth`)
 OR the `admin-tokens` operator token. The admin chain is live-mutable over the API
 (`PUT /api/v1/admin/auth`) with an anti-lockout guard; see the [Admin API guide](./admin-api.md).
+
+#### auth plugins
+
+Any `auth.chain` module name that is not the built-in `keys` is a **`kind: auth` plugin** —
+an identity provider loaded in-process at boot over the signed plugin ABI, the same trust and
+loader path as store and secret plugins (see [plugins.md](plugins.md#auth-plugins-kind-auth)).
+Install it like any other plugin: set `plugins.enabled: true`, drop the signed tarball in the
+plugins directory, then name the module in the chain. Its `settings:` map is passed to the plugin
+verbatim as its config.
+
+Role policy is nested under the plugin's **runtime module name** — the value the plugin returns from
+`name()`, which for the bundled OIDC module is `oidc`. Bind roles under that name, not the config
+alias if they differ.
+
+The bundled **`oidc`** module (`busbar-auth-oidc-plugin`) verifies OIDC/JWT bearer tokens against an
+IdP's JWKS, mapping a token claim (default `groups`) to the principal's roles. Microsoft Entra ID
+(Azure AD) example — replace `<tenant-id>` and `<client-id>` with your own:
+
+```yaml
+plugins:
+  enabled: true
+  dir: /etc/busbar/plugins            # the signed busbar-auth-oidc-plugin tarball lives here
+
+auth:
+  chain:
+    - keys                            # still accept busbar-minted virtual keys
+    - oidc:                           # then IdP-issued JWTs
+        settings:
+          issuer:    "https://login.microsoftonline.com/<tenant-id>/v2.0"
+          audience:  "api://<client-id>"
+          # jwks_url optional — discovered from the issuer when omitted:
+          jwks_url:  "https://login.microsoftonline.com/<tenant-id>/discovery/v2.0/keys"
+          role_claim: "groups"        # the JWT claim carrying the caller's groups
+  role_bindings:
+    oidc:                             # nested by the module's runtime name (`oidc`)
+      "<entra-group-object-id>":      # a group id from the `groups` claim
+        allowed_pools: [fast]
+        group: growth                 # charge through the `growth` limit bucket
+```
+
+A caller then presents the Entra-issued JWT as `Authorization: Bearer <jwt>`; `oidc` verifies it,
+asserts the token's groups as roles, and busbar maps them through `role_bindings.oidc` to pools,
+limits, and (optionally) an admin scope capped by `auth.chain.oidc.max_admin_scope`.
 
 ---
 
