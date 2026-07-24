@@ -51,6 +51,7 @@ groups:
       - { budget: 5000, per: month, pool: value,
           on_exhaust: downgrade, downgrade_to: frontier-lite }  # budget dry → reroute, don't refuse
       - { concurrent: 5 }                # instantaneous in-flight cap: NO per:, NO pool:
+    child_default: { limits: [ { budget: 500, per: month } ] }  # optional template for auto-provisioned children (nearest ancestor wins)
 ```
 
 Chain-AND enforced at admission (atomic, all-or-nothing); rejections name the exact blocking

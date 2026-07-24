@@ -377,7 +377,7 @@ pub(crate) fn build_without_hook(current: &App, name: &str) -> Result<App, Admin
 /// Build the next `App` snapshot with `name` created-or-replaced in the group registry — the pure
 /// core of `POST`/`PUT /api/v1/admin/groups`. VALIDATE-AT-THE-DOOR: the mutated registry is run
 /// through the SAME `validate_groups` boot uses (parent references exist, the parent chain is
-/// acyclic and within the depth cap), so a bad group (dangling/cyclic parent) is a `400` that
+/// acyclic — any depth, the cycle check is the bound), so a bad group (dangling/cyclic parent) is a `400` that
 /// changes nothing. On success the enforcement projection is rebuilt via `CostModel::with_groups`
 /// (reusing the rate card + fee unchanged) so the new limits are live after the swap; the governance
 /// LEDGER survives (it is Arc-shared, not rebuilt), so past accrual is preserved across the change.
@@ -398,7 +398,7 @@ pub(crate) fn build_with_group(
         )));
     }
     // Build the candidate registry and validate it WHOLE before mutating the snapshot — a group's
-    // legality (parent exists, acyclic, depth) is a property of the tree, not the single entry.
+    // legality (parent exists, chain acyclic) is a property of the tree, not the single entry.
     let mut groups = current.groups_registry.clone();
     groups.insert(name.to_string(), cfg);
     let mut errors = Vec::new();

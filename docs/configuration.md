@@ -318,6 +318,7 @@ groups:
 | `parent` | string | none | The parent group; must exist; the chain must be acyclic (validated with paste-ready fixes). Any depth. |
 | `enabled` | bool | `true` | `false` FREEZES the group: every request charging through it (its own keys and every descendant's) is rejected with a 403 naming the group, while its usage history is kept. |
 | `limits` | list | `[]` | Each entry has exactly ONE metric key: `requests`, `tokens`, or `budget` with a required `per:` window (`minute` \| `hour` \| `day` \| `month` \| `total`), or `concurrent` with NO `per:` (instantaneous). An optional `pool: <name>` on a windowed metric scopes the limit to that pool's traffic (see below); the pool must exist. A metric repeated for the same window + pool scope keeps the most restrictive amount. |
+| `child_default` | `{ limits: [...] }` | none | The limit template stamped onto any CHILD group auto-provisioned under this one (see below). Provisioning-time only: it never affects THIS group's own enforcement. |
 
 **Metric semantics:**
 
@@ -371,6 +372,28 @@ to the plain quota rejection), and cascades are cycle-bounded. Absent (or `on_ex
 exhaustion rejects with the vendor's quota status — today's default. `downgrade` requires
 `downgrade_to:` naming a different existing pool, a `pool:` scope, and the `budget` metric (all
 validated at the door).
+
+**Auto-provisioned children (`child_default`).** A group may carry a limit template for children
+created under it at runtime (e.g. a per-user `user:<sub>` leaf provisioned on first self-mint):
+
+```yaml
+groups:
+  org:
+    child_default: { limits: [ { budget: 500, per: month } ] }   # the org-wide default
+  engineering:
+    parent: org
+    child_default: { limits: [ { budget: 2000, per: month } ] }  # overrides the org's for ITS children
+  accounting:
+    parent: org                                                  # no template of its own
+```
+
+The template's `limits:` use the same shape as any group's `limits:`. Resolution is
+**nearest-ancestor-wins**: provisioning walks up from the immediate parent and copies the first
+`child_default` it finds — a leaf under `engineering` gets the 2000 budget, one under `accounting`
+inherits the org's 500. No template anywhere on the chain means the new child is **inherit-only**:
+no limits of its own, capped solely by the parent chain. `child_default` never changes what the
+declaring group itself enforces, and pool qualifiers inside a template are validated like any
+other limit's.
 
 ---
 

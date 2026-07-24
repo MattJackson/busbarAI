@@ -1358,8 +1358,9 @@ fn validate_limits(limits: &crate::config::LimitsResolved, errors: &mut Vec<Stri
 /// requirement (governance is always available but inert, the admin surface off).
 ///
 /// Validate the COST + GROUPS + STORE + SECRETS surface of the resolved config (S3/S5/S6/C2):
-/// rate_card completeness/wellformedness, the `groups:` limit tree (parents exist, acyclic,
-/// depth <= 8, limit values sane), `per_request_fee` sanity, the store module reference, and every
+/// rate_card completeness/wellformedness, the `groups:` limit tree (parents exist, chain acyclic —
+/// any depth, the cycle check is the bound; limit values sane), `per_request_fee` sanity, the store
+/// module reference, and every
 /// secret reference's MODULE resolvability. Paste-ready stubs throughout. Pure - shared verbatim
 /// by boot and `--validate` so the two cannot drift.
 fn validate_cost_model(cfg: &RootCfg, errors: &mut Vec<String>) {
@@ -1430,7 +1431,8 @@ fn validate_cost_model(cfg: &RootCfg, errors: &mut Vec<String>) {
         ));
     }
 
-    // groups (S3): parents exist, acyclic, depth <= 8 (shared with the parse-time module), plus
+    // groups (S3): parents exist, chain acyclic — any depth, the cycle check is the bound (shared
+    // with the parse-time module), plus
     // value-level checks the tree walk does not cover.
     crate::config::groups::validate_groups(&cfg.groups, &|p| cfg.pools.contains_key(p), errors);
     for (name, g) in &cfg.groups {
