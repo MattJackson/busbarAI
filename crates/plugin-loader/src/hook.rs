@@ -573,4 +573,78 @@ mod tests {
         policy.notify(&projection, Duration::from_secs(5)).await;
         policy.notify(b"not json", Duration::from_secs(5)).await; // malformed → swallowed
     }
+
+    /// A NACK'd `configure` is a wrong-version ack over the ABI → `configure` returns `Err` (the push
+    /// does not commit). The plugin's `nack_configure` echoes `version+1`, which the exact-match rejects.
+    #[tokio::test]
+    async fn dlopen_configure_nack_is_err() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load(r#"{"nack_configure": true}"#);
+        assert!(
+            policy
+                .configure("h", &serde_json::Map::new(), 5, Duration::from_secs(5))
+                .await
+                .is_err(),
+            "a NACK (wrong-version ack) must fail the configure push"
+        );
+    }
+
+    /// `describe`/`status` are fail-open `None` when the plugin replies `{}` (unsupported): the reply
+    /// carries no `schema`/`status` member, so the engine surfaces nothing rather than erroring.
+    #[tokio::test]
+    async fn dlopen_empty_management_reads_are_none() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load(r#"{"empty_management": true}"#);
+        assert!(policy.describe(Duration::from_secs(5)).await.is_none());
+        assert!(policy.status(Duration::from_secs(5)).await.is_none());
+    }
+
+    /// A slow gate is cut off by the `budget` over the dlopen seam (spawn_blocking + timeout), promptly
+    /// → `Err`, never a hang. The blocking sleep never stalls the runtime.
+    #[tokio::test]
+    async fn dlopen_slow_gate_hits_the_deadline() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load(r#"{"order": [0], "sleep_ms": 2000}"#);
+        let started = std::time::Instant::now();
+        let r = policy
+            .decide(
+                &req_with_prompt("x"),
+                &[cand(0)],
+                &ctx(),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(r.is_err(), "a slow gate must exceed the deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the deadline must cut off promptly"
+        );
+    }
+
+    /// A malformed plugin config is a fail-closed LOAD error (the ctor rejects it), never a live policy.
+    #[test]
+    fn load_refuses_malformed_config() {
+        let Some(path) = hook_plugin_path() else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read hook cdylib");
+        let err = match load_hook_from_bytes(
+            &bytes,
+            "{ this is not json",
+            "test-hook",
+            "hook",
+            "h",
+            test_projectors(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a malformed config must fail the hook load"),
+        };
+        assert!(err.contains("open failed"), "got: {err}");
+    }
 }
