@@ -454,6 +454,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-webrequest-hook-plugin"
+version = "1.5.0"
+dependencies = [
+ "axum",
+ "busbar-api",
+ "busbar-plugin-loader",
+ "busbar-plugin-sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

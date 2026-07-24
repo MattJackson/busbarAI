@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-webrequest-hook-plugin"
+version = "1.5.0"
+publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "First-party signed kind:hook plugin cdylib: a transparent HTTP forwarder that POSTs each hook op envelope (decide/transform/notify/configure/describe/status) to an operator-configured URL and returns the capped JSON reply. The migration path for the retired socket/webhook hook transport and the isolation path for untrusted hook logic (run it remotely behind this trusted dlopen'd forwarder). Owns its own reqwest client; applies its own SSRF guard on the configured URL."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]   # cdylib for the C ABI delivery; rlib so the unit tests can exercise the pure helpers
+
+[dependencies]
+busbar-plugin-sdk = { path = "../plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The plugin owns the web call: its own async runtime + HTTP client. redirect::none is set on the
+# client so a target cannot 30x-redirect us to an internal host at runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+# A local mock HTTP server for the end-to-end forward tests (mirrors the old webhook.rs test harness).
+axum = { version = "0.8", features = ["http1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }
+busbar-plugin-loader = { path = "../plugin-loader" }
+busbar-api = { path = "../api" }
