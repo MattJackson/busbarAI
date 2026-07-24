@@ -112,7 +112,12 @@ fn auth_plugin_loads_and_identifies_through_middleware() {
         .expect("preflight resolves the kind:auth plugin");
 
     // The real load through the middleware — resolve → open_auth → box → chain.
-    let mw = AuthMiddleware::new(&cfg, &registry).expect("auth chain loads the plugin");
+    let mw = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .expect("auth chain loads the plugin");
     // The RUNTIME module identity is the plugin's own `name()` (`static-auth`), NOT the config alias.
     assert_eq!(mw.chain_names(), vec!["static-auth"], "runtime module name");
 
@@ -170,7 +175,12 @@ fn auth_plugin_role_binding_and_scope_cap_apply() {
 
     let registry = crate::plugins_preflight(None, Some(&cfg), &Default::default(), &plugins)
         .expect("preflight");
-    let mw = AuthMiddleware::new(&cfg, &registry).expect("load");
+    let mw = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .expect("load");
 
     let principal = match mw.run_chain(Some("sekret")) {
         ChainVerdict::Identified { principal, .. } => principal,
@@ -231,7 +241,12 @@ fn untrusted_auth_plugin_fails_closed_not_open() {
         &strict.to_policy().unwrap(),
     )
     .expect("scan succeeds; the untrusted plugin is merely skipped");
-    let mw_err = AuthMiddleware::new(&cfg, &registry).unwrap_err();
+    let mw_err = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .unwrap_err();
     assert!(
         mw_err.contains("oidc"),
         "middleware names the module: {mw_err}"
@@ -269,7 +284,12 @@ fn missing_auth_plugin_is_loud_boot_failure() {
         &plugins.to_policy().unwrap(),
     )
     .expect("scan");
-    let mw_err = AuthMiddleware::new(&cfg, &registry).unwrap_err();
+    let mw_err = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .unwrap_err();
     assert!(mw_err.contains("oidc"), "middleware names it: {mw_err}");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -306,7 +326,12 @@ fn keys_module_is_not_a_plugin_ref() {
     let plugins = PluginsCfg::default();
     let registry = crate::plugins_preflight(None, Some(&cfg), &Default::default(), &plugins)
         .expect("keys needs no plugin");
-    let mw = AuthMiddleware::new(&cfg, &registry).expect("keys chain builds");
+    let mw = AuthMiddleware::new(
+        &cfg,
+        &registry,
+        &crate::config::secret::SecretResolver::builtins_only(),
+    )
+    .expect("keys chain builds");
     assert!(mw.keys_in_chain, "keys sets the engine flag");
     assert!(mw.chain_names().is_empty(), "keys is not a boxed module");
 }

@@ -63,7 +63,10 @@ fn test_env_needs(alias: &str, needs: busbar_plugin_sign::HookNeeds) -> Option<H
     policy.allow_unsigned = true;
     let registry = busbar_plugin_loader::scan_and_validate(&dir, &policy).expect("scan");
     let _ = std::fs::remove_dir_all(&dir);
-    Some(HookEnv::new(std::sync::Arc::new(registry)))
+    Some(HookEnv::new(
+        std::sync::Arc::new(registry),
+        std::sync::Arc::new(crate::config::secret::SecretResolver::builtins_only()),
+    ))
 }
 
 /// A [`HookEnv`] that resolves `test-hook` (declaring rw prompt + ro user intent, so the projection
@@ -80,9 +83,10 @@ fn test_env() -> Option<HookEnv> {
 
 /// An empty env (no plugins loaded) — a hook ref resolves to `None` (gate-absent).
 fn empty_env() -> HookEnv {
-    HookEnv::new(std::sync::Arc::new(
-        busbar_plugin_loader::PluginRegistry::empty(),
-    ))
+    HookEnv::new(
+        std::sync::Arc::new(busbar_plugin_loader::PluginRegistry::empty()),
+        std::sync::Arc::new(crate::config::secret::SecretResolver::builtins_only()),
+    )
 }
 
 /// A pool with a native ranking strategy and no gate.

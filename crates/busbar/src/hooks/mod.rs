@@ -62,15 +62,34 @@ pub(crate) use busbar_api::{
 pub(crate) struct HookEnv {
     pub(crate) registry: std::sync::Arc<busbar_plugin_loader::PluginRegistry>,
     pub(crate) projectors: std::sync::Arc<busbar_plugin_loader::hook::HookProjectors>,
+    /// The secret resolver used to turn any SecretRef-typed hook setting (e.g. a `licenseKey`) into
+    /// its raw value BEFORE the settings cross the ABI at open/configure (ADR-0007). Shared with the
+    /// store/auth open paths; the same fail-closed resolver.
+    pub(crate) secret_resolver: std::sync::Arc<crate::config::secret::SecretResolver>,
 }
 
 impl HookEnv {
-    /// Bundle a registry + the shared projectors into the resolution environment.
-    pub(crate) fn new(registry: std::sync::Arc<busbar_plugin_loader::PluginRegistry>) -> Self {
+    /// Bundle a registry + the shared projectors + the secret resolver into the resolution
+    /// environment.
+    pub(crate) fn new(
+        registry: std::sync::Arc<busbar_plugin_loader::PluginRegistry>,
+        secret_resolver: std::sync::Arc<crate::config::secret::SecretResolver>,
+    ) -> Self {
         HookEnv {
             registry,
             projectors: plugin::projectors(),
+            secret_resolver,
         }
+    }
+
+    /// Resolve a hook's opaque `settings:` map — substituting any SecretRef-typed value (e.g. a
+    /// `licenseKey`) with its resolved secret — before the JSON crosses the ABI at open/configure.
+    /// FAIL-CLOSED: an unresolvable ref is an `Err`, never a dangling reference handed to the plugin.
+    fn resolve_hook_settings(
+        &self,
+        settings: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+        crate::config::secret::resolve_settings(settings, &self.secret_resolver)
     }
 }
 
@@ -338,7 +357,22 @@ fn gate_transport_named(
     env: &HookEnv,
     _settings_version: u64,
 ) -> Option<Arc<dyn RoutingPolicy>> {
-    let cfg_json = serde_json::to_string(&hook.settings).unwrap_or_else(|_| "{}".to_string());
+    // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) against the secret store BEFORE the
+    // settings cross the ABI (ADR-0007). A resolution failure is treated exactly like a failed load:
+    // the gate degrades to absent (the existing fail-open-to-the-request posture of this runtime
+    // safety net). The FAIL-CLOSED guarantee lives in the plugin pre-flight, which refuses boot/reload
+    // on an unresolvable hook secret before this path is ever taken.
+    let resolved = match env.resolve_hook_settings(&hook.settings) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                hook = %name, plugin = %hook.plugin, error = %e,
+                "hook settings did not resolve; gate treated as absent (fail-open to the request)"
+            );
+            return None;
+        }
+    };
+    let cfg_json = serde_json::Value::Object(resolved).to_string();
     match env
         .registry
         .open_hook(&hook.plugin, &cfg_json, name, env.projectors.clone())
@@ -366,13 +400,19 @@ pub(crate) async fn push_configure(
     settings_version: u64,
     env: &HookEnv,
 ) -> Result<(), String> {
+    // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) before the settings cross the ABI
+    // (ADR-0007). FAIL-CLOSED: an unresolvable ref is NOT committed — the plugin never receives a
+    // dangling reference on a settings push.
+    let resolved = env
+        .resolve_hook_settings(&hook.settings)
+        .map_err(|e| format!("hook '{name}' settings: {e}"))?;
     let Some(transport) = gate_transport_named(name, hook, env, settings_version) else {
         return Err("hook plugin unresolvable".to_string());
     };
     transport
         .configure(
             name,
-            &hook.settings,
+            &resolved,
             settings_version,
             std::time::Duration::from_millis(CONFIGURE_TIMEOUT_MS),
         )

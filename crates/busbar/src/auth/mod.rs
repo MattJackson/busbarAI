@@ -148,6 +148,7 @@ impl AuthMiddleware {
     pub(crate) fn new(
         cfg: &AuthCfg,
         registry: &busbar_plugin_loader::PluginRegistry,
+        secret_resolver: &crate::config::secret::SecretResolver,
     ) -> Result<Self, String> {
         let mut keys_in_chain = false;
         let mut chain: Vec<Box<dyn AuthModule>> = Vec::new();
@@ -166,7 +167,14 @@ impl AuthMiddleware {
                     // posture, same loader as store/secret). The `settings:` map is the plugin's
                     // opaque config, pushed verbatim. FAIL-CLOSED — surface the load error so boot
                     // (or an apply/reload) aborts rather than silently dropping the module.
-                    let cfg_json = serde_json::Value::Object(entry.settings.clone()).to_string();
+                    // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) against the secret
+                    // store BEFORE the settings cross the ABI (ADR-0007). FAIL-CLOSED: an
+                    // unresolvable ref aborts the chain build rather than handing the plugin a
+                    // dangling reference.
+                    let resolved =
+                        crate::config::secret::resolve_settings(&entry.settings, secret_resolver)
+                            .map_err(|e| format!("auth.chain module '{other}' settings: {e}"))?;
+                    let cfg_json = serde_json::Value::Object(resolved).to_string();
                     let module = registry.open_auth(other, &cfg_json).map_err(|e| {
                         format!(
                             "auth.chain module '{other}' could not be loaded as a `kind: auth` \
@@ -197,8 +205,12 @@ impl AuthMiddleware {
     /// dozens of builtin-only test call sites from threading a registry + `.unwrap()` each.
     #[cfg(test)]
     pub(crate) fn new_builtin(cfg: &AuthCfg) -> Self {
-        Self::new(cfg, &busbar_plugin_loader::PluginRegistry::empty())
-            .expect("builtin-only auth chain never fails to construct")
+        Self::new(
+            cfg,
+            &busbar_plugin_loader::PluginRegistry::empty(),
+            &crate::config::secret::SecretResolver::builtins_only(),
+        )
+        .expect("builtin-only auth chain never fails to construct")
     }
 
     /// The ordered names of the auth chain's modules (`module.name()` for each). For the Admin API

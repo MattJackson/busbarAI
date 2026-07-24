@@ -324,6 +324,67 @@ impl SecretResolver {
     }
 }
 
+/// The well-known plugin-settings keys carrying a LICENSE credential (1.5.0 plugin-licensing
+/// convention, ADR-0007). The core does NOT enforce licensing - a plugin validates its OWN license.
+/// These names exist only so operators have a documented, first-class spelling; like any other
+/// setting they MAY be a [`SecretRef`], which [`resolve_settings`] resolves to the raw key before it
+/// crosses the ABI, so a license key never has to sit in plaintext config.
+pub(crate) const PLUGIN_LICENSE_KEYS: &[&str] = &["license", "licenseKey"];
+
+/// Walk a plugin's opaque `settings:` map and RESOLVE any [`SecretRef`]-shaped value in place,
+/// substituting the resolved UTF-8 secret string, so the plugin receives the real value (e.g. its
+/// `licenseKey`) and never a reference it cannot dereference. Non-ref values (strings, numbers,
+/// nested config the plugin documents) pass through VERBATIM - a value only resolves if it parses as
+/// a full secret reference (`{ env: … }` / `{ file: … }` / `{ module: …, settings: … }`); an
+/// ordinary settings object like `{ db_path: … }` is not a ref (its keys aren't a ref's keys) and is
+/// left untouched.
+///
+/// Runs CORE-SIDE at every `open` (boot, config apply/reload, AND hot plugin reload) BEFORE the
+/// settings JSON crosses the ABI - it does not touch the wire ABI or the manifest signature. The
+/// input `settings` (kept in the overlay/config) still holds the `SecretRef`, never the resolved
+/// bytes; only the returned map carries the secret, and only long enough to hand it to the plugin.
+///
+/// FAIL-CLOSED: an unresolvable ref (unknown module, unset env, missing/empty file, plugin error) is
+/// a hard `Err` that must fail the plugin load/reload - the plugin is NEVER handed an unresolved ref
+/// or a silently-empty value. `field` names the settings key in the error (never the secret value).
+pub(crate) fn resolve_settings(
+    settings: &serde_json::Map<String, serde_json::Value>,
+    resolver: &SecretResolver,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut out = serde_json::Map::with_capacity(settings.len());
+    for (field, value) in settings {
+        // A ref is always a JSON object; skip scalars/arrays without an allocating round-trip.
+        if let serde_json::Value::Object(_) = value {
+            if let Ok(secret) = serde_json::from_value::<SecretRef>(value.clone()) {
+                let resolved = resolver.resolve_string(&secret).map_err(|e| {
+                    format!(
+                        "plugin setting '{field}' is a secret reference that did not resolve: {e}"
+                    )
+                })?;
+                out.insert(field.clone(), serde_json::Value::String(resolved));
+                continue;
+            }
+        }
+        out.insert(field.clone(), value.clone());
+    }
+    // License-agnostic ergonomic breadcrumb: if the settings carry a well-known license key, note at
+    // INFO that a license credential is being DELIVERED to the plugin (which validates it itself; the
+    // core enforces nothing). NEVER logs the value - only that the key is present and whether it was a
+    // resolved secret reference. Lets an operator confirm the license wiring without exposing the key.
+    for key in PLUGIN_LICENSE_KEYS {
+        if out.contains_key(*key) {
+            let via_secret_ref = settings.get(*key).map(|v| v.is_object()).unwrap_or(false);
+            tracing::info!(
+                license_key = key,
+                via_secret_ref,
+                "delivering a plugin license credential to the plugin (the plugin validates its own \
+                 license; the core enforces nothing)"
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// P1-internal BUILT-IN resolution of a secret reference to its raw bytes: `env` reads the
 /// environment variable; `file` reads the file. Any other module name is FAIL-CLOSED here - the
 /// full secret-plugin resolver (third-party `kind: secret` modules through the plugin trust
@@ -586,5 +647,87 @@ mod resolver_tests {
         std::env::set_var(&var, "envval");
         assert_eq!(r.resolve_string(&SecretRef::env(&var)).unwrap(), "envval");
         std::env::remove_var(&var);
+    }
+}
+
+#[cfg(test)]
+mod settings_resolution_tests {
+    use super::*;
+
+    fn obj(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// A SecretRef-shaped setting (the `{ env: … }` sugar for a `licenseKey`) is RESOLVED to its
+    /// value before delivery, while a plain sibling setting passes through verbatim.
+    #[test]
+    fn resolves_secret_ref_settings_and_passes_plain_through() {
+        let var = format!("BUSBAR_PLUGIN_LICENSE_TEST_{}", std::process::id());
+        std::env::set_var(&var, "LIC-123\n");
+        let resolver = SecretResolver::builtins_only();
+        let settings = obj(&[
+            ("licenseKey", serde_json::json!({ "env": var })),
+            ("endpoint", serde_json::json!("https://example.test")),
+            ("retries", serde_json::json!(3)),
+        ]);
+        let out = resolve_settings(&settings, &resolver).unwrap();
+        // The ref resolved to the raw secret (trailing newline trimmed) — a plain STRING now.
+        assert_eq!(
+            out.get("licenseKey").unwrap(),
+            &serde_json::json!("LIC-123")
+        );
+        // Non-ref settings are untouched.
+        assert_eq!(
+            out.get("endpoint").unwrap(),
+            &serde_json::json!("https://example.test")
+        );
+        assert_eq!(out.get("retries").unwrap(), &serde_json::json!(3));
+        std::env::remove_var(&var);
+    }
+
+    /// An ordinary settings OBJECT that is not a secret reference (its keys aren't a ref's keys) is
+    /// left untouched — resolution only fires on a genuine ref shape.
+    #[test]
+    fn leaves_non_ref_object_settings_untouched() {
+        let resolver = SecretResolver::builtins_only();
+        let settings = obj(&[("db", serde_json::json!({ "path": ":memory:", "wal": true }))]);
+        let out = resolve_settings(&settings, &resolver).unwrap();
+        assert_eq!(
+            out.get("db").unwrap(),
+            &serde_json::json!({ "path": ":memory:", "wal": true })
+        );
+    }
+
+    /// FAIL-CLOSED: a SecretRef setting that cannot resolve (unset env) is a hard error naming the
+    /// FIELD — never a silently-empty or dangling value handed to the plugin. The error text does not
+    /// echo any secret value.
+    #[test]
+    fn unresolvable_secret_ref_setting_fails_closed_naming_field() {
+        let var = format!("BUSBAR_PLUGIN_LICENSE_MISSING_{}", std::process::id());
+        std::env::remove_var(&var);
+        let resolver = SecretResolver::builtins_only();
+        let settings = obj(&[("license", serde_json::json!({ "env": var }))]);
+        let err = resolve_settings(&settings, &resolver).unwrap_err();
+        assert!(err.contains("license"), "names the field: {err}");
+        assert!(err.contains("did not resolve"), "fail-closed: {err}");
+    }
+
+    /// An unknown secret module in a plugin setting is FAIL-CLOSED when no secret plugin can resolve
+    /// it (built-ins-only resolver), never handed through.
+    #[test]
+    fn unknown_secret_module_in_setting_fails_closed() {
+        let resolver = SecretResolver::builtins_only();
+        let settings = obj(&[(
+            "licenseKey",
+            serde_json::json!({ "module": "vault", "settings": { "path": "kv/license" } }),
+        )]);
+        let err = resolve_settings(&settings, &resolver).unwrap_err();
+        assert!(
+            err.contains("licenseKey") && err.contains("fail-closed"),
+            "unknown module fails closed: {err}"
+        );
     }
 }

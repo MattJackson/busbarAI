@@ -1714,14 +1714,6 @@ pub(crate) fn plugins_preflight(
     Ok(registry)
 }
 
-/// The JSON config blob handed to a store plugin's `open`: the operator's `store.settings` map,
-/// VERBATIM (S6/C2c: `settings` is the module's own opaque config - the sqlite plugin reads
-/// `db_path`/`busy_timeout_ms`, postgres/redis read `url`; a third-party store reads whatever it
-/// documents). busbar never interprets it.
-fn store_plugin_cfg_json(g: &config::StoreCfg) -> String {
-    serde_json::Value::Object(g.settings.clone()).to_string()
-}
-
 /// Resolve the KEY-SIGNING key (S2, 1.5.0). When `auth.signing_key` is set, resolve it via the
 /// secret seam to the ed25519 secret material (32 raw bytes, or 64 hex chars). When ABSENT,
 /// GENERATE a keypair on first boot and PERSIST it 0600 beside the config (dev zero-config), so a
@@ -2174,7 +2166,7 @@ pub(crate) fn build_app_from_config(
     // auth plugin that cannot be loaded (missing/untrusted tarball, wrong kind, ABI failure) aborts
     // boot here rather than silently dropping the module and leaving the front door open.
     let auth_mw = Arc::new(
-        AuthMiddleware::new(&auth_cfg, &plugin_registry)
+        AuthMiddleware::new(&auth_cfg, &plugin_registry, &secret_resolver)
             .map_err(|e| format!("auth chain construction failed: {e}"))?,
     );
     // Thread the operator-configured hard-down cooldown + honored-Retry-After ceiling into the store
@@ -2317,7 +2309,7 @@ pub(crate) fn build_app_from_config(
     // The hook plugin-resolution environment: the validated registry + shared projectors. Every hook
     // `plugin:` ref opens a `DlopenPolicy` through this. Built once and cloned into each resolver and
     // onto `App` (for the control-plane reads + scrape).
-    let hook_env = hooks::HookEnv::new(plugin_registry.clone());
+    let hook_env = hooks::HookEnv::new(plugin_registry.clone(), secret_resolver.clone());
 
     // Per-pool runtime config (failover/exclusions), keyed by pool name.
     let mut pool_runtime = std::collections::HashMap::new();
@@ -2417,7 +2409,12 @@ pub(crate) fn build_app_from_config(
                 );
                 Arc::new(governance::MemoryStore::new())
             } else {
-                let cfg_json = store_plugin_cfg_json(&g);
+                // Resolve any SecretRef-typed setting (e.g. a `licenseKey`) against the secret
+                // store BEFORE the settings cross the ABI (ADR-0007). FAIL-CLOSED: an unresolvable
+                // ref refuses the store load rather than handing the plugin a dangling reference.
+                let resolved = config::secret::resolve_settings(&g.settings, &secret_resolver)
+                    .map_err(|e| format!("store '{}' settings: {e}", g.module))?;
+                let cfg_json = serde_json::Value::Object(resolved).to_string();
                 match plugin_registry.open_store(&g.module, &cfg_json) {
                     Ok(s) => Arc::from(s),
                     Err(e) => return Err(format!("store '{}' plugin load failed: {e}", g.module)),

@@ -849,9 +849,10 @@ impl TestApp {
             tap_hooks_completion: Vec::new(),
             global_gates: Vec::new(),
             hook_env: self.hook_env.unwrap_or_else(|| {
-                crate::hooks::HookEnv::new(std::sync::Arc::new(
-                    busbar_plugin_loader::PluginRegistry::empty(),
-                ))
+                crate::hooks::HookEnv::new(
+                    std::sync::Arc::new(busbar_plugin_loader::PluginRegistry::empty()),
+                    std::sync::Arc::new(crate::config::secret::SecretResolver::builtins_only()),
+                )
             }),
             hook_registry: self.hook_registry,
             global_hooks: self.global_hooks,
@@ -961,7 +962,10 @@ pub(crate) fn test_hook_env(
     };
     let registry = busbar_plugin_loader::scan_and_validate(&dir, &policy).expect("scan");
     let _ = std::fs::remove_dir_all(&dir);
-    Some(crate::hooks::HookEnv::new(std::sync::Arc::new(registry)))
+    Some(crate::hooks::HookEnv::new(
+        std::sync::Arc::new(registry),
+        std::sync::Arc::new(crate::config::secret::SecretResolver::builtins_only()),
+    ))
 }
 
 /// THE METRICS RECORDER HARNESS: sum every exposition sample of `name` whose label set contains
