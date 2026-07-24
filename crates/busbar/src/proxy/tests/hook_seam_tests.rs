@@ -609,7 +609,7 @@ async fn completion_tap_fires_synthetic_rejected_by_auth() {
             "http://127.0.0.1:1/",
         ))
         .pool("p", &[(0, 1)])
-        .auth(Arc::new(crate::auth::AuthMiddleware::new(
+        .auth(Arc::new(crate::auth::AuthMiddleware::new_builtin(
             &serde_yaml::from_str::<crate::config::AuthCfg>("chain: [test-groups-module]\n")
                 .unwrap(),
         )))
@@ -646,7 +646,7 @@ async fn completion_tap_status_is_protocol_native_gemini_400() {
     crate::metrics::init();
     let (server, state, tap) = webhook_tap().await;
     let mut app = TestApp::new()
-        .auth(Arc::new(crate::auth::AuthMiddleware::new(
+        .auth(Arc::new(crate::auth::AuthMiddleware::new_builtin(
             &serde_yaml::from_str::<crate::config::AuthCfg>("chain: [test-groups-module]\n")
                 .unwrap(),
         )))

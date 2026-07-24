@@ -130,40 +130,53 @@ impl fmt::Debug for AuthMiddleware {
 }
 
 impl AuthMiddleware {
-    pub(crate) fn new(cfg: &AuthCfg) -> Self {
-        // Build the auth chain by RESOLVING the configured module entries. The built-in `keys`
-        // (signed-key verifier) is engine-handled: virtual keys authenticate on the governance
-        // path, not through a boxed module, so its entry sets a flag rather than a module. An
-        // unknown name is skipped here with a loud log; config_validate rejects it at boot, so a
-        // running server never has a silently-dropped module. An EMPTY chain is the open front
-        // door (the old none/passthrough).
+    /// Build the auth chain by RESOLVING the configured module entries against the plugin
+    /// `registry`. The built-in `keys` (signed-key verifier) is engine-handled: virtual keys
+    /// authenticate on the governance path, not through a boxed module, so its entry sets a flag
+    /// rather than a module. Any OTHER name is resolved as a `kind: auth` PLUGIN via
+    /// [`PluginRegistry::open_auth`] (the exact trust/load pipeline store & secret plugins use) and
+    /// boxed into the chain. FAIL-CLOSED: a configured auth module that cannot be loaded (missing
+    /// tarball, wrong kind, untrusted under the running policy, or a `dlopen`/ABI failure) is a
+    /// HARD boot error — never a silently-dropped module that would leave the front door open.
+    /// `--validate`/`plugins_preflight` catches most of these manifest-only, so this is the
+    /// belt-and-suspenders load-time gate. An EMPTY chain is the open front door (none/passthrough).
+    ///
+    /// The plugin's config JSON is its chain entry's opaque `settings:` map (verbatim, exactly like
+    /// a store/secret plugin's `settings:`). The chain module's RUNTIME identity is `module.name()`
+    /// (the name the loaded plugin reports over the ABI), which is what `role_bindings.<module>` and
+    /// `auth.modules.<module>` caps key off — not the config alias.
+    pub(crate) fn new(
+        cfg: &AuthCfg,
+        registry: &busbar_plugin_loader::PluginRegistry,
+    ) -> Result<Self, String> {
         let mut keys_in_chain = false;
-        let chain: Vec<Box<dyn AuthModule>> = cfg
-            .chain
-            .iter()
-            .filter_map(|entry| -> Option<Box<dyn AuthModule>> {
-                match entry.module.as_str() {
-                    crate::config::KEYS_MODULE => {
-                        keys_in_chain = true;
-                        None
-                    }
-                    // TEST-ONLY external-module stand-in for the DATA-PLANE chain (the admin
-                    // chain has its own): `grp:<role>` identifies as a principal carrying that
-                    // role, so the governance re-key is e2e-testable. Compiled out of release
-                    // binaries entirely.
-                    #[cfg(test)]
-                    "test-groups-module" => Some(Box::new(TestGroupsModule)),
-                    other => {
-                        tracing::error!(
-                            module = other,
-                            "auth.chain names an unknown/uncompiled module; skipping \
-                             (config_validate rejects this at boot)"
-                        );
-                        None
-                    }
+        let mut chain: Vec<Box<dyn AuthModule>> = Vec::new();
+        for entry in &cfg.chain {
+            match entry.module.as_str() {
+                crate::config::KEYS_MODULE => {
+                    keys_in_chain = true;
                 }
-            })
-            .collect();
+                // TEST-ONLY external-module stand-in for the DATA-PLANE chain (the admin chain has
+                // its own): `grp:<role>` identifies as a principal carrying that role, so the
+                // governance re-key is e2e-testable. Compiled out of release binaries entirely.
+                #[cfg(test)]
+                "test-groups-module" => chain.push(Box::new(TestGroupsModule)),
+                other => {
+                    // A `kind: auth` PLUGIN: resolve + open over the signed hybrid ABI (same trust
+                    // posture, same loader as store/secret). The `settings:` map is the plugin's
+                    // opaque config, pushed verbatim. FAIL-CLOSED — surface the load error so boot
+                    // (or an apply/reload) aborts rather than silently dropping the module.
+                    let cfg_json = serde_json::Value::Object(entry.settings.clone()).to_string();
+                    let module = registry.open_auth(other, &cfg_json).map_err(|e| {
+                        format!(
+                            "auth.chain module '{other}' could not be loaded as a `kind: auth` \
+                             plugin: {e}"
+                        )
+                    })?;
+                    chain.push(module);
+                }
+            }
+        }
 
         if chain.is_empty() && !keys_in_chain {
             tracing::warn!(
@@ -171,11 +184,21 @@ impl AuthMiddleware {
             );
         }
 
-        Self {
+        Ok(Self {
             upstream_creds: cfg.upstream_credentials,
             keys_in_chain,
             chain,
-        }
+        })
+    }
+
+    /// TEST-ONLY convenience: build the chain against an EMPTY plugin registry (only builtins +
+    /// the compiled-in `test-groups-module` resolve). Panics on a plugin-name entry — a test that
+    /// needs a real `kind: auth` plugin builds a registry and calls [`new`] directly. Keeps the
+    /// dozens of builtin-only test call sites from threading a registry + `.unwrap()` each.
+    #[cfg(test)]
+    pub(crate) fn new_builtin(cfg: &AuthCfg) -> Self {
+        Self::new(cfg, &busbar_plugin_loader::PluginRegistry::empty())
+            .expect("builtin-only auth chain never fails to construct")
     }
 
     /// The ordered names of the auth chain's modules (`module.name()` for each). For the Admin API

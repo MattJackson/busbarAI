@@ -933,7 +933,7 @@ async fn test_passthrough_no_caller_token_selects_empty_not_lane_key() {
             .api_key("sk-operator-secret"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&passthrough)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&passthrough)))
         .build();
 
     let body = serde_json::to_vec(
@@ -1822,7 +1822,7 @@ async fn test_anthropic_same_proto_passthrough_401_relays_request_id_verbatim_on
             .provider("anthropic"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&passthrough)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&passthrough)))
         .build();
 
     let resp = forward_with_pool(

@@ -31,7 +31,7 @@ fn minimal_app() -> Arc<App> {
         by_model: std::collections::HashMap::new(),
         pools: std::collections::HashMap::new(),
         client: crate::state::UpstreamClients::build(1, reqwest::Client::new),
-        auth: Arc::new(crate::auth::AuthMiddleware::new(
+        auth: Arc::new(crate::auth::AuthMiddleware::new_builtin(
             &crate::config::AuthCfg::default_none(),
         )),
         rewrite_hooks: Vec::new(),
@@ -2013,7 +2013,9 @@ async fn test_role_bound_principal_governed_like_a_virtual_key() {
         )
         .pool("gpool-a", &[(0, 1)])
         .pool("gpool-b", &[(0, 1)])
-        .auth(StdArc::new(crate::auth::AuthMiddleware::new(&auth_cfg)))
+        .auth(StdArc::new(crate::auth::AuthMiddleware::new_builtin(
+            &auth_cfg,
+        )))
         .governance(gov)
         // The old GovState carried fee 0; keep the no-charge semantics under the CostModel.
         .cost(crate::cost::CostModel::flat(0))

@@ -284,7 +284,11 @@ fn validate_config_command() -> i32 {
     // consistency (plugins.enabled vs store.module), trust-policy resolution, the three-phase
     // scan of every tarball (structural -> trust -> conflict), and store resolution. Manifest-only:
     // nothing is `dlopen`ed, no store is opened — zero side effects.
-    let registry = match plugins_preflight(loaded.deploy.store.as_ref(), &loaded.deploy.plugins) {
+    let registry = match plugins_preflight(
+        loaded.deploy.store.as_ref(),
+        cfg.auth.as_ref(),
+        &loaded.deploy.plugins,
+    ) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[error] {e}");
@@ -1465,12 +1469,28 @@ pub(crate) fn load_config_from_disk(
 /// NO plugin code runs in this function (manifest-only; `dlopen` happens later, at store open).
 pub(crate) fn plugins_preflight(
     store_cfg: Option<&config::StoreCfg>,
+    auth_cfg: Option<&config::AuthCfg>,
     plugins_cfg: &config::PluginsCfg,
 ) -> Result<busbar_plugin_loader::PluginRegistry, String> {
     let store_ref = store_cfg
         .map(|g| g.module.as_str())
         .unwrap_or(config::GOVERNANCE_STORE_MEMORY);
     let store_is_plugin = store_ref != config::GOVERNANCE_STORE_MEMORY;
+
+    // Every non-builtin `auth.chain` module is a `kind: auth` plugin — the same manifest-only
+    // pre-flight the store ref gets, so `--validate` catches a missing/wrong-kind/untrusted auth
+    // plugin BEFORE boot. `keys` is engine-handled (never a plugin); `test-groups-module` is the
+    // compiled-in test stand-in.
+    let auth_plugin_refs: Vec<&str> = auth_cfg
+        .map(|a| {
+            a.chain
+                .iter()
+                .map(|e| e.module.as_str())
+                .filter(|m| *m != config::KEYS_MODULE && *m != "test-groups-module")
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_auth_plugin = !auth_plugin_refs.is_empty();
 
     // 1. Consistency: referencing a plugin store while the master switch is off is a NAMED error.
     if store_is_plugin && !plugins_cfg.enabled {
@@ -1479,6 +1499,17 @@ pub(crate) fn plugins_preflight(
              false (the default). Set plugins.enabled: true and place the signed \
              '{store_ref}' store plugin tarball in the plugins directory ('{}'), or set \
              store.module: memory.",
+            plugins_cfg.dir
+        ));
+    }
+    // Same consistency gate for an auth plugin: a configured `kind: auth` module cannot load with
+    // the plugin subsystem off — fail-closed, never a silently-open front door.
+    if has_auth_plugin && !plugins_cfg.enabled {
+        return Err(format!(
+            "auth.chain names plugin module(s) [{}], which require the plugin subsystem, but \
+             plugins.enabled is false (the default). Set plugins.enabled: true and place the \
+             signed auth plugin tarball(s) in the plugins directory ('{}').",
+            auth_plugin_refs.join(", "),
             plugins_cfg.dir
         ));
     }
@@ -1552,6 +1583,44 @@ pub(crate) fn plugins_preflight(
                         "store.module: '{store_ref}' does not match any plugin in '{}' (by \
                          alias or canonical name; loadable: [{}]). Install the store plugin \
                          tarball, or set store.module: memory.",
+                        plugins_cfg.dir,
+                        registry
+                            .loadable()
+                            .iter()
+                            .map(|p| p.manifest.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+    }
+
+    // 5. Every configured auth-chain plugin must resolve to a loadable `kind: auth` plugin. Same
+    // manifest-only resolution as the store ref (no `dlopen` here; the real load happens in
+    // `AuthMiddleware::new` at App construction). A missing/wrong-kind/untrusted auth plugin fails
+    // `--validate` and boot alike — a typo'd or absent front-door module must never pass silently.
+    for auth_ref in &auth_plugin_refs {
+        match registry.resolve(auth_ref) {
+            Some(p) if p.manifest.kind == "auth" => {}
+            Some(p) => {
+                return Err(format!(
+                    "auth.chain module '{auth_ref}' resolves to plugin '{}' of kind '{}', not an \
+                     `auth` plugin",
+                    p.manifest.name, p.manifest.kind
+                ));
+            }
+            None => {
+                return Err(match registry.unresolved_reason(auth_ref) {
+                    Some(s) => format!(
+                        "auth.chain module '{auth_ref}' matches plugin '{}' ({}) but it was not \
+                         loaded: {}",
+                        s.manifest.name, s.file, s.reason
+                    ),
+                    None => format!(
+                        "auth.chain module '{auth_ref}' does not match any plugin in '{}' (by \
+                         alias or canonical name; loadable: [{}]). Install the `kind: auth` plugin \
+                         tarball, or remove it from auth.chain.",
                         plugins_cfg.dir,
                         registry
                             .loadable()
@@ -1738,7 +1807,11 @@ pub(crate) fn build_app_from_config(
     // PLUGIN PRE-FLIGHT (the ONE shared pipeline; see the fn doc). Run UP FRONT so the secret
     // resolver - and the store open below - both draw on the same validated registry. A non-memory
     // store, an unresolvable secret plugin, or any invalid tarball fails boot here.
-    let plugin_registry = Arc::new(plugins_preflight(cfg.store.as_ref(), &plugins_cfg)?);
+    let plugin_registry = Arc::new(plugins_preflight(
+        cfg.store.as_ref(),
+        cfg.auth.as_ref(),
+        &plugins_cfg,
+    )?);
 
     // The SECRET RESOLVER (P2): built-in env/file resolve inline; any other module delegates to a
     // loaded `kind: secret` plugin via the registry (fail-closed if the plugin subsystem is off or
@@ -2017,7 +2090,14 @@ pub(crate) fn build_app_from_config(
         tracing::error!("{banner}");
     }
 
-    let auth_mw = Arc::new(AuthMiddleware::new(&auth_cfg));
+    // FAIL-CLOSED: the auth chain resolves every non-builtin `auth.chain` module as a `kind: auth`
+    // plugin via the SAME validated registry the store/secret plugins load through. A configured
+    // auth plugin that cannot be loaded (missing/untrusted tarball, wrong kind, ABI failure) aborts
+    // boot here rather than silently dropping the module and leaving the front door open.
+    let auth_mw = Arc::new(
+        AuthMiddleware::new(&auth_cfg, &plugin_registry)
+            .map_err(|e| format!("auth chain construction failed: {e}"))?,
+    );
     // Thread the operator-configured hard-down cooldown + honored-Retry-After ceiling into the store
     // (both default to their historical const at the config layer).
     // D1 carry-over: an APPLY/RELOAD (prior = Some) restores every surviving lane's learned
