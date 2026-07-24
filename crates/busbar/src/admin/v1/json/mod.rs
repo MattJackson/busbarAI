@@ -87,6 +87,7 @@ impl AdminTransport for JsonV1 {
             )
             .route("/plugins", get(list_plugins).post(install_plugin))
             .route("/plugins/reload", post(reload_plugins))
+            .route("/plugins/rollback", post(rollback_plugin))
             .route("/plugins/{file}", axum::routing::delete(remove_plugin))
             .route("/auth", get(get_auth))
             .route(PATH_ADMIN_AUTH, get(get_admin_auth).put(put_auth))

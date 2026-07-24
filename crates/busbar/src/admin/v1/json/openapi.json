@@ -1629,6 +1629,46 @@
         ],
         "type": "object"
       },
+      "PluginRollbackView": {
+        "description": "The result of an EXPLICIT plugin ROLLBACK (`POST /api/v1/admin/plugins/rollback`, 1.5.0\nrollback-friendly versioning): the operator deliberately pinned a plugin DOWN to a prior version and\nthe engine hot-swapped to that artifact. The pin is persisted (survives restart) and the trust\nfloor was lowered to EXACTLY the pinned version for THIS plugin — a lower artifact still cannot\nload, and an automatic/silent replay of an old artifact is still refused (only this explicit,\naudited action lowered the floor). Additive-only; never a secret.",
+        "properties": {
+          "config_version": {
+            "description": "The now-live config version after the hot swap (the ETag the response also carries).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "file": {
+            "description": "The library FILENAME the rollback selected in the plugins directory.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The plugin's canonical manifest name that was pinned.",
+            "type": "string"
+          },
+          "note": {
+            "description": "A human note on the rollback's semantics + durability.",
+            "type": "string"
+          },
+          "publisher": {
+            "description": "The manifest publisher of the pinned artifact (`busbar` = first-party).",
+            "type": "string"
+          },
+          "version": {
+            "description": "The version the plugin was pinned DOWN to (now serving), from the target artifact's manifest.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "file",
+          "version",
+          "publisher",
+          "config_version",
+          "note"
+        ],
+        "type": "object"
+      },
       "PluginView": {
         "description": "One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either\nCOMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`),\nEXTERNAL (registered at runtime over socket/webhook), or a DYNAMIC-LIBRARY plugin (a loadable\n`.so`/`.dll`/`.dylib` in the plugins directory, loaded over the store C ABI). `active` is\n`Some(true/false)` where activation is tracked (auth modules: in the chain?; external hooks:\nconfigured = true; dynamic store: the configured `store.module`) and `None` where it is a\nper-pool concern not summarized here (compiled-in ranking policies). Additive-only.",
         "properties": {

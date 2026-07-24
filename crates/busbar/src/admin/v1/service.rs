@@ -1111,9 +1111,84 @@ impl AdminService {
         Ok(crate::admin::v1::contract::PluginReloadView {
             plugins,
             note:
-                "re-scanned the plugins directory; a store change takes effect on the next store \
-                   (re)load (restart or store.module apply), not as a hot swap",
+                "hot-reloaded the plugin layer LIVE: a new plugin registry and new kind:hook \
+                   transports are serving with no restart, and the prior shared libraries unmap once \
+                   in-flight requests drain. A `store` MODULE change still lands on a dedicated store \
+                   swap (the token ledger cannot be re-hydrated under load), not this reload.",
         })
+    }
+
+    /// The RESOLUTION half of an EXPLICIT plugin ROLLBACK (`POST /api/v1/admin/plugins/rollback`,
+    /// 1.5.0). Validate that `file` is a plugin tarball in the plugins dir, unpack + STRUCTURALLY
+    /// validate its manifest, and TRUST-verify it against a policy whose first-party floor is LOWERED to
+    /// the target's OWN version — so a validly-signed but OLDER artifact (exactly the rollback case)
+    /// clears trust here even though it would be an anti-downgrade reject on the automatic path. This is
+    /// where "automatic vs explicit" is made concrete: the rollback deliberately relaxes the floor to
+    /// the pinned target and only that target; a lower artifact still fails, and a signature/opt-in
+    /// failure is still fatal (a rollback can never launder an untrusted artifact). Returns the target
+    /// manifest identity (name/version/publisher) + the MERGED pin map (prior overlay pins with this
+    /// plugin's name set to the target version) the caller persists and re-derives the policy from.
+    ///
+    /// `prior_pins` is the current persisted `plugin_versions` overlay section (empty if none).
+    pub(crate) fn resolve_plugin_rollback(
+        &self,
+        file: &str,
+        prior_pins: &std::collections::BTreeMap<String, String>,
+    ) -> Result<
+        (
+            busbar_plugin_sign::Manifest,
+            std::collections::BTreeMap<String, String>,
+        ),
+        AdminError,
+    > {
+        use busbar_plugin_sign::{evaluate, validate_structure, Verdict};
+        let file = validate_plugin_filename(file)?;
+        let lib_path = self.app.plugins_dir.join(&file);
+        if !lib_path.is_file() {
+            return Err(AdminError::NotFound(format!("plugin `{file}`")));
+        }
+        let bytes = std::fs::read(&lib_path)
+            .map_err(|e| AdminError::Validation(format!("cannot read plugin `{file}`: {e}")))?;
+        let unpacked = busbar_plugin_loader::tarball::unpack(&bytes)
+            .map_err(|e| AdminError::Validation(format!("invalid plugin tarball `{file}`: {e}")))?;
+        validate_structure(
+            &unpacked.manifest,
+            &unpacked.lib_bytes,
+            &busbar_plugin_loader::supported_abi,
+        )
+        .map_err(|e| AdminError::Validation(format!("invalid plugin manifest `{file}`: {e}")))?;
+        let manifest = unpacked.manifest;
+
+        // Build the trust policy with the first-party floor LOWERED to the target artifact's own
+        // version — the EXPLICIT relaxation. `min_versions` is carried from base config as-is; we
+        // additionally lower THIS plugin's configured floor to the target version so a floored
+        // third-party plugin can also roll back. Anything the target does NOT satisfy (a broken
+        // signature, an un-opted-in third party) still fails: a rollback authenticates the OPERATOR,
+        // never the ARTIFACT.
+        let mut policy = self
+            .app
+            .plugins_cfg
+            .to_policy_with_floor(&manifest.version)
+            .map_err(AdminError::Validation)?;
+        policy
+            .min_versions
+            .insert(manifest.name.clone(), manifest.version.clone());
+        match evaluate(&unpacked.lib_bytes, &manifest, &policy) {
+            Ok(Verdict::Trusted { .. }) | Ok(Verdict::Allowed { .. }) => {}
+            Err(rejected) => {
+                return Err(AdminError::Conflict(format!(
+                    "rollback target `{file}` is not loadable under the trust policy even with the \
+                     floor lowered to its own version {}: {}. A rollback lowers the anti-downgrade \
+                     floor for an explicit operator action; it cannot load an untrusted artifact.",
+                    manifest.version, rejected.0
+                )));
+            }
+        }
+
+        // Merge: this plugin's pin becomes the target version; other plugins' prior pins are preserved.
+        let mut pins = prior_pins.clone();
+        pins.insert(manifest.name.clone(), manifest.version.clone());
+        Ok((manifest, pins))
     }
 
     /// `GET /api/v1/admin/config` — the EFFECTIVE running config, composed from the same redacted reads as

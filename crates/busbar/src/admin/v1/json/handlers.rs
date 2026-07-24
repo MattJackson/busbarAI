@@ -213,22 +213,70 @@ pub(crate) async fn remove_plugin(
     }
 }
 
-/// `POST /api/v1/admin/plugins/reload` — re-scan the plugins directory and report the reconciled
-/// dynamic-library inventory (Full scope) — the sibling of `config/reload`. Audited.
+/// `POST /api/v1/admin/plugins/reload` — HOT-SWAP the plugin layer LIVE (Full scope, audited) — the
+/// sibling of `config/reload`, now a true hot reload rather than a report-only re-scan.
+///
+/// It re-runs the exact fail-closed plugin pipeline boot runs (re-read `config.yaml` + the persisted
+/// overlay → resolve → three-phase `scan_and_validate` → open the hook transports) to build a FRESH
+/// `App` snapshot carrying a NEW `PluginRegistry` and NEW hook-plugin instances, then `handle.swap`s
+/// it. New requests immediately use the new plugin instances; in-flight requests finish on the OLD
+/// snapshot, and when that snapshot drops its instances drop, their `Arc`-held `Library` handles drop,
+/// and the old shared libraries unmap — no process restart. The core never goes down: any pipeline
+/// failure (a bad new artifact — bad signature / abi out of range / open failure / conflict) is
+/// FAIL-CLOSED — the swap is rejected, the OLD snapshot keeps serving, and the error names the fault.
+///
+/// The governance/store instance is REUSED across the swap (its keys/budgets/ledger must survive), so
+/// this hot-reloads the registry + `kind: hook` transports; a `store` MODULE change still lands on a
+/// dedicated store swap (the ledger cannot be silently re-hydrated under load). See the view `note`.
 pub(crate) async fn reload_plugins(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
 ) -> Response {
     let actor = principal.actor_id().to_string();
-    match service(&handle).reload_store_plugins() {
-        Ok(view) => {
+    // Serialize against config applies/reloads — they all rebuild-and-swap the App snapshot.
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    // EPHEMERAL mode (no disk config, e.g. tests/dev) has no disk truth to rebuild the snapshot from —
+    // fall back to the report-only reconcile (the folder is still the source of truth for the catalog),
+    // so an install→reload flow still works without persistence. The LIVE hot swap needs disk truth.
+    if current.config_path.is_none() || current.providers_path.is_none() {
+        return match service(&handle).reload_store_plugins() {
+            Ok(view) => {
+                audit::AUDIT.record_by(
+                    "plugin.reload",
+                    "plugin:dir",
+                    audit::OUTCOME_APPLIED,
+                    &actor,
+                );
+                ok_json(StatusCode::OK, &view)
+            }
+            Err(e) => {
+                audit::AUDIT.record_by(
+                    "plugin.reload",
+                    "plugin:dir",
+                    audit::OUTCOME_REJECTED,
+                    &actor,
+                );
+                err_json(&e)
+            }
+        };
+    }
+    match rebuild_app_from_disk(&current) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone()); // swap re-spawns health probers; old snapshot drains + drops
             audit::AUDIT.record_by(
                 "plugin.reload",
                 "plugin:dir",
                 audit::OUTCOME_APPLIED,
                 &actor,
             );
-            ok_json(StatusCode::OK, &view)
+            // Project the inventory of the NOW-LIVE snapshot (the reconciled, loaded set).
+            match service(&handle).reload_store_plugins() {
+                Ok(view) => ok_json(StatusCode::OK, &view),
+                // The swap already succeeded; a projection hiccup is an internal error, not a rollback.
+                Err(e) => err_json(&e),
+            }
         }
         Err(e) => {
             audit::AUDIT.record_by(
@@ -237,7 +285,146 @@ pub(crate) async fn reload_plugins(
                 audit::OUTCOME_REJECTED,
                 &actor,
             );
-            err_json(&e)
+            err_json(&AdminError::Validation(e))
+        }
+    }
+}
+
+/// The `POST /api/v1/admin/plugins/rollback` body: the target library FILENAME to roll DOWN to.
+#[derive(serde::Deserialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct PluginRollbackReq {
+    /// The plugin tarball FILENAME (in the plugins directory) carrying the prior version to pin to.
+    file: String,
+}
+
+/// `POST /api/v1/admin/plugins/rollback` — EXPLICIT, authenticated, audited rollback of a plugin to a
+/// PRIOR version (Full scope, `If-Match`, 1.5.0 rollback-friendly versioning).
+///
+/// Anti-downgrade blocks only AUTOMATIC/silent downgrade (a replayed old artifact being auto-accepted
+/// as "current"); it must NOT block an operator who pushed a bad plugin and needs to roll back. This
+/// endpoint is that escape hatch, and it is deliberately NOT a blanket floor bypass. It (1)
+/// authenticates the OPERATOR (Full scope) and rides `If-Match` for optimistic concurrency; (2)
+/// validates the TARGET artifact (structure + trust) with the anti-downgrade floor lowered to EXACTLY
+/// the target's own version — a lower artifact still fails, and an untrusted artifact still fails (a
+/// rollback authenticates the operator, never the bytes); (3) PERSISTS the version pin to the overlay
+/// (survives restart) and hot-swaps to the prior artifact via the same rebuild-and-swap path as
+/// `plugins/reload`; and (4) audits EVERY attempt (applied or rejected).
+///
+/// An automatic path (boot/reload/apply) never lowers the floor — only this explicit, audited action
+/// does (via the persisted pin) — so a silent replay of an old artifact is still refused.
+pub(crate) async fn rollback_plugin(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let req: PluginRollbackReq = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed rollback body: {e}"
+            )))
+        }
+    };
+    let resource = format!("plugin:{}", req.file);
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by(
+            "plugin.rollback",
+            &resource,
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&e);
+    }
+    // A rollback must PERSIST its pin — an ephemeral (no-overlay) busbar has nowhere durable to record
+    // the operator's decision, and a restart would silently re-upgrade. Refuse loudly.
+    let Some(overlay_path) = current.overlay_path.clone() else {
+        audit::AUDIT.record_by(
+            "plugin.rollback",
+            &resource,
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&AdminError::Validation(
+            "plugin rollback requires config persistence (BUSBAR_CONFIG_OVERLAY); without it the \
+             pin cannot be recorded and a restart would silently re-upgrade the plugin"
+                .into(),
+        ));
+    };
+    // The current persisted pins (empty if none) — the base we merge this rollback onto.
+    let prior_pins = match crate::config::overlay::read(&overlay_path) {
+        Some(doc) => doc.plugin_versions,
+        None => std::collections::BTreeMap::new(),
+    };
+    // Resolve + validate the target and compute the merged pin map (fail-closed on a bad/absent/
+    // untrusted target — nothing is persisted or swapped).
+    let (manifest, pins) = match service(&handle).resolve_plugin_rollback(&req.file, &prior_pins) {
+        Ok(v) => v,
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "plugin.rollback",
+                &resource,
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            return err_json(&e);
+        }
+    };
+    // Persist the pin FIRST, so the rebuild (which re-reads the overlay) derives the lowered floor and
+    // loads the prior artifact. Durability precedes the swap: if the process died between here and the
+    // swap, a restart would come up already rolled back (the safe direction).
+    crate::config::overlay::persist_plugin_versions(Some(&overlay_path), &pins);
+    match rebuild_app_from_disk(&current) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("plugin.rollback", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            installed.versions.record(
+                installed.config_version,
+                &actor,
+                &format!("plugin.rollback {resource} -> {}", manifest.version),
+                &installed.hook_registry,
+                &installed.global_hooks,
+            );
+            with_config_etag(
+                ok_json(
+                    StatusCode::OK,
+                    &crate::admin::v1::contract::PluginRollbackView {
+                        name: manifest.name,
+                        file: req.file,
+                        version: manifest.version,
+                        publisher: manifest.publisher,
+                        config_version: cur.config_version,
+                        note: "rolled the plugin DOWN to the prior version and hot-swapped to it; the \
+                               version pin is persisted (survives restart) and the anti-downgrade \
+                               floor was lowered ONLY for this explicit, audited action — a silent \
+                               replay of an old artifact is still refused.",
+                    },
+                ),
+                cur.config_version,
+            )
+        }
+        Err(e) => {
+            // The rebuild failed AFTER persisting the pin — the live snapshot is unchanged (old plugin
+            // still serving, fail-closed), but the pin is now on disk. Roll the pin back so a restart
+            // doesn't come up in a state the running engine rejected.
+            crate::config::overlay::persist_plugin_versions(Some(&overlay_path), &prior_pins);
+            audit::AUDIT.record_by(
+                "plugin.rollback",
+                &resource,
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            err_json(&AdminError::Validation(e))
         }
     }
 }
@@ -1648,6 +1835,59 @@ pub(crate) async fn flush_credential_cache(
 /// atomically swap it in. A NORMAL admin call under the NORMAL admin auth chain — no second
 /// credential path exists (D3). Invalid disk config = `invalid_request`, nothing changes. The
 /// GitOps primitive: push config, call reload, no restart, no health amnesia.
+/// Rebuild a fresh `App` snapshot from DISK TRUTH (base `config.yaml` + `providers.yaml`) merged with
+/// the persisted OVERLAY, reusing `current`'s process-lifetime state (governance/store, version log,
+/// limiters, health by stable identity). The shared core of `config/reload` AND `plugins/reload`: both
+/// re-run the exact fail-closed boot pipeline (which re-scans the plugins dir into a NEW registry and
+/// re-opens every hook transport), differing only in what they report. Returns the built `App` (the
+/// caller wraps it in `Arc` and swaps) or a human-readable error (any failure changes nothing —
+/// fail-closed, the old snapshot keeps serving). Requires disk config paths (ephemeral mode has no
+/// disk truth to read).
+pub(crate) fn rebuild_app_from_disk(
+    current: &Arc<crate::state::App>,
+) -> Result<crate::state::App, String> {
+    let (Some(config_path), Some(providers_path)) =
+        (current.config_path.clone(), current.providers_path.clone())
+    else {
+        return Err(
+            "this busbar was started without config files (ephemeral mode); reload has no \
+                    disk truth to read"
+                .into(),
+        );
+    };
+    let mut loaded = crate::load_config_from_disk(
+        &config_path,
+        &providers_path,
+        false,
+        crate::config::EnvSubst::Strict,
+    )?;
+    // 1.5.0 full-config coverage: apply the overlay's `root` section (single-value config) AND the
+    // `plugin_versions` rollback pins onto the base `DeployCfg` BEFORE resolve, so the limits
+    // projection + admin-mTLS boot-guard + the plugin trust FLOORS re-derive over the merged shape —
+    // exactly as boot does. The hooks/groups sections merge POST-resolve below.
+    if let Some(doc) = loaded.overlay_doc.as_ref() {
+        crate::config::overlay::apply_root_to_deploy(&mut loaded.deploy, doc);
+    }
+    let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
+        .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
+    // Base hook + group names = the config-defined registry, pre-overlay (the admin API refuses
+    // to PUT-replace / DELETE one); then merge the persisted overlay onto the resolved registry.
+    let base_hook_names: std::collections::HashSet<String> = cfg.hooks.keys().cloned().collect();
+    let base_group_names: std::collections::HashSet<String> = cfg.groups.keys().cloned().collect();
+    if let Some(doc) = loaded.overlay_doc {
+        crate::config::overlay::merge_into(&mut cfg, doc);
+    }
+    crate::build_app_from_config(
+        cfg,
+        loaded.deploy.plugins.clone(),
+        loaded.overlay_path,
+        base_hook_names,
+        base_group_names,
+        (Some(config_path), Some(providers_path)),
+        Some(current.as_ref()),
+    )
+}
+
 pub(crate) async fn reload_config(
     State(handle): State<Arc<AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
@@ -1655,50 +1895,7 @@ pub(crate) async fn reload_config(
     let actor = principal.actor_id().to_string();
     let _mlock = CONFIG_MUTATION_LOCK.lock().await;
     let current = handle.load();
-    let (Some(config_path), Some(providers_path)) =
-        (current.config_path.clone(), current.providers_path.clone())
-    else {
-        return err_json(&AdminError::Validation(
-            "this busbar was started without config files (ephemeral mode); reload has no disk \
-             truth to read"
-                .into(),
-        ));
-    };
-    let outcome = crate::load_config_from_disk(
-        &config_path,
-        &providers_path,
-        false,
-        crate::config::EnvSubst::Strict,
-    )
-    .and_then(|mut loaded| {
-        // 1.5.0 full-config coverage: apply the overlay's `root` section (single-value config) onto
-        // the base `DeployCfg` BEFORE resolve, so the limits projection + admin-mTLS boot-guard
-        // re-derive over the merged shape — exactly as boot does. The hooks/groups sections merge
-        // POST-resolve below.
-        if let Some(doc) = loaded.overlay_doc.as_ref() {
-            crate::config::overlay::apply_root_to_deploy(&mut loaded.deploy, doc);
-        }
-        let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
-            .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
-        // Base hook + group names = the config-defined registry, pre-overlay (the admin API refuses
-        // to PUT-replace / DELETE one); then merge the persisted overlay onto the resolved registry.
-        let base_hook_names: std::collections::HashSet<String> =
-            cfg.hooks.keys().cloned().collect();
-        let base_group_names: std::collections::HashSet<String> =
-            cfg.groups.keys().cloned().collect();
-        if let Some(doc) = loaded.overlay_doc {
-            crate::config::overlay::merge_into(&mut cfg, doc);
-        }
-        crate::build_app_from_config(
-            cfg,
-            loaded.deploy.plugins.clone(),
-            loaded.overlay_path,
-            base_hook_names,
-            base_group_names,
-            (Some(config_path), Some(providers_path)),
-            Some(&current),
-        )
-    });
+    let outcome = rebuild_app_from_disk(&current);
     match outcome {
         Ok(next) => {
             let installed = Arc::new(next);
@@ -3255,6 +3452,12 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/plugins", "get", "200", Page<PluginView>);
     typed!("/plugins", "post", "201", PluginInstallView);
     typed!("/plugins/reload", "post", "200", PluginReloadView);
+    typed!(
+        "/plugins/rollback",
+        "post",
+        "200",
+        crate::admin::v1::contract::PluginRollbackView
+    );
     typed!("/usage", "get", "200", UsageView);
     typed!("/config", "get", "200", EffectiveConfigView);
     typed!(PATH_CONFIG_VALIDATE, "post", "200", ConfigValidateView);

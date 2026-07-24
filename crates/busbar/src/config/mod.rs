@@ -1677,6 +1677,17 @@ pub(crate) struct PluginsCfg {
     /// meets the floor; nothing else loads it. Sibling of `trust` (a version axis, not a trust axis).
     #[serde(default)]
     pub(crate) min_versions: std::collections::BTreeMap<String, String>,
+    /// RUNTIME-ONLY (never in config, `#[serde(skip)]`): the FIRST-PARTY anti-downgrade floor OVERRIDE
+    /// for an EXPLICIT operator rollback (1.5.0). `None` (the default, and the ONLY value the automatic
+    /// boot/reload path ever sees) = the running binary's own version — the full automatic floor. An
+    /// explicit, audited `POST /plugins/rollback` of a FIRST-PARTY plugin sets this to the pinned
+    /// target version so `busbar_plugin_sign::evaluate`'s first-party check (which gates on
+    /// `binary_version`) admits the prior first-party artifact. Derived from the persisted
+    /// `plugin_versions` pins during a rebuild (`overlay::apply_plugin_versions_to_deploy`); it is
+    /// never deserialized, so config parsing + `deny_unknown_fields` are unchanged. See
+    /// `to_policy_with_floor`'s doc for the automatic-vs-explicit contract.
+    #[serde(skip)]
+    pub(crate) first_party_floor: Option<String>,
 }
 
 impl Default for PluginsCfg {
@@ -1686,6 +1697,7 @@ impl Default for PluginsCfg {
             dir: default_plugins_dir(),
             trust: PluginsTrustCfg::default(),
             min_versions: std::collections::BTreeMap::new(),
+            first_party_floor: None,
         }
     }
 }
@@ -1727,6 +1739,40 @@ impl PluginsCfg {
     /// third-party publishers/opt-ins/floors. A malformed publisher key is a boot error, not a
     /// silent skip (a skipped trust anchor could wrongly reject a good plugin).
     pub(crate) fn to_policy(&self) -> Result<busbar_plugin_sign::TrustPolicy, String> {
+        // The AUTOMATIC anti-downgrade posture: the first-party floor is the running binary's own
+        // version, so a validly-signed but OLD first-party artifact can never be REPLAYED into a newer
+        // binary and silently accepted as "current". This is the policy every automatic path
+        // (boot / config reload / config apply / admin plugin reload) uses — UNLESS an explicit,
+        // audited rollback has set `first_party_floor` (a runtime-only, serde-skip field derived from
+        // the persisted `plugin_versions` pins), in which case the operator's pinned floor stands.
+        // `first_party_floor` is `None` on every path except a rebuild carrying a persisted rollback
+        // pin, so the automatic guarantee is unchanged by default.
+        let floor = self
+            .first_party_floor
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        self.to_policy_with_floor(floor)
+    }
+
+    /// Build the trust policy with an EXPLICIT first-party anti-downgrade floor OVERRIDE — the seam
+    /// that makes "automatic vs explicit" downgrade concrete in code (1.5.0 rollback-friendly
+    /// versioning). `binary_version` is the frozen `busbar_plugin_sign::evaluate` first-party floor: a
+    /// `publisher: busbar` artifact below it is a hard reject no opt-in can relax.
+    ///
+    /// - AUTOMATIC paths call [`to_policy`], which passes the running binary's own version — the full
+    ///   floor. A replayed old first-party artifact hitting any automatic path still faces it and is
+    ///   refused. Anti-downgrade holds.
+    /// - An EXPLICIT operator ROLLBACK (Full-scope, If-Match, audited) passes the operator's pinned
+    ///   TARGET version here, LOWERING the floor to exactly that version, so the prior artifact — and
+    ///   nothing older — re-loads. The distinction is not in the frozen `evaluate`/`Manifest` (both
+    ///   untouched): it is WHICH floor the engine feeds the policy, and that choice is gated by an
+    ///   authenticated, audited human action. `plugins.min_versions` (the configured third-party
+    ///   floor) is carried as-is here; the rollback lowers the relevant `min_versions` entry via the
+    ///   persisted overlay `plugin_versions` pin (see `overlay::apply_plugin_versions_to_deploy`).
+    pub(crate) fn to_policy_with_floor(
+        &self,
+        binary_version: &str,
+    ) -> Result<busbar_plugin_sign::TrustPolicy, String> {
         let mut publishers = std::collections::BTreeMap::new();
         for p in &self.trust.publishers {
             if p.name == busbar_plugin_sign::FIRST_PARTY_PUBLISHER {
@@ -1743,7 +1789,7 @@ impl PluginsCfg {
         }
         Ok(busbar_plugin_sign::TrustPolicy {
             first_party_key: busbar_plugin_sign::embedded_release_pubkey(),
-            binary_version: env!("CARGO_PKG_VERSION").to_string(),
+            binary_version: binary_version.to_string(),
             publishers,
             allow_unsigned: self.trust.allow_unsigned,
             allow_third_party: self.trust.allow_third_party,

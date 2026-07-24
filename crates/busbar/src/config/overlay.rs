@@ -276,6 +276,29 @@ pub(crate) fn persist_root(path: Option<&Path>, settings: &RootSettings) {
     }
 }
 
+/// Persist the `plugin_versions` overlay section — the durable half of an explicit plugin ROLLBACK
+/// (1.5.0). Same read-modify-WRITE durability contract as `persist_root`: the hooks/groups/root
+/// sections (and their tombstones) are carried forward verbatim, and an unreadable overlay is REFUSED
+/// (never clobbered). `pins` is the FULL desired pin map (the caller computed the merge of the prior
+/// pins + this rollback), so an empty map clears the section (every pin lifted). `None` path is a
+/// no-op (persistence disabled). Best-effort: the live policy already swapped, so this is durability
+/// (a restart re-derives the same lowered floor from the persisted pin), never correctness.
+pub(crate) fn persist_plugin_versions(path: Option<&Path>, pins: &BTreeMap<String, String>) {
+    if let Some(p) = path {
+        let Some(mut doc) = load_for_rmw(p) else {
+            return;
+        };
+        doc.plugin_versions = pins.clone();
+        doc.version = OVERLAY_VERSION;
+        if let Err(e) = write(p, &doc) {
+            tracing::warn!(
+                error = %e, path = %p.display(),
+                "failed to persist config overlay (plugin_versions)"
+            );
+        }
+    }
+}
+
 /// One MUTABLE overlay SECTION — the unit a per-section reset (`DELETE /api/v1/admin/overlay/{section}`)
 /// discards. Each section is an independent `base + overlay` layer with its own entries + tombstones;
 /// clearing one reverts exactly that slice of the effective config to base `config.yaml` while the
@@ -286,6 +309,10 @@ pub(crate) enum OverlaySection {
     Groups,
     /// The single-value config sections (`RootSettings`) — the 1.5.0 full-config coverage slice.
     Root,
+    /// The per-plugin ROLLBACK version pins (1.5.0). Clearing it drops every explicit rollback pin,
+    /// restoring the base-config `plugins.min_versions` floors — the plugins then upgrade back to their
+    /// current artifacts on the next (re)load.
+    PluginVersions,
 }
 
 impl OverlaySection {
@@ -296,6 +323,7 @@ impl OverlaySection {
             "hooks" => Some(OverlaySection::Hooks),
             "groups" => Some(OverlaySection::Groups),
             "root" => Some(OverlaySection::Root),
+            "plugin_versions" => Some(OverlaySection::PluginVersions),
             _ => None,
         }
     }
@@ -306,6 +334,7 @@ impl OverlaySection {
             OverlaySection::Hooks => "hooks",
             OverlaySection::Groups => "groups",
             OverlaySection::Root => "root",
+            OverlaySection::PluginVersions => "plugin_versions",
         }
     }
 }
@@ -361,6 +390,17 @@ pub(crate) struct OverlayDoc {
     /// `RootSettings::apply_to_deploy`. No tombstones: a single-value field is present-or-absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<RootSettings>,
+    /// The `plugin_versions` section (1.5.0 rollback-friendly versioning): per-plugin VERSION PINS an
+    /// operator set via an EXPLICIT, authenticated, audited rollback (`POST
+    /// /api/v1/admin/plugins/rollback`). Maps a plugin's manifest `name` -> the version the operator
+    /// deliberately pinned it to. This is DISTINCT from `plugins.min_versions` (the base-config
+    /// anti-downgrade FLOOR): a pin LOWERS the effective floor for THAT plugin to the pinned version so
+    /// the prior artifact re-loads, and it does so ONLY because a human took an explicit, audited
+    /// action — an automatic/silent replay of an old artifact never consults this map and still faces
+    /// the full floor. See `PluginsCfg::to_policy_with_pins`. Empty (`{}`, the default) = no pins, the
+    /// base floors stand unchanged. No tombstones: a pin is present-or-absent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) plugin_versions: BTreeMap<String, String>,
 }
 
 impl OverlayDoc {
@@ -381,6 +421,9 @@ impl OverlayDoc {
             OverlaySection::Root => {
                 self.root = None;
             }
+            OverlaySection::PluginVersions => {
+                self.plugin_versions.clear();
+            }
         }
     }
 
@@ -395,6 +438,7 @@ impl OverlayDoc {
             }
             OverlaySection::Groups => self.groups.is_empty() && self.deleted_groups.is_empty(),
             OverlaySection::Root => self.root.as_ref().is_none_or(RootSettings::is_empty),
+            OverlaySection::PluginVersions => self.plugin_versions.is_empty(),
         }
     }
 }
@@ -475,6 +519,48 @@ pub(crate) fn apply_root_to_deploy(deploy: &mut DeployCfg, doc: &OverlayDoc) {
     if let Some(root) = &doc.root {
         root.apply_to_deploy(deploy);
     }
+    apply_plugin_versions_to_deploy(deploy, doc);
+}
+
+/// Apply the overlay's `plugin_versions` pins onto `deploy.plugins.min_versions` (1.5.0
+/// rollback-friendly versioning). Each pin OVERRIDES the base-config floor for THAT plugin name to the
+/// operator's explicitly-pinned version — so on the next (re)load the pinned (older) third-party
+/// artifact clears its (now-lowered) floor and re-loads, and no floor is silently RAISED. A pin only
+/// ever exists because a human took an explicit, authenticated, audited rollback action; the automatic
+/// boot/reload path merely honors the persisted decision. A pin for a plugin the base config never
+/// floored simply adds a (low) floor entry — harmless, since a floor at/below the artifact's version
+/// is a no-op. NOTE: this covers the CONFIGURED (third-party) floor only; the AUTOMATIC first-party
+/// `binary_version` floor inside `busbar_plugin_sign::evaluate` is NOT relaxed here (that would let a
+/// replayed old first-party artifact load on the automatic path) — an explicit first-party rollback
+/// lowers `binary_version` only on the dedicated, audited rollback swap path.
+pub(crate) fn apply_plugin_versions_to_deploy(deploy: &mut DeployCfg, doc: &OverlayDoc) {
+    for (name, pinned) in &doc.plugin_versions {
+        deploy
+            .plugins
+            .min_versions
+            .insert(name.clone(), pinned.clone());
+    }
+    // FIRST-PARTY floor: `busbar_plugin_sign::evaluate` gates a first-party artifact on the single
+    // `binary_version` (checked BEFORE any `min_versions` entry), so a first-party rollback cannot be
+    // expressed by a per-name `min_versions` pin alone — it must LOWER `binary_version`. We lower it to
+    // the LOWEST pinned version across all pins; this is the runtime-only `first_party_floor` override.
+    // SCOPE NOTE (surfaced for review): because `evaluate` has ONE first-party floor, lowering it for a
+    // pinned first-party plugin also lowers it for any OTHER first-party plugin present — an unpinned
+    // first-party artifact below `CARGO_PKG_VERSION` but at/above the lowest pin could then load on a
+    // rebuild. A per-plugin first-party floor would need a per-plugin scan-time policy (a scan API
+    // change). In practice the first-party set is small and the operator's rollback is an explicit,
+    // audited fleet decision; the caveat is documented rather than silently assumed.
+    deploy.plugins.first_party_floor = doc
+        .plugin_versions
+        .values()
+        .min_by(|a, b| {
+            if busbar_plugin_sign::version_at_least(a, b) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        })
+        .cloned();
 }
 
 /// Merge an overlay into the RESOLVED config (the boot-merge, run AFTER `config::resolve` - the

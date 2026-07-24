@@ -730,6 +730,29 @@ pub(crate) struct PluginReloadView {
     pub(crate) note: &'static str,
 }
 
+/// The result of an EXPLICIT plugin ROLLBACK (`POST /api/v1/admin/plugins/rollback`, 1.5.0
+/// rollback-friendly versioning): the operator deliberately pinned a plugin DOWN to a prior version and
+/// the engine hot-swapped to that artifact. The pin is persisted (survives restart) and the trust
+/// floor was lowered to EXACTLY the pinned version for THIS plugin — a lower artifact still cannot
+/// load, and an automatic/silent replay of an old artifact is still refused (only this explicit,
+/// audited action lowered the floor). Additive-only; never a secret.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "openapi-schema", derive(schemars::JsonSchema))]
+pub(crate) struct PluginRollbackView {
+    /// The plugin's canonical manifest name that was pinned.
+    pub(crate) name: String,
+    /// The library FILENAME the rollback selected in the plugins directory.
+    pub(crate) file: String,
+    /// The version the plugin was pinned DOWN to (now serving), from the target artifact's manifest.
+    pub(crate) version: String,
+    /// The manifest publisher of the pinned artifact (`busbar` = first-party).
+    pub(crate) publisher: String,
+    /// The now-live config version after the hot swap (the ETag the response also carries).
+    pub(crate) config_version: u64,
+    /// A human note on the rollback's semantics + durability.
+    pub(crate) note: &'static str,
+}
+
 /// The ingress auth chain read (`GET /api/v1/admin/auth`): the ordered module names that authenticate
 /// callers + the upstream-credential mode. Never a secret — module names and the mode are config
 /// identifiers, not credentials. An empty `chain` is the open front door (admits every request).
