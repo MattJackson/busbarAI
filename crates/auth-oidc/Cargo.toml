@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-auth-oidc"
+version = "1.5.0"
+publish = false            # internal workspace crate; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "The OIDC auth module for busbar: verify an OpenID Connect JWT (JWKS signature + iss/aud/exp/nbf) and map its role/group claim to a Principal. Implements busbar_api::AuthModule. Crypto on ring (no jsonwebtoken/rsa)."
+license = "Apache-2.0"
+
+[dependencies]
+busbar-api = { path = "../api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Signature verification on the workspace's existing crypto backend — NO jsonwebtoken/rsa (avoids
+# RUSTSEC-2023-0071 and a second crypto stack). ring is already in the graph (rustls' backend).
+ring = "0.17"
+# base64url for the JWT segments and JWKS key material; already in the graph.
+base64 = "0.22"
+# JWKS/discovery HTTPS fetch on the SAME reqwest 0.12 major busbar already uses (rustls/ring TLS). The
+# `blocking` feature reuses that major (no second HTTP stack); the auth path is synchronous.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+tracing = "0.1"
+
+[dev-dependencies]
+# ring's ECDSA keygen/signing lets the tests mint real ES256 tokens + a matching JWKS fixture with no
+# network — the full signature path is exercised in-process.
+ring = { version = "0.17", features = ["std"] }

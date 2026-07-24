@@ -252,6 +252,163 @@ pub unsafe fn close_impl(handle: *mut c_void) {
     drop(Box::from_raw(handle as *mut BoxedStore));
 }
 
+// ── AUTH-plugin glue (`kind: auth`) ──────────────────────────────────────────────────────────────
+// Mirrors the store glue: same six-symbol shape via `export_plugin!`, its own handle type
+// (`Box<dyn AuthModule>`) and the identity-only auth wire. A denied credential is a SUCCESSFUL call
+// (`Reject`/`Pass` ride the OK payload); only a malformed request / encode failure is a protocol error.
+
+/// The auth handle behind the opaque `*mut c_void`: a boxed [`busbar_api::AuthModule`].
+type BoxedAuth = Box<dyn busbar_api::AuthModule>;
+
+/// The auth PAYLOAD schema version this SDK builds against (the manifest `abi_version` a `kind: auth`
+/// plugin declares). NOT the transport version — see [`transport_version`].
+pub fn auth_abi_version() -> u32 {
+    1
+}
+
+/// Run one [`busbar_plugin_abi::auth::AuthRequest`] against an `AuthModule` — the single match that
+/// maps the wire enum to the trait, unit-testable without FFI. An empty `credential` (no usable
+/// credential presented) is passed to `authenticate(None)`.
+pub fn dispatch_auth(
+    module: &dyn busbar_api::AuthModule,
+    req: busbar_plugin_abi::auth::AuthRequest,
+) -> busbar_plugin_abi::auth::AuthResponse {
+    use busbar_plugin_abi::auth::{AuthRequest, AuthResponse};
+    match req {
+        AuthRequest::Name => AuthResponse::Name(module.name().to_string()),
+        AuthRequest::Cacheable => AuthResponse::Cacheable(module.cacheable()),
+        AuthRequest::Authenticate { credential } => {
+            let candidate = if credential.is_empty() {
+                None
+            } else {
+                Some(credential.as_str())
+            };
+            AuthResponse::from_outcome(module.authenticate(candidate))
+        }
+    }
+}
+
+/// `busbar_open` body for an auth plugin — build a `Box<dyn AuthModule>` from the JSON config.
+///
+/// # Safety
+/// Pointers must be valid per the ABI (see [`open_impl`]).
+pub unsafe fn auth_open_impl(
+    cfg: *const u8,
+    cfg_len: usize,
+    out_handle: *mut *mut c_void,
+    out_err: *mut *mut u8,
+    out_err_len: *mut usize,
+    ctor: fn(&str) -> Result<BoxedAuth, String>,
+) -> i32 {
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if cfg_len == 0 {
+            &[]
+        } else if cfg.is_null() {
+            return Err((String::from("null config pointer"), true));
+        } else {
+            std::slice::from_raw_parts(cfg, cfg_len)
+        };
+        let s = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return Err((String::from("config is not valid UTF-8"), true)),
+        };
+        ctor(s).map_err(|msg| (msg, false))
+    }));
+    match res {
+        Ok(Ok(module)) => {
+            let handle = Box::into_raw(Box::new(module)) as *mut c_void;
+            if !out_handle.is_null() {
+                *out_handle = handle;
+            }
+            STATUS_OK
+        }
+        Ok(Err((msg, protocol))) => {
+            write_buf(msg.into_bytes(), out_err, out_err_len);
+            if protocol {
+                STATUS_PROTOCOL
+            } else {
+                STATUS_ERR
+            }
+        }
+        Err(_) => STATUS_PROTOCOL,
+    }
+}
+
+/// `busbar_call` body for an auth plugin — deserialize an [`busbar_plugin_abi::auth::AuthRequest`],
+/// dispatch, serialize the [`busbar_plugin_abi::auth::AuthResponse`]. Panics are caught.
+///
+/// # Safety
+/// `handle` must be a live handle from [`auth_open_impl`]; buffers per the ABI.
+pub unsafe fn auth_call_impl(
+    handle: *mut c_void,
+    req: *const u8,
+    req_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if handle.is_null() {
+        return STATUS_PROTOCOL;
+    }
+    let module: &BoxedAuth = &*(handle as *const BoxedAuth);
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if req_len == 0 {
+            &[]
+        } else if req.is_null() {
+            return Err((String::from("null request pointer"), true));
+        } else {
+            std::slice::from_raw_parts(req, req_len)
+        };
+        let request: busbar_plugin_abi::auth::AuthRequest = match serde_json::from_slice(bytes) {
+            Ok(r) => r,
+            Err(e) => return Err((format!("malformed request JSON: {e}"), true)),
+        };
+        let resp = dispatch_auth(module.as_ref(), request);
+        serde_json::to_vec(&resp).map_err(|e| (format!("response encode failed: {e}"), true))
+    }));
+    match res {
+        Ok(Ok(payload)) => {
+            write_buf(payload, out, out_len);
+            STATUS_OK
+        }
+        Ok(Err((msg, protocol))) => {
+            write_buf(msg.into_bytes(), out, out_len);
+            if protocol {
+                STATUS_PROTOCOL
+            } else {
+                STATUS_ERR
+            }
+        }
+        Err(_) => STATUS_PROTOCOL,
+    }
+}
+
+/// `busbar_close` body for an auth plugin — drop the module instance. Idempotent on null.
+///
+/// # Safety
+/// `handle` must be a live handle from [`auth_open_impl`] not already closed.
+pub unsafe fn auth_close_impl(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle as *mut BoxedAuth));
+}
+
+/// Emit an `auth`-kind cdylib plugin from `$ctor` (a
+/// `fn(&str) -> Result<Box<dyn busbar_api::AuthModule>, String>`). Expands through
+/// [`export_plugin!`], stamping `busbar_plugin_kind() == "auth"` + the six neutral symbols.
+#[macro_export]
+macro_rules! export_auth_plugin {
+    ($ctor:path) => {
+        $crate::export_plugin!(
+            kind = "auth",
+            open = $crate::auth_open_impl,
+            call = $crate::auth_call_impl,
+            close = $crate::auth_close_impl,
+            ctor = $ctor,
+        );
+    };
+}
+
 // ── SECRET-plugin glue (`kind: secret`) ─────────────────────────────────────────────────────────
 // Mirrors the store glue one-to-one: same five-symbol shape, same panic-catching impl style, its
 // own handle type (`Box<dyn SecretModule>`) and its own tiny request enum.
