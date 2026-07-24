@@ -2169,4 +2169,196 @@ mod tests {
         };
         assert!(matches!(&err, AdminError::NotFound(m) if m.contains("ghost")));
     }
+
+    // ---- group usage read (§6d, `GET /groups/{name}/usage`) ----
+
+    use crate::governance::{GovState, MemoryStore, TierTokens, VirtualKey};
+
+    /// The §6d fixture group: a group-wide requests cap (day), a group-wide budget (month), and a
+    /// POOL-SCOPED budget on `frontier` (month) — three distinct `(window, pool?)` enforcement
+    /// buckets from three limits.
+    fn usage_group_cfg() -> GroupCfg {
+        let limit = |metric, amount, per, pool: Option<&str>| LimitCfg {
+            metric,
+            amount,
+            per: Some(per),
+            pool: pool.map(String::from),
+            on_exhaust: None,
+            downgrade_to: None,
+        };
+        GroupCfg {
+            limits: vec![
+                limit(LimitMetric::Requests, 5, LimitWindow::Day, None),
+                limit(LimitMetric::Budget, 1_000, LimitWindow::Month, None),
+                limit(
+                    LimitMetric::Budget,
+                    500,
+                    LimitWindow::Month,
+                    Some("frontier"),
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// A cost model carrying `groups` and a rate card pricing model `m` at 10 micro-units per
+    /// token (in and out) — 1 cent per 1_000 tokens, so the derived-spend assertions are round.
+    fn usage_cost(groups: &std::collections::BTreeMap<String, GroupCfg>) -> crate::cost::CostModel {
+        let card = std::collections::BTreeMap::from([(
+            "m".to_string(),
+            crate::config::RateEntryCfg {
+                input_utok: 10.0,
+                output_utok: 10.0,
+                cache_read_utok: 0.0,
+                cache_write_utok: 0.0,
+            },
+        )]);
+        crate::cost::CostModel::resolve_parts(Some(&card), 0, groups)
+    }
+
+    fn usage_key(group: &str) -> VirtualKey {
+        VirtualKey {
+            id: "vk_usage_probe".to_string(),
+            key_hash: "h:vk_usage_probe".to_string(),
+            name: "usage-probe".to_string(),
+            allowed_pools: None,
+            enabled: true,
+            created_at: 0,
+            group: Some(group.to_string()),
+            labels: Default::default(),
+        }
+    }
+
+    fn input_toks(n: u64) -> TierTokens {
+        TierTokens {
+            input: n,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+        }
+    }
+
+    /// §6d: `get_group_usage` returns ONE row per `(window, pool?)` enforcement bucket. Usage is
+    /// driven through the REAL admission/accrual seam (`try_admit` + `record_usage`, the same path
+    /// the proxy charges), so the read proves: the pool-scoped bucket accounts ONLY its pool's
+    /// traffic, the group-wide buckets account everything, caps are projected from the limits, and
+    /// `budget_remaining_cents = cap − derived spend` (ledger × the current rate card).
+    #[tokio::test]
+    async fn get_group_usage_splits_window_pool_buckets_and_derives_remaining() {
+        let groups = std::collections::BTreeMap::from([("acme".to_string(), usage_group_cfg())]);
+        let gov = Arc::new(GovState::new(Arc::new(MemoryStore::new()), None).unwrap());
+        let app = TestApp::new()
+            .group("acme", usage_group_cfg())
+            .cost(usage_cost(&groups))
+            .governance(gov.clone())
+            .build();
+
+        // One request through `frontier` (100k tokens = 100 cents), one through `value` (50k =
+        // 50 cents). The frontier bucket must see only the first; the group-wide buckets both.
+        let k = usage_key("acme");
+        let now = crate::store::now();
+        gov.try_admit(&app.cost, &k, "frontier", now)
+            .expect("frontier request admits");
+        gov.record_usage(&app.cost, &k, "frontier", "m", &input_toks(100_000), now);
+        gov.try_admit(&app.cost, &k, "value", now)
+            .expect("value request admits");
+        gov.record_usage(&app.cost, &k, "value", "m", &input_toks(50_000), now);
+
+        let svc = AdminService::new(app);
+        let view = svc.get_group_usage("acme").await.expect("usage read");
+        assert_eq!(view.group, "acme");
+        assert!(view.enabled);
+        assert!(view.as_of >= now, "as_of is the read instant");
+        assert_eq!(
+            view.buckets.len(),
+            3,
+            "three (window, pool?) buckets: {:?}",
+            view.buckets
+        );
+        let find = |window: &str, pool: Option<&str>| {
+            view.buckets
+                .iter()
+                .find(|b| b.window == window && b.pool.as_deref() == pool)
+                .unwrap_or_else(|| {
+                    panic!("bucket ({window}, {pool:?}) missing: {:?}", view.buckets)
+                })
+        };
+
+        // (day, group-wide) — the requests cap's bucket: both admissions land; no budget cap ⇒
+        // no remaining (never a fabricated 0).
+        let day = find("day", None);
+        assert_eq!(day.requests, 2);
+        assert_eq!(day.tokens, 150_000);
+        assert_eq!(day.requests_cap, Some(5));
+        assert_eq!(day.budget_cap, None);
+        assert_eq!(day.budget_remaining_cents, None);
+
+        // (month, group-wide) — EVERY pool's traffic accounts here.
+        let month = find("month", None);
+        assert_eq!(month.requests, 2);
+        assert_eq!(month.tokens, 150_000);
+        assert_eq!(month.spend_cents, 150, "150k tokens at 1c/1k tokens");
+        assert_eq!(month.budget_cap, Some(1_000));
+        assert_eq!(month.budget_remaining_cents, Some(850));
+
+        // (month, frontier) — ONLY the frontier-dispatched request accounts here.
+        let frontier = find("month", Some("frontier"));
+        assert_eq!(frontier.requests, 1);
+        assert_eq!(frontier.tokens, 100_000);
+        assert_eq!(frontier.spend_cents, 100);
+        assert_eq!(frontier.budget_cap, Some(500));
+        assert_eq!(frontier.budget_remaining_cents, Some(400));
+    }
+
+    /// An unknown group is `not_found` — the usage read resolves against the enforcement
+    /// projection (the cost model), the same truth `try_admit` walks.
+    #[tokio::test]
+    async fn get_group_usage_unknown_group_not_found() {
+        let groups = std::collections::BTreeMap::from([("acme".to_string(), usage_group_cfg())]);
+        let app = TestApp::new()
+            .group("acme", usage_group_cfg())
+            .cost(usage_cost(&groups))
+            .build();
+        let svc = AdminService::new(app);
+        let err = svc.get_group_usage("ghost").await.unwrap_err();
+        assert!(
+            matches!(&err, AdminError::NotFound(m) if m.contains("ghost")),
+            "unknown group is not_found: {err:?}"
+        );
+    }
+
+    /// Governance OFF: the read still serves the full bucket projection — every bucket present
+    /// with ZERO usage, caps projected, remaining = the whole cap. The definition exists even
+    /// when nothing enforces (the doc contract on `get_group_usage`).
+    #[tokio::test]
+    async fn get_group_usage_governance_off_zero_usage_caps_projected() {
+        let groups = std::collections::BTreeMap::from([("acme".to_string(), usage_group_cfg())]);
+        let app = TestApp::new()
+            .group("acme", usage_group_cfg())
+            .cost(usage_cost(&groups))
+            .build(); // no .governance(..)
+        let svc = AdminService::new(app);
+        let view = svc.get_group_usage("acme").await.expect("usage read");
+        assert_eq!(
+            view.buckets.len(),
+            3,
+            "caps still projected: {:?}",
+            view.buckets
+        );
+        for b in &view.buckets {
+            assert_eq!(b.requests, 0, "governance off = zero usage ({b:?})");
+            assert_eq!(b.tokens, 0);
+            assert_eq!(b.spend_cents, 0);
+            assert_eq!(
+                b.budget_remaining_cents, b.budget_cap,
+                "nothing spent ⇒ the whole cap remains ({b:?})"
+            );
+        }
+        // The caps themselves survived the projection.
+        assert!(view.buckets.iter().any(|b| b.requests_cap == Some(5)));
+        assert!(view
+            .buckets
+            .iter()
+            .any(|b| b.budget_cap == Some(500) && b.pool.as_deref() == Some("frontier")));
+    }
 }
