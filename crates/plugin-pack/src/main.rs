@@ -23,11 +23,24 @@
 //! half goes in `plugins.trust.publishers` (third-party) or is embedded into the busbar binary at
 //! build time via `BUSBAR_RELEASE_PUBKEY` (first-party); the PRIVATE half is the signing secret.
 
-use busbar_plugin_sign::{sign, Manifest, SigningKey};
+use busbar_plugin_sign::{sign, HookNeeds, Manifest, NeedLevel, SigningKey};
 use std::collections::HashMap;
 use std::process::ExitCode;
 
 const SIGN_KEY_ENV: &str = "BUSBAR_SIGN_KEY";
+
+/// Parse a `--needs-*` flag value into a [`NeedLevel`] (`no` | `ro` | `rw`). This is the ADVISORY
+/// declared-intent a `kind: hook` plugin's manifest carries — it is SIGNED (so it cannot be spoofed)
+/// and surfaced to the admin at register/load, but the operator's config grant remains the
+/// enforcement. An unknown value is a hard error (a fat-fingered intent must not silently default).
+fn parse_need_level(s: &str) -> Result<NeedLevel, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "no" | "none" | "" => Ok(NeedLevel::No),
+        "ro" | "read" => Ok(NeedLevel::Ro),
+        "rw" | "readwrite" | "read-write" => Ok(NeedLevel::Rw),
+        other => Err(format!("need level '{other}' is not one of no|ro|rw")),
+    }
+}
 
 fn usage() -> &'static str {
     "busbar-plugin-pack - package + sign a busbar plugin tarball
@@ -36,6 +49,7 @@ USAGE:
     busbar-plugin-pack pack --lib <cdylib> --name <name> --alias <alias> --kind <store|auth|hook|secret>
                             --version <semver> --publisher <publisher> --out <file.tar.gz>
                             [--description <text>] [--homepage <url>] [--license <spdx>]
+                            [--needs-prompt <no|ro|rw>] [--needs-user <no|ro>]
                             [--allow-unsigned]
     busbar-plugin-pack keygen
 
@@ -43,6 +57,10 @@ USAGE:
              in $BUSBAR_SIGN_KEY (64 hex chars), and writes the {cdylib + manifest.json} .tar.gz.
              --allow-unsigned permits packaging WITHOUT a signature (dev only; busbar loads such a
              tarball only under plugins.trust.allow_unsigned: true).
+             --needs-prompt / --needs-user declare a kind:hook plugin's ADVISORY intent (what caller
+             content it asks to receive); SIGNED into the manifest. The operator's config grant still
+             enforces — a plugin gets prompt/user content only when BOTH the manifest declares the
+             need AND the operator grants it. A prompt:rw rewrite gate packs with --needs-prompt rw.
     keygen   generates a fresh ed25519 keypair and prints both halves as hex. Keep the private half
              secret (it becomes $BUSBAR_SIGN_KEY); publish/allowlist/embed the public half."
 }
@@ -145,9 +163,22 @@ fn pack(args: &[String]) -> ExitCode {
             description: flags.get("description").cloned().unwrap_or_default(),
             homepage: flags.get("homepage").cloned().unwrap_or_default(),
             license: flags.get("license").cloned().unwrap_or_default(),
-            // Declared-intent (`needs:`) is authored in a hook's source manifest, not synthesized by
-            // the ad-hoc packer flags; default to "asks for nothing" here.
-            needs: Default::default(),
+            // Declared-intent (`needs:`) for a `kind: hook` plugin: authored at pack time via the
+            // OPTIONAL `--needs-prompt`/`--needs-user` flags. Absent → "asks for nothing" (the correct
+            // default for every non-hook kind and for a hook that needs no caller content). The value
+            // is SIGNED (covered by the manifest signature) so it cannot be spoofed after packing.
+            needs: HookNeeds {
+                prompt: flags
+                    .get("needs-prompt")
+                    .map(|v| parse_need_level(v).map_err(|e| format!("--needs-prompt: {e}")))
+                    .transpose()?
+                    .unwrap_or_default(),
+                user: flags
+                    .get("needs-user")
+                    .map(|v| parse_need_level(v).map_err(|e| format!("--needs-user: {e}")))
+                    .transpose()?
+                    .unwrap_or_default(),
+            },
         };
         let lib_bytes =
             std::fs::read(&lib_path).map_err(|e| format!("cannot read --lib '{lib_path}': {e}"))?;
@@ -254,6 +285,65 @@ mod tests {
         let up = busbar_plugin_loader::tarball::unpack(&tarball).unwrap();
         let mut policy = busbar_plugin_sign::TrustPolicy::default();
         policy.publishers.insert("acme".into(), key.verifying_key());
+        assert!(matches!(
+            busbar_plugin_sign::evaluate(&up.lib_bytes, &up.manifest, &policy).unwrap(),
+            busbar_plugin_sign::Verdict::Trusted { .. }
+        ));
+    }
+
+    /// The `--needs-*` level parser accepts the ladder tokens (case/alias-insensitively) and hard-errors
+    /// on anything else (a fat-fingered intent must not silently default to a weaker/stronger level).
+    #[test]
+    fn need_level_parsing() {
+        assert_eq!(parse_need_level("no").unwrap(), NeedLevel::No);
+        assert_eq!(parse_need_level("").unwrap(), NeedLevel::No);
+        assert_eq!(parse_need_level("RO").unwrap(), NeedLevel::Ro);
+        assert_eq!(parse_need_level("read").unwrap(), NeedLevel::Ro);
+        assert_eq!(parse_need_level(" rw ").unwrap(), NeedLevel::Rw);
+        assert_eq!(parse_need_level("read-write").unwrap(), NeedLevel::Rw);
+        assert!(parse_need_level("maybe").is_err());
+    }
+
+    /// A hook manifest packed with `--needs-prompt rw` carries a SIGNED `needs.prompt = rw` that
+    /// verifies end-to-end and cannot be altered after packing (parity with the store round-trip).
+    #[test]
+    fn packed_hook_needs_prompt_rw_is_signed() {
+        let seed = [3u8; 32];
+        let key = SigningKey::from_bytes(&seed);
+        let lib = b"pretend headroom cdylib";
+        let m = Manifest {
+            name: "busbar-headroom".into(),
+            alias: "headroom".into(),
+            kind: "hook".into(),
+            version: "1.5.0".into(),
+            publisher: "busbar".into(),
+            abi_version: busbar_plugin_loader::supported_abi("hook")
+                .iter()
+                .copied()
+                .max()
+                .unwrap(),
+            sha256: String::new(),
+            signature: String::new(),
+            description: String::new(),
+            homepage: String::new(),
+            license: String::new(),
+            needs: HookNeeds {
+                prompt: NeedLevel::Rw,
+                user: NeedLevel::No,
+            },
+        };
+        let signed = sign(&key, m, lib);
+        assert_eq!(signed.needs.prompt, NeedLevel::Rw);
+        busbar_plugin_sign::validate_structure(&signed, lib, &busbar_plugin_loader::supported_abi)
+            .expect("structural");
+        // Tampering the declared intent after signing breaks verification (needs is signed).
+        let tarball = busbar_plugin_loader::tarball::package(&signed, "lib.so", lib).unwrap();
+        let up = busbar_plugin_loader::tarball::unpack(&tarball).unwrap();
+        let policy = busbar_plugin_sign::TrustPolicy {
+            first_party_key: Some(key.verifying_key()),
+            binary_version: "1.5.0".into(),
+            ..Default::default()
+        };
         assert!(matches!(
             busbar_plugin_sign::evaluate(&up.lib_bytes, &up.manifest, &policy).unwrap(),
             busbar_plugin_sign::Verdict::Trusted { .. }

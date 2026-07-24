@@ -300,3 +300,112 @@ jobs:
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: "plugin-dist/*.tar.gz"
+
+  # ── Hook-plugin tarballs — one signed .tar.gz per (plugin, target) ───────────────────────────────
+  # The first-party kind:hook plugins (webrequest, headroom) ship as signed plugin tarballs
+  # {cdylib + manifest.json} exactly like the store plugins above: same busbar release PRIVATE key
+  # (BUSBAR_SIGN_KEY secret) signs the manifest, and the matching PUBLIC key embedded in the busbar
+  # binary (BUSBAR_RELEASE_PUBKEY repository variable) makes them verify as FIRST-PARTY with zero
+  # operator configuration.
+  #
+  # Two hook plugins, distinct declared intent:
+  #   - webrequest: a transparent HTTP forwarder. It relays whatever the CORE projected; a deployment
+  #     that fronts a prompt:rw gate would re-declare that need, but the shipped first-party artifact
+  #     asks for NOTHING by default (no --needs-*), the least-privilege posture. The operator still
+  #     grants explicitly, and the forwarder cannot cause content to be sent.
+  #   - headroom: a prompt-compression REWRITE gate. It MUST read + rewrite the prompt, so it packs
+  #     with --needs-prompt rw (SIGNED into the manifest, surfaced to the admin at register/load).
+  #     The operator's config grant of prompt:rw remains the enforcement (belt-and-suspenders).
+  #
+  # TODO(release-keys): same seam as store-plugins — until the BUSBAR_SIGN_KEY secret is provisioned
+  # this job packages UNSIGNED tarballs (loadable only under plugins.trust.allow_unsigned), so a
+  # release is never blocked on key setup. The gh step prints which mode it ran in.
+  hook-plugins:
+    needs: create-release
+    name: hook-plugins (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            libext: so
+            libprefix: lib
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            libext: so
+            libprefix: lib
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            libext: dylib
+            libprefix: lib
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            libext: dll
+            libprefix: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the hook plugin cdylibs + the packer
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p busbar-webrequest-hook-plugin -p busbar-headroom-hook-plugin \
+            -p busbar-plugin-pack
+        shell: bash
+      - name: Package + sign the hook plugin tarballs
+        env:
+          BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          outdir="plugin-dist"; mkdir -p "$outdir"
+          pack="target/${target}/release/busbar-plugin-pack"
+          [ -x "$pack" ] || pack="target/${target}/release/busbar-plugin-pack.exe"
+          unsigned_flag=""
+          if [ -z "${BUSBAR_SIGN_KEY:-}" ]; then
+            echo "::warning::BUSBAR_SIGN_KEY secret is not provisioned — packaging UNSIGNED hook plugin tarballs (loadable only under plugins.trust.allow_unsigned). See the TODO(release-keys) seam."
+            unsigned_flag="--allow-unsigned"
+          fi
+          libpfx='${{ matrix.libprefix }}'; libext='${{ matrix.libext }}'
+
+          # webrequest: transparent forwarder, declares NO needs (least privilege).
+          "$pack" pack \
+            --lib "target/${target}/release/${libpfx}busbar_webrequest_hook_plugin.${libext}" \
+            --name "busbar-webrequest" --alias "webrequest" --kind hook \
+            --version "$ver" --publisher busbar \
+            --description "busbar webrequest hook plugin: signed dlopen'd HTTP forwarder for hook ops" \
+            --license Apache-2.0 \
+            --out "${outdir}/busbar-webrequest-${ver}-${target}.tar.gz" \
+            $unsigned_flag
+
+          # headroom: prompt-compression rewrite gate, declares needs.prompt=rw (SIGNED).
+          "$pack" pack \
+            --lib "target/${target}/release/${libpfx}busbar_headroom_hook_plugin.${libext}" \
+            --name "busbar-headroom" --alias "headroom" --kind hook \
+            --version "$ver" --publisher busbar \
+            --needs-prompt rw \
+            --description "busbar headroom hook plugin: deterministic rule-based prompt-compression rewrite gate" \
+            --license Apache-2.0 \
+            --out "${outdir}/busbar-headroom-${ver}-${target}.tar.gz" \
+            $unsigned_flag
+
+          ls -l "$outdir"
+        shell: bash
+      - name: Attach hook plugin tarballs to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" plugin-dist/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
+        shell: bash
+      - name: Attest hook plugin build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "plugin-dist/*.tar.gz"
