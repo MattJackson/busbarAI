@@ -79,19 +79,21 @@ the next **auth adapters** on a seam that already exists.
 
 ## Shipped in 1.5
 
-- **The cost model: tokens are the ledger, dollars are derived.** Governance accumulates a
+- **The cost model: tokens are the ledger, dollars are derived.** Enforcement accumulates a
   per-(bucket, window, model, tier) token ledger; every spend figure is computed at read time from
-  that ledger and `governance.rate_card` (per-model, per-tier micro-unit rates in an abstract cost
-  unit). Nothing dollar-shaped is stored, so correcting a rate is a config edit and reload, not a
-  re-billing. The old flat `governance.price_per_1k_tokens_cents` is gone; `rate_card` is the only
-  token-pricing mechanism, with `price_per_request_cents` as a separate flat per-call fee.
-- **Budget groups (`governance.budget_groups`).** Nestable enforcement buckets above the per-key
-  budget. A key binds one with the mint field `budget_group`; admission walks the whole chain
-  most-restrictively and the 429 names the exhausted bucket. Mint-time key `labels` ride onto the
-  Prometheus series so external dashboards break spend down by any operator dimension.
-- **Governance is always on.** The `governance.enabled` switch is removed. Governance is always
-  present and simply inert until an admin token is set and keys are minted, so a default deploy
-  behaves as "off" did with the same RAM. The durable store is a choice via `governance.store`.
+  that ledger and the top-level `rate_card` (per-model, per-tier micro-unit rates in an abstract
+  cost unit). Nothing dollar-shaped is stored, so correcting a rate is a config edit and reload,
+  not a re-billing. The old flat per-1k-token price is gone; `rate_card` is the only token-pricing
+  mechanism, with `per_request_fee` as a separate flat per-call fee.
+- **The `groups:` limit tree.** Nestable enforcement buckets — the ONE place limits live (keys are
+  pure auth and carry none). A key binds one with the mint field `group`; admission walks the whole
+  parent chain, ANDs every limit, and the 429 names the exhausted bucket. Mint-time key `labels`
+  ride onto the Prometheus series so external dashboards break spend down by any operator
+  dimension.
+- **Enforcement is always on.** There is no `governance:` block or enabled switch. Enforcement is
+  always present and simply inert until keys are minted, so a default deploy behaves as "off" did
+  with the same RAM. Durability is a choice via the top-level `store:` block (`memory` default;
+  durable backends load as signed plugins).
 - **Dynamic plugins.** Store, auth, and hook backends can load from a signed `.tar.gz` at boot over
   a versioned C ABI, gated by the `plugins.*` block (off by default, ed25519 signature verification
   against the embedded release key, explicit opt-ins for unsigned or third-party). The default

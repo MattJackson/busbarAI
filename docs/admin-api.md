@@ -1,6 +1,6 @@
 # Admin API v1: drive Busbar over HTTP
 
-Everything Busbar knows about itself (its topology, its hooks, its auth posture, its live health, its keys, its metering) is readable and mutable over one authenticated, versioned HTTP surface: **`/api/v1/admin`**. Point `curl`, Terraform, a dashboard, or your own tooling at it and build against a contract that does not move.
+Everything Busbar knows about itself (its topology, its hooks, its auth posture, its live health, its keys, its limit groups, its metering) is readable and mutable over one authenticated, versioned HTTP surface: **`/api/v1/admin`**. Point `curl`, Terraform, a dashboard, or your own tooling at it and build against a contract that does not move.
 
 ---
 
@@ -21,7 +21,7 @@ A missing or wrong credential is `401 unauthorized` (in the same JSON error enve
 |---|---|
 | `read-only` | Every `GET`, **plus `POST /config/validate`** (a stateless dry-run: a read in POST clothing, so a read-only CI token can lint configs) |
 | `hooks-register` | reads + hook-definition mutations (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/admin/hooks`) |
-| `full` | everything else: keys, config apply/reload/rollback, the admin auth chain, cache flush |
+| `full` | everything else: keys, groups, config apply/reload/rollback, the admin auth chain, cache flush |
 
 The operator admin token holds `full`. Role-carrying principals (external modules) get the most permissive `admin_scope` their roles bind to under `auth.role_bindings.<module>` (capped by the module's `max_admin_scope:`); unbound roles grant nothing. Insufficient scope is `403 forbidden` naming the scope that would have sufficed. Unknown HTTP methods fail closed to `full`.
 
@@ -32,7 +32,7 @@ One **body-derived refinement**: a `hooks-register` principal may define hooks b
 | Class | Budget | Covers |
 |---|---|---|
 | config | 10/min | `POST /config/apply`, `/config/reload`, `/config/rollback`, and `PUT /admin-auth` (the blast-radius set) |
-| CRUD | 60/min | every other mutation: hooks, keys, cache flush, **and `/config/validate`** (a dry-run never contends with the config budget) |
+| CRUD | 60/min | every other mutation: hooks, keys, groups, cache flush, **and `/config/validate`** (a dry-run never contends with the config budget) |
 
 Over-budget is `429 rate_limited` with a **`Retry-After: 60`** header, and the event is audited. Reads are unmetered.
 
@@ -52,7 +52,7 @@ Every `/api/v1/admin` error (including 401, 404 on an unmatched path, and 405 on
 | `forbidden` | 403 | Authenticated but under-scoped (the message names the sufficient scope) |
 | `invalid_request` | 400 | Malformed body, bad parameter, malformed `If-Match`, or a foreign pagination cursor |
 | `version_conflict` | 409 | **Retryable**: your `If-Match` is stale, re-read for a fresh ETag and retry |
-| `conflict` | 409 | **Terminal**: the request contradicts server state in a way a retry cannot fix (governance disabled, base-defined hook, immutable grant change, in-flight idempotency reservation, lockout guard) |
+| `conflict` | 409 | **Terminal**: the request contradicts server state in a way a retry cannot fix (governance disabled, base-defined hook or group, a group another group still parents on, immutable grant change, in-flight idempotency reservation, lockout guard) |
 | `rate_limited` | 429 | The principal's per-minute mutation budget is spent (`Retry-After: 60`) |
 | `internal` | 500 | An internal failure (details are logged server-side, never returned) |
 
@@ -68,18 +68,18 @@ Every list endpoint speaks one envelope: `{ "items": [...], "next_cursor": "..."
 | `GET /audit` | 200 | 1000 |
 | `GET /config/versions` | 100 | 1000 |
 
-The topology reads (`/pools`, `/models`, `/providers`, `/hooks`, `/plugins`) return the same envelope in a single page (`next_cursor: null`).
+The topology reads (`/pools`, `/models`, `/providers`, `/hooks`, `/groups`, `/plugins`) return the same envelope in a single page (`next_cursor: null`).
 
 ## Concurrency: ETag + If-Match
 
 Optimistic concurrency is **one mechanism across the whole surface**: the RFC-7232 `If-Match` header; there is no body-level `expected_version` twin:
 
-- **Config plane** (hooks, config, admin-auth): the ETag is the config version, quoted: `ETag: "42"`. It rides on `GET /hooks`, `GET /hooks/{name}`, `GET /config`, `GET /admin-auth`, and on **every successful config-plane mutation response** (including the `204` from a hook DELETE), so a scripted mutation chain never needs a re-read.
+- **Config plane** (hooks, groups, config, admin-auth): the ETag is the config version, quoted: `ETag: "42"`. It rides on `GET /hooks`, `GET /hooks/{name}`, `GET /groups`, `GET /groups/{name}`, `GET /config`, `GET /admin-auth`, and on **every successful config-plane mutation response** (including the `204` from a hook or group DELETE), so a scripted mutation chain never needs a re-read.
 - **Keys**: each record's ETag is a 16-hex-char digest of its mutable metadata, returned in the `ETag` header of `GET /keys/{id}`. `PATCH` and `DELETE /keys/{id}` accept it.
 - `If-Match: *` matches unconditionally (no guard); an absent header is also unguarded.
 - A stale tag is `409 version_conflict` and nothing changes. A **malformed** `If-Match` is `400 invalid_request`. A broken guard never silently passes as "no guard".
 
-Guarded mutations: `POST /hooks`, `PUT|DELETE /hooks/{name}`, `PATCH /hooks/{name}/settings`, `PUT /admin-auth`, `POST /config/apply`, `POST /config/rollback`, `PATCH|DELETE /keys/{id}`. Deliberately unguarded: `validate` (stateless), `reload` (returns to disk truth unconditionally), `cache/flush`, key create/rotate (no versioned resource).
+Guarded mutations: `POST /hooks`, `PUT|DELETE /hooks/{name}`, `PATCH /hooks/{name}/settings`, `POST /groups`, `PUT|PATCH|DELETE /groups/{name}`, `PUT /admin-auth`, `POST /config/apply`, `POST /config/rollback`, `PATCH|DELETE /keys/{id}`. Deliberately unguarded: `validate` (stateless), `reload` (returns to disk truth unconditionally), `cache/flush`, key create/rotate (no versioned resource).
 
 ## Discovery
 
@@ -173,7 +173,7 @@ The virtual-key surface at `/api/v1/admin/keys` (`full` scope for mutations). Ke
 | Endpoint | Does |
 |---|---|
 | `POST /keys` | Mint a key: `201`, body is the metadata plus the **signed token, returned exactly once**. Body: `{name, group?, allowed_pools?, labels?, expires_in\|expires_at?, issue_aws_credential?}` (default expiry 90d). `group` binds the key into the `groups:` limit chain and must name a configured group (`400` naming the offender otherwise); `allowed_pools` omitted = all pools, `[]` = none (the intent is stored verbatim); `labels` (`{"team": "growth"}`) are echoed onto the key's metric series, never interpreted by enforcement. `issue_aws_credential: true` also returns a once-shown `aws_access_key_id` + `aws_secret_access_key` for SigV4 clients |
-| `GET /keys` | List metadata, id-sorted. Strict filters (`?enabled=true\|false`, `?prefix=vk_ab`) where an unparseable value is a `400`, never a silently dropped filter. Cursor-paginated |
+| `GET /keys` | List metadata, id-sorted. Strict filters (`?enabled=true\|false`, `?prefix=vk_ab`, `?group=<name>`) where an unparseable value is a `400`, never a silently dropped filter. `?group=` is an exact bound-group match with **no existence check** against the registry: a key can reference a group the running config no longer has, and listing "keys of `g`" must still find them (that dangling state is exactly what an operator hunts). Cursor-paginated |
 | `GET /keys/{id}` | One key's metadata + its `ETag` header (16 hex chars) |
 | `PATCH /keys/{id}` | Adjust `enabled` and/or `group`. `group` is three-state: absent = unchanged, `null` = unbind (authed + unlimited), value = rebind to an existing group (mint-parity validated). The 1.4.x cap fields are rejected. Honors `If-Match` |
 | `DELETE /keys/{id}` | Revoke: **`204 No Content`**; the key stops resolving immediately. Honors `If-Match`; `404` for an unknown id |
@@ -186,11 +186,51 @@ With no store/keys, one unambiguous rule: `GET /keys` answers `200` with an empt
 
 ---
 
+## Groups
+
+The `groups:` limit tree — where every limit lives (keys are pure auth) — is fully readable and mutable at runtime under `/api/v1/admin/groups`. Reads are `read-only` scope; every mutation is `full`. The read shape (`GroupView`) is `{name, parent?, enabled, limits, child_default?}`; each limit is projected **explicitly** as `{metric, amount, per?, pool?, on_exhaust?, downgrade_to?}` (`metric` ∈ `requests`|`tokens`|`budget`|`concurrent`; `per` absent only for `concurrent`; `pool` present only on a pool-scoped limit) — the config file's compact `{ budget: 3000, per: month }` form is write-side sugar, a consumer never has to know the metric is the map key. The **write** verbs accept a `GroupCfg` verbatim: paste a `groups:` block from config.yaml.
+
+### Reading the tree
+
+| Endpoint | Returns |
+|---|---|
+| `GET /groups` | Every group, name-sorted, single page. Carries the config-plane `ETag`, so a client reads then mutates without a second round-trip |
+| `GET /groups/{name}` | One group definition (+ config-plane `ETag`); `404` for an unknown name |
+| `GET /groups/{name}/usage` | The group's **derived** current-window usage, one row per enforcement bucket — each `(window, pool?)` its limits materialise: `{group, enabled, buckets: [{window, pool?, requests, tokens, spend_cents, requests_cap?, tokens_cap?, budget_cap?, budget_remaining_cents?}], as_of}`. Spend is repriced at read time from the token ledger × the *current* `rate_card` (nothing dollar-shaped is stored). `buckets` is empty for a group with only a `concurrent` limit (or none): there is no windowed ledger to read. The self-service dashboard read: a `user:<sub>` leaf's usage is one person's view |
+| `GET /keys?group=<name>` | The keys bound to a group (see the keys table above): a leaf group's keys are one person's keys; a team group's are the team's |
+
+### Mutating the tree
+
+| Endpoint | Does |
+|---|---|
+| `POST /groups` | Create (or replace) a group at runtime. Body `{ "name": "...", "config": { "parent": ..., "enabled": ..., "limits": [...], "child_default": ... } }` — a config.yaml group block verbatim. **`201` when the name is new; `200` when it replaces an existing overlay group** (honest upsert; re-creating a deleted name clears its tombstone) |
+| `PUT /groups/{name}` | Replace an existing **overlay** group, live. `404` for an unknown name (PUT replaces; POST creates) |
+| `PATCH /groups/{name}` | **Partial** update: only the fields present change, the rest are preserved — the ergonomic "raise Alice's budget" (send just `limits`) and "freeze this team" (send `enabled: false`) verb. `limits`/`child_default` replace their whole list when present (a list can't be field-merged); to *clear* `parent` or `child_default`, use `PUT` with the full definition. A typo'd field is a `400`, never a silent no-op |
+| `DELETE /groups/{name}` | Remove an overlay group, live. **`204`** (still carrying the new config ETag); `404` if unknown; terminal `409` if another group still names it as `parent` (re-parent or remove the children first — a delete never silently orphans them). The name is tombstoned in the overlay so the deletion survives restart |
+
+**Validate-at-the-door.** Every write runs the mutated registry through the *same* `validate_groups` boot uses (parent exists, chain acyclic, pool qualifiers resolve, limit values sane): a bad group — dangling or cyclic parent, a `pool:` naming no pool — is a `400` that changes nothing. On success the enforcement projection is rebuilt atomically and the new limits are live for the next request; the usage **ledger survives the swap**, so past accrual is preserved across a limit change.
+
+**Base groups are file-owned.** A group defined in config.yaml answers every mutation with a terminal `409 conflict`: the API cannot silently shadow operator file config (mirrors hooks). Edit config.yaml and reload instead.
+
+All group mutations honor `If-Match` against the config-plane ETag, are audited (including rejections), recorded in version history, and overlay-persisted (set `BUSBAR_CONFIG_OVERLAY` to survive restart).
+
+```bash
+# Raise one group's limits without touching the rest of its definition
+curl -s -X PATCH -H "x-admin-token: $TOK" -H 'content-type: application/json' \
+  --data '{"limits":[{"budget":500000,"per":"month"}]}' \
+  http://localhost:8081/api/v1/admin/groups/growth
+
+# How is the team tracking against its caps?
+curl -s -H "x-admin-token: $TOK" http://localhost:8081/api/v1/admin/groups/growth/usage
+```
+
+---
+
 ## Changing config over the API
 
 Busbar's config plane is live: an authenticated write takes effect immediately, with no restart and without disturbing in-flight requests. Under the hood an apply atomically swaps the running config snapshot: new requests see the new config; requests already in flight finish on the old one; and surviving lanes keep their learned health (breakers, latency) **by identity**. Config-plane mutations are serialized internally, so concurrent writes can never silently lose one.
 
-**Persistence (optional).** By default, API-applied changes are live but not written to disk. Set `BUSBAR_CONFIG_OVERLAY=/path/to/overlay.json` to persist hook-surface changes: Busbar writes them to that busbar-owned overlay and re-applies it at boot on top of your hand-written `config.yaml` (which it never touches). A missing or corrupt overlay is ignored at boot: a bad overlay can never brick startup. `GET /info` reports `config_persistence` so tooling knows which mode it's in.
+**Persistence (optional).** By default, API-applied changes are live but not written to disk. Set `BUSBAR_CONFIG_OVERLAY=/path/to/overlay.json` to persist hook- and group-surface changes: Busbar writes them to that busbar-owned overlay and re-applies it at boot on top of your hand-written `config.yaml` (which it never touches). A missing or corrupt overlay is ignored at boot: a bad overlay can never brick startup. `GET /info` reports `config_persistence` so tooling knows which mode it's in.
 
 ### The config plane
 
