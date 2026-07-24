@@ -869,7 +869,7 @@ async fn test_metrics_requires_auth_in_chain_mode() {
         ..crate::config::AuthCfg::default_none()
     };
     let app = TestApp::new()
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .build();
 
     let router = crate::build_router(app);
@@ -2198,7 +2198,7 @@ async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
             .api_key("busbar-key"),
         )
         .pool("default", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg_passthrough)))
         .build();
 
     // Scenario A response: pushed immediately before the forward() that consumes it.
@@ -2260,7 +2260,7 @@ async fn test_section6_passthrough_401_no_trip_vs_token_mode() {
             .api_key("busbar-key"),
         )
         .pool("default", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg_token)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg_token)))
         .build();
 
     let req_body = serde_json::to_vec(&json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 100})).unwrap();
@@ -2371,7 +2371,7 @@ async fn test_passthrough_forwards_caller_token() {
             .api_key("busbar-central-key"),
         )
         .pool("default", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg_passthrough)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg_passthrough)))
         .build();
 
     // Caller's Bearer token (NOT busbar's key)

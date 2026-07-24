@@ -122,9 +122,61 @@ cargo build --release -p my-store-plugin                      # host target
 cargo build --release -p my-store-plugin --target aarch64-unknown-linux-gnu
 ```
 
-Auth and hook plugin manifests (`kind: auth` / `kind: hook`) travel through the same discovery,
-trust, validation, and inventory today; the engine-side dynamic consumers for those kinds arrive
-with their ABI generations.
+## Auth plugins (`kind: auth`)
+
+A `kind: auth` plugin is a first-class **identity provider**: it implements the same
+`busbar_api::AuthModule` trait the built-in modules do (`name()` + `authenticate()` returning
+`Identify(principal)` / `Reject` / `Pass`), and the engine loads it **in-process** at boot over the
+signed hybrid ABI — exactly like a store or secret plugin, same trust posture, same loader. It runs
+in the data-plane **`auth.chain`**: name it there and the engine resolves it against the plugins
+directory, loads it, and boxes it into the chain.
+
+```rust
+// crate-type = ["cdylib"]; deps: busbar-api, busbar-plugin-sdk, serde_json
+use busbar_api::{AuthModule, AuthOutcome, Principal};
+
+struct MyIdp { /* … */ }
+impl AuthModule for MyIdp {
+    fn name(&self) -> &'static str { "myidp" }             // the RUNTIME module identity
+    fn authenticate(&self, candidate: Option<&str>) -> AuthOutcome {
+        match verify(candidate) {
+            Some((id, groups)) => {
+                let mut p = Principal::from_id(id);
+                p.roles = groups;                            // roles/groups the IdP asserts
+                AuthOutcome::Identify(p)
+            }
+            None => AuthOutcome::Pass,                        // not my credential — defer
+        }
+    }
+    fn cacheable(&self) -> bool { true }                     // per-call I/O ⇒ opt into the cred cache
+}
+
+fn open(cfg: &str) -> Result<Box<dyn AuthModule>, String> {
+    // `cfg` is the chain entry's own `settings:` map, passed through verbatim as JSON.
+    Ok(Box::new(MyIdp::from_config(cfg)?))
+}
+busbar_plugin_sdk::export_auth_plugin!(open);
+```
+
+An auth module returns **identity only** — who the caller is (`id` + `roles`). Policy (which pools,
+which group's limits, which admin scope) is resolved by busbar from `auth.role_bindings.<module>`
+(nested by module) and capped by `auth.chain.<module>.max_admin_scope`, never asserted by the
+module. Crucially, `<module>` is the value the plugin returns from **`name()`** — its runtime
+identity — NOT the config alias you write in `auth.chain`. Bind roles under that name.
+
+**Fail-closed, always:** a configured auth plugin that cannot load (missing/untrusted tarball, wrong
+kind, or a `dlopen`/ABI failure) is a **hard boot error** — the front door never silently opens
+because a module was dropped. `--validate` catches a missing/wrong-kind/untrusted auth plugin
+manifest-only, before boot; and referencing an auth plugin while `plugins.enabled: false` is refused,
+naming the flag.
+
+The bundled **`oidc`** module (`busbar-auth-oidc-plugin`) is exactly such a plugin — see
+[configuration.md](configuration.md#auth-plugins) for the `auth.chain: [oidc]` + `settings:` recipe
+(including an Entra ID example).
+
+Hook plugin manifests (`kind: hook`) travel through the same discovery, trust, validation, and
+inventory today, but hooks stay **out-of-process** (socket/webhook transports); the in-process
+dynamic hook consumer arrives with its ABI generation.
 
 ## Signing and packaging
 

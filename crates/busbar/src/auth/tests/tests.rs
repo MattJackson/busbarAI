@@ -212,7 +212,7 @@ fn test_extract_bearer_token_malformed_no_panic() {
 /// nested by module and policy resolution needs both halves.
 #[test]
 fn test_chain_identifies_with_module_and_principal() {
-    let mw = AuthMiddleware::new(&chain_cfg(&["test-groups-module"]));
+    let mw = AuthMiddleware::new_builtin(&chain_cfg(&["test-groups-module"]));
     match mw.run_chain(Some("grp:dev")) {
         ChainVerdict::Identified { module, principal } => {
             assert_eq!(module, "test-groups-module");
@@ -230,7 +230,7 @@ fn test_chain_identifies_with_module_and_principal() {
 /// "wrong token rejected" coverage.
 #[test]
 fn test_nonempty_chain_fails_closed_on_all_pass() {
-    let mw = AuthMiddleware::new(&chain_cfg(&["test-groups-module"]));
+    let mw = AuthMiddleware::new_builtin(&chain_cfg(&["test-groups-module"]));
     assert_eq!(
         mw.run_chain(Some("not-a-recognized-credential")),
         ChainVerdict::Denied,
@@ -250,7 +250,7 @@ fn test_nonempty_chain_fails_closed_on_all_pass() {
 /// admitted anonymously (`ChainVerdict::Open`), with or without a credential.
 #[test]
 fn test_empty_chain_is_open_front_door() {
-    let mw = AuthMiddleware::new(&crate::config::AuthCfg::default_none());
+    let mw = AuthMiddleware::new_builtin(&crate::config::AuthCfg::default_none());
     assert!(mw.is_open());
     assert_eq!(mw.run_chain(None), ChainVerdict::Open);
     assert_eq!(mw.run_chain(Some("anything")), ChainVerdict::Open);
@@ -266,7 +266,7 @@ fn test_open_door_regardless_of_upstream_creds() {
     for uc in [UpstreamCreds::Own, UpstreamCreds::Passthrough] {
         let mut cfg = crate::config::AuthCfg::default_none();
         cfg.upstream_credentials = uc;
-        let mw = AuthMiddleware::new(&cfg);
+        let mw = AuthMiddleware::new_builtin(&cfg);
         assert_eq!(mw.upstream_creds, uc);
         assert!(mw.validate_token(None));
         assert!(mw.validate_token(Some("anything")));
@@ -278,18 +278,18 @@ fn test_open_door_regardless_of_upstream_creds() {
 /// validation/reporting and the boxed chain stays empty.
 #[test]
 fn test_keys_in_chain_sets_flag_not_module() {
-    let mw = AuthMiddleware::new(&chain_cfg(&["keys"]));
+    let mw = AuthMiddleware::new_builtin(&chain_cfg(&["keys"]));
     assert!(mw.keys_in_chain, "chain: [keys] must set keys_in_chain");
     assert!(
         mw.chain_names().is_empty(),
         "keys is engine-handled, never a boxed module"
     );
 
-    let mw = AuthMiddleware::new(&crate::config::AuthCfg::default_none());
+    let mw = AuthMiddleware::new_builtin(&crate::config::AuthCfg::default_none());
     assert!(!mw.keys_in_chain, "an empty chain must not claim keys");
 
     // keys + an external module: the flag is set AND the boxed module still identifies.
-    let mw = AuthMiddleware::new(&chain_cfg(&["keys", "test-groups-module"]));
+    let mw = AuthMiddleware::new_builtin(&chain_cfg(&["keys", "test-groups-module"]));
     assert!(mw.keys_in_chain);
     assert_eq!(mw.chain_names(), vec!["test-groups-module"]);
     assert!(mw.validate_token(Some("grp:dev")));
@@ -959,7 +959,7 @@ async fn test_chain_accepts_all_carriers_and_native_401() {
             .api_key("busbar-upstream-key"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .build();
 
     let router = crate::build_router(app);
@@ -1088,7 +1088,7 @@ async fn test_cohere_and_responses_ingress_token_mode_native_401() {
             .api_key("busbar-upstream-key"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .build();
 
     let router = crate::build_router(app);
@@ -1187,7 +1187,7 @@ async fn test_bedrock_ingress_wrong_token_is_403_native_envelope() {
             .api_key("busbar-upstream-key"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .build();
 
     let router = crate::build_router(app);
@@ -1270,7 +1270,7 @@ async fn test_gemini_ingress_wrong_token_is_native_bad_key_envelope() {
             .api_key("busbar-upstream-key"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .build();
 
     let router = crate::build_router(app);
@@ -1348,7 +1348,7 @@ async fn test_admin_prefix_is_boundary_safe() {
             .api_key("busbar-upstream-key"),
         )
         .pool("apix", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .build();
 
     let router = crate::build_router(app);
@@ -2216,7 +2216,7 @@ fn test_auth_middleware_debug_redacts_tokens() {
     // static client tokens anymore; the invariant is that ONLY the whitelisted shape fields
     // appear, so a future field holding a secret cannot leak through a derived Debug.
     let cfg = chain_cfg(&["keys", "test-groups-module"]);
-    let mw = AuthMiddleware::new(&cfg);
+    let mw = AuthMiddleware::new_builtin(&cfg);
     let dbg = format!("{mw:?}");
     assert!(
         dbg.contains("chain_len") && dbg.contains("Own"),
@@ -2642,7 +2642,7 @@ async fn test_governance_inert_without_admin_token_static_token_admitted() {
             .api_key("busbar-upstream-key"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .governance(gov)
         .build();
 
@@ -2995,7 +2995,7 @@ async fn test_inert_governance_persisted_key_is_not_enforced_static_chain_wins()
             .api_key("busbar-upstream-key"),
         )
         .pool("pa", &[(0, 1)])
-        .auth(Arc::new(AuthMiddleware::new(&auth_cfg)))
+        .auth(Arc::new(AuthMiddleware::new_builtin(&auth_cfg)))
         .governance(gov)
         .build();
 

@@ -767,7 +767,9 @@ impl TestApp {
             upstream_credentials: uc,
             ..crate::config::AuthCfg::default_none()
         };
-        self.auth = Some(std::sync::Arc::new(crate::auth::AuthMiddleware::new(&cfg)));
+        self.auth = Some(std::sync::Arc::new(
+            crate::auth::AuthMiddleware::new_builtin(&cfg),
+        ));
         self
     }
     pub(crate) fn auth(mut self, a: std::sync::Arc<crate::auth::AuthMiddleware>) -> Self {
@@ -812,7 +814,7 @@ impl TestApp {
             lane_data.push(spec.to_lane_data());
         }
         let auth = self.auth.unwrap_or_else(|| {
-            std::sync::Arc::new(crate::auth::AuthMiddleware::new(
+            std::sync::Arc::new(crate::auth::AuthMiddleware::new_builtin(
                 &crate::config::AuthCfg::default_none(),
             ))
         });

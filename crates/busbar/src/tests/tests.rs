@@ -663,7 +663,7 @@ async fn test_axum_marker_413_is_reshaped_even_as_plain_text() {
 
 /// Helpers for the plugin pre-flight regression tests: a fresh temp plugins dir and an in-memory
 /// signed/unsigned tarball builder.
-fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
+pub(crate) fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "busbar-boot-plugins-{}-{tag}-{}",
         std::process::id(),
@@ -676,7 +676,11 @@ fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn plugin_manifest(name: &str, alias: &str, publisher: &str) -> busbar_plugin_sign::Manifest {
+pub(crate) fn plugin_manifest(
+    name: &str,
+    alias: &str,
+    publisher: &str,
+) -> busbar_plugin_sign::Manifest {
     busbar_plugin_sign::Manifest {
         name: name.into(),
         alias: alias.into(),
@@ -696,7 +700,7 @@ fn plugin_manifest(name: &str, alias: &str, publisher: &str) -> busbar_plugin_si
 }
 
 /// An UNSIGNED (but structurally valid) tarball: sha256 set, signature empty.
-fn unsigned_tarball(mut m: busbar_plugin_sign::Manifest, lib: &[u8]) -> Vec<u8> {
+pub(crate) fn unsigned_tarball(mut m: busbar_plugin_sign::Manifest, lib: &[u8]) -> Vec<u8> {
     m.sha256 = busbar_plugin_sign::sha256_hex(lib);
     busbar_plugin_loader::tarball::package(&m, "lib.so", lib).unwrap()
 }
@@ -721,13 +725,18 @@ fn gov_with_store(store: &str) -> crate::config::StoreCfg {
 #[test]
 fn store_plugin_with_plugins_disabled_is_boot_error_naming_the_flag() {
     let dir = tmp_plugin_dir("disabled-store");
-    let err = crate::plugins_preflight(Some(&gov_with_store("redis")), &plugins_cfg(&dir, false))
-        .unwrap_err();
+    let err = crate::plugins_preflight(
+        Some(&gov_with_store("redis")),
+        None,
+        &plugins_cfg(&dir, false),
+    )
+    .unwrap_err();
     assert!(err.contains("plugins.enabled"), "names the flag: {err}");
     assert!(err.contains("redis"), "names the store: {err}");
     // The ABSENT-block default behaves identically.
     let err = crate::plugins_preflight(
         Some(&gov_with_store("redis")),
+        None,
         &crate::config::PluginsCfg::default(),
     )
     .unwrap_err();
@@ -744,7 +753,7 @@ fn disabled_plugins_are_inert_even_when_present() {
     std::fs::write(dir.join("x.tar.gz"), tarball).unwrap();
     // Even an INVALID tarball must not matter while disabled.
     std::fs::write(dir.join("junk.tar.gz"), b"not a tarball").unwrap();
-    let reg = crate::plugins_preflight(None, &plugins_cfg(&dir, false)).expect("inert");
+    let reg = crate::plugins_preflight(None, None, &plugins_cfg(&dir, false)).expect("inert");
     assert!(reg.loadable().is_empty() && reg.skipped().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -763,8 +772,12 @@ fn configured_store_with_untrusted_plugin_fails_boot_with_naming_error() {
     std::fs::write(dir.join("sqlite.tar.gz"), tarball).unwrap();
 
     // STRICT default trust: the referenced store plugin is skipped -> preflight fails, naming it.
-    let err = crate::plugins_preflight(Some(&gov_with_store("sqlite")), &plugins_cfg(&dir, true))
-        .unwrap_err();
+    let err = crate::plugins_preflight(
+        Some(&gov_with_store("sqlite")),
+        None,
+        &plugins_cfg(&dir, true),
+    )
+    .unwrap_err();
     assert!(
         err.contains("busbar-store-sqlite") || err.contains("'sqlite'"),
         "names the plugin: {err}"
@@ -777,14 +790,14 @@ fn configured_store_with_untrusted_plugin_fails_boot_with_naming_error() {
     // Opt in to unsigned: preflight passes and the store resolves by alias AND canonical name.
     let mut cfg = plugins_cfg(&dir, true);
     cfg.trust.allow_unsigned = true;
-    let reg = crate::plugins_preflight(Some(&gov_with_store("sqlite")), &cfg)
+    let reg = crate::plugins_preflight(Some(&gov_with_store("sqlite")), None, &cfg)
         .expect("allow_unsigned permits the unsigned store plugin at boot");
     assert!(reg.resolve("sqlite").is_some(), "alias resolves");
     assert!(
         reg.resolve("busbar-store-sqlite").is_some(),
         "canonical name resolves"
     );
-    let reg2 = crate::plugins_preflight(Some(&gov_with_store("busbar-store-sqlite")), &cfg)
+    let reg2 = crate::plugins_preflight(Some(&gov_with_store("busbar-store-sqlite")), None, &cfg)
         .expect("the canonical name is equally valid as governance.store");
     assert!(reg2.resolve("busbar-store-sqlite").is_some());
     let _ = std::fs::remove_dir_all(&dir);
@@ -799,7 +812,7 @@ fn unknown_store_name_is_a_clear_boot_error() {
     cfg.trust.allow_unsigned = true;
     let tarball = unsigned_tarball(plugin_manifest("acme-store-x", "x", "acme"), b"lib");
     std::fs::write(dir.join("x.tar.gz"), tarball).unwrap();
-    let err = crate::plugins_preflight(Some(&gov_with_store("dynamo")), &cfg).unwrap_err();
+    let err = crate::plugins_preflight(Some(&gov_with_store("dynamo")), None, &cfg).unwrap_err();
     assert!(err.contains("'dynamo'"), "names the missing store: {err}");
     assert!(
         err.contains("acme-store-x"),
@@ -815,7 +828,7 @@ fn unknown_store_name_is_a_clear_boot_error() {
 fn invalid_manifest_in_enabled_dir_fails_boot() {
     let dir = tmp_plugin_dir("invalid-any");
     std::fs::write(dir.join("junk.tar.gz"), b"not a tarball at all").unwrap();
-    let err = crate::plugins_preflight(None, &plugins_cfg(&dir, true)).unwrap_err();
+    let err = crate::plugins_preflight(None, None, &plugins_cfg(&dir, true)).unwrap_err();
     assert!(err.contains("junk.tar.gz"), "names the file: {err}");
     assert!(err.contains("plugin validation failed"), "got {err}");
 
@@ -825,7 +838,7 @@ fn invalid_manifest_in_enabled_dir_fails_boot() {
     m.sha256 = busbar_plugin_sign::sha256_hex(b"OTHER bytes");
     let tarball = busbar_plugin_loader::tarball::package(&m, "lib.so", b"real bytes").unwrap();
     std::fs::write(dir.join("sha.tar.gz"), tarball).unwrap();
-    let err = crate::plugins_preflight(None, &plugins_cfg(&dir, true)).unwrap_err();
+    let err = crate::plugins_preflight(None, None, &plugins_cfg(&dir, true)).unwrap_err();
     assert!(err.contains("integrity"), "names the sha mismatch: {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -844,7 +857,7 @@ fn alias_conflict_fails_boot_naming_both() {
     let b = unsigned_tarball(plugin_manifest("acme-store-redis", "redis", "acme"), b"b");
     std::fs::write(dir.join("a.tar.gz"), a).unwrap();
     std::fs::write(dir.join("b.tar.gz"), b).unwrap();
-    let err = crate::plugins_preflight(None, &cfg).unwrap_err();
+    let err = crate::plugins_preflight(None, None, &cfg).unwrap_err();
     assert!(
         err.contains("busbar-store-redis") && err.contains("acme-store-redis"),
         "names both plugins: {err}"

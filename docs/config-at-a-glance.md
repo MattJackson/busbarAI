@@ -28,7 +28,7 @@ keys fail boot.
 |---|---|---|
 | [`auth.signing_key`](configuration.md#auth) | The ed25519 key that signs virtual-key tokens (fleet-shared; rotate = revoke-all) | Secret ref; absent = generated 0600 on first boot |
 | [`auth.upstream_credentials`](configuration.md#auth) | Whose key hits the provider | `own` (default) \| `passthrough` |
-| [`auth.chain`](configuration.md#auth) | The ordered DATA-PLANE auth chain | List of module entries: `- keys` (bare, the built-in signed-key verifier) or `- <module>: { max_admin_scope?, settings? }`. `[]` (default) = open front door (dev only) |
+| [`auth.chain`](configuration.md#auth) | The ordered DATA-PLANE auth chain | List of module entries: `- keys` (bare, the built-in signed-key verifier) or `- <module>: { max_admin_scope?, settings? }`. Any non-`keys` name loads a `kind: auth` plugin (e.g. `oidc`); a configured-but-unloadable auth plugin fails boot closed. `[]` (default) = open front door (dev only) |
 | [`auth.admin_auth`](configuration.md#auth) | The chain gating `/api/v1/admin/*` | Default `[admin-tokens]`; the built-in carries `token: <secret-ref>`. `[]` = open admin (dev only) |
 | [`auth.role_bindings`](configuration.md#auth) | Role policy, NESTED BY MODULE (pure auth) | `<module>: { <role>: { allowed_pools?, group?, admin_scope? } }`. Omitted `allowed_pools` = all pools, `[]` = none; `admin_scope` = `read-only\|hooks-register\|full` |
 
@@ -87,9 +87,13 @@ bucket (group + metric + window).
 
 ## Plugins: [`plugins`](configuration.md#plugins)
 
+One signed artifact format + trust model + loader for **store**, **secret**, and **auth** plugins
+(all loaded in-process over the hybrid ABI); **hook** plugins share the machinery but run
+out-of-process (socket/webhook). An `auth` plugin is referenced from `auth.chain` (e.g. `oidc`).
+
 | Key | Owns | Shape / default |
 |---|---|---|
-| [`plugins.enabled`](configuration.md#plugins) | MASTER SWITCH | `false` (default): no plugin ever loads |
+| [`plugins.enabled`](configuration.md#plugins) | MASTER SWITCH | `false` (default): no plugin ever loads (store/secret/auth all inert) |
 | [`plugins.dir`](configuration.md#plugins) | Where signed tarballs live | `plugins` (default) |
 | [`plugins.trust`](configuration.md#plugins) | Signature policy | `{ publishers: [{name, public_key}], allow_unsigned: false, allow_third_party: false }` (busbar's release key is embedded; untrusted plugins are never dlopened) |
 | [`plugins.min_versions`](configuration.md#plugins) | Anti-downgrade floors | `<plugin-name>: "<min version>"` (first-party auto-floored at the binary version) |

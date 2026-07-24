@@ -194,6 +194,23 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   name/alias). The loader maps EXACTLY the verified bytes (`memfd_create` on Linux; a private
   `0700` staging dir elsewhere) - a pre-existing on-disk library is never loaded, closing the
   verify-then-load TOCTOU. `plugins.min_versions` adds per-plugin anti-downgrade floors.
+- **Auth plugins load over the same signed hybrid ABI as store and secret plugins.** A
+  `kind: auth` plugin is now a real runtime identity provider: name it in `auth.chain` (anything
+  but the built-in `keys`) and the engine resolves it against the plugins directory and loads it
+  IN-PROCESS at boot through `registry.open_auth` — the identical trust posture, loader, and
+  fail-closed pipeline that back store and secret plugins. **STORE, SECRET, AND AUTH plugins now
+  genuinely load over the one signed hybrid ABI** (an earlier note that implied a single loader
+  already carried all plugin kinds was ahead of the code for `auth`; it is now true for these
+  three). The plugin returns identity only (`Principal` id + roles); busbar maps those roles
+  through `auth.role_bindings.<module>` — keyed by the plugin's RUNTIME `name()` — to pools,
+  group limits, and an admin scope capped by `auth.chain.<module>.max_admin_scope`. **Fail-closed
+  everywhere:** a configured auth plugin that cannot load (missing/untrusted tarball, wrong kind,
+  `plugins.enabled: false`, or an ABI failure) is a HARD boot/apply error — a dropped front-door
+  module can never silently open the door. `busbar --validate` catches it manifest-only ahead of
+  boot, and `GET /api/v1/admin/plugins?type=auth` reports a loaded auth plugin. The bundled
+  `oidc` module (`busbar-auth-oidc-plugin`, `auth.chain: [oidc]`) is the first such plugin.
+  **Hook plugins stay OUT-OF-PROCESS** (socket/webhook transports); they share the artifact,
+  trust, and inventory machinery but are not in-process `dlopen` consumers.
 - **Admin plugin API.** The admin surface manages the plugin catalog over its own versioned
   contract: list/inspect installed plugins (manifest, signature verdict, load status), install a
   signed tarball, and remove one - with the same trust pipeline as boot (an untrusted upload is

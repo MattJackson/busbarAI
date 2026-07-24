@@ -819,8 +819,25 @@ impl AdminService {
                         None,
                     ));
                 }
-                // External auth modules (runtime-registered) — none until the auth-module registration
-                // endpoint lands (#56); the catalog shape is ready for them.
+                // DYNAMIC auth modules: a `kind: auth` plugin loaded over the signed hybrid ABI and
+                // boxed into the data-plane chain. Its runtime name (`module.name()`, what
+                // `role_bindings.<module>` keys off) appears in `chain_names()` but is NOT
+                // compiled-in — report each such module as a loaded plugin, always `active` (it is
+                // in the chain by construction).
+                let compiled = auth_modules_compiled_in();
+                for name in &chain {
+                    if !compiled.contains(name) {
+                        plugins.push(PluginView::basic(
+                            name.to_string(),
+                            "auth",
+                            "plugin",
+                            Some(true),
+                            None,
+                        ));
+                    }
+                }
+                // External auth modules (runtime-registered over socket/webhook) — none until the
+                // auth-module registration endpoint lands (#56); the catalog shape is ready.
             }
             "hooks" => {
                 // The weighted SWRR floor is compiled in unconditionally (the non-removable default
