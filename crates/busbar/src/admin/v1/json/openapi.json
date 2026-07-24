@@ -4893,6 +4893,98 @@
         "x-busbar-required-scope": "read-only"
       }
     },
+    "/api/v1/admin/overlay/{section}": {
+      "delete": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "section",
+            "required": true,
+            "schema": {
+              "enum": [
+                "groups",
+                "hooks"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`{reset, config_version, changed}` — changed:false when the section had no overlay state"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Unknown section, or ephemeral busbar with no config files to revert to (error code `invalid_request`)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "DISCARD a section's overlay mutations and revert it to base config.yaml (section ∈ groups|hooks). Per-section reset — the OTHER section's overlay survives. A NEW config version; an already-empty section is an idempotent no-op (changed:false)",
+        "x-busbar-required-scope": "full"
+      }
+    },
     "/api/v1/admin/plugins": {
       "get": {
         "parameters": [

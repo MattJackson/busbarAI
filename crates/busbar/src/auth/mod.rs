@@ -875,6 +875,9 @@ pub(crate) async fn auth_middleware(
             let class = if (rel.starts_with("/config/")
                 && rel != crate::admin::v1::contract::PATH_CONFIG_VALIDATE)
                 || rel == crate::admin::v1::contract::PATH_ADMIN_AUTH
+                // A per-section overlay reset discards a whole section back to base config — a
+                // blast-radius revert (rebuilds the App), so it meters in the tight CONFIG class.
+                || rel.starts_with("/overlay/")
             {
                 crate::admin::rate::MutationClass::Config
             } else {

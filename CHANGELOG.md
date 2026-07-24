@@ -108,6 +108,16 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   + overlay, re-merged at boot and re-validated on every hot-apply. Atomic write (temp + rename),
   per-section tombstones for deletions, and a loud refusal to overwrite a corrupt overlay. This is
   what makes the runtime-mutable groups (above) durable across restarts.
+- **Per-section overlay RESET - the audited revert-to-config.yaml front door.**
+  `DELETE /api/v1/admin/overlay/{section}` (section ∈ `groups` | `hooks`) DISCARDS every overlay
+  mutation for that one section and reverts it to what base `config.yaml` declares: a `groups` reset
+  restores the base limit tree (cost model rebuilt), a `hooks` reset restores base hooks
+  (registry/gates/rewrites rebuilt), each leaving the OTHER section's runtime mutations untouched.
+  Full scope, `If-Match` optimistic concurrency, audited + versioned, and the cleared overlay is
+  persisted so the revert survives a restart. A section with no overlay state is an idempotent no-op
+  (`changed: false`, version unchanged); an unknown section is a 400. The revert re-reads disk truth
+  (the same boot pipeline `config/reload` runs), so an ephemeral busbar with no config files has
+  nothing to revert to and 400s.
 - **`auth.role_bindings` NESTED BY MODULE.** `role_bindings.<module>.<role> ->
   { allowed_pools?, group?, admin_scope? }` - pure auth. A role asserted by one module can never
   ride another module's binding (`ad.platform` != `oidc.platform`); an unbound role grants
