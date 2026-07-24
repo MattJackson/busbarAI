@@ -542,12 +542,222 @@ pub unsafe fn secret_close_impl(handle: *mut c_void) {
     drop(Box::from_raw(handle as *mut BoxedSecret));
 }
 
+// ── HOOK-plugin glue (`kind: hook`) ───────────────────────────────────────────────────────────────
+// A hook plugin is a routing policy behind the frozen six-symbol ABI. Its author implements the tiny
+// SYNC [`HookHandler`] trait (the six ops over JSON), NOT the engine's async `RoutingPolicy` — the
+// async/borrowed trait lives on the ENGINE side (`DlopenPolicy`), which translates each method into a
+// `busbar_call`. The op-dispatch match ([`dispatch_hook`]) is the ergonomic helper the spec asks for:
+// a hook author writes `decide`/`transform`/etc. and the SDK routes the op envelope to them.
+
+/// The sync contract a `kind: hook` plugin author implements. Each method receives the op's payload as
+/// the opaque projection [`serde_json::Value`] the engine built (`hooks::wire::build`) and returns the
+/// reply object the engine parses through its fail-closed normalizers. Every method has a DEFAULT so a
+/// trivial hook (e.g. a gate that only ranks) implements just the ops it cares about; the rest degrade
+/// to the safe "no opinion" / "unsupported" replies the engine already treats as fail-open.
+///
+/// A hook NEVER sees prompt/user content it was not granted: the engine only projects `prompt`/`user`
+/// into `payload` when BOTH the operator grant and the signed-manifest intent allow it. The handler
+/// just reads whatever keys are present.
+pub trait HookHandler: Send + Sync {
+    /// `decide` — rank candidates / return a verdict. Default: `{}` (abstain).
+    fn decide(&self, _payload: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    /// `transform` — a `prompt: rw` gate's rewrite/reject pass. Default: `{}` (abstain, original body).
+    fn transform(&self, _payload: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    /// `notify` — a tap observation (fire-and-forget). Default: no-op.
+    fn notify(&self, _payload: &serde_json::Value) {}
+    /// `configure` — accept a desired-state settings push. Return `true` to ACK the version (the engine
+    /// requires the ack), `false`/anything-else to reject the push. Default: ACK (idempotent no-op).
+    fn configure(
+        &self,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+        _settings_version: u64,
+    ) -> bool {
+        true
+    }
+    /// `describe` — the self-description envelope `{schema, dashboard?}`. Default: `{}` (none).
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    /// `status` — observed settings + metrics (`{status: {...}}`). Default: `{}` (unsupported → the
+    /// engine fails open).
+    fn status(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+}
+
+/// The hook handle behind the opaque `*mut c_void`: a boxed [`HookHandler`].
+type BoxedHook = Box<dyn HookHandler>;
+
+/// Return the HOOK PAYLOAD schema version this SDK builds against (`busbar_plugin_kind() == "hook"`).
+pub fn hook_abi_version() -> u32 {
+    busbar_plugin_abi::hook::HOOK_ABI_VERSION
+}
+
+/// Run one [`busbar_plugin_abi::hook::HookRequest`] against a [`HookHandler`] — the single op-dispatch
+/// match that maps the wire envelope to the trait, unit-testable without FFI. This is the ergonomic
+/// helper a hook author never has to write.
+pub fn dispatch_hook(
+    handler: &dyn HookHandler,
+    req: busbar_plugin_abi::hook::HookRequest,
+) -> busbar_plugin_abi::hook::HookReply {
+    use busbar_plugin_abi::hook::{HookReply, HookRequest};
+    match req {
+        HookRequest::Decide { payload } => HookReply::Reply(handler.decide(&payload)),
+        HookRequest::Transform { payload } => HookReply::Reply(handler.transform(&payload)),
+        HookRequest::Notify { payload } => {
+            handler.notify(&payload);
+            HookReply::None
+        }
+        HookRequest::Configure(body) => {
+            if handler.configure(&body.settings, body.settings_version) {
+                HookReply::ConfigureAck {
+                    settings_version: body.settings_version,
+                }
+            } else {
+                // A non-ack is signaled by echoing a version that CANNOT match the pushed one, so the
+                // engine's exact-version ack rule rejects the configure (commit does not proceed).
+                HookReply::ConfigureAck {
+                    settings_version: body.settings_version.wrapping_add(1),
+                }
+            }
+        }
+        HookRequest::Describe => HookReply::Reply(handler.describe()),
+        HookRequest::Status => HookReply::Reply(handler.status()),
+    }
+}
+
+/// `busbar_open` body for a hook plugin — build a `Box<dyn HookHandler>` from the JSON config.
+///
+/// # Safety
+/// Pointers must be valid per the ABI (see [`open_impl`]).
+pub unsafe fn hook_open_impl(
+    cfg: *const u8,
+    cfg_len: usize,
+    out_handle: *mut *mut c_void,
+    out_err: *mut *mut u8,
+    out_err_len: *mut usize,
+    ctor: fn(&str) -> Result<BoxedHook, String>,
+) -> i32 {
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if cfg_len == 0 {
+            &[]
+        } else if cfg.is_null() {
+            return Err((String::from("null config pointer"), true));
+        } else {
+            std::slice::from_raw_parts(cfg, cfg_len)
+        };
+        let s = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return Err((String::from("config is not valid UTF-8"), true)),
+        };
+        ctor(s).map_err(|msg| (msg, false))
+    }));
+    match res {
+        Ok(Ok(handler)) => {
+            let handle = Box::into_raw(Box::new(handler)) as *mut c_void;
+            if !out_handle.is_null() {
+                *out_handle = handle;
+            }
+            STATUS_OK
+        }
+        Ok(Err((msg, protocol))) => {
+            write_buf(msg.into_bytes(), out_err, out_err_len);
+            if protocol {
+                STATUS_PROTOCOL
+            } else {
+                STATUS_ERR
+            }
+        }
+        Err(_) => STATUS_PROTOCOL,
+    }
+}
+
+/// `busbar_call` body for a hook plugin — deserialize a
+/// [`busbar_plugin_abi::hook::HookRequest`], dispatch, serialize the reply. Panics are caught (a panic
+/// never crosses the C boundary — the engine maps a caught panic to a PROTOCOL error).
+///
+/// # Safety
+/// `handle` must be a live handle from [`hook_open_impl`]; buffers per the ABI.
+pub unsafe fn hook_call_impl(
+    handle: *mut c_void,
+    req: *const u8,
+    req_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if handle.is_null() {
+        return STATUS_PROTOCOL;
+    }
+    let handler: &BoxedHook = &*(handle as *const BoxedHook);
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if req_len == 0 {
+            &[]
+        } else if req.is_null() {
+            return Err((String::from("null request pointer"), true));
+        } else {
+            std::slice::from_raw_parts(req, req_len)
+        };
+        let request: busbar_plugin_abi::hook::HookRequest = match serde_json::from_slice(bytes) {
+            Ok(r) => r,
+            Err(e) => return Err((format!("malformed request JSON: {e}"), true)),
+        };
+        let resp = dispatch_hook(handler.as_ref(), request);
+        serde_json::to_vec(&resp).map_err(|e| (format!("response encode failed: {e}"), true))
+    }));
+    match res {
+        Ok(Ok(payload)) => {
+            write_buf(payload, out, out_len);
+            STATUS_OK
+        }
+        Ok(Err((msg, protocol))) => {
+            write_buf(msg.into_bytes(), out, out_len);
+            if protocol {
+                STATUS_PROTOCOL
+            } else {
+                STATUS_ERR
+            }
+        }
+        Err(_) => STATUS_PROTOCOL,
+    }
+}
+
+/// `busbar_close` body for a hook plugin — drop the handler instance. Idempotent on null.
+///
+/// # Safety
+/// `handle` must be a live handle from [`hook_open_impl`] not already closed.
+pub unsafe fn hook_close_impl(handle: *mut c_void) {
+    if handle.is_null() {
+        return;
+    }
+    drop(Box::from_raw(handle as *mut BoxedHook));
+}
+
+/// Emit a `hook`-kind cdylib plugin from `$ctor` (a
+/// `fn(&str) -> Result<Box<dyn busbar_plugin_sdk::HookHandler>, String>`). Expands through
+/// [`export_plugin!`], stamping `busbar_plugin_kind() == "hook"` + the six neutral symbols.
+#[macro_export]
+macro_rules! export_hook_plugin {
+    ($ctor:path) => {
+        $crate::export_plugin!(
+            kind = "hook",
+            open = $crate::hook_open_impl,
+            call = $crate::hook_call_impl,
+            close = $crate::hook_close_impl,
+            ctor = $ctor,
+        );
+    };
+}
+
 /// The ONE macro that stamps a plugin's KIND and emits the SIX kind-neutral `extern "C"` symbols
 /// (`busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`, `busbar_free`, `busbar_close`),
 /// wiring `open`/`call`/`close` to the caller-supplied bodies. The per-kind `export_*_plugin!`
 /// convenience macros expand through this — a plugin author normally calls those, not this directly.
 ///
-/// - `$kind` — a `&'static str` kind (`"store"` | `"secret"` | `"auth"`), stamped into
+/// - `$kind` — a `&'static str` kind (`"store"` | `"secret"` | `"auth"` | `"hook"`), stamped into
 ///   `busbar_plugin_kind()` as a NUL-terminated string.
 /// - `$open`/`$call`/`$close` — paths to the SDK `*_impl` bodies for this kind (the FFI unsafe lives
 ///   there, unit-tested; the macro is a thin per-plugin wrapper).
@@ -742,6 +952,108 @@ mod tests {
             assert!(msg.contains("settings.name required"), "got {msg}");
 
             secret_close_impl(handle);
+        }
+    }
+
+    /// A trivial test hook handler: decide prefers `[0]`, configure acks only the pushed version.
+    struct TestHook;
+    impl HookHandler for TestHook {
+        fn decide(&self, _payload: &serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"order": [0]})
+        }
+        fn status(&self) -> serde_json::Value {
+            serde_json::json!({"status": {"metrics": []}})
+        }
+    }
+
+    /// HOOK glue: `dispatch_hook` maps each op envelope to the trait — decide returns the reply
+    /// object, notify returns None, configure ACKs the exact version, describe/status pass through.
+    #[test]
+    fn hook_dispatch_maps_ops() {
+        use busbar_plugin_abi::hook::{ConfigureBody, HookReply, HookRequest};
+        match dispatch_hook(
+            &TestHook,
+            HookRequest::Decide {
+                payload: serde_json::json!({}),
+            },
+        ) {
+            HookReply::Reply(v) => assert_eq!(v, serde_json::json!({"order": [0]})),
+            other => panic!("expected Reply, got {other:?}"),
+        }
+        // notify is fire-and-forget → None.
+        assert!(matches!(
+            dispatch_hook(
+                &TestHook,
+                HookRequest::Notify {
+                    payload: serde_json::json!({})
+                }
+            ),
+            HookReply::None
+        ));
+        // configure with the default handler (acks) echoes the pushed version.
+        match dispatch_hook(
+            &TestHook,
+            HookRequest::Configure(ConfigureBody {
+                hook: "h".into(),
+                settings: serde_json::Map::new(),
+                settings_version: 42,
+                busbar_version: "1.5.0".into(),
+            }),
+        ) {
+            HookReply::ConfigureAck { settings_version } => assert_eq!(settings_version, 42),
+            other => panic!("expected ConfigureAck(42), got {other:?}"),
+        }
+    }
+
+    /// HOOK glue: the FFI path (open → call → close) round-trips a decide and a status, and a
+    /// malformed request is a PROTOCOL error, never a crash.
+    #[test]
+    fn hook_ffi_roundtrip_open_call_close() {
+        fn hook_ctor(_cfg: &str) -> Result<BoxedHook, String> {
+            Ok(Box::new(TestHook))
+        }
+        unsafe {
+            let mut handle: *mut c_void = ptr::null_mut();
+            let mut err: *mut u8 = ptr::null_mut();
+            let mut err_len: usize = 0;
+            let st = hook_open_impl(
+                b"{}".as_ptr(),
+                2,
+                &mut handle,
+                &mut err,
+                &mut err_len,
+                hook_ctor,
+            );
+            assert_eq!(st, STATUS_OK);
+            assert!(!handle.is_null());
+
+            let req = serde_json::to_vec(&busbar_plugin_abi::hook::HookRequest::Decide {
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+            let mut out: *mut u8 = ptr::null_mut();
+            let mut out_len: usize = 0;
+            let st = hook_call_impl(handle, req.as_ptr(), req.len(), &mut out, &mut out_len);
+            assert_eq!(st, STATUS_OK);
+            let resp: busbar_plugin_abi::hook::HookReply =
+                serde_json::from_slice(std::slice::from_raw_parts(out, out_len)).unwrap();
+            free_impl(out, out_len);
+            match resp {
+                busbar_plugin_abi::hook::HookReply::Reply(v) => {
+                    assert_eq!(v, serde_json::json!({"order": [0]}))
+                }
+                other => panic!("expected Reply, got {other:?}"),
+            }
+
+            // Malformed request → PROTOCOL, with a message, never a crash.
+            let junk = b"not json";
+            let mut out: *mut u8 = ptr::null_mut();
+            let mut out_len: usize = 0;
+            let st = hook_call_impl(handle, junk.as_ptr(), junk.len(), &mut out, &mut out_len);
+            assert_eq!(st, STATUS_PROTOCOL);
+            free_impl(out, out_len);
+
+            hook_close_impl(handle);
         }
     }
 
