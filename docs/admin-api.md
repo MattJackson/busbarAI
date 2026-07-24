@@ -15,13 +15,16 @@ Authorization: Bearer <token>
 
 A missing or wrong credential is `401 unauthorized` (in the same JSON error envelope as every other admin error) on every endpoint. `admin_auth: []` is the explicit open dev posture (anonymous, full authority); external admin modules (SSO/AD) slot into the same chain at compile time. Admin requests deliberately bypass virtual-key governance: the operator credential manages keys, it is not one.
 
-**Authorization is a scope ladder** on the authenticated principal (`read-only` ⊂ `hooks-register` ⊂ `full`), derived from **method + path, never the request body** (a crafted body cannot escalate):
+**Authorization is a scope lattice** — NOT a ladder — on the authenticated principal, derived from **method + path, never the request body** (a crafted body cannot escalate). The scopes form a diamond: `read-only` at the bottom, `full` at the top, and `hooks-register` + `mint` as two **incomparable siblings** in the middle:
 
-| Scope | May |
-|---|---|
-| `read-only` | Every `GET`, **plus `POST /config/validate`** (a stateless dry-run: a read in POST clothing, so a read-only CI token can lint configs) |
-| `hooks-register` | reads + hook-definition mutations (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/admin/hooks`) |
-| `full` | everything else: keys, groups, config apply/reload/rollback, the admin auth chain, cache flush |
+| Scope | May | Notes |
+|---|---|---|
+| `read-only` | Every `GET`, **plus `POST /config/validate`** (a stateless dry-run: a read in POST clothing, so a read-only CI token can lint configs) | Satisfied by any grant |
+| `hooks-register` | reads + hook-definition mutations (`POST`/`PUT`/`PATCH`/`DELETE` under `/api/v1/admin/hooks`) | **Sibling of `mint`**: cannot mint keys |
+| `mint` | reads + **mint a key** (`POST /keys`, including auto-provisioning the leaf group on first mint) | **Sibling of `hooks-register`**: cannot register hooks. The delegated scope for a customer's self-service portal |
+| `full` | everything else: keys (lifecycle), groups, config apply/reload/rollback, the admin auth chain, cache flush, overlay reset | Satisfies every requirement |
+
+`hooks-register` and `mint` are SIBLINGS, not ladder rungs — the authorization check is an explicit lattice (`allows`), NOT `self >= needed`. A `mint` credential cannot register hooks, and a `hooks-register` credential cannot mint keys. A `max_admin_scope: mint` ceiling on a role never widens it into hook authority; both remain safe in either direction.
 
 The operator admin token holds `full`. Role-carrying principals (external modules) get the most permissive `admin_scope` their roles bind to under `auth.role_bindings.<module>` (capped by the module's `max_admin_scope:`); unbound roles grant nothing. Insufficient scope is `403 forbidden` naming the scope that would have sufficed. Unknown HTTP methods fail closed to `full`.
 
@@ -172,7 +175,7 @@ The virtual-key surface at `/api/v1/admin/keys` (`full` scope for mutations). Ke
 
 | Endpoint | Does |
 |---|---|
-| `POST /keys` | Mint a key: `201`, body is the metadata plus the **signed token, returned exactly once**. Body: `{name, group?, allowed_pools?, labels?, expires_in\|expires_at?, issue_aws_credential?}` (default expiry 90d). `group` binds the key into the `groups:` limit chain and must name a configured group (`400` naming the offender otherwise); `allowed_pools` omitted = all pools, `[]` = none (the intent is stored verbatim); `labels` (`{"team": "growth"}`) are echoed onto the key's metric series, never interpreted by enforcement. `issue_aws_credential: true` also returns a once-shown `aws_access_key_id` + `aws_secret_access_key` for SigV4 clients |
+| `POST /keys` | Mint a key: `201`, body is the metadata plus the **signed token, returned exactly once**. Body: `{name, group?, parent?, allowed_pools?, labels?, expires_in\|expires_at?, issue_aws_credential?}` (default expiry 90d). `group` binds the key into the `groups:` limit chain. **Auto-provision**: when `group` names a leaf that does NOT yet exist and `parent` is an existing group, the leaf is created automatically (limits stamped from the nearest-ancestor `child_default`, inherit-only when none) and the key is bound to it — the first self-mint materializes a `user:<sub>` personal budget bucket live in the enforcement chain. If the group already exists, `parent` must match its actual parent (a `409` otherwise — a mint never re-homes an existing group). `allowed_pools` omitted = all pools, `[]` = none (the intent is stored verbatim); `labels` (`{"team": "growth"}`) are echoed onto the key's metric series, never interpreted by enforcement. `issue_aws_credential: true` also returns a once-shown `aws_access_key_id` + `aws_secret_access_key` for SigV4 clients. Requires **`mint`** scope (or `full`) |
 | `GET /keys` | List metadata, id-sorted. Strict filters (`?enabled=true\|false`, `?prefix=vk_ab`, `?group=<name>`) where an unparseable value is a `400`, never a silently dropped filter. `?group=` is an exact bound-group match with **no existence check** against the registry: a key can reference a group the running config no longer has, and listing "keys of `g`" must still find them (that dangling state is exactly what an operator hunts). Cursor-paginated |
 | `GET /keys/{id}` | One key's metadata + its `ETag` header (16 hex chars) |
 | `PATCH /keys/{id}` | Adjust `enabled` and/or `group`. `group` is three-state: absent = unchanged, `null` = unbind (authed + unlimited), value = rebind to an existing group (mint-parity validated). The 1.4.x cap fields are rejected. Honors `If-Match` |
@@ -181,6 +184,8 @@ The virtual-key surface at `/api/v1/admin/keys` (`full` scope for mutations). Ke
 | `GET /keys/{id}/usage` | The **attribution view**: `{id, budget_period: "total", window_start: 0, as_of, group, spend_cents, tokens, requests, rate_headroom}`, the key's all-time attribution counters (its limits, if any, live on the bound group's own windows). `spend_cents` is DERIVED at read time from the key bucket's token ledger x the current `rate_card` plus fee x requests (reprice-on-read; nothing dollar-shaped is stored). `rate_headroom`: the fraction `[0,1]` of the tightest `requests`/`tokens` limit across the group chain left in each limit's own window (`null` = no such limit), back off *before* tripping a 429 |
 
 **Idempotency.** `POST /keys` and `POST /keys/{id}/rotate` accept an **`Idempotency-Key`** header: a retried request with the same key inside the ~10-minute window returns the first response verbatim (including the once-shown secret) instead of double-minting. The cache is scoped per principal (and per operation + key id for rotate), so no other admin's identical header value can replay your secret. A concurrent request while the first is still in flight is a terminal `409 conflict`.
+
+**Anti-sprawl cap.** The optional `limits.max_keys_per_principal` config knob caps how many keys may be bound to one group (a group = one principal in the self-service model; a user leaf can only hold so many keys). An over-cap mint is a terminal `409 conflict`. Absent or `0` = unlimited (the default — today's behavior).
 
 With no store/keys, one unambiguous rule: `GET /keys` answers `200` with an empty page (the keyspace is truthfully empty), single-resource reads answer `404 not_found` (also truthful), and writes answer with an actionable message.
 
@@ -242,6 +247,7 @@ Busbar's config plane is live: an authenticated write takes effect immediately, 
 | `POST /config/rollback` | Restore a retained version's hook surface. Body `{ "version": N }`; guard with `If-Match`. The target is **re-validated against current reality** before the swap (`400` if it no longer resolves); the result is a **new** version; history is append-only. Returns `{restored_version, config_version}`. `404` for a pruned/unknown target |
 | `PUT /admin-auth` | **Replace the admin auth chain at runtime.** Body `{ "admin_auth": ["admin-tokens", ...] }`; unknown module names are `400` (a typo can never silently drop auth). Guarded against self-lockout: the calling request's own credentials are re-evaluated against the *new* chain, and unless they would still hold `full` scope the change is a terminal `409` that changes nothing. Response is the resource (`{configured, modules, applied, config_version, note}`). Live until the next reload/restart |
 | `POST /auth/cache/flush` | **Instant revocation of the credential cache's allow window.** Body `{ "module": "name" }` flushes one auth module's partition; an empty body flushes everything. Returns `{flushed}` (entries dropped). The deny path never needs this; rejections are never cached |
+| `DELETE /overlay/{section}` | **Revert one overlay section to base `config.yaml` truth** (`section` ∈ `groups` \| `hooks`). Discards ALL overlay mutations for that section — a `groups` reset restores the base limit tree, a `hooks` reset restores base hooks — while leaving the other section's runtime mutations untouched. `full` scope, `If-Match` optimistic concurrency, audited, versioned, and the cleared overlay is persisted (the revert survives restart). A section with no overlay state is an idempotent no-op (`changed: false`, ETag/version unchanged). An unknown section is `400`. An ephemeral busbar with no config files has nothing to revert to and returns `400` |
 
 ### Hooks lifecycle
 

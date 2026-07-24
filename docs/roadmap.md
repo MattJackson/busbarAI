@@ -87,9 +87,31 @@ the next **auth adapters** on a seam that already exists.
   mechanism, with `per_request_fee` as a separate flat per-call fee.
 - **The `groups:` limit tree.** Nestable enforcement buckets — the ONE place limits live (keys are
   pure auth and carry none). A key binds one with the mint field `group`; admission walks the whole
-  parent chain, ANDs every limit, and the 429 names the exhausted bucket. Mint-time key `labels`
-  ride onto the Prometheus series so external dashboards break spend down by any operator
-  dimension.
+  parent chain (any depth — the arbitrary 8-level ceiling is gone; the cycle check bounds the walk),
+  ANDs every limit, and the 429 names the exhausted bucket. Mint-time key `labels` ride onto the
+  Prometheus series so external dashboards break spend down by any operator dimension. A group may
+  carry a `child_default` limit template: the first auto-provisioned child under a group inherits
+  those limits (nearest-ancestor wins), so a org/team/user hierarchy stamps per-user budgets
+  automatically.
+- **Pool-qualified limits and `on_exhaust: downgrade`.** A windowed limit may carry `pool: <name>`
+  to account per `(group, pool)` instead of group-wide: one team's expensive-tier budget is
+  independent from their cheap-tier budget. A pool-scoped `budget` limit may also declare
+  `on_exhaust: downgrade, downgrade_to: <pool>` — when it runs dry, the request is re-admitted
+  through the cheaper pool instead of refused (the caller's expensive calls get cheaper, not
+  blocked).
+- **Runtime-mutable groups on the Admin API.** `GET/POST/PUT/PATCH/DELETE /api/v1/admin/groups`
+  and `GET /groups/{name}/usage` (per-(window, pool) usage vs. caps, repriced at read time) and
+  `GET /keys?group=<name>` (the keys bound to a group). A write is validate-at-the-door, then live
+  on the next request; the ledger survives the swap. `PATCH` is the ergonomic "raise Alice's
+  budget" and "freeze a team" verb.
+- **Self-service mint: auto-provision + the `mint` scope.** `POST /keys` accepts an optional
+  `parent`: when `group` names a leaf that does not yet exist, it is auto-provisioned under
+  `parent` (limits from `child_default`). A new delegated `mint` admin scope — sibling of
+  `hooks-register`, NOT a ladder rung above it — lets a self-service portal mint keys without
+  god-mode `full`. `limits.max_keys_per_principal` caps keys per group (per-user anti-sprawl).
+- **Per-section overlay reset.** `DELETE /api/v1/admin/overlay/{section}` (section `groups` |
+  `hooks`) discards all overlay mutations for that section and reverts it to base `config.yaml`
+  truth, leaving the other section's runtime mutations untouched.
 - **Enforcement is always on.** There is no `governance:` block or enabled switch. Enforcement is
   always present and simply inert until keys are minted, so a default deploy behaves as "off" did
   with the same RAM. Durability is a choice via the top-level `store:` block (`memory` default;

@@ -935,6 +935,7 @@ limits:
   upstream_error_body_max_bytes: 262144  # 256 KiB
   max_honored_retry_after_secs: 86400 # 24 h
   default_max_tokens: 4096
+  max_keys_per_principal: 0       # 0 = unlimited; >0 caps keys bound to one group (per-user anti-sprawl)
 ```
 
 | Field | Type | Default | Notes |
@@ -950,6 +951,7 @@ limits:
 | `upstream_error_body_max_bytes` | integer | `262144` | Maximum bytes buffered from a non-2xx upstream response body for error classification. |
 | `max_honored_retry_after_secs` | integer | `86400` | Maximum value honored from an upstream `Retry-After` header (to prevent overflow). |
 | `default_max_tokens` | integer | `4096` | Gateway-wide default injected on cross-protocol hops to Anthropic when the caller omitted `max_tokens`. Overridden by a per-model `default_max_tokens` when set. |
+| `max_keys_per_principal` | integer | `0` | Anti-sprawl cap: the maximum number of keys that may be bound to one group (a group = one principal in the self-service model). `0` = unlimited. An over-cap `POST /keys` is a terminal `409 conflict`. Absent = unlimited. |
 
 ---
 
@@ -994,7 +996,7 @@ unlimited (access only).
   "labels": { "team": "growth" }, "expires_in": "7d" }
 ```
 
-- `group` must name a configured `groups:` entry (400 otherwise). Omitted = unlimited key.
+- `group` must name a configured `groups:` entry (`400` otherwise). Omitted = unlimited key. **Auto-provision**: when `group` names a leaf that does NOT yet exist and `parent` names an existing group, the leaf is created automatically (limits stamped from the nearest-ancestor `child_default`; inherit-only when none), bound to the key, and live in the enforcement chain immediately. If the group already exists, `parent` must match its actual parent (`409` otherwise — a mint never re-homes). Requires `mint` scope or `full`.
 - `allowed_pools` omitted = ALL pools; an explicit `[]` = NO pools (C6: an empty list is the
   empty set). The intent is stored exactly as given.
 - `expires_in` / `expires_at` are mutually exclusive; the default lifetime is 90 days.
@@ -1002,6 +1004,9 @@ unlimited (access only).
   `aws_secret_access_key` for Bedrock-SDK (SigV4) clients: both shown once.
 - The signed token is returned ONCE and never stored (the store holds the binding, ledger, and
   denylist, not the token).
+- `limits.max_keys_per_principal`: when set to a positive integer, caps how many keys may be
+  bound to one group (a group = one principal in the self-service model). An over-cap mint is a
+  `409 conflict`. Absent or `0` = unlimited.
 
 **Enforcement** walks the bound group's chain at admission and ANDs every limit (see
 [`groups`](#groups) for per-metric semantics). Spend derives at check time from the token ledger
