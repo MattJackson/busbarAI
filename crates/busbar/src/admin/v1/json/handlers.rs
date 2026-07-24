@@ -610,6 +610,136 @@ pub(crate) async fn delete_hook(
     }
 }
 
+/// Resolve — and if needed AUTO-PROVISION — the group a `POST /keys` mint binds to (self-service
+/// D2, §6a). The mint-time group contract, one place, shared by the key handler:
+///
+///   - group EXISTS, no `parent` given → bind as-is (`provisioned: false`).
+///   - group EXISTS, `parent` given → the given parent MUST equal the group's actual parent, else
+///     `409 conflict` (a portal must not silently re-home an existing leaf under a different team).
+///   - group MISSING, `parent` given → CREATE it as a leaf under `parent`, limits stamped from the
+///     nearest-ancestor `child_default` (inherit-only when none), via the SAME `build_with_group`
+///     validate-at-the-door path every group write uses (so validation / cost rebuild / version log
+///     / overlay persistence / base-shadow guard all hold), then bind (`provisioned: true`).
+///   - group MISSING, no `parent` → today's `400` (an unknown group with nowhere to root it).
+///
+/// Runs the create under `CONFIG_MUTATION_LOCK` (serialized with every other group/config mutation)
+/// and re-loads INSIDE the lock, so a concurrent create of the same leaf is a benign no-op (the
+/// second caller sees it exists and binds). Audited + versioned + overlay-persisted exactly like an
+/// explicit `POST /groups`. `parent` is capped at `MAX_GROUP_NAME_LEN` (a registry key / audit row).
+///
+/// Returns `Ok(true)` when a leaf was auto-provisioned for this mint, `Ok(false)` when the group
+/// already existed (bind as-is).
+pub(crate) async fn resolve_mint_group(
+    handle: &Arc<AppHandle>,
+    group: &str,
+    parent: Option<&str>,
+    actor: &str,
+) -> Result<bool, AdminError> {
+    let current = handle.load();
+    // Fast path: the group already exists (existence is the ENFORCEMENT truth — `cost.group_named`,
+    // the exact check every request admission uses — so a mint never binds a group the chain can't
+    // resolve). If a `parent` was named it must match the existing parent (never silently re-home an
+    // existing leaf); the parent value comes from the config registry, which agrees with the cost
+    // model in production (both rebuilt together on every apply).
+    if current.cost.group_named(group).is_some() {
+        if let Some(want) = parent {
+            let actual = current
+                .groups_registry
+                .get(group)
+                .and_then(|g| g.parent.clone());
+            if actual.as_deref() != Some(want) {
+                return Err(AdminError::Conflict(format!(
+                    "group `{group}` already exists with parent {}; the mint named parent `{want}` \
+                     — a mint cannot re-home an existing group (PATCH the group to re-parent it, or \
+                     drop `parent` to bind as-is)",
+                    actual
+                        .map(|p| format!("`{p}`"))
+                        .unwrap_or_else(|| "<root>".into()),
+                )));
+            }
+        }
+        return Ok(false);
+    }
+    // The group does NOT exist. Without a `parent` there is nowhere to root it — today's 400 stands
+    // (mirrors the pre-auto-provision message, but points at the self-service `parent:` field).
+    let Some(parent) = parent else {
+        return Err(AdminError::Validation(format!(
+            "group '{group}' does not exist in the top-level groups block; either configure it \
+             first, or pass `parent: <existing-group>` to auto-provision it as a leaf (e.g. \
+             `parent: team-payments` creates {group} under team-payments and binds the key)"
+        )));
+    };
+    if parent.len() > crate::admin::v1::service::MAX_GROUP_NAME_LEN {
+        return Err(AdminError::Validation(format!(
+            "parent name is {} chars; must be <= {}",
+            parent.len(),
+            crate::admin::v1::service::MAX_GROUP_NAME_LEN
+        )));
+    }
+    // AUTO-PROVISION under the mutation lock (serialized with /groups + /config writes). Re-load
+    // INSIDE the lock so we build against the freshest tree and a concurrent create of the same leaf
+    // is caught (benign: bind to it).
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    if current.cost.group_named(group).is_some() {
+        // A racing mint created it between our read and the lock. Honor the same parent-match rule.
+        let actual = current
+            .groups_registry
+            .get(group)
+            .and_then(|g| g.parent.clone());
+        if actual.as_deref() != Some(parent) {
+            return Err(AdminError::Conflict(format!(
+                "group `{group}` was concurrently created with a different parent than `{parent}`"
+            )));
+        }
+        return Ok(false);
+    }
+    // The named parent must exist — build_with_group's validate-at-the-door would reject a dangling
+    // parent as a 400, but name it precisely here (the mint's parent, not an opaque tree error).
+    // Existence via the enforcement truth (cost), matching the group existence check above.
+    if current.cost.group_named(parent).is_none() {
+        return Err(AdminError::Validation(format!(
+            "cannot auto-provision `{group}`: its `parent: {parent}` does not exist in the \
+             top-level groups block; name an existing team/org group"
+        )));
+    }
+    // A base-config group name is file-owned — the additive overlay cannot durably shadow it, so a
+    // mint must not materialize one at runtime (mirrors POST /groups). Vanishingly unlikely for a
+    // `user:<sub>` leaf, but the guard is uniform across every write path.
+    if current.base_group_names.contains(group) {
+        return Err(AdminError::Conflict(format!(
+            "group `{group}` is defined in the base config file; edit config.yaml (the API cannot \
+             silently shadow operator file config)"
+        )));
+    }
+    let leaf = crate::config::groups::provision_child(&current.groups_registry, parent);
+    let resource = format!("group:{group}");
+    match build_with_group(&current, group, leaf) {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("group.provision", &resource, audit::OUTCOME_APPLIED, actor);
+            let cur = handle.load();
+            record_group_version(
+                &installed,
+                actor,
+                &format!("group.provision {resource} (auto, parent {parent})"),
+            );
+            crate::config::overlay::persist_groups(
+                cur.overlay_path.as_deref(),
+                &cur.groups_registry,
+                None,
+                Some(group),
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("group.provision", &resource, audit::OUTCOME_REJECTED, actor);
+            Err(e)
+        }
+    }
+}
+
 /// `POST /api/v1/admin/groups` — create (or replace) a group at RUNTIME. Validate-at-the-door: the
 /// mutated tree is re-validated (parent exists, acyclic, depth) — an invalid tree is a `400` that
 /// changes nothing. `201` when the name is NEW, `200` on replace (upsert). `409` for a base-config

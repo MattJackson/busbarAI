@@ -4354,8 +4354,9 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
                 })
                 .to_string(),
             );
+            let handle = std::sync::Arc::new(crate::state::AppHandle::new(app.clone()));
             let r1 = super::create_key(
-                crate::state::CurrentApp(app.clone()),
+                axum::extract::State(handle.clone()),
                 axum::Extension(crate::auth::AuthPrincipal(None)),
                 axum::http::HeaderMap::new(),
                 body1,
@@ -4372,7 +4373,7 @@ fn test_create_key_warns_on_unconfigured_allowed_pool() {
                 .to_string(),
             );
             let r2 = super::create_key(
-                crate::state::CurrentApp(app),
+                axum::extract::State(handle),
                 axum::Extension(crate::auth::AuthPrincipal(None)),
                 axum::http::HeaderMap::new(),
                 body2,
@@ -5525,6 +5526,421 @@ async fn test_create_key_budget_group_and_labels_roundtrip_and_missing_group_400
         .expect("minted key listed");
     assert_eq!(row["group"], "growth");
     assert_eq!(row["labels"]["team"], "growth");
+
+    handle.abort();
+}
+
+// ── self-service mint: auto-provision + delegated mint scope + max_keys_per_principal (D2/§6a) ────
+
+/// A `budget` limit for a group tree (helper to keep the test trees readable).
+fn budget_limit(cents: u64) -> crate::config::groups::LimitCfg {
+    crate::config::groups::LimitCfg {
+        metric: crate::config::groups::LimitMetric::Budget,
+        amount: cents,
+        per: Some(crate::config::groups::LimitWindow::Month),
+        pool: None,
+        on_exhaust: None,
+        downgrade_to: None,
+    }
+}
+
+/// AUTO-PROVISION ON MINT (D2): minting into a NONEXISTENT `user:<sub>` leaf under a team carrying a
+/// `child_default` creates the leaf with the TEMPLATE limits, binds the key, and the new leaf is
+/// live in the enforcement chain (its resolved limits carry the template budget). Nearest-ancestor
+/// wins, so the leaf gets the team's per-head default. Also: `group_provisioned: true` is echoed.
+#[tokio::test]
+async fn test_mint_auto_provisions_leaf_from_child_default() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    // acme (org) → team-payments (team, child_default $20/mo per head). No user leaf yet.
+    let groups = std::collections::BTreeMap::from([
+        (
+            "acme".to_string(),
+            crate::config::GroupCfg {
+                limits: vec![budget_limit(5_000_000)],
+                ..Default::default()
+            },
+        ),
+        (
+            "team-payments".to_string(),
+            crate::config::GroupCfg {
+                parent: Some("acme".to_string()),
+                limits: vec![budget_limit(2_000_000)],
+                child_default: Some(crate::config::groups::ChildDefault {
+                    limits: vec![budget_limit(2000)],
+                }),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let app = TestApp::new().governance(gov).groups_tree(groups).build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+
+    // Mint into a leaf that does NOT exist, naming its team as the parent → auto-provision.
+    let resp = client
+        .post(format!("http://{addr}/api/v1/admin/keys"))
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({
+            "name": "alice-cli",
+            "group": "user:alice",
+            "parent": "team-payments"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "auto-provision + mint succeeds"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["group"], "user:alice", "key bound to the new leaf");
+    assert_eq!(
+        body["group_provisioned"], true,
+        "the mint reports it created the leaf"
+    );
+
+    // The leaf now EXISTS, parented to the team, with the team's child_default limits stamped on.
+    let leaf: serde_json::Value = client
+        .get(format!("http://{addr}/api/v1/admin/groups/user:alice"))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(leaf["parent"], "team-payments");
+    assert_eq!(leaf["enabled"], true);
+    assert_eq!(leaf["limits"][0]["metric"], "budget");
+    assert_eq!(
+        leaf["limits"][0]["amount"], 2000,
+        "leaf carries the nearest-ancestor child_default budget"
+    );
+    // The leaf is a per-user bucket, not itself a template source.
+    assert!(leaf.get("child_default").is_none());
+
+    // ENFORCEMENT CHAIN: the leaf's usage read projects the template budget as its cap (the limit is
+    // live in the cost model / governance projection — the chain will AND leaf ∩ team ∩ org).
+    let usage: serde_json::Value = client
+        .get(format!(
+            "http://{addr}/api/v1/admin/groups/user:alice/usage"
+        ))
+        .header("x-admin-token", "admintok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let month_bucket = usage["buckets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["window"] == "month")
+        .expect("a month bucket exists for the leaf");
+    assert_eq!(
+        month_bucket["budget_cap"], 2000,
+        "the leaf's budget cap is enforced from the stamped template"
+    );
+
+    // A SECOND mint into the now-existing leaf binds as-is (no re-provision).
+    let resp2 = client
+        .post(format!("http://{addr}/api/v1/admin/keys"))
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({
+            "name": "alice-cli-2",
+            "group": "user:alice",
+            "parent": "team-payments"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status().as_u16(), 201);
+    let body2: serde_json::Value = resp2.json().await.unwrap();
+    assert_eq!(
+        body2["group_provisioned"], false,
+        "binding to an existing leaf does not re-provision"
+    );
+
+    handle.abort();
+}
+
+/// PARENT-MISMATCH 409: minting into an EXISTING group while naming a `parent` that is NOT its
+/// actual parent is a conflict — a mint must never silently re-home an existing leaf. Naming the
+/// CORRECT parent (or none) binds fine.
+#[tokio::test]
+async fn test_mint_parent_mismatch_is_409() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let groups = std::collections::BTreeMap::from([
+        (
+            "team-a".to_string(),
+            crate::config::GroupCfg {
+                limits: vec![budget_limit(1_000_000)],
+                ..Default::default()
+            },
+        ),
+        (
+            "team-b".to_string(),
+            crate::config::GroupCfg {
+                limits: vec![budget_limit(1_000_000)],
+                ..Default::default()
+            },
+        ),
+        (
+            "user:bob".to_string(),
+            crate::config::GroupCfg {
+                parent: Some("team-a".to_string()),
+                limits: vec![budget_limit(3000)],
+                ..Default::default()
+            },
+        ),
+    ]);
+    let app = TestApp::new().governance(gov).groups_tree(groups).build();
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+
+    // Bob exists under team-a; a mint naming team-b as parent is a 409 (never re-home).
+    let resp = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "k", "group": "user:bob", "parent": "team-b"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409, "parent mismatch is a conflict");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "conflict");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already exists with parent"),
+        "the 409 explains the re-home refusal: {body}"
+    );
+
+    // Naming the CORRECT parent binds fine (parent matches).
+    let ok = client
+        .post(&url)
+        .header("x-admin-token", "admintok")
+        .json(&serde_json::json!({"name": "k2", "group": "user:bob", "parent": "team-a"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 201, "matching parent binds");
+
+    handle.abort();
+}
+
+/// DELEGATED MINT SCOPE (D2): a `mint`-scoped principal can MINT keys but CANNOT register hooks nor
+/// mutate groups; a `hooks-register` principal can register hooks but CANNOT mint. The two are
+/// SIBLINGS — neither confers the other. (The module ceiling is `full` so the bound scopes resolve
+/// un-capped; the operator token stays full and ceiling-exempt.)
+#[tokio::test]
+async fn test_mint_scope_is_sibling_of_hooks_register() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let groups = std::collections::BTreeMap::from([(
+        "team".to_string(),
+        crate::config::GroupCfg {
+            limits: vec![budget_limit(1_000_000)],
+            child_default: Some(crate::config::groups::ChildDefault {
+                limits: vec![budget_limit(1000)],
+            }),
+            ..Default::default()
+        },
+    )]);
+    let mut app = TestApp::new().governance(gov).groups_tree(groups).build();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.admin_chain = vec!["test-scope-module".to_string(), "admin-tokens".to_string()];
+        let mut table = std::collections::BTreeMap::new();
+        table.insert(
+            "minters".to_string(),
+            crate::config::RoleBindingCfg {
+                admin_scope: Some("mint".to_string()),
+                ..Default::default()
+            },
+        );
+        table.insert(
+            "registrars".to_string(),
+            crate::config::RoleBindingCfg {
+                admin_scope: Some("hooks-register".to_string()),
+                ..Default::default()
+            },
+        );
+        inner
+            .role_bindings
+            .insert("test-scope-module".to_string(), table);
+        // Ceiling `full` so `mint` / `hooks-register` resolve un-capped (default ceiling is read-only).
+        inner
+            .auth_scope_caps
+            .insert("test-scope-module".to_string(), "full".to_string());
+    }
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let with = |tok: &'static str, req: reqwest::RequestBuilder| {
+        req.header("x-admin-token", tok)
+            .header("content-type", "application/json")
+    };
+    let hook_body = serde_json::json!({
+        "name": "some-hook",
+        "config": {"kind": "tap", "webhook": "http://127.0.0.1:9969/"}
+    })
+    .to_string();
+
+    // MINT principal: CAN mint (into an existing group, and auto-provision a leaf).
+    let r = with(
+        "grp:minters",
+        client.post(format!("http://{addr}/api/v1/admin/keys")),
+    )
+    .body(serde_json::json!({"name": "m", "group": "user:dev", "parent": "team"}).to_string())
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        201,
+        "mint scope can mint + auto-provision"
+    );
+
+    // MINT principal: CANNOT register hooks (sibling boundary).
+    let r = with(
+        "grp:minters",
+        client.post(format!("http://{addr}/api/v1/admin/hooks")),
+    )
+    .body(hook_body.clone())
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        403,
+        "mint scope must NOT register hooks"
+    );
+
+    // MINT principal: CANNOT mutate groups (group CRUD stays full).
+    let r = with(
+        "grp:minters",
+        client.post(format!("http://{addr}/api/v1/admin/groups")),
+    )
+    .body(serde_json::json!({"name": "sneaky", "config": {"parent": "team"}}).to_string())
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        403,
+        "mint scope must NOT mutate arbitrary groups"
+    );
+
+    // HOOKS-REGISTER principal: CAN register a (shape-only) hook, CANNOT mint.
+    let r = with(
+        "grp:registrars",
+        client.post(format!("http://{addr}/api/v1/admin/hooks")),
+    )
+    .body(hook_body)
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(r.status().as_u16(), 201, "hooks-register registers hooks");
+    let r = with(
+        "grp:registrars",
+        client.post(format!("http://{addr}/api/v1/admin/keys")),
+    )
+    .body(serde_json::json!({"name": "x", "group": "team"}).to_string())
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        403,
+        "hooks-register must NOT mint keys"
+    );
+
+    handle.abort();
+}
+
+/// `max_keys_per_principal` (audit gap 7): with the cap set to 2, a group's 3rd mint is a 409 that
+/// names the cap; a DIFFERENT group is unaffected (the cap is per group = per principal). Cap `0`
+/// (default, tested elsewhere) is unlimited.
+#[tokio::test]
+async fn test_max_keys_per_principal_cap_trips() {
+    crate::metrics::init();
+    let store = Arc::new(MemoryStore::new());
+    let gov = gov_with_signer(store, Some("admintok".to_string()));
+    let groups = std::collections::BTreeMap::from([
+        (
+            "capped".to_string(),
+            crate::config::GroupCfg {
+                limits: vec![budget_limit(1_000_000)],
+                ..Default::default()
+            },
+        ),
+        (
+            "other".to_string(),
+            crate::config::GroupCfg {
+                limits: vec![budget_limit(1_000_000)],
+                ..Default::default()
+            },
+        ),
+    ]);
+    let mut app = TestApp::new().governance(gov).groups_tree(groups).build();
+    {
+        let inner = Arc::get_mut(&mut app).expect("sole owner");
+        inner.max_keys_per_principal = 2;
+    }
+    let router = crate::build_router(app);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/admin/keys");
+    let mint = |name: &str, group: &str| {
+        client
+            .post(&url)
+            .header("x-admin-token", "admintok")
+            .json(&serde_json::json!({"name": name, "group": group}))
+            .send()
+    };
+
+    // Two keys into `capped` — both fine (at the cap, not over it).
+    assert_eq!(mint("a", "capped").await.unwrap().status().as_u16(), 201);
+    assert_eq!(mint("b", "capped").await.unwrap().status().as_u16(), 201);
+    // The THIRD trips the cap → 409 naming the limit.
+    let r = mint("c", "capped").await.unwrap();
+    assert_eq!(
+        r.status().as_u16(),
+        409,
+        "3rd key into a capped group is a conflict"
+    );
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "conflict");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("max_keys_per_principal"),
+        "the 409 names the cap: {body}"
+    );
+
+    // A DIFFERENT group is unaffected — the cap is per group (= per principal).
+    assert_eq!(mint("d", "other").await.unwrap().status().as_u16(), 201);
 
     handle.abort();
 }

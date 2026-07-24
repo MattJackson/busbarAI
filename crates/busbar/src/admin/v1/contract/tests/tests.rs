@@ -50,12 +50,40 @@ fn required_scope_matrix() {
         required_scope(&Method::POST, "/api/v1/admin/hooksx"),
         Scope::Full
     );
+    // MINTING a key (POST /keys, the collection) is the delegated `mint` scope — NOT `full` and NOT
+    // `hooks-register` (self-service D2). The auto-provision-on-mint leaf creation rides this same
+    // request, so the whole mint path is `mint`.
     assert_eq!(
         required_scope(&Method::POST, "/api/v1/admin/keys"),
+        Scope::Mint
+    );
+    // A sibling of /keys must NOT inherit the mint scope (boundary-safe exact match).
+    assert_eq!(
+        required_scope(&Method::POST, "/api/v1/admin/keysx"),
+        Scope::Full
+    );
+    // Per-key lifecycle verbs are NOT mint — a self-service portal mints, it does not
+    // revoke/rotate/rebind. These stay `full`.
+    assert_eq!(
+        required_scope(&Method::DELETE, "/api/v1/admin/keys/vk_123"),
+        Scope::Full
+    );
+    assert_eq!(
+        required_scope(&Method::PATCH, "/api/v1/admin/keys/vk_123"),
+        Scope::Full
+    );
+    assert_eq!(
+        required_scope(&Method::POST, "/api/v1/admin/keys/vk_123/rotate"),
         Scope::Full
     );
     assert_eq!(
         required_scope(&Method::POST, "/api/v1/admin/config/apply"),
+        Scope::Full
+    );
+    // Group CRUD stays `full` (a mint token auto-provisions a leaf via POST /keys, but cannot
+    // freely mutate arbitrary groups).
+    assert_eq!(
+        required_scope(&Method::POST, "/api/v1/admin/groups"),
         Scope::Full
     );
     assert_eq!(
@@ -65,16 +93,53 @@ fn required_scope_matrix() {
     );
 }
 
-/// The scope ladder: read-only ⊂ hooks-register ⊂ full — and parse round-trips the tokens.
+/// The scope LATTICE (a diamond, not a chain): `ReadOnly` ⊂ {`HooksRegister`, `Mint`} ⊂ `Full`,
+/// with `HooksRegister` and `Mint` as INCOMPARABLE SIBLINGS. `allows` must NOT be `>=`: the whole
+/// point (self-service D2) is that a mint credential cannot register a hook and a hooks-register
+/// credential cannot mint. Also: parse round-trips every token.
 #[test]
-fn scope_ladder_allows() {
+fn scope_lattice_allows() {
+    // Full is god-mode: satisfies every requirement.
     assert!(Scope::Full.allows(Scope::ReadOnly));
     assert!(Scope::Full.allows(Scope::HooksRegister));
+    assert!(Scope::Full.allows(Scope::Mint));
+    assert!(Scope::Full.allows(Scope::Full));
+
+    // Every grant can read.
+    assert!(Scope::ReadOnly.allows(Scope::ReadOnly));
     assert!(Scope::HooksRegister.allows(Scope::ReadOnly));
+    assert!(Scope::Mint.allows(Scope::ReadOnly));
+
+    // Each middle rung satisfies ONLY itself (plus read) — the sibling property.
+    assert!(Scope::HooksRegister.allows(Scope::HooksRegister));
+    assert!(Scope::Mint.allows(Scope::Mint));
+
+    // THE CROSS-SIBLING PROHIBITION (the crux of D2): mint ⇏ hooks-register and vice versa. Under a
+    // naive `self >= needed` ordinal these would leak (Mint outranks HooksRegister), so this is the
+    // regression guard for the enumerated `allows`.
+    assert!(
+        !Scope::Mint.allows(Scope::HooksRegister),
+        "a mint credential must NOT be able to register hooks"
+    );
+    assert!(
+        !Scope::HooksRegister.allows(Scope::Mint),
+        "a hooks-register credential must NOT be able to mint keys"
+    );
+
+    // Neither middle rung reaches full.
     assert!(!Scope::HooksRegister.allows(Scope::Full));
+    assert!(!Scope::Mint.allows(Scope::Full));
     assert!(!Scope::ReadOnly.allows(Scope::HooksRegister));
+    assert!(!Scope::ReadOnly.allows(Scope::Mint));
+    assert!(!Scope::ReadOnly.allows(Scope::Full));
+
+    // Token round-trips (incl. the new `mint` token and its wire spelling).
     assert!(Scope::parse("bogus").is_none());
+    assert_eq!(Scope::parse("read-only"), Some(Scope::ReadOnly));
     assert_eq!(Scope::parse("hooks-register"), Some(Scope::HooksRegister));
+    assert_eq!(Scope::parse("mint"), Some(Scope::Mint));
+    assert_eq!(Scope::parse("full"), Some(Scope::Full));
+    assert_eq!(Scope::Mint.as_str(), "mint");
 }
 
 /// The stable error taxonomy is locked: each variant's `code` + HTTP status is the frozen wire

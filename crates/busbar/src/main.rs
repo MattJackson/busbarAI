@@ -2450,6 +2450,7 @@ pub(crate) fn build_app_from_config(
         providers_path: config_paths.1,
         overlay_path,
         config_version: app_config_version,
+        max_keys_per_principal: cfg.limits.max_keys_per_principal,
         failover_cfg,
         pool_runtime,
         fallback_pools,

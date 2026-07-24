@@ -56,6 +56,7 @@ fn minimal_app() -> Arc<App> {
         providers_path: None,
         overlay_path: None,
         config_version: 0,
+        max_keys_per_principal: 0,
         failover_cfg: None,
         pool_runtime: std::collections::HashMap::new(),
         fallback_pools: std::collections::HashMap::new(),

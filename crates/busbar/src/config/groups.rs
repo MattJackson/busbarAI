@@ -446,8 +446,7 @@ pub(crate) fn validate_groups(
 /// Config reaching here is validated ACYCLIC, so the walk terminates on its own; the `groups.len()`
 /// bound is a principled backstop (a distinct-node walk cannot exceed the number of groups without
 /// revisiting one, i.e. a cycle) — deliberately NOT the arbitrary depth policy constant.
-// Wired by the Phase 1 groups-provisioning handler (task #100); staged here with its logic + tests.
-#[allow(dead_code)]
+// Wired by the mint auto-provision path (`admin::v1::json::handlers::resolve_mint_group`).
 pub(crate) fn resolve_child_default<'a>(
     groups: &'a BTreeMap<String, GroupCfg>,
     parent: &str,
@@ -470,8 +469,7 @@ pub(crate) fn resolve_child_default<'a>(
 /// (`overlay::persist_groups`) and binds the new key to it; the enforcement chain then caps the leaf by
 /// `leaf ∩ parent ∩ ...`. Pure: does not mutate `groups`. `child_default` on the leaf itself is left
 /// unset (a per-user leaf is not itself a template source).
-// Wired by the Phase 1 groups-provisioning handler (task #100); staged here with its logic + tests.
-#[allow(dead_code)]
+// Wired by the mint auto-provision path (`admin::v1::json::handlers::resolve_mint_group`).
 pub(crate) fn provision_child(groups: &BTreeMap<String, GroupCfg>, parent: &str) -> GroupCfg {
     let limits = resolve_child_default(groups, parent)
         .map(|cd| cd.limits.clone())

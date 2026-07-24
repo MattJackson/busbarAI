@@ -40,6 +40,10 @@ pub(crate) const PATH_ADMIN_AUTH: &str = "/admin-auth";
 pub(crate) const PATH_CONFIG_VALIDATE: &str = "/config/validate";
 pub(crate) const PATH_HOOKS: &str = "/hooks";
 pub(crate) const PATH_GROUPS: &str = "/groups";
+/// The keys collection path — `POST` here MINTS a key (the delegated `mint` scope; auto-provision
+/// rides the same request). Exact-matched in `required_scope` so only the collection POST earns
+/// `mint`; per-key lifecycle verbs (`/keys/{id}` PATCH/DELETE, rotate, revoke) stay `full`.
+pub(crate) const PATH_KEYS: &str = "/keys";
 
 /// Shared pagination limit policy (§0.4, one cursor grammar → one limit policy) for the admin
 /// lists: `?limit=` hard cap and default page size, used by the keys list (admin.rs) and the
@@ -51,14 +55,29 @@ pub(crate) const LIST_LIMIT_DEFAULT: usize = 200;
 /// shared `LIST_LIMIT_MAX`.
 pub(crate) const VERSIONS_LIMIT_DEFAULT: usize = 100;
 
-/// The three built-in authorization scopes, totally ordered `ReadOnly ⊂ HooksRegister ⊂ Full`
-/// (design-admin-api-v1 §1). Authorization is checked on the PRINCIPAL per endpoint and is NEVER
-/// derived from the request body, so a crafted request cannot escalate. `Ord` derives from
-/// declaration order (low → high), so `principal_scope >= required` is the check.
+/// The built-in authorization scopes. They form a DIAMOND lattice, NOT a strict chain:
+/// `ReadOnly` at the bottom, `Full` at the top, and `HooksRegister` + `Mint` as two INCOMPARABLE
+/// siblings in the middle (design-admin-api-v1 §1; self-service governance D2). Authorization is
+/// checked on the PRINCIPAL per endpoint and is NEVER derived from the request body, so a crafted
+/// request cannot escalate.
 ///
-/// The full variant set is the FROZEN authorization contract; the per-endpoint scope checks that
-/// compare these land with the config/hooks/auth endpoints (upcoming slices), so the set is
-/// deliberately ahead of its first consumer.
+/// SIBLING, NOT A LADDER RUNG (self-service D2): `HooksRegister` and `Mint` are delegated,
+/// least-privilege scopes for two DIFFERENT automations — a hook-registration bot vs. the
+/// self-service portal that mints keys. Neither must confer the other: a mint credential cannot
+/// register a hook, and a hooks-register credential cannot mint a key. So `allows` is NOT
+/// `self >= needed` — it encodes the lattice explicitly (see `allows`).
+///
+/// `Ord` STILL derives from declaration order (low → high), but is used ONLY as an ordinal
+/// PRIVILEGE LEVEL for the `max_admin_scope:` ceiling arithmetic (`min(scope, cap)`) and the
+/// role-binding `max()` — NEVER as the authorization check. The ordinal places `Mint` above
+/// `HooksRegister` purely so that ceiling math stays TOTAL (a lattice `min`/`max` over incomparable
+/// elements is undefined); it does NOT mean mint subsumes hooks-register. The `allows` lattice is
+/// the sole truth for what a scope may DO. Practical consequence: a `max_admin_scope: hooks-register`
+/// ceiling capping a `mint`-granting role yields `hooks-register` (the ordinal floor), i.e. the cap
+/// still strictly narrows; and a `max_admin_scope: mint` ceiling never widens a `hooks-register`
+/// role into hook authority (min keeps it at hooks-register). Both directions are safe.
+///
+/// The full variant set is the FROZEN authorization contract.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Scope {
@@ -66,8 +85,14 @@ pub(crate) enum Scope {
     ReadOnly,
     /// read-only + register/update/delete/PATCH-settings of `tap|gate|route` HOOK definitions ONLY.
     /// Deliberately narrow (for automation that only registers hooks): cannot mint keys, change
-    /// auth, or wire chains.
+    /// auth, or wire chains. SIBLING of `Mint` — carries NO key-mint authority.
     HooksRegister,
+    /// read-only + MINT keys (`POST /keys`, INCLUDING the auto-provision-on-mint leaf-group
+    /// creation). The delegated scope for the customer's self-service portal (self-service §6a): it
+    /// can mint a key into a group and auto-provision the `user:<sub>` leaf, but CANNOT register
+    /// hooks, change auth, or mutate arbitrary config. SIBLING of `HooksRegister` — carries NO hook
+    /// authority.
+    Mint,
     /// Everything: keys, config apply/rollback, auth chains, group_map, cache.
     Full,
 }
@@ -78,43 +103,63 @@ impl Scope {
         match self {
             Scope::ReadOnly => "read-only",
             Scope::HooksRegister => "hooks-register",
+            Scope::Mint => "mint",
             Scope::Full => "full",
         }
     }
 
-    /// Parse a config-side scope token (`group_map.<g>.admin_scope`). `None` = unknown token —
-    /// config_validate rejects it at boot; runtime callers treat it as no grant (fail closed).
+    /// Parse a config-side scope token (`group_map.<g>.admin_scope`, `max_admin_scope:`). `None` =
+    /// unknown token — config_validate rejects it at boot; runtime callers treat it as no grant
+    /// (fail closed).
     pub(crate) fn parse(token: &str) -> Option<Self> {
         match token {
             "read-only" => Some(Scope::ReadOnly),
             "hooks-register" => Some(Scope::HooksRegister),
+            "mint" => Some(Scope::Mint),
             "full" => Some(Scope::Full),
             _ => None,
         }
     }
 
-    /// Whether a principal holding `self` may call an endpoint requiring `needed`. The scopes are
-    /// a strict ladder (`read-only ⊂ hooks-register ⊂ full`), encoded in the derive(Ord) variant
-    /// order above.
+    /// Whether a principal holding `self` may call an endpoint requiring `needed`. NOT a `>=`
+    /// ladder: the scopes are a DIAMOND lattice (`ReadOnly` ⊂ {`HooksRegister`, `Mint`} ⊂ `Full`)
+    /// where `HooksRegister` and `Mint` are INCOMPARABLE siblings — so this is enumerated explicitly
+    /// rather than derived from `Ord`, precisely so a mint credential can never satisfy a
+    /// hook-register requirement and vice versa (self-service D2). `Full` satisfies everything;
+    /// `ReadOnly` is satisfied by anything (every grant can read); a sibling requirement is
+    /// satisfied only by itself or `Full`.
     pub(crate) fn allows(self, needed: Scope) -> bool {
-        self >= needed
+        match needed {
+            // Every grant can read.
+            Scope::ReadOnly => true,
+            // Only the god-mode grant satisfies a full requirement.
+            Scope::Full => self == Scope::Full,
+            // The two middle rungs are SIBLINGS: satisfied only by the exact scope or `Full`.
+            // (This is the whole point of enumerating instead of `self >= needed`: under `>=`,
+            // `Mint >= HooksRegister` would be true by ordinal and a mint token could register
+            // hooks.)
+            Scope::HooksRegister => self == Scope::HooksRegister || self == Scope::Full,
+            Scope::Mint => self == Scope::Mint || self == Scope::Full,
+        }
     }
 }
 
 /// The AUTHORIZATION MATRIX (design-admin-api-v1 §1, §6.3): the scope an admin endpoint requires,
-/// derived from METHOD + PATH — never from the body (a crafted request cannot escalate). The
-/// ladder: every read is `read-only`; the hook-DEFINITION lifecycle (`/api/v1/admin/hooks*` mutations)
-/// is `hooks-register` (deliberately narrow — automation can register itself but cannot mint keys
-/// or change auth); every other mutation — keys, config apply/rollback, auth chains, group_map,
-/// cache — is `full`. Unknown methods fail closed to `full`. Body-derived refinements (§6.3: a
-/// `hooks-register` principal must not register a hook wired into a security-critical path) are
-/// enforced at the service layer, where the body is parsed.
+/// derived from METHOD + PATH — never from the body (a crafted request cannot escalate). NOT a
+/// ladder (the scope lattice is a diamond — see `Scope`): every read is `read-only`; the
+/// hook-DEFINITION lifecycle (`/api/v1/admin/hooks*` mutations) needs `hooks-register`; MINTING a
+/// key (`POST /keys`, which carries the auto-provision-on-mint leaf creation) needs `mint`; every
+/// other mutation — config apply/rollback, auth chains, group_map, cache, group CRUD — needs
+/// `full`. Because `HooksRegister`/`Mint` are SIBLINGS in `allows`, a `mint` requirement is
+/// satisfied by exactly `mint` or `full` — never by `hooks-register`, and vice versa. Unknown
+/// methods fail closed to `full`. Body-derived refinements (§6.3: a `hooks-register` principal must
+/// not register a hook wired into a security-critical path) are enforced at the service layer.
 pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
     use axum::http::Method;
     if method == Method::GET || method == Method::HEAD {
         return Scope::ReadOnly;
     }
-    // Only the enumerated mutation verbs earn the narrower hooks scope; anything else (OPTIONS,
+    // Only the enumerated mutation verbs earn a narrower delegated scope; anything else (OPTIONS,
     // TRACE, extension methods) fails closed to `full`.
     let is_mutation = method == Method::POST
         || method == Method::PUT
@@ -131,6 +176,15 @@ pub(crate) fn required_scope(method: &axum::http::Method, path: &str) -> Scope {
     }
     if is_mutation && (rel == PATH_HOOKS || rel.starts_with("/hooks/")) {
         return Scope::HooksRegister;
+    }
+    // MINTING a key is the delegated self-service verb (self-service §6a): `POST /keys` (only) —
+    // the auto-provision-on-mint leaf creation rides the same request, so the whole mint path is
+    // `mint`, not `full`. Everything else under `/keys*` (list/get are reads above; PATCH/DELETE/
+    // rotate/revoke are lifecycle mutations) stays `full` — a self-service portal mints, it does
+    // not revoke or rotate. Boundary-safe: `PATH_KEYS` exact match only (a sibling like `/keysx`
+    // falls through to `full`).
+    if method == Method::POST && rel == PATH_KEYS {
+        return Scope::Mint;
     }
     Scope::Full
 }

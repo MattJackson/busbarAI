@@ -4348,7 +4348,7 @@
                 }
               }
             },
-            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+            "description": "Authenticated but under-scoped: requires `mint` (error code `forbidden`)"
           },
           "409": {
             "content": {
@@ -4380,7 +4380,7 @@
           }
         ],
         "summary": "Mint a virtual key. The secret is returned EXACTLY once. Honors an `Idempotency-Key` header (per-principal ~10min replay)",
-        "x-busbar-required-scope": "full"
+        "x-busbar-required-scope": "mint"
       }
     },
     "/api/v1/admin/keys/{id}": {
