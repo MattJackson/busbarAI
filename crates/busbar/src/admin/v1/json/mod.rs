@@ -79,6 +79,12 @@ impl AdminTransport for JsonV1 {
                     .delete(delete_group),
             )
             .route("/groups/{name}/usage", get(get_group_usage))
+            // Per-section overlay RESET (D3): DISCARD a section's overlay mutations and revert it to
+            // base config.yaml. Full scope (the mutation fallthrough). section ∈ {groups, hooks}.
+            .route(
+                "/overlay/{section}",
+                axum::routing::delete(reset_overlay_section),
+            )
             .route("/plugins", get(list_plugins).post(install_plugin))
             .route("/plugins/reload", post(reload_plugins))
             .route("/plugins/{file}", axum::routing::delete(remove_plugin))

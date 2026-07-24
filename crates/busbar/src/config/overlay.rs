@@ -128,6 +128,59 @@ pub(crate) fn persist_groups(
     }
 }
 
+/// One MUTABLE overlay SECTION — the unit a per-section reset (`DELETE /api/v1/admin/overlay/{section}`)
+/// discards. Each section is an independent `base + overlay` layer with its own entries + tombstones;
+/// clearing one reverts exactly that slice of the effective config to base `config.yaml` while the
+/// other section's overlay mutations survive untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlaySection {
+    Hooks,
+    Groups,
+}
+
+impl OverlaySection {
+    /// Parse a URL path segment into a section, or `None` for an unknown name (the caller 400s). The
+    /// ONE place the valid section names live, so the route + the doc + the tests share one source.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hooks" => Some(OverlaySection::Hooks),
+            "groups" => Some(OverlaySection::Groups),
+            _ => None,
+        }
+    }
+
+    /// The section's wire/label name (the path segment).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OverlaySection::Hooks => "hooks",
+            OverlaySection::Groups => "groups",
+        }
+    }
+}
+
+/// Clear ONE section's entries + tombstones from the persisted overlay, IF persistence is enabled —
+/// the durable half of a per-section reset (`DELETE /api/v1/admin/overlay/{section}`). Read-modify-write
+/// so the OTHER section (its API-applied entries and tombstones) is carried forward verbatim: a
+/// `groups` reset must not resurrect an API-deleted hook, and vice-versa. Same durability (not
+/// correctness) contract as `persist`/`persist_groups`: the live config already reverted, so a write
+/// failure is logged, never fatal. `None` path is a no-op; an unreadable overlay is REFUSED (clearing
+/// it would silently drop the other section's tombstones).
+pub(crate) fn clear_section(path: Option<&Path>, section: OverlaySection) {
+    if let Some(p) = path {
+        let Some(mut doc) = load_for_rmw(p) else {
+            return;
+        };
+        doc.clear_section(section);
+        doc.version = OVERLAY_VERSION;
+        if let Err(e) = write(p, &doc) {
+            tracing::warn!(
+                error = %e, path = %p.display(), section = section.as_str(),
+                "failed to persist config overlay (section reset)"
+            );
+        }
+    }
+}
+
 /// The persisted overlay document: the API-applied hook registry + global-hook wiring, plus TOMBSTONES
 /// (`deleted`) — hooks removed via the API that must be subtracted from base config at boot. Tombstones
 /// are what let the additive `base + overlay` model express a DELETION (an additive merge alone cannot
@@ -150,6 +203,38 @@ pub(crate) struct OverlayDoc {
     /// Group tombstones — groups deleted via the API, subtracted from base config at boot.
     #[serde(default)]
     pub(crate) deleted_groups: Vec<String>,
+}
+
+impl OverlayDoc {
+    /// Wipe ONE section's entries + tombstones in place (the pure core of a per-section reset). The
+    /// remaining section is untouched, so merging this doc onto a freshly-resolved base config reverts
+    /// exactly the cleared section to `config.yaml` truth while the other section's overlay stays live.
+    pub(crate) fn clear_section(&mut self, section: OverlaySection) {
+        match section {
+            OverlaySection::Hooks => {
+                self.hooks.clear();
+                self.global_hooks.clear();
+                self.deleted.clear();
+            }
+            OverlaySection::Groups => {
+                self.groups.clear();
+                self.deleted_groups.clear();
+            }
+        }
+    }
+
+    /// Whether a section carries NO overlay state (no API-applied entries AND no tombstones) — so a
+    /// reset of it is a clean no-op (the effective config already equals base for that section). Drives
+    /// the idempotent-success short-circuit: resetting an untouched section changes nothing and must
+    /// not bump the config version or re-run the boot pipeline.
+    pub(crate) fn section_is_empty(&self, section: OverlaySection) -> bool {
+        match section {
+            OverlaySection::Hooks => {
+                self.hooks.is_empty() && self.global_hooks.is_empty() && self.deleted.is_empty()
+            }
+            OverlaySection::Groups => self.groups.is_empty() && self.deleted_groups.is_empty(),
+        }
+    }
 }
 
 /// Read the overlay at `path`, or `None` if it is absent, unreadable, or malformed. Fail-soft: a
@@ -517,6 +602,129 @@ mod tests {
         assert!(
             !doc.deleted_groups.iter().any(|n| n == "x"),
             "tombstone reconciled away for a restored group, else it vanishes on restart"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `OverlaySection::parse` is the ONE valid-name gate: `groups`/`hooks` round-trip, everything
+    /// else is `None` (the reset endpoint 400s on it).
+    #[test]
+    fn overlay_section_parse_round_trips_and_rejects() {
+        assert_eq!(
+            OverlaySection::parse("groups"),
+            Some(OverlaySection::Groups)
+        );
+        assert_eq!(OverlaySection::parse("hooks"), Some(OverlaySection::Hooks));
+        assert_eq!(OverlaySection::Groups.as_str(), "groups");
+        assert_eq!(OverlaySection::Hooks.as_str(), "hooks");
+        for bad in ["", "Groups", "hook", "auth", "plugins", "groups/"] {
+            assert!(
+                OverlaySection::parse(bad).is_none(),
+                "`{bad}` is not a section"
+            );
+        }
+    }
+
+    /// `clear_section(Groups)` wipes the groups entries + tombstones and leaves the hooks section
+    /// (and its tombstones) untouched — the per-section reset invariant.
+    #[test]
+    fn clear_section_wipes_one_section_only() {
+        let mut doc = OverlayDoc {
+            hooks: HashMap::from([("h".to_string(), gate())]),
+            global_hooks: vec!["h".to_string()],
+            deleted: vec!["gonehook".to_string()],
+            groups: BTreeMap::from([("user:alice".to_string(), group_with_budget())]),
+            deleted_groups: vec!["gonegroup".to_string()],
+            ..Default::default()
+        };
+        doc.clear_section(OverlaySection::Groups);
+        assert!(doc.groups.is_empty(), "groups entries cleared");
+        assert!(doc.deleted_groups.is_empty(), "group tombstones cleared");
+        assert!(doc.hooks.contains_key("h"), "hooks section preserved");
+        assert_eq!(
+            doc.global_hooks,
+            vec!["h".to_string()],
+            "global wiring preserved"
+        );
+        assert_eq!(
+            doc.deleted,
+            vec!["gonehook".to_string()],
+            "hook tombstones preserved"
+        );
+        // And the symmetric case.
+        doc.clear_section(OverlaySection::Hooks);
+        assert!(doc.hooks.is_empty() && doc.global_hooks.is_empty() && doc.deleted.is_empty());
+    }
+
+    /// `section_is_empty` is true only when a section carries neither entries nor tombstones — the
+    /// idempotent-no-op predicate the reset handler short-circuits on.
+    #[test]
+    fn section_is_empty_tracks_entries_and_tombstones() {
+        let empty = OverlayDoc::default();
+        assert!(empty.section_is_empty(OverlaySection::Groups));
+        assert!(empty.section_is_empty(OverlaySection::Hooks));
+        // A lone tombstone (no live entry) still counts as non-empty (a base deletion to revert).
+        let tombstoned = OverlayDoc {
+            deleted_groups: vec!["x".to_string()],
+            deleted: vec!["y".to_string()],
+            ..Default::default()
+        };
+        assert!(!tombstoned.section_is_empty(OverlaySection::Groups));
+        assert!(!tombstoned.section_is_empty(OverlaySection::Hooks));
+    }
+
+    /// The DURABLE half of a reset: `clear_section` on disk wipes one section + preserves the other,
+    /// exactly like the read-modify-write persist paths. Guards "reset drops the sibling section".
+    #[test]
+    fn clear_section_persist_preserves_sibling() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busbar-ovl-clearsect-{}.json", std::process::id()));
+        write(
+            &path,
+            &OverlayDoc {
+                hooks: HashMap::from([("keepme".to_string(), gate())]),
+                deleted: vec!["keephook_tomb".to_string()],
+                groups: BTreeMap::from([("user:zap".to_string(), group_with_budget())]),
+                deleted_groups: vec!["zap_tomb".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        clear_section(Some(&path), OverlaySection::Groups);
+        let doc = read(&path).expect("read back");
+        assert!(
+            doc.groups.is_empty() && doc.deleted_groups.is_empty(),
+            "groups reset on disk"
+        );
+        assert!(
+            doc.hooks.contains_key("keepme"),
+            "hooks entries survive the groups reset"
+        );
+        assert_eq!(
+            doc.deleted,
+            vec!["keephook_tomb".to_string()],
+            "hook tombstones survive"
+        );
+        assert_eq!(doc.version, OVERLAY_VERSION, "schema version stamped");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A section reset must REFUSE to overwrite a present-but-corrupt overlay (clearing it would drop
+    /// the sibling section's tombstones), mirroring the persist paths' fail-closed posture.
+    #[test]
+    fn clear_section_refuses_to_overwrite_corrupt_overlay() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "busbar-ovl-clearcorrupt-{}.json",
+            std::process::id()
+        ));
+        let corrupt = b"{ not valid json hiding tombstones";
+        std::fs::write(&path, corrupt).unwrap();
+        clear_section(Some(&path), OverlaySection::Groups);
+        let raw = std::fs::read(&path).expect("still present");
+        assert_eq!(
+            raw, corrupt,
+            "a corrupt overlay is preserved verbatim, never clobbered"
         );
         let _ = std::fs::remove_file(&path);
     }

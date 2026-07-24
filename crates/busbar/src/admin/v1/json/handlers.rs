@@ -1018,6 +1018,146 @@ pub(crate) async fn delete_group(
     }
 }
 
+/// `DELETE /api/v1/admin/overlay/{section}` — DISCARD every overlay mutation for one section and revert
+/// it to what base `config.yaml` declares. `section` ∈ {`groups`, `hooks`}; an unknown name is a `400`
+/// `invalid_request`. This is the audited revert-to-config front door (D3: per-section, NOT
+/// whole-overlay): it clears that section's overlay entries + tombstones, then rebuilds a complete
+/// `App` from base config (disk truth re-read + resolved, the OTHER section's overlay still merged) and
+/// swaps it in — so a `groups` reset restores base group limits (cost model rebuilt) and a `hooks` reset
+/// restores base hooks (registry/gates/rewrites rebuilt), each leaving the sibling section's runtime
+/// mutations untouched. Full scope; `If-Match` optimistic concurrency; audited + versioned; the cleared
+/// overlay is persisted so the revert survives a restart. A section with NO overlay state is a clean
+/// no-op success (idempotent) — nothing changes, the version does not bump. Requires config files on
+/// disk (the base truth to revert to); an ephemeral busbar has none, so reset is an `invalid_request`
+/// there, exactly like `config/reload`.
+pub(crate) async fn reset_overlay_section(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    Path(section): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    use crate::config::overlay::OverlaySection;
+    let actor = principal.actor_id().to_string();
+    // Validate the section name BEFORE the If-Match parse so an unknown section is always a plain
+    // 400 (never masked by a header error). Unknown → invalid_request (the taxonomy's 400).
+    let Some(section) = OverlaySection::parse(&section) else {
+        return err_json(&AdminError::Validation(format!(
+            "unknown overlay section `{section}`: expected `groups` or `hooks`"
+        )));
+    };
+    let resource = format!("overlay:{}", section.as_str());
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by("overlay.reset", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&e);
+    }
+    // IDEMPOTENT NO-OP: if this section carries no overlay state (no API-applied entries AND no
+    // tombstones), the effective config already equals base for it — a reset changes nothing, so
+    // short-circuit a 200 without bumping the version or re-running the boot pipeline. With
+    // persistence disabled there is no overlay at all, so every section is definitionally empty.
+    let overlay_empty = match current.overlay_path.as_deref() {
+        None => true,
+        Some(p) => crate::config::overlay::read(p)
+            .map(|doc| doc.section_is_empty(section))
+            .unwrap_or(true),
+    };
+    if overlay_empty {
+        audit::AUDIT.record_by("overlay.reset", &resource, audit::OUTCOME_APPLIED, &actor);
+        return with_config_etag(
+            ok_json(
+                StatusCode::OK,
+                &json!({
+                    "reset": section.as_str(),
+                    "config_version": current.config_version,
+                    "changed": false
+                }),
+            ),
+            current.config_version,
+        );
+    }
+    // Re-run the BOOT disk-load pipeline to recover base `config.yaml` truth, then merge the CURRENT
+    // overlay with this section CLEARED — the sibling section's overlay entries/tombstones survive, the
+    // reset section reverts to base. This is the exact `config/reload` mechanism, minus one section.
+    let (Some(config_path), Some(providers_path)) =
+        (current.config_path.clone(), current.providers_path.clone())
+    else {
+        audit::AUDIT.record_by("overlay.reset", &resource, audit::OUTCOME_REJECTED, &actor);
+        return err_json(&AdminError::Validation(
+            "this busbar was started without config files (ephemeral mode); a per-section reset has \
+             no disk truth to revert to"
+                .into(),
+        ));
+    };
+    let outcome = crate::load_config_from_disk(
+        &config_path,
+        &providers_path,
+        false,
+        crate::config::EnvSubst::Strict,
+    )
+    .and_then(|loaded| {
+        let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
+            .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
+        let base_hook_names: std::collections::HashSet<String> =
+            cfg.hooks.keys().cloned().collect();
+        let base_group_names: std::collections::HashSet<String> =
+            cfg.groups.keys().cloned().collect();
+        // Clear the target section from the persisted overlay before merging: that slice reverts to
+        // base, the other slice stays live.
+        if let Some(mut doc) = loaded.overlay_doc {
+            doc.clear_section(section);
+            crate::config::overlay::merge_into(&mut cfg, doc);
+        }
+        crate::build_app_from_config(
+            cfg,
+            loaded.deploy.plugins.clone(),
+            // Preserve the LIVE overlay path (not the env-derived one `load_config_from_disk`
+            // returns) — the reset rewrites the same overlay file the running App uses, exactly as
+            // `config/apply` preserves `current.overlay_path`.
+            current.overlay_path.clone(),
+            base_hook_names,
+            base_group_names,
+            (Some(config_path), Some(providers_path)),
+            Some(&current),
+        )
+    });
+    match outcome {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by("overlay.reset", &resource, audit::OUTCOME_APPLIED, &actor);
+            let cur = handle.load();
+            record_group_version(
+                &installed,
+                &actor,
+                &format!("overlay.reset {} (revert to config.yaml)", section.as_str()),
+            );
+            // Persist the section-cleared overlay so the revert survives a restart (the sibling
+            // section is preserved verbatim by the read-modify-write).
+            crate::config::overlay::clear_section(cur.overlay_path.as_deref(), section);
+            with_config_etag(
+                ok_json(
+                    StatusCode::OK,
+                    &json!({
+                        "reset": section.as_str(),
+                        "config_version": cur.config_version,
+                        "changed": true
+                    }),
+                ),
+                cur.config_version,
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by("overlay.reset", &resource, audit::OUTCOME_REJECTED, &actor);
+            err_json(&AdminError::Validation(e))
+        }
+    }
+}
+
 /// Apply a partial group PATCH onto a base definition: a field that is `Some` REPLACES, `None`
 /// PRESERVES. `limits`/`child_default` replace their whole list (a list can't be field-merged). The
 /// pure, testable core of `patch_group`.
@@ -2402,6 +2542,21 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         }),
     );
     paths.insert(
+        ap("/overlay/{section}"),
+        json!({
+            "delete": {
+                "summary": "DISCARD a section's overlay mutations and revert it to base config.yaml (section ∈ groups|hooks). Per-section reset — the OTHER section's overlay survives. A NEW config version; an already-empty section is an idempotent no-op (changed:false)",
+                "security": [{"adminToken": []}],
+                "parameters": [{"name": "section", "in": "path", "required": true, "schema": {"type": "string", "enum": ["groups", "hooks"]}}],
+                "responses": {
+                    "200": {"description": "`{reset, config_version, changed}` — changed:false when the section had no overlay state"},
+                    "400": {"description": "Unknown section, or ephemeral busbar with no config files to revert to (error code `invalid_request`)"},
+                    "409": {"description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"}
+                }
+            }
+        }),
+    );
+    paths.insert(
         ap(PATH_CONFIG_VALIDATE),
         json!({
             "post": {
@@ -2666,6 +2821,7 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         (PATH_ADMIN_AUTH, "put"),
         ("/config/apply", "post"),
         ("/config/rollback", "post"),
+        ("/overlay/{section}", "delete"),
         ("/keys/{id}", "patch"),
         ("/keys/{id}", "delete"),
     ];
@@ -2795,6 +2951,12 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/config/apply", "post", "200", sview::ConfigApplyView);
     typed!("/config/reload", "post", "200", sview::ConfigReloadView);
     typed!("/config/rollback", "post", "200", sview::ConfigRollbackView);
+    typed!(
+        "/overlay/{section}",
+        "delete",
+        "200",
+        sview::OverlayResetView
+    );
     typed!("/config/diff", "get", "200", sview::ConfigDiffView);
     typed!(
         "/config/versions",
