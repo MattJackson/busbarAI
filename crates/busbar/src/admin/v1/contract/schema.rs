@@ -143,10 +143,11 @@ pub(crate) struct CacheFlushView {
 /// overlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective
 /// root override (the merge of prior overlay + this request), overlay-persisted so it survives a
 /// restart. `reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE:
-/// the process-level binds (`listen`/`admin_listen` socket rebind, `tls`/`admin_tls` bind,
-/// `admin_insecure`) and the durable `store` backend cannot hot-swap, so they take effect on the next
-/// `POST /config/reload` or restart. Everything else (`rate_card`/`per_request_fee`/`security`/
-/// `limits`/`observability`/`advanced`/`metrics`/`health`/`routing`) is LIVE on the swap.
+/// the process-level binds (`listen`/`admin_listen` socket, `tls`/`admin_tls` bind, `admin_insecure`)
+/// are read once at process start, and the durable `store` backend is reused across a hot reload —
+/// none can hot-swap, so they take effect on the next RESTART. Everything else
+/// (`rate_card`/`per_request_fee`/`security`/`limits`/`observability`/`advanced`/`metrics`/`health`/
+/// `routing`) is LIVE on the swap.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ConfigSettingsView {
     /// `true` on a PUT that stored + swapped; `false` on a GET (a pure read).

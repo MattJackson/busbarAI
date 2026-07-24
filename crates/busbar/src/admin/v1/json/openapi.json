@@ -344,7 +344,7 @@
         "type": "object"
       },
       "ConfigSettingsView": {
-        "description": "`GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config\noverlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective\nroot override (the merge of prior overlay + this request), overlay-persisted so it survives a\nrestart. `reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE:\nthe process-level binds (`listen`/`admin_listen` socket rebind, `tls`/`admin_tls` bind,\n`admin_insecure`) and the durable `store` backend cannot hot-swap, so they take effect on the next\n`POST /config/reload` or restart. Everything else (`rate_card`/`per_request_fee`/`security`/\n`limits`/`observability`/`advanced`/`metrics`/`health`/`routing`) is LIVE on the swap.",
+        "description": "`GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config\noverlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective\nroot override (the merge of prior overlay + this request), overlay-persisted so it survives a\nrestart. `reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE:\nthe process-level binds (`listen`/`admin_listen` socket, `tls`/`admin_tls` bind, `admin_insecure`)\nare read once at process start, and the durable `store` backend is reused across a hot reload —\nnone can hot-swap, so they take effect on the next RESTART. Everything else\n(`rate_card`/`per_request_fee`/`security`/`limits`/`observability`/`advanced`/`metrics`/`health`/\n`routing`) is LIVE on the swap.",
         "properties": {
           "applied": {
             "description": "`true` on a PUT that stored + swapped; `false` on a GET (a pure read).",
@@ -2933,7 +2933,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged reload-to-apply. NEVER writes config.yaml",
+        "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged restart-to-apply (bound once at start / store reused across a hot reload). NEVER writes config.yaml",
         "x-busbar-required-scope": "full"
       }
     },

@@ -1903,14 +1903,15 @@ fn merge_root_settings(
     base
 }
 
-/// The RELOAD-TO-APPLY fields a `PUT /config/settings` REQUEST touched: the process-level binds
-/// (`listen`/`admin_listen` socket rebind, `tls`/`admin_tls` bind, `admin_insecure` boot-guard waiver)
-/// and the durable `store` backend cannot HOT-SWAP — a live `arc-swap` cannot rebind a socket or
-/// migrate an in-flight governance ledger to a new backend — so their new value is DURABLY STORED but
-/// takes effect only on the next `POST /config/reload` or restart. Every OTHER field
-/// (`rate_card`/`per_request_fee`/`security`/`limits`/…) applies live on the swap. Keyed on the
-/// REQUEST (only fields the operator just changed are flagged), so a subsequent live-only edit does
-/// not re-flag an already-reloaded bind.
+/// The RESTART-TO-APPLY fields a `PUT /config/settings` REQUEST touched: the process-level binds
+/// (`listen`/`admin_listen` socket, `tls`/`admin_tls` bind, `admin_insecure` boot-guard waiver) are
+/// read ONCE in `main()` at process start and bound to sockets that a live `arc-swap` — or even a
+/// hot `POST /config/reload` — cannot rebind; the durable `store` backend is REUSED from the prior
+/// snapshot on every apply/reload (an in-flight governance ledger cannot migrate backends live), so
+/// it too only re-opens on a fresh process. Their new value is DURABLY STORED in the overlay but
+/// takes effect on the next RESTART. Every OTHER field (`rate_card`/`per_request_fee`/`security`/
+/// `limits`/…) applies live on the swap. Keyed on the REQUEST (only fields the operator just changed
+/// are flagged), so a subsequent live-only edit does not re-flag an already-restart-pending bind.
 fn reload_to_apply_fields(req: &crate::config::overlay::RootSettings) -> Vec<String> {
     let mut out = Vec::new();
     let mut push = |set: bool, name: &str| {
@@ -1970,8 +1971,9 @@ pub(crate) async fn get_config_settings(State(handle): State<Arc<AppHandle>>) ->
 /// that changes NOTHING), built into a new `App`, and swapped in — so `rate_card`/`per_request_fee`/
 /// `security`/`limits`/… go LIVE immediately. The process-level binds
 /// (`listen`/`admin_listen`/`tls`/`admin_tls`/`admin_insecure`) and the durable `store` backend are
-/// stored + flagged RELOAD-TO-APPLY (they cannot hot-swap; `POST /config/reload` or restart makes them
-/// live) — the response's `reload_to_apply` names exactly which. Full scope; `If-Match` optimistic
+/// stored + flagged RESTART-TO-APPLY (they cannot hot-swap — sockets/TLS are bound once at process
+/// start and the store backend is reused across a hot reload; a RESTART makes them live) — the
+/// response's `reload_to_apply` names exactly which. Full scope; `If-Match` optimistic
 /// concurrency; audited (every attempt) + versioned; overlay-persisted so it survives a restart.
 /// Requires config files on disk (the base to merge onto); an ephemeral busbar has none, so this is a
 /// `400 invalid_request` there, exactly like `config/reload`.
@@ -2077,8 +2079,9 @@ pub(crate) async fn put_config_settings(
                 "applied live".to_string()
             } else {
                 format!(
-                    "applied live except {} — stored, effective on the next reload/restart (a socket \
-                     rebind / TLS bind / store backend cannot hot-swap)",
+                    "applied live except {} — stored in the overlay, effective on the next RESTART (a \
+                     socket rebind / TLS bind is read once at process start, and the store backend is \
+                     reused across a hot reload; none can hot-swap)",
                     reload_to_apply.join(", ")
                 )
             };
@@ -2798,7 +2801,7 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
                 }
             },
             "put": {
-                "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged reload-to-apply. NEVER writes config.yaml",
+                "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged restart-to-apply (bound once at start / store reused across a hot reload). NEVER writes config.yaml",
                 "security": [{"adminToken": []}],
                 "responses": {
                     "200": {"description": "`{applied:true, config_version, settings, reload_to_apply, note}`"},
