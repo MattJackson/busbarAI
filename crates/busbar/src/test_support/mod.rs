@@ -800,7 +800,13 @@ impl TestApp {
                 &crate::config::AuthCfg::default_none(),
             ))
         });
+        let tslots = std::sync::Arc::new(crate::telemetry::AppSlots::build(
+            &lanes,
+            &self.pools,
+            &by_model,
+        ));
         let app = std::sync::Arc::new(crate::state::App {
+            tslots,
             lanes,
             store: std::sync::Arc::new(crate::store::InMemoryStore::new(lane_data)),
             by_model,

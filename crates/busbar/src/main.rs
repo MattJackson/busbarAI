@@ -84,6 +84,7 @@ mod sigv4;
 mod state;
 mod state_persist;
 mod store;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod tls;
@@ -2386,6 +2387,10 @@ pub(crate) fn build_app_from_config(
     );
 
     Ok(App {
+        // Telemetry-bank slot table for this generation, registered BEFORE the config-derived
+        // collections move into the snapshot. Identical label sets across applies re-intern to the
+        // same slots, so hot-path counters accumulate monotonically across config generations.
+        tslots: Arc::new(telemetry::AppSlots::build(&lanes, &pools, &by_model)),
         lanes,
         store,
         by_model,

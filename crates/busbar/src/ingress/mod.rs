@@ -520,12 +520,13 @@ fn finish_inner(
         400..=499 => "client_error",
         _ => "error",
     };
-    // Per-request emits via CACHED handles (see `metrics::incr_requests_total` /
-    // `record_request_duration`): the steady-state path is a lock-free map read + atomic op, with no
-    // per-request `Label`/`Key` allocation or registry probe. Same series/values as the macros.
-    crate::metrics::incr_requests_total(ingress_protocol, pool, outcome);
+    // Per-request emits via the TELEMETRY BANK (telemetry.rs): a plain add into THIS thread's
+    // pre-registered cells — no shared-atomic contention, no per-request `Label`/`Key` allocation,
+    // no registry probe. The scrape-time aggregator folds the cells into the recorder, so the
+    // rendered series/values are identical to the macro emission. Unregistered label values (e.g.
+    // a bare test `App`) fall back to the cached-handle helpers in `metrics.rs` inside the helper.
     let elapsed = started.elapsed();
-    crate::metrics::record_request_duration(ingress_protocol, pool, elapsed.as_secs_f64());
+    crate::telemetry::request_finished(app, ingress_protocol, pool, outcome, elapsed.as_secs_f64());
 
     // best-effort request-log webhook (no-op unless configured). Gated on the configured check so an
     // unconfigured webhook (the default) skips even BUILDING the JSON payload — `fire_request_log`
