@@ -14,6 +14,7 @@ members = [
     "crates/auth-static-plugin",
     "crates/hook-test-plugin",
     "crates/webrequest-hook-plugin",
+    "crates/headroom-hook-plugin",
     "crates/hooks-ranking",
     "crates/store-sqlite",
     "crates/store-sqlite-plugin",

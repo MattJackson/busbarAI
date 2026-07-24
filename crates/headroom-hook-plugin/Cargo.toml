@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-headroom-hook-plugin"
+version = "1.5.0"
+publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "First-party signed kind:hook plugin cdylib: Headroom, a prompt-compression rewrite gate. On the transform op it receives the projected prompt (only when the operator granted prompt: rw AND the manifest declares needs.prompt = rw) and returns a deterministic, rule-based (v1) lossless-of-meaning compression as the rewrite reply — collapsing whitespace, de-duplicating consecutive identical lines and repeated system blocks. It ABSTAINS (returns the input unchanged) whenever there is nothing safe to compress or the grant was not given; it never fails the request. Reports honest cumulative char savings via status."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]   # cdylib for the C ABI delivery; rlib so the unit tests can exercise the pure compressor
+
+[dependencies]
+busbar-plugin-sdk = { path = "../plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The end-to-end test drives Headroom through the loader's real open_hook seam (mirrors webrequest's e2e).
+tokio = { version = "1", features = ["rt", "macros"] }
+busbar-plugin-loader = { path = "../plugin-loader" }
+busbar-api = { path = "../api" }
