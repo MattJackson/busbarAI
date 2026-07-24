@@ -43,6 +43,18 @@ struct HookConfig {
     /// fail-closed 403).
     #[serde(default)]
     raw_decide_reply: Option<serde_json::Value>,
+    /// Sleep this many milliseconds inside `decide` before replying — lets a test drive the engine's
+    /// hard wall-clock `budget` timeout (a slow gate → the caller's `on_error`).
+    #[serde(default)]
+    sleep_ms: Option<u64>,
+    /// `describe`/`status` reply empty (`{}`) — the "unsupported" reply the engine treats as fail-open
+    /// (no schema / no status). Proves the fail-open reads over the dlopen seam.
+    #[serde(default)]
+    empty_management: bool,
+    /// Refuse to ack a `configure` push (the handler returns `false`, so the SDK echoes a mismatched
+    /// version) — lets a test prove a NACK'd configure does not commit (Err over the seam).
+    #[serde(default)]
+    nack_configure: bool,
 }
 
 struct TestGate {
@@ -51,6 +63,9 @@ struct TestGate {
     reject_status: i64,
     restrict_tags: Option<Vec<String>>,
     raw_decide_reply: Option<serde_json::Value>,
+    sleep_ms: Option<u64>,
+    empty_management: bool,
+    nack_configure: bool,
     /// A monotonically incrementing decide count, surfaced via `status` — proves the control-plane
     /// scrape reads a real observed metric back over the ABI. `AtomicU64` keeps `&self` (the handler
     /// is shared behind the ABI handle).
@@ -82,6 +97,10 @@ impl HookHandler for TestGate {
     fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
         self.decides
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A slow gate: sleep so the engine's wall-clock budget cuts the exchange off (→ on_error).
+        if let Some(ms) = self.sleep_ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         // The raw-reply escape hatch wins over everything (drives fail-closed normalizer coverage).
         if let Some(raw) = &self.raw_decide_reply {
             return raw.clone();
@@ -111,12 +130,18 @@ impl HookHandler for TestGate {
     }
 
     fn describe(&self) -> serde_json::Value {
+        if self.empty_management {
+            return serde_json::json!({});
+        }
         serde_json::json!({
             "schema": {"type": "object", "properties": {"order": {"type": "array"}}}
         })
     }
 
     fn status(&self) -> serde_json::Value {
+        if self.empty_management {
+            return serde_json::json!({});
+        }
         let n = self.decides.load(std::sync::atomic::Ordering::Relaxed);
         serde_json::json!({
             "status": {
@@ -125,6 +150,15 @@ impl HookHandler for TestGate {
                 ]
             }
         })
+    }
+
+    fn configure(
+        &self,
+        _settings: &serde_json::Map<String, serde_json::Value>,
+        _settings_version: u64,
+    ) -> bool {
+        // Ack by default; a configured NACK proves a rejected push does not commit over the seam.
+        !self.nack_configure
     }
 }
 
@@ -142,6 +176,9 @@ fn open(cfg: &str) -> Result<Box<dyn HookHandler>, String> {
         reject_status: c.reject_status.unwrap_or(403),
         restrict_tags: c.restrict_tags,
         raw_decide_reply: c.raw_decide_reply,
+        sleep_ms: c.sleep_ms,
+        empty_management: c.empty_management,
+        nack_configure: c.nack_configure,
         decides: std::sync::atomic::AtomicU64::new(0),
     }))
 }

@@ -1340,3 +1340,75 @@ async fn dlopen_user_identity_projection_rides_the_wire() {
         "no prompt grant/need → prompt content stays withheld"
     );
 }
+
+/// A SLOW gate is cut off by the wall-clock `budget` over the dlopen seam (ported from the socket
+/// silent-hook timeout test): a decide that overruns the deadline surfaces as `Err` (→ the caller's
+/// `on_error`), promptly — never a hang. The blocking call runs on `spawn_blocking`, so a sleeping
+/// plugin never stalls the runtime.
+#[tokio::test]
+async fn dlopen_decide_deadline_cuts_off_a_slow_gate() {
+    let Some(env) = test_env() else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let policy =
+        resolve_one(&env, serde_json::json!({"order": [0], "sleep_ms": 2000})).expect("resolve");
+    let started = std::time::Instant::now();
+    let r = policy
+        .decide(
+            &dreq("x"),
+            &[dcand(0)],
+            &dctx(),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+    assert!(r.is_err(), "a slow gate must exceed the deadline → Err");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the deadline must cut the exchange off promptly, not wait out the sleep"
+    );
+}
+
+/// FAIL-OPEN management reads over the dlopen seam (ported from the socket status/describe
+/// "unsupported" coverage): a hook that replies `{}` to `status`/`describe` is treated as
+/// "doesn't speak it" — `fetch_status`/`fetch_schema` return `None`, never affecting a request.
+#[tokio::test]
+async fn dlopen_empty_management_reads_are_fail_open_none() {
+    let Some(env) = test_env() else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let mut hook = base_gate();
+    hook.settings = serde_json::json!({"empty_management": true})
+        .as_object()
+        .cloned()
+        .unwrap();
+    assert!(
+        fetch_status("h", &hook, 0, &env).await.is_none(),
+        "an empty status reply is fail-open None"
+    );
+    assert!(
+        fetch_schema("h", &hook, 0, &env).await.is_none(),
+        "an empty describe reply is fail-open None"
+    );
+}
+
+/// A NACK'd `configure` push over the dlopen seam does NOT commit (ported from the socket
+/// wrong-version-ack coverage): the plugin refuses to ack, so `push_configure` returns `Err` and the
+/// settings PATCH would not commit — the exact-version ack rule holds over the ABI.
+#[tokio::test]
+async fn dlopen_configure_nack_does_not_commit() {
+    let Some(env) = test_env() else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let mut hook = base_gate();
+    hook.settings = serde_json::json!({"nack_configure": true})
+        .as_object()
+        .cloned()
+        .unwrap();
+    assert!(
+        push_configure(&hook, "h", 7, &env).await.is_err(),
+        "a hook that refuses to ack must fail the configure push (no commit)"
+    );
+}
