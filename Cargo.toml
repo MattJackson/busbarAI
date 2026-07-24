@@ -12,6 +12,7 @@ members = [
     "crates/auth-oidc",
     "crates/auth-oidc-plugin",
     "crates/auth-static-plugin",
+    "crates/hook-test-plugin",
     "crates/hooks-ranking",
     "crates/store-sqlite",
     "crates/store-sqlite-plugin",

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-hook-test-plugin"
+version = "1.5.0"
+publish = false            # internal TEST-support cdylib; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "A hermetic trivial kind:hook plugin cdylib used to drive the end-to-end DlopenPolicy seam tests (no network; a fixed gate that ranks/transforms/reports based on the projection it is handed)."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+busbar-plugin-sdk = { path = "../plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

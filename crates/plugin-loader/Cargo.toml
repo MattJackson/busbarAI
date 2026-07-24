@@ -29,6 +29,11 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # Random staging-directory suffix (a pid alone is predictable to a pre-planter).
 getrandom = "0.3"
 
+[dev-dependencies]
+# The end-to-end DlopenPolicy test drives the async RoutingPolicy methods, so the test needs a
+# runtime + the `#[tokio::test]` macro (the crate's own dep is `rt`/`time` only — no macros).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
 [target.'cfg(unix)'.dependencies]
 # memfd_create (Linux zero-disk loads) + kill(pid, 0) liveness for the dead-pid staging sweep.
 libc = "0.2"

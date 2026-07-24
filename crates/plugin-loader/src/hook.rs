@@ -240,3 +240,309 @@ pub fn load_hook_from_bytes(
         name,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use busbar_api::TransformOutcome;
+
+    /// Locate the test hook plugin cdylib in the build's target dir (mirrors the sqlite loader test).
+    /// Under CI (`cargo test --workspace` always builds it) a missing cdylib is a HARD failure, never
+    /// a silent skip — the only over-the-ABI coverage of the DlopenPolicy seam must not vanish.
+    fn hook_plugin_path() -> Option<std::path::PathBuf> {
+        let candidate = (|| {
+            let exe = std::env::current_exe().ok()?;
+            let profile_dir = exe.parent()?.parent()?;
+            let name = crate::plugin_library_filename("busbar_hook_test_plugin");
+            let candidate = profile_dir.join(&name);
+            candidate.exists().then_some(candidate)
+        })();
+        if candidate.is_none() && std::env::var_os("CI").is_some() {
+            panic!(
+                "the hook test plugin cdylib is not built under CI: `cargo test --workspace` must \
+                 build busbar_hook_test_plugin. Refusing to silently skip the only over-the-ABI \
+                 coverage of the DlopenPolicy hook seam."
+            );
+        }
+        candidate
+    }
+
+    /// Minimal engine-side projectors for the test: build a projection carrying `request.messages`,
+    /// and parse the reply with tiny fail-closed shims (the real engine wires `hooks::wire` here).
+    fn test_projectors() -> Arc<HookProjectors> {
+        Arc::new(HookProjectors {
+            decide: Box::new(|req, cands, _ctx| {
+                serde_json::json!({
+                    "request": {
+                        "pool": req.pool,
+                        "messages": req.prompt.as_ref().map(|p| {
+                            p.messages.iter().map(|(r, t)| {
+                                serde_json::json!({"role": r.as_ref(), "text": t.as_ref()})
+                            }).collect::<Vec<_>>()
+                        }),
+                    },
+                    "candidates": cands.iter().map(|c| serde_json::json!({"idx": c.idx})).collect::<Vec<_>>(),
+                })
+            }),
+            transform: Box::new(|req| {
+                serde_json::json!({
+                    "request": {
+                        "messages": req.prompt.as_ref().map(|p| {
+                            p.messages.iter().map(|(r, t)| {
+                                serde_json::json!({"role": r.as_ref(), "text": t.as_ref()})
+                            }).collect::<Vec<_>>()
+                        }),
+                    }
+                })
+            }),
+            normalize: Box::new(|v, cands| {
+                if let Some(reject) = v.get("reject") {
+                    let status = reject
+                        .get("status")
+                        .and_then(|s| s.as_u64())
+                        .map(|s| s as u16)
+                        .unwrap_or(403);
+                    let message = reject
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    return RoutingDecision::Reject { status, message };
+                }
+                let Some(order) = v.get("order").and_then(|o| o.as_array()) else {
+                    return RoutingDecision::Abstain;
+                };
+                let valid: std::collections::HashSet<usize> = cands.iter().map(|c| c.idx).collect();
+                RoutingDecision::from_ranked(
+                    order.iter().filter_map(|x| x.as_u64().map(|x| x as usize)),
+                    &valid,
+                )
+            }),
+            transform_outcome: Box::new(|v| {
+                if let Some(reject) = v.get("reject") {
+                    let status = reject
+                        .get("status")
+                        .and_then(|s| s.as_u64())
+                        .map(|s| s as u16)
+                        .unwrap_or(403);
+                    return TransformOutcome::Reject {
+                        status,
+                        message: reject
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    };
+                }
+                match v
+                    .get("rewrite")
+                    .and_then(|r| r.get("messages"))
+                    .and_then(|m| m.as_array())
+                {
+                    Some(msgs) if !msgs.is_empty() => {
+                        TransformOutcome::Rewrite(busbar_api::RewriteReply {
+                            messages: msgs.clone(),
+                            tools: Vec::new(),
+                        })
+                    }
+                    _ => TransformOutcome::Abstain,
+                }
+            }),
+            status: Box::new(|v| {
+                v.get("status").map(|s| busbar_api::HookStatus {
+                    settings_version: None,
+                    settings: None,
+                    metrics: s.get("metrics").and_then(|m| m.as_array()).cloned(),
+                })
+            }),
+            describe_schema: Box::new(|v| v.get("schema").cloned()),
+        })
+    }
+
+    fn load(cfg: &str) -> Arc<dyn RoutingPolicy> {
+        let path = hook_plugin_path().expect("hook cdylib built under --workspace");
+        let bytes = std::fs::read(&path).expect("read hook cdylib");
+        load_hook_from_bytes(
+            &bytes,
+            cfg,
+            "test-hook",
+            "hook",
+            "test-hook",
+            test_projectors(),
+        )
+        .expect("load hook plugin over the ABI")
+    }
+
+    fn req_with_prompt(text: &str) -> RoutingRequest<'static> {
+        RoutingRequest {
+            pool: "p",
+            ingress_protocol: "anthropic",
+            requested_model: None,
+            message_count: 1,
+            tool_count: 0,
+            has_tools: false,
+            total_chars: text.len(),
+            system_chars: 0,
+            max_tokens: None,
+            stream: false,
+            prompt: Some(busbar_api::PromptProjection {
+                system: None,
+                messages: vec![("user".into(), text.to_string().into())],
+            }),
+            identity: None,
+        }
+    }
+
+    fn cand(idx: usize) -> Candidate<'static> {
+        Candidate {
+            idx,
+            model: "m",
+            provider: "prov",
+            weight: 1,
+            context_max: None,
+            tier: None,
+            cost_per_mtok: None,
+            tags: &[],
+            latency_ms: None,
+            available_concurrency: 1,
+            budget_remaining: None,
+            rate_headroom: None,
+        }
+    }
+
+    fn ctx() -> RoutingContext<'static> {
+        RoutingContext {
+            pool: "p",
+            budget_remaining: None,
+            budget: &[],
+        }
+    }
+
+    /// END-TO-END over the REAL hook cdylib: load it, then drive every op. `decide` echoes the
+    /// configured order; the opt-in prompt projection reaches the in-process gate and drives a
+    /// reject; `transform` rewrites (and rejects on the token); `configure` acks the exact version;
+    /// `describe` returns the schema; `status` reports the observed decide count. This is the exact
+    /// seam the engine sees: an `Arc<dyn RoutingPolicy>` indistinguishable from a compiled-in policy.
+    #[tokio::test]
+    async fn dlopen_policy_drives_every_op() {
+        let Some(_) = hook_plugin_path() else {
+            eprintln!("skip: hook test plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let budget = Duration::from_secs(5);
+
+        // decide: the configured order [1, 0] is echoed and normalized.
+        let policy = load(r#"{"order": [1, 0], "reject_if_contains": "BLOCKME"}"#);
+        let cands = [cand(0), cand(1)];
+        let d = policy
+            .decide(&req_with_prompt("hello"), &cands, &ctx(), budget)
+            .await
+            .expect("decide ok");
+        assert_eq!(d, RoutingDecision::Prefer(vec![1, 0]));
+
+        // decide: the opt-in prompt projection reaches the gate → reject (proves content arrives).
+        let d = policy
+            .decide(
+                &req_with_prompt("please BLOCKME now"),
+                &cands,
+                &ctx(),
+                budget,
+            )
+            .await
+            .expect("decide ok");
+        assert_eq!(
+            d,
+            RoutingDecision::Reject {
+                status: 403,
+                message: "blocked by test gate".to_string()
+            }
+        );
+
+        // transform: rewrites the body; and rejects on the screen token.
+        match policy.transform(&req_with_prompt("hello"), budget).await {
+            TransformOutcome::Rewrite(rw) => assert_eq!(rw.messages.len(), 1),
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+        match policy.transform(&req_with_prompt("BLOCKME"), budget).await {
+            TransformOutcome::Reject { status, .. } => assert_eq!(status, 451),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+
+        // notify: fire-and-forget, never panics, never blocks.
+        let projection =
+            serde_json::to_vec(&serde_json::json!({"request": {"pool": "p"}})).unwrap();
+        policy.notify(&projection, budget).await;
+
+        // configure: the gate acks the exact version → Ok.
+        policy
+            .configure("test-hook", &serde_json::Map::new(), 7, budget)
+            .await
+            .expect("configure acks the pushed version");
+
+        // describe: the schema envelope comes back.
+        let schema = policy.describe(budget).await.expect("describe");
+        assert_eq!(schema["type"], "object");
+
+        // status: the observed decide count (we ran decide twice above).
+        let status = policy.status(budget).await.expect("status");
+        let metrics = status.metrics.expect("metrics");
+        assert_eq!(metrics[0]["name"], "test_decides_total");
+        assert!(metrics[0]["value"].as_f64().unwrap() >= 2.0);
+    }
+
+    /// An abstain config (no order) → the gate abstains, and an unresolvable order idx is dropped by
+    /// the engine's normalizer (fail-closed liberal parse over the ABI).
+    #[tokio::test]
+    async fn dlopen_policy_abstains_and_drops_unknown_idx() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load(r#"{"order": [9, 0]}"#);
+        let cands = [cand(0)];
+        let d = policy
+            .decide(
+                &req_with_prompt("x"),
+                &cands,
+                &ctx(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("decide ok");
+        // idx 9 is unknown (dropped), idx 0 survives.
+        assert_eq!(d, RoutingDecision::Prefer(vec![0]));
+
+        let policy = load("{}");
+        let d = policy
+            .decide(
+                &req_with_prompt("x"),
+                &cands,
+                &ctx(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("decide ok");
+        assert_eq!(d, RoutingDecision::Abstain);
+    }
+
+    /// A kind cross-check MISMATCH is a hard fail-closed load error naming both sides (loading the
+    /// hook cdylib as the wrong `manifest_kind`).
+    #[test]
+    fn load_refuses_kind_mismatch() {
+        let Some(path) = hook_plugin_path() else {
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read hook cdylib");
+        let err = match load_hook_from_bytes(
+            &bytes,
+            "{}",
+            "test-hook",
+            "store",
+            "h",
+            test_projectors(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a hook cdylib loaded with manifest kind 'store' must be refused"),
+        };
+        assert!(err.contains("hook") && err.contains("store"), "got: {err}");
+    }
+}

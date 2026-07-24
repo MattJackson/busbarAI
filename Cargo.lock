@@ -312,6 +312,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-hook-test-plugin"
+version = "1.5.0"
+dependencies = [
+ "busbar-plugin-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "busbar-hooks-ranking"
 version = "1.5.0"
 dependencies = [
