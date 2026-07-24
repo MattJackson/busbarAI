@@ -25,15 +25,32 @@ struct HookConfig {
     /// Absent/empty → the gate abstains.
     #[serde(default)]
     order: Vec<usize>,
-    /// If any projected message text CONTAINS this token, `decide`/`transform` reject (403). This
-    /// proves the opt-in `prompt` projection actually reaches an in-process hook and drives a verdict.
+    /// If any projected message text CONTAINS this token, `decide`/`transform` reject. This proves the
+    /// opt-in `prompt` projection actually reaches an in-process hook and drives a verdict.
     #[serde(default)]
     reject_if_contains: Option<String>,
+    /// The `status` the content-reject emits (default 403). Lets a test drive the engine normalizer's
+    /// reject-status CLAMP over the ABI (e.g. a hook that says 200/500/70000 → the engine forces 403).
+    #[serde(default)]
+    reject_status: Option<i64>,
+    /// If set, `decide` always RESTRICTS to these tags (`{"restrict": {"tags_any": [...]}}`) — proves
+    /// the compliance-gate verb rides the ABI and normalizes to a `Restrict` decision.
+    #[serde(default)]
+    restrict_tags: Option<Vec<String>>,
+    /// A raw reply shape to return VERBATIM from `decide`, overriding everything else — the escape
+    /// hatch that lets a test drive a wrong-variant / malformed / arbitrary reply through the engine's
+    /// fail-closed normalizer (e.g. `{}` → abstain, a bogus object → abstain, a bad reject detail →
+    /// fail-closed 403).
+    #[serde(default)]
+    raw_decide_reply: Option<serde_json::Value>,
 }
 
 struct TestGate {
     order: Vec<usize>,
     reject_if_contains: Option<String>,
+    reject_status: i64,
+    restrict_tags: Option<Vec<String>>,
+    raw_decide_reply: Option<serde_json::Value>,
     /// A monotonically incrementing decide count, surfaced via `status` — proves the control-plane
     /// scrape reads a real observed metric back over the ABI. `AtomicU64` keeps `&self` (the handler
     /// is shared behind the ABI handle).
@@ -65,8 +82,17 @@ impl HookHandler for TestGate {
     fn decide(&self, payload: &serde_json::Value) -> serde_json::Value {
         self.decides
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The raw-reply escape hatch wins over everything (drives fail-closed normalizer coverage).
+        if let Some(raw) = &self.raw_decide_reply {
+            return raw.clone();
+        }
         if self.should_reject(payload) {
-            return serde_json::json!({"reject": {"status": 403, "message": "blocked by test gate"}});
+            return serde_json::json!({
+                "reject": {"status": self.reject_status, "message": "blocked by test gate"}
+            });
+        }
+        if let Some(tags) = &self.restrict_tags {
+            return serde_json::json!({ "restrict": {"tags_any": tags} });
         }
         if self.order.is_empty() {
             serde_json::json!({})
@@ -113,6 +139,9 @@ fn open(cfg: &str) -> Result<Box<dyn HookHandler>, String> {
     Ok(Box::new(TestGate {
         order: c.order,
         reject_if_contains: c.reject_if_contains,
+        reject_status: c.reject_status.unwrap_or(403),
+        restrict_tags: c.restrict_tags,
+        raw_decide_reply: c.raw_decide_reply,
         decides: std::sync::atomic::AtomicU64::new(0),
     }))
 }

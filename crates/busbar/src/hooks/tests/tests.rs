@@ -1158,3 +1158,185 @@ async fn dlopen_prompt_no_grant_withholds_content() {
         "no content reached the gate → it ranks, never rejects"
     );
 }
+
+/// REJECT-STATUS CLAMP over the dlopen seam (ported from the socket reject-status test): a hook may
+/// only speak client errors. Whatever status the plugin returns, the REAL `wire::normalize` clamps
+/// anything outside 400..=499 to 403 — a hook cannot mint a success/redirect/5xx through the ABI.
+#[tokio::test]
+async fn dlopen_decide_reject_status_is_clamped() {
+    let Some(env) = test_env() else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let budget = std::time::Duration::from_secs(5);
+    let cands = [dcand(0)];
+    for (sent, want) in [
+        (400, 400),
+        (451, 451),
+        (499, 499),
+        (200, 403),
+        (302, 403),
+        (500, 403),
+        (0, 403),
+        (70000, 403),
+    ] {
+        let policy = resolve_one(
+            &env,
+            serde_json::json!({"reject_if_contains": "X", "reject_status": sent}),
+        )
+        .expect("resolve");
+        match policy
+            .decide(&dreq("X please"), &cands, &dctx(), budget)
+            .await
+            .expect("decide")
+        {
+            RoutingDecision::Reject { status, .. } => {
+                assert_eq!(status, want, "sent {sent} must clamp to {want}")
+            }
+            other => panic!("expected Reject for sent {sent}, got {other:?}"),
+        }
+    }
+}
+
+/// RESTRICT over the dlopen seam (ported from the socket restrict coverage): a compliance gate's
+/// `{"restrict":{"tags_any":[...]}}` reply surfaces as a `RoutingDecision::Restrict` through the REAL
+/// `wire::normalize` — restrict wins over `order`, and a malformed/empty restrict is fail-closed to an
+/// EMPTY tag set (resolved downstream by `on_empty`, never allow-all).
+#[tokio::test]
+async fn dlopen_decide_restrict_and_fail_closed() {
+    let Some(env) = test_env() else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let budget = std::time::Duration::from_secs(5);
+    let cands = [dcand(0), dcand(1)];
+
+    // Well-formed restrict → Restrict{tags_any}; restrict wins even though `order` is also set.
+    let policy = resolve_one(
+        &env,
+        serde_json::json!({"order": [1, 0], "restrict_tags": ["baa"]}),
+    )
+    .expect("resolve");
+    match policy
+        .decide(&dreq("x"), &cands, &dctx(), budget)
+        .await
+        .expect("decide")
+    {
+        RoutingDecision::Restrict { tags_any } => assert_eq!(tags_any, vec!["baa".to_string()]),
+        other => panic!("expected Restrict, got {other:?}"),
+    }
+
+    // A malformed restrict (empty tags) is fail-closed to an EMPTY tag set — never allow-all/order.
+    let policy = resolve_one(
+        &env,
+        serde_json::json!({"raw_decide_reply": {"restrict": {"tags_any": []}}}),
+    )
+    .expect("resolve");
+    match policy
+        .decide(&dreq("x"), &cands, &dctx(), budget)
+        .await
+        .expect("decide")
+    {
+        RoutingDecision::Restrict { tags_any } => assert!(
+            tags_any.is_empty(),
+            "malformed restrict stays Restrict (fail-closed → on_empty), got {tags_any:?}"
+        ),
+        other => panic!("malformed restrict must stay Restrict, got {other:?}"),
+    }
+}
+
+/// FAIL-CLOSED reply parsing over the dlopen seam (ported from the socket malformed-reply coverage):
+/// the REAL `wire::normalize` degrades a mis-typed `reject` detail to a full-strength 403 rejection
+/// (never a silent route), while a non-verb reply object abstains — a hook that tried to stop a
+/// request can never have it routed because a detail was malformed.
+#[tokio::test]
+async fn dlopen_decide_raw_reply_is_fail_closed() {
+    let Some(env) = test_env() else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let budget = std::time::Duration::from_secs(5);
+    let cands = [dcand(0)];
+
+    // A `reject` with a bogus (string) status degrades to the default 403 — still a rejection.
+    let policy = resolve_one(
+        &env,
+        serde_json::json!({"raw_decide_reply": {"reject": {"status": "451"}}}),
+    )
+    .expect("resolve");
+    match policy
+        .decide(&dreq("x"), &cands, &dctx(), budget)
+        .await
+        .expect("decide")
+    {
+        RoutingDecision::Reject { status, .. } => assert_eq!(status, 403),
+        other => panic!("malformed reject must stay a 403 Reject, got {other:?}"),
+    }
+
+    // A non-verb reply object → Abstain (no opinion), never an error.
+    let policy = resolve_one(
+        &env,
+        serde_json::json!({"raw_decide_reply": {"unknown_field": true}}),
+    )
+    .expect("resolve");
+    assert_eq!(
+        policy
+            .decide(&dreq("x"), &cands, &dctx(), budget)
+            .await
+            .expect("decide"),
+        RoutingDecision::Abstain
+    );
+
+    // `reject: false` is the explicit opt-out — defers to `order`.
+    let policy = resolve_one(
+        &env,
+        serde_json::json!({"raw_decide_reply": {"reject": false, "order": [0]}}),
+    )
+    .expect("resolve");
+    assert_eq!(
+        policy
+            .decide(&dreq("x"), &cands, &dctx(), budget)
+            .await
+            .expect("decide"),
+        RoutingDecision::Prefer(vec![0])
+    );
+}
+
+/// The USER-identity opt-in projection rides the dlopen seam when BOTH the grant and manifest agree:
+/// a `user: ro` gate (manifest declares the user need) gets the caller identity in the projection.
+/// This is the identity analogue of the prompt opt-in delivery test.
+#[tokio::test]
+async fn dlopen_user_identity_projection_rides_the_wire() {
+    use busbar_plugin_sign::{HookNeeds, NeedLevel};
+    let Some(env) = test_env_needs(
+        "user-hook",
+        HookNeeds {
+            prompt: NeedLevel::No,
+            user: NeedLevel::Ro,
+        },
+    ) else {
+        eprintln!("skip: hook cdylib not built (run under --workspace)");
+        return;
+    };
+    let hooks = registry(
+        "h",
+        HookCfg {
+            plugin: "user-hook".to_string(),
+            user: UserAccess::Ro,
+            ..base_gate()
+        },
+    );
+    let Some(ResolvedPolicy::Policy {
+        send_user,
+        send_prompt,
+        ..
+    }) = resolve_gate_transport("h", &hooks["h"], &hooks, &env, 0)
+    else {
+        panic!("gate must resolve");
+    };
+    assert!(send_user, "user:ro grant + manifest user need → send_user");
+    assert!(
+        !send_prompt,
+        "no prompt grant/need → prompt content stays withheld"
+    );
+}
