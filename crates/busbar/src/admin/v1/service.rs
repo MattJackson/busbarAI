@@ -1891,6 +1891,91 @@ mod tests {
         ));
     }
 
+    /// ROLLBACK RESOLUTION (1.5.0), the EXPLICIT-downgrade core: a TRUSTED third-party artifact whose
+    /// version is BELOW its configured base floor — which the AUTOMATIC path (`install`) rejects as an
+    /// anti-downgrade — is ACCEPTED by `resolve_plugin_rollback`, because the rollback lowers the floor
+    /// to the target's own version. It returns the target manifest + the merged pin map (prior pins
+    /// preserved, this plugin pinned to the target version).
+    #[test]
+    fn rollback_resolves_a_trusted_below_floor_target_and_merges_pins() {
+        let dir = tmp_plugins_dir("rollback-ok");
+        let acme = SigningKey::from_bytes(&[11u8; 32]);
+        // Base posture: allowlist acme AND floor this plugin at 2.0.0.
+        let mut cfg = publisher_posture("acme", &acme);
+        cfg.min_versions
+            .insert("acme-store-x".to_string(), "2.0.0".to_string());
+        let svc = svc_with(dir.clone(), cfg);
+
+        // The PRIOR artifact at 1.4.0 (the rollback target) sits in the plugins dir.
+        let lib = b"prior artifact bytes";
+        let tarball = signed_tarball(
+            &acme,
+            test_manifest("acme-store-x", "x", "acme", "1.4.0"),
+            lib,
+        );
+        std::fs::write(dir.join("old.tar.gz"), &tarball).unwrap();
+
+        // The automatic install path REJECTS the below-floor artifact (anti-downgrade).
+        let install_err = svc
+            .install_store_plugin("old.tar.gz", &tarball)
+            .unwrap_err();
+        assert!(
+            matches!(install_err, AdminError::Conflict(_)),
+            "automatic install of a below-floor artifact is a conflict, got {install_err:?}"
+        );
+
+        // The EXPLICIT rollback resolves it, lowering the floor to 1.4.0, and merges the pin onto a
+        // pre-existing pin for a DIFFERENT plugin (which must be preserved).
+        let prior =
+            std::collections::BTreeMap::from([("other-plugin".to_string(), "3.0.0".to_string())]);
+        let (manifest, pins) = svc
+            .resolve_plugin_rollback("old.tar.gz", &prior)
+            .expect("rollback resolves the trusted below-floor target");
+        assert_eq!(manifest.name, "acme-store-x");
+        assert_eq!(manifest.version, "1.4.0");
+        assert_eq!(
+            pins.get("acme-store-x").map(String::as_str),
+            Some("1.4.0"),
+            "this plugin is pinned to the target version"
+        );
+        assert_eq!(
+            pins.get("other-plugin").map(String::as_str),
+            Some("3.0.0"),
+            "a prior pin for another plugin is preserved"
+        );
+    }
+
+    /// ROLLBACK is FAIL-CLOSED: an ABSENT target is a 404, and an UNTRUSTED target (unsigned under a
+    /// strict posture) is refused even with the floor lowered — a rollback authenticates the OPERATOR,
+    /// never the ARTIFACT. Nothing is pinned in either case.
+    #[test]
+    fn rollback_is_fail_closed_on_absent_or_untrusted_target() {
+        let dir = tmp_plugins_dir("rollback-closed");
+        let svc = svc_with(dir.clone(), strict_posture());
+        let empty = std::collections::BTreeMap::new();
+
+        // Absent file → NotFound.
+        assert!(matches!(
+            svc.resolve_plugin_rollback("nope.tar.gz", &empty),
+            Err(AdminError::NotFound(_))
+        ));
+
+        // An UNSIGNED artifact present in the dir, under the STRICT posture: trust refuses it even for
+        // a rollback (the floor was lowered, but the signature/opt-in gate still fails).
+        let lib = b"unsigned prior artifact";
+        let mut m = test_manifest("acme-store-x", "x", "acme", "1.4.0");
+        m.sha256 = busbar_plugin_sign::sha256_hex(lib);
+        let tarball = busbar_plugin_loader::tarball::package(&m, "lib.so", lib).unwrap();
+        std::fs::write(dir.join("unsigned.tar.gz"), &tarball).unwrap();
+        let err = svc
+            .resolve_plugin_rollback("unsigned.tar.gz", &empty)
+            .unwrap_err();
+        assert!(
+            matches!(err, AdminError::Conflict(_)),
+            "an untrusted rollback target is refused (a rollback never launders trust), got {err:?}"
+        );
+    }
+
     /// SECURITY: under the DEFAULT (strict) posture, an unsigned tarball present in the plugins dir
     /// is reported present + `rejected` by the catalog WITHOUT ever being `dlopen`ed — the catalog
     /// path is manifest-only (pure data), so the junk library bytes here can never execute.

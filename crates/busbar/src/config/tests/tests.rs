@@ -1991,3 +1991,109 @@ fn test_resolve_projects_admin_auth_names() {
     let cfg = resolve(&deploy, &HashMap::new()).expect("resolve");
     assert_eq!(cfg.admin_auth, [ADMIN_TOKENS_MODULE]);
 }
+
+/// AUTOMATIC vs EXPLICIT anti-downgrade (1.5.0 rollback-friendly versioning): the SAME validly-signed
+/// OLD first-party artifact is REFUSED under the automatic policy (`to_policy`, floored at the running
+/// binary version) but ACCEPTED under an explicit rollback policy (`to_policy_with_floor` lowered to
+/// the artifact's own version). This is the whole distinction, made without touching the frozen
+/// `evaluate`/`Manifest`: it is WHICH floor the engine feeds the policy that differs, and the lowered
+/// floor is only ever reached via an authenticated, audited rollback.
+#[test]
+fn to_policy_floor_distinguishes_automatic_from_explicit_downgrade() {
+    use busbar_plugin_sign::{evaluate, sign, Manifest, SigningKey, Verdict};
+
+    // A first-party release key + an OLD (below the current binary) signed first-party artifact.
+    let release = SigningKey::from_bytes(&[7u8; 32]);
+    let artifact = b"\x7fELF old first-party build";
+    let old = sign(
+        &release,
+        Manifest {
+            name: "busbar-store-redis".into(),
+            alias: "redis".into(),
+            kind: "store".into(),
+            version: "0.9.0".into(), // below any real CARGO_PKG_VERSION (1.x)
+            publisher: busbar_plugin_sign::FIRST_PARTY_PUBLISHER.into(),
+            abi_version: 2,
+            sha256: String::new(),
+            signature: String::new(),
+            description: String::new(),
+            homepage: String::new(),
+            license: String::new(),
+            needs: Default::default(),
+        },
+        artifact,
+    );
+
+    // Build both policies off ONE PluginsCfg, but embed the SAME release key as the first-party key so
+    // the signature verifies in-test (production reads the embedded release key; here we inject it).
+    let cfg = PluginsCfg {
+        enabled: true,
+        ..Default::default()
+    };
+    let mut automatic = cfg.to_policy().expect("automatic policy");
+    automatic.first_party_key = Some(release.verifying_key());
+    // AUTOMATIC: floored at the running binary version — the old artifact is a hard anti-downgrade
+    // reject that no opt-in can relax.
+    let err = evaluate(artifact, &old, &automatic).unwrap_err();
+    assert!(
+        err.0.contains("anti-downgrade"),
+        "automatic policy must refuse the old first-party artifact, got {err:?}"
+    );
+
+    // EXPLICIT rollback: the floor is lowered to the artifact's OWN version, so it now loads.
+    let mut explicit = cfg.to_policy_with_floor("0.9.0").expect("explicit policy");
+    explicit.first_party_key = Some(release.verifying_key());
+    assert!(
+        matches!(
+            evaluate(artifact, &old, &explicit).unwrap(),
+            Verdict::Trusted {
+                first_party: true,
+                ..
+            }
+        ),
+        "an explicit rollback floor admits the prior first-party artifact"
+    );
+
+    // But an EVEN OLDER artifact is STILL refused under the explicit floor — a rollback lowers the
+    // floor to EXACTLY the pinned target, not to zero.
+    let older = sign(
+        &release,
+        Manifest {
+            name: "busbar-store-redis".into(),
+            alias: "redis".into(),
+            kind: "store".into(),
+            version: "0.8.0".into(),
+            publisher: busbar_plugin_sign::FIRST_PARTY_PUBLISHER.into(),
+            abi_version: 2,
+            sha256: String::new(),
+            signature: String::new(),
+            description: String::new(),
+            homepage: String::new(),
+            license: String::new(),
+            needs: Default::default(),
+        },
+        artifact,
+    );
+    assert!(
+        evaluate(artifact, &older, &explicit).is_err(),
+        "an artifact below the pinned rollback target is still refused"
+    );
+}
+
+/// A runtime-set `first_party_floor` on `PluginsCfg` is honored by `to_policy` (the seam the persisted
+/// rollback pin drives), while the default `None` keeps the binary's own version — so the automatic
+/// posture is unchanged unless a pin explicitly lowered it.
+#[test]
+fn to_policy_honors_runtime_first_party_floor_override() {
+    let mut cfg = PluginsCfg {
+        enabled: true,
+        ..Default::default()
+    };
+    // Default: the automatic floor equals the binary version.
+    let auto = cfg.to_policy().expect("policy");
+    assert_eq!(auto.binary_version, env!("CARGO_PKG_VERSION"));
+    // With an explicit override (as a persisted rollback pin sets): the lowered floor is used.
+    cfg.first_party_floor = Some("0.9.0".to_string());
+    let pinned = cfg.to_policy().expect("policy");
+    assert_eq!(pinned.binary_version, "0.9.0");
+}

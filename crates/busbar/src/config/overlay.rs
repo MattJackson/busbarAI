@@ -1133,4 +1133,122 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "lissten": "0.0.0.0:9000" }));
         assert!(r.is_err(), "a typo'd root field is rejected");
     }
+
+    /// PLUGIN VERSION PINS (1.5.0 rollback-friendly versioning): a `plugin_versions` pin lowers BOTH
+    /// the per-name `min_versions` floor (third-party path) AND the runtime-only `first_party_floor`
+    /// override (first-party path) when applied to a base `DeployCfg`. The lowest pin wins the
+    /// first-party floor; a plugin the base never floored simply gains a low `min_versions` entry.
+    #[test]
+    fn plugin_versions_pins_lower_the_floors() {
+        let mut deploy = minimal_deploy();
+        // Base has a higher floor and no first_party_floor override (the automatic default).
+        deploy
+            .plugins
+            .min_versions
+            .insert("acme-store-x".to_string(), "2.0.0".to_string());
+        assert!(deploy.plugins.first_party_floor.is_none());
+
+        let doc = OverlayDoc {
+            plugin_versions: BTreeMap::from([
+                ("acme-store-x".to_string(), "1.4.0".to_string()),
+                ("busbar-store-redis".to_string(), "1.5.0".to_string()),
+            ]),
+            ..Default::default()
+        };
+        apply_plugin_versions_to_deploy(&mut deploy, &doc);
+
+        assert_eq!(
+            deploy
+                .plugins
+                .min_versions
+                .get("acme-store-x")
+                .map(String::as_str),
+            Some("1.4.0"),
+            "the third-party floor is LOWERED to the pinned version"
+        );
+        assert_eq!(
+            deploy.plugins.first_party_floor.as_deref(),
+            Some("1.4.0"),
+            "the first-party floor override is the LOWEST pin (1.4.0 < 1.5.0)"
+        );
+    }
+
+    /// No pins ⇒ no floor override (the automatic posture is untouched): `apply_root_to_deploy` (which
+    /// also applies pins) leaves `first_party_floor` as `None` when the overlay carries no pins, so the
+    /// automatic path keeps the binary's own version as the first-party floor.
+    #[test]
+    fn no_pins_leaves_first_party_floor_none() {
+        let mut deploy = minimal_deploy();
+        apply_root_to_deploy(&mut deploy, &OverlayDoc::default());
+        assert!(
+            deploy.plugins.first_party_floor.is_none(),
+            "with no pins the automatic first-party floor stands"
+        );
+    }
+
+    /// `persist_plugin_versions` round-trips the pin map AND preserves the hooks/groups/root sections;
+    /// storing an empty map clears the section (every pin lifted → the base floors return).
+    #[test]
+    fn persist_plugin_versions_round_trips_and_preserves_siblings() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busbar-ovl-pins-{}.json", std::process::id()));
+        write(
+            &path,
+            &OverlayDoc {
+                hooks: HashMap::from([("keepme".to_string(), gate())]),
+                root: Some(sample_root()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let pins = BTreeMap::from([("acme-store-x".to_string(), "1.4.0".to_string())]);
+        persist_plugin_versions(Some(&path), &pins);
+        let doc = read(&path).expect("read back");
+        assert_eq!(
+            doc.plugin_versions.get("acme-store-x").map(String::as_str),
+            Some("1.4.0"),
+            "pin persisted"
+        );
+        assert!(doc.hooks.contains_key("keepme"), "hooks preserved");
+        assert!(doc.root.is_some(), "root preserved");
+        assert!(
+            !doc.section_is_empty(OverlaySection::PluginVersions),
+            "the pin section is non-empty"
+        );
+
+        // Clearing the pins restores the base floors and preserves siblings.
+        persist_plugin_versions(Some(&path), &BTreeMap::new());
+        let doc = read(&path).expect("read back after clear");
+        assert!(doc.plugin_versions.is_empty(), "pins cleared");
+        assert!(doc.hooks.contains_key("keepme"), "hooks still preserved");
+        assert!(
+            doc.section_is_empty(OverlaySection::PluginVersions),
+            "the pin section is empty after clear"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `clear_section(PluginVersions)` wipes only the pins; the other sections survive — the durable
+    /// half of `DELETE /api/v1/admin/overlay/plugin_versions` (lift every rollback pin).
+    #[test]
+    fn clear_plugin_versions_section_only() {
+        let mut doc = OverlayDoc {
+            hooks: HashMap::from([("h".to_string(), gate())]),
+            plugin_versions: BTreeMap::from([("p".to_string(), "1.0.0".to_string())]),
+            ..Default::default()
+        };
+        doc.clear_section(OverlaySection::PluginVersions);
+        assert!(doc.plugin_versions.is_empty(), "pins cleared");
+        assert!(doc.hooks.contains_key("h"), "hooks preserved");
+    }
+
+    /// The `plugin_versions` path segment parses to the section and round-trips its label.
+    #[test]
+    fn plugin_versions_section_parses() {
+        assert_eq!(
+            OverlaySection::parse("plugin_versions"),
+            Some(OverlaySection::PluginVersions)
+        );
+        assert_eq!(OverlaySection::PluginVersions.as_str(), "plugin_versions");
+    }
 }

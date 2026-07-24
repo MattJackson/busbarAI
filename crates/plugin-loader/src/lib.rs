@@ -1040,6 +1040,142 @@ mod tests {
         );
     }
 
+    /// HOT-SWAP LIFECYCLE (1.5.0): the load-bearing safety property behind a live plugin reload — a
+    /// NEW instance is loaded ALONGSIDE the old (both libraries mapped at once), the OLD instance is
+    /// then dropped (as an old App snapshot's last in-flight request drains), and the NEW instance
+    /// keeps serving. Because each instance OWNS its `Library` (`RawPlugin._lib`), dropping the old
+    /// instance unmaps ONLY the old library — the new one is untouched — and its staged backing is
+    /// released, while nothing of the new load is disturbed. This is exactly the drop order a
+    /// `handle.swap` relies on: instance → close handle → `_lib` unmaps → `_backing` removed.
+    #[test]
+    fn hot_swap_old_and_new_coexist_then_old_unmaps_new_keeps_serving() {
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read sqlite cdylib");
+        let base = std::env::temp_dir();
+        let prefix = format!("busbar-plugins-{}-", std::process::id());
+        let count_staged = || {
+            std::fs::read_dir(&base)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(&prefix))
+                })
+                .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+                .count()
+        };
+        let baseline = count_staged();
+
+        // The OLD instance is serving; write a key so we can prove instance IDENTITY across the swap.
+        let old = load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "old-gen", "store")
+            .expect("load OLD");
+        let key = busbar_api::VirtualKey {
+            id: "vk_old".into(),
+            key_hash: "h".into(),
+            name: "old".into(),
+            allowed_pools: Some(vec!["p".into()]),
+            enabled: true,
+            created_at: 1,
+            group: None,
+            labels: std::collections::BTreeMap::new(),
+        };
+        old.put_key(&key).expect("old put");
+
+        // Load the NEW instance ALONGSIDE the old — both libraries are mapped simultaneously. On
+        // macOS/Windows this is two staged files at once; on Linux two memfds (no disk).
+        let new = load_store_from_bytes(&bytes, r#"{"db_path": ":memory:"}"#, "new-gen", "store")
+            .expect("load NEW alongside OLD");
+        // The NEW instance is a DISTINCT backend (fresh :memory: db): it does NOT see the old key.
+        assert!(
+            new.get_key("vk_old").expect("new get").is_none(),
+            "the new instance is a separate backend, proving a real second load — not an alias"
+        );
+
+        // Drop the OLD instance (the old snapshot drained): its library unmaps, its staged file goes.
+        drop(old);
+
+        // The NEW instance keeps serving with no restart — its library was untouched by the old drop.
+        new.put_key(&busbar_api::VirtualKey {
+            id: "vk_new".into(),
+            key_hash: "h".into(),
+            name: "new".into(),
+            allowed_pools: Some(vec!["p".into()]),
+            enabled: true,
+            created_at: 2,
+            group: None,
+            labels: std::collections::BTreeMap::new(),
+        })
+        .expect("new keeps serving after old unmaps");
+        assert_eq!(
+            new.get_key("vk_new")
+                .expect("new get2")
+                .expect("present")
+                .id,
+            "vk_new"
+        );
+
+        // Drop the NEW instance too: everything is released back to the baseline (no leak).
+        drop(new);
+        let after = count_staged();
+        assert!(
+            after <= baseline,
+            "after both generations drop, no staged library file may remain (baseline={baseline}, \
+             after={after})"
+        );
+    }
+
+    /// NO LEAK ACROSS REPEATED RELOADS (1.5.0): loading + dropping a from-bytes instance many times
+    /// (the repeated-hot-reload case) must return to the SAME staged-file count each cycle — every
+    /// generation's library unmaps and its staged backing is released when the instance drops, so
+    /// there is no unbounded mmap/file accumulation across reloads. This is the drop-counter-balances
+    /// property proven at the loader seam (the engine-level proof is that the old App snapshot drops).
+    #[test]
+    fn repeated_reloads_do_not_leak_staged_libraries() {
+        let Some(path) = sqlite_plugin_path() else {
+            eprintln!("skip: sqlite plugin cdylib not built (run under --workspace)");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read sqlite cdylib");
+        let base = std::env::temp_dir();
+        let prefix = format!("busbar-plugins-{}-", std::process::id());
+        let count_staged = || {
+            std::fs::read_dir(&base)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with(&prefix))
+                })
+                .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+                .count()
+        };
+        let baseline = count_staged();
+        for i in 0..16 {
+            let s = load_store_from_bytes(
+                &bytes,
+                r#"{"db_path": ":memory:"}"#,
+                &format!("reload-{i}"),
+                "store",
+            )
+            .unwrap_or_else(|e| panic!("reload {i} load: {e}"));
+            assert!(s.list_keys().expect("list").is_empty());
+            drop(s);
+            // Each cycle returns to baseline: the just-dropped generation left nothing behind.
+            assert!(
+                count_staged() <= baseline,
+                "reload cycle {i} leaked a staged library (baseline={baseline})"
+            );
+        }
+        assert!(count_staged() <= baseline, "no net leak after 16 reloads");
+    }
+
     /// On Linux the from-bytes load is a MEMFD load: it must not create ANY file in the temp base
     /// (the zero-disk property the spec requires on Linux).
     #[cfg(target_os = "linux")]
