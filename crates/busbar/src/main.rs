@@ -647,12 +647,21 @@ async fn run() {
     )
     .unwrap_or_else(|e| die(e));
     let LoadedConfig {
-        deploy,
+        mut deploy,
         defs,
         overlay_path,
         overlay_doc,
         unset_env_vars: _,
     } = loaded;
+
+    // 1.5.0 full-config coverage: apply the overlay's `root` section (API-set single-value config —
+    // listen/tls/rate_card/store/security/limits/…) onto the base `DeployCfg` BEFORE `resolve`, so
+    // the limits projection + the exposed-admin-mTLS boot-guard re-derive over the merged shape. The
+    // hooks + groups overlay sections merge POST-resolve (below). `--safe-mode` clears `overlay_doc`,
+    // so the root overrides are quarantined too — the whole overlay is one on/off switch.
+    if let Some(doc) = overlay_doc.as_ref() {
+        config::overlay::apply_root_to_deploy(&mut deploy, doc);
+    }
 
     // Optional observability sinks; grab before `deploy` is borrowed by resolve.
     let observability_cfg = deploy.observability.clone().unwrap_or_default();

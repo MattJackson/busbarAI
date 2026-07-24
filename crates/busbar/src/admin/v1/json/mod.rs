@@ -101,6 +101,10 @@ impl AdminTransport for JsonV1 {
             .route("/config/reload", post(reload_config))
             .route("/auth/cache/flush", post(flush_credential_cache))
             .route("/config/apply", post(apply_config))
+            .route(
+                "/config/settings",
+                get(get_config_settings).put(put_config_settings),
+            )
             .route("/openapi.json", get(openapi))
             // Virtual-key management — the keys resource of the SAME v1 admin surface. Handlers
             // live in `crate::admin` while they migrate into the layered service; mounting them

@@ -17,7 +17,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{GroupCfg, HookCfg, RootCfg};
+use super::{
+    AdvancedCfg, DeployCfg, GroupCfg, HealthDefaultsCfg, HookCfg, LimitsCfg, MetricsCfg,
+    ObservabilityCfg, RateEntryCfg, RootCfg, RoutingCfg, SecurityCfg, StoreCfg, TlsCfg,
+};
 
 /// Current overlay schema version. Stamped on every write; a missing field (a pre-versioning overlay)
 /// reads as `1`, the additive baseline (hooks + the newly-added groups section, both backward
@@ -82,7 +85,7 @@ pub(crate) fn persist(
 fn load_for_rmw(p: &Path) -> Option<OverlayDoc> {
     match read_state(p) {
         OverlayReadState::Absent => Some(OverlayDoc::default()),
-        OverlayReadState::Loaded(doc) => Some(doc),
+        OverlayReadState::Loaded(doc) => Some(*doc),
         OverlayReadState::Unreadable => {
             tracing::error!(
                 path = %p.display(),
@@ -128,6 +131,151 @@ pub(crate) fn persist_groups(
     }
 }
 
+/// The `root` overlay section (1.5.0 full-config coverage): the API-settable SINGLE-VALUE config
+/// sections that are NOT name-keyed maps (so they carry no tombstones — a field is either PRESENT in
+/// the overlay, and WINS over base `config.yaml`, or ABSENT, and base stands). It mirrors the
+/// uncovered `DeployCfg` surface: the process-level binds (`listen`/`tls`/`admin_listen`/`admin_tls`/
+/// `admin_insecure`), the cost inputs (`rate_card`/`per_request_fee`), the durable `store`, the
+/// `security` SSRF controls, and the operational-limit blocks (`limits`/`observability`/`advanced`/
+/// `metrics`/`health`/`routing`). Every field is `Option`: a `PUT /config/settings` overwrites only
+/// the fields it names (a partial edit), and the merge (`apply_to_deploy`) splices exactly those onto
+/// the resolved base `DeployCfg` BEFORE `resolve` — so the limits projection + admin-mTLS boot-guard
+/// re-run over the merged shape exactly as for a hand-written config. `deny_unknown_fields` so a
+/// typo'd key is a loud reject, never a silent no-op.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RootSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tls: Option<TlsCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin_listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin_tls: Option<TlsCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin_insecure: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rate_card: Option<BTreeMap<String, RateEntryCfg>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_request_fee: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) store: Option<StoreCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) security: Option<SecurityCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) limits: Option<LimitsCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observability: Option<ObservabilityCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) advanced: Option<AdvancedCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) metrics: Option<MetricsCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) health: Option<HealthDefaultsCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) routing: Option<RoutingCfg>,
+}
+
+impl RootSettings {
+    /// Whether NO root override is set (every field `None`) — drives the section-empty predicate and
+    /// the idempotent-reset short-circuit. Checked field-by-field (not via `PartialEq`) so the nested
+    /// config structs need no `PartialEq` derive.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.listen.is_none()
+            && self.tls.is_none()
+            && self.admin_listen.is_none()
+            && self.admin_tls.is_none()
+            && self.admin_insecure.is_none()
+            && self.rate_card.is_none()
+            && self.per_request_fee.is_none()
+            && self.store.is_none()
+            && self.security.is_none()
+            && self.limits.is_none()
+            && self.observability.is_none()
+            && self.advanced.is_none()
+            && self.metrics.is_none()
+            && self.health.is_none()
+            && self.routing.is_none()
+    }
+
+    /// Splice the present overrides onto a base `DeployCfg`, IN PLACE. Applied BEFORE `resolve` so the
+    /// limits projection + the exposed-admin-mTLS boot-guard re-derive over the merged shape exactly
+    /// as for a hand-written config. Only `Some` fields overwrite; a `None` field leaves base config
+    /// untouched. `admin_insecure`/`per_request_fee` are non-optional on `DeployCfg`, so an unset
+    /// overlay override simply preserves the base value.
+    pub(crate) fn apply_to_deploy(&self, deploy: &mut DeployCfg) {
+        if let Some(v) = &self.listen {
+            deploy.listen = v.clone();
+        }
+        if self.tls.is_some() {
+            deploy.tls = self.tls.clone();
+        }
+        if let Some(v) = &self.admin_listen {
+            deploy.admin_listen = v.clone();
+        }
+        if self.admin_tls.is_some() {
+            deploy.admin_tls = self.admin_tls.clone();
+        }
+        if let Some(v) = self.admin_insecure {
+            deploy.admin_insecure = v;
+        }
+        if self.rate_card.is_some() {
+            deploy.rate_card = self.rate_card.clone();
+        }
+        if let Some(v) = self.per_request_fee {
+            deploy.per_request_fee = v;
+        }
+        if self.store.is_some() {
+            deploy.store = self.store.clone();
+        }
+        if self.security.is_some() {
+            deploy.security = self.security.clone();
+        }
+        if let Some(v) = &self.limits {
+            deploy.limits = v.clone();
+        }
+        if self.observability.is_some() {
+            deploy.observability = self.observability.clone();
+        }
+        if let Some(v) = &self.advanced {
+            deploy.advanced = v.clone();
+        }
+        if let Some(v) = &self.metrics {
+            deploy.metrics = v.clone();
+        }
+        if let Some(v) = &self.health {
+            deploy.health = v.clone();
+        }
+        if let Some(v) = &self.routing {
+            deploy.routing = v.clone();
+        }
+    }
+}
+
+/// Persist the `root` overlay section (1.5.0 full-config coverage), IF persistence is enabled. Same
+/// read-modify-WRITE durability contract as `persist`/`persist_groups`: the hooks + groups sections
+/// (and their tombstones) are carried forward verbatim, and an unreadable overlay is REFUSED (never
+/// clobbered). `None` path is a no-op. `settings` is the full desired root state (the merge of the
+/// prior overlay root + this request's fields is computed by the caller, so a `PUT /config/settings`
+/// passes the already-merged desired state here — this fn just stores it).
+pub(crate) fn persist_root(path: Option<&Path>, settings: &RootSettings) {
+    if let Some(p) = path {
+        let Some(mut doc) = load_for_rmw(p) else {
+            return;
+        };
+        doc.root = if settings.is_empty() {
+            None
+        } else {
+            Some(settings.clone())
+        };
+        doc.version = OVERLAY_VERSION;
+        if let Err(e) = write(p, &doc) {
+            tracing::warn!(error = %e, path = %p.display(), "failed to persist config overlay (root)");
+        }
+    }
+}
+
 /// One MUTABLE overlay SECTION — the unit a per-section reset (`DELETE /api/v1/admin/overlay/{section}`)
 /// discards. Each section is an independent `base + overlay` layer with its own entries + tombstones;
 /// clearing one reverts exactly that slice of the effective config to base `config.yaml` while the
@@ -136,6 +284,8 @@ pub(crate) fn persist_groups(
 pub(crate) enum OverlaySection {
     Hooks,
     Groups,
+    /// The single-value config sections (`RootSettings`) — the 1.5.0 full-config coverage slice.
+    Root,
 }
 
 impl OverlaySection {
@@ -145,6 +295,7 @@ impl OverlaySection {
         match s {
             "hooks" => Some(OverlaySection::Hooks),
             "groups" => Some(OverlaySection::Groups),
+            "root" => Some(OverlaySection::Root),
             _ => None,
         }
     }
@@ -154,6 +305,7 @@ impl OverlaySection {
         match self {
             OverlaySection::Hooks => "hooks",
             OverlaySection::Groups => "groups",
+            OverlaySection::Root => "root",
         }
     }
 }
@@ -203,6 +355,12 @@ pub(crate) struct OverlayDoc {
     /// Group tombstones — groups deleted via the API, subtracted from base config at boot.
     #[serde(default)]
     pub(crate) deleted_groups: Vec<String>,
+    /// The `root` section (1.5.0 full-config coverage): API-set single-value config overrides
+    /// (`listen`/`tls`/`rate_card`/`store`/`security`/`limits`/…). `None` = no root override (base
+    /// `config.yaml` stands). Applied at the `DeployCfg` level BEFORE `resolve` — see
+    /// `RootSettings::apply_to_deploy`. No tombstones: a single-value field is present-or-absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) root: Option<RootSettings>,
 }
 
 impl OverlayDoc {
@@ -220,6 +378,9 @@ impl OverlayDoc {
                 self.groups.clear();
                 self.deleted_groups.clear();
             }
+            OverlaySection::Root => {
+                self.root = None;
+            }
         }
     }
 
@@ -233,6 +394,7 @@ impl OverlayDoc {
                 self.hooks.is_empty() && self.global_hooks.is_empty() && self.deleted.is_empty()
             }
             OverlaySection::Groups => self.groups.is_empty() && self.deleted_groups.is_empty(),
+            OverlaySection::Root => self.root.as_ref().is_none_or(RootSettings::is_empty),
         }
     }
 }
@@ -245,7 +407,7 @@ impl OverlayDoc {
 pub(crate) fn read(path: &Path) -> Option<OverlayDoc> {
     match read_state(path) {
         OverlayReadState::Absent => None,
-        OverlayReadState::Loaded(doc) => Some(doc),
+        OverlayReadState::Loaded(doc) => Some(*doc),
         OverlayReadState::Unreadable => {
             tracing::warn!(
                 path = %path.display(),
@@ -263,7 +425,10 @@ pub(crate) fn read(path: &Path) -> Option<OverlayDoc> {
 /// (must NOT overwrite, or accumulated tombstones are lost).
 pub(crate) enum OverlayReadState {
     Absent,
-    Loaded(OverlayDoc),
+    // Boxed: `OverlayDoc` grew a large `root` section (1.5.0 full-config coverage), so an inline
+    // variant would make the whole enum ~1 KiB regardless of the `Absent`/`Unreadable` common case
+    // (clippy `large_enum_variant`). The box keeps the enum pointer-sized.
+    Loaded(Box<OverlayDoc>),
     Unreadable,
 }
 
@@ -296,6 +461,19 @@ pub(crate) fn from_state(hooks: &HashMap<String, HookCfg>, global_hooks: &[Strin
         global_hooks: global_hooks.to_vec(),
         deleted: Vec::new(),
         ..Default::default()
+    }
+}
+
+/// Apply the overlay's `root` section (the single-value config overrides) to a base `DeployCfg`
+/// BEFORE `resolve` — the pre-resolve half of the boot-merge. The hooks + groups sections merge
+/// POST-resolve (`merge_into`, the runtime registry is synthesized in `resolve`); the root section is
+/// DeployCfg-level input, so the limits projection + the exposed-admin-mTLS boot-guard re-run over
+/// the merged shape. A no-op when the overlay carries no root override. Kept a free fn (not folded
+/// into `merge_into`) precisely because it operates on a DIFFERENT input (DeployCfg, not RootCfg) at
+/// a DIFFERENT pipeline stage.
+pub(crate) fn apply_root_to_deploy(deploy: &mut DeployCfg, doc: &OverlayDoc) {
+    if let Some(root) = &doc.root {
+        root.apply_to_deploy(deploy);
     }
 }
 
@@ -615,9 +793,11 @@ mod tests {
             Some(OverlaySection::Groups)
         );
         assert_eq!(OverlaySection::parse("hooks"), Some(OverlaySection::Hooks));
+        assert_eq!(OverlaySection::parse("root"), Some(OverlaySection::Root));
         assert_eq!(OverlaySection::Groups.as_str(), "groups");
         assert_eq!(OverlaySection::Hooks.as_str(), "hooks");
-        for bad in ["", "Groups", "hook", "auth", "plugins", "groups/"] {
+        assert_eq!(OverlaySection::Root.as_str(), "root");
+        for bad in ["", "Groups", "hook", "auth", "plugins", "groups/", "Root"] {
             assert!(
                 OverlaySection::parse(bad).is_none(),
                 "`{bad}` is not a section"
@@ -727,5 +907,144 @@ mod tests {
             "a corrupt overlay is preserved verbatim, never clobbered"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── ROOT section (1.5.0 full-config coverage) ─────────────────────────────────────────────
+
+    /// A minimal base `DeployCfg` (all uncovered sections at their defaults) to apply root overrides
+    /// onto. Uses the real YAML parse path so the defaults match production exactly.
+    fn minimal_deploy() -> DeployCfg {
+        serde_yaml::from_str("providers: {}\nmodels: {}\n").expect("minimal deploy parses")
+    }
+
+    /// A `RootSettings` naming a couple of overrides, parsed from JSON exactly as the API body would.
+    fn sample_root() -> RootSettings {
+        serde_json::from_value(serde_json::json!({
+            "listen": "0.0.0.0:9000",
+            "per_request_fee": 7,
+            "rate_card": { "m0": { "input_utok": 1.5, "output_utok": 2.0 } },
+            "limits": { "max_inbound_concurrent": 512 }
+        }))
+        .expect("root settings parse")
+    }
+
+    /// `apply_to_deploy` overwrites ONLY the named fields; unset fields keep base values.
+    #[test]
+    fn root_apply_overwrites_only_named_fields() {
+        let mut deploy = minimal_deploy();
+        let base_admin_listen = deploy.admin_listen.clone();
+        sample_root().apply_to_deploy(&mut deploy);
+        assert_eq!(deploy.listen, "0.0.0.0:9000", "listen overridden");
+        assert_eq!(deploy.per_request_fee, 7, "fee overridden");
+        assert_eq!(
+            deploy.limits.max_inbound_concurrent, 512,
+            "a limits field overridden"
+        );
+        assert!(
+            deploy
+                .rate_card
+                .as_ref()
+                .is_some_and(|rc| rc.contains_key("m0")),
+            "rate_card overridden"
+        );
+        assert_eq!(
+            deploy.admin_listen, base_admin_listen,
+            "an unset field keeps its base value"
+        );
+    }
+
+    /// `is_empty` / `section_is_empty(Root)` track whether any override is set.
+    #[test]
+    fn root_is_empty_tracks_overrides() {
+        assert!(RootSettings::default().is_empty());
+        assert!(OverlayDoc::default().section_is_empty(OverlaySection::Root));
+        let doc = OverlayDoc {
+            root: Some(sample_root()),
+            ..Default::default()
+        };
+        assert!(!doc.section_is_empty(OverlaySection::Root));
+        // A root override does not make hooks/groups non-empty (independent sections).
+        assert!(doc.section_is_empty(OverlaySection::Hooks));
+        assert!(doc.section_is_empty(OverlaySection::Groups));
+    }
+
+    /// `persist_root` round-trips the root section AND preserves the hooks + groups sections; storing
+    /// an empty `RootSettings` clears the section back to `None`.
+    #[test]
+    fn persist_root_round_trips_and_preserves_siblings() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("busbar-ovl-root-{}.json", std::process::id()));
+        write(
+            &path,
+            &OverlayDoc {
+                hooks: HashMap::from([("keepme".to_string(), gate())]),
+                groups: BTreeMap::from([("user:z".to_string(), group_with_budget())]),
+                deleted_groups: vec!["oldteam".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        persist_root(Some(&path), &sample_root());
+        let doc = read(&path).expect("read back");
+        assert!(
+            doc.root
+                .as_ref()
+                .is_some_and(|r| r.per_request_fee == Some(7)),
+            "root section written"
+        );
+        assert!(doc.hooks.contains_key("keepme"), "hooks preserved");
+        assert!(doc.groups.contains_key("user:z"), "groups preserved");
+        assert_eq!(
+            doc.deleted_groups,
+            vec!["oldteam".to_string()],
+            "group tombstones preserved"
+        );
+        // Storing an empty root clears the section.
+        persist_root(Some(&path), &RootSettings::default());
+        let doc = read(&path).expect("read back after clear");
+        assert!(doc.root.is_none(), "empty root clears the section");
+        assert!(doc.hooks.contains_key("keepme"), "hooks still preserved");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `clear_section(Root)` wipes only the root override; the hooks/groups sections survive. And the
+    /// on-disk `clear_section` refuses a corrupt overlay (fail-closed, like the sibling sections).
+    #[test]
+    fn clear_root_section_only() {
+        let mut doc = OverlayDoc {
+            hooks: HashMap::from([("h".to_string(), gate())]),
+            root: Some(sample_root()),
+            ..Default::default()
+        };
+        doc.clear_section(OverlaySection::Root);
+        assert!(doc.root.is_none(), "root cleared");
+        assert!(doc.hooks.contains_key("h"), "hooks preserved");
+    }
+
+    /// `apply_root_to_deploy` is a no-op when the overlay has no root override, and applies it when
+    /// present — the pre-resolve boot-merge half.
+    #[test]
+    fn apply_root_to_deploy_noop_and_active() {
+        let mut deploy = minimal_deploy();
+        apply_root_to_deploy(&mut deploy, &OverlayDoc::default());
+        assert_eq!(
+            deploy.per_request_fee, 0,
+            "no root override → base unchanged"
+        );
+        let doc = OverlayDoc {
+            root: Some(sample_root()),
+            ..Default::default()
+        };
+        apply_root_to_deploy(&mut deploy, &doc);
+        assert_eq!(deploy.per_request_fee, 7, "root override applied");
+    }
+
+    /// An unknown key in a root-settings body is a loud reject (`deny_unknown_fields`), never a silent
+    /// no-op — the same fail-closed posture as the DeployCfg surface.
+    #[test]
+    fn root_settings_rejects_unknown_field() {
+        let r: Result<RootSettings, _> =
+            serde_json::from_value(serde_json::json!({ "lissten": "0.0.0.0:9000" }));
+        assert!(r.is_err(), "a typo'd root field is rejected");
     }
 }

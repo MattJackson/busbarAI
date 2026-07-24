@@ -139,6 +139,31 @@ pub(crate) struct CacheFlushView {
     pub(crate) flushed: usize,
 }
 
+/// `GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config
+/// overlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective
+/// root override (the merge of prior overlay + this request), overlay-persisted so it survives a
+/// restart. `reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE:
+/// the process-level binds (`listen`/`admin_listen` socket rebind, `tls`/`admin_tls` bind,
+/// `admin_insecure`) and the durable `store` backend cannot hot-swap, so they take effect on the next
+/// `POST /config/reload` or restart. Everything else (`rate_card`/`per_request_fee`/`security`/
+/// `limits`/`observability`/`advanced`/`metrics`/`health`/`routing`) is LIVE on the swap.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ConfigSettingsView {
+    /// `true` on a PUT that stored + swapped; `false` on a GET (a pure read).
+    pub(crate) applied: bool,
+    pub(crate) config_version: u64,
+    /// The current effective root-section overlay (only the fields the operator has set; base
+    /// `config.yaml` stands for the rest). An arbitrary JSON object (the `RootSettings` projection).
+    pub(crate) settings: serde_json::Value,
+    /// Fields that were stored but are RELOAD-TO-APPLY (a `POST /config/reload` or restart makes them
+    /// live). Empty when the PUT touched only live-swappable fields (or on a GET).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reload_to_apply: Vec<String>,
+    /// A human note describing the live-vs-reload split (absent on a GET).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+}
+
 /// `PUT /admin-auth` — the resource post-state (`{configured, modules}`, the same shape
 /// `GET /admin-auth` returns) plus apply metadata, so a client uses the PUT response as post-state.
 #[derive(Serialize, JsonSchema)]

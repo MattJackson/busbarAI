@@ -1019,13 +1019,15 @@ pub(crate) async fn delete_group(
 }
 
 /// `DELETE /api/v1/admin/overlay/{section}` — DISCARD every overlay mutation for one section and revert
-/// it to what base `config.yaml` declares. `section` ∈ {`groups`, `hooks`}; an unknown name is a `400`
-/// `invalid_request`. This is the audited revert-to-config front door (D3: per-section, NOT
+/// it to what base `config.yaml` declares. `section` ∈ {`groups`, `hooks`, `root`}; an unknown name is
+/// a `400` `invalid_request`. This is the audited revert-to-config front door (D3: per-section, NOT
 /// whole-overlay): it clears that section's overlay entries + tombstones, then rebuilds a complete
-/// `App` from base config (disk truth re-read + resolved, the OTHER section's overlay still merged) and
-/// swaps it in — so a `groups` reset restores base group limits (cost model rebuilt) and a `hooks` reset
-/// restores base hooks (registry/gates/rewrites rebuilt), each leaving the sibling section's runtime
-/// mutations untouched. Full scope; `If-Match` optimistic concurrency; audited + versioned; the cleared
+/// `App` from base config (disk truth re-read + resolved, the OTHER sections' overlay still merged) and
+/// swaps it in — so a `groups` reset restores base group limits (cost model rebuilt), a `hooks` reset
+/// restores base hooks (registry/gates/rewrites rebuilt), and a `root` reset restores base single-value
+/// config (rate_card/store/security/limits/… — cost model + limits reprojected), each leaving the
+/// sibling sections' runtime mutations untouched. Full scope; `If-Match` optimistic concurrency;
+/// audited + versioned; the cleared
 /// overlay is persisted so the revert survives a restart. A section with NO overlay state is a clean
 /// no-op success (idempotent) — nothing changes, the version does not bump. Requires config files on
 /// disk (the base truth to revert to); an ephemeral busbar has none, so reset is an `invalid_request`
@@ -1042,7 +1044,7 @@ pub(crate) async fn reset_overlay_section(
     // 400 (never masked by a header error). Unknown → invalid_request (the taxonomy's 400).
     let Some(section) = OverlaySection::parse(&section) else {
         return err_json(&AdminError::Validation(format!(
-            "unknown overlay section `{section}`: expected `groups` or `hooks`"
+            "unknown overlay section `{section}`: expected `groups`, `hooks`, or `root`"
         )));
     };
     let resource = format!("overlay:{}", section.as_str());
@@ -1099,17 +1101,28 @@ pub(crate) async fn reset_overlay_section(
         false,
         crate::config::EnvSubst::Strict,
     )
-    .and_then(|loaded| {
+    .and_then(|mut loaded| {
+        // CLEAR the target section from the persisted overlay FIRST — that slice reverts to base, the
+        // other slices stay live. The clear happens before both merge halves so a `root` reset drops
+        // its DeployCfg-level overrides pre-resolve, and a `hooks`/`groups` reset drops its registry
+        // entries post-resolve.
+        let cleared_doc = loaded.overlay_doc.take().map(|mut doc| {
+            doc.clear_section(section);
+            doc
+        });
+        // Pre-resolve half: apply the (post-clear) root overrides onto the base DeployCfg, so the
+        // limits projection + admin-mTLS boot-guard re-derive over the merged shape.
+        if let Some(doc) = cleared_doc.as_ref() {
+            crate::config::overlay::apply_root_to_deploy(&mut loaded.deploy, doc);
+        }
         let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
             .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
         let base_hook_names: std::collections::HashSet<String> =
             cfg.hooks.keys().cloned().collect();
         let base_group_names: std::collections::HashSet<String> =
             cfg.groups.keys().cloned().collect();
-        // Clear the target section from the persisted overlay before merging: that slice reverts to
-        // base, the other slice stays live.
-        if let Some(mut doc) = loaded.overlay_doc {
-            doc.clear_section(section);
+        // Post-resolve half: merge the (post-clear) hooks + groups sections onto the resolved config.
+        if let Some(doc) = cleared_doc {
             crate::config::overlay::merge_into(&mut cfg, doc);
         }
         crate::build_app_from_config(
@@ -1657,7 +1670,14 @@ pub(crate) async fn reload_config(
         false,
         crate::config::EnvSubst::Strict,
     )
-    .and_then(|loaded| {
+    .and_then(|mut loaded| {
+        // 1.5.0 full-config coverage: apply the overlay's `root` section (single-value config) onto
+        // the base `DeployCfg` BEFORE resolve, so the limits projection + admin-mTLS boot-guard
+        // re-derive over the merged shape — exactly as boot does. The hooks/groups sections merge
+        // POST-resolve below.
+        if let Some(doc) = loaded.overlay_doc.as_ref() {
+            crate::config::overlay::apply_root_to_deploy(&mut loaded.deploy, doc);
+        }
         let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
             .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
         // Base hook + group names = the config-defined registry, pre-overlay (the admin API refuses
@@ -1818,6 +1838,269 @@ pub(crate) async fn apply_config(
             audit::AUDIT.record_by(
                 "config.apply",
                 "config:body",
+                audit::OUTCOME_REJECTED,
+                &actor,
+            );
+            err_json(&AdminError::Validation(e))
+        }
+    }
+}
+
+/// Merge a partial `RootSettings` request onto the current overlay root state: a field the request
+/// sets (`Some`) REPLACES; a field it omits (`None`) is PRESERVED from the current overlay. The
+/// partial-update semantics of `PUT /config/settings` — "raise the per-request fee" sends only
+/// `per_request_fee`, leaving every other override untouched. To CLEAR the whole root section, use
+/// `DELETE /overlay/root`.
+fn merge_root_settings(
+    mut base: crate::config::overlay::RootSettings,
+    req: crate::config::overlay::RootSettings,
+) -> crate::config::overlay::RootSettings {
+    if req.listen.is_some() {
+        base.listen = req.listen;
+    }
+    if req.tls.is_some() {
+        base.tls = req.tls;
+    }
+    if req.admin_listen.is_some() {
+        base.admin_listen = req.admin_listen;
+    }
+    if req.admin_tls.is_some() {
+        base.admin_tls = req.admin_tls;
+    }
+    if req.admin_insecure.is_some() {
+        base.admin_insecure = req.admin_insecure;
+    }
+    if req.rate_card.is_some() {
+        base.rate_card = req.rate_card;
+    }
+    if req.per_request_fee.is_some() {
+        base.per_request_fee = req.per_request_fee;
+    }
+    if req.store.is_some() {
+        base.store = req.store;
+    }
+    if req.security.is_some() {
+        base.security = req.security;
+    }
+    if req.limits.is_some() {
+        base.limits = req.limits;
+    }
+    if req.observability.is_some() {
+        base.observability = req.observability;
+    }
+    if req.advanced.is_some() {
+        base.advanced = req.advanced;
+    }
+    if req.metrics.is_some() {
+        base.metrics = req.metrics;
+    }
+    if req.health.is_some() {
+        base.health = req.health;
+    }
+    if req.routing.is_some() {
+        base.routing = req.routing;
+    }
+    base
+}
+
+/// The RELOAD-TO-APPLY fields a `PUT /config/settings` REQUEST touched: the process-level binds
+/// (`listen`/`admin_listen` socket rebind, `tls`/`admin_tls` bind, `admin_insecure` boot-guard waiver)
+/// and the durable `store` backend cannot HOT-SWAP — a live `arc-swap` cannot rebind a socket or
+/// migrate an in-flight governance ledger to a new backend — so their new value is DURABLY STORED but
+/// takes effect only on the next `POST /config/reload` or restart. Every OTHER field
+/// (`rate_card`/`per_request_fee`/`security`/`limits`/…) applies live on the swap. Keyed on the
+/// REQUEST (only fields the operator just changed are flagged), so a subsequent live-only edit does
+/// not re-flag an already-reloaded bind.
+fn reload_to_apply_fields(req: &crate::config::overlay::RootSettings) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |set: bool, name: &str| {
+        if set {
+            out.push(name.to_string());
+        }
+    };
+    push(req.listen.is_some(), "listen");
+    push(req.tls.is_some(), "tls");
+    push(req.admin_listen.is_some(), "admin_listen");
+    push(req.admin_tls.is_some(), "admin_tls");
+    push(req.admin_insecure.is_some(), "admin_insecure");
+    push(req.store.is_some(), "store");
+    out
+}
+
+/// Read the current overlay `root` section (the operator's API-set single-value overrides), or an
+/// empty `RootSettings` when persistence is disabled / the overlay is absent or carries no root
+/// section. Shared by the GET/PUT `/config/settings` handlers.
+fn current_root_settings(
+    overlay_path: Option<&std::path::Path>,
+) -> crate::config::overlay::RootSettings {
+    overlay_path
+        .and_then(crate::config::overlay::read)
+        .and_then(|doc| doc.root)
+        .unwrap_or_default()
+}
+
+/// `GET /api/v1/admin/config/settings` — read the API-set single-value config overlay (the `root`
+/// section: `listen`/`tls`/`rate_card`/`store`/`security`/`limits`/…). Reports ONLY the operator's
+/// overrides (the fields set via `PUT /config/settings`); base `config.yaml` stands for the rest.
+/// Read scope; carries the config-plane `ETag` so a `PUT` can chain `If-Match` off this read. Never a
+/// secret in the clear beyond what the operator themselves supplied (TLS refs are secret-references,
+/// not raw key bytes).
+pub(crate) async fn get_config_settings(State(handle): State<Arc<AppHandle>>) -> Response {
+    let current = handle.load();
+    let root = current_root_settings(current.overlay_path.as_deref());
+    let settings = serde_json::to_value(&root).unwrap_or_else(|_| json!({}));
+    with_config_etag(
+        ok_json(
+            StatusCode::OK,
+            &json!({
+                "applied": false,
+                "config_version": current.config_version,
+                "settings": settings,
+            }),
+        ),
+        current.config_version,
+    )
+}
+
+/// `PUT /api/v1/admin/config/settings` — SET any single-value config section via the API, durably
+/// (1.5.0 full-config coverage). The body is a PARTIAL `RootSettings`: only the fields present are
+/// changed (merged onto the current overlay root), the rest preserved — so the admin NEVER edits
+/// `config.yaml` and persistence is ALWAYS the busbar-owned overlay. The merged root is applied onto
+/// the base `DeployCfg` (re-read from disk), re-resolved + re-validated (an invalid result is a `400`
+/// that changes NOTHING), built into a new `App`, and swapped in — so `rate_card`/`per_request_fee`/
+/// `security`/`limits`/… go LIVE immediately. The process-level binds
+/// (`listen`/`admin_listen`/`tls`/`admin_tls`/`admin_insecure`) and the durable `store` backend are
+/// stored + flagged RELOAD-TO-APPLY (they cannot hot-swap; `POST /config/reload` or restart makes them
+/// live) — the response's `reload_to_apply` names exactly which. Full scope; `If-Match` optimistic
+/// concurrency; audited (every attempt) + versioned; overlay-persisted so it survives a restart.
+/// Requires config files on disk (the base to merge onto); an ephemeral busbar has none, so this is a
+/// `400 invalid_request` there, exactly like `config/reload`.
+pub(crate) async fn put_config_settings(
+    State(handle): State<Arc<AppHandle>>,
+    axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let actor = principal.actor_id().to_string();
+    let expected = match if_match_version(&headers) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let req: crate::config::overlay::RootSettings = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return err_json(&AdminError::Validation(format!(
+                "malformed config settings body: {e}"
+            )))
+        }
+    };
+    let _mlock = CONFIG_MUTATION_LOCK.lock().await;
+    let current = handle.load();
+    if let Some(e) = stale_if_match(expected, current.config_version) {
+        audit::AUDIT.record_by(
+            "config.settings",
+            "config:settings",
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&e);
+    }
+    let (Some(config_path), Some(providers_path)) =
+        (current.config_path.clone(), current.providers_path.clone())
+    else {
+        audit::AUDIT.record_by(
+            "config.settings",
+            "config:settings",
+            audit::OUTCOME_REJECTED,
+            &actor,
+        );
+        return err_json(&AdminError::Validation(
+            "this busbar was started without config files (ephemeral mode); /config/settings has no \
+             disk base to merge onto"
+                .into(),
+        ));
+    };
+    // Merge the partial request onto the CURRENT overlay root (partial-update semantics).
+    let merged = merge_root_settings(
+        current_root_settings(current.overlay_path.as_deref()),
+        req.clone(),
+    );
+    let merged_for_build = merged.clone();
+    // Re-run the disk-load pipeline (base truth), apply the MERGED root onto the DeployCfg BEFORE
+    // resolve (so the limits projection + admin-mTLS boot-guard re-derive over it), then merge the
+    // CURRENT hooks/groups overlay sections POST-resolve — exactly the reload mechanism, with the
+    // root section coming from the just-merged desired state rather than the on-disk overlay.
+    let outcome = crate::load_config_from_disk(
+        &config_path,
+        &providers_path,
+        false,
+        crate::config::EnvSubst::Strict,
+    )
+    .and_then(|mut loaded| {
+        merged_for_build.apply_to_deploy(&mut loaded.deploy);
+        let mut cfg = crate::config::resolve(&loaded.deploy, &loaded.defs)
+            .map_err(|errs| format!("config errors:\n  - {}", errs.join("\n  - ")))?;
+        let base_hook_names: std::collections::HashSet<String> =
+            cfg.hooks.keys().cloned().collect();
+        let base_group_names: std::collections::HashSet<String> =
+            cfg.groups.keys().cloned().collect();
+        if let Some(doc) = loaded.overlay_doc {
+            crate::config::overlay::merge_into(&mut cfg, doc);
+        }
+        crate::build_app_from_config(
+            cfg,
+            loaded.deploy.plugins.clone(),
+            current.overlay_path.clone(),
+            base_hook_names,
+            base_group_names,
+            (Some(config_path), Some(providers_path)),
+            Some(&current),
+        )
+    });
+    match outcome {
+        Ok(next) => {
+            let installed = Arc::new(next);
+            handle.swap(installed.clone());
+            audit::AUDIT.record_by(
+                "config.settings",
+                "config:settings",
+                audit::OUTCOME_APPLIED,
+                &actor,
+            );
+            let cur = handle.load();
+            record_group_version(&installed, &actor, "config.settings (root section applied)");
+            // Persist the merged root section (best-effort; the sibling hooks/groups sections are
+            // preserved verbatim by the read-modify-write).
+            crate::config::overlay::persist_root(cur.overlay_path.as_deref(), &merged);
+            let reload_to_apply = reload_to_apply_fields(&req);
+            let note = if reload_to_apply.is_empty() {
+                "applied live".to_string()
+            } else {
+                format!(
+                    "applied live except {} — stored, effective on the next reload/restart (a socket \
+                     rebind / TLS bind / store backend cannot hot-swap)",
+                    reload_to_apply.join(", ")
+                )
+            };
+            let settings = serde_json::to_value(&merged).unwrap_or_else(|_| json!({}));
+            with_config_etag(
+                ok_json(
+                    StatusCode::OK,
+                    &json!({
+                        "applied": true,
+                        "config_version": cur.config_version,
+                        "settings": settings,
+                        "reload_to_apply": reload_to_apply,
+                        "note": note,
+                    }),
+                ),
+                cur.config_version,
+            )
+        }
+        Err(e) => {
+            audit::AUDIT.record_by(
+                "config.settings",
+                "config:settings",
                 audit::OUTCOME_REJECTED,
                 &actor,
             );
@@ -2503,6 +2786,28 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
             }
         }),
     );
+    paths.insert(
+        ap("/config/settings"),
+        json!({
+            "get": {
+                "summary": "Read the API-set single-value config overlay (root section: listen/tls/rate_card/store/security/limits/…) — only the operator's overrides; base config.yaml stands for the rest",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{applied:false, config_version, settings}` (settings = the current root overrides)"},
+                    "401": {"description": "Missing/invalid admin credential"}
+                }
+            },
+            "put": {
+                "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged reload-to-apply. NEVER writes config.yaml",
+                "security": [{"adminToken": []}],
+                "responses": {
+                    "200": {"description": "`{applied:true, config_version, settings, reload_to_apply, note}`"},
+                    "400": {"description": "Invalid config after the merge, unknown field, or ephemeral busbar with no disk base (error code `invalid_request`); nothing changed"},
+                    "409": {"description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"}
+                }
+            }
+        }),
+    );
     if let Some(auth_path) = paths.get_mut(&ap(PATH_ADMIN_AUTH)) {
         auth_path["put"] = json!({
             "summary": "Replace the admin_auth chain at runtime — dry-run guarded (the calling credentials must hold full scope under the NEW chain, else 409). Live until the next reload/restart",
@@ -2821,6 +3126,7 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
         ("/hooks/{name}/settings", "patch"),
         (PATH_ADMIN_AUTH, "put"),
         ("/config/apply", "post"),
+        ("/config/settings", "put"),
         ("/config/rollback", "post"),
         ("/overlay/{section}", "delete"),
         ("/keys/{id}", "patch"),
@@ -2950,6 +3256,8 @@ pub(crate) fn openapi_doc() -> serde_json::Value {
     typed!("/config", "get", "200", EffectiveConfigView);
     typed!(PATH_CONFIG_VALIDATE, "post", "200", ConfigValidateView);
     typed!("/config/apply", "post", "200", sview::ConfigApplyView);
+    typed!("/config/settings", "get", "200", sview::ConfigSettingsView);
+    typed!("/config/settings", "put", "200", sview::ConfigSettingsView);
     typed!("/config/reload", "post", "200", sview::ConfigReloadView);
     typed!("/config/rollback", "post", "200", sview::ConfigRollbackView);
     typed!(

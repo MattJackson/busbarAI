@@ -343,6 +343,43 @@
         ],
         "type": "object"
       },
+      "ConfigSettingsView": {
+        "description": "`GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config\noverlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective\nroot override (the merge of prior overlay + this request), overlay-persisted so it survives a\nrestart. `reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE:\nthe process-level binds (`listen`/`admin_listen` socket rebind, `tls`/`admin_tls` bind,\n`admin_insecure`) and the durable `store` backend cannot hot-swap, so they take effect on the next\n`POST /config/reload` or restart. Everything else (`rate_card`/`per_request_fee`/`security`/\n`limits`/`observability`/`advanced`/`metrics`/`health`/`routing`) is LIVE on the swap.",
+        "properties": {
+          "applied": {
+            "description": "`true` on a PUT that stored + swapped; `false` on a GET (a pure read).",
+            "type": "boolean"
+          },
+          "config_version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "note": {
+            "description": "A human note describing the live-vs-reload split (absent on a GET).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reload_to_apply": {
+            "description": "Fields that were stored but are RELOAD-TO-APPLY (a `POST /config/reload` or restart makes them\nlive). Empty when the PUT touched only live-swappable fields (or on a GET).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "settings": {
+            "description": "The current effective root-section overlay (only the fields the operator has set; base\n`config.yaml` stands for the rest). An arbitrary JSON object (the `RootSettings` projection)."
+          }
+        },
+        "required": [
+          "applied",
+          "config_version",
+          "settings"
+        ],
+        "type": "object"
+      },
       "ConfigValidateView": {
         "description": "The result of `POST /api/v1/admin/config/validate` — a DRY-RUN: does a proposed config resolve +\nvalidate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution\nfailure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid\nrequest that describes an INVALID config is `ok: false`, not an HTTP error); only a MALFORMED request\nbody is an `invalid_request`. Env-var interpolation is out of scope — this checks structure and\ncross-reference resolution, not runtime secret presence.",
         "properties": {
@@ -2766,6 +2803,137 @@
           }
         ],
         "summary": "Restore a retained version's hook surface (re-validated; a NEW version)",
+        "x-busbar-required-scope": "full"
+      }
+    },
+    "/api/v1/admin/config/settings": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigSettingsView"
+                }
+              }
+            },
+            "description": "`{applied:false, config_version, settings}` (settings = the current root overrides)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `read-only` (error code `forbidden`)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the API-set single-value config overlay (root section: listen/tls/rate_card/store/security/limits/…) — only the operator's overrides; base config.yaml stands for the rest",
+        "x-busbar-required-scope": "read-only"
+      },
+      "put": {
+        "parameters": [
+          {
+            "description": "Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigSettingsView"
+                }
+              }
+            },
+            "description": "`{applied:true, config_version, settings, reload_to_apply, note}`"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Invalid config after the merge, unknown field, or ephemeral busbar with no disk base (error code `invalid_request`); nothing changed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Missing/invalid admin credential (error code `unauthorized`)"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Authenticated but under-scoped: requires `full` (error code `forbidden`)"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stale `If-Match` (error code `version_conflict` — re-read and retry)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)"
+          }
+        },
+        "security": [
+          {
+            "adminToken": []
+          },
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "SET any single-value config section durably (1.5.0 full-config coverage): partial RootSettings merged onto the overlay, re-resolved + validated, swapped in. rate_card/per_request_fee/security/limits/… go live; listen/tls/admin_listen/admin_tls/admin_insecure/store are stored + flagged reload-to-apply. NEVER writes config.yaml",
         "x-busbar-required-scope": "full"
       }
     },

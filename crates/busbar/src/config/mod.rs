@@ -202,7 +202,7 @@ pub(crate) struct RootCfg {
 // deny_unknown_fields (M8): a typo under `tls:` - e.g. `client_c:` for `client_ca:` - would
 // otherwise be SILENTLY IGNORED, leaving mTLS DISABLED while the operator believes it is on
 // (a security downgrade with no diagnostic). Reject any unknown key here so the typo fails boot.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TlsCfg {
     /// PEM certificate chain, leaf first (e.g. fullchain.pem), as a secret reference.
@@ -1627,7 +1627,7 @@ pub(crate) struct DeployCfg {
 }
 
 /// Operator-owned security controls (config.yaml `security:` block).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SecurityCfg {
     /// Additional hosts/IPs APPENDED to the hardcoded cloud-metadata denylist. A provider `base_url`
@@ -1760,7 +1760,7 @@ pub(crate) const GOVERNANCE_STORE_MEMORY: &str = "memory";
 /// config, passed through verbatim (the built-in sqlite plugin reads `db_path` /
 /// `busy_timeout_ms`; postgres/redis read `url`). Absent block = the compiled-in ephemeral RAM
 /// store (keys/usage reset on restart).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoreCfg {
     /// The store module, by plugin ALIAS or CANONICAL NAME. `memory` (default) is the compiled-in
@@ -1790,7 +1790,7 @@ fn default_governance_store() -> String {
 
 /// The `advanced:` block - INTERNAL tuning knobs (formerly under `governance:`). Every field
 /// defaults to its historical value; the whole block is normally omitted.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdvancedCfg {
     /// Amortization interval for the rate-limiter stale-entry sweep: every Nth `check_rate` pays
@@ -1824,7 +1824,7 @@ fn default_per_request_fee() -> i64 {
 /// model with no cache pricing simply omits the cache rates). Values must be finite and >= 0
 /// (validated at boot). Floats exist ONLY here at the config boundary: they are converted once at
 /// resolve time to integer nano-units per token, and the hot path does pure integer math.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RateEntryCfg {
     #[serde(default)]
@@ -1838,7 +1838,7 @@ pub(crate) struct RateEntryCfg {
 }
 
 /// Observability sinks. All fields optional; absent = that sink is disabled.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)] // M8: a typo'd observability key must fail boot, not be silently ignored.
 pub(crate) struct ObservabilityCfg {
     /// OTLP/HTTP traces endpoint URL (e.g. `http://localhost:4318/v1/traces`). When set, busbar
@@ -2039,7 +2039,7 @@ fn default_probe_timeout_secs() -> u64 {
 
 /// The `limits:` block — global operational caps. Each field defaults to its historical hardcoded
 /// value, so an absent field (or an absent block) is today's behavior.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)] // M8: a typo'd limits key must fail boot, not be silently ignored.
 pub(crate) struct LimitsCfg {
     #[serde(default = "default_upstream_request_timeout_secs")]
@@ -2091,7 +2091,7 @@ pub(crate) struct LimitsCfg {
 }
 
 /// The `minimal/low/medium/high` → token-budget table (see `LimitsCfg::reasoning_effort_budgets`).
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ReasoningEffortBudgets {
     #[serde(default = "default_reasoning_minimal")]
     pub(crate) minimal: u32,
@@ -2150,7 +2150,7 @@ impl Default for LimitsCfg {
 }
 
 /// The `metrics:` block.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)] // M8: a typo'd metrics key must fail boot, not be silently ignored.
 pub(crate) struct MetricsCfg {
     #[serde(default = "default_key_gauge_limit")]
@@ -2167,7 +2167,7 @@ impl Default for MetricsCfg {
 
 /// The `health:` block — process-wide active-probe fallbacks (per-lane `health.interval_secs` /
 /// `timeout_secs` still override these).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct HealthDefaultsCfg {
     #[serde(default = "default_probe_interval_secs")]
     pub(crate) default_probe_interval_secs: u64,
@@ -2186,7 +2186,7 @@ impl Default for HealthDefaultsCfg {
 
 /// The `routing:` block — the global default policy timeout (per-policy `policy.timeout_ms` still
 /// overrides).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)] // M8: a typo'd routing key must fail boot, not be silently ignored.
 pub(crate) struct RoutingCfg {
     #[serde(default = "default_policy_timeout_ms")]
