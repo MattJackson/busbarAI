@@ -323,6 +323,11 @@ pub(crate) struct App {
     /// tooling can tell whether the running config changed since a prior read. Process-local (resets on
     /// restart); durable version history + rollback is a follow-up.
     pub(crate) config_version: u64,
+    /// Anti-sprawl cap on keys BOUND TO ONE GROUP (self-service §6a; `limits.max_keys_per_principal`).
+    /// Because a `user:<sub>` leaf IS the principal (§5), this is effectively "max keys per principal".
+    /// `0` = unlimited (default). Enforced at `POST /keys`; carried on the snapshot so a config apply
+    /// can change it (survives `App::clone`).
+    pub(crate) max_keys_per_principal: usize,
     /// Default failover config (deadline_s and max_failover cap) when a pool has no override.
     pub(crate) failover_cfg: Option<crate::config::FailoverCfg>,
     /// Per-pool runtime config (failover/exclusions today; breaker/affinity as they're wired).

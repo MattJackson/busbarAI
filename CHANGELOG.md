@@ -103,6 +103,19 @@ the release's security headline: 1.x keys never expired; 1.5.0 keys are signed t
   OVERLAY so it survives a restart; a base-config group is file-owned (a 409 - edit config.yaml).
   New optional `groups.<g>.child_default` seeds the limits of children auto-provisioned under a
   group (nearest-ancestor-wins).
+- **SELF-SERVICE MINT: auto-provision + the delegated `mint` scope.** `POST /api/v1/admin/keys`
+  takes an optional `parent`: when `group` names a leaf that does NOT yet exist and `parent` is an
+  existing group, the leaf is AUTO-PROVISIONED under it (limits stamped from the nearest-ancestor
+  `child_default`, inherit-only when none) through the SAME validate-at-the-door group-write path -
+  so the first self-mint materializes a `user:<sub>` personal budget bucket, binds the key, and the
+  new leaf is live in the enforcement chain (`leaf ∩ team ∩ org`). If the group already exists,
+  `parent` must match its actual parent (a 409 - a mint never re-homes an existing group). A new
+  delegated **`mint`** admin scope lets a customer's self-service portal mint keys (and
+  auto-provision) WITHOUT god-mode `full`. `mint` and `hooks-register` are SIBLINGS, not ladder
+  rungs: a mint credential cannot register hooks and a hooks-register credential cannot mint (the
+  authorization check is a diamond lattice, not `>=`). New optional
+  `limits.max_keys_per_principal` caps how many keys may bind to one group (= one principal, since a
+  user is a leaf group) - an over-cap self-mint is a 409; absent/`0` = unlimited (today's behavior).
 - **Config OVERLAY substrate (`BUSBAR_CONFIG_OVERLAY`).** Admin-API config mutations layer onto a
   busbar-owned overlay file (never the operator's base `config.yaml`); the effective config = base
   + overlay, re-merged at boot and re-validated on every hot-apply. Atomic write (temp + rename),

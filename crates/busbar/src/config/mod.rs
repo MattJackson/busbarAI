@@ -232,9 +232,9 @@ pub(crate) struct AuthChainEntry {
     /// The module name (built-in `keys` / `admin-tokens`, or a `kind: auth` plugin name/alias).
     pub(crate) module: String,
     /// Ceiling on the ADMIN scope obtainable through this module, regardless of what
-    /// `role_bindings:` grants: `read-only` | `hooks-register` | `full`. Absent = `read-only` for
-    /// every module except the built-in `admin-tokens` operator credential (full by definition and
-    /// exempt) - `full` from an external chain is an explicit opt-in.
+    /// `role_bindings:` grants: `read-only` | `hooks-register` | `mint` | `full`. Absent =
+    /// `read-only` for every module except the built-in `admin-tokens` operator credential (full by
+    /// definition and exempt) - `full` from an external chain is an explicit opt-in.
     pub(crate) max_admin_scope: Option<String>,
     /// The operator ADMIN credential, for the built-in `admin-tokens` module (a secret reference).
     /// Meaningless on other modules (validated).
@@ -343,9 +343,9 @@ pub(crate) struct RoleBindingCfg {
     /// The `groups:` bucket this role's principals charge through. Absent = no group (unlimited).
     #[serde(default)]
     pub(crate) group: Option<String>,
-    /// The ADMIN scope this role grants: `read-only` | `hooks-register` | `full`. Absent = no
-    /// admin access from this role. The most permissive of a principal's bound roles wins,
-    /// ceilinged by the asserting module's `max_admin_scope`.
+    /// The ADMIN scope this role grants: `read-only` | `hooks-register` | `mint` | `full`. Absent =
+    /// no admin access from this role. The most permissive of a principal's bound roles wins (by the
+    /// `Scope` ordinal), ceilinged by the asserting module's `max_admin_scope`.
     #[serde(default)]
     pub(crate) admin_scope: Option<String>,
 }
@@ -1991,6 +1991,10 @@ fn default_pool_idle_timeout_secs() -> u64 {
 fn default_max_inbound_concurrent() -> usize {
     DEFAULT_MAX_INBOUND_CONCURRENT
 }
+/// `0` = unlimited keys per group (today's behavior — an absent knob changes nothing).
+fn default_max_keys_per_principal() -> usize {
+    0
+}
 fn default_hard_down_cooldown_secs() -> u64 {
     DEFAULT_HARD_DOWN_COOLDOWN_SECS
 }
@@ -2056,6 +2060,13 @@ pub(crate) struct LimitsCfg {
     /// `>0`, a `tower` global concurrency limit wraps the router as the outermost layer.
     #[serde(default = "default_max_inbound_concurrent")]
     pub(crate) max_inbound_concurrent: usize,
+    /// Cap on how many keys may be BOUND TO ONE GROUP — the anti-sprawl mitigation for self-service
+    /// minting (self-service §6a). Because a `user:<sub>` leaf group IS the principal (§5), this is
+    /// effectively "max keys per principal": a self-issued mint into a group already holding this
+    /// many keys is a `409`. `0` (default) = UNLIMITED (today's behavior — an absent knob changes
+    /// nothing). Enforced at `POST /keys` only; keys already present are never retroactively revoked.
+    #[serde(default = "default_max_keys_per_principal")]
+    pub(crate) max_keys_per_principal: usize,
     #[serde(default = "default_hard_down_cooldown_secs")]
     pub(crate) hard_down_cooldown_secs: u64,
     #[serde(default = "default_upstream_error_body_max_bytes")]
@@ -2127,6 +2138,7 @@ impl Default for LimitsCfg {
             pool_max_idle_per_host: default_pool_max_idle_per_host(),
             pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
             max_inbound_concurrent: default_max_inbound_concurrent(),
+            max_keys_per_principal: default_max_keys_per_principal(),
             hard_down_cooldown_secs: default_hard_down_cooldown_secs(),
             upstream_error_body_max_bytes: default_upstream_error_body_max_bytes(),
             tls_handshake_timeout_secs: default_tls_handshake_timeout_secs(),
@@ -2200,6 +2212,8 @@ pub(crate) struct LimitsResolved {
     pub(crate) pool_max_idle_per_host: usize,
     pub(crate) pool_idle_timeout_secs: u64,
     pub(crate) max_inbound_concurrent: usize,
+    /// Max keys bound to one group (0 = unlimited) — the self-service mint anti-sprawl cap (§6a).
+    pub(crate) max_keys_per_principal: usize,
     pub(crate) hard_down_cooldown_secs: u64,
     pub(crate) upstream_error_body_max_bytes: usize,
     pub(crate) tls_handshake_timeout_secs: u64,
@@ -2245,6 +2259,7 @@ impl LimitsResolved {
             pool_max_idle_per_host: limits.pool_max_idle_per_host,
             pool_idle_timeout_secs: limits.pool_idle_timeout_secs,
             max_inbound_concurrent: limits.max_inbound_concurrent,
+            max_keys_per_principal: limits.max_keys_per_principal,
             hard_down_cooldown_secs: limits.hard_down_cooldown_secs,
             upstream_error_body_max_bytes: limits.upstream_error_body_max_bytes,
             tls_handshake_timeout_secs: limits.tls_handshake_timeout_secs,

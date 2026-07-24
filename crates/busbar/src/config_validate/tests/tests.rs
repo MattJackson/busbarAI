@@ -1326,13 +1326,50 @@ fn test_validate_rejects_bad_chain_and_role_binding_scopes() {
             && e.contains("unknown admin_scope 'readonly'")),
         "expected the role_bindings admin_scope error; got: {errs:?}"
     );
-    // Both messages must teach the valid set so the operator can self-correct.
+    // Both messages must teach the valid set so the operator can self-correct — including the
+    // delegated `mint` token (self-service D2).
     assert!(
         errs.iter()
             .filter(|e| e.contains("superuser") || e.contains("readonly"))
-            .all(|e| e.contains("read-only") && e.contains("hooks-register") && e.contains("full")),
-        "scope errors must enumerate the valid scope tokens; got: {errs:?}"
+            .all(|e| e.contains("read-only")
+                && e.contains("hooks-register")
+                && e.contains("mint")
+                && e.contains("full")),
+        "scope errors must enumerate the valid scope tokens (incl. mint); got: {errs:?}"
     );
+}
+
+/// The delegated `mint` scope token (self-service D2) is ACCEPTED wherever a scope token is
+/// validated: an auth chain entry's `max_admin_scope` and a `role_bindings` `admin_scope`.
+#[test]
+fn test_validate_accepts_mint_scope_token() {
+    let (providers, models, pools) = valid_maps();
+    let mut cfg = make_root_cfg(providers, models, pools);
+    let mut auth = config::AuthCfg::default_none();
+    let mut entry = config::AuthChainEntry::bare("keys");
+    entry.max_admin_scope = Some("mint".to_string());
+    auth.chain = vec![entry];
+    auth.role_bindings.insert(
+        "keys".to_string(),
+        std::collections::BTreeMap::from([(
+            "portal".to_string(),
+            config::RoleBindingCfg {
+                allowed_pools: None,
+                group: None,
+                admin_scope: Some("mint".to_string()),
+            },
+        )]),
+    );
+    cfg.auth = Some(auth);
+    // No scope-token error may appear (other unrelated validation may or may not pass, but the
+    // `mint` token itself must never be flagged as unknown).
+    if let Err(errs) = validate(&cfg) {
+        assert!(
+            !errs.iter().any(|e| e.contains("unknown")
+                && (e.contains("max_admin_scope") || e.contains("admin_scope"))),
+            "`mint` must be a KNOWN scope token; got scope errors: {errs:?}"
+        );
+    }
 }
 
 #[test]

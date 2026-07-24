@@ -74,10 +74,21 @@ static EXISTENCE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[serde(deny_unknown_fields)]
 struct CreateKeyReq {
     name: String,
-    /// The `groups:` bucket this key binds to (at most one). Validated to EXIST at mint - a key
-    /// naming a missing group is a 400. A key with NO group is authed + unlimited (access only).
+    /// The `groups:` bucket this key binds to (at most one). A key with NO group is authed +
+    /// unlimited (access only). If the named group EXISTS, the key binds to it. If it does NOT
+    /// exist, the mint 400s UNLESS `parent` is given — then it is AUTO-PROVISIONED as a leaf under
+    /// `parent` (self-service D2; see `parent`).
     #[serde(default)]
     group: Option<String>,
+    /// AUTO-PROVISION target (self-service §6a, D2): the EXISTING parent group under which to create
+    /// `group` as a leaf when `group` does not yet exist — the first-self-mint materialization of a
+    /// `user:<sub>` personal budget bucket. The new leaf's limits come from the nearest-ancestor
+    /// `child_default` template (inherit-only when none up the chain), created through the same
+    /// validate-at-the-door path as `POST /groups`. If `group` ALREADY exists, `parent` must equal
+    /// its actual parent (else 409) — a mint never re-homes an existing group. Ignored when `group`
+    /// is absent (a key with no group has nothing to provision).
+    #[serde(default)]
+    parent: Option<String>,
     /// Pools this key may target. OMITTED = ALL pools; an explicit `[]` = NO pools (C6).
     #[serde(default)]
     allowed_pools: Option<Vec<String>>,
@@ -243,6 +254,18 @@ fn error_response(status: StatusCode, error_type: &str, message: impl Into<Strin
     json_response(
         status,
         json!({"error": {"code": code, "message": message.into()}}),
+    )
+}
+
+/// Project an `AdminError` (from the shared group/auto-provision path) onto the SAME frozen
+/// `{"error":{"code","message"}}` envelope the keys handlers emit — so a mint's auto-provision
+/// failure (400 dangling parent, 409 parent-mismatch / base-shadow) carries the identical stable
+/// `code` + HTTP status a `POST /groups` would for the same condition. One taxonomy, two doors.
+fn err_to_key_response(e: &crate::admin::v1::contract::AdminError) -> Response {
+    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    json_response(
+        status,
+        json!({"error": {"code": e.code(), "message": e.message()}}),
     )
 }
 
@@ -431,11 +454,14 @@ impl Drop for IdemReservation {
 
 /// POST /api/v1/admin/keys — mint a virtual key. Returns the plaintext secret ONCE.
 pub(crate) async fn create_key(
-    crate::state::CurrentApp(app): crate::state::CurrentApp,
+    axum::extract::State(handle): axum::extract::State<std::sync::Arc<crate::state::AppHandle>>,
     axum::Extension(principal): axum::Extension<crate::auth::AuthPrincipal>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    // A fresh snapshot for the mint's pool/group READS; the auto-provision path (below) swaps
+    // through `handle` and re-loads inside its own lock, so binding always sees the provisioned leaf.
+    let app = handle.load();
     let actor = principal.actor_id().to_string();
     // IDEMPOTENT MINT (optional `Idempotency-Key`): a retried POST with the same key inside the
     // ~10min window returns the FIRST response verbatim (including the once-shown secret — the
@@ -572,20 +598,72 @@ pub(crate) async fn create_key(
             );
         }
     }
-    // MINT-TIME fail-closed check: a bound `group` must exist in the top-level groups block NOW - a
-    // dangling binding would make every request on the new key fail closed at admission. 400 with
-    // the offender named (mirrors the boot-side check over stored keys). A key with NO group is
-    // authed + unlimited (access only).
+    // MINT-TIME group resolution (self-service D2): a bound `group` must exist NOW — a dangling
+    // binding would make every request on the new key fail closed at admission. When it does not
+    // exist AND `parent` is given, AUTO-PROVISION it as a leaf under `parent` (materializing the
+    // `user:<sub>` personal budget bucket on first self-mint) through the SAME validate-at-the-door
+    // group-write path, so validation / cost rebuild / version log / overlay persistence hold. When
+    // it exists and `parent` is given, `parent` must match the actual parent (409 otherwise). A key
+    // with NO group is authed + unlimited (access only) — nothing to resolve.
+    let mut provisioned_group = false;
     if let Some(group) = req.group.as_deref() {
-        if app.cost.group_named(group).is_none() {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                ERR_TYPE_INVALID_REQUEST,
-                format!(
-                    "group '{group}' does not exist in the top-level groups block; configure it \
-                     first (e.g. {group}: {{ limits: [ {{ budget: 0, per: month }} ] }})"
-                ),
-            );
+        match crate::admin::v1::json::resolve_mint_group(
+            &handle,
+            group,
+            req.parent.as_deref(),
+            &actor,
+        )
+        .await
+        {
+            Ok(provisioned) => provisioned_group = provisioned,
+            Err(e) => return err_to_key_response(&e),
+        }
+    } else if req.parent.is_some() {
+        // `parent` without `group` has nothing to root — a loud 400 beats silently ignoring it.
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            ERR_TYPE_INVALID_REQUEST,
+            "`parent` was given without `group`; `parent` names the group to auto-provision \
+             `group` under, so `group` is required with it",
+        );
+    }
+    // ANTI-SPRAWL CAP (audit gap 7 / self-service §6a): `limits.max_keys_per_principal` bounds how
+    // many keys may bind to ONE group. Since a `user:<sub>` leaf IS the principal (§5), this caps a
+    // self-issuing dev's key count. `0` = unlimited (skip). Counted here, BEFORE the mint, over the
+    // keys currently bound to this group; `>= cap` is a `409` (a retry can't fix it without deleting
+    // a key). An auto-provisioned leaf is brand-new (0 keys), so a group's FIRST self-mint always
+    // passes. Only meaningful for a bound key — a groupless key has no principal to cap.
+    if app.max_keys_per_principal > 0 {
+        if let Some(group) = req.group.as_deref() {
+            let gov = gov.clone();
+            let group_owned = group.to_string();
+            let count = tokio::task::spawn_blocking(move || {
+                gov.all_keys().map(|keys| {
+                    keys.iter()
+                        .filter(|k| k.group.as_deref() == Some(&group_owned))
+                        .count()
+                })
+            })
+            .await;
+            match count {
+                Ok(Ok(n)) if n >= app.max_keys_per_principal => {
+                    return error_response(
+                        StatusCode::CONFLICT,
+                        ERR_TYPE_CONFLICT,
+                        format!(
+                            "group '{group}' already has {n} key(s), at the \
+                             `limits.max_keys_per_principal` cap of {}; revoke or delete an existing \
+                             key before minting another",
+                            app.max_keys_per_principal
+                        ),
+                    );
+                }
+                Ok(Ok(_)) => {}
+                // A store failure counting keys must FAIL CLOSED — never mint past a cap we could
+                // not verify (the whole point of the cap is a hard ceiling).
+                Ok(Err(e)) => return internal_error("create_key", &e),
+                Err(e) => return join_error("create_key", &e),
+            }
         }
     }
     // Keys carry NO inline limits (S1); enforcement flows through the bound group.
@@ -616,6 +694,10 @@ pub(crate) async fn create_key(
                 // The busbar-SIGNED token IS the key credential (S1), shown exactly once.
                 body["token"] = json!(token);
                 body["expires_at"] = json!(exp);
+                // Tell the caller whether this mint AUTO-PROVISIONED its group leaf (self-service
+                // D2), so a portal can distinguish "bound to an existing bucket" from "created your
+                // personal bucket + bound".
+                body["group_provisioned"] = json!(provisioned_group);
                 // The AccessKeyId is NOT secret (it travels in plaintext in the SigV4 header); the
                 // AWS SECRET access key is shown ONCE here only, mirroring the token.
                 body["aws_access_key_id"] = json!(access_key_id);
@@ -647,6 +729,8 @@ pub(crate) async fn create_key(
                 let mut body = key_meta(&key);
                 body["token"] = json!(token); // the signed token, shown exactly once
                 body["expires_at"] = json!(exp);
+                // Whether this mint auto-provisioned its group leaf (self-service D2) — see above.
+                body["group_provisioned"] = json!(provisioned_group);
                 if let Some(ref ck) = idem_ckey {
                     app.idempotency_cache
                         .lock()

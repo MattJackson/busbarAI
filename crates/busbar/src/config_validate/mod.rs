@@ -1050,7 +1050,7 @@ pub(crate) fn validate_with_unset(
                     if crate::admin::v1::contract::Scope::parse(scope).is_none() {
                         errors.push(format!(
                             "role_bindings.{module}.{role} has unknown admin_scope '{scope}': \
-                             expected read-only, hooks-register, or full"
+                             expected read-only, hooks-register, mint, or full"
                         ));
                     }
                 }
@@ -1074,7 +1074,7 @@ pub(crate) fn validate_with_unset(
                 match crate::admin::v1::contract::Scope::parse(scope) {
                     None => errors.push(format!(
                         "auth chain entry '{}' has unknown max_admin_scope '{scope}': expected \
-                         read-only, hooks-register, or full",
+                         read-only, hooks-register, mint, or full",
                         entry.module
                     )),
                     Some(crate::admin::v1::contract::Scope::Full) => tracing::warn!(

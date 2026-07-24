@@ -726,6 +726,22 @@ impl TestApp {
         self.base_group_names.insert(name.into());
         self
     }
+    /// Seed the WHOLE groups tree at once as RUNTIME (non-base) groups: populates the App's group
+    /// registry AND builds the cost model from the same tree, so `cost.group_named` (enforcement +
+    /// mint existence) and `groups_registry` (the Admin-API write surface / auto-provision) AGREE —
+    /// the exact production invariant (both rebuilt together on every apply). NOT marked base, so
+    /// the mint auto-provision path can create a `user:<sub>` leaf under one of these without the
+    /// base-shadow 409 misfiring. Overwrites any `.cost(...)` set earlier.
+    pub(crate) fn groups_tree(
+        mut self,
+        groups: std::collections::BTreeMap<String, crate::config::GroupCfg>,
+    ) -> Self {
+        self.cost = Some(std::sync::Arc::new(crate::cost::CostModel::resolve_parts(
+            None, 0, &groups,
+        )));
+        self.groups_registry = groups;
+        self
+    }
     /// Add a name to the `global_hooks:` list (globally-wired hooks).
     pub(crate) fn global_hook(mut self, name: &str) -> Self {
         self.global_hooks.push(name.into());
@@ -839,6 +855,7 @@ impl TestApp {
             providers_path: None,
             overlay_path: self.overlay_path,
             config_version: 0,
+            max_keys_per_principal: 0,
             failover_cfg: self.failover_cfg,
             pool_runtime: self.pool_runtime,
             fallback_pools: self.fallback_pools,
