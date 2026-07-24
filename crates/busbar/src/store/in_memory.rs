@@ -2050,7 +2050,14 @@ impl StateStore for InMemoryStore {
 
     fn try_acquire(&self, lane: usize) -> Option<Permit> {
         let ls = self.get_lane(lane);
-        ls.sem.clone().try_acquire_owned().ok()
+        // Unbounded lane (`max_concurrent` omitted, realized as MAX_PERMITS): nothing to enforce,
+        // nothing counted — skip the semaphore's shared atomics entirely. /stats `inflight` reads
+        // 0 for such lanes (observational; the routing seam's availability signal is unaffected —
+        // it already reads "effectively infinite" either way).
+        if ls.max >= Semaphore::MAX_PERMITS {
+            return Some(Permit::Unbounded);
+        }
+        ls.sem.clone().try_acquire_owned().ok().map(Permit::Bounded)
     }
 
     fn lane_semaphore(&self, lane: usize) -> Arc<Semaphore> {

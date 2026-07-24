@@ -3445,3 +3445,38 @@ fn test_export_health_reads_consistent_state_cooldown_pair() {
         pool_cell.cooldown_until
     );
 }
+
+/// `max_concurrent` OMITTED (realized as MAX_PERMITS) = UNBOUNDED: `try_acquire` returns
+/// `Permit::Unbounded` without touching the semaphore at all — no shared-atomic traffic for a
+/// limit that can never bind. A BOUNDED lane still enforces exactly: at the cap `try_acquire`
+/// refuses until a held permit drops.
+#[test]
+fn test_unbounded_lane_skips_the_semaphore_bounded_still_enforces() {
+    use crate::store::Permit;
+    // Unbounded: the sentinel capacity, exactly what main.rs seeds for an omitted max_concurrent.
+    let unbounded =
+        InMemoryStore::new(vec![make_lane_data(0, tokio::sync::Semaphore::MAX_PERMITS)]);
+    let before = unbounded.available_permits(0);
+    let p = unbounded.try_acquire(0).expect("unbounded always admits");
+    assert!(matches!(p, Permit::Unbounded), "no slot was counted");
+    assert_eq!(
+        unbounded.available_permits(0),
+        before,
+        "the semaphore was never touched"
+    );
+    drop(p); // dropping is a no-op — nothing to return
+
+    // Bounded (max_concurrent: 1): the cap binds exactly.
+    let bounded = InMemoryStore::new(vec![make_lane_data(0, 1)]);
+    let held = bounded.try_acquire(0).expect("first slot admits");
+    assert!(matches!(held, Permit::Bounded(_)));
+    assert!(
+        bounded.try_acquire(0).is_none(),
+        "at the cap: the second concurrent request must be refused"
+    );
+    drop(held);
+    assert!(
+        bounded.try_acquire(0).is_some(),
+        "the released slot admits again"
+    );
+}

@@ -361,10 +361,11 @@ pub(crate) async fn pick_among(
         .await
         {
             // Got a permit before the deadline — a genuine dispatch; disarm the guard (the request
-            // itself will record the success/failure that releases the probe).
+            // itself will record the success/failure that releases the probe). Only BOUNDED lanes
+            // ever park here: an unbounded lane's `try_acquire` above always succeeds.
             Ok(Ok(permit)) => {
                 probe_guard.armed = false;
-                return Some((picked_lane_idx, permit));
+                return Some((picked_lane_idx, crate::store::Permit::Bounded(permit)));
             }
             // Semaphore closed (shutdown) — no request dispatched; `probe_guard` drops and releases.
             Ok(Err(_)) => return None,

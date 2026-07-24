@@ -135,11 +135,20 @@ pub(crate) enum BreakerState {
     HalfOpen,
 }
 
-/// RAII concurrency permit: an owned semaphore permit, held solely to keep the lane's concurrency
-/// slot reserved for this request's lifetime. The slot is returned to the semaphore when the permit
-/// is dropped. `OwnedSemaphorePermit` is already `Send + 'static` and itself `#[must_use]`, so it is
-/// moved into the `FirstByteBody` stream directly with no wrapper.
-pub(crate) type Permit = tokio::sync::OwnedSemaphorePermit;
+/// RAII concurrency permit, held for the request's lifetime and released on drop.
+///
+/// A lane with `max_concurrent` SET holds a real slot on its semaphore (`Bounded`) — the cap is
+/// enforced exactly, at any configured value. A lane with `max_concurrent` OMITTED is unbounded:
+/// there is nothing to enforce, so nothing is counted — `Unbounded` touches no shared state at
+/// all. (The old realization acquired a permit from a `MAX_PERMITS` semaphore even for unbounded
+/// lanes: two shared-atomic writes per request on a cache line every worker fights over, paying
+/// full contention for a limit that could never bind.)
+#[must_use]
+pub(crate) enum Permit {
+    // The permit is never READ — it exists to be HELD (its Drop returns the slot).
+    Bounded(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit),
+    Unbounded,
+}
 
 /// Snapshot of lane stats for /stats endpoint.
 #[derive(Debug, Clone)]
