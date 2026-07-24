@@ -174,9 +174,75 @@ The bundled **`oidc`** module (`busbar-auth-oidc-plugin`) is exactly such a plug
 [configuration.md](configuration.md#auth-plugins) for the `auth.chain: [oidc]` + `settings:` recipe
 (including an Entra ID example).
 
-Hook plugin manifests (`kind: hook`) travel through the same discovery, trust, validation, and
-inventory today, but hooks stay **out-of-process** (socket/webhook transports); the in-process
-dynamic hook consumer arrives with its ABI generation.
+Hook plugins (`kind: hook`) load over the same signed hybrid ABI as store, secret, and auth
+plugins. They are in-process dlopen consumers: the hook `cdylib` exports the six kind-neutral C
+symbols (`busbar_abi`, `busbar_plugin_kind`, `busbar_open`, `busbar_call`, `busbar_free`,
+`busbar_close`) and the engine loads and calls it directly. Trust is signature-based, not
+process-based: the manifest `kind` is cross-checked against `busbar_plugin_kind()` at load, and
+the signed `needs` field caps what grants the plugin may receive. The socket and webhook transport
+modules remain as out-of-process hook options for operators who want process isolation.
+
+## Hook plugins (`kind: hook`)
+
+A hook plugin implements the `busbar_api::Hook` trait, returning `HookOutcome` from each op
+(`Decide`, `Transform`, `Notify`, `Configure`, `Describe`, `Status`). The SDK emits the ABI glue:
+
+```rust
+// crate-type = ["cdylib"]; deps: busbar-api, busbar-plugin-sdk, serde_json
+use busbar_api::{Hook, HookOp, HookOutcome};
+
+struct MyGate { /* … */ }
+impl Hook for MyGate {
+    fn call(&self, op: HookOp) -> HookOutcome {
+        match op {
+            HookOp::Decide(ctx) => {
+                if ctx.request.total_chars > 100_000 {
+                    HookOutcome::Reject { status: 413, message: "prompt too large".into() }
+                } else {
+                    HookOutcome::Abstain
+                }
+            }
+            _ => HookOutcome::Abstain,
+        }
+    }
+}
+
+fn open(cfg: &str) -> Result<Box<dyn Hook>, String> {
+    Ok(Box::new(MyGate::from_config(cfg)?))
+}
+busbar_plugin_sdk::export_hook_plugin!(open);
+```
+
+`export_hook_plugin!` emits the six extern-C hybrid ABI symbols. Operations ride `busbar_call` as
+op-discriminated JSON (the same `decide`/`transform`/`notify`/`configure`/`describe`/`status` payload
+as the socket/webhook wire).
+
+Pack with grant declarations (the core enforces the actual projection; the plugin cannot self-grant
+above what it declares):
+
+```sh
+BUSBAR_SIGN_KEY=9f2c... busbar-plugin-pack pack \
+    --lib target/release/libmy_gate.so \
+    --name acme-pii-hook --alias pii-guard --kind hook \
+    --version 1.0.0 --publisher acme \
+    --needs-prompt ro \          # declare: this plugin reads prompt text
+    --license Apache-2.0 \
+    --out acme-pii-hook-1.0.0-x86_64-linux.tar.gz
+```
+
+**Fail-closed, always:** a configured `kind: hook` module that cannot load (missing/untrusted
+tarball, wrong kind, ABI failure) is a hard error on the config-apply path — a dropped security
+gate never silently disappears. `busbar --validate` catches it manifest-only ahead of boot.
+
+**Shipped first-party hook plugins (1.5.0):**
+
+- **Headroom** (`busbar-headroom-hook`): a `prompt: rw` gate that compresses context before
+  dispatch, saving tokens and latency. Reports `chars_saved_total` via the `status` op.
+- **Webrequest** (`busbar-webrequest-hook`): an HTTP-forwarder gate — the out-of-process isolation
+  path for code you don't want in-process. Forwards the routing projection over HTTPS to an
+  operator-run sidecar (any language). SSRF-guarded, signed by release CI.
+
+Both are auto-trusted by the embedded release key; no `trust.publishers` entry is needed.
 
 ## Signing and packaging
 
