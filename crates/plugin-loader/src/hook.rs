@@ -647,4 +647,66 @@ mod tests {
         };
         assert!(err.contains("open failed"), "got: {err}");
     }
+
+    /// A `decide` REJECT rides the seam: the opt-in prompt projection reaches the gate and its
+    /// `{"reject":{...}}` surfaces as a `RoutingDecision::Reject` through the projector normalizer.
+    #[tokio::test]
+    async fn dlopen_decide_reject_over_the_seam() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load(r#"{"order": [0], "reject_if_contains": "BLOCKME"}"#);
+        match policy
+            .decide(
+                &req_with_prompt("x BLOCKME y"),
+                &[cand(0)],
+                &ctx(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("decide")
+        {
+            RoutingDecision::Reject { status, .. } => assert_eq!(status, 403),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// `transform` over the dlopen seam maps the plugin's `{"rewrite":{...}}` reply to a `Rewrite`
+    /// outcome through the projector's `transform_outcome` — the rw-gate rewrite arm rides the ABI.
+    #[tokio::test]
+    async fn dlopen_transform_rewrites_over_the_seam() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load("{}");
+        match policy
+            .transform(&req_with_prompt("hi"), Duration::from_secs(5))
+            .await
+        {
+            TransformOutcome::Rewrite(rw) => assert_eq!(rw.messages.len(), 1),
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
+
+    /// A PANIC inside the plugin is caught at the boundary (SDK catch_unwind → PROTOCOL, plus the
+    /// engine's own catch_unwind) and surfaces as a fail-closed `Err` (→ on_error), never a crash.
+    #[tokio::test]
+    async fn dlopen_plugin_panic_is_fail_closed_err() {
+        let Some(_) = hook_plugin_path() else {
+            return;
+        };
+        let policy = load(r#"{"panic_decide": true}"#);
+        let r = policy
+            .decide(
+                &req_with_prompt("x"),
+                &[cand(0)],
+                &ctx(),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            r.is_err(),
+            "a panicking gate must surface as a fail-closed Err"
+        );
+    }
 }
