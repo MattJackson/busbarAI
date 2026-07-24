@@ -302,6 +302,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "busbar-auth-static-plugin"
+version = "1.5.0"
+dependencies = [
+ "busbar-api",
+ "busbar-plugin-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "busbar-hooks-ranking"
 version = "1.5.0"
 dependencies = [

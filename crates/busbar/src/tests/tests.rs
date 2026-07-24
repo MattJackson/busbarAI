@@ -663,7 +663,7 @@ async fn test_axum_marker_413_is_reshaped_even_as_plain_text() {
 
 /// Helpers for the plugin pre-flight regression tests: a fresh temp plugins dir and an in-memory
 /// signed/unsigned tarball builder.
-fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
+pub(crate) fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "busbar-boot-plugins-{}-{tag}-{}",
         std::process::id(),
@@ -676,7 +676,11 @@ fn tmp_plugin_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn plugin_manifest(name: &str, alias: &str, publisher: &str) -> busbar_plugin_sign::Manifest {
+pub(crate) fn plugin_manifest(
+    name: &str,
+    alias: &str,
+    publisher: &str,
+) -> busbar_plugin_sign::Manifest {
     busbar_plugin_sign::Manifest {
         name: name.into(),
         alias: alias.into(),
@@ -696,7 +700,7 @@ fn plugin_manifest(name: &str, alias: &str, publisher: &str) -> busbar_plugin_si
 }
 
 /// An UNSIGNED (but structurally valid) tarball: sha256 set, signature empty.
-fn unsigned_tarball(mut m: busbar_plugin_sign::Manifest, lib: &[u8]) -> Vec<u8> {
+pub(crate) fn unsigned_tarball(mut m: busbar_plugin_sign::Manifest, lib: &[u8]) -> Vec<u8> {
     m.sha256 = busbar_plugin_sign::sha256_hex(lib);
     busbar_plugin_loader::tarball::package(&m, "lib.so", lib).unwrap()
 }

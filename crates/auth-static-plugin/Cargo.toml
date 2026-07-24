@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "busbar-auth-static-plugin"
+version = "1.5.0"
+publish = false            # internal TEST-support cdylib; never goes to crates.io
+edition = "2021"
+rust-version = "1.87"
+description = "A hermetic static-token kind:auth plugin cdylib used by the full-chain auth-plugin seam tests (no network; a fixed token maps to a fixed identity + roles)."
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+busbar-api = { path = "../api" }
+busbar-plugin-sdk = { path = "../plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

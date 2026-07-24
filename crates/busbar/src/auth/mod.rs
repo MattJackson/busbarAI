@@ -1346,3 +1346,7 @@ fn verify_bedrock_sigv4(
 #[cfg(test)]
 #[path = "tests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/plugin_chain_tests.rs"]
+mod plugin_chain_tests;
