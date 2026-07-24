@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use std::os::raw::c_void;
 
 pub mod auth;
+pub mod hook;
 
 /// The kind-neutral **TRANSPORT** ABI version, returned by a plugin's `busbar_abi()`. Frozen at 1:
 /// this is the low-level linker contract (the six C signatures, ptr+len byte buffers, the
@@ -65,6 +66,9 @@ pub mod kind {
     pub const SECRET: &str = "secret";
     /// An external identity provider / auth module (`Box<dyn busbar_api::AuthModule>`).
     pub const AUTH: &str = "auth";
+    /// An in-process routing hook / policy (`Arc<dyn busbar_api::RoutingPolicy>`). The 1.5.0
+    /// replacement for the retired out-of-process socket/webhook hook transport.
+    pub const HOOK: &str = "hook";
 }
 
 /// The store-plugin ABI version this crate defines. Bumped only on a breaking change to the wire
@@ -239,7 +243,7 @@ pub enum SecretResponse {
 pub type AbiFn = unsafe extern "C" fn() -> u32;
 
 /// `busbar_plugin_kind` — returns a pointer to a NUL-terminated static string naming the ONE kind
-/// this library speaks (`"store"` | `"secret"` | `"auth"`).
+/// this library speaks (`"store"` | `"secret"` | `"auth"` | `"hook"`).
 pub type PluginKindFn = unsafe extern "C" fn() -> *const u8;
 
 /// `busbar_open` — construct an instance from a JSON config blob. On `STATUS_OK`, `*out_handle` is
