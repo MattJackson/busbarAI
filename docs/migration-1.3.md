@@ -125,6 +125,12 @@ an interpreter). Move your logic into a small socket hook binary and register it
 error: `route: script (the embedded Rhai transport) was removed in 1.3. Define an out-of-process gate
 under top-level `hooks:` (kind: gate, socket:) and name it in the pool's `hooks: [...]` list`.
 
+> **1.5.0 note:** `kind: hook` dlopen plugins are the new first-class mechanism for custom policies
+> in 1.5.0. A socket hook binary (above) still works and remains a valid choice, especially for
+> out-of-process isolation. For in-process performance and the full plugin trust model, consider
+> building a signed `kind: hook` plugin tarball instead — see [plugins.md](plugins.md) and
+> [hooks.md](hooks.md).
+
 ---
 
 ## 5. Auth: `auth.mode` → `auth.chain` + `upstream_credentials`
